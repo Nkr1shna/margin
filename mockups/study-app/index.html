@@ -2,89 +2,122 @@
 <meta name="description" content="Three UI directions for Margin, a minimal study app: lessons, notes, topic hierarchy, and manimgl + Breeze-TTS-2 video generation.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=STIX+Two+Text:ital@1&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;500;600&family=Geist+Mono:wght@400;500&family=STIX+Two+Text:ital@1&display=swap">
 <style>
 /* Layout: an openai.com-style page (thin nav, large tight headline, pill segmented control)
    framing one desktop app window per option. Monochrome greys, one restrained blue, OpenAI's green for "done". */
 :root {
-  --bg: #ffffff;
-  --fg: #0d0d0d;
-  --fg-2: #5d5d5d;
-  --fg-3: #8f8f8f;
-  --line: rgba(0, 0, 0, 0.08);
-  --line-2: rgba(0, 0, 0, 0.14);
-  --surface: #f4f4f4;
-  --surface-2: #e8e8e8;
+  /* Showcase page: deliberately plain and neutral. The openai.com look lives only inside the app windows (.win). */
+  --bg: #efefef;
+  --fg: #1a1a1a;
+  --fg-2: #555555;
+  --fg-3: #8a8a8a;
+  --line: rgba(0, 0, 0, 0.1);
+  --line-2: rgba(0, 0, 0, 0.16);
+  --surface: #e4e4e4;
+  --surface-2: #d8d8d8;
   --win: #ffffff;
   --sidebar: #f9f9f9;
-  --hover: rgba(0, 0, 0, 0.045);
-  --select: rgba(0, 0, 0, 0.07);
-  --invert-bg: #0d0d0d;
+  --hover: rgba(0, 0, 0, 0.05);
+  --select: rgba(0, 0, 0, 0.08);
+  --invert-bg: #1a1a1a;
   --invert-fg: #ffffff;
-  --accent: #1d6ff2;
-  --accent-soft: rgba(29, 111, 242, 0.1);
-  --ok: #10a37f;
-  --warn: #b7791f;
-  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
-  --win-shadow: 0 0 0 1px rgba(0,0,0,.06), 0 24px 64px -12px rgba(0,0,0,.18);
+  --accent: #3a83f7;
+  --accent-soft: rgba(58, 131, 247, 0.12);
+  --ok: #48a04c;
+  --warn: #ee7c37;
+  --shadow: 0 1px 2px rgba(0,0,0,.05);
+  --win-shadow: 0 0 0 1px rgba(0,0,0,.08), 0 24px 64px -16px rgba(0,0,0,.25);
   --manim-bg: #000000;
 
-  --font-sans: "OpenAI Sans", "Geist", ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-app: "OpenAI Sans", "Albert Sans", ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --font-math: "STIX Two Text", "Cambria Math", "Times New Roman", serif;
 
   --r-pill: 9999px;
-  --r-card: 12px;
+  --r-card: 10px;
   --r-ctl: 8px;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0b0b0b; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
-    --line: rgba(255,255,255,.09); --line-2: rgba(255,255,255,.16);
-    --surface: #2a2a2a; --surface-2: #353535; --win: #212121; --sidebar: #171717;
-    --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.09);
-    --invert-bg: #ececec; --invert-fg: #0d0d0d;
-    --accent: #5b9bff; --accent-soft: rgba(91,155,255,.14); --ok: #2fc39a; --warn: #e0a84a;
-    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
-    --win-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 24px 64px -12px rgba(0,0,0,.7);
+    --bg: #161616; --fg: #e6e6e6; --fg-2: #a8a8a8; --fg-3: #7a7a7a;
+    --line: rgba(255,255,255,.1); --line-2: rgba(255,255,255,.16);
+    --surface: #242424; --surface-2: #303030; --win: #000000; --sidebar: #0a0a0a;
+    --hover: rgba(255,255,255,.06); --select: rgba(255,255,255,.1);
+    --invert-bg: #e6e6e6; --invert-fg: #111111;
+    --accent: #4da3ff; --accent-soft: rgba(77,163,255,.16); --ok: #6bc67f; --warn: #ef8b57;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+    --win-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 24px 64px -16px rgba(0,0,0,.8);
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #0b0b0b; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
-  --line: rgba(255,255,255,.09); --line-2: rgba(255,255,255,.16);
-  --surface: #2a2a2a; --surface-2: #353535; --win: #212121; --sidebar: #171717;
-  --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.09);
-  --invert-bg: #ececec; --invert-fg: #0d0d0d;
-  --accent: #5b9bff; --accent-soft: rgba(91,155,255,.14); --ok: #2fc39a; --warn: #e0a84a;
-  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
-  --win-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 24px 64px -12px rgba(0,0,0,.7);
+  --bg: #161616; --fg: #e6e6e6; --fg-2: #a8a8a8; --fg-3: #7a7a7a;
+  --line: rgba(255,255,255,.1); --line-2: rgba(255,255,255,.16);
+  --surface: #242424; --surface-2: #303030; --win: #000000; --sidebar: #0a0a0a;
+  --hover: rgba(255,255,255,.06); --select: rgba(255,255,255,.1);
+  --invert-bg: #e6e6e6; --invert-fg: #111111;
+  --accent: #4da3ff; --accent-soft: rgba(77,163,255,.16); --ok: #6bc67f; --warn: #ef8b57;
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+  --win-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 24px 64px -16px rgba(0,0,0,.8);
   color-scheme: dark;
 }
-/* The app windows carry their own theme, independent of this showcase page. */
-.win[data-app-theme="light"] {
-  --bg: #ffffff; --fg: #0d0d0d; --fg-2: #5d5d5d; --fg-3: #8f8f8f;
-  --line: rgba(0,0,0,.08); --line-2: rgba(0,0,0,.14);
-  --surface: #f4f4f4; --surface-2: #e8e8e8; --win: #ffffff; --sidebar: #f9f9f9;
-  --hover: rgba(0,0,0,.045); --select: rgba(0,0,0,.07);
-  --invert-bg: #0d0d0d; --invert-fg: #ffffff;
-  --accent: #1d6ff2; --accent-soft: rgba(29,111,242,.1); --ok: #10a37f; --warn: #b7791f;
-  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
-  --win-shadow: 0 0 0 1px rgba(0,0,0,.06), 0 24px 64px -12px rgba(0,0,0,.18);
+
+/* ---------- App theme: openai.com (Oct 2026) tokens ----------
+   Light: --color-background #fff, --color-primary-100 #000, -60 #0009, -44 #00000070, -12 #0000001f, -4 #0000000a,
+          primary-solid-4 #f5f5f5, primary-solid-12 #e0e0e0, gray-50 #f9f9f9.
+   Dark:  --color-background #000, primary-100 #fff, -60 #fff9, -44 #ffffff70, -12 #fff3, -4 #ffffff1f, -2 #ffffff14,
+          primary-solid-4 #1f1f1f, primary-solid-12 #333.
+   The app follows the viewer's theme unless the App theme switch forces one. */
+.win, .app-scope {
+  --bg: #ffffff; --win: #ffffff; --sidebar: #f9f9f9;
+  --fg: #000000; --fg-2: rgba(0,0,0,.6); --fg-3: rgba(0,0,0,.44);
+  --line: rgba(0,0,0,.08); --line-2: rgba(0,0,0,.12);
+  --surface: #f5f5f5; --surface-2: #e0e0e0;
+  --hover: rgba(0,0,0,.04); --select: rgba(0,0,0,.06);
+  --invert-bg: #000000; --invert-fg: #ffffff;
+  --accent: #3a83f7; --accent-soft: rgba(58,131,247,.12); --ok: #48a04c; --warn: #ee7c37;
+  --shadow: 0 4px 6px rgba(0,0,0,.02), 0 0 2px rgba(0,0,0,.05);
+  --composer-bg: #ffffff; --composer-ring: 0 0 0 1px rgba(0,0,0,.12), 0 4px 16px rgba(0,0,0,.04);
+  --win-shadow: 0 0 0 1px rgba(0,0,0,.08), 0 24px 64px -16px rgba(0,0,0,.25);
+  --r-card: 6px; --r-ctl: 6px;
   color-scheme: light;
+  color: var(--fg);
+  font-family: var(--font-app);
 }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .win:not([data-app-theme="light"]),
+  :root:not([data-theme="light"]) .app-scope {
+    --bg: #000000; --win: #000000; --sidebar: #0a0a0a;
+    --fg: #ffffff; --fg-2: rgba(255,255,255,.6); --fg-3: rgba(255,255,255,.44);
+    --line: rgba(255,255,255,.12); --line-2: rgba(255,255,255,.2);
+    --surface: #1f1f1f; --surface-2: #333333;
+    --hover: rgba(255,255,255,.08); --select: rgba(255,255,255,.12);
+    --invert-bg: #ffffff; --invert-fg: #000000;
+    --accent: #4da3ff; --accent-soft: rgba(77,163,255,.16); --ok: #6bc67f; --warn: #ef8b57;
+    --shadow: none;
+    --composer-bg: rgba(255,255,255,.12); --composer-ring: none;
+    --win-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 24px 64px -16px rgba(0,0,0,.8);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] .win:not([data-app-theme="light"]),
+:root[data-theme="dark"] .app-scope,
 .win[data-app-theme="dark"] {
-  --bg: #212121; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
-  --line: rgba(255,255,255,.08); --line-2: rgba(255,255,255,.15);
-  --surface: #2c2c2c; --surface-2: #383838; --win: #212121; --sidebar: #181818;
-  --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.085);
-  --invert-bg: #ececec; --invert-fg: #0d0d0d;
-  --accent: #5b9bff; --accent-soft: rgba(91,155,255,.15); --ok: #2fc39a; --warn: #e0a84a;
-  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
-  --win-shadow: 0 0 0 1px rgba(0,0,0,.5), 0 0 0 2px rgba(255,255,255,.05), 0 24px 64px -12px rgba(0,0,0,.45);
+  --bg: #000000; --win: #000000; --sidebar: #0a0a0a;
+  --fg: #ffffff; --fg-2: rgba(255,255,255,.6); --fg-3: rgba(255,255,255,.44);
+  --line: rgba(255,255,255,.12); --line-2: rgba(255,255,255,.2);
+  --surface: #1f1f1f; --surface-2: #333333;
+  --hover: rgba(255,255,255,.08); --select: rgba(255,255,255,.12);
+  --invert-bg: #ffffff; --invert-fg: #000000;
+  --accent: #4da3ff; --accent-soft: rgba(77,163,255,.16); --ok: #6bc67f; --warn: #ef8b57;
+  --shadow: none;
+  --composer-bg: rgba(255,255,255,.12); --composer-ring: none;
+  --win-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 24px 64px -16px rgba(0,0,0,.8);
   color-scheme: dark;
 }
-.win { color: var(--fg); }
+.win[data-app-theme="light"] { color-scheme: light; }
 
 * { box-sizing: border-box; }
 body {
@@ -380,6 +413,93 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- App skin: components as openai.com builds them ---------- */
+.win { font-size: 14px; letter-spacing: -0.005em; }
+.win button, .win textarea, .win input { font-family: inherit; }
+/* Pills: 36px, 14px/500, 0 20px padding, 40px radius. Filled = ink, secondary = 4% tint. */
+.win .btn, .app-scope .btn { height: 36px; padding: 0 20px; border-radius: 40px; font-size: 14px; font-weight: 500; letter-spacing: 0; }
+.win .btn-sm, .app-scope .btn-sm { height: 32px; padding: 0 14px; }
+.win .btn-secondary, .app-scope .btn-secondary { background: var(--hover); }
+.win .btn-secondary:hover, .app-scope .btn-secondary:hover { background: var(--select); }
+.win .btn-ghost { padding: 0 12px; }
+/* Outlined chips, like the suggestions under the homepage composer. */
+.win .chip { height: 36px; padding: 0 14px; border: 1px solid var(--line-2); font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.win .chip.on { background: var(--hover); border-color: var(--line-2); color: var(--fg); }
+.win .row { border-radius: 6px; font-size: 14px; }
+.win .row[aria-current="true"] { background: var(--select); }
+.win .sb-label { font-size: 13px; font-weight: 500; color: var(--fg-3); }
+.win .seg { background: var(--hover); }
+.win .seg button { font-weight: 500; }
+.win .seg button[aria-selected="true"] { background: var(--win); box-shadow: 0 0 0 1px var(--line-2); }
+.win .titlebar .t { font-weight: 500; }
+.win .crumbs { font-size: 14px; color: var(--fg-2); }
+.win .crumbs b { font-weight: 500; }
+.win .status, .win .pipeline span { background: transparent; border: 1px solid var(--line-2); font-weight: 500; font-size: 13px; }
+
+/* Reading: 17px/28px body, 500-weight headlines with tight tracking, meta in 14px/500. */
+.win .doc p, .win .doc li { font-size: 17px; line-height: 28px; letter-spacing: -0.01em; }
+.win .doc .lede { font-size: 19px; line-height: 30px; color: var(--fg); }
+.win .doc h1 { font-size: 44px; line-height: 1.12; font-weight: 500; letter-spacing: -0.03em; margin: 12px 0 16px; }
+.win .doc h2 { font-size: 22px; line-height: 1.26; font-weight: 500; letter-spacing: -0.01em; margin: 40px 0 10px; }
+.win .meta { font-size: 14px; font-weight: 500; color: var(--fg-2); gap: 6px 12px; }
+.win .meta .cat { color: var(--fg); }
+.win .math { border-radius: 6px; background: var(--surface); }
+.win .callout { border: 0; background: var(--surface); border-radius: 6px; font-size: 16px; line-height: 26px; }
+.win .check summary { font-size: 17px; }
+.win .check summary::after { font-size: 14px; font-weight: 500; }
+.win .check details p { font-size: 16px; line-height: 26px; }
+.win .next { border-radius: 6px; }
+.win .next small { font-size: 14px; font-weight: 500; color: var(--fg-2); }
+
+/* Video in a lesson reads like a news item on the homepage: media left, title and meta right. */
+.win .video-block { border: 0; padding: 0; gap: 20px; grid-template-columns: 240px 1fr; margin: 28px 0 8px; }
+.win .video-block canvas { width: 240px; height: 135px; border-radius: 6px; }
+.win .video-block .vt { font-size: 17px; font-weight: 400; }
+.win .video-block .vs { font-size: 14px; font-weight: 500; color: var(--fg-2); margin-top: 2px; }
+.win .video-block .vs b { font-weight: 500; color: var(--fg); }
+.win .preview { border-radius: 6px; }
+
+/* Ask: the homepage hero. 28px/600 question, 24px-radius composer, 36px round send, outlined suggestions. */
+.win .gen { padding-top: 88px; gap: 24px; }
+.win .gen h1 { font-size: 28px; line-height: 34px; font-weight: 600; letter-spacing: 0.3px; }
+.win .composer { border-radius: 24px; background: var(--composer-bg); box-shadow: var(--composer-ring); padding: 16px 16px 12px 16px; }
+.win .composer textarea { font-size: 16px; line-height: 24px; letter-spacing: -0.01em; }
+.win .send { background: var(--invert-bg); color: var(--invert-fg); }
+.win .suggest .chip { height: 40px; padding: 0 12px; }
+/* Proposed outline: a "Recent news" style list, heading with a right-aligned link, hairline rows. */
+.win .outline { border: 0; border-radius: 0; overflow: visible; margin-top: 24px; }
+.win .outline-h { border: 0; padding: 0 0 12px; align-items: baseline; }
+.win .outline-h b { font-size: 22px; font-weight: 500; letter-spacing: -0.01em; }
+.win .outline-h small { font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.win .ol-item { padding: 14px 0; border-bottom: 1px solid var(--line); grid-template-columns: 28px 1fr auto; }
+.win .ol-item:first-of-type { border-top: 1px solid var(--line); }
+.win .ol-item b { font-size: 17px; font-weight: 400; }
+.win .ol-item p { font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.win .ol-item .n, .win .ol-item .d { font-family: var(--font-app); font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.win .outline-f { background: transparent; border: 0; padding: 16px 0 0; }
+
+/* Notes and studio */
+.win .note-item b { font-size: 14px; }
+.win .note-item span { font-size: 13px; font-weight: 500; color: var(--fg-3); }
+.win .link-chip { background: transparent; border: 1px solid var(--line-2); font-weight: 500; }
+.win .scene { border-color: var(--line); border-radius: 6px; }
+.win .scene[aria-current="true"] { border-color: var(--line-2); box-shadow: none; background: var(--win); }
+.win .scene-h .name { font-size: 15px; }
+.win .narr { font-size: 15px; line-height: 24px; border-radius: 6px; }
+.win .code, .win .log { border-radius: 6px; }
+.win .select { border-radius: 6px; background: var(--hover); }
+.win .studio-head h1 { font-size: 28px; font-weight: 500; letter-spacing: -0.02em; }
+.win .panel-sec h3 { font-size: 13px; color: var(--fg-2); }
+.win .mnote { font-size: 14px; line-height: 22px; }
+.win .mnote small { font-size: 12px; font-weight: 500; }
+.win .doc-tab { font-weight: 500; }
+
+.opt-c .win .studio-head h1 { font-size: 22px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+/* The page around the windows stays plain. */
+.hero h1 { font-weight: 600; letter-spacing: -0.02em; }
+.option-head h2, .section h2 { font-weight: 600; letter-spacing: -0.01em; }
 </style>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -410,7 +530,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
     <div class="nav-links">
       <a href="#options">Options</a>
       <a href="#pipeline">Video pipeline</a>
-      <a href="#system">Design system</a>
+      <a href="#system">App theme</a>
     </div>
     <div class="nav-spacer"></div>
     <button class="btn btn-secondary btn-sm" id="theme-btn" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Page: System</span></button>
@@ -557,7 +677,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
                 <div class="screen" data-screen="gen" data-fill="gen"></div>
                 <div class="screen" data-screen="lesson" hidden>
                   <div class="margin-layout">
-                    <div data-fill="lesson-body"></div>
+                    <div class="doc" data-fill="lesson-body"></div>
                     <aside class="margins" aria-label="Margin notes">
                       <div class="mnote mine"><small>Your note · ¶2</small>"Whole-number multiples" is the whole trick. Non-integer ratios wouldn't repeat with period T.</div>
                       <div class="mnote"><small>Generated · ¶3</small>ω₀ is in radians per second. 2π/T converts the period into a rate of rotation.</div>
@@ -723,7 +843,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
                 <div class="screen" data-screen="gen" data-fill="gen"></div>
                 <div class="screen" data-screen="lesson" hidden>
                   <div class="margin-layout">
-                    <div data-margin-lesson></div>
+                    <div class="doc" data-margin-lesson></div>
                     <aside class="margins" aria-label="Margin notes">
                       <div class="mnote mine"><small>Your note · ¶2</small>"Whole-number multiples" is the whole trick. Non-integer ratios wouldn't repeat with period T.</div>
                       <div class="mnote"><small>Generated · ¶3</small>ω₀ is in radians per second. 2π/T turns the period into a rate of rotation.</div>
@@ -772,13 +892,13 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
   </section>
 
   <section class="section" id="system">
-    <h2>Borrowed from openai.com</h2>
-    <p>A white canvas, near-black type, greys doing most of the work, fully rounded buttons, and big headlines set at weight 500 with tight letter-spacing. OpenAI Sans isn't publicly licensed, so Geist stands in for it here. In the app, bundle whichever licensed face you choose.</p>
-    <div class="tokens">
-      <div class="tok"><h4>Type</h4><div class="type-a">Aa Sines</div><div style="font-size:13px;color:var(--fg-2)">Sans 500, −0.03em for display · 400 for body · Mono for code · STIX italic for math</div></div>
-      <div class="tok"><h4>Neutrals</h4><div class="sw"><i style="background:var(--bg)"></i><i style="background:var(--sidebar)"></i><i style="background:var(--surface)"></i><i style="background:var(--fg-3)"></i><i style="background:var(--fg)"></i></div><div style="font-size:13px;color:var(--fg-2)">Canvas, sidebar, surface, muted, ink. Dark mode uses the ChatGPT greys.</div></div>
-      <div class="tok"><h4>Buttons</h4><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm">Make video</button><button class="btn btn-secondary btn-sm">Edit outline</button></div><div style="font-size:13px;color:var(--fg-2)">Pills only. One filled button per screen.</div></div>
-      <div class="tok"><h4>State</h4><div style="display:flex;gap:14px;font-size:13px;align-items:center"><span style="display:flex;gap:6px;align-items:center"><span class="dot ok"></span>Rendered</span><span style="display:flex;gap:6px;align-items:center"><span class="dot run"></span>Rendering</span><span style="display:flex;gap:6px;align-items:center"><span class="dot"></span>No video</span></div><div style="font-size:13px;color:var(--fg-2)">Green for done, blue for in progress. Color is never decoration.</div></div>
+    <h2>App theme, taken from openai.com</h2>
+    <p>Pulled from the live site's CSS in October 2026. Pure white or pure black backgrounds, ink at 100, 60 and 44 percent opacity for text, 12 and 4 percent for borders and fills, 40px pill buttons, a 24px-radius composer, and 6px corners on media. OpenAI Sans can't be redistributed, so Albert Sans stands in. In the Rust app, bundle whichever licensed face you choose.</p>
+    <div class="tokens app-scope" style="padding:16px;border-radius:12px;background:var(--bg)">
+      <div class="tok"><h4>Type</h4><div class="type-a" style="font-family:var(--font-app)">What can I help with?</div><div style="font-size:13px;color:var(--fg-2)">Body 17/28 · headlines 500 at −0.03em · question 28px/600 · meta 14px/500</div></div>
+      <div class="tok"><h4>Ink</h4><div class="sw"><i style="background:var(--bg)"></i><i style="background:var(--surface)"></i><i style="background:var(--fg-3)"></i><i style="background:var(--fg-2)"></i><i style="background:var(--fg)"></i></div><div style="font-size:13px;color:var(--fg-2)">Background, 4% fill, 44%, 60%, 100%. Dark mode is pure black with white ink.</div></div>
+      <div class="tok"><h4>Buttons</h4><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary">Make video</button><button class="btn btn-secondary">Log in</button></div><div style="font-size:13px;color:var(--fg-2)">36px pills, 14px/500. One filled button per screen.</div></div>
+      <div class="tok"><h4>State</h4><div style="display:flex;gap:14px;font-size:13px;align-items:center;flex-wrap:wrap"><span style="display:flex;gap:6px;align-items:center"><span class="dot ok"></span>Rendered</span><span style="display:flex;gap:6px;align-items:center"><span class="dot run"></span>Rendering</span><span style="display:flex;gap:6px;align-items:center"><span class="dot"></span>No video</span></div><div style="font-size:13px;color:var(--fg-2)">From OpenAI's primitives: green-500 and blue-400.</div></div>
     </div>
   </section>
 
@@ -820,10 +940,10 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
     </ul>`;
 
   const lessonBody = (withVideoBlock) => `
-    <div class="meta"><span class="tag">Lesson 1 of 3</span><span>9 min read</span><span>Intro level</span><span>Generated Oct 12</span></div>
+    <div class="meta"><span class="cat">Lesson 1 of 3</span><span>9 min read</span><span>Intro level</span><span>Generated Oct 12</span></div>
     <h1>Why sums of sines?</h1>
     <p class="lede">Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.</p>
-    ${withVideoBlock ? `<div class="video-block"><canvas class="manim" data-terms="3"></canvas><div><div class="vt">Why sums of sines?</div><div class="vs">2:48 · 1080p · 4 scenes · narrated by Breeze-TTS-2</div><div style="display:flex;gap:6px;margin-top:10px"><button class="btn btn-primary btn-sm">${ic("play")}Play</button><button class="btn btn-secondary btn-sm" data-go="studio">Edit scenes</button></div></div></div>` : ""}
+    ${withVideoBlock ? `<div class="video-block"><canvas class="manim" data-terms="3"></canvas><div><div class="vt">Why sums of sines?</div><div class="vs"><b>Video</b>&nbsp;&nbsp;2:48 · 1080p · 4 scenes · Breeze-TTS-2 voice</div><div style="display:flex;gap:6px;margin-top:10px"><button class="btn btn-primary btn-sm">${ic("play")}Play</button><button class="btn btn-secondary btn-sm" data-go="studio">Edit scenes</button></div></div></div>` : ""}
     <h2>The idea</h2>
     <p>The slowest wave sets the period <span class="inline-math">T</span>. The faster ones repeat a whole number of times inside each period, so they add detail without breaking the repetition. <span class="hl">That's why the frequencies must be whole-number multiples</span>, and it's what makes the decomposition unique.</p>
     <div class="math">f(t) = <span class="up">a</span>₀/2 + Σ<sub>n=1</sub><sup>∞</sup> ( aₙ cos nω₀t + bₙ sin nω₀t ),&nbsp;&nbsp; ω₀ = 2π / T</div>
@@ -909,11 +1029,11 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
       </div>
       <div class="suggest"><button class="chip">Eigenvectors, visually</button><button class="chip">How transformers attend</button><button class="chip">SN1 vs SN2 reactions</button></div>
       <div class="outline">
-        <div class="outline-h"><b>Proposed outline</b><small>Fourier Series · in Signals &amp; Systems</small></div>
+        <div class="outline-h"><b>Proposed outline</b><small>Signals &amp; Systems</small></div>
         <div class="ol-item"><span class="n">1</span><b>Why sums of sines?</b><span class="d">~9 min</span><p>Periodic signals, harmonics, building a square wave</p></div>
         <div class="ol-item"><span class="n">2</span><b>Computing coefficients</b><span class="d">~14 min</span><p>Orthogonality, the aₙ and bₙ integrals, worked examples</p></div>
         <div class="ol-item"><span class="n">3</span><b>Convergence &amp; Gibbs</b><span class="d">~11 min</span><p>Pointwise vs uniform convergence, the 9% overshoot</p></div>
-        <div class="outline-f"><button class="btn btn-ghost btn-sm">Edit outline</button><button class="btn btn-primary btn-sm" data-go="lesson">Create lessons</button></div>
+        <div class="outline-f"><button class="btn btn-secondary">Edit outline</button><button class="btn btn-primary" data-go="lesson">Create lessons</button></div>
       </div>
     </div>`;
 
