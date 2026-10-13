@@ -1,0 +1,914 @@
+<title>Margin Study App Mockups</title>
+<meta name="description" content="Three UI directions for Margin, a minimal study app: lessons, notes, topic hierarchy, and manimgl + Breeze-TTS-2 video generation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=STIX+Two+Text:ital@1&display=swap">
+<style>
+/* Layout: an openai.com-style page (thin nav, large tight headline, pill segmented control)
+   framing one desktop app window per option. Monochrome greys, one restrained blue, OpenAI's green for "done". */
+:root {
+  --bg: #ffffff;
+  --fg: #0d0d0d;
+  --fg-2: #5d5d5d;
+  --fg-3: #8f8f8f;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-2: rgba(0, 0, 0, 0.14);
+  --surface: #f4f4f4;
+  --surface-2: #e8e8e8;
+  --win: #ffffff;
+  --sidebar: #f9f9f9;
+  --hover: rgba(0, 0, 0, 0.045);
+  --select: rgba(0, 0, 0, 0.07);
+  --invert-bg: #0d0d0d;
+  --invert-fg: #ffffff;
+  --accent: #1d6ff2;
+  --accent-soft: rgba(29, 111, 242, 0.1);
+  --ok: #10a37f;
+  --warn: #b7791f;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
+  --win-shadow: 0 0 0 1px rgba(0,0,0,.06), 0 24px 64px -12px rgba(0,0,0,.18);
+  --manim-bg: #000000;
+
+  --font-sans: "OpenAI Sans", "Geist", ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-math: "STIX Two Text", "Cambria Math", "Times New Roman", serif;
+
+  --r-pill: 9999px;
+  --r-card: 12px;
+  --r-ctl: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b0b0b; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
+    --line: rgba(255,255,255,.09); --line-2: rgba(255,255,255,.16);
+    --surface: #2a2a2a; --surface-2: #353535; --win: #212121; --sidebar: #171717;
+    --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.09);
+    --invert-bg: #ececec; --invert-fg: #0d0d0d;
+    --accent: #5b9bff; --accent-soft: rgba(91,155,255,.14); --ok: #2fc39a; --warn: #e0a84a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    --win-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 24px 64px -12px rgba(0,0,0,.7);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b0b0b; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
+  --line: rgba(255,255,255,.09); --line-2: rgba(255,255,255,.16);
+  --surface: #2a2a2a; --surface-2: #353535; --win: #212121; --sidebar: #171717;
+  --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.09);
+  --invert-bg: #ececec; --invert-fg: #0d0d0d;
+  --accent: #5b9bff; --accent-soft: rgba(91,155,255,.14); --ok: #2fc39a; --warn: #e0a84a;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+  --win-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 24px 64px -12px rgba(0,0,0,.7);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-sans); font-size: 16px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---------- page ---------- */
+.page { max-width: 1320px; margin: 0 auto; padding-inline: 24px; }
+.nav { display: flex; align-items: center; gap: 24px; height: 64px; }
+.wordmark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 17px; letter-spacing: -0.02em; }
+.mark { width: 22px; height: 22px; border-radius: 6px; background: var(--invert-bg); position: relative; }
+.mark::after { content: ""; position: absolute; left: 6px; top: 4px; bottom: 4px; width: 2px; background: var(--invert-fg); border-radius: 1px; box-shadow: 5px 0 0 var(--invert-fg); opacity: .9; }
+.nav-links { display: flex; gap: 22px; font-size: 14px; color: var(--fg-2); }
+.nav-links a { color: inherit; text-decoration: none; }
+.nav-links a:hover { color: var(--fg); }
+.nav-spacer { flex: 1; }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 36px; padding: 0 16px; border-radius: var(--r-pill); border: 0; font-size: 14px; font-weight: 500; white-space: nowrap; transition: background .15s, opacity .15s; }
+.btn-primary { background: var(--invert-bg); color: var(--invert-fg); }
+.btn-primary:hover { opacity: .86; }
+.btn-secondary { background: var(--surface); color: var(--fg); }
+.btn-secondary:hover { background: var(--surface-2); }
+.btn-ghost { background: transparent; color: var(--fg-2); padding: 0 10px; }
+.btn-ghost:hover { background: var(--hover); color: var(--fg); }
+.btn-sm { height: 30px; padding: 0 12px; font-size: 13px; }
+.icon-btn { width: 30px; height: 30px; padding: 0; border-radius: var(--r-ctl); border: 0; background: transparent; color: var(--fg-2); display: inline-flex; align-items: center; justify-content: center; }
+.icon-btn:hover { background: var(--hover); color: var(--fg); }
+
+.hero { padding-block: 56px 32px; display: grid; gap: 20px; justify-items: center; text-align: center; }
+.eyebrow { font-size: 13px; color: var(--fg-2); }
+.hero h1 { margin: 0; font-size: clamp(36px, 6vw, 64px); line-height: 1.04; font-weight: 500; letter-spacing: -0.035em; text-wrap: balance; max-width: 16ch; }
+.hero p { margin: 0; color: var(--fg-2); font-size: 17px; max-width: 60ch; text-wrap: balance; }
+
+.seg { display: inline-flex; padding: 4px; gap: 2px; background: var(--surface); border-radius: var(--r-pill); flex-wrap: wrap; justify-content: center; }
+.seg button { border: 0; background: transparent; height: 34px; padding: 0 16px; border-radius: var(--r-pill); font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.seg button[aria-selected="true"] { background: var(--bg); color: var(--fg); box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 0 0 1px var(--line); }
+.seg.sm button { height: 26px; padding: 0 10px; font-size: 12.5px; }
+.seg.sm { padding: 3px; }
+
+.option-head { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px 32px; padding-block: 24px 16px; }
+.option-head h2 { margin: 0; font-size: 28px; font-weight: 500; letter-spacing: -0.025em; }
+.option-head p { margin: 4px 0 0; color: var(--fg-2); max-width: 62ch; font-size: 15px; }
+.screen-switch { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--fg-3); }
+
+.stage { overflow-x: auto; padding-block: 8px 24px; margin-inline: -8px; padding-inline: 8px; }
+
+/* ---------- app window ---------- */
+.win { width: 1240px; height: 780px; border-radius: 14px; background: var(--win); box-shadow: var(--win-shadow); display: flex; flex-direction: column; overflow: hidden; font-size: 14px; line-height: 1.5; }
+.titlebar { height: 38px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--line); background: var(--sidebar); }
+.lights { display: flex; gap: 8px; }
+.lights i { width: 12px; height: 12px; border-radius: 50%; background: var(--surface-2); display: block; }
+.titlebar .t { flex: 1; text-align: center; font-size: 12.5px; color: var(--fg-3); margin-right: 52px; }
+.app { flex: 1; display: flex; min-height: 0; }
+
+/* sidebar */
+.sb { width: 256px; flex: none; background: var(--sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.sb-top { padding: 10px 10px 4px; display: grid; gap: 2px; }
+.ws { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--r-ctl); font-weight: 500; }
+.ws .mark { width: 20px; height: 20px; border-radius: 5px; }
+.ws .mark::after { left: 5px; top: 4px; bottom: 4px; box-shadow: 4px 0 0 var(--invert-fg); }
+.row { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; border-radius: var(--r-ctl); color: var(--fg-2); background: transparent; border: 0; width: 100%; text-align: left; font-size: 13.5px; }
+.row:hover { background: var(--hover); color: var(--fg); }
+.row[aria-current="true"] { background: var(--select); color: var(--fg); font-weight: 500; }
+.row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .k { font-size: 11.5px; color: var(--fg-3); font-family: var(--font-mono); }
+.row .count { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.sb-label { padding: 14px 16px 4px; font-size: 12px; color: var(--fg-3); font-weight: 500; display: flex; align-items: center; justify-content: space-between; }
+.sb-scroll { flex: 1; overflow: auto; padding: 0 10px 10px; }
+.sb-foot { padding: 8px 10px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+.avatar { width: 24px; height: 24px; border-radius: 50%; background: var(--surface-2); display: grid; place-items: center; font-size: 11px; font-weight: 600; color: var(--fg-2); }
+
+.tree { list-style: none; margin: 0; padding: 0; }
+.tree .tree { padding-left: 14px; margin-left: 9px; border-left: 1px solid var(--line); }
+.tree li > .row { height: 28px; }
+.chev { width: 14px; height: 14px; color: var(--fg-3); transition: transform .15s; }
+.collapsed > .row .chev { transform: rotate(-90deg); }
+.collapsed > .tree { display: none; }
+.dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--fg-3); opacity: .5; }
+.dot.ok { background: var(--ok); opacity: 1; }
+.dot.run { background: var(--accent); opacity: 1; animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.leaf-ic { width: 14px; height: 14px; color: var(--fg-3); }
+
+/* main */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--win); }
+.topbar { height: 46px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 12px 0 16px; }
+.crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg-3); min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; }
+.crumbs b { font-weight: 400; color: var(--fg); }
+.crumbs span.sep { opacity: .6; }
+.scroll { flex: 1; overflow: auto; min-height: 0; }
+.screen[hidden] { display: none !important; }
+
+/* document */
+.doc { max-width: 700px; margin: 0 auto; padding: 32px 48px 96px; }
+.doc h1 { font-size: 34px; line-height: 1.15; font-weight: 500; letter-spacing: -0.03em; margin: 8px 0 10px; text-wrap: balance; }
+.doc h2 { font-size: 19px; font-weight: 500; letter-spacing: -0.015em; margin: 32px 0 6px; }
+.doc p { margin: 0 0 12px; font-size: 15.5px; line-height: 1.7; color: var(--fg); }
+.doc .lede { color: var(--fg-2); font-size: 16.5px; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: var(--fg-3); }
+.meta .tag { padding: 1px 8px; border-radius: var(--r-pill); background: var(--surface); color: var(--fg-2); }
+.math { font-family: var(--font-math); font-style: italic; font-size: 19px; text-align: center; padding: 18px 12px; margin: 8px 0 18px; border-radius: var(--r-card); background: var(--surface); overflow-x: auto; white-space: nowrap; letter-spacing: .01em; }
+.math .up { font-style: normal; }
+.inline-math { font-family: var(--font-math); font-style: italic; font-size: 1.08em; }
+.callout { display: flex; gap: 12px; padding: 14px 16px; border-radius: var(--r-card); border: 1px solid var(--line); margin: 16px 0; font-size: 14.5px; }
+.callout .lbl { font-weight: 500; }
+.callout svg { margin-top: 3px; color: var(--fg-2); }
+.check { border-top: 1px solid var(--line); }
+.check details { border-bottom: 1px solid var(--line); padding: 12px 2px; }
+.check summary { cursor: pointer; font-size: 15px; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+.check summary::-webkit-details-marker { display: none; }
+.check summary::after { content: "Show answer"; color: var(--fg-3); font-size: 13px; white-space: nowrap; }
+.check details[open] summary::after { content: "Hide"; }
+.check details p { margin: 8px 0 2px; color: var(--fg-2); font-size: 14.5px; }
+.next { display: flex; justify-content: space-between; align-items: center; margin-top: 36px; padding: 16px 18px; border-radius: var(--r-card); background: var(--surface); }
+.next small { color: var(--fg-3); display: block; font-size: 12.5px; }
+
+.video-block { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: center; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-card); margin: 20px 0 8px; }
+.video-block canvas { width: 220px; height: 124px; border-radius: 8px; display: block; background: var(--manim-bg); }
+.video-block .vt { font-weight: 500; }
+.video-block .vs { font-size: 13px; color: var(--fg-3); }
+
+/* canvas preview */
+.preview { position: relative; border-radius: var(--r-card); overflow: hidden; background: var(--manim-bg); }
+.preview canvas { display: block; width: 100%; aspect-ratio: 16 / 9; }
+.preview .sub { position: absolute; left: 0; right: 0; bottom: 14px; text-align: center; font-size: 13px; color: #fff; text-shadow: 0 1px 2px #000; padding: 0 24px; }
+.preview .badge { position: absolute; top: 10px; left: 10px; font-size: 11px; font-family: var(--font-mono); color: rgba(255,255,255,.7); background: rgba(255,255,255,.08); padding: 2px 7px; border-radius: 5px; }
+.transport { display: flex; align-items: center; gap: 10px; padding: 8px 2px; font-size: 12.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.scrub { flex: 1; height: 4px; border-radius: 2px; background: var(--surface-2); position: relative; }
+.scrub i { position: absolute; inset: 0 auto 0 0; width: 38%; background: var(--fg); border-radius: 2px; }
+.scrub b { position: absolute; top: 0; bottom: 0; background: var(--line-2); }
+
+/* studio */
+.studio { padding: 20px 28px 64px; display: grid; gap: 16px; }
+.studio-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.studio-head h1 { font-size: 22px; font-weight: 500; letter-spacing: -0.02em; margin: 0; flex: 1; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--fg-2); padding: 3px 10px; border-radius: var(--r-pill); background: var(--surface); white-space: nowrap; }
+.pipeline { display: flex; gap: 6px; flex-wrap: wrap; font-size: 12.5px; }
+.pipeline span { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: var(--r-pill); border: 1px solid var(--line); color: var(--fg-2); }
+.pipeline span.done { color: var(--fg); }
+.pipeline span.done::before, .pipeline span.now::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+.pipeline span.now::before { background: var(--accent); animation: pulse 1.4s infinite; }
+.pipeline span.now { color: var(--fg); border-color: var(--line-2); }
+
+.scenes { display: grid; gap: 10px; }
+.scene { border: 1px solid var(--line); border-radius: var(--r-card); padding: 12px 14px; display: grid; gap: 8px; background: var(--win); }
+.scene[aria-current="true"] { border-color: var(--line-2); box-shadow: var(--shadow); }
+.scene-h { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.scene-h .n { font-family: var(--font-mono); color: var(--fg-3); font-size: 12px; }
+.scene-h .name { font-weight: 500; flex: 1; }
+.scene-h .tc { font-family: var(--font-mono); font-size: 12px; color: var(--fg-3); }
+.narr { font-size: 14px; line-height: 1.6; color: var(--fg); padding: 8px 10px; border-radius: var(--r-ctl); background: var(--surface); border: 0; width: 100%; resize: none; }
+.code { font-family: var(--font-mono); font-size: 12px; line-height: 1.65; background: var(--surface); border-radius: var(--r-ctl); padding: 10px 12px; margin: 0; overflow-x: auto; color: var(--fg-2); white-space: pre; }
+.code .kw { color: var(--fg); font-weight: 500; }
+.code .str { color: var(--accent); }
+.code .cm { color: var(--fg-3); }
+.scene-f { display: flex; gap: 14px; font-size: 12px; color: var(--fg-3); align-items: center; }
+.scene-f .ok { color: var(--ok); }
+.bar { height: 3px; border-radius: 2px; background: var(--surface-2); overflow: hidden; width: 120px; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+
+.panel { width: 340px; flex: none; border-left: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: var(--win); }
+.panel-sec { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+.panel-sec h3 { margin: 0; font-size: 12px; font-weight: 500; color: var(--fg-3); }
+.field { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 10px; font-size: 13px; }
+.field > label { color: var(--fg-2); }
+.select { height: 30px; border-radius: var(--r-ctl); background: var(--surface); border: 0; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; font-size: 13px; min-width: 0; }
+.select .mono { font-family: var(--font-mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+input[type="range"] { width: 100%; accent-color: var(--fg); }
+.log { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.7; color: var(--fg-2); background: var(--surface); border-radius: var(--r-ctl); padding: 10px 12px; margin: 0; overflow: auto; white-space: pre; }
+.log .p { color: var(--fg-3); }
+.log .g { color: var(--ok); }
+.log .b { color: var(--accent); }
+.switch { width: 30px; height: 18px; border-radius: 9px; background: var(--fg); position: relative; flex: none; }
+.switch::after { content: ""; position: absolute; top: 2px; right: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--win); }
+.switch.off { background: var(--surface-2); }
+.switch.off::after { right: auto; left: 2px; }
+
+/* notes */
+.notes-wrap { display: flex; height: 100%; }
+.note-list { width: 280px; flex: none; border-right: 1px solid var(--line); padding: 12px 10px; display: grid; gap: 2px; align-content: start; overflow: auto; }
+.note-item { padding: 10px 10px; border-radius: var(--r-ctl); display: grid; gap: 2px; cursor: pointer; border: 0; background: transparent; text-align: left; }
+.note-item:hover { background: var(--hover); }
+.note-item[aria-current="true"] { background: var(--select); }
+.note-item b { font-weight: 500; font-size: 13.5px; }
+.note-item span { font-size: 12.5px; color: var(--fg-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note-doc { flex: 1; overflow: auto; }
+.note-doc .doc { padding-top: 40px; }
+.doc ul { margin: 0 0 14px; padding-left: 22px; }
+.doc li { margin: 4px 0; font-size: 15px; line-height: 1.65; }
+.link-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 3px 10px; border-radius: var(--r-pill); background: var(--surface); color: var(--fg-2); }
+.slash { display: flex; align-items: center; gap: 8px; color: var(--fg-3); font-size: 15px; padding: 2px 0; }
+.caret { display: inline-block; width: 1.5px; height: 18px; background: var(--fg); animation: blink 1s steps(1) infinite; vertical-align: -3px; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* generate / composer */
+.gen { max-width: 760px; margin: 0 auto; padding: 72px 32px 64px; display: grid; gap: 22px; }
+.gen h1 { margin: 0; text-align: center; font-size: 30px; font-weight: 500; letter-spacing: -0.028em; }
+.composer { border-radius: 28px; background: var(--win); box-shadow: 0 0 0 1px var(--line-2), var(--shadow); padding: 16px 16px 12px 20px; display: grid; gap: 10px; }
+.composer textarea { border: 0; background: transparent; resize: none; outline: none; font-size: 16px; line-height: 1.55; min-height: 52px; }
+.composer-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: var(--r-pill); border: 1px solid var(--line-2); background: transparent; font-size: 13px; color: var(--fg-2); }
+.chip:hover { background: var(--hover); color: var(--fg); }
+.chip.on { background: var(--surface); border-color: transparent; color: var(--fg); }
+.send { margin-left: auto; width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--invert-bg); color: var(--invert-fg); display: grid; place-items: center; }
+.suggest { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.outline { border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.outline-h { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+.outline-h b { font-weight: 500; flex: 1; }
+.outline-h small { color: var(--fg-3); font-size: 12.5px; }
+.ol-item { display: grid; grid-template-columns: 28px 1fr auto; gap: 4px 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.ol-item:last-of-type { border-bottom: 0; }
+.ol-item .n { font-family: var(--font-mono); font-size: 12px; color: var(--fg-3); padding-top: 2px; }
+.ol-item b { font-weight: 500; font-size: 14.5px; }
+.ol-item p { grid-column: 2; margin: 0; font-size: 13px; color: var(--fg-3); }
+.ol-item .d { font-size: 12px; color: var(--fg-3); font-family: var(--font-mono); }
+.outline-f { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 14px; background: var(--sidebar); border-top: 1px solid var(--line); }
+.skel { height: 10px; border-radius: 5px; background: var(--surface); }
+
+/* ---------- option-specific ---------- */
+/* B: prompt-first, text-only outline sidebar, margin notes */
+.opt-b .sb { width: 240px; background: var(--win); }
+.opt-b .outline-nav { list-style: none; margin: 0; padding: 0; }
+.opt-b .outline-nav .row { height: 28px; }
+.opt-b .outline-nav .num { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-3); width: 26px; flex: none; }
+.opt-b .outline-nav .sub-l .row { padding-left: 34px; }
+.opt-b .titlebar { background: var(--win); }
+.margin-layout { display: grid; grid-template-columns: minmax(0, 640px) 248px; gap: 40px; justify-content: center; padding: 32px 40px 96px; }
+.margin-layout .doc { padding: 0; margin: 0; max-width: none; }
+.margins { display: grid; align-content: start; gap: 14px; padding-top: 196px; }
+.mnote { border-left: 2px solid var(--line-2); padding: 2px 0 2px 12px; font-size: 13px; color: var(--fg-2); line-height: 1.55; }
+.mnote small { display: block; color: var(--fg-3); font-size: 11.5px; margin-bottom: 2px; }
+.mnote.mine { border-color: var(--fg); color: var(--fg); }
+.mnote.add { border-left-style: dashed; color: var(--fg-3); }
+.hl { background: var(--accent-soft); border-radius: 3px; padding: 0 2px; box-shadow: inset 0 -1px 0 var(--accent); }
+.toc { position: absolute; }
+
+/* C: studio three-pane */
+.opt-c .sb { width: 248px; }
+.opt-c .studio { padding: 16px 20px 48px; }
+.opt-c .panel .preview .sub { font-size: 11.5px; bottom: 8px; }
+
+.foot-notes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; padding-block: 8px 24px; }
+.foot-notes h3 { margin: 0 0 6px; font-size: 14px; font-weight: 500; }
+.foot-notes p, .foot-notes li { margin: 0; color: var(--fg-2); font-size: 14px; line-height: 1.6; }
+.foot-notes ul { margin: 0; padding-left: 18px; }
+.mono { font-family: var(--font-mono); font-size: .92em; }
+
+.section { border-top: 1px solid var(--line); padding-block: 48px; }
+.section h2 { margin: 0 0 8px; font-size: 28px; font-weight: 500; letter-spacing: -0.025em; }
+.section > p { margin: 0 0 28px; color: var(--fg-2); max-width: 64ch; }
+.flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.step { padding: 16px; border-radius: var(--r-card); background: var(--surface); display: grid; gap: 6px; align-content: start; }
+.step .n { font-family: var(--font-mono); font-size: 12px; color: var(--fg-3); }
+.step b { font-weight: 500; }
+.step p { margin: 0; font-size: 13.5px; color: var(--fg-2); }
+.step code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); word-break: break-word; }
+.tokens { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.tok { border: 1px solid var(--line); border-radius: var(--r-card); padding: 14px; display: grid; gap: 10px; }
+.tok h4 { margin: 0; font-size: 12px; font-weight: 500; color: var(--fg-3); }
+.sw { display: flex; gap: 6px; }
+.sw i { width: 28px; height: 28px; border-radius: 50%; box-shadow: inset 0 0 0 1px var(--line-2); }
+.type-a { font-size: 32px; font-weight: 500; letter-spacing: -0.03em; line-height: 1.1; }
+footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--fg-3); }
+
+@media (max-width: 900px) {
+  .foot-notes, .flow, .tokens { grid-template-columns: 1fr 1fr; }
+  .nav-links { display: none; }
+}
+@media (max-width: 560px) {
+  .page { padding-inline: 16px; }
+  .foot-notes, .flow, .tokens { grid-template-columns: 1fr; }
+  .hero { padding-block: 32px 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-6 8 6v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><path d="M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20z"/><path d="M14 3.5V8h4M9 12h6M9 15.5h6"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="18" cy="12" r="1" fill="currentColor"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V6M6 11.5L12 5.5l6 6"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H11v16H5.5A1.5 1.5 0 0 1 4 18.5zM20 5.5A1.5 1.5 0 0 0 18.5 4H13v16h5.5a1.5 1.5 0 0 0 1.5-1.5z"/></symbol>
+    <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9 4.5v15"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 11v2"/></symbol>
+  </defs>
+</svg>
+
+<div class="page">
+  <nav class="nav">
+    <div class="wordmark"><span class="mark" aria-hidden="true"></span>Margin</div>
+    <div class="nav-links">
+      <a href="#options">Options</a>
+      <a href="#pipeline">Video pipeline</a>
+      <a href="#system">Design system</a>
+    </div>
+    <div class="nav-spacer"></div>
+    <button class="btn btn-secondary btn-sm" id="theme-btn" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Theme: System</span></button>
+  </nav>
+
+  <header class="hero">
+    <div class="eyebrow">Mockups · native app in Rust with gpui-component</div>
+    <h1>Study anything, at your own pace.</h1>
+    <p>Margin turns a topic into lessons, keeps your notes next to them, and renders explainer videos with manimgl and Breeze-TTS-2. Here are three layout directions for the same app.</p>
+    <div class="seg" role="tablist" id="opt-tabs" aria-label="Layout option">
+      <button role="tab" aria-selected="true" data-opt="a">A · Notebook</button>
+      <button role="tab" aria-selected="false" data-opt="b">B · Ask first</button>
+      <button role="tab" aria-selected="false" data-opt="c">C · Studio</button>
+    </div>
+  </header>
+
+  <section id="options">
+    <!-- ============ OPTION A ============ -->
+    <div class="option opt-a" data-option="a">
+      <div class="option-head">
+        <div>
+          <h2>A · Notebook</h2>
+          <p>Closest to Notion. One sidebar holds the whole topic tree; every lesson is a page, and the video is a block inside it. The studio opens as its own page when you want to edit scenes.</p>
+        </div>
+        <div class="screen-switch">Screen
+          <div class="seg sm" data-screens="a">
+            <button aria-selected="true" data-screen="lesson">Lesson</button>
+            <button aria-selected="false" data-screen="notes">Notes</button>
+            <button aria-selected="false" data-screen="studio">Video</button>
+            <button aria-selected="false" data-screen="gen">New lesson</button>
+          </div>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="win">
+          <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Fourier Series</div></div>
+          <div class="app">
+            <aside class="sb">
+              <div class="sb-top">
+                <div class="ws"><span class="mark"></span><span class="grow">Krishna's study</span><svg class="i chev"><use href="#i-chev"/></svg></div>
+                <button class="row"><svg class="i"><use href="#i-search"/></svg><span class="grow">Search</span><span class="k">⌘K</span></button>
+                <button class="row" data-go="gen"><svg class="i"><use href="#i-spark"/></svg><span class="grow">New lesson</span><span class="k">⌘N</span></button>
+                <button class="row" data-go="notes"><svg class="i"><use href="#i-note"/></svg><span class="grow">All notes</span><span class="count">24</span></button>
+                <button class="row" data-go="studio"><svg class="i"><use href="#i-video"/></svg><span class="grow">Videos</span><span class="count">7</span></button>
+              </div>
+              <div class="sb-label">Topics <button class="icon-btn" style="width:22px;height:22px" aria-label="Add topic"><svg class="i"><use href="#i-plus"/></svg></button></div>
+              <div class="sb-scroll" data-tree="full"></div>
+              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
+            </aside>
+            <main class="main">
+              <div class="topbar">
+                <div class="crumbs" data-crumbs></div>
+                <button class="btn btn-ghost btn-sm" data-go="notes"><svg class="i"><use href="#i-note"/></svg>3 notes</button>
+                <button class="btn btn-primary btn-sm" data-go="studio"><svg class="i"><use href="#i-video"/></svg>Make video</button>
+                <button class="icon-btn" aria-label="More"><svg class="i"><use href="#i-more"/></svg></button>
+              </div>
+              <div class="scroll">
+                <div class="screen" data-screen="lesson" data-fill="lesson"></div>
+                <div class="screen" data-screen="notes" data-fill="notes" hidden style="height:100%"></div>
+                <div class="screen" data-screen="studio" hidden>
+                  <div class="studio" style="max-width:900px;margin:0 auto">
+                    <div data-fill="studio-head"></div>
+                    <div class="preview"><canvas class="manim" data-terms="cycle"></canvas><span class="badge">manimgl · AddingHarmonics</span><div class="sub">Now add a third harmonic, one third as tall, spinning three times as fast.</div></div>
+                    <div class="transport"><button class="icon-btn" aria-label="Play"><svg class="i"><use href="#i-play"/></svg></button><span>1:04</span><div class="scrub"><i></i><b style="left:7%;width:1px"></b><b style="left:24%;width:1px"></b><b style="left:69%;width:1px"></b></div><span>2:48</span></div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap">
+                      <div class="select" style="flex:1;min-width:200px"><span style="color:var(--fg-2)">Voice</span><span class="mono">BreezeBlue/Breeze-TTS-2</span></div>
+                      <div class="select" style="width:150px"><span style="color:var(--fg-2)">Speed</span><span>1.0×</span></div>
+                      <div class="select" style="width:150px"><span style="color:var(--fg-2)">Quality</span><span>1080p · 60</span></div>
+                    </div>
+                    <div class="scenes" data-fill="scenes"></div>
+                  </div>
+                </div>
+                <div class="screen" data-screen="gen" data-fill="gen" hidden></div>
+              </div>
+            </main>
+          </div>
+        </div>
+      </div>
+      <div class="foot-notes">
+        <div><h3>Why this one</h3><p>Fewest new ideas to learn. Topics, lessons and notes all live in one tree, so the sidebar is the map of the course.</p></div>
+        <div><h3>Trade-off</h3><p>Notes and video sit one click away from the lesson, not beside it. Reading and annotating at the same time means switching pages.</p></div>
+        <div><h3>gpui-component pieces</h3><p>Sidebar with collapsible groups, a tree list, Button, Input, Select, Progress, a markdown text view, and a Kbd hint for shortcuts.</p></div>
+      </div>
+    </div>
+
+    <!-- ============ OPTION B ============ -->
+    <div class="option opt-b" data-option="b" hidden>
+      <div class="option-head">
+        <div>
+          <h2>B · Ask first</h2>
+          <p>Opens on one question, the way openai.com does. The sidebar is a plain numbered outline of the course, and notes live in the right margin next to the paragraph they're about. That margin column gives the app its name.</p>
+        </div>
+        <div class="screen-switch">Screen
+          <div class="seg sm" data-screens="b">
+            <button aria-selected="true" data-screen="gen">Ask</button>
+            <button aria-selected="false" data-screen="lesson">Lesson + margin</button>
+            <button aria-selected="false" data-screen="studio">Video</button>
+          </div>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="win">
+          <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin</div></div>
+          <div class="app">
+            <aside class="sb">
+              <div class="sb-top">
+                <div class="ws"><span class="mark"></span><span class="grow">Margin</span><button class="icon-btn" style="width:24px;height:24px" aria-label="Collapse sidebar"><svg class="i"><use href="#i-panel"/></svg></button></div>
+                <button class="row" data-go="gen"><svg class="i"><use href="#i-plus"/></svg><span class="grow">Learn something new</span></button>
+                <button class="row"><svg class="i"><use href="#i-search"/></svg><span class="grow">Search</span><span class="k">⌘K</span></button>
+              </div>
+              <div class="sb-label">Signals &amp; Systems</div>
+              <div class="sb-scroll">
+                <ul class="outline-nav">
+                  <li><button class="row"><span class="num">1</span><span class="grow">Complex numbers</span><span class="dot ok"></span></button></li>
+                  <li><button class="row" style="color:var(--fg)"><span class="num">2</span><span class="grow">Fourier series</span></button></li>
+                  <li class="sub-l"><button class="row" data-go="lesson" aria-current="true"><span class="grow">Why sums of sines?</span><span class="dot ok"></span></button></li>
+                  <li class="sub-l"><button class="row" data-go="lesson"><span class="grow">Computing coefficients</span><span class="dot run"></span></button></li>
+                  <li class="sub-l"><button class="row" data-go="lesson"><span class="grow">Convergence &amp; Gibbs</span><span class="dot"></span></button></li>
+                  <li><button class="row"><span class="num">3</span><span class="grow">Fourier transform</span><span class="dot"></span></button></li>
+                  <li><button class="row"><span class="num">4</span><span class="grow">Sampling</span><span class="dot"></span></button></li>
+                </ul>
+                <div class="sb-label" style="padding-inline:6px">Other topics</div>
+                <button class="row"><span class="grow">Linear Algebra</span><span class="count">6</span></button>
+                <button class="row"><span class="grow">Organic Chemistry</span><span class="count">4</span></button>
+                <button class="row"><span class="grow">Spanish B1</span><span class="count">9</span></button>
+              </div>
+              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
+            </aside>
+            <main class="main">
+              <div class="topbar">
+                <div class="crumbs" data-crumbs></div>
+                <button class="btn btn-ghost btn-sm"><svg class="i"><use href="#i-note"/></svg>Margin notes</button>
+                <button class="btn btn-secondary btn-sm" data-go="studio"><svg class="i"><use href="#i-video"/></svg>Video</button>
+              </div>
+              <div class="scroll">
+                <div class="screen" data-screen="gen" data-fill="gen"></div>
+                <div class="screen" data-screen="lesson" hidden>
+                  <div class="margin-layout">
+                    <div data-fill="lesson-body"></div>
+                    <aside class="margins" aria-label="Margin notes">
+                      <div class="mnote mine"><small>Your note · ¶2</small>"Whole-number multiples" is the whole trick. Non-integer ratios wouldn't repeat with period T.</div>
+                      <div class="mnote"><small>Generated · ¶3</small>ω₀ is in radians per second. 2π/T converts the period into a rate of rotation.</div>
+                      <div class="mnote mine" style="margin-top:110px"><small>Your note · ¶4</small>Gibbs overshoot ≈ 8.95% of the jump. Ask in Friday's TA session why it doesn't shrink.</div>
+                      <div class="mnote add">Select text to add a note</div>
+                    </aside>
+                  </div>
+                </div>
+                <div class="screen" data-screen="studio" hidden>
+                  <div class="studio" style="max-width:820px;margin:0 auto">
+                    <div data-fill="studio-head"></div>
+                    <div class="preview"><canvas class="manim" data-terms="cycle"></canvas><span class="badge">manimgl · Epicycles</span><div class="sub">Each term is an arrow spinning at its own speed. Stack them, and the tip draws the square wave.</div></div>
+                    <div class="transport"><button class="icon-btn" aria-label="Play"><svg class="i"><use href="#i-play"/></svg></button><span>2:01</span><div class="scrub"><i style="width:72%"></i></div><span>2:48</span></div>
+                    <div class="scenes" data-fill="scenes"></div>
+                  </div>
+                </div>
+              </div>
+            </main>
+          </div>
+        </div>
+      </div>
+      <div class="foot-notes">
+        <div><h3>Why this one</h3><p>The first thing you see is the thing the app does best: ask, get a course. Margin notes keep your thinking attached to the exact sentence.</p></div>
+        <div><h3>Trade-off</h3><p>A text-only outline gets long with many topics, so other topics collapse to one line each. Notes have no standalone list here; search finds them.</p></div>
+        <div><h3>gpui-component pieces</h3><p>A multi-line Input as the composer, toggle Buttons as chips, a List for the outline, and a two-column layout for lesson and margin.</p></div>
+      </div>
+    </div>
+
+    <!-- ============ OPTION C ============ -->
+    <div class="option opt-c" data-option="c" hidden>
+      <div class="option-head">
+        <div>
+          <h2>C · Studio</h2>
+          <p>Three panes for when making videos is the main event. Topic tree on the left, lesson or scene script in the middle, and a fixed preview with render controls on the right. Each lesson section maps to one manim scene.</p>
+        </div>
+        <div class="screen-switch">Screen
+          <div class="seg sm" data-screens="c">
+            <button aria-selected="true" data-screen="studio">Scenes</button>
+            <button aria-selected="false" data-screen="lesson">Lesson</button>
+            <button aria-selected="false" data-screen="notes">Notes</button>
+          </div>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="win">
+          <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Studio</div></div>
+          <div class="app">
+            <aside class="sb">
+              <div class="sb-top">
+                <div class="ws"><span class="mark"></span><span class="grow">Krishna's study</span></div>
+                <button class="row"><svg class="i"><use href="#i-search"/></svg><span class="grow">Search</span><span class="k">⌘K</span></button>
+                <button class="row"><svg class="i"><use href="#i-spark"/></svg><span class="grow">New lesson</span><span class="k">⌘N</span></button>
+              </div>
+              <div class="sb-label">Topics</div>
+              <div class="sb-scroll" data-tree="video"></div>
+              <div class="sb-foot"><span class="dot run"></span><span style="flex:1;font-size:12.5px;color:var(--fg-2)">Rendering 1 of 4 scenes</span></div>
+            </aside>
+            <main class="main">
+              <div class="topbar">
+                <div class="crumbs" data-crumbs></div>
+                <div class="seg sm" style="margin-right:4px" data-screens="c-inner">
+                  <button aria-selected="false" data-screen="lesson">Read</button>
+                  <button aria-selected="true" data-screen="studio">Scenes</button>
+                </div>
+              </div>
+              <div class="scroll">
+                <div class="screen" data-screen="studio"><div class="studio"><div data-fill="studio-head"></div><div class="scenes" data-fill="scenes"></div></div></div>
+                <div class="screen" data-screen="lesson" data-fill="lesson" hidden></div>
+                <div class="screen" data-screen="notes" data-fill="notes" hidden style="height:100%"></div>
+              </div>
+            </main>
+            <aside class="panel">
+              <div class="panel-sec">
+                <div class="preview"><canvas class="manim" data-terms="cycle"></canvas><span class="badge">03 · 1080p60</span><div class="sub">Now add a third harmonic…</div></div>
+                <div class="transport" style="padding:0"><button class="icon-btn" aria-label="Play"><svg class="i"><use href="#i-play"/></svg></button><span>1:04</span><div class="scrub"><i></i></div><span>2:48</span></div>
+              </div>
+              <div class="panel-sec">
+                <h3>Narration</h3>
+                <div class="field"><label>Model</label><div class="select"><span class="mono">BreezeBlue/Breeze-TTS-2</span><svg class="i chev"><use href="#i-chev"/></svg></div></div>
+                <div class="field"><label>Voice</label><div class="select"><span>Default speaker</span><svg class="i chev"><use href="#i-chev"/></svg></div></div>
+                <div class="field"><label>Speed</label><input type="range" id="c-speed" min="0.7" max="1.3" step="0.05" value="1" aria-label="Narration speed"></div>
+                <div class="field"><label>Subtitles</label><div style="display:flex;justify-content:flex-end"><span class="switch"></span></div></div>
+              </div>
+              <div class="panel-sec">
+                <h3>Animation</h3>
+                <div class="field"><label>Renderer</label><div class="select"><span class="mono">manimgl</span><svg class="i chev"><use href="#i-chev"/></svg></div></div>
+                <div class="field"><label>Quality</label><div class="seg sm" style="justify-self:start"><button aria-selected="false">720p</button><button aria-selected="true">1080p</button><button aria-selected="false">4K</button></div></div>
+                <button class="btn btn-primary" style="width:100%"><svg class="i"><use href="#i-play"/></svg>Render all scenes</button>
+              </div>
+              <div class="panel-sec" style="border-bottom:0;flex:1;min-height:0">
+                <h3>Log</h3>
+                <pre class="log" style="flex:1"><span class="g">✓</span> tts  scene_01.wav  11.8 s
+<span class="g">✓</span> tts  scene_02.wav  27.4 s
+<span class="g">✓</span> tts  scene_03.wav  74.6 s
+<span class="p">$</span> manimgl lesson_01.py AddingHarmonics -w --hd
+<span class="b">…</span> frame 2786 / 4476  (62%)</pre>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </div>
+      <div class="foot-notes">
+        <div><h3>Why this one</h3><p>The preview never leaves the screen, so you can tweak a line of narration or a manim call and see the result without losing your place.</p></div>
+        <div><h3>Trade-off</h3><p>Busiest of the three. Reading needs the centre pane only, so the panel should collapse with one shortcut when you're studying, not producing.</p></div>
+        <div><h3>gpui-component pieces</h3><p>Resizable panels or a Dock for the three panes, Slider, Switch, segmented Tabs, Progress, and a code editor view for the manim script.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="pipeline">
+    <h2>How a video gets made</h2>
+    <p>Every option drives the same local pipeline. Each lesson section becomes one scene with its own narration and its own manim class, so a single scene can be re-rendered without redoing the whole video.</p>
+    <div class="flow">
+      <div class="step"><span class="n">1</span><b>Lesson</b><p>Generated from your topic, then edited like any page.</p></div>
+      <div class="step"><span class="n">2</span><b>Script</b><p>Split into scenes: narration text plus a manim scene class per section.</p></div>
+      <div class="step"><span class="n">3</span><b>Voice</b><p>Breeze-TTS-2 reads each scene. Clip length sets the scene's duration.</p><code>BreezeBlue/Breeze-TTS-2</code></div>
+      <div class="step"><span class="n">4</span><b>Animation</b><p>manimgl renders each scene, timed to its audio clip.</p><code>manimgl lesson.py Scene -w</code></div>
+      <div class="step"><span class="n">5</span><b>Mux</b><p>Scenes and audio are joined into one MP4 with subtitles.</p><code>ffmpeg -f concat …</code></div>
+    </div>
+  </section>
+
+  <section class="section" id="system">
+    <h2>Borrowed from openai.com</h2>
+    <p>A white canvas, near-black type, greys doing most of the work, fully rounded buttons, and big headlines set at weight 500 with tight letter-spacing. OpenAI Sans isn't publicly licensed, so Geist stands in for it here. In the app, bundle whichever licensed face you choose.</p>
+    <div class="tokens">
+      <div class="tok"><h4>Type</h4><div class="type-a">Aa Sines</div><div style="font-size:13px;color:var(--fg-2)">Sans 500, −0.03em for display · 400 for body · Mono for code · STIX italic for math</div></div>
+      <div class="tok"><h4>Neutrals</h4><div class="sw"><i style="background:var(--bg)"></i><i style="background:var(--sidebar)"></i><i style="background:var(--surface)"></i><i style="background:var(--fg-3)"></i><i style="background:var(--fg)"></i></div><div style="font-size:13px;color:var(--fg-2)">Canvas, sidebar, surface, muted, ink. Dark mode uses the ChatGPT greys.</div></div>
+      <div class="tok"><h4>Buttons</h4><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm">Make video</button><button class="btn btn-secondary btn-sm">Edit outline</button></div><div style="font-size:13px;color:var(--fg-2)">Pills only. One filled button per screen.</div></div>
+      <div class="tok"><h4>State</h4><div style="display:flex;gap:14px;font-size:13px;align-items:center"><span style="display:flex;gap:6px;align-items:center"><span class="dot ok"></span>Rendered</span><span style="display:flex;gap:6px;align-items:center"><span class="dot run"></span>Rendering</span><span style="display:flex;gap:6px;align-items:center"><span class="dot"></span>No video</span></div><div style="font-size:13px;color:var(--fg-2)">Green for done, blue for in progress. Color is never decoration.</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>Margin · design mockups · sample content is a Signals &amp; Systems course</span>
+    <span>Preview animation is drawn live to mimic a manimgl render</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+  const ic = (id, cls = "i") => `<svg class="${cls}"><use href="#i-${id}"/></svg>`;
+
+  /* ---------- shared content ---------- */
+  const tree = (withVideo) => `
+    <ul class="tree">
+      <li><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Signals &amp; Systems</span><span class="count">4</span></button>
+        <ul class="tree">
+          <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Complex numbers</span>${withVideo ? '<span class="dot ok"></span>' : ""}</button>
+            <ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Euler's formula</span></button></li></ul></li>
+          <li><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Fourier series</span></button>
+            <ul class="tree">
+              <li><button class="row" data-go="${withVideo ? "studio" : "lesson"}" aria-current="true">${ic("book", "i leaf-ic")}<span class="grow">Why sums of sines?</span>${withVideo ? '<span class="dot ok"></span>' : ""}</button></li>
+              <li><button class="row" data-go="lesson">${ic("book", "i leaf-ic")}<span class="grow">Computing coefficients</span>${withVideo ? '<span class="dot run"></span>' : ""}</button></li>
+              <li><button class="row" data-go="lesson">${ic("book", "i leaf-ic")}<span class="grow">Convergence &amp; Gibbs</span>${withVideo ? '<span class="dot"></span>' : ""}</button></li>
+              <li><button class="row" data-go="notes">${ic("note", "i leaf-ic")}<span class="grow">Notes</span><span class="count">3</span></button></li>
+            </ul></li>
+          <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Fourier transform</span></button><ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">From series to integral</span></button></li></ul></li>
+          <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Sampling</span></button><ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Nyquist rate</span></button></li></ul></li>
+        </ul></li>
+      <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Linear Algebra</span><span class="count">6</span></button>
+        <ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Span and basis</span></button></li><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Eigenvectors</span></button></li></ul></li>
+      <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Organic Chemistry</span><span class="count">4</span></button>
+        <ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">SN1 vs SN2</span></button></li></ul></li>
+      <li class="collapsed"><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Spanish B1</span><span class="count">9</span></button>
+        <ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Subjunctive triggers</span></button></li></ul></li>
+    </ul>`;
+
+  const lessonBody = (withVideoBlock) => `
+    <div class="meta"><span class="tag">Lesson 1 of 3</span><span>9 min read</span><span>Intro level</span><span>Generated Oct 12</span></div>
+    <h1>Why sums of sines?</h1>
+    <p class="lede">Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.</p>
+    ${withVideoBlock ? `<div class="video-block"><canvas class="manim" data-terms="3"></canvas><div><div class="vt">Why sums of sines?</div><div class="vs">2:48 · 1080p · 4 scenes · narrated by Breeze-TTS-2</div><div style="display:flex;gap:6px;margin-top:10px"><button class="btn btn-primary btn-sm">${ic("play")}Play</button><button class="btn btn-secondary btn-sm" data-go="studio">Edit scenes</button></div></div></div>` : ""}
+    <h2>The idea</h2>
+    <p>The slowest wave sets the period <span class="inline-math">T</span>. The faster ones repeat a whole number of times inside each period, so they add detail without breaking the repetition. <span class="hl">That's why the frequencies must be whole-number multiples</span>, and it's what makes the decomposition unique.</p>
+    <div class="math">f(t) = <span class="up">a</span>₀/2 + Σ<sub>n=1</sub><sup>∞</sup> ( aₙ cos nω₀t + bₙ sin nω₀t ),&nbsp;&nbsp; ω₀ = 2π / T</div>
+    <p>Each pair <span class="inline-math">aₙ, bₙ</span> says how much of the <span class="inline-math">n</span>-th harmonic the signal contains. Lesson 2 shows how to compute them with one integral each.</p>
+    <h2>Building a square wave</h2>
+    <p>A square wave of height 1 uses only odd harmonics, and only sines:</p>
+    <div class="math">f(t) = (4/π) [ sin ω₀t + ⅓ sin 3ω₀t + ⅕ sin 5ω₀t + … ]</div>
+    <p>With three terms the shape is already recognisable. With fifty, only a small overshoot at each jump remains. That overshoot, about 9% of the jump, never goes away. It's called the Gibbs phenomenon, and Lesson 3 covers it.</p>
+    <div class="callout">${ic("bulb")}<div><span class="lbl">Key idea.</span> Every term repeats with period T because its frequency is an integer multiple of ω₀. Change T and every harmonic moves with it.</div></div>
+    <h2>Check yourself</h2>
+    <div class="check">
+      <details><summary>Why does the square wave have no cosine terms?</summary><p>Centred at zero, it's an odd function: f(−t) = −f(t). Cosines are even, so their coefficients integrate to zero.</p></details>
+      <details><summary>If you double the period T, what happens to ω₀?</summary><p>It halves, since ω₀ = 2π / T. Every harmonic slows down by the same factor.</p></details>
+      <details><summary>Roughly how big is the overshoot at a jump?</summary><p>About 9% of the jump height, no matter how many terms you add.</p></details>
+    </div>
+    <div class="next"><div><small>Next lesson</small>Computing coefficients</div><button class="btn btn-secondary btn-sm" data-go="lesson">Continue</button></div>`;
+
+  const lesson = () => `<div class="doc">${lessonBody(true)}</div>`;
+
+  const notes = () => `
+    <div class="notes-wrap">
+      <div class="note-list">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 8px 8px"><b style="font-weight:500">Fourier series · notes</b><button class="icon-btn" aria-label="New note">${ic("plus")}</button></div>
+        <button class="note-item" aria-current="true"><b>Gibbs overshoot: why 9%?</b><span>Edited 2 h ago · from Lesson 1</span></button>
+        <button class="note-item"><b>Odd vs even functions</b><span>Yesterday · from Lesson 1</span></button>
+        <button class="note-item"><b>Euler's formula cheat sheet</b><span>Oct 9 · Complex numbers</span></button>
+        <button class="note-item"><b>Questions for Friday's TA session</b><span>Oct 8</span></button>
+      </div>
+      <div class="note-doc"><div class="doc">
+        <div class="meta"><span class="link-chip">${ic("book")}Why sums of sines?</span><span>Edited 2 h ago</span></div>
+        <h1>Gibbs overshoot: why 9%?</h1>
+        <p>The partial sums of a square wave overshoot each jump by about 8.95% of the jump height, and adding terms doesn't shrink it.</p>
+        <ul>
+          <li>More terms make the overshoot <b style="font-weight:500">narrower</b>, not shorter.</li>
+          <li>The limit is a sine-integral: (1/π)·Si(π) − ½ ≈ 0.0895.</li>
+          <li>Convergence still holds at every point away from the jump, so this is pointwise, not uniform, convergence.</li>
+        </ul>
+        <p>Ask on Friday whether windowing (Lanczos σ-factors) counts as "fixing" it or just hiding it.</p>
+        <div class="slash"><span class="caret"></span><span>Type / for blocks, or ask about this note</span></div>
+      </div></div>
+    </div>`;
+
+  const studioHead = () => `
+    <div class="studio-head">
+      <h1>Why sums of sines?</h1>
+      <span class="status"><span class="dot run"></span>Rendering scene 3 of 4</span>
+      <button class="btn btn-secondary btn-sm">Regenerate script</button>
+      <button class="btn btn-primary btn-sm">${ic("play")}Render</button>
+    </div>
+    <div class="pipeline" style="margin-top:12px"><span class="done">Script</span><span class="done">Voice · 4/4</span><span class="now">Animation · 2/4</span><span>Mux</span></div>`;
+
+  const scenes = [
+    { n: "01", name: "Title card", tc: "0:00–0:12", narr: "Every periodic signal hides a set of simple waves. Let's find them.", code: `<span class="kw">class</span> TitleCard(Scene):\n    <span class="kw">def</span> construct(self):\n        self.play(Write(Text(<span class="str">"Why sums of sines?"</span>)))`, state: "done" },
+    { n: "02", name: "One sine", tc: "0:12–0:40", narr: "Start with a single sine wave. Its period, T, is the time it takes to repeat once.", code: `axes = Axes((-1, 7), (-1.5, 1.5))\nwave = axes.get_graph(np.sin, color=BLUE)\nself.play(ShowCreation(wave), run_time=<span class="str">3</span>)`, state: "done" },
+    { n: "03", name: "Adding harmonics", tc: "0:40–1:55", narr: "Now add a third harmonic, one third as tall, spinning three times as fast. Then a fifth.", code: `<span class="kw">for</span> n <span class="kw">in</span> (<span class="str">3</span>, <span class="str">5</span>, <span class="str">7</span>):\n    nxt = axes.get_graph(partial_sum(n), color=YELLOW)\n    self.play(Transform(wave, nxt))  <span class="cm"># timed to narration</span>`, state: "run", open: true },
+    { n: "04", name: "Epicycles", tc: "1:55–2:48", narr: "Each term is an arrow spinning at its own speed. Stack them, and the tip draws the square wave.", code: "", state: "queued" },
+  ];
+  const scenesHtml = () => scenes.map((s) => `
+    <div class="scene" ${s.open ? 'aria-current="true"' : ""}>
+      <div class="scene-h"><span class="n">${s.n}</span><span class="name">${s.name}</span><span class="tc">${s.tc}</span><button class="icon-btn" aria-label="Scene options">${ic("more")}</button></div>
+      <textarea class="narr" rows="2" aria-label="Narration for ${s.name}">${s.narr}</textarea>
+      ${s.open || s.n === "01" ? `<pre class="code">${s.code}</pre>` : ""}
+      <div class="scene-f">
+        ${s.state === "done" ? `<span class="ok">✓ Voice</span><span class="ok">✓ Animation</span>` : ""}
+        ${s.state === "run" ? `<span class="ok">✓ Voice</span><span>Animation 62%</span><span class="bar"><i style="width:62%"></i></span>` : ""}
+        ${s.state === "queued" ? `<span class="ok">✓ Voice</span><span>Animation queued</span>` : ""}
+        <span style="flex:1"></span>${s.open || s.n === "01" ? "" : `<span>Show code</span>`}
+      </div>
+    </div>`).join("");
+
+  const gen = () => `
+    <div class="gen">
+      <h1>What do you want to learn?</h1>
+      <div class="composer">
+        <textarea id="gen-input" rows="2" aria-label="Topic to learn">Fourier series, from the intuition to the Gibbs phenomenon. I know basic calculus.</textarea>
+        <div class="composer-row">
+          <button class="chip on">${ic("book")}Course · 3 lessons</button>
+          <button class="chip">Intro level</button>
+          <button class="chip on">${ic("video")}With videos</button>
+          <button class="chip">Quiz at the end</button>
+          <button class="send" aria-label="Generate">${ic("up")}</button>
+        </div>
+      </div>
+      <div class="suggest"><button class="chip">Eigenvectors, visually</button><button class="chip">How transformers attend</button><button class="chip">SN1 vs SN2 reactions</button></div>
+      <div class="outline">
+        <div class="outline-h"><b>Proposed outline</b><small>Fourier Series · in Signals &amp; Systems</small></div>
+        <div class="ol-item"><span class="n">1</span><b>Why sums of sines?</b><span class="d">~9 min</span><p>Periodic signals, harmonics, building a square wave</p></div>
+        <div class="ol-item"><span class="n">2</span><b>Computing coefficients</b><span class="d">~14 min</span><p>Orthogonality, the aₙ and bₙ integrals, worked examples</p></div>
+        <div class="ol-item"><span class="n">3</span><b>Convergence &amp; Gibbs</b><span class="d">~11 min</span><p>Pointwise vs uniform convergence, the 9% overshoot</p></div>
+        <div class="outline-f"><button class="btn btn-ghost btn-sm">Edit outline</button><button class="btn btn-primary btn-sm" data-go="lesson">Create lessons</button></div>
+      </div>
+    </div>`;
+
+  const crumbs = {
+    lesson: ["Signals &amp; Systems", "Fourier series", "Why sums of sines?"],
+    notes: ["Signals &amp; Systems", "Fourier series", "Notes"],
+    studio: ["Fourier series", "Why sums of sines?", "Video"],
+    gen: ["New lesson"],
+  };
+
+  /* ---------- fill templates ---------- */
+  const fills = { lesson, notes, gen, "lesson-body": () => lessonBody(false), "studio-head": studioHead, scenes: scenesHtml };
+  $$("[data-fill]").forEach((el) => { el.innerHTML = fills[el.dataset.fill](); });
+  $$("[data-tree]").forEach((el) => { el.innerHTML = tree(el.dataset.tree === "video"); });
+
+  /* ---------- screens per option ---------- */
+  function show(opt, screen) {
+    const root = $(`.option[data-option="${opt}"]`);
+    if (!$(`.screen[data-screen="${screen}"]`, root)) return;
+    $$(".screen", root).forEach((s) => (s.hidden = s.dataset.screen !== screen));
+    $$("[data-screens] button", root).forEach((b) => b.setAttribute("aria-selected", String(b.dataset.screen === screen)));
+    const c = crumbs[screen] || [];
+    const cr = $("[data-crumbs]", root);
+    cr.innerHTML = c.map((t, i) => (i === c.length - 1 ? `<b>${t}</b>` : `<span>${t}</span><span class="sep">/</span>`)).join("");
+    const t = $(".titlebar .t", root);
+    if (t) t.textContent = "Margin — " + (c[c.length - 1] || "").replace("&amp;", "&");
+    $(".scroll", root).scrollTop = 0;
+  }
+  $$(".option").forEach((root) => {
+    const opt = root.dataset.option;
+    root.addEventListener("click", (e) => {
+      const tog = e.target.closest("[data-toggle]");
+      if (tog) { tog.parentElement.classList.toggle("collapsed"); return; }
+      const sw = e.target.closest("[data-screens] button");
+      if (sw) { show(opt, sw.dataset.screen); return; }
+      const go = e.target.closest("[data-go]");
+      if (go) {
+        show(opt, go.dataset.go);
+        if (go.classList.contains("row")) {
+          $$(".sb .row[aria-current]", root).forEach((r) => r.removeAttribute("aria-current"));
+          go.setAttribute("aria-current", "true");
+        }
+      }
+      const chip = e.target.closest(".chip");
+      if (chip && chip.closest(".composer")) chip.classList.toggle("on");
+      const nt = e.target.closest(".note-item");
+      if (nt) { $$(".note-item", root).forEach((n) => n.removeAttribute("aria-current")); nt.setAttribute("aria-current", "true"); }
+    });
+    const first = $("[data-screens] button[aria-selected=true]", root);
+    show(opt, first.dataset.screen);
+  });
+
+  /* ---------- option tabs ---------- */
+  function pickOption(o) {
+    $$("#opt-tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.opt === o)));
+    $$(".option").forEach((el) => (el.hidden = el.dataset.option !== o));
+    try { localStorage.setItem("margin-opt", o); } catch (e) {}
+  }
+  $("#opt-tabs").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) pickOption(b.dataset.opt); });
+  const hashOpt = { "option-a": "a", "option-b": "b", "option-c": "c" }[location.hash.slice(1)];
+  let saved = null; try { saved = localStorage.getItem("margin-opt"); } catch (e) {}
+  pickOption(hashOpt || saved || "a");
+
+  /* ---------- theme toggle ---------- */
+  const modes = ["system", "light", "dark"];
+  let mode = 0;
+  try { mode = Math.max(0, modes.indexOf(localStorage.getItem("margin-theme") || "system")); } catch (e) {}
+  function applyTheme() {
+    const m = modes[mode];
+    if (m === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", m);
+    $("#theme-btn span").textContent = "Theme: " + m[0].toUpperCase() + m.slice(1);
+  }
+  $("#theme-btn").addEventListener("click", () => { mode = (mode + 1) % 3; applyTheme(); try { localStorage.setItem("margin-theme", modes[mode]); } catch (e) {} });
+  applyTheme();
+
+  /* ---------- manim-style preview: Fourier epicycles drawing a square wave ---------- */
+  const BLUE = "#58C4DD", YELLOW = "#F7D96F", GREY = "rgba(255,255,255,0.28)";
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const canvases = $$("canvas.manim").map((c) => ({ c, ctx: c.getContext("2d"), trail: [], w: 0, h: 0 }));
+  function size(s) {
+    const r = s.c.getBoundingClientRect();
+    if (!r.width) return false;
+    const d = Math.min(2, window.devicePixelRatio || 1);
+    if (s.w !== r.width || s.h !== r.height) {
+      s.w = r.width; s.h = r.height; s.c.width = r.width * d; s.c.height = r.height * d;
+      s.ctx.setTransform(d, 0, 0, d, 0, 0); s.trail = [];
+    }
+    return true;
+  }
+  function draw(s, t) {
+    const { ctx, w, h } = s;
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h);
+    const fixed = s.c.dataset.terms !== "cycle";
+    const nTerms = fixed ? +s.c.dataset.terms : 1 + Math.floor((t / 3.2) % 5);
+    const R = h * 0.2, cx = w * 0.24, cy = h * 0.48, x0 = w * 0.46;
+    // axis
+    ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, cy); ctx.lineTo(w * 0.95, cy); ctx.stroke();
+    let x = cx, y = cy;
+    const ang = t * 1.6;
+    for (let k = 0; k < nTerms; k++) {
+      const n = 2 * k + 1, r = (4 / Math.PI) * R / n;
+      ctx.strokeStyle = GREY; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+      const nx = x + r * Math.cos(n * ang), ny = y - r * Math.sin(n * ang);
+      ctx.strokeStyle = BLUE; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(nx, ny); ctx.stroke();
+      x = nx; y = ny;
+    }
+    s.trail.unshift(y); if (s.trail.length > Math.floor(w * 0.48)) s.trail.pop();
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.setLineDash([3, 4]);
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x0, s.trail[0]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle = YELLOW; ctx.lineWidth = 2.5; ctx.beginPath();
+    s.trail.forEach((yy, i) => (i ? ctx.lineTo(x0 + i, yy) : ctx.moveTo(x0, yy)));
+    ctx.stroke();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+    if (h > 200) {
+      ctx.font = `italic ${Math.round(h * 0.055)}px "STIX Two Text", serif`; ctx.fillStyle = "rgba(255,255,255,0.85)";
+      const terms = Array.from({ length: nTerms }, (_, k) => (k ? `sin ${2 * k + 1}t/${2 * k + 1}` : "sin t")).join(" + ");
+      ctx.fillText(`f(t) ≈ (4/π)(${terms})`, w * 0.05, h * 0.12);
+    }
+  }
+  function prefill(s) { const n = Math.floor(s.w * 0.5); for (let i = n; i > 0; i--) draw(s, 9 - i / 60); }
+  let start = performance.now();
+  function frame(now) {
+    const t = (now - start) / 1000;
+    canvases.forEach((s) => { if (s.c.offsetParent && size(s)) { if (!s.trail.length) prefill(s); draw(s, 9 + t); } });
+    if (!reduce) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  // redraw static frames when switching tabs under reduced motion
+  if (reduce) document.addEventListener("click", () => requestAnimationFrame(frame));
+})();
+</script>
