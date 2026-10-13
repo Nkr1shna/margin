@@ -428,7 +428,8 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
     </div>
     <div class="screen-switch">App theme
       <div class="seg sm" id="app-theme" aria-label="App theme">
-        <button aria-selected="true" data-app="light">Light</button>
+        <button aria-selected="true" data-app="system">System</button>
+        <button aria-selected="false" data-app="light">Light</button>
         <button aria-selected="false" data-app="dark">Dark</button>
       </div>
     </div>
@@ -452,7 +453,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win" data-app-theme="light">
+        <div class="win">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Fourier Series</div></div>
           <div class="app">
             <aside class="sb">
@@ -519,7 +520,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win" data-app-theme="light">
+        <div class="win">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin</div></div>
           <div class="app">
             <aside class="sb">
@@ -601,7 +602,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win" data-app-theme="light">
+        <div class="win">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Studio</div></div>
           <div class="app">
             <aside class="sb">
@@ -687,7 +688,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win" data-app-theme="light">
+        <div class="win">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin</div></div>
           <div class="tabstrip" role="tablist" aria-label="Open documents">
             <button class="doc-tab" aria-selected="true" data-go="lesson"><span>Why sums of sines?</span><span class="x">×</span></button>
@@ -1004,16 +1005,16 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
   applyTheme();
 
   /* ---------- app theme (inside the windows only) ---------- */
-  let appTheme = "light";
-  try { appTheme = localStorage.getItem("margin-app-theme") || "light"; } catch (e) {}
+  let appTheme = "system";
+  try { appTheme = localStorage.getItem("margin-app-theme2") || "system"; } catch (e) {}
   function applyApp(t) {
     appTheme = t;
-    $$(".win").forEach((w) => (w.dataset.appTheme = t));
+    $$(".win").forEach((w) => { if (t === "system") delete w.dataset.appTheme; else w.dataset.appTheme = t; });
     $$("#app-theme button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.app === t)));
-    try { localStorage.setItem("margin-app-theme", t); } catch (e) {}
+    try { localStorage.setItem("margin-app-theme2", t); } catch (e) {}
   }
   $("#app-theme").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) applyApp(b.dataset.app); });
-  document.addEventListener("click", (e) => { if (e.target.closest("[data-app-toggle]")) applyApp(appTheme === "dark" ? "light" : "dark"); });
+  document.addEventListener("click", (e) => { if (e.target.closest("[data-app-toggle]")) { const dark = getComputedStyle(document.querySelector(".win")).colorScheme === "dark"; applyApp(dark ? "light" : "dark"); } });
   applyApp(appTheme);
 
   /* ---------- manim-style preview: Fourier epicycles drawing a square wave ---------- */
