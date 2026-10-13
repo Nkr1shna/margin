@@ -61,6 +61,30 @@
   --win-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 24px 64px -12px rgba(0,0,0,.7);
   color-scheme: dark;
 }
+/* The app windows carry their own theme, independent of this showcase page. */
+.win[data-app-theme="light"] {
+  --bg: #ffffff; --fg: #0d0d0d; --fg-2: #5d5d5d; --fg-3: #8f8f8f;
+  --line: rgba(0,0,0,.08); --line-2: rgba(0,0,0,.14);
+  --surface: #f4f4f4; --surface-2: #e8e8e8; --win: #ffffff; --sidebar: #f9f9f9;
+  --hover: rgba(0,0,0,.045); --select: rgba(0,0,0,.07);
+  --invert-bg: #0d0d0d; --invert-fg: #ffffff;
+  --accent: #1d6ff2; --accent-soft: rgba(29,111,242,.1); --ok: #10a37f; --warn: #b7791f;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
+  --win-shadow: 0 0 0 1px rgba(0,0,0,.06), 0 24px 64px -12px rgba(0,0,0,.18);
+  color-scheme: light;
+}
+.win[data-app-theme="dark"] {
+  --bg: #212121; --fg: #ececec; --fg-2: #b4b4b4; --fg-3: #8a8a8a;
+  --line: rgba(255,255,255,.08); --line-2: rgba(255,255,255,.15);
+  --surface: #2c2c2c; --surface-2: #383838; --win: #212121; --sidebar: #181818;
+  --hover: rgba(255,255,255,.05); --select: rgba(255,255,255,.085);
+  --invert-bg: #ececec; --invert-fg: #0d0d0d;
+  --accent: #5b9bff; --accent-soft: rgba(91,155,255,.15); --ok: #2fc39a; --warn: #e0a84a;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+  --win-shadow: 0 0 0 1px rgba(0,0,0,.5), 0 0 0 2px rgba(255,255,255,.05), 0 24px 64px -12px rgba(0,0,0,.45);
+  color-scheme: dark;
+}
+.win { color: var(--fg); }
 
 * { box-sizing: border-box; }
 body {
@@ -303,6 +327,19 @@ input[type="range"] { width: 100%; accent-color: var(--fg); }
 .hl { background: var(--accent-soft); border-radius: 3px; padding: 0 2px; box-shadow: inset 0 -1px 0 var(--accent); }
 .toc { position: absolute; }
 
+/* D: notebook + ask, optional document tabs */
+.tabstrip { display: none; height: 36px; flex: none; align-items: end; gap: 2px; padding: 0 8px; background: var(--sidebar); border-bottom: 1px solid var(--line); }
+.opt-d[data-tabs="on"] .tabstrip { display: flex; }
+.doc-tab { display: flex; align-items: center; gap: 8px; height: 30px; max-width: 220px; padding: 0 8px 0 12px; border-radius: 8px 8px 0 0; font-size: 12.5px; color: var(--fg-2); border: 0; background: transparent; }
+.doc-tab:hover { background: var(--hover); }
+.doc-tab[aria-selected="true"] { background: var(--win); color: var(--fg); box-shadow: 0 0 0 1px var(--line); clip-path: inset(-1px -1px 0 -1px); }
+.doc-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-tab .x { opacity: .5; font-size: 14px; line-height: 1; }
+.opt-d .margins { padding-top: 360px; }
+.verdict { border: 1px solid var(--line); border-radius: var(--r-card); padding: 18px 20px; display: grid; gap: 8px; margin-bottom: 24px; max-width: 900px; }
+.verdict h3 { margin: 0; font-size: 15px; font-weight: 500; }
+.verdict p { margin: 0; color: var(--fg-2); font-size: 14.5px; }
+
 /* C: studio three-pane */
 .opt-c .sb { width: 248px; }
 .opt-c .studio { padding: 16px 20px 48px; }
@@ -376,17 +413,24 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
       <a href="#system">Design system</a>
     </div>
     <div class="nav-spacer"></div>
-    <button class="btn btn-secondary btn-sm" id="theme-btn" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Theme: System</span></button>
+    <button class="btn btn-secondary btn-sm" id="theme-btn" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Page: System</span></button>
   </nav>
 
   <header class="hero">
     <div class="eyebrow">Mockups · native app in Rust with gpui-component</div>
     <h1>Study anything, at your own pace.</h1>
-    <p>Margin turns a topic into lessons, keeps your notes next to them, and renders explainer videos with manimgl and Breeze-TTS-2. Here are three layout directions for the same app.</p>
+    <p>Margin turns a topic into lessons, keeps your notes next to them, and renders explainer videos with manimgl and Breeze-TTS-2. Here are four layout directions for the same app.</p>
     <div class="seg" role="tablist" id="opt-tabs" aria-label="Layout option">
       <button role="tab" aria-selected="true" data-opt="a">A · Notebook</button>
       <button role="tab" aria-selected="false" data-opt="b">B · Ask first</button>
       <button role="tab" aria-selected="false" data-opt="c">C · Studio</button>
+      <button role="tab" aria-selected="false" data-opt="d">D · Notebook + Ask</button>
+    </div>
+    <div class="screen-switch">App theme
+      <div class="seg sm" id="app-theme" aria-label="App theme">
+        <button aria-selected="true" data-app="light">Light</button>
+        <button aria-selected="false" data-app="dark">Dark</button>
+      </div>
     </div>
   </header>
 
@@ -408,7 +452,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win">
+        <div class="win" data-app-theme="light">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Fourier Series</div></div>
           <div class="app">
             <aside class="sb">
@@ -421,7 +465,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
               </div>
               <div class="sb-label">Topics <button class="icon-btn" style="width:22px;height:22px" aria-label="Add topic"><svg class="i"><use href="#i-plus"/></svg></button></div>
               <div class="sb-scroll" data-tree="full"></div>
-              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
+              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Switch app theme" data-app-toggle><svg class="i"><use href="#i-sun"/></svg></button><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
             </aside>
             <main class="main">
               <div class="topbar">
@@ -475,7 +519,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win">
+        <div class="win" data-app-theme="light">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin</div></div>
           <div class="app">
             <aside class="sb">
@@ -500,7 +544,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
                 <button class="row"><span class="grow">Organic Chemistry</span><span class="count">4</span></button>
                 <button class="row"><span class="grow">Spanish B1</span><span class="count">9</span></button>
               </div>
-              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
+              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Switch app theme" data-app-toggle><svg class="i"><use href="#i-sun"/></svg></button><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
             </aside>
             <main class="main">
               <div class="topbar">
@@ -557,7 +601,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         </div>
       </div>
       <div class="stage">
-        <div class="win">
+        <div class="win" data-app-theme="light">
           <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin — Studio</div></div>
           <div class="app">
             <aside class="sb">
@@ -620,6 +664,98 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
         <div><h3>gpui-component pieces</h3><p>Resizable panels or a Dock for the three panes, Slider, Switch, segmented Tabs, Progress, and a code editor view for the manim script.</p></div>
       </div>
     </div>
+
+    <!-- ============ OPTION D ============ -->
+    <div class="option opt-d" data-option="d" data-tabs="off" hidden>
+      <div class="option-head">
+        <div>
+          <h2>D · Notebook + Ask</h2>
+          <p>A's topic tree and pages, with B's ask box as home and B's margin notes on every lesson. Each lesson has three views, Read, Notes and Video, switched from the top bar.</p>
+        </div>
+        <div class="screen-switch" style="flex-wrap:wrap">Screen
+          <div class="seg sm" data-screens="d">
+            <button aria-selected="true" data-screen="gen">Ask</button>
+            <button aria-selected="false" data-screen="lesson">Lesson</button>
+            <button aria-selected="false" data-screen="notes">Notes</button>
+            <button aria-selected="false" data-screen="studio">Video</button>
+          </div>
+          <span style="margin-left:8px">Document tabs</span>
+          <div class="seg sm" data-tabs-toggle>
+            <button aria-selected="true" data-tabs="off">Off</button>
+            <button aria-selected="false" data-tabs="on">On</button>
+          </div>
+        </div>
+      </div>
+      <div class="stage">
+        <div class="win" data-app-theme="light">
+          <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="t">Margin</div></div>
+          <div class="tabstrip" role="tablist" aria-label="Open documents">
+            <button class="doc-tab" aria-selected="true" data-go="lesson"><span>Why sums of sines?</span><span class="x">×</span></button>
+            <button class="doc-tab" aria-selected="false" data-go="notes"><span>Gibbs overshoot: why 9%?</span><span class="x">×</span></button>
+            <button class="doc-tab" aria-selected="false"><span>Eigenvectors</span><span class="x">×</span></button>
+            <button class="icon-btn" style="width:26px;height:26px;margin-bottom:2px" aria-label="New tab" data-go="gen"><svg class="i"><use href="#i-plus"/></svg></button>
+          </div>
+          <div class="app">
+            <aside class="sb">
+              <div class="sb-top">
+                <div class="ws"><span class="mark"></span><span class="grow">Krishna's study</span><svg class="i chev"><use href="#i-chev"/></svg></div>
+                <button class="row" data-go="gen"><svg class="i"><use href="#i-spark"/></svg><span class="grow">Ask</span><span class="k">⌘N</span></button>
+                <button class="row"><svg class="i"><use href="#i-search"/></svg><span class="grow">Search</span><span class="k">⌘K</span></button>
+                <button class="row" data-go="notes"><svg class="i"><use href="#i-note"/></svg><span class="grow">All notes</span><span class="count">24</span></button>
+                <button class="row" data-go="studio"><svg class="i"><use href="#i-video"/></svg><span class="grow">Videos</span><span class="count">7</span></button>
+              </div>
+              <div class="sb-label">Topics <button class="icon-btn" style="width:22px;height:22px" aria-label="Add topic"><svg class="i"><use href="#i-plus"/></svg></button></div>
+              <div class="sb-scroll" data-tree="merged"></div>
+              <div class="sb-foot"><span class="avatar">K</span><span style="flex:1;font-size:13px;color:var(--fg-2)">Krishna</span><button class="icon-btn" aria-label="Switch app theme" data-app-toggle><svg class="i"><use href="#i-sun"/></svg></button><button class="icon-btn" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg></button></div>
+            </aside>
+            <main class="main">
+              <div class="topbar">
+                <div class="crumbs" data-crumbs></div>
+                <div class="seg sm" data-screens="d-inner">
+                  <button aria-selected="false" data-screen="lesson">Read</button>
+                  <button aria-selected="false" data-screen="notes">Notes</button>
+                  <button aria-selected="false" data-screen="studio">Video</button>
+                </div>
+                <button class="icon-btn" aria-label="More"><svg class="i"><use href="#i-more"/></svg></button>
+              </div>
+              <div class="scroll">
+                <div class="screen" data-screen="gen" data-fill="gen"></div>
+                <div class="screen" data-screen="lesson" hidden>
+                  <div class="margin-layout">
+                    <div data-margin-lesson></div>
+                    <aside class="margins" aria-label="Margin notes">
+                      <div class="mnote mine"><small>Your note · ¶2</small>"Whole-number multiples" is the whole trick. Non-integer ratios wouldn't repeat with period T.</div>
+                      <div class="mnote"><small>Generated · ¶3</small>ω₀ is in radians per second. 2π/T turns the period into a rate of rotation.</div>
+                      <div class="mnote mine" style="margin-top:110px"><small>Your note · ¶4</small>Gibbs overshoot ≈ 8.95% of the jump. Ask in Friday's TA session why it doesn't shrink.</div>
+                      <div class="mnote add">Select text to add a note</div>
+                    </aside>
+                  </div>
+                </div>
+                <div class="screen" data-screen="notes" data-fill="notes" hidden style="height:100%"></div>
+                <div class="screen" data-screen="studio" hidden>
+                  <div class="studio" style="max-width:900px;margin:0 auto">
+                    <div data-fill="studio-head"></div>
+                    <div class="preview"><canvas class="manim" data-terms="cycle"></canvas><span class="badge">manimgl · AddingHarmonics</span><div class="sub">Now add a third harmonic, one third as tall, spinning three times as fast.</div></div>
+                    <div class="transport"><button class="icon-btn" aria-label="Play"><svg class="i"><use href="#i-play"/></svg></button><span>1:04</span><div class="scrub"><i></i></div><span>2:48</span></div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap">
+                      <div class="select" style="flex:1;min-width:200px"><span style="color:var(--fg-2)">Voice</span><span class="mono">BreezeBlue/Breeze-TTS-2</span></div>
+                      <div class="select" style="width:150px"><span style="color:var(--fg-2)">Speed</span><span>1.0×</span></div>
+                      <div class="select" style="width:150px"><span style="color:var(--fg-2)">Quality</span><span>1080p · 60</span></div>
+                    </div>
+                    <div class="scenes" data-fill="scenes"></div>
+                  </div>
+                </div>
+              </div>
+            </main>
+          </div>
+        </div>
+      </div>
+      <div class="verdict">
+        <h3>Tabs: off by default</h3>
+        <p>Here the views of one lesson (Read, Notes, Video) are switched in the top bar, and the sidebar tree already shows where everything is. Margin notes cover the usual reason for a second tab, which is keeping notes open beside the reading. Document tabs only help when you jump between unrelated pages, like a lesson in one topic and a note from another, and they add a row of chrome to every screen.</p>
+        <p>Suggestion: ship without the tab strip and add back and forward history (⌘[ and ⌘]) plus ⌘K for recent pages. If you later miss tabs, put the strip behind a setting. Switch "Document tabs" to On above to compare.</p>
+      </div>
+    </div>
   </section>
 
   <section class="section" id="pipeline">
@@ -658,7 +794,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
   const ic = (id, cls = "i") => `<svg class="${cls}"><use href="#i-${id}"/></svg>`;
 
   /* ---------- shared content ---------- */
-  const tree = (withVideo) => `
+  const tree = (withVideo, firstGo = withVideo ? "studio" : "lesson") => `
     <ul class="tree">
       <li><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Signals &amp; Systems</span><span class="count">4</span></button>
         <ul class="tree">
@@ -666,7 +802,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
             <ul class="tree"><li><button class="row">${ic("book", "i leaf-ic")}<span class="grow">Euler's formula</span></button></li></ul></li>
           <li><button class="row" data-toggle>${ic("chev", "i chev")}<span class="grow">Fourier series</span></button>
             <ul class="tree">
-              <li><button class="row" data-go="${withVideo ? "studio" : "lesson"}" aria-current="true">${ic("book", "i leaf-ic")}<span class="grow">Why sums of sines?</span>${withVideo ? '<span class="dot ok"></span>' : ""}</button></li>
+              <li><button class="row" data-go="${firstGo}" aria-current="true">${ic("book", "i leaf-ic")}<span class="grow">Why sums of sines?</span>${withVideo ? '<span class="dot ok"></span>' : ""}</button></li>
               <li><button class="row" data-go="lesson">${ic("book", "i leaf-ic")}<span class="grow">Computing coefficients</span>${withVideo ? '<span class="dot run"></span>' : ""}</button></li>
               <li><button class="row" data-go="lesson">${ic("book", "i leaf-ic")}<span class="grow">Convergence &amp; Gibbs</span>${withVideo ? '<span class="dot"></span>' : ""}</button></li>
               <li><button class="row" data-go="notes">${ic("note", "i leaf-ic")}<span class="grow">Notes</span><span class="count">3</span></button></li>
@@ -790,7 +926,18 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
   /* ---------- fill templates ---------- */
   const fills = { lesson, notes, gen, "lesson-body": () => lessonBody(false), "studio-head": studioHead, scenes: scenesHtml };
   $$("[data-fill]").forEach((el) => { el.innerHTML = fills[el.dataset.fill](); });
-  $$("[data-tree]").forEach((el) => { el.innerHTML = tree(el.dataset.tree === "video"); });
+  $$("[data-tree]").forEach((el) => {
+    const t = el.dataset.tree;
+    el.innerHTML = t === "merged" ? tree(true, "lesson") : tree(t === "video");
+  });
+  $$("[data-margin-lesson]").forEach((el) => { el.innerHTML = lessonBody(true); });
+
+  /* document tabs on/off (option D) */
+  $$("[data-tabs-toggle]").forEach((seg) => seg.addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    $$("button", seg).forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+    seg.closest(".option").dataset.tabs = b.dataset.tabs;
+  }));
 
   /* ---------- screens per option ---------- */
   function show(opt, screen) {
@@ -815,6 +962,9 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
       const go = e.target.closest("[data-go]");
       if (go) {
         show(opt, go.dataset.go);
+        if (go.classList.contains("doc-tab")) {
+          $$(".doc-tab", root).forEach((t) => t.setAttribute("aria-selected", String(t === go)));
+        }
         if (go.classList.contains("row")) {
           $$(".sb .row[aria-current]", root).forEach((r) => r.removeAttribute("aria-current"));
           go.setAttribute("aria-current", "true");
@@ -836,9 +986,9 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
     try { localStorage.setItem("margin-opt", o); } catch (e) {}
   }
   $("#opt-tabs").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) pickOption(b.dataset.opt); });
-  const hashOpt = { "option-a": "a", "option-b": "b", "option-c": "c" }[location.hash.slice(1)];
+  const hashOpt = { "option-a": "a", "option-b": "b", "option-c": "c", "option-d": "d" }[location.hash.slice(1)];
   let saved = null; try { saved = localStorage.getItem("margin-opt"); } catch (e) {}
-  pickOption(hashOpt || saved || "a");
+  pickOption(hashOpt || saved || "d");
 
   /* ---------- theme toggle ---------- */
   const modes = ["system", "light", "dark"];
@@ -848,10 +998,23 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
     const m = modes[mode];
     if (m === "system") document.documentElement.removeAttribute("data-theme");
     else document.documentElement.setAttribute("data-theme", m);
-    $("#theme-btn span").textContent = "Theme: " + m[0].toUpperCase() + m.slice(1);
+    $("#theme-btn span").textContent = "Page: " + m[0].toUpperCase() + m.slice(1);
   }
   $("#theme-btn").addEventListener("click", () => { mode = (mode + 1) % 3; applyTheme(); try { localStorage.setItem("margin-theme", modes[mode]); } catch (e) {} });
   applyTheme();
+
+  /* ---------- app theme (inside the windows only) ---------- */
+  let appTheme = "light";
+  try { appTheme = localStorage.getItem("margin-app-theme") || "light"; } catch (e) {}
+  function applyApp(t) {
+    appTheme = t;
+    $$(".win").forEach((w) => (w.dataset.appTheme = t));
+    $$("#app-theme button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.app === t)));
+    try { localStorage.setItem("margin-app-theme", t); } catch (e) {}
+  }
+  $("#app-theme").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) applyApp(b.dataset.app); });
+  document.addEventListener("click", (e) => { if (e.target.closest("[data-app-toggle]")) applyApp(appTheme === "dark" ? "light" : "dark"); });
+  applyApp(appTheme);
 
   /* ---------- manim-style preview: Fourier epicycles drawing a square wave ---------- */
   const BLUE = "#58C4DD", YELLOW = "#F7D96F", GREY = "rgba(255,255,255,0.28)";
