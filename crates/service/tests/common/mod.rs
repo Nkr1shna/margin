@@ -276,6 +276,7 @@ impl Renderer for FakeRenderer {
                 .await
                 .unwrap();
             Ok(RenderOutput {
+                poster: None,
                 mp4,
                 storyboard,
                 captions: Some(captions),
