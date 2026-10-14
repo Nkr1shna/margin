@@ -21,8 +21,13 @@ pub const VIDEO: &str = "video";
 pub const PROPOSAL: &str = "proposal";
 pub const DEVICE: &str = "device";
 pub const SETTINGS: &str = "settings";
+pub const SOURCE: &str = "source";
+/// Embedded pieces of sources (`sources::ChunkRow`).
+pub const CHUNK: &str = "chunk";
 
-const TABLES: [&str; 7] = [TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS];
+const TABLES: [&str; 9] = [
+    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK,
+];
 
 #[derive(Clone)]
 pub struct Store {
@@ -149,6 +154,45 @@ impl Store {
             .check()?;
         Ok(())
     }
+
+    /// Deletes every record whose top-level JSON field `field` equals `value`.
+    pub async fn delete_where(
+        &self,
+        table: &'static str,
+        field: &'static str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        self.db
+            .query(format!(
+                "DELETE {table} WHERE doc.{field} = $value RETURN NONE"
+            ))
+            .bind(("value", value.to_string()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Sets the top-level JSON field `set` to `to` on every record whose field `field`
+    /// equals `value`.
+    pub async fn set_where<T: Serialize>(
+        &self,
+        table: &'static str,
+        field: &'static str,
+        value: &str,
+        set: &'static str,
+        to: &T,
+    ) -> anyhow::Result<()> {
+        let to = serde_json::to_value(to)?;
+        self.db
+            .query(format!(
+                "UPDATE {table} SET doc.{set} = $to WHERE doc.{field} = $value RETURN NONE"
+            ))
+            .bind(("value", value.to_string()))
+            .bind(("to", to))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +242,36 @@ mod tests {
         s.delete(TOPIC, "a").await.unwrap();
         assert!(s.get::<Row>(TOPIC, "a").await.unwrap().is_none());
         assert_eq!(s.list::<Row>(TOPIC).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn updates_and_deletes_by_field() {
+        let s = Store::memory().await.unwrap();
+        let row = |id: &str, parent: &str| Row {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            n: 0,
+            f: Some(0.25),
+            status: serde_json::json!(null),
+        };
+        s.put(CHUNK, "a", &row("a", "x")).await.unwrap();
+        s.put(CHUNK, "b", &row("b", "x")).await.unwrap();
+        s.put(CHUNK, "c", &row("c", "y")).await.unwrap();
+        s.set_where(CHUNK, "parent_id", "x", "status", &"moved")
+            .await
+            .unwrap();
+        let moved: Vec<Row> = s.list_where(CHUNK, "parent_id", "x").await.unwrap();
+        assert_eq!(moved.len(), 2);
+        assert!(
+            moved
+                .iter()
+                .all(|r| r.status == "moved" && r.f == Some(0.25))
+        );
+        let c: Row = s.get(CHUNK, "c").await.unwrap().unwrap();
+        assert!(c.status.is_null());
+        s.delete_where(CHUNK, "parent_id", "x").await.unwrap();
+        let left: Vec<Row> = s.list(CHUNK).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "c");
     }
 }

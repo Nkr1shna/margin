@@ -1,22 +1,23 @@
 //! Ask: outline proposals, accepting them, and lesson generation jobs.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use chrono::Utc;
 use margin_ai::LessonContext;
 use margin_shared::{
     AcceptProposal, AskRequest, Event, Id, Lesson, LessonStatus, Outline, OutlineLesson, Proposal,
-    ProposalStatus, Topic,
+    ProposalStatus, Source, Topic,
 };
 
-use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
 use crate::state::{AppState, StoredLesson, new_id};
-use crate::video;
+use crate::{db, sources, video};
 
 pub const MAX_LESSONS: usize = 12;
 /// How often a streaming lesson's partial body is saved.
@@ -32,14 +33,39 @@ fn validate_ask(req: &AskRequest) -> AppResult<()> {
     Ok(())
 }
 
+/// Every source must exist and be unattached or already in the topic the Ask is filed
+/// under. Duplicates are dropped.
+async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> {
+    let mut seen = HashSet::new();
+    req.source_ids.retain(|id| seen.insert(id.clone()));
+    for id in &req.source_ids {
+        let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unknown_source",
+                "One of the sources isn't on the service any more. Add it again.",
+            ));
+        };
+        if source.topic_id.is_some() && source.topic_id != req.parent_topic_id {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unknown_source",
+                format!("{} belongs to another topic.", source.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn ask(
     State(state): State<AppState>,
-    ApiJson(req): ApiJson<AskRequest>,
+    ApiJson(mut req): ApiJson<AskRequest>,
 ) -> AppResult<Json<Proposal>> {
     validate_ask(&req)?;
     if let Some(parent) = &req.parent_topic_id {
         library::topic(&state, parent).await?;
     }
+    check_sources(&state, &mut req).await?;
     state.ai_config().await?;
     let proposal = Proposal {
         id: new_id(),
@@ -92,9 +118,15 @@ async fn draft_outline(state: &AppState, id: &str) -> Result<Outline, String> {
     };
     let ai = state.ai_config().await.map_err(|e| e.message)?;
     let subjects = root_subjects(state).await.map_err(|e| e.to_string())?;
+    let passages = sources::passages(
+        state,
+        &proposal.request.source_ids,
+        &proposal.request.prompt,
+    )
+    .await;
     let outline = state
         .generator
-        .propose_outline(&ai, &proposal.request, &subjects)
+        .propose_outline(&ai, &proposal.request, &subjects, &passages)
         .await
         .map_err(|e| e.to_string())?;
     if outline.lessons.is_empty() {
@@ -250,6 +282,10 @@ pub async fn accept(
             events.push(Event::LessonChanged { lesson: row.lesson });
         }
 
+        // The Ask's sources now belong to the new topic.
+        events
+            .extend(sources::attach_locked(&state, &proposal.request.source_ids, &topic.id).await?);
+
         proposal.outline = Some(outline);
         proposal.status = ProposalStatus::Accepted {
             topic_id: topic.id.clone(),
@@ -361,17 +397,34 @@ async fn lesson_context(
         .iter()
         .position(|s| s.lesson.id == row.lesson.id)
         .unwrap_or(0);
+    let prompt = proposal
+        .as_ref()
+        .map(|p| p.request.prompt.clone())
+        .unwrap_or_else(|| row.lesson.title.clone());
+
+    // The passages most relevant to this lesson, from its topic's sources.
+    let asked = proposal
+        .as_ref()
+        .map(|p| p.request.source_ids.clone())
+        .unwrap_or_default();
+    let source_ids = sources::for_lesson(state, &row.lesson.topic_id, &asked).await?;
+    let query = format!(
+        "{}\n{}\n{}",
+        row.lesson.title,
+        row.lesson.summary,
+        prompt.trim()
+    );
+    let passages = sources::passages(state, &source_ids, &query).await;
+
     let ctx = LessonContext {
         subject_title,
         topic_title,
-        prompt: proposal
-            .as_ref()
-            .map(|p| p.request.prompt.clone())
-            .unwrap_or_else(|| row.lesson.title.clone()),
+        prompt,
         level: row.lesson.level,
         with_quiz: proposal.as_ref().is_some_and(|p| p.request.with_quiz),
         outline,
         index,
+        passages,
     };
     Ok((ctx, proposal))
 }

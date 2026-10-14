@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
-use margin_shared::{Event, Id, Lesson, Proposal, Settings, Topic, Video, VideoMedia, VideoStatus};
+use margin_embed::{Embedder, ModelFiles};
+use margin_shared::{
+    Event, Id, Lesson, Proposal, Settings, Source, Topic, Video, VideoMedia, VideoStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
@@ -16,7 +19,8 @@ use tokio::task::AbortHandle;
 use crate::auth::{Login, RateLimiter};
 use crate::config::Config;
 use crate::db::{self, Store};
-use crate::engines::{AiConfig, Generator, Renderer};
+use crate::embedding::ModelJob;
+use crate::engines::{AiConfig, Generator, Renderer, SourceTools};
 use crate::error::{AppError, AppResult};
 use crate::secrets::{OPENAI_API_KEY, SecretStore};
 
@@ -129,6 +133,20 @@ pub struct App {
     pub video_queue: mpsc::UnboundedSender<Id>,
     /// The video currently rendering, so deleting it can stop the render.
     pub render_job: Mutex<Option<(Id, AbortHandle)>>,
+    pub source_tools: Arc<dyn SourceTools>,
+    /// Hugging Face base URL the embedding model is downloaded from.
+    pub hf_base: String,
+    /// For model downloads: no overall time limit, only for stalls.
+    pub download_http: reqwest::Client,
+    pub model_files: ModelFiles,
+    /// The embedding model, loaded on first use once downloaded.
+    pub embedder: tokio::sync::Mutex<Option<Arc<dyn Embedder>>>,
+    /// A download in progress or the last one's failure (on-disk state is checked live).
+    pub model_job: Mutex<ModelJob>,
+    /// Bytes a download fetches, once Hugging Face has told us.
+    pub model_download_bytes: Mutex<Option<u64>>,
+    /// Sources to read, one at a time.
+    pub source_queue: mpsc::UnboundedSender<Id>,
 }
 
 impl App {
@@ -161,8 +179,19 @@ impl App {
         });
     }
 
+    pub fn emit_source(&self, source: &Source) {
+        self.emit(Event::SourceChanged {
+            source: source.clone(),
+        });
+    }
+
     pub fn video_dir(&self, video_id: &str) -> PathBuf {
         self.config.videos_dir().join(video_id)
+    }
+
+    /// The folder holding an uploaded source's `file`.
+    pub fn source_dir(&self, source_id: &str) -> PathBuf {
+        self.config.sources_dir().join(source_id)
     }
 
     // -- media signing -----------------------------------------------------

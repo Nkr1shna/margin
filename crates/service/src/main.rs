@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use margin_service::config::{self, Config};
 use margin_service::db::Store;
-use margin_service::engines::{AiGenerator, VideoRenderer};
+use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::secrets::KeychainStore;
 use margin_service::server::{Options, Service, shutdown_signal};
 
@@ -91,6 +91,8 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             secrets: Arc::new(KeychainStore),
             generator: Arc::new(AiGenerator),
             renderer: Arc::new(VideoRenderer),
+            source_tools: Arc::new(EmbedTools),
+            hf_base: margin_embed::HF_BASE.into(),
             allow_unsandboxed_render,
         })
         .await?;

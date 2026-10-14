@@ -148,6 +148,16 @@ impl Config {
     pub fn videos_dir(&self) -> PathBuf {
         self.data_dir.join("videos")
     }
+
+    /// Uploaded sources, each as `{id}/file`.
+    pub fn sources_dir(&self) -> PathBuf {
+        self.data_dir.join("sources")
+    }
+
+    /// The downloaded embedding model.
+    pub fn embedding_model_dir(&self) -> PathBuf {
+        self.data_dir.join("models").join("embeddinggemma-2")
+    }
 }
 
 /// `margin-service setup`: asks for the public URL, the GitHub OAuth app's client id and

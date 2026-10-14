@@ -1,4 +1,5 @@
-//! Topics, lessons and notes: the library and its edits, with cascading deletes.
+//! Topics, lessons and notes: the library and its edits, with cascading deletes (a
+//! topic takes its sources with it).
 
 use std::collections::{HashMap, HashSet};
 
@@ -8,12 +9,12 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use margin_shared::{
     Event, Id, Lesson, LessonPatch, LessonStatus, Library, NewNote, NewTopic, Note, NotePatch,
-    Topic, TopicPatch,
+    Source, Topic, TopicPatch,
 };
 
-use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::state::{AppState, StoredLesson, StoredVideo, new_id};
+use crate::{db, sources};
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -133,12 +134,14 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
     let mut videos: Vec<StoredVideo> = state.store.list(db::VIDEO).await?;
     videos.sort_by_key(|v| v.video.created_at);
     let videos = videos.iter().map(|v| state.public_video(v)).collect();
+    let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+    sources.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     Ok(Json(Library {
         topics,
         lessons,
         notes,
         videos,
-        sources: Vec::new(),
+        sources,
     }))
 }
 
@@ -254,6 +257,14 @@ pub async fn delete_topic(
         {
             state.store.delete(db::NOTE, &n.id).await?;
             events.push(Event::NoteDeleted { id: n.id.clone() });
+        }
+        let sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+        for s in sources.iter().filter(|s| {
+            s.topic_id
+                .as_deref()
+                .is_some_and(|t| doomed_set.contains(t))
+        }) {
+            events.push(sources::delete_locked(&state, &s.id).await?);
         }
         // Children before parents.
         for t in doomed.iter().rev() {

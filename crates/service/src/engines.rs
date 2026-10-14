@@ -1,11 +1,14 @@
-//! The service's seams to `margin-ai` and `margin-video`. Jobs call these traits; the
-//! production implementations forward to the crates, and tests plug in fakes.
+//! The service's seams to `margin-ai`, `margin-video` and `margin-embed`. Jobs call these
+//! traits; the production implementations forward to the crates, and tests plug in fakes.
 
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use margin_ai::{AiError, LessonContext, ResponsesClient, SceneRequest};
-use margin_shared::{AskRequest, Outline, ToolStatus};
+use margin_ai::{AiError, LessonContext, Passage, ResponsesClient, SceneRequest};
+use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles};
+use margin_shared::{AskRequest, Outline, SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -34,6 +37,7 @@ pub trait Generator: Send + Sync + 'static {
         ai: &'a AiConfig,
         req: &'a AskRequest,
         existing_subjects: &'a [String],
+        passages: &'a [Passage],
     ) -> BoxFuture<'a, Result<Outline, AiError>>;
 
     fn write_lesson<'a>(
@@ -74,10 +78,11 @@ impl Generator for AiGenerator {
         ai: &'a AiConfig,
         req: &'a AskRequest,
         existing_subjects: &'a [String],
+        passages: &'a [Passage],
     ) -> BoxFuture<'a, Result<Outline, AiError>> {
-        Box::pin(
-            async move { margin_ai::propose_outline(&client(ai), req, existing_subjects).await },
-        )
+        Box::pin(async move {
+            margin_ai::propose_outline(&client(ai), req, existing_subjects, passages).await
+        })
     }
 
     fn write_lesson<'a>(
@@ -113,5 +118,122 @@ impl Renderer for VideoRenderer {
         on_progress: Box<dyn FnMut(RenderProgress) + Send + 'a>,
     ) -> BoxFuture<'a, Result<RenderOutput, RenderError>> {
         Box::pin(margin_video::render(job, config, on_progress))
+    }
+}
+
+/// The service's seam to `margin-embed`: the embedding model's files, loading it, and
+/// reading, cutting and ranking sources. `EmbedTools` forwards to the crate; tests plug
+/// in fakes (with a fake Hugging Face server).
+pub trait SourceTools: Send + Sync + 'static {
+    /// Whether a finished download is in `files`.
+    fn is_complete(&self, files: &ModelFiles) -> bool;
+    /// Bytes the downloaded model takes on disk.
+    fn size_on_disk(&self, files: &ModelFiles) -> u64;
+    /// Bytes a download would fetch.
+    fn remote_size<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>>;
+    /// Downloads the model into `files`, calling `progress(received, total)`.
+    fn download<'a>(
+        &'a self,
+        files: &'a ModelFiles,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>>;
+    /// Deletes the downloaded model.
+    fn remove(&self, files: &ModelFiles) -> Result<(), EmbedError>;
+    /// Loads the downloaded model. Blocking.
+    fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError>;
+    /// A source file's text. Blocking.
+    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError>;
+    /// Cuts extracted text into chunks of at most `max_tokens`.
+    fn chunk(
+        &self,
+        doc: &Extracted,
+        kind: SourceKind,
+        count_tokens: &dyn Fn(&str) -> usize,
+        max_tokens: usize,
+    ) -> Vec<Chunk>;
+    /// How well a chunk matches a query; higher is better.
+    fn score(
+        &self,
+        query_vec: &[f32],
+        query_text: &str,
+        chunk_vec: &[f32],
+        chunk_text: &str,
+    ) -> f32;
+}
+
+/// `margin_embed`: EmbeddingGemma 2 on Core ML, PDFKit + Vision OCR.
+pub struct EmbedTools;
+
+impl SourceTools for EmbedTools {
+    fn is_complete(&self, files: &ModelFiles) -> bool {
+        files.is_complete()
+    }
+
+    fn size_on_disk(&self, files: &ModelFiles) -> u64 {
+        files.size_on_disk()
+    }
+
+    fn remote_size<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+        Box::pin(ModelFiles::remote_size(http, hf_base))
+    }
+
+    fn download<'a>(
+        &'a self,
+        files: &'a ModelFiles,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>> {
+        Box::pin(files.download(http, hf_base, progress))
+    }
+
+    fn remove(&self, files: &ModelFiles) -> Result<(), EmbedError> {
+        files.remove()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
+        Ok(Arc::new(margin_embed::CoreMlEmbedder::load(files)?))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn load(&self, _files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
+        Err(EmbedError::Load(
+            "the embedding model runs on Core ML, which needs macOS".into(),
+        ))
+    }
+
+    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
+        margin_embed::extract(path, kind)
+    }
+
+    fn chunk(
+        &self,
+        doc: &Extracted,
+        kind: SourceKind,
+        count_tokens: &dyn Fn(&str) -> usize,
+        max_tokens: usize,
+    ) -> Vec<Chunk> {
+        margin_embed::chunk(doc, kind, count_tokens, max_tokens)
+    }
+
+    fn score(
+        &self,
+        query_vec: &[f32],
+        query_text: &str,
+        chunk_vec: &[f32],
+        chunk_text: &str,
+    ) -> f32 {
+        margin_embed::score(query_vec, query_text, chunk_vec, chunk_text)
     }
 }
