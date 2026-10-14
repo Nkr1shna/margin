@@ -15,7 +15,8 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 | `docs/agent-providers-brief.md` | **Switchable model providers brief (OpenAI key / ChatGPT sign-in / Claude API)**; see the status below |
 | `docs/agent-engine-review.md` | Fable's review of the ACP/CLI-engine idea. Background only, superseded by the providers decision |
 | `docs/service-setup.md` | How the service and Cloudflare Tunnel run |
-| `docs/plan-dogfood.md` | **D (dogfood)**: Margin as the knowledge base for building Margin. `crates/mcp` (`margin-mcp serve/login/ingest/ingest-dir/purge`), `.mcp.json`, `/margin-handoff`, `scripts/{backup-margin,ingest-docs}.sh`; live once R1-store and R1-retrieve merge |
+| `docs/plan-dogfood.md` | **D (dogfood)**: Margin as the knowledge base for building Margin. `crates/mcp` (`margin-mcp serve/login/ingest/ingest-dir/purge`), `.mcp.json`, `/margin-handoff`, the automatic `SessionEnd` summary, `scripts/{backup-margin,ingest-docs,claude-session-summary}.sh`; merged with R1 (live once the owner installs the service and runs `margin-mcp login`) |
+| `docs/agent-rag-architecture.md` | **R1** (RAG pipeline): target architecture, eval suite, build brief §6; §2.2 lists the SurrealDB 3.3.4 deviations the build found |
 
 ## Status
 
@@ -23,7 +24,11 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 - **Phase 2:** merged, reviewed and fixed (34021c9).
 - **Phase 3** (job tools, Stop awaiting writes, Retry-After waiting, model titles, app-control tools, chat attachments, mobile reconnect): merged, reviewed, 6 findings fixed (a615637). 527 tests at integration. Clippy is clean, and the desktop and iOS-sim builds pass.
 - The chat thinking-block overflow fix is merged (420bc16).
-- **Phase 4** (attached folders on desktop, iOS and Android): brief written, not built.
+- **R1 (RAG pipeline) + phase 4 app areas + D (dogfood)**: integrated on `claude/agent-build` (2026-10-14). Merged `agent/r1-{embed,store,retrieve,ai,trace,evals}`, `agent/p4-{core,desktop,ios,android}`, `agent/d-mcp`; the integration commits wire the areas together (see their messages) and add `crates/service/tests/r1_e2e.rs` (§6.4 e2e 1–6). `cargo test --workspace` green twice, clippy and fmt clean, iOS-sim check and `dx build` for Android and desktop pass. 779 tests pass, 1 ignored (the CI eval gate, e2e 7, waiting on the recordings).
+  - **Waiting on the owner (by hand, on the service Mac):** `margin-eval record-embeddings`, `record-generations` and `run --suite retrieval --variant baseline --write-baseline`, committed; then un-ignore `crates/evals/tests/gates.rs` (e2e 7). Back up the data folder before installing (the one-pass `passages-v1` migration runs at first start; `scripts/backup-margin.sh`). A real course from a real PDF with traces visible through `GET /api/traces`. Then `cargo install --path crates/mcp`, `margin-mcp login`, `margin-mcp ingest-dir docs PLAN.md`.
+  - **Every Claude Code session's summary now goes to Margin automatically** (owner decision): the `SessionEnd` hook in `.claude/settings.json` (`scripts/claude-session-summary.sh`, fails quietly without `margin-mcp`, a sign-in or the service).
+  - **Not done here, with reasons:** phase 4's service side (4-S: folder files as sources, the sync route, `FolderIndex`) and 4-agent are still to build, rebriefed on R1's `ingest`/`Retriever` (§6.6), and with them D13's service e2e 1–7; R1-app (Settings pipeline/model slots, Passages locators) waits for nothing now and can start; `ModelInfo.context_window` comes with providers (retrieval keeps its window table until then); `view_picture` pixels need `ToolOutput.images` (4-agent); the iOS folder picker and the macOS/iOS/Android manual runs of D13 need the owner's hands-on run; the Linux desktop target isn't checked (no cross toolchain here).
+- **Phase 4** (attached folders on desktop, iOS and Android): app areas built and integrated (above); 4-S and 4-agent not built.
 - **Providers** (owner decision 2026-10-14): Fable's brief is written in `docs/agent-providers-brief.md`, not built.
   - **Shape:**
     - Two traits in `crates/ai/src/model.rs`: `TextModel` and `Provider`. `ResponsesClient` and a new `ClaudeClient` implement both.
@@ -73,7 +78,7 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 
 ## Next steps
 
-1. Confirm the reworked phase 4 brief's remaining owner items. Then run the phase 4 workflow from `docs/agent-phase4-brief.md` (first commit, then areas 4-S, 4-core, 4a desktop, 4b iOS and 4c Android).
+1. Review the R1 + phase 4 integration (two reviewers on the §6.5 and phase 4 lenses, then a fixer). Then build 4-S and 4-agent, rebriefed on R1's `ingest`/`Retriever` (`docs/agent-rag-architecture.md` §6.6), and R1-app; their integrator rewrites D13's service e2e for the ingest path.
 2. In parallel, run the SIWC spike (`docs/agent-providers-brief.md` D11). The owner runs it by hand.
 3. Get the answers to Providers Q1–Q3. Have Fable re-check its brief against phase 4 as merged, then run the providers workflow.
 4. Phase 5: have Fable write the brief, then build it.
@@ -108,7 +113,7 @@ The reusable script is `margin-agent-phase` (args: phase, base, extra, first, ar
 - Android: `ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724`, `JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`. Android has never been built for the agent; phase 4c must run `dx build -p margin-app --platform android`.
 - Release app: `dx bundle -p margin-app --platform desktop --package-types macos --release`, then `codesign --force --deep --sign -`.
 - Every new service binary path triggers a macOS Keychain "Always Allow" prompt for media-signing-key. The owner has to click it.
-- Known flaky test: `sources::unsupported_oversized_and_misfiled_uploads_are_rejected`. The service closes the connection before the oversized upload finishes. Needs fixing.
+- Fixed: `sources::unsupported_oversized_and_misfiled_uploads_are_rejected` was flaky because the service answered 413 while the client was still sending; refused bodies are now drained (bounded) before the answer.
 
 ## Owner's current test install
 
