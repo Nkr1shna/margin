@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,7 +42,13 @@ pub struct FakeState {
     pub simulate: bool,
     pub public_url: String,
     pub media_dir: Option<std::path::PathBuf>,
+    pub embedding: EmbeddingModelState,
 }
+
+/// Hugging Face repo of the embedding model, as the service reports it.
+pub const EMBEDDING_REPO: &str = "FluidInference/embeddinggemma-2-coreml";
+/// What the fake says the model download weighs.
+pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 640_000_000;
 
 #[derive(Clone)]
 pub struct Fake {
@@ -194,7 +201,46 @@ pub fn sample_library() -> Library {
             created_at: ts(0),
             updated_at: ts(0),
         }],
-        sources: vec![],
+        sources: vec![
+            Source {
+                id: "s1".into(),
+                topic_id: Some("fourier".into()),
+                name: "Oppenheim ch3.pdf".into(),
+                folder: None,
+                kind: SourceKind::Pdf,
+                bytes: 2_400_000,
+                status: SourceStatus::Ready {
+                    chunks: 48,
+                    pages: Some(32),
+                },
+                created_at: ts(30),
+            },
+            Source {
+                id: "s2".into(),
+                topic_id: Some("fourier".into()),
+                name: "notes/gibbs.md".into(),
+                folder: Some("fourier-notes".into()),
+                kind: SourceKind::Text,
+                bytes: 5_200,
+                status: SourceStatus::Ready {
+                    chunks: 3,
+                    pages: None,
+                },
+                created_at: ts(31),
+            },
+            Source {
+                id: "s3".into(),
+                topic_id: Some("fourier".into()),
+                name: "plot_series.py".into(),
+                folder: Some("fourier-notes".into()),
+                kind: SourceKind::Code,
+                bytes: 1_900,
+                status: SourceStatus::Failed {
+                    error: "The file isn't valid UTF-8 text.".into(),
+                },
+                created_at: ts(32),
+            },
+        ],
     }
 }
 
@@ -243,6 +289,16 @@ impl FakeState {
             simulate: false,
             public_url: String::new(),
             media_dir: None,
+            embedding: EmbeddingModelState::NotDownloaded {
+                download_bytes: EMBEDDING_DOWNLOAD_BYTES,
+            },
+        }
+    }
+
+    fn embedding_model(&self) -> EmbeddingModel {
+        EmbeddingModel {
+            repo: EMBEDDING_REPO.into(),
+            state: self.embedding.clone(),
         }
     }
 
@@ -324,6 +380,13 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/tools", get(tools))
         .route("/api/devices", get(devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
+        .route(
+            "/api/sources",
+            post(upload_source).layer(DefaultBodyLimit::max(routes::MAX_SOURCE_BYTES as usize)),
+        )
+        .route("/api/sources/{id}", axum::routing::delete(delete_source))
+        .route("/api/embedding", get(get_embedding).delete(delete_embedding))
+        .route("/api/embedding/download", post(download_embedding))
         .route("/api/events", get(events))
         .route("/media/videos/{id}/{file}", get(media))
         .with_state(fake)
@@ -545,6 +608,9 @@ async fn delete_topic(
         }
         s.library.lessons.retain(|l| l.topic_id != id);
         s.library.notes.retain(|n| n.topic_id != id);
+        s.library
+            .sources
+            .retain(|src| src.topic_id.as_deref() != Some(&id));
     }
     publish(&fake, Event::TopicDeleted { id });
     StatusCode::NO_CONTENT.into_response()
@@ -1046,6 +1112,12 @@ async fn accept(
             s.library.lessons.push(lesson.clone());
             created.push(lesson);
         }
+        // The proposal's sources now belong to the new topic.
+        for src in s.library.sources.iter_mut() {
+            if src.topic_id.is_none() && p.request.source_ids.contains(&src.id) {
+                src.topic_id = Some(topic.id.clone());
+            }
+        }
         let proposal = {
             let p = s.proposals.get_mut(&id).unwrap();
             p.status = ProposalStatus::Accepted {
@@ -1067,6 +1139,18 @@ async fn accept(
                 lesson: lesson.clone(),
             },
         );
+    }
+    let attached: Vec<Source> = {
+        let s = fake.state.lock().unwrap();
+        s.library
+            .sources
+            .iter()
+            .filter(|src| src.topic_id.as_deref() == Some(topic.id.as_str()))
+            .cloned()
+            .collect()
+    };
+    for source in attached {
+        publish(&fake, Event::SourceChanged { source });
     }
     publish(&fake, Event::ProposalChanged { proposal });
     if simulate {
@@ -1258,6 +1342,216 @@ async fn revoke_device(
         return not_found();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct UploadQuery {
+    name: String,
+    folder: Option<String>,
+    topic_id: Option<String>,
+}
+
+async fn upload_source(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Query(query): Query<UploadQuery>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let Some(kind) = SourceKind::for_name(&query.name) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_source",
+            "Margin can't read this kind of file.",
+        );
+    };
+    let (source, process) = {
+        let mut s = fake.state.lock().unwrap();
+        if let Some(topic_id) = &query.topic_id
+            && !s.library.topics.iter().any(|t| &t.id == topic_id)
+        {
+            return not_found();
+        }
+        let source = Source {
+            id: s.id("source"),
+            topic_id: query.topic_id,
+            name: query.name,
+            folder: query.folder,
+            kind,
+            bytes: body.len() as u64,
+            status: SourceStatus::Queued,
+            created_at: Utc::now(),
+        };
+        s.library.sources.push(source.clone());
+        let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
+        (source, s.simulate && ready)
+    };
+    publish(
+        &fake,
+        Event::SourceChanged {
+            source: source.clone(),
+        },
+    );
+    if process {
+        tokio::spawn(simulate_source(fake.clone(), source.id.clone()));
+    }
+    Json(source).into_response()
+}
+
+/// Read and embed a source over a couple of seconds, a chunk at a time.
+async fn simulate_source(fake: Fake, id: Id) {
+    let set = |status: SourceStatus| {
+        let mut s = fake.state.lock().unwrap();
+        let src = s.library.sources.iter_mut().find(|src| src.id == id)?;
+        src.status = status;
+        Some(src.clone())
+    };
+    let total = 4;
+    for done in 0..=total {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        match set(SourceStatus::Processing { done, total }) {
+            Some(source) => publish(&fake, Event::SourceChanged { source }),
+            None => return,
+        }
+    }
+    let pdf = fake
+        .state
+        .lock()
+        .unwrap()
+        .library
+        .sources
+        .iter()
+        .any(|src| src.id == id && src.kind == SourceKind::Pdf);
+    let status = SourceStatus::Ready {
+        chunks: total,
+        pages: pdf.then_some(2),
+    };
+    if let Some(source) = set(status) {
+        publish(&fake, Event::SourceChanged { source });
+    }
+}
+
+async fn delete_source(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    {
+        let mut s = fake.state.lock().unwrap();
+        let before = s.library.sources.len();
+        s.library.sources.retain(|src| src.id != id);
+        if s.library.sources.len() == before {
+            return not_found();
+        }
+    }
+    publish(&fake, Event::SourceDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn get_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    Json(fake.state.lock().unwrap().embedding_model()).into_response()
+}
+
+fn set_embedding(fake: &Fake, state: EmbeddingModelState) -> EmbeddingModel {
+    let model = {
+        let mut s = fake.state.lock().unwrap();
+        s.embedding = state;
+        s.embedding_model()
+    };
+    publish(
+        fake,
+        Event::EmbeddingModelChanged {
+            model: model.clone(),
+        },
+    );
+    model
+}
+
+async fn download_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (current, simulate) = {
+        let s = fake.state.lock().unwrap();
+        (s.embedding_model(), s.simulate)
+    };
+    // Already downloading or downloaded: nothing to start.
+    if matches!(
+        current.state,
+        EmbeddingModelState::Downloading { .. } | EmbeddingModelState::Ready { .. }
+    ) {
+        return Json(current).into_response();
+    }
+    let model = set_embedding(
+        &fake,
+        EmbeddingModelState::Downloading {
+            received: 0,
+            total: EMBEDDING_DOWNLOAD_BYTES,
+        },
+    );
+    if simulate {
+        tokio::spawn(simulate_download(fake.clone()));
+    }
+    Json(model).into_response()
+}
+
+/// Download over ~5 s, then read the sources that were waiting for the model.
+async fn simulate_download(fake: Fake) {
+    let total = EMBEDDING_DOWNLOAD_BYTES;
+    for step in 1..=10u64 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Removed while downloading: stop.
+        let downloading = matches!(
+            fake.state.lock().unwrap().embedding,
+            EmbeddingModelState::Downloading { .. }
+        );
+        if !downloading {
+            return;
+        }
+        let state = if step == 10 {
+            EmbeddingModelState::Ready { bytes: total }
+        } else {
+            EmbeddingModelState::Downloading {
+                received: total * step / 10,
+                total,
+            }
+        };
+        set_embedding(&fake, state);
+    }
+    let waiting: Vec<Id> = fake
+        .state
+        .lock()
+        .unwrap()
+        .library
+        .sources
+        .iter()
+        .filter(|src| src.status == SourceStatus::Queued)
+        .map(|src| src.id.clone())
+        .collect();
+    for id in waiting {
+        simulate_source(fake.clone(), id).await;
+    }
+}
+
+async fn delete_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let model = set_embedding(
+        &fake,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: EMBEDDING_DOWNLOAD_BYTES,
+        },
+    );
+    Json(model).into_response()
 }
 
 async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
