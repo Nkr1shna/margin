@@ -5095,6 +5095,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "margin-embed"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "margin-shared",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "margin-service"
 version = "0.1.0"
 dependencies = [
