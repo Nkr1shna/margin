@@ -768,11 +768,19 @@ pub fn slot_help(route: Route) -> &'static str {
     }
 }
 
-/// The model a slot names now, "" for the default model. Chats run on `agent_model`;
+/// The model a slot names now, "" for the default model. Chats run on the pipeline's
+/// chat route when it names one (the service gives it precedence), else `agent_model`;
 /// writing and small tasks on the pipeline's route for them.
 pub fn slot_value(settings: &Settings, route: Route) -> String {
     match route {
-        Route::Chat => settings.agent_model.clone().unwrap_or_default(),
+        Route::Chat => settings
+            .pipeline
+            .routes
+            .chat
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| settings.agent_model.clone())
+            .unwrap_or_default(),
         Route::Write | Route::Small => settings
             .pipeline
             .routes
@@ -795,7 +803,14 @@ pub fn slots_patch(settings: &Settings, wanted: &[String; 3]) -> SettingsPatch {
         }
         let model = (!value.is_empty()).then(|| value.to_string());
         match route {
-            Route::Chat => patch.agent_model = Some(model),
+            // The slot is `agent_model`; a chat route would win over it, so it's cleared.
+            Route::Chat => {
+                patch.agent_model = Some(model);
+                if routes.chat.is_some() {
+                    routes.chat = None;
+                    routes_changed = true;
+                }
+            }
             Route::Write => {
                 routes.write = model;
                 routes_changed = true;
@@ -2660,6 +2675,22 @@ mod tests {
         let only_chat = slots_patch(&settings, &["gpt-6".into(), "".into(), "gpt-6-luna".into()]);
         assert_eq!(only_chat.agent_model, Some(Some("gpt-6".into())));
         assert_eq!(only_chat.pipeline, None);
+
+        // A chat route set elsewhere (a variant, the pipeline editor) is what chats run
+        // on: the slot shows it, and saving the slot clears it so the slot takes effect.
+        settings.pipeline.routes.chat = Some("gpt-6-terra".into());
+        assert_eq!(slot_value(&settings, Route::Chat), "gpt-6-terra");
+        let patch = slots_patch(&settings, &["gpt-7".into(), "".into(), "gpt-6-luna".into()]);
+        assert_eq!(patch.agent_model, Some(Some("gpt-7".into())));
+        let pipeline = patch.pipeline.unwrap();
+        assert_eq!(pipeline.routes.chat, None);
+        assert_eq!(pipeline.routes.small.as_deref(), Some("gpt-6-luna"));
+        // Unchanged: nothing is sent.
+        let same = slots_patch(
+            &settings,
+            &["gpt-6-terra".into(), "".into(), "gpt-6-luna".into()],
+        );
+        assert_eq!(same, SettingsPatch::default());
     }
 
     #[test]
