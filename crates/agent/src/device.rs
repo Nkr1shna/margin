@@ -1,19 +1,21 @@
-//! Device tools: folder reads and app control, run on a device over its events socket.
+//! Device tools: syncing a folder and app control, run on a device over its events
+//! socket. A folder's files are read on the service (they are sources there); the only
+//! folder call that reaches a device is `sync_folder`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use margin_shared::{
-    DeviceRef, DeviceToolCall, DeviceToolOutput, Id, LessonView, NavTarget, READ_FILE_MAX_LINES,
+    DeviceRef, DeviceToolCall, DeviceToolOutput, Id, LessonView, MAX_LISTED_ENTRIES, NavTarget,
     Workspace,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    APP_CONTROL_TIMEOUT, BoxFuture, FOLDER_TOOL_TIMEOUT, SEARCH_TEXT_TIMEOUT, Tool, ToolContext,
-    ToolKind, ToolOutput, Typed, TypedTool,
+    APP_CONTROL_TIMEOUT, BoxFuture, FOLDER_TOOL_TIMEOUT, Tool, ToolContext, ToolKind, ToolOutput,
+    Typed, TypedTool,
 };
 
 /// One device tool call for the [`DeviceBridge`].
@@ -22,8 +24,7 @@ pub struct DeviceCall {
     pub chat_id: Id,
     pub call_id: String,
     pub call: DeviceToolCall,
-    /// How long the device has (`FOLDER_TOOL_TIMEOUT`, `SEARCH_TEXT_TIMEOUT` or
-    /// `APP_CONTROL_TIMEOUT`).
+    /// How long the device has (`FOLDER_TOOL_TIMEOUT` or `APP_CONTROL_TIMEOUT`).
     pub timeout: Duration,
 }
 
@@ -75,8 +76,11 @@ impl DeviceBridge for NoDevices {
     }
 }
 
-/// The folder tools: offered only while the chat has a folder attached.
-pub const FOLDER_TOOLS: [&str; 4] = ["list_files", "find_files", "search_text", "read_file"];
+/// The folder tools: offered only while the chat has a folder attached. `list_files`
+/// and `find_files` are the service's (they read what it stores); `sync_folder` is the
+/// one device tool here. `search`, `read_passage`, `document_outline` and
+/// `view_picture` reach folders too but aren't gated: they read sources as well.
+pub const FOLDER_TOOLS: [&str; 3] = ["list_files", "find_files", "sync_folder"];
 /// The app-control tools: offered only while the device that sent the message is
 /// connected.
 pub const APP_CONTROL_TOOLS: [&str; 4] = [
@@ -91,21 +95,17 @@ pub const APP_CONTROL_TOOLS: [&str; 4] = [
 const BRIDGE_GRACE: Duration = Duration::from_secs(5);
 
 /// The device tools, all `ToolKind::Device`:
-/// - folders (phase 4, to the device that registered the workspace, which must be one
-///   of `ToolContext.workspaces`): `list_files`, `find_files`, `search_text`,
-///   `read_file`;
+/// - folders (phase 4, to the device that holds the workspace, which must be one of
+///   `ToolContext.workspaces`): `sync_folder`;
 /// - app control (phase 3, to `ToolContext.origin_device`): `navigate`,
 ///   `open_citation`, `show_passage`, `toggle_sidebar`.
 ///
 /// Offline or timed-out devices give an error output naming the device and what to do,
-/// e.g. "iPhone isn't connected to Margin right now (the app must be open to read the
-/// folder)."
+/// e.g. "MacBook Pro isn't connected to Margin right now (the app must be open to send
+/// the folder's files)."
 pub fn device_tools() -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(Typed(ListFiles)),
-        Arc::new(Typed(FindFiles)),
-        Arc::new(Typed(SearchText)),
-        Arc::new(Typed(ReadFile)),
+        Arc::new(Typed(SyncFolder)),
         Arc::new(Typed(Navigate)),
         Arc::new(Typed(OpenCitation)),
         Arc::new(Typed(ShowPassage)),
@@ -113,8 +113,10 @@ pub fn device_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-/// What the model reads for a device's answer: a compact text rendering (one entry or
-/// match per line, file text with line numbers).
+/// What the model reads for a device's answer: a compact text rendering (one entry,
+/// match or file per line, file text with line numbers). `Files`, `Matches` and
+/// `FileText` answer the old device folder calls, which no tool sends any more; they are
+/// still rendered so a stray answer reads sensibly.
 pub fn device_output_text(output: &DeviceToolOutput) -> String {
     match output {
         DeviceToolOutput::Files { entries, truncated } => {
@@ -195,11 +197,29 @@ pub fn device_output_text(output: &DeviceToolOutput) -> String {
             if files.is_empty() {
                 return "No files.".into();
             }
-            files
-                .iter()
-                .map(|f| format!("{}  ({})", f.path, size_text(f.stamp.bytes)))
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut lines = vec![match files.len() {
+                1 => "1 file:".to_string(),
+                n => format!("{n} files:"),
+            }];
+            lines.extend(files.iter().take(MAX_LISTED_ENTRIES).map(|f| {
+                let kind = serde_json::to_value(f.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let hash: String = f.stamp.sha256.chars().take(12).collect();
+                format!(
+                    "{}  ({}, {kind}, sha256 {hash})",
+                    f.path,
+                    size_text(f.stamp.bytes)
+                )
+            }));
+            if files.len() > MAX_LISTED_ENTRIES {
+                lines.push(format!(
+                    "[{} more files not listed.]",
+                    files.len() - MAX_LISTED_ENTRIES
+                ));
+            }
+            lines.join("\n")
         }
     }
 }
@@ -268,7 +288,7 @@ enum Purpose {
 fn offline_message(device: &str, purpose: Purpose) -> String {
     match purpose {
         Purpose::Folder => format!(
-            "{device} isn't connected to Margin right now (the app must be open to read the folder)."
+            "{device} isn't connected to Margin right now (the app must be open to send the folder's files)."
         ),
         Purpose::AppControl => format!(
             "{device} isn't connected to Margin right now (the app must be open to show something there)."
@@ -313,7 +333,8 @@ async fn dispatch(
     }
 }
 
-/// The attached workspace `id`, or the error the model gets.
+/// The attached workspace `id`, or the error the model gets. The service's folder tools
+/// (`list_files`, `find_files`) refuse with the same words.
 fn workspace<'a>(ctx: &'a ToolContext, id: &str) -> Result<&'a Workspace, String> {
     if let Some(ws) = ctx.workspaces.iter().find(|w| w.id == id) {
         return Ok(ws);
@@ -367,177 +388,45 @@ async fn app_call(ctx: &ToolContext, call: DeviceToolCall) -> ToolOutput {
     .await
 }
 
-fn quoted_path(path: &str) -> String {
-    if path.trim_matches(['/', '.']).is_empty() {
-        "the folder".into()
-    } else {
-        format!("“{path}”")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Folder tools
 // ---------------------------------------------------------------------------
 
-struct ListFiles;
+struct SyncFolder;
 
 #[derive(Deserialize, JsonSchema)]
-struct ListFilesArgs {
+struct SyncFolderArgs {
     /// The attached folder's workspace_id.
     workspace_id: String,
-    /// A folder inside it, relative to its root, "/"-separated; "" for the root.
-    path: String,
 }
 
-impl TypedTool for ListFiles {
-    type Args = ListFilesArgs;
-    const NAME: &'static str = "list_files";
-    const DESCRIPTION: &'static str = "List the files and folders directly inside a folder of an attached folder (not recursive). Hidden files, build folders and files that may hold secrets are never listed. Read-only.";
+impl TypedTool for SyncFolder {
+    type Args = SyncFolderArgs;
+    const NAME: &'static str = "sync_folder";
+    const DESCRIPTION: &'static str = "Ask the device holding an attached folder to send what changed in it (new, changed and deleted files). Only when the owner says the folder changed: files already sent are searchable without it, and the device syncs on its own every 15 minutes while Margin is open there.";
     const KIND: ToolKind = ToolKind::Device;
 
-    fn label(&self, args: &ListFilesArgs) -> String {
-        format!("Listing {}", quoted_path(&args.path))
+    fn label(&self, _args: &SyncFolderArgs) -> String {
+        "Syncing the folder".into()
     }
 
-    fn device(&self, ctx: &ToolContext, args: &ListFilesArgs) -> Option<DeviceRef> {
+    fn context_label(&self, ctx: &ToolContext, args: &SyncFolderArgs) -> String {
+        match workspace(ctx, &args.workspace_id) {
+            Ok(ws) => format!("Syncing “{}”", ws.name),
+            Err(_) => self.label(args),
+        }
+    }
+
+    fn device(&self, ctx: &ToolContext, args: &SyncFolderArgs) -> Option<DeviceRef> {
         workspace(ctx, &args.workspace_id)
             .ok()
             .map(workspace_device)
     }
 
-    fn run<'a>(&'a self, ctx: &'a ToolContext, args: ListFilesArgs) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: SyncFolderArgs) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
-            let call = DeviceToolCall::ListFiles {
+            let call = DeviceToolCall::SyncFolder {
                 workspace_id: args.workspace_id.clone(),
-                path: args.path,
-            };
-            folder_call(ctx, &args.workspace_id, call, FOLDER_TOOL_TIMEOUT).await
-        })
-    }
-}
-
-struct FindFiles;
-
-#[derive(Deserialize, JsonSchema)]
-struct FindFilesArgs {
-    /// The attached folder's workspace_id.
-    workspace_id: String,
-    /// Where to look, relative to the folder's root; "" for the whole folder.
-    path: String,
-    /// A glob matched against paths relative to `path`, case-insensitive: `*` within a
-    /// name, `**` across folders, `?` one character. E.g. "**/*.md".
-    pattern: String,
-}
-
-impl TypedTool for FindFiles {
-    type Args = FindFilesArgs;
-    const NAME: &'static str = "find_files";
-    const DESCRIPTION: &'static str = "Find files anywhere under a folder of an attached folder whose path matches a glob pattern. Read-only.";
-    const KIND: ToolKind = ToolKind::Device;
-
-    fn label(&self, args: &FindFilesArgs) -> String {
-        format!("Finding “{}” in {}", args.pattern, quoted_path(&args.path))
-    }
-
-    fn device(&self, ctx: &ToolContext, args: &FindFilesArgs) -> Option<DeviceRef> {
-        workspace(ctx, &args.workspace_id)
-            .ok()
-            .map(workspace_device)
-    }
-
-    fn run<'a>(&'a self, ctx: &'a ToolContext, args: FindFilesArgs) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            let call = DeviceToolCall::FindFiles {
-                workspace_id: args.workspace_id.clone(),
-                path: args.path,
-                pattern: args.pattern,
-            };
-            folder_call(ctx, &args.workspace_id, call, FOLDER_TOOL_TIMEOUT).await
-        })
-    }
-}
-
-struct SearchText;
-
-#[derive(Deserialize, JsonSchema)]
-struct SearchTextArgs {
-    /// The attached folder's workspace_id.
-    workspace_id: String,
-    /// Plain text to look for, case-insensitive (not a regular expression).
-    query: String,
-    /// Where to search, relative to the folder's root; "" for the whole folder.
-    path: String,
-    /// Only search files whose path matches this glob (e.g. "**/*.rs"); null for all
-    /// text files.
-    pattern: Option<String>,
-}
-
-impl TypedTool for SearchText {
-    type Args = SearchTextArgs;
-    const NAME: &'static str = "search_text";
-    const DESCRIPTION: &'static str = "Search the text files under a folder of an attached folder for lines containing some text. Returns path:line: text per match. Read-only.";
-    const KIND: ToolKind = ToolKind::Device;
-
-    fn label(&self, args: &SearchTextArgs) -> String {
-        format!("Searching {} for “{}”", quoted_path(&args.path), args.query)
-    }
-
-    fn device(&self, ctx: &ToolContext, args: &SearchTextArgs) -> Option<DeviceRef> {
-        workspace(ctx, &args.workspace_id)
-            .ok()
-            .map(workspace_device)
-    }
-
-    fn run<'a>(&'a self, ctx: &'a ToolContext, args: SearchTextArgs) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            let call = DeviceToolCall::SearchText {
-                workspace_id: args.workspace_id.clone(),
-                path: args.path,
-                query: args.query,
-                pattern: args.pattern,
-            };
-            folder_call(ctx, &args.workspace_id, call, SEARCH_TEXT_TIMEOUT).await
-        })
-    }
-}
-
-struct ReadFile;
-
-#[derive(Deserialize, JsonSchema)]
-struct ReadFileArgs {
-    /// The attached folder's workspace_id.
-    workspace_id: String,
-    /// The file, relative to the folder's root.
-    path: String,
-    /// First line to read, from 1.
-    start_line: u32,
-    /// How many lines, at most 400.
-    max_lines: u32,
-}
-
-impl TypedTool for ReadFile {
-    type Args = ReadFileArgs;
-    const NAME: &'static str = "read_file";
-    const DESCRIPTION: &'static str = "Read lines of a text file in an attached folder, numbered. At most 400 lines (64 KB) per call; read long files in parts. Read-only.";
-    const KIND: ToolKind = ToolKind::Device;
-
-    fn label(&self, args: &ReadFileArgs) -> String {
-        format!("Reading “{}”", args.path)
-    }
-
-    fn device(&self, ctx: &ToolContext, args: &ReadFileArgs) -> Option<DeviceRef> {
-        workspace(ctx, &args.workspace_id)
-            .ok()
-            .map(workspace_device)
-    }
-
-    fn run<'a>(&'a self, ctx: &'a ToolContext, args: ReadFileArgs) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            let call = DeviceToolCall::ReadFile {
-                workspace_id: args.workspace_id.clone(),
-                path: args.path,
-                start_line: args.start_line.max(1),
-                max_lines: args.max_lines.clamp(1, READ_FILE_MAX_LINES),
             };
             folder_call(ctx, &args.workspace_id, call, FOLDER_TOOL_TIMEOUT).await
         })
@@ -767,7 +656,7 @@ mod tests {
     use super::*;
     use crate::check_strict_schema;
     use chrono::{DateTime, Utc};
-    use margin_shared::{FileEntry, Platform, TextMatch};
+    use margin_shared::{FileEntry, FileStamp, FolderFileType, ManifestFile, Platform};
     use serde_json::{Value, json};
     use std::sync::Mutex;
 
@@ -828,11 +717,11 @@ mod tests {
             },
             workspaces: vec![Workspace {
                 id: "w1".into(),
-                name: "margin".into(),
+                name: "notes".into(),
                 device_id: "mac".into(),
                 device_name: "MacBook Pro".into(),
                 platform: Platform::Macos,
-                location: "~/Developer/margin".into(),
+                location: "~/notes".into(),
                 created_at: at(),
                 sync: Default::default(),
             }],
@@ -857,7 +746,17 @@ mod tests {
     #[test]
     fn every_device_tool_has_a_strict_schema() {
         let tools = device_tools();
-        assert_eq!(tools.len(), 8);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "sync_folder",
+                "navigate",
+                "open_citation",
+                "show_passage",
+                "toggle_sidebar"
+            ]
+        );
         for t in &tools {
             assert_eq!(t.kind(), ToolKind::Device);
             check_strict_schema(&t.parameters())
@@ -868,73 +767,61 @@ mod tests {
                 t.name()
             );
         }
+        // Folders are read on the service: `sync_folder` is the only device folder tool.
+        let folder: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| FOLDER_TOOLS.contains(n))
+            .collect();
+        assert_eq!(folder, ["sync_folder"]);
+    }
+
+    #[test]
+    fn sync_folders_schema_is_one_workspace_id() {
+        let schema = tool("sync_folder").parameters();
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The attached folder's workspace_id."
+                    }
+                },
+                "required": ["workspace_id"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[tokio::test]
-    async fn folder_tools_go_to_the_workspace_device_with_their_deadline() {
-        let device = fake(Ok(DeviceToolOutput::Matches {
-            matches: vec![
-                TextMatch {
-                    path: "src/a.rs".into(),
-                    line: 3,
-                    text: "fn main() {}".into(),
-                    page: None,
-                },
-                TextMatch {
-                    path: "src/b.rs".into(),
-                    line: 9,
-                    text: "main();".into(),
-                    page: None,
-                },
-            ],
-            truncated: false,
+    async fn sync_folder_goes_to_the_holding_device_and_says_what_it_did() {
+        let message = "Synced “notes”: 3 files to send, 1 removed; sending now.";
+        let device = fake(Ok(DeviceToolOutput::Done {
+            message: message.into(),
         }));
         let ctx = ctx(device.clone());
-        let args = json!({"workspace_id": "w1", "query": "main", "path": "", "pattern": null});
-        let search = tool("search_text");
-        assert_eq!(search.label(&args), "Searching the folder for “main”");
-        assert_eq!(search.device(&ctx, &args).unwrap().name, "MacBook Pro");
-        let out = search.run(&ctx, args).await;
+        let args = json!({"workspace_id": "w1"});
+        let sync = tool("sync_folder");
+        assert_eq!(sync.label(&args), "Syncing the folder");
+        assert_eq!(sync.context_label(&ctx, &args), "Syncing “notes”");
+        assert_eq!(sync.device(&ctx, &args).unwrap().name, "MacBook Pro");
+        let out = sync.run(&ctx, args).await;
         assert!(out.ok);
-        assert_eq!(out.summary, "2 matches in 2 files");
-        assert_eq!(out.output, "src/a.rs:3: fn main() {}\nsrc/b.rs:9: main();");
+        assert_eq!(out.output, message);
+        assert_eq!(out.summary, message);
+        assert!(out.images.is_empty());
         let calls = device.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "mac");
-        assert_eq!(calls[0].1.timeout, SEARCH_TEXT_TIMEOUT);
+        assert_eq!(calls[0].1.timeout, FOLDER_TOOL_TIMEOUT);
         assert_eq!(calls[0].1.call_id, "call_1");
         assert_eq!(calls[0].1.chat_id, "c1");
-    }
-
-    #[tokio::test]
-    async fn read_file_clamps_its_lines() {
-        let device = fake(Ok(DeviceToolOutput::FileText {
-            path: "README.md".into(),
-            start_line: 1,
-            end_line: 2,
-            total_lines: 10,
-            text: "# Margin\nA study app.".into(),
-        }));
-        let ctx = ctx(device.clone());
-        let out = tool("read_file")
-            .run(
-                &ctx,
-                json!({"workspace_id": "w1", "path": "README.md", "start_line": 0, "max_lines": 5000}),
-            )
-            .await;
-        assert!(out.ok);
-        assert_eq!(
-            out.output,
-            "README.md, lines 1–2 of 10:\n1  # Margin\n2  A study app.\n[Lines 3–10 not shown; read on from line 3.]"
-        );
-        let calls = device.calls.lock().unwrap();
-        assert_eq!(calls[0].1.timeout, FOLDER_TOOL_TIMEOUT);
         assert_eq!(
             calls[0].1.call,
-            DeviceToolCall::ReadFile {
-                workspace_id: "w1".into(),
-                path: "README.md".into(),
-                start_line: 1,
-                max_lines: READ_FILE_MAX_LINES,
+            DeviceToolCall::SyncFolder {
+                workspace_id: "w1".into()
             }
         );
     }
@@ -948,6 +835,7 @@ mod tests {
         let args = json!({"to": {"screen": "lesson", "lesson_id": "l2", "view": "video"}});
         let nav = tool("navigate");
         assert_eq!(nav.label(&args), "Opening the lesson's video");
+        assert_eq!(nav.context_label(&ctx, &args), "Opening the lesson's video");
         assert_eq!(nav.device(&ctx, &args).unwrap().device_id, "phone");
         let out = nav.run(&ctx, args).await;
         assert!(out.ok);
@@ -969,52 +857,63 @@ mod tests {
     #[tokio::test]
     async fn offline_devices_are_named() {
         let ctx = ctx(Arc::new(NoDevices));
-        let out = tool("list_files")
-            .run(&ctx, json!({"workspace_id": "w1", "path": "src"}))
+        let out = tool("sync_folder")
+            .run(&ctx, json!({"workspace_id": "w1"}))
             .await;
         assert!(!out.ok);
         assert_eq!(
             out.summary,
-            "MacBook Pro isn't connected to Margin right now (the app must be open to read the folder)."
+            "MacBook Pro isn't connected to Margin right now (the app must be open to send the folder's files)."
         );
         let parsed: Value = serde_json::from_str(&out.output).unwrap();
         assert_eq!(parsed["error"], out.summary);
         let out = tool("toggle_sidebar")
             .run(&ctx, json!({"visible": null}))
             .await;
-        assert!(out.summary.starts_with("iPhone isn't connected"));
+        assert_eq!(
+            out.summary,
+            "iPhone isn't connected to Margin right now (the app must be open to show something there)."
+        );
     }
 
     #[tokio::test]
     async fn timeouts_and_device_errors_go_back_to_the_model() {
         let ctx_timed = ctx(fake(Err(DeviceError::TimedOut)));
-        let out = tool("find_files")
-            .run(
-                &ctx_timed,
-                json!({"workspace_id": "w1", "path": "", "pattern": "*.md"}),
-            )
+        let out = tool("sync_folder")
+            .run(&ctx_timed, json!({"workspace_id": "w1"}))
             .await;
         assert!(!out.ok);
         assert!(
             out.summary
-                .starts_with("MacBook Pro didn't answer within 60 seconds")
+                .starts_with("MacBook Pro didn't answer within 60 seconds"),
+            "{}",
+            out.summary
         );
 
         let ctx_err = ctx(fake(Err(DeviceError::Failed(
-            "Margin no longer has access to this folder; attach it again on the Mac.".into(),
+            "Margin no longer has access to the folder “notes”; attach it again on the Mac.".into(),
         ))));
-        let out = tool("list_files")
-            .run(&ctx_err, json!({"workspace_id": "w1", "path": ""}))
+        let out = tool("sync_folder")
+            .run(&ctx_err, json!({"workspace_id": "w1"}))
             .await;
+        assert!(!out.ok);
         assert_eq!(
             out.summary,
-            "Margin no longer has access to this folder; attach it again on the Mac."
+            "Margin no longer has access to the folder “notes”; attach it again on the Mac."
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_silent_bridge_still_times_out() {
         let ctx = ctx(Arc::new(SilentDevice));
+        let out = tool("sync_folder")
+            .run(&ctx, json!({"workspace_id": "w1"}))
+            .await;
+        assert!(!out.ok);
+        assert!(
+            out.summary
+                .starts_with("MacBook Pro didn't answer within 60 seconds")
+        );
         let out = tool("open_citation")
             .run(&ctx, json!({"lesson_id": "l1", "n": 2}))
             .await;
@@ -1031,25 +930,76 @@ mod tests {
             message: String::new(),
         }));
         let mut c = ctx(device.clone());
-        let out = tool("list_files")
-            .run(&c, json!({"workspace_id": "w9", "path": ""}))
-            .await;
+        let sync = tool("sync_folder");
+        let out = sync.run(&c, json!({"workspace_id": "w9"})).await;
         assert!(!out.ok);
-        assert!(out.summary.contains("“margin” (w1)"), "{}", out.summary);
+        assert_eq!(
+            out.summary,
+            "No folder attached to this chat has the workspace_id “w9”. Attached: “notes” (w1)."
+        );
+        assert_eq!(
+            sync.context_label(&c, &json!({"workspace_id": "w9"})),
+            "Syncing the folder"
+        );
+        assert!(sync.device(&c, &json!({"workspace_id": "w9"})).is_none());
         c.workspaces.clear();
-        let out = tool("list_files")
-            .run(&c, json!({"workspace_id": "w1", "path": ""}))
-            .await;
-        assert!(out.summary.starts_with("No folder is attached"));
+        let out = sync.run(&c, json!({"workspace_id": "w1"})).await;
+        assert_eq!(
+            out.summary,
+            "No folder is attached to this chat. The owner can attach one with Attach folder."
+        );
         assert!(device.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn file_listings_read_compactly() {
+    fn done_and_manifest_answers_read_compactly() {
+        assert_eq!(
+            device_output_text(&DeviceToolOutput::Done {
+                message: "Synced “notes”: nothing changed.".into()
+            }),
+            "Synced “notes”: nothing changed."
+        );
+        let file = |path: &str, kind, bytes| ManifestFile {
+            path: path.into(),
+            kind,
+            stamp: FileStamp {
+                bytes,
+                modified: Some(at()),
+                sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            },
+        };
+        let manifest = DeviceToolOutput::Manifest {
+            files: vec![
+                file("intro.md", FolderFileType::Text, 120),
+                file("ch1/paper.pdf", FolderFileType::Pdf, 2_130_000),
+            ],
+        };
+        assert_eq!(
+            device_output_text(&manifest),
+            "2 files:\nintro.md  (120 B, text, sha256 9f86d081884c)\nch1/paper.pdf  (2.0 MB, pdf, sha256 9f86d081884c)"
+        );
+        assert_eq!(output_summary(&manifest), "2 files");
+        assert_eq!(
+            device_output_text(&DeviceToolOutput::Manifest { files: vec![] }),
+            "No files."
+        );
+        // Cut at MAX_LISTED_ENTRIES.
+        let many = DeviceToolOutput::Manifest {
+            files: (0..MAX_LISTED_ENTRIES + 3)
+                .map(|i| file(&format!("p{i}.png"), FolderFileType::Image, 10))
+                .collect(),
+        };
+        let text = device_output_text(&many);
+        assert_eq!(text.lines().count(), MAX_LISTED_ENTRIES + 2);
+        assert!(text.ends_with("[3 more files not listed.]"), "{text}");
+    }
+
+    #[test]
+    fn old_folder_answers_still_render() {
         let text = device_output_text(&DeviceToolOutput::Files {
             entries: vec![
                 FileEntry {
-                    path: "src".into(),
+                    path: "ch1".into(),
                     is_dir: true,
                     bytes: 0,
                     modified: None,
@@ -1062,22 +1012,14 @@ mod tests {
                     bytes: 2150,
                     modified: Some(at()),
                     binary: false,
-                    kind: None,
-                },
-                FileEntry {
-                    path: "logo.png".into(),
-                    is_dir: false,
-                    bytes: 12,
-                    modified: None,
-                    binary: true,
-                    kind: None,
+                    kind: Some(FolderFileType::Text),
                 },
             ],
             truncated: true,
         });
         assert_eq!(
             text,
-            "src/\nREADME.md  (2.1 KB, modified 2025-10-09)\nlogo.png  (12 B, not readable as text)\n[More than 3 entries; only these are listed. Narrow the path or the pattern.]"
+            "ch1/\nREADME.md  (2.1 KB, modified 2025-10-09)\n[More than 2 entries; only these are listed. Narrow the path or the pattern.]"
         );
         assert_eq!(
             device_output_text(&DeviceToolOutput::Matches {

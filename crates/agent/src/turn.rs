@@ -17,13 +17,16 @@ use margin_shared::{
 use serde_json::{Value, json};
 
 use crate::device::{APP_CONTROL_TOOLS, FOLDER_TOOLS};
-use crate::replay::{compaction_start, condensed_history_input, item_type};
+use crate::replay::{
+    PICTURE_REMOVED, compaction_start, condensed_history_input, item_type, tool_pictures_call_id,
+};
 use crate::tool::{floor_char_boundary, generic_label};
 use crate::{
     COMPACT_THRESHOLD_TOKENS, ConfirmationPrompt, DeviceBridge, ItemRecord, MAX_STEPS,
     MODEL_RETRIES, ModelClient, RETRY_BASE_DELAY, RETRY_MAX_DELAY, SinkError,
     TOOL_OUTPUT_MAX_BYTES, TURN_OUTPUT_MAX_BYTES, ToolContext, ToolKind, ToolOutput, ToolRegistry,
-    TurnSink, action_input, error_output, function_call_output, system_prompt, truncate_output,
+    TurnSink, action_input, error_output, function_call_output, system_prompt, tool_pictures_input,
+    truncate_output,
 };
 
 /// What a turn runs with.
@@ -820,7 +823,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 } else {
                     None
                 };
-                (tool.label(&args), device)
+                (tool.context_label(&self.context(&call_id), &args), device)
             }
             None => (generic_label(&name), None),
         };
@@ -931,13 +934,20 @@ impl<'t, 'a> Turn<'t, 'a> {
             ran.insert(i, result?);
         }
         let mut outputs = Vec::with_capacity(calls.len());
+        let mut pictures = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             let out = match ran.remove(&i) {
                 Some(out) => out,
                 None => self.execute(call).await?,
             };
-            outputs.push(self.record(call, out).await?);
+            let (output, picture) = self.record(call, out).await?;
+            outputs.push(output);
+            pictures.extend(picture);
         }
+        // Each picture message is stored with its call's output, but sent after all of
+        // the step's outputs: no input comes between a step's calls and their outputs,
+        // and replay (which defers input messages the same way) gives the same order.
+        outputs.extend(pictures);
         Ok(outputs)
     }
 
@@ -951,6 +961,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 output,
                 summary: "Already answered".into(),
                 cards: Vec::new(),
+                images: Vec::new(),
             });
         }
         let Some(tool) = self.deps.tools.get(&call.name) else {
@@ -973,6 +984,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 output: error_output(BUDGET_USED),
                 summary: "Not run: the answer's tool output budget is used up".into(),
                 cards: Vec::new(),
+                images: Vec::new(),
             });
         }
         let ctx = self.context(&call.call_id);
@@ -1030,14 +1042,21 @@ impl<'t, 'a> Turn<'t, 'a> {
                     output: error_output(&format!("The owner declined: {}", prompt.title)),
                     summary: "Declined".into(),
                     cards: Vec::new(),
+                    images: Vec::new(),
                 }))
             }
         }
     }
 
     /// Stores a call's result (then marks the call done, then its cards) and returns
-    /// its `function_call_output`.
-    async fn record(&self, call: &Call, out: ToolOutput) -> Result<Value, SinkError> {
+    /// its `function_call_output`, and the message with its pictures when it has some
+    /// (stored in the same `model_items`, after the output; pictures don't count toward
+    /// the output budgets).
+    async fn record(
+        &self,
+        call: &Call,
+        out: ToolOutput,
+    ) -> Result<(Value, Option<Value>), SinkError> {
         let sink = self.sink();
         let output = truncate_output(&out.output, TOOL_OUTPUT_MAX_BYTES);
         self.output_bytes.fetch_add(output.len(), Ordering::SeqCst);
@@ -1046,6 +1065,9 @@ impl<'t, 'a> Turn<'t, 'a> {
                 .fetch_sub(TOOL_OUTPUT_MAX_BYTES, Ordering::SeqCst);
         }
         let model_item = function_call_output(&call.call_id, &output);
+        let pictures = tool_pictures_input(&call.call_id, &out.summary, &out.images);
+        let mut model_items = vec![model_item.clone()];
+        model_items.extend(pictures.clone());
         sink.add_item(
             ItemStatus::Done,
             ChatItemKind::ToolResult {
@@ -1055,7 +1077,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 output_bytes: output.len() as u64,
             },
             ItemRecord {
-                model_items: Some(vec![model_item.clone()]),
+                model_items: Some(model_items),
                 full_output: Some(output.clone()),
             },
         )
@@ -1079,7 +1101,7 @@ impl<'t, 'a> Turn<'t, 'a> {
             .unwrap()
             .entry(call.call_id.clone())
             .or_insert(output);
-        Ok(model_item)
+        Ok((model_item, pictures))
     }
 
     /// Gives each call a "Not run" result with `message`.
@@ -1091,8 +1113,9 @@ impl<'t, 'a> Turn<'t, 'a> {
                 output: error_output(message),
                 summary: "Not run".into(),
                 cards: Vec::new(),
+                images: Vec::new(),
             };
-            outputs.push(self.record(call, out).await?);
+            outputs.push(self.record(call, out).await?.0);
         }
         Ok(outputs)
     }
@@ -1273,9 +1296,13 @@ fn with_streamed_text(kind: ChatItemKind, text: String) -> ChatItemKind {
 
 /// Where the current message starts in `history`: the last user message (which carries
 /// its context), or the developer context message just before it for messages stored
-/// by older builds; 0 when there is none.
+/// by older builds; 0 when there is none. A tool call's pictures (a user message too)
+/// are part of the answer, not a message of the owner's.
 fn current_message_start(history: &[Value]) -> usize {
-    let Some(user) = history.iter().rposition(|v| v["role"] == "user") else {
+    let Some(user) = history
+        .iter()
+        .rposition(|v| v["role"] == "user" && tool_pictures_call_id(v).is_none())
+    else {
         return 0;
     };
     if user > 0
@@ -1289,7 +1316,9 @@ fn current_message_start(history: &[Value]) -> usize {
 }
 
 /// Cuts every `function_call_output` but the last `KEEP_RECENT_OUTPUTS` to
-/// `CONDENSED_OUTPUT_MAX_BYTES`. Whether any was cut.
+/// `CONDENSED_OUTPUT_MAX_BYTES`, and takes the pictures out of those calls' picture
+/// messages (each `input_image` becomes "[picture removed]"; the text part stays).
+/// Whether anything was cut.
 fn trim_old_outputs(items: &mut [Value]) -> bool {
     let outputs: Vec<usize> = items
         .iter()
@@ -1299,12 +1328,31 @@ fn trim_old_outputs(items: &mut [Value]) -> bool {
         .collect();
     let old = outputs.len().saturating_sub(KEEP_RECENT_OUTPUTS);
     let mut trimmed = false;
+    let mut old_calls: HashSet<String> = HashSet::new();
     for &i in &outputs[..old] {
+        if let Some(call_id) = items[i]["call_id"].as_str() {
+            old_calls.insert(call_id.to_string());
+        }
         let output = items[i]["output"].as_str().unwrap_or_default();
         if output.len() > CONDENSED_OUTPUT_MAX_BYTES {
             let cut = truncate_output(output, CONDENSED_OUTPUT_MAX_BYTES);
             items[i]["output"] = Value::String(cut);
             trimmed = true;
+        }
+    }
+    for item in items.iter_mut() {
+        let old = tool_pictures_call_id(item).is_some_and(|id| old_calls.contains(id));
+        if !old {
+            continue;
+        }
+        let Some(parts) = item["content"].as_array_mut() else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if part["type"] == "input_image" {
+                *part = json!({"type": "input_text", "text": PICTURE_REMOVED});
+                trimmed = true;
+            }
         }
     }
     trimmed
@@ -1342,6 +1390,16 @@ fn transcript(items: &[Value]) -> String {
                 )
             ),
             (Some("reasoning"), _) => continue,
+            _ if tool_pictures_call_id(v).is_some() => {
+                let pictures = v["content"]
+                    .as_array()
+                    .map_or(0, |parts| parts.iter().skip(1).count());
+                format!(
+                    "{} [{pictures} picture{}, not shown here]",
+                    v["content"][0]["text"].as_str().unwrap_or_default(),
+                    if pictures == 1 { "" } else { "s" }
+                )
+            }
             (Some("compaction"), _) => {
                 "(An earlier part of the chat was condensed and can't be shown here.)".into()
             }
@@ -1514,5 +1572,75 @@ mod tests {
         assert_eq!(current_message_start(&history), 1);
         assert_eq!(current_message_start(&history[2..]), 0);
         assert_eq!(current_message_start(&[]), 0);
+    }
+
+    fn picture() -> margin_ai::Image {
+        margin_ai::Image {
+            media_type: "image/jpeg".into(),
+            data: vec![0xff, 0xd8, 0xff],
+        }
+    }
+
+    #[test]
+    fn tool_pictures_are_not_the_owners_message() {
+        let pictures = tool_pictures_input("c1", "Page 3", &[picture()]).unwrap();
+        let history = vec![
+            json!({"role": "user", "content": [{"type": "input_text", "text": "Context Margin adds…"}, {"type": "input_text", "text": "look"}]}),
+            json!({"type": "function_call", "call_id": "c1"}),
+            function_call_output("c1", "page text"),
+            pictures.clone(),
+        ];
+        assert_eq!(current_message_start(&history), 0);
+        let t = transcript(&history);
+        assert!(
+            t.ends_with(
+                "Pictures from the tool call c1 (Page 3), in order. [1 picture, not shown here]"
+            ),
+            "{t}"
+        );
+        assert!(!t.contains("base64"), "{t}");
+        assert!(tool_pictures_input("c1", "x", &[]).is_none());
+    }
+
+    #[test]
+    fn condensing_takes_out_old_pictures_only() {
+        let mut items = vec![json!({"role": "user", "content": "go"})];
+        let calls = KEEP_RECENT_OUTPUTS + 2;
+        for i in 0..calls {
+            let id = format!("c{i}");
+            items.push(json!({"type": "function_call", "call_id": id}));
+            items.push(function_call_output(&id, "short"));
+            items.push(tool_pictures_input(&id, "Page", &[picture(), picture()]).unwrap());
+        }
+        assert!(trim_old_outputs(&mut items));
+        let pictures: Vec<&Value> = items
+            .iter()
+            .filter(|v| tool_pictures_call_id(v).is_some())
+            .collect();
+        for (i, p) in pictures.iter().enumerate() {
+            let parts = p["content"].as_array().unwrap();
+            assert_eq!(parts.len(), 3);
+            assert_eq!(
+                parts[0]["text"],
+                format!("Pictures from the tool call c{i} (Page), in order.")
+            );
+            if i < calls - KEEP_RECENT_OUTPUTS {
+                assert_eq!(
+                    parts[1],
+                    json!({"type": "input_text", "text": "[picture removed]"})
+                );
+                assert_eq!(parts[2], parts[1]);
+            } else {
+                assert_eq!(parts[1]["type"], "input_image");
+                assert!(
+                    parts[1]["image_url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/jpeg;base64,")
+                );
+            }
+        }
+        // Nothing left to take out.
+        assert!(!trim_old_outputs(&mut items));
     }
 }

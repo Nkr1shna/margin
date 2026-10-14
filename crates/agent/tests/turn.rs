@@ -316,6 +316,7 @@ struct FakeTool {
     barrier: Option<Arc<Barrier>>,
     delay: Duration,
     cards: Vec<Card>,
+    images: Vec<margin_ai::Image>,
 }
 
 impl FakeTool {
@@ -329,6 +330,7 @@ impl FakeTool {
             barrier: None,
             delay: Duration::ZERO,
             cards: Vec::new(),
+            images: Vec::new(),
         }
     }
 }
@@ -373,6 +375,9 @@ impl Tool for FakeTool {
             self.log.push(format!("end {}", self.name));
             let mut out = ToolOutput::ok(self.output.clone(), format!("{} done", self.name));
             out.cards = self.cards.clone();
+            for image in &self.images {
+                out = out.with_image(image.clone());
+            }
             out
         })
     }
@@ -1674,7 +1679,14 @@ async fn tool_output_never_becomes_instructions() {
 #[tokio::test]
 async fn device_tools_are_offered_only_where_they_can_work() {
     let log = Log::default();
-    let mut tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    // The service's tools as far as the gate cares: `search` reads sources and folders
+    // (never gated), `list_files`/`find_files` are its folder tools.
+    let mut tools = registry(vec![
+        FakeTool::new("list_topics", ToolKind::Read, &log),
+        FakeTool::new("search", ToolKind::Read, &log),
+        FakeTool::new("list_files", ToolKind::Read, &log),
+        FakeTool::new("find_files", ToolKind::Read, &log),
+    ]);
     for t in device_tools() {
         tools.register(t);
     }
@@ -1700,9 +1712,34 @@ async fn device_tools_are_offered_only_where_they_can_work() {
         model.requests()[0].tool_choice,
         Some(ToolChoice::AllowedTools {
             required: false,
-            names: vec!["list_topics".into()]
+            names: vec!["list_topics".into(), "search".into()]
         })
     );
+
+    // No folders, the phone online: everything but exactly the three folder tools.
+    let model = ScriptedModel::new([Scripted::Events(text_reply(&["hi"]))]);
+    let online = Arc::new(FakeDevices {
+        online: true,
+        answer: Err(DeviceError::Offline),
+        calls: Mutex::new(vec![]),
+    });
+    run(
+        &model,
+        &tools,
+        &sink,
+        online.clone(),
+        input(history.clone()),
+    )
+    .await;
+    let Some(ToolChoice::AllowedTools { names, .. }) = &model.requests()[0].tool_choice else {
+        panic!()
+    };
+    let left_out: Vec<String> = tools
+        .names()
+        .into_iter()
+        .filter(|n| !names.contains(n))
+        .collect();
+    assert_eq!(left_out, ["list_files", "find_files", "sync_folder"]);
 
     // A folder attached, the phone offline: folder tools too.
     let model = ScriptedModel::new([Scripted::Events(text_reply(&["hi"]))]);
@@ -1723,20 +1760,15 @@ async fn device_tools_are_offered_only_where_they_can_work() {
         names,
         &[
             "list_topics",
+            "search",
             "list_files",
             "find_files",
-            "search_text",
-            "read_file"
+            "sync_folder"
         ]
     );
 
     // Both: everything.
     let model = ScriptedModel::new([Scripted::Events(text_reply(&["hi"]))]);
-    let online = Arc::new(FakeDevices {
-        online: true,
-        answer: Err(DeviceError::Offline),
-        calls: Mutex::new(vec![]),
-    });
     run(&model, &tools, &sink, online, with_folder).await;
     assert_eq!(model.requests()[0].tool_choice, Some(ToolChoice::Auto));
 }
@@ -1755,8 +1787,8 @@ async fn device_calls_go_through_the_bridge() {
     let model = ScriptedModel::new([
         Scripted::Events(tool_calls_reply(&[(
             "call_1",
-            "list_files",
-            r#"{"workspace_id":"w1","path":""}"#,
+            "sync_folder",
+            r#"{"workspace_id":"w1"}"#,
         )])),
         Scripted::Events(text_reply(&["The Mac is off."])),
     ]);
@@ -1773,10 +1805,10 @@ async fn device_calls_go_through_the_bridge() {
     assert_eq!(calls[0].1.timeout, Duration::from_secs(60));
     assert!(sink.kinds().iter().any(|k| matches!(k,
         ChatItemKind::ToolCall { device: Some(d), label, .. }
-            if d.device_id == "mac" && label == "Listing the folder")));
+            if d.device_id == "mac" && label == "Syncing “margin”")));
     assert_eq!(
         outputs_of(&model.requests()[1])[0].1,
-        r#"{"error":"MacBook Pro isn't connected to Margin right now (the app must be open to read the folder)."}"#
+        r#"{"error":"MacBook Pro isn't connected to Margin right now (the app must be open to send the folder's files)."}"#
     );
 }
 
@@ -2041,5 +2073,96 @@ async fn storage_failures_end_the_turn() {
             error: "Margin couldn't save the answer: the disk is full".into(),
             retryable: true
         }
+    );
+}
+
+/// A tool answering with pictures: they follow its `function_call_output` in the same
+/// stored item, are sent after the step's outputs, don't count as output bytes, and
+/// replay byte for byte.
+#[tokio::test]
+async fn pictures_follow_their_output_and_replay_identically() {
+    let log = Log::default();
+    let jpeg = margin_ai::Image {
+        media_type: "image/jpeg".into(),
+        data: vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3],
+    };
+    let mut view = FakeTool::new("view_picture", ToolKind::Read, &log);
+    view.output = "Page 3 of notes/paper.pdf. Text in the picture: Figure 2.".into();
+    view.images = vec![jpeg.clone(), jpeg.clone()];
+    let tools = registry(vec![
+        view,
+        FakeTool::new("list_topics", ToolKind::Read, &log),
+    ]);
+    let model = ScriptedModel::new([
+        Scripted::Events(tool_calls_reply(&[
+            ("call_p", "view_picture", "{}"),
+            ("call_l", "list_topics", "{}"),
+        ])),
+        Scripted::Events(text_reply(&["Figure 2 shows it."])),
+        Scripted::Events(text_reply(&["Still."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.user_message("show me page 3");
+    let outcome = run(&model, &tools, &sink, Arc::new(NoDevices), input(history)).await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
+
+    let pictures = json!({"role": "user", "content": [
+        {"type": "input_text", "text": "Pictures from the tool call call_p (view_picture done), in order."},
+        {"type": "input_image", "image_url": jpeg.data_url(), "detail": "auto"},
+        {"type": "input_image", "image_url": jpeg.data_url(), "detail": "auto"},
+    ]});
+    assert!(
+        pictures["content"][1]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,/9j/")
+    );
+    // Stored: the output, then the pictures, in the result's model items.
+    let items = sink.items();
+    let result = items
+        .iter()
+        .find(
+            |i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == "call_p"),
+        )
+        .unwrap();
+    let output = "Page 3 of notes/paper.pdf. Text in the picture: Figure 2.";
+    assert_eq!(
+        sink.model_items(&result.id),
+        vec![
+            json!({"type": "function_call_output", "call_id": "call_p", "output": output}),
+            pictures.clone(),
+        ]
+    );
+    // Pictures aren't output bytes.
+    assert!(matches!(&result.kind,
+        ChatItemKind::ToolResult { output_bytes, .. } if *output_bytes == output.len() as u64));
+    assert_eq!(sink.full_output(&result.id).as_deref(), Some(output));
+
+    // Sent: both outputs, then the pictures.
+    let sent = &model.requests()[1].input[1..];
+    let n = sent.len();
+    assert_eq!(sent[n - 3]["call_id"], "call_p");
+    assert_eq!(sent[n - 2]["call_id"], "call_l");
+    assert_eq!(sent[n - 1], pictures);
+
+    // Replayed byte for byte, and the next turn starts from it.
+    let replay = sink.replay();
+    assert_eq!(
+        serde_json::to_string(&replay[..sent.len()]).unwrap(),
+        serde_json::to_string(sent).unwrap()
+    );
+    let mut next = replay.clone();
+    next.extend(sink.user_message("and page 4?"));
+    run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        input(next.clone()),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_string(&model.requests()[2].input[1..]).unwrap(),
+        serde_json::to_string(&next).unwrap()
     );
 }
