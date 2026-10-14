@@ -36,6 +36,9 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
     let mut confirm_delete = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut action_error = use_signal(|| None::<String>);
+    let mut confirm_regenerate = use_signal(|| false);
+    let rename_busy = use_signal(|| false);
+    let mut delete_error = use_signal(|| None::<String>);
 
     let lib = app.lib.read();
     let Some(lesson) = lib.lessons.get(&id).cloned() else {
@@ -85,6 +88,9 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
             let id = id.clone();
             async move {
                 let Some(api) = app.api() else { return };
+                if *busy.peek() {
+                    return;
+                }
                 busy.set(true);
                 action_error.set(None);
                 match api.regenerate_lesson(&id).await {
@@ -96,6 +102,9 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
         }
     };
     let regenerate_menu = regenerate.clone();
+    let regenerate_confirmed = regenerate.clone();
+    // A written lesson is replaced by the new draft, so ask first.
+    let lesson_written = lesson.status == LessonStatus::Ready;
 
     rsx! {
         TopBar { crumbs,
@@ -137,13 +146,20 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                         }
                         button {
                             role: "menuitem",
+                            disabled: *busy.read(),
                             onclick: move |_| {
                                 menu_open.set(false);
                                 let r = regenerate_menu.clone();
-                                async move { r().await }
+                                async move {
+                                    if lesson_written {
+                                        confirm_regenerate.set(true);
+                                    } else {
+                                        r().await
+                                    }
+                                }
                             },
                             Icon { name: "refresh" }
-                            "Regenerate lesson"
+                            if lesson_written { "Regenerate lesson…" } else { "Regenerate lesson" }
                         }
                         button {
                             role: "menuitem",
@@ -151,6 +167,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                             onclick: move |_| {
                                 menu_open.set(false);
                                 action_error.set(None);
+                                delete_error.set(None);
                                 confirm_delete.set(true);
                             },
                             Icon { name: "trash" }
@@ -178,7 +195,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                     renaming.set(false);
                                 } else if e.key() == Key::Enter {
                                     e.prevent_default();
-                                    save_title(app, id, rename_value.peek().clone(), renaming, action_error).await;
+                                    save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await;
                                 }
                             }
                         }
@@ -186,14 +203,20 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                 }
                 button {
                     class: "btn btn-primary btn-sm",
+                    disabled: *rename_busy.read(),
                     onclick: {
                         let id = id.clone();
                         move |_| {
                             let id = id.clone();
-                            async move { save_title(app, id, rename_value.peek().clone(), renaming, action_error).await }
+                            async move { save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await }
                         }
                     },
-                    "Save"
+                    if *rename_busy.read() {
+                        span { class: "spinner" }
+                        "Saving…"
+                    } else {
+                        "Save"
+                    }
                 }
                 button { class: "btn btn-ghost btn-sm", onclick: move |_| renaming.set(false), "Cancel" }
             }
@@ -241,12 +264,30 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                     app.lib.write().apply(Event::LessonDeleted { id });
                                     nav.replace(Route::Ask {});
                                 }
-                                Err(e) => {
-                                    confirm_delete.set(false);
-                                    action_error.set(Some(app.failure(&e)));
-                                }
+                                // Shown in the dialog, which stays open to try again.
+                                Err(e) => delete_error.set(Some(app.failure(&e))),
                             }
                             busy.set(false);
+                        }
+                    }
+                },
+                error: delete_error.read().clone(),
+            }
+        }
+        if *confirm_regenerate.read() {
+            ConfirmDialog {
+                title: "Regenerate “{lesson.title}”?",
+                message: "The lesson is written again from its outline and this text is replaced. Your notes stay, but a note anchored to a quote may no longer find it. This can't be undone.",
+                confirm_label: "Regenerate",
+                busy: *busy.read(),
+                error: action_error.read().clone(),
+                on_cancel: move |_| confirm_regenerate.set(false),
+                on_confirm: move |_| {
+                    let r = regenerate_confirmed.clone();
+                    async move {
+                        r().await;
+                        if action_error.peek().is_none() {
+                            confirm_regenerate.set(false);
                         }
                     }
                 },
@@ -261,6 +302,7 @@ async fn save_title(
     title: String,
     mut renaming: Signal<bool>,
     mut error: Signal<Option<String>>,
+    mut busy: Signal<bool>,
 ) {
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -268,11 +310,17 @@ async fn save_title(
         return;
     }
     let Some(api) = app.api() else { return };
+    if *busy.peek() {
+        return; // Enter pressed again while saving
+    }
     let patch = LessonPatch {
         title: Some(title),
         ..Default::default()
     };
-    match api.patch_lesson(&id, &patch).await {
+    busy.set(true);
+    let result = api.patch_lesson(&id, &patch).await;
+    busy.set(false);
+    match result {
         Ok(lesson) => {
             let mut lib = app.lib;
             lib.write().apply(Event::LessonChanged { lesson });
@@ -521,6 +569,9 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
             let note = note.clone();
             async move {
                 let Some(api) = app.api() else { return };
+                if *busy.peek() {
+                    return;
+                }
                 let text = body.peek().clone();
                 busy.set(true);
                 error.set(None);
@@ -593,7 +644,12 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                         class: "btn btn-primary btn-sm",
                         disabled: *busy.read(),
                         onclick: move |_| { let s = save.clone(); async move { s().await } },
-                        "Save"
+                        if *busy.read() {
+                            span { class: "spinner" }
+                            "Saving…"
+                        } else {
+                            "Save"
+                        }
                     }
                     button { class: "btn btn-ghost btn-sm", onclick: move |_| editing.set(false), "Cancel" }
                 }
@@ -687,6 +743,9 @@ pub fn NewNoteEditor(
                     return;
                 }
                 let Some(api) = app.api() else { return };
+                if *busy.peek() {
+                    return; // ⌘Enter again while saving
+                }
                 busy.set(true);
                 error.set(None);
                 let new = NewNote {
@@ -741,7 +800,7 @@ pub fn NewNoteEditor(
                 class: "btn btn-primary btn-sm",
                 disabled: *busy.read(),
                 onclick: move |_| { let s = save.clone(); async move { s().await } },
-                if *busy.read() { "Saving…" } else { "Save note" }
+                if *busy.read() { span { class: "spinner" } "Saving…" } else { "Save note" }
             }
             button { class: "btn btn-ghost btn-sm", onclick: move |_| on_done.call(()), "Cancel" }
         }
@@ -809,6 +868,7 @@ fn VideoView(lesson_id: Id) -> Element {
     let mut app = use_app();
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| None::<ApiFailure>);
+    let mut confirm_rerender = use_signal(|| false);
 
     // Keep the signed media URLs fresh: refetch the video when they are near expiry.
     let refresh_lesson = lesson_id.clone();
@@ -846,14 +906,20 @@ fn VideoView(lesson_id: Id) -> Element {
 
     let make = {
         let lesson_id = lesson_id.clone();
-        move |_| {
+        move || {
             let lesson_id = lesson_id.clone();
             async move {
                 let Some(api) = app.api() else { return };
+                if *busy.peek() {
+                    return;
+                }
                 busy.set(true);
                 error.set(None);
                 match api.make_video(&lesson_id).await {
-                    Ok(video) => app.lib.write().apply(Event::VideoChanged { video }),
+                    Ok(video) => {
+                        app.lib.write().apply(Event::VideoChanged { video });
+                        confirm_rerender.set(false);
+                    }
                     Err(e) => {
                         app.failure(&e);
                         error.set(Some(e));
@@ -863,6 +929,9 @@ fn VideoView(lesson_id: Id) -> Element {
             }
         }
     };
+    let make_confirmed = make.clone();
+    // A finished video is replaced by the new render, so ask first.
+    let video_ready = matches!(video.as_ref().map(|v| &v.status), Some(VideoStatus::Ready));
 
     let lesson_ready = lesson.status == LessonStatus::Ready;
     let make_icon: &'static str = if video.is_some() { "refresh" } else { "video" };
@@ -903,7 +972,13 @@ fn VideoView(lesson_id: Id) -> Element {
                         class: "btn btn-primary btn-sm",
                         disabled: *busy.read() || !lesson_ready,
                         title: if lesson_ready { "" } else { "The lesson must finish writing first" },
-                        onclick: make,
+                        onclick: move |_| {
+                            if video_ready {
+                                confirm_rerender.set(true);
+                            } else {
+                                spawn(make());
+                            }
+                        },
                         if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
                         Icon { name: make_icon }
                         if video.is_some() { "Re-render" } else { "Make video" }
@@ -927,6 +1002,22 @@ fn VideoView(lesson_id: Id) -> Element {
                     }
                 },
                 Some(v) => rsx! { VideoDetails { video: v } },
+            }
+        }
+        if *confirm_rerender.read() {
+            ConfirmDialog {
+                title: "Re-render the video?",
+                message: "A new scene is written and rendered from the lesson, and it replaces the current video. This can't be undone.",
+                confirm_label: "Re-render",
+                busy: *busy.read(),
+                error: error.read().as_ref().map(|e| e.message.clone()),
+                on_cancel: move |_| confirm_rerender.set(false),
+                on_confirm: move |_| {
+                    let make = make_confirmed.clone();
+                    async move {
+                        make().await;
+                    }
+                },
             }
         }
     }
