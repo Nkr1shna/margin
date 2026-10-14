@@ -136,7 +136,10 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "note" }
                     span { class: "grow", "All notes" }
-                    span { class: "count", "{note_count}" }
+                    // The count only once there is something to count.
+                    if note_count > 0 {
+                        span { class: "count", "{note_count}" }
+                    }
                 }
             }
             div { class: "sb-label",
@@ -475,7 +478,10 @@ fn TopicNode(id: Id) -> Element {
                                 },
                                 Icon { name: "note", class: "leaf-ic" }
                                 span { class: "grow", "Notes" }
-                                span { class: "count", "{note_count}" }
+                                // The count only once there is something to count.
+                    if note_count > 0 {
+                        span { class: "count", "{note_count}" }
+                    }
                             }
                         }
                     }
