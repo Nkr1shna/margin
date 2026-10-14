@@ -28,6 +28,7 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 reqwest = { workspace = true, features = ["form", "query"] }
+globset = "=0.4.18"
 futures-util.workspace = true
 axum = { version = "=0.8.9", features = ["ws"] }
 surrealdb = { version = "=3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem"] }

@@ -1,5 +1,6 @@
-//! Attached folders (table `workspace`). The service stores only what a device says
-//! about a folder it holds; reading goes through that device (`devices::DeviceHub`).
+//! Attached folders (table `workspace`). The service stores what a device says about a
+//! folder it holds; the folder's allow-listed files are synced to the service and read
+//! there as sources (`folders.rs`), never read from the device.
 
 use axum::Extension;
 use axum::Json;
@@ -10,6 +11,7 @@ use margin_shared::{Chat, Event, Id, NewWorkspace, Workspace};
 
 use crate::auth::CurrentDevice;
 use crate::chats;
+use crate::folders;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::state::{AppState, new_id};
@@ -91,9 +93,14 @@ pub async fn delete_workspace(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Deletes a workspace and detaches it from every chat (`ChatChanged` each), then emits
-/// `WorkspaceDeleted`. Call with `write_lock` held.
+/// Deletes a workspace: its files on the service (each source with its document,
+/// passages and file: `SourceDeleted` each) and their rows, detaches it from every chat
+/// (`ChatChanged` each), then emits `WorkspaceDeleted`. Lessons keep their citations.
+/// Call with `write_lock` held.
 pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
+    for event in folders::delete_files_locked(state, id).await? {
+        state.emit(event);
+    }
     let chats: Vec<Chat> = state.store.list(db::CHAT).await?;
     for mut chat in chats {
         if chat.workspace_ids.iter().any(|w| w == id) {

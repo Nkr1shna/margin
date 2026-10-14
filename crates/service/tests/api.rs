@@ -1587,6 +1587,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
             author: Default::default(),
             prompt: None,
             with_quiz: false,
+            workspace_ids: Vec::new(),
         };
     store
         .put(

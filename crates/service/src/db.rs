@@ -38,6 +38,9 @@ pub const CHAT: &str = "chat";
 pub const CHAT_ITEM: &str = "chat_item";
 /// Attached folders (`margin_shared::Workspace`).
 pub const WORKSPACE: &str = "workspace";
+/// What the service knows about each path of an attached folder
+/// (`folders::FolderFileRow`), keyed by `folders::row_key`.
+pub const FOLDER_FILE: &str = "folder_file";
 /// Corpora (`margin_shared::context::Project`), `{ doc }` like the tables above.
 pub const PROJECT: &str = "project";
 /// Indexed documents (`margin_shared::context::Document`), `{ doc }`.
@@ -64,7 +67,7 @@ const OLD_TABLES: [&str; 2] = [CHUNK, MEDIA];
 pub const TRACE_HOURLY_KEPT: &str = "trace_hourly_kept";
 pub const TRACE_DAILY_KEPT: &str = "trace_daily_kept";
 
-const TABLES: [&str; 16] = [
+const TABLES: [&str; 17] = [
     TOPIC,
     LESSON,
     NOTE,
@@ -76,6 +79,7 @@ const TABLES: [&str; 16] = [
     CHAT,
     CHAT_ITEM,
     WORKSPACE,
+    FOLDER_FILE,
     PROJECT,
     DOCUMENT,
     DOCUMENT_DELETED,
@@ -91,6 +95,8 @@ DEFINE INDEX IF NOT EXISTS document_project ON document FIELDS doc.project_id;
 DEFINE INDEX IF NOT EXISTS document_access  ON document FIELDS doc.access.*;
 DEFINE INDEX IF NOT EXISTS document_generation ON document FIELDS doc.generation;
 DEFINE INDEX IF NOT EXISTS document_deleted_generation ON document_deleted FIELDS doc.generation;
+DEFINE INDEX IF NOT EXISTS folder_file_workspace ON folder_file FIELDS doc.workspace_id;
+DEFINE INDEX IF NOT EXISTS source_workspace ON source FIELDS doc.workspace_id;
 
 DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
@@ -191,6 +197,19 @@ DEFINE TABLE OVERWRITE trace_daily TYPE NORMAL AS
     math::mean(duration_ms) AS mean_ms
   FROM trace GROUP BY kind, route, provider, model, bucket;
 "#;
+
+/// How often `Store::query_rows` retries a statement SurrealDB says can be retried.
+const CONFLICT_RETRIES: u32 = 5;
+
+/// A transaction conflict SurrealDB says can be retried.
+fn is_retryable(e: &surrealdb::Error) -> bool {
+    e.to_string().contains("can be retried")
+}
+
+/// A record that knows its own key (for `Store::put_many`).
+pub trait HasKey {
+    fn key(&self) -> String;
+}
 
 /// The most rows one `insert_many` statement writes.
 pub const INSERT_MANY_MAX: usize = 64;
@@ -422,11 +441,27 @@ impl Store {
         sql: &str,
         binds: Vec<(&'static str, serde_json::Value)>,
     ) -> anyhow::Result<Vec<T>> {
-        let mut q = self.db.query(sql.to_string());
-        for (name, value) in binds {
-            q = q.bind((name, value));
-        }
-        let mut res = q.await?.check()?;
+        // The passage indexes (FULLTEXT, HNSW) keep shared keys that SurrealDB's own
+        // background index work also writes; a statement that collides with it fails
+        // with a conflict SurrealDB says can be retried. Every write here holds the
+        // service's write lock, so retrying is safe.
+        let mut attempt = 0;
+        let mut res = loop {
+            let mut q = self.db.query(sql.to_string());
+            for (name, value) in &binds {
+                q = q.bind((*name, value.clone()));
+            }
+            match q.await.and_then(|r| r.check()) {
+                Ok(res) => break res,
+                Err(e) if attempt < CONFLICT_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    tracing::debug!("retrying after a transaction conflict ({attempt}): {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64))
+                        .await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         let last = res.num_statements().saturating_sub(1);
         let value: surrealdb::types::Value = res.take(last)?;
         let rows = match value.into_json_value() {
@@ -507,6 +542,30 @@ impl Store {
             .bind(("doc", doc))
             .await?
             .check()?;
+        Ok(())
+    }
+
+    /// Inserts or replaces records `{ doc }` keyed by `key(row)`, at most
+    /// `INSERT_MANY_MAX` per statement. Call with the write lock held.
+    pub async fn put_many<T: Serialize + HasKey>(
+        &self,
+        table: &'static str,
+        rows: &[T],
+    ) -> anyhow::Result<()> {
+        for batch in rows.chunks(INSERT_MANY_MAX) {
+            let records = batch
+                .iter()
+                .map(|r| Ok(serde_json::json!({ "id": r.key(), "doc": serde_json::to_value(r)? })))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            self.db
+                .query(format!(
+                    "INSERT INTO {table} $rows ON DUPLICATE KEY UPDATE doc = $input.doc RETURN NONE"
+                ))
+                .bind(("rows", serde_json::Value::Array(records)))
+                .await?
+                .check()
+                .with_context(|| format!("couldn't write {table}"))?;
+        }
         Ok(())
     }
 

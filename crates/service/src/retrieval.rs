@@ -492,6 +492,9 @@ impl Filter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Legs {
     Hybrid,
+    /// Both legs, each min-max normalised and summed with `dense_weight` and
+    /// `lex_weight` (`"hybrid-linear"`, `evals/variants/hybrid.toml`).
+    HybridLinear,
     Dense,
     Lexical,
 }
@@ -506,6 +509,9 @@ pub struct IndexRetriever {
     rrf_k: u32,
     /// HNSW's search breadth (`<|k, ef|>`).
     ef: usize,
+    /// The legs' weights in `"hybrid-linear"`.
+    dense_weight: f32,
+    lex_weight: f32,
 }
 
 /// A passage row and what the legs said about it.
@@ -575,7 +581,50 @@ impl IndexRetriever {
             k_lex: param_usize(params, "k_lex", RETRIEVAL_K_LEX).max(1),
             rrf_k: param_usize(params, "rrf_k", RRF_K as usize) as u32,
             ef: param_usize(params, "ef", 128).max(1),
+            dense_weight: param_f32(params, "dense_weight", 1.0),
+            lex_weight: param_f32(params, "lex_weight", 1.0),
         }
+    }
+
+    /// `"hybrid-linear"`: both legs, each min-max normalised to 0–1, summed with their
+    /// weights; a passage only one leg found gets 0 from the other.
+    async fn hybrid_linear(&self, filter: &Filter, q: &Query) -> anyhow::Result<Vec<Hit>> {
+        let dense = self.dense(filter, q).await?;
+        let lex = self.lexical(filter, q).await?;
+        let normalised = |leg: &[Hit]| -> Vec<f32> {
+            let (lo, hi) = leg.iter().fold((f32::MAX, f32::MIN), |(lo, hi), h| {
+                (lo.min(h.score), hi.max(h.score))
+            });
+            leg.iter()
+                .map(|h| if hi > lo { (h.score - lo) / (hi - lo) } else { 1.0 })
+                .collect()
+        };
+        let (dn, ln) = (normalised(&dense), normalised(&lex));
+        let mut fused: Vec<Hit> = Vec::new();
+        let mut at: HashMap<String, usize> = HashMap::new();
+        for (hit, n) in dense.into_iter().zip(dn) {
+            at.insert(hit.passage.id.clone(), fused.len());
+            fused.push(Hit {
+                score: self.dense_weight * n,
+                ..hit
+            });
+        }
+        for (hit, n) in lex.into_iter().zip(ln) {
+            match at.get(&hit.passage.id) {
+                Some(&i) => {
+                    let f = &mut fused[i];
+                    f.score += self.lex_weight * n;
+                    f.lex_rank = hit.lex_rank;
+                    f.highlight = hit.highlight;
+                }
+                None => fused.push(Hit {
+                    score: self.lex_weight * n,
+                    ..hit
+                }),
+            }
+        }
+        fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+        Ok(fused)
     }
 
     fn dense_sql(&self, filter: &Filter, k: usize, fields: &str) -> String {
@@ -678,6 +727,7 @@ impl Retriever for IndexRetriever {
     fn name(&self) -> &'static str {
         match self.legs {
             Legs::Hybrid => "hybrid-rrf",
+            Legs::HybridLinear => "hybrid-linear",
             Legs::Dense => "dense",
             Legs::Lexical => "bm25",
         }
@@ -694,8 +744,13 @@ impl Retriever for IndexRetriever {
             let k = q.k.max(1);
             let mut hits = match (self.legs, has_vector, has_text) {
                 (Legs::Hybrid, true, true) => self.hybrid(&filter, q, k).await?,
-                (Legs::Hybrid | Legs::Dense, true, _) => self.dense(&filter, q).await?,
-                (Legs::Hybrid | Legs::Lexical, _, true) => self.lexical(&filter, q).await?,
+                (Legs::HybridLinear, true, true) => self.hybrid_linear(&filter, q).await?,
+                (Legs::Hybrid | Legs::HybridLinear | Legs::Dense, true, _) => {
+                    self.dense(&filter, q).await?
+                }
+                (Legs::Hybrid | Legs::HybridLinear | Legs::Lexical, _, true) => {
+                    self.lexical(&filter, q).await?
+                }
                 _ => Vec::new(),
             };
             hits.truncate(k);
@@ -1407,6 +1462,7 @@ async fn index_generation(store: &Store) -> anyhow::Result<String> {
 pub fn register(reg: &mut Registry) {
     for (name, legs) in [
         ("hybrid-rrf", Legs::Hybrid),
+        ("hybrid-linear", Legs::HybridLinear),
         ("dense", Legs::Dense),
         ("bm25", Legs::Lexical),
     ] {
@@ -1780,6 +1836,19 @@ pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>
             },
             None => (d.name.clone(), d.kind),
         };
+        // A folder's file is a source with the document's id: its media are served under
+        // it, and it reads as "folder/path".
+        if file.is_some()
+            && let Some(s) = store.get::<Source>(db::SOURCE, &d.id).await?
+        {
+            return Ok(Some(DocInfo {
+                document_id: d.id,
+                source_id: Some(s.id),
+                name: folder_file_name(s.folder.as_deref(), &s.name),
+                kind: s.kind,
+                file,
+            }));
+        }
         return Ok(Some(DocInfo {
             document_id: d.id,
             source_id,
@@ -1795,9 +1864,20 @@ pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>
             workspace_id,
             path: s.name.clone(),
         }),
-        name: s.name,
+        name: match &s.workspace_id {
+            Some(_) => folder_file_name(s.folder.as_deref(), &s.name),
+            None => s.name,
+        },
         kind: s.kind,
     }))
+}
+
+/// A folder file's name as citations and tools show it: "`folder`/`path`".
+pub fn folder_file_name(folder: Option<&str>, path: &str) -> String {
+    match folder.filter(|f| !f.is_empty()) {
+        Some(f) => format!("{f}/{path}"),
+        None => path.to_string(),
+    }
 }
 
 /// Fills each packed passage's citation with its document (name, kind, the source its

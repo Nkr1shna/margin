@@ -248,6 +248,43 @@ async fn hybrid_rrf_fuses_both_legs_inside_the_scope() {
 }
 
 #[tokio::test]
+async fn hybrid_linear_weighs_both_legs_inside_the_scope() {
+    let s = seeded().await;
+    put_topic(&s, "t1", None).await;
+    put_topic(&s, "t2", None).await;
+    let r = retriever(&s, "hybrid-linear");
+    assert_eq!(r.name(), "hybrid-linear");
+    let hits = r
+        .search(&query("entropy", unit(0), Scope::Topic { id: "t1".into() }))
+        .await
+        .unwrap();
+    assert_eq!(ids(&hits).len(), 2);
+    let a = hits.iter().find(|h| h.passage.id == "a").unwrap();
+    let b = hits.iter().find(|h| h.passage.id == "b").unwrap();
+    assert_eq!(a.dense_rank, Some(0));
+    assert_eq!(b.lex_rank, Some(0));
+    assert!(b.highlight.is_some());
+    // Each leg's best scores 1 times its weight (both 1 by default).
+    assert!(hits[0].score >= 1.0 - 1e-4);
+    assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
+    // The weights come from the retriever's params.
+    let reg = Registry::standard(StageDeps { store: s.clone() });
+    let mut cfg = PipelineConfig {
+        retriever: StageCfg::named("hybrid-linear"),
+        ..PipelineConfig::default()
+    };
+    cfg.retriever
+        .params
+        .insert("lex_weight".into(), serde_json::json!(0.0));
+    let r = crate::pipeline::Pipeline::build(&cfg, &reg).unwrap().retriever;
+    let hits = r
+        .search(&query("entropy", unit(0), Scope::Topic { id: "t1".into() }))
+        .await
+        .unwrap();
+    assert_eq!(hits[0].passage.id, "a", "the dense leg alone decides");
+}
+
+#[tokio::test]
 async fn dense_and_bm25_run_one_leg_each() {
     let s = seeded().await;
     let lib = Scope::Library;

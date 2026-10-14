@@ -115,3 +115,121 @@ pub async fn patch_settings(
 pub async fn tools(State(state): State<AppState>) -> Json<Vec<ToolStatus>> {
     Json(state.renderer.detect_tools().await)
 }
+
+/// The stage kinds a `PipelineConfig` names, in the order the pipeline runs them.
+pub const STAGE_KINDS: [&str; 6] = [
+    "chunker",
+    "retriever",
+    "fusion",
+    "reranker",
+    "packer",
+    "prompts",
+];
+
+/// `GET /api/pipeline/variants`: what Settings can choose a pipeline from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineVariants {
+    /// The registered stage names per kind ("chunker", "retriever", …), sorted.
+    pub stages: std::collections::BTreeMap<String, Vec<String>>,
+    /// The named variants of `evals/variants/*.toml` that could be read, by name.
+    pub variants: Vec<NamedVariant>,
+}
+
+/// One `evals/variants/<name>.toml`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NamedVariant {
+    pub name: String,
+    pub config: margin_shared::pipeline::PipelineConfig,
+    /// Why this service can't build it (a stage it doesn't register); `None` when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+/// Where the named variants are: `MARGIN_EVALS_DIR`, else the repository's `evals/`
+/// next to this crate (the service runs from its checkout).
+fn evals_dir() -> std::path::PathBuf {
+    match std::env::var_os("MARGIN_EVALS_DIR") {
+        Some(dir) => dir.into(),
+        None => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals"),
+    }
+}
+
+/// The variants in `dir/variants`, by name; a file that can't be read or parsed is
+/// skipped (logged), and a missing folder is no variants.
+pub fn named_variants(
+    dir: &std::path::Path,
+    registry: &crate::pipeline::Registry,
+) -> Vec<NamedVariant> {
+    let Ok(entries) = std::fs::read_dir(dir.join("variants")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<NamedVariant> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .filter_map(|p| {
+            let name = p.file_stem()?.to_string_lossy().into_owned();
+            let parsed = std::fs::read_to_string(&p)
+                .map_err(anyhow::Error::from)
+                .and_then(|t| {
+                    Ok(toml::from_str::<margin_shared::pipeline::PipelineConfig>(&t)?)
+                });
+            match parsed {
+                Ok(config) => {
+                    let unavailable = Pipeline::build(&config, registry)
+                        .err()
+                        .map(|e| format!("{e:#}"));
+                    Some(NamedVariant {
+                        name,
+                        config,
+                        unavailable,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("couldn't read the variant {}: {e:#}", p.display());
+                    None
+                }
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// `GET /api/pipeline/variants`.
+pub async fn pipeline_variants(State(state): State<AppState>) -> Json<PipelineVariants> {
+    let stages = STAGE_KINDS
+        .iter()
+        .map(|k| (k.to_string(), state.registry.names(k)))
+        .collect();
+    let dir = evals_dir();
+    let variants = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || named_variants(&dir, &state.registry))
+            .await
+            .unwrap_or_default()
+    };
+    Json(PipelineVariants { stages, variants })
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+    use crate::pipeline::{Registry, StageDeps};
+
+    #[tokio::test]
+    async fn the_repositorys_variants_are_listed_and_buildable() {
+        let store = crate::db::Store::memory().await.unwrap();
+        let reg = Registry::standard(StageDeps { store });
+        let variants = named_variants(&evals_dir(), &reg);
+        let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        for n in ["baseline", "bm25", "dense", "hybrid"] {
+            assert!(names.contains(&n), "{n} missing from {names:?}");
+        }
+        for v in &variants {
+            assert_eq!(v.unavailable, None, "{}", v.name);
+        }
+        assert!(named_variants(std::path::Path::new("/nonexistent"), &reg).is_empty());
+        assert!(reg.names("retriever").contains(&"hybrid-linear".to_string()));
+    }
+}

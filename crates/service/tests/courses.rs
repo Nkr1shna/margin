@@ -2036,6 +2036,7 @@ mod lesson_retrieval {
                 }],
             }),
             pipeline_hash: None,
+            workspace_ids: Vec::new(),
         };
         h.state
             .store
@@ -2073,6 +2074,7 @@ mod lesson_retrieval {
             author: Author::Agent,
             prompt: None,
             with_quiz: false,
+            workspace_ids: Vec::new(),
         };
         h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
         *h.generator.lesson_body.lock().unwrap() = Some("Ringing.[^1]".into());

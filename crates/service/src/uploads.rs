@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use axum::Json;
+use axum::{Extension, Json};
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use margin_shared::{Id, Source, SourceUpload, routes::UPLOAD_PART_BYTES};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::CurrentDevice;
 use crate::error::{AppError, AppResult};
 use crate::sources::{self, FILE_NAME, Upload, UploadQuery, content_length, receive, remove_dir};
 use crate::state::{AppState, new_id};
@@ -38,6 +39,10 @@ pub struct StartQuery {
     name: String,
     folder: Option<String>,
     topic_id: Option<Id>,
+    #[serde(default)]
+    workspace_id: Option<Id>,
+    #[serde(default)]
+    modified: Option<DateTime<Utc>>,
     bytes: u64,
 }
 
@@ -108,10 +113,12 @@ impl Drop for Busy<'_> {
     }
 }
 
-/// `POST /api/source-uploads?name&folder&topic_id&bytes`: checks the file's name and
-/// size (413 over its kind's limit) and starts an upload in parts.
+/// `POST /api/source-uploads?name&folder&topic_id&bytes` (plus `workspace_id` and
+/// `modified` for a folder's file): checks the file's name and size (413 over its
+/// kind's limit; a folder's files have none) and starts an upload in parts.
 pub async fn start(
     State(state): State<AppState>,
+    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
     query: Result<Query<StartQuery>, QueryRejection>,
 ) -> AppResult<Json<SourceUpload>> {
     let Query(q) =
@@ -120,8 +127,10 @@ pub async fn start(
         name: q.name,
         folder: q.folder,
         topic_id: q.topic_id,
+        workspace_id: q.workspace_id,
+        modified: q.modified,
     };
-    let upload = Upload::check(&state, source).await?;
+    let upload = Upload::check(&state, source, &device).await?;
     if q.bytes > upload.limit() {
         return Err(upload.too_large());
     }
@@ -192,7 +201,7 @@ pub async fn put_part(
     }
     let path = dir.join(FILE_NAME);
     match receive(body, &path, max).await {
-        Ok(n) => Ok(Json(SourceUpload {
+        Ok((n, _)) => Ok(Json(SourceUpload {
             id,
             bytes: meta.bytes,
             received: have + n,
@@ -260,7 +269,19 @@ pub async fn finish(State(state): State<AppState>, Path(id): Path<Id>) -> AppRes
         )));
     }
     remove_dir(&dir).await;
-    let source = sources::create(&state, &source_id, meta.upload, have).await?;
+    // What arrived, hashed once (a folder's row records it).
+    let sha256 = match sources::hash_file(&target.join(FILE_NAME)).await {
+        Ok(h) => h,
+        Err(e) => {
+            remove_dir(&target).await;
+            return Err(AppError::internal(format!(
+                "couldn't read {}: {e}",
+                target.display()
+            )));
+        }
+    };
+    let source =
+        sources::create_or_replace(&state, &source_id, meta.upload, have, sha256).await?;
     Ok(Json(source))
 }
 
