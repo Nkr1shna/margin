@@ -3,8 +3,11 @@
 //! registers a one-off activity result callback with the activity's
 //! `ActivityResultRegistry` (dx's `MainActivity` is an `AppCompatActivity` through wry's
 //! `WryActivity`) and hands the picked URIs back to `on_picked`. The chosen documents are
-//! copied through the `ContentResolver` into the staging folder. (`MarginPicker.kt`
-//! keeps `treeRoot`/`children` for the folder access 4c builds.)
+//! copied through the `ContentResolver` into the staging folder.
+//!
+//! A folder to attach is picked with `ACTION_OPEN_DOCUMENT_TREE` the same way; the
+//! callback persists the tree's read grant before handing it back, and
+//! `folders::android` reads the tree in place from then on.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -15,7 +18,7 @@ use jni::sys::jlong;
 use jni::{JNIEnv, JavaVM, NativeMethod};
 use tokio::sync::oneshot;
 
-use crate::folders::FolderPick;
+use crate::folders::{FolderHandle, FolderPick};
 use crate::sources::{Selection, select_named};
 
 /// The Kotlin side, in the package dx gives wry's classes.
@@ -226,12 +229,59 @@ fn call_strings(
     strings(env, &result).map(Some)
 }
 
-/// The folder picker (4c: the tree picker with a persisted read grant). Not built yet.
+/// The folder picker: the system's tree picker (`ACTION_OPEN_DOCUMENT_TREE`), whose read
+/// grant `MarginPicker` persists in the result callback, so the folder stays readable
+/// across restarts until `folders::forget` releases it. Named by the tree's root folder;
+/// located by the storage or app holding it and the path inside.
 pub async fn pick_folder() -> Option<FolderPick> {
-    None
+    let tree = show(true).await?.into_iter().next()?;
+    tokio::task::spawn_blocking(move || describe_tree(tree))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn describe_tree(tree: String) -> Option<FolderPick> {
+    let root = java(|env| {
+        call_strings(
+            env,
+            "treeRoot",
+            "(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;",
+            &[&tree],
+        )
+    })
+    .flatten();
+    match root.as_deref() {
+        Some([status, _id, name, location]) if status == "ok" => Some(FolderPick {
+            name: name.clone(),
+            location: location.clone(),
+            handle: FolderHandle::AndroidTree { uri: tree },
+        }),
+        _ => {
+            eprintln!("picker: the picked folder couldn't be read");
+            // Don't keep a grant for a folder that isn't attached.
+            crate::folders::forget(&FolderHandle::AndroidTree { uri: tree });
+            None
+        }
+    }
 }
 
 pub async fn pick_files() -> Option<Selection> {
+    let uris = show(false).await?;
+    if uris.is_empty() {
+        return None;
+    }
+    let dir = super::new_staging_dir()?;
+    tokio::task::spawn_blocking(move || {
+        select_documents(uris).stage(&dir, |doc, to| copy(&doc.uri, to))
+    })
+    .await
+    .ok()
+}
+
+/// Show the files picker or the folder picker and wait for what was picked: the URIs
+/// (empty: cancelled), or `None` when it couldn't be shown.
+async fn show(folder: bool) -> Option<Vec<String>> {
     let Some(looper) = EventLoopLooper::current() else {
         eprintln!("picker: the app's thread has no looper");
         return None;
@@ -254,7 +304,7 @@ pub async fn pick_files() -> Option<Selection> {
             "(Landroid/app/Activity;ZJ)V",
             &[
                 JValue::Object(&activity()),
-                JValue::Bool(false.into()),
+                JValue::Bool(folder.into()),
                 JValue::Long(token),
             ],
         )?;
@@ -264,16 +314,7 @@ pub async fn pick_files() -> Option<Selection> {
         take_pending(token);
         return None;
     }
-    let uris = rx.await.ok().flatten()?;
-    if uris.is_empty() {
-        return None;
-    }
-    let dir = super::new_staging_dir()?;
-    tokio::task::spawn_blocking(move || {
-        select_documents(uris).stage(&dir, |doc, to| copy(&doc.uri, to))
-    })
-    .await
-    .ok()
+    rx.await.ok().flatten()
 }
 
 /// A document: its URI, and its size when the provider knows it.
