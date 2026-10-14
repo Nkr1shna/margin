@@ -21,7 +21,7 @@ mod responses;
 mod sse;
 
 pub use responses::{
-    ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
+    Backoff, ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
     StreamEvent, ToolChoice,
 };
 
@@ -354,13 +354,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
     if status.is_success() {
         return Ok(resp);
     }
-    // Retry-After in seconds; the HTTP-date form isn't used by the Responses API.
-    let retry_after = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let retry_after = retry_after(resp.headers(), std::time::SystemTime::now());
     let body = resp.text().await.unwrap_or_default();
     let message = serde_json::from_str::<Value>(&body)
         .ok()
@@ -380,6 +374,35 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
         status: status.as_u16(),
         message,
         retry_after,
+    })
+}
+
+/// The pause a 429/503 asks for: OpenAI's `retry-after-ms` when sent (it is more
+/// precise), else `Retry-After` in seconds (whole or fractional) or as an HTTP date
+/// (a date in the past is no pause).
+fn retry_after(
+    headers: &reqwest::header::HeaderMap,
+    now: std::time::SystemTime,
+) -> Option<Duration> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+    };
+    let seconds = |v: &str| {
+        v.parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .and_then(|s| Duration::try_from_secs_f64(s).ok())
+    };
+    if let Some(ms) = header("retry-after-ms").and_then(seconds) {
+        return Some(ms / 1000);
+    }
+    let v = header("retry-after")?;
+    seconds(v).or_else(|| {
+        let at = httpdate::parse_http_date(v).ok()?;
+        Some(at.duration_since(now).unwrap_or(Duration::ZERO))
     })
 }
 
@@ -836,6 +859,83 @@ mod tests {
         assert!(
             matches!(response_text(&incomplete), Err(AiError::Incomplete(m)) if m.contains("token limit"))
         );
+    }
+
+    #[test]
+    fn retry_after_forms() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            h
+        };
+        assert_eq!(retry_after(&headers(&[]), now), None);
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "7")]), now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "1.5")]), now),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            retry_after(
+                &headers(&[("retry-after", "7"), ("retry-after-ms", "250")]),
+                now
+            ),
+            Some(Duration::from_millis(250))
+        );
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_str(&date).unwrap());
+        assert_eq!(retry_after(&h, now), Some(Duration::from_secs(30)));
+        assert_eq!(
+            retry_after(&h, now + Duration::from_secs(60)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(retry_after(&headers(&[("retry-after", "soon")]), now), None);
+        assert_eq!(retry_after(&headers(&[("retry-after", "-3")]), now), None);
+    }
+
+    #[test]
+    fn backoff_delays() {
+        let b = Backoff {
+            retries: 3,
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(5),
+        };
+        let busy = AiError::Http {
+            status: 503,
+            message: "busy".into(),
+            retry_after: None,
+        };
+        assert_eq!(b.delay(0, &busy), Some(Duration::from_secs(2)));
+        assert_eq!(b.delay(1, &busy), Some(Duration::from_secs(4)));
+        assert_eq!(b.delay(2, &busy), Some(Duration::from_secs(5)));
+        assert_eq!(b.delay(3, &busy), None);
+        let limited = AiError::Http {
+            status: 429,
+            message: "slow".into(),
+            retry_after: Some(Duration::from_secs(9)),
+        };
+        assert_eq!(b.delay(0, &limited), Some(Duration::from_secs(9)));
+        assert_eq!(
+            b.delay(0, &AiError::Network("x".into())),
+            Some(Duration::from_secs(2))
+        );
+        let bad = AiError::Http {
+            status: 400,
+            message: "bad".into(),
+            retry_after: None,
+        };
+        assert_eq!(b.delay(0, &bad), None);
+        assert_eq!(b.delay(0, &AiError::Parse("x".into())), None);
+        let huge = Backoff { retries: 100, ..b };
+        assert_eq!(huge.delay(60, &busy), Some(Duration::from_secs(5)));
+        assert_eq!(Backoff::default().retries, 3);
     }
 
     #[test]
