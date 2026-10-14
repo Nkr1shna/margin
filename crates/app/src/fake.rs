@@ -223,12 +223,14 @@ pub fn sample_citations() -> Vec<Citation> {
         start_line: None,
         end_line: None,
         file: None,
+        section_path: None,
     };
     vec![
         Citation {
             page: Some(3),
             excerpt: "A periodic signal x(t) with fundamental period T can be represented as a linear combination of harmonically related complex exponentials, each with a frequency that is an integer multiple of the fundamental frequency ω₀ = 2π/T.".into(),
             image_url: Some(media_url("s1", "page-3.png")),
+            section_path: Some("3 Fourier series > 3.3 Representation".into()),
             ..cite(1, "s1", "Oppenheim ch3.pdf", SourceKind::Pdf)
         },
         Citation {
@@ -722,6 +724,7 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/search", get(search))
         .route("/api/settings", get(get_settings).patch(patch_settings))
         .route("/api/tools", get(tools))
+        .route(routes::PIPELINE_VARIANTS, get(pipeline_variants))
         .route(routes::TRACES, get(traces))
         .route(routes::TRACES_ROLLUP, get(traces_rollup))
         .route("/api/devices", get(devices))
@@ -1797,33 +1800,91 @@ async fn patch_settings(
 }
 
 /// The stage names the service's registry knows (`crates/service`: `pipeline.rs`,
-/// `ingest.rs`, `retrieval.rs`), by kind.
+/// `ingest.rs`, `retrieval.rs`), by kind (`STAGE_KINDS`).
 pub const FAKE_STAGES: &[(&str, &[&str])] = &[
     ("chunker", &["pages-v1", "sections-v2"]),
-    ("retriever", &["bm25", "dense", "hybrid-rrf"]),
+    (
+        "retriever",
+        &["bm25", "dense", "hybrid-linear", "hybrid-rrf"],
+    ),
     ("fusion", &["first", "linear", "rrf"]),
     ("reranker", &["none"]),
     ("packer", &["mmr-v1", "take-k"]),
+    ("prompts", &["lesson-v2"]),
 ];
 
 /// The service's 400 for a pipeline naming a stage it doesn't have.
 fn unknown_stage(cfg: &margin_shared::pipeline::PipelineConfig) -> Option<String> {
-    let named = [
-        ("chunker", &cfg.chunker.name),
-        ("retriever", &cfg.retriever.name),
-        ("fusion", &cfg.fusion.name),
-        ("reranker", &cfg.reranker.name),
-        ("packer", &cfg.packer.name),
-    ];
-    named.into_iter().find_map(|(kind, name)| {
-        let known = FAKE_STAGES.iter().find(|(k, _)| *k == kind)?.1;
-        (!known.contains(&name.as_str())).then(|| {
-            format!(
-                "There is no {kind} named \"{name}\" (known: {}).",
-                known.join(", ")
-            )
+    margin_shared::pipeline::STAGE_KINDS
+        .into_iter()
+        .find_map(|kind| {
+            let name = cfg.stage_name(kind)?;
+            let known = FAKE_STAGES.iter().find(|(k, _)| *k == kind)?.1;
+            (!known.contains(&name)).then(|| {
+                format!(
+                    "There is no {kind} named \"{name}\" (known: {}).",
+                    known.join(", ")
+                )
+            })
         })
-    })
+}
+
+/// What `GET /api/pipeline/variants` serves: `FAKE_STAGES` and the repository's
+/// `evals/variants/*.toml` (baseline, bm25, dense, hybrid), plus one naming a reranker
+/// this service doesn't have.
+pub fn fake_pipeline_variants() -> margin_shared::pipeline::PipelineVariants {
+    use margin_shared::pipeline::{NamedVariant, PipelineConfig, PipelineVariants, StageCfg};
+    let baseline = PipelineConfig::default();
+    let mut hybrid = baseline
+        .with_stage("retriever", "hybrid-linear")
+        .with_stage("fusion", "linear");
+    hybrid.retriever = StageCfg {
+        name: "hybrid-linear".into(),
+        params:
+            serde_json::json!({"dense_weight": 2.0, "lex_weight": 1.0, "normalisation": "minmax"})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+    };
+    let named = |name: &str, config: PipelineConfig| NamedVariant {
+        name: name.into(),
+        config,
+        unavailable: None,
+    };
+    PipelineVariants {
+        stages: FAKE_STAGES
+            .iter()
+            .map(|(k, names)| (k.to_string(), names.iter().map(|n| n.to_string()).collect()))
+            .collect(),
+        variants: vec![
+            named("baseline", baseline.clone()),
+            named(
+                "bm25",
+                baseline
+                    .with_stage("retriever", "bm25")
+                    .with_stage("fusion", "first"),
+            ),
+            named(
+                "dense",
+                baseline
+                    .with_stage("retriever", "dense")
+                    .with_stage("fusion", "first"),
+            ),
+            named("hybrid", hybrid),
+            NamedVariant {
+                unavailable: Some("There is no reranker named \"listwise-v1\".".into()),
+                ..named("listwise", baseline.with_stage("reranker", "listwise-v1"))
+            },
+        ],
+    }
+}
+
+/// `GET /api/pipeline/variants`.
+async fn pipeline_variants(headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    Json(fake_pipeline_variants()).into_response()
 }
 
 /// `GET /api/traces`: the fake records no traces, so none (JSON lines, oldest first).
@@ -5293,6 +5354,7 @@ pub fn sample_folder_citations() -> Vec<Citation> {
             workspace_id: workspace.into(),
             path: path.into(),
         }),
+        section_path: None,
     };
     vec![
         Citation {

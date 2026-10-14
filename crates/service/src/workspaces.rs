@@ -11,9 +11,9 @@ use margin_shared::{Chat, Event, Id, NewWorkspace, Workspace};
 
 use crate::auth::CurrentDevice;
 use crate::chats;
-use crate::folders;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::folders;
 use crate::state::{AppState, new_id};
 
 /// Longest folder name or location kept, in characters.

@@ -44,6 +44,9 @@ pub struct LibraryState {
     pub folder_files: BTreeMap<Id, BTreeMap<Id, Source>>,
     /// Devices once fetched (`GET /api/devices`), with presence from `DeviceChanged`.
     pub devices: BTreeMap<Id, Device>,
+    /// What Settings can pick the pipeline from (`GET /api/pipeline/variants`), once
+    /// fetched; fetched again each time the Pipeline section opens.
+    pub pipeline_variants: Option<margin_shared::pipeline::PipelineVariants>,
 }
 
 /// What the sidebar dot shows for a lesson's video.

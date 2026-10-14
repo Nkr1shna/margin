@@ -596,7 +596,13 @@ impl IndexRetriever {
                 (lo.min(h.score), hi.max(h.score))
             });
             leg.iter()
-                .map(|h| if hi > lo { (h.score - lo) / (hi - lo) } else { 1.0 })
+                .map(|h| {
+                    if hi > lo {
+                        (h.score - lo) / (hi - lo)
+                    } else {
+                        1.0
+                    }
+                })
                 .collect()
         };
         let (dn, ln) = (normalised(&dense), normalised(&lex));

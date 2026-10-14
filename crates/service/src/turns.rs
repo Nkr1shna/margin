@@ -477,16 +477,19 @@ async fn run_turn(
 ) -> Result<TurnOutcome, Early> {
     // A missing key or model ends the turn like a failed model call. The chat route
     // (`pipeline.routes.chat`) when set, else the agent model, else the main model.
-    let ai = state.route_ai_config(Route::Chat).await.map_err(|e| Early {
-        code: match e.code {
-            error_code::NO_API_KEY => error_code::NO_API_KEY,
-            error_code::NO_MODEL => error_code::NO_MODEL,
-            // The settings couldn't be read.
-            _ => error_code::STORAGE,
-        },
-        message: e.message,
-        retryable: true,
-    })?;
+    let ai = state
+        .route_ai_config(Route::Chat)
+        .await
+        .map_err(|e| Early {
+            code: match e.code {
+                error_code::NO_API_KEY => error_code::NO_API_KEY,
+                error_code::NO_MODEL => error_code::NO_MODEL,
+                // The settings couldn't be read.
+                _ => error_code::STORAGE,
+            },
+            message: e.message,
+            retryable: true,
+        })?;
     let internal = |e: anyhow::Error| {
         tracing::error!(chat = %chat_id, "couldn't start the turn: {e:#}");
         Early {

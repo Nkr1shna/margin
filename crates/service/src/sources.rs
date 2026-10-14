@@ -23,12 +23,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use axum::Extension;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Extension;
 use chrono::{DateTime, Utc};
 use margin_ai::{Image, Passage};
 use margin_embed::{Purpose, Transcript};
@@ -503,7 +503,12 @@ pub async fn create_or_replace(
 }
 
 /// A new topic or chat source. Call with the write lock held.
-async fn create_locked(state: &AppState, id: &str, upload: Upload, bytes: u64) -> AppResult<Source> {
+async fn create_locked(
+    state: &AppState,
+    id: &str,
+    upload: Upload,
+    bytes: u64,
+) -> AppResult<Source> {
     // The topic may have been deleted while the file was being saved.
     if let Some(topic_id) = &upload.topic_id {
         library::topic(state, topic_id).await?;
@@ -542,7 +547,10 @@ async fn replace_locked(
         .await?
         .ok_or_else(|| AppError::not_found("folder"))?;
     let kind = folder_file_type(&upload.name).ok_or_else(|| {
-        AppError::internal(format!("{} passed the check but isn't a folder file", upload.name))
+        AppError::internal(format!(
+            "{} passed the check but isn't a folder file",
+            upload.name
+        ))
     })?;
     let stamp = FileStamp {
         bytes,
@@ -560,8 +568,11 @@ async fn replace_locked(
             let old_dir = state.source_dir(&old.id);
             let moved = async {
                 tokio::fs::create_dir_all(&old_dir).await?;
-                tokio::fs::rename(state.source_dir(id).join(FILE_NAME), old_dir.join(FILE_NAME))
-                    .await?;
+                tokio::fs::rename(
+                    state.source_dir(id).join(FILE_NAME),
+                    old_dir.join(FILE_NAME),
+                )
+                .await?;
                 // The link AVFoundation reads by is made again when it's read.
                 if let Some(link) = link_name(&old.name) {
                     match tokio::fs::remove_file(old_dir.join(link)).await {
@@ -1196,6 +1207,7 @@ fn retrieved(
             start_line: row.start_line.map(|v| v as u32),
             end_line: row.end_line.map(|v| v as u32),
             file: None,
+            section_path: Some(row.section_path.trim().to_string()).filter(|s| !s.is_empty()),
         },
     }
 }

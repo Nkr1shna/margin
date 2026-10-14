@@ -1385,6 +1385,10 @@ fn PassagesView(item_id: Id, card: PassagesCard) -> Element {
                                 span { class: "cite-meta",
                                     "{kind_label(c.kind)}"
                                     if let Some(at) = locator(&c) { " · {at}" }
+                                    if let Some(section) = c.section_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                                        " · "
+                                        span { class: "cite-section", title: "Section", "{section.trim()}" }
+                                    }
                                 }
                                 if !c.excerpt.trim().is_empty() {
                                     span { class: "cite-excerpt", title: "{c.excerpt.trim()}", "{c.excerpt.trim()}" }
@@ -2222,6 +2226,11 @@ mod tests {
         assert!(html.contains("Passages for “partial sums overshoot”"));
         assert!(html.contains("Oppenheim ch3.pdf"));
         assert!(html.contains("PDF · p. 3"));
+        // With the section the chunker named.
+        assert!(
+            html.contains(r#"<span class="cite-section" title="Section">3 Fourier series &#62; 3.3 Representation</span>"#),
+            "{html}"
+        );
         assert!(html.contains("Code · lines 1–7"), "{html}");
         // The retrieval tools' rows: label, icon, what they found.
         assert!(html.contains("Searching for “partial sums overshoot”"));

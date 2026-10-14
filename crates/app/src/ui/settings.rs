@@ -1,9 +1,11 @@
 //! Settings: service, account and devices, AI provider and key, the three model slots
-//! and the retrieval pipeline's budget, the embedding model for sources, voice, render
+//! and the retrieval pipeline's stages and budget, the embedding model for sources, voice, render
 //! size, tools on the service Mac, trace retention, and appearance.
 
 use dioxus::prelude::*;
-use margin_shared::pipeline::{Budget, PipelineConfig, Route};
+use margin_shared::pipeline::{
+    Budget, NamedVariant, PipelineConfig, PipelineVariants, Route, STAGE_KINDS,
+};
 use margin_shared::{
     Device, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id, ReasoningEffort, SOURCE_KINDS,
     Settings, SettingsPatch, Source, TRACE_RETENTION_DAYS, ToolStatus, Workspace, WorkspaceSync,
@@ -1062,6 +1064,255 @@ pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// What a kind of stage (`STAGE_KINDS`) is called in Settings.
+pub fn stage_label(kind: &str) -> &'static str {
+    match kind {
+        "chunker" => "Chunker",
+        "retriever" => "Retriever",
+        "fusion" => "Fusion",
+        "reranker" => "Reranker",
+        "packer" => "Packer",
+        "prompts" => "Prompts",
+        _ => "Stage",
+    }
+}
+
+/// What a kind of stage does, under its picker.
+pub fn stage_help(kind: &str) -> &'static str {
+    match kind {
+        "chunker" => {
+            "How sources are cut into passages. A new chunker applies as sources are read again."
+        }
+        "retriever" => "How passages are found: by meaning, by words, or both.",
+        "fusion" => "How the meaning and word results are merged into one list.",
+        "reranker" => "Whether the merged list is reordered before packing.",
+        "packer" => "How the best passages are chosen to fit the budget below.",
+        "prompts" => "The version of the instructions lessons and outlines are written with.",
+        _ => "",
+    }
+}
+
+/// The named variant whose stages and prompts `cfg` has (routes and budget aside).
+pub fn current_variant<'a>(
+    cfg: &PipelineConfig,
+    variants: &'a PipelineVariants,
+) -> Option<&'a NamedVariant> {
+    variants
+        .variants
+        .iter()
+        .find(|v| cfg.has_stages_of(&v.config))
+}
+
+/// The choices of one kind's picker, (value, label): the names the service registers,
+/// and `current` too when it doesn't (so the picker shows what is set).
+pub fn stage_options(
+    kind: &str,
+    current: &str,
+    variants: &PipelineVariants,
+) -> Vec<(String, String)> {
+    let known = variants.stages.get(kind).cloned().unwrap_or_default();
+    let mut out: Vec<(String, String)> = known.iter().map(|n| (n.clone(), n.clone())).collect();
+    if !known.iter().any(|n| n == current) {
+        out.insert(
+            0,
+            (
+                current.to_string(),
+                format!("{current} (not on this service)"),
+            ),
+        );
+    }
+    out
+}
+
+/// A stage-only fingerprint of `cfg` (routes and budget left out), so the stage picker
+/// starts over when the stages change elsewhere but not when the budget or a model slot
+/// is saved.
+fn stages_key(cfg: &PipelineConfig) -> String {
+    PipelineConfig::default().with_stages_of(cfg).hash()
+}
+
+/// What saving the stage picker sends: the saved pipeline (its routes and budget as they
+/// are now) with `draft`'s stages and prompts; `None` when that changes nothing.
+pub fn stages_patch(saved: &PipelineConfig, draft: &PipelineConfig) -> Option<SettingsPatch> {
+    let pipeline = saved.with_stages_of(draft);
+    (pipeline != *saved).then(|| SettingsPatch {
+        pipeline: Some(pipeline),
+        ..Default::default()
+    })
+}
+
+/// The stages of the pipeline: read-only until the service's choices load, then a picker
+/// of named variants and of each stage (`GET /api/pipeline/variants`).
+#[component]
+fn StagePicker(cfg: PipelineConfig) -> Element {
+    let app = use_app();
+    let mut fetch = use_resource(move || async move {
+        let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+        match api.pipeline_variants().await {
+            Ok(v) => {
+                let mut lib = app.lib;
+                lib.write().pipeline_variants = Some(v);
+                Ok(())
+            }
+            Err(e) => Err(app.failure(&e)),
+        }
+    });
+    let failed = match &*fetch.read() {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let variants = app.lib.read().pipeline_variants.clone();
+    let saved_note = use_signal(|| false);
+    let rows = pipeline_rows(&cfg);
+    rsx! {
+        match variants {
+            Some(variants) => rsx! {
+                if let Some(err) = failed {
+                    ErrorNotice { message: format!("Couldn't check the service's stages again: {err}"), on_retry: move |_| fetch.restart() }
+                }
+                div {
+                    StageForm { key: "{stages_key(&cfg)}", cfg: cfg.clone(), variants, saved_note }
+                }
+                div { class: "kv", "aria-label": "Fingerprint",
+                    span { "Fingerprint" }
+                    span { class: "mono", "{cfg.hash()}" }
+                }
+            },
+            None => rsx! {
+                div { class: "kv", "aria-label": "Stages",
+                    for (label, value) in rows {
+                        span { key: "{label}", "{label}" }
+                        span { class: "mono", "{value}" }
+                    }
+                }
+                match failed {
+                    Some(err) => rsx! { ErrorNotice { message: err, on_retry: move |_| fetch.restart() } },
+                    None => rsx! { div { class: "skel", style: "width: 50%", "aria-label": "Loading the stages" } },
+                }
+            },
+        }
+    }
+}
+
+/// The variant and stage pickers over a draft of `cfg`'s stages; Save sends them.
+#[component]
+fn StageForm(cfg: PipelineConfig, variants: PipelineVariants, saved_note: Signal<bool>) -> Element {
+    let app = use_app();
+    let mut draft = use_signal(|| cfg.clone());
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let d = draft.read().clone();
+    let dirty = !cfg.has_stages_of(&d);
+    let current = current_variant(&d, &variants).map(|v| v.name.clone());
+    let named = variants.variants.clone();
+    rsx! {
+        form {
+            style: "display: grid; gap: 14px",
+            novalidate: true,
+            onsubmit: move |e: FormEvent| {
+                e.prevent_default();
+                async move {
+                    if *busy.peek() {
+                        return;
+                    }
+                    let Some(settings) = app.lib.peek().settings.clone() else { return };
+                    let Some(patch) = stages_patch(&settings.pipeline, &draft.peek()) else {
+                        return;
+                    };
+                    if save_settings(app, patch, error, busy).await {
+                        saved_note.set(true);
+                    }
+                }
+            },
+            div { class: "field",
+                label { r#for: "pl-variant", "Variant" }
+                select {
+                    id: "pl-variant",
+                    class: "select-input",
+                    "aria-describedby": "pl-variant-help",
+                    onchange: {
+                        let named = named.clone();
+                        move |e: FormEvent| {
+                            let name = e.value();
+                            if let Some(v) = named.iter().find(|v| v.name == name && v.unavailable.is_none()) {
+                                let next = draft.peek().with_stages_of(&v.config);
+                                draft.set(next);
+                                saved_note.set(false);
+                            }
+                        }
+                    },
+                    if current.is_none() {
+                        option { value: "", selected: true, "Custom" }
+                    }
+                    for v in named.iter() {
+                        option {
+                            key: "{v.name}",
+                            value: "{v.name}",
+                            selected: current.as_deref() == Some(v.name.as_str()),
+                            disabled: v.unavailable.is_some(),
+                            title: v.unavailable.clone().unwrap_or_default(),
+                            if v.unavailable.is_some() { "{v.name} (not on this service)" } else { "{v.name}" }
+                        }
+                    }
+                }
+                span { id: "pl-variant-help", class: "faint", style: "font-size: 13px",
+                    "Sets every stage at once, as the evals compare them. The models above and the budget below stay."
+                }
+            }
+            div { class: "grid2",
+                for kind in STAGE_KINDS {
+                    div { key: "{kind}", class: "field",
+                        label { r#for: "pl-stage-{kind}", {stage_label(kind)} }
+                        select {
+                            id: "pl-stage-{kind}",
+                            class: "select-input",
+                            "aria-describedby": "pl-stage-{kind}-help",
+                            onchange: move |e: FormEvent| {
+                                let next = draft.peek().with_stage(kind, &e.value());
+                                draft.set(next);
+                                saved_note.set(false);
+                            },
+                            for (value, label) in stage_options(kind, d.stage_name(kind).unwrap_or_default(), &variants) {
+                                option {
+                                    key: "{value}",
+                                    value: "{value}",
+                                    selected: d.stage_name(kind) == Some(value.as_str()),
+                                    "{label}"
+                                }
+                            }
+                        }
+                        span { id: "pl-stage-{kind}-help", class: "faint", style: "font-size: 13px", {stage_help(kind)} }
+                    }
+                }
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+            div { class: "row-actions",
+                button {
+                    r#type: "submit",
+                    class: "btn btn-primary btn-sm",
+                    disabled: !dirty || *busy.read(),
+                    SaveLabel { busy: *busy.read(), label: "Save stages".to_string() }
+                }
+                button {
+                    r#type: "button",
+                    class: "btn btn-secondary btn-sm",
+                    disabled: !dirty || *busy.read(),
+                    onclick: {
+                        let cfg = cfg.clone();
+                        move |_| draft.set(cfg.clone())
+                    },
+                    "Undo changes"
+                }
+                if *saved_note.read() && !dirty {
+                    span { class: "save-state", role: "status", "Saved" }
+                }
+            }
+        }
+    }
+}
+
 /// The retrieval pipeline: its stages, its budget (editable), and Reset to default.
 #[component]
 fn PipelineSection(settings: Settings) -> Element {
@@ -1080,18 +1331,12 @@ fn PipelineSection(settings: Settings) -> Element {
     let reset_busy = use_signal(|| false);
     let dirty = *fields.read() != initial;
     let is_default = reset_pipeline(&cfg) == cfg;
-    let rows = pipeline_rows(&cfg);
 
     rsx! {
         section { class: "set-sec",
             h2 { "Pipeline" }
             p { class: "help", "How the service finds passages in your sources and packs them for lessons, outlines and the agent's search. The budget is a share of each model's context window, not a fixed size." }
-            div { class: "kv", "aria-label": "Stages",
-                for (label, value) in rows {
-                    span { key: "{label}", "{label}" }
-                    span { class: "mono", "{value}" }
-                }
-            }
+            StagePicker { cfg: cfg.clone() }
             form {
                 style: "display: grid; gap: 14px",
                 novalidate: true,
@@ -2404,6 +2649,120 @@ mod tests {
         let reset = html.find("Reset to default…").unwrap();
         let button = &html[html[..reset].rfind("<button").unwrap()..reset];
         assert!(!button.contains("disabled"), "{button}");
+    }
+
+    #[test]
+    fn ai_pane_picks_the_pipelines_stages() {
+        use crate::store::LibraryState;
+        let variants = crate::fake::fake_pipeline_variants();
+        let mut settings = crate::fake::FakeState::new().settings;
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        lib.settings = Some(settings.clone());
+        lib.pipeline_variants = Some(variants.clone());
+        let html =
+            crate::ui::test_render::render_with_settings("/", lib.clone(), Some(SettingsPane::Ai));
+        // The variant picker, at the default's "baseline"; one the service can't build is
+        // offered but disabled.
+        assert!(html.contains(r#"id="pl-variant""#), "{html}");
+        assert!(
+            html.contains(r#"<option value="baseline" selected"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<option value="hybrid""#));
+        let listwise = html.find(r#"<option value="listwise""#).unwrap();
+        let tag = &html[listwise..listwise + html[listwise..].find('>').unwrap()];
+        assert!(tag.contains("disabled"), "{tag}");
+        assert!(html.contains("listwise (not on this service)"));
+        assert!(!html.contains(">Custom<"));
+        // A picker per stage with every registered name, the current one chosen.
+        for kind in STAGE_KINDS {
+            assert!(html.contains(&format!(r#"id="pl-stage-{kind}""#)), "{kind}");
+            assert!(html.contains(&format!(">{}<", stage_label(kind))));
+            assert!(html.contains(&stage_help(kind).replace('\'', "&#39;")));
+            for name in &variants.stages[kind] {
+                assert!(
+                    html.contains(&format!(r#"<option value="{name}""#)),
+                    "{name}"
+                );
+            }
+        }
+        assert!(html.contains(r#"<option value="hybrid-rrf" selected"#));
+        assert!(html.contains(&settings.pipeline.hash()));
+        // Nothing picked yet: Save and Undo have nothing to do.
+        let save = html.find("Save stages").unwrap();
+        let button = &html[html[..save].rfind("<button").unwrap()..save];
+        assert!(button.contains("disabled"), "{button}");
+
+        // Stages no variant has: "Custom", and a name the service lacks is still shown.
+        settings.pipeline = settings
+            .pipeline
+            .with_stage("packer", "take-k")
+            .with_stage("reranker", "cross-v9");
+        lib.settings = Some(settings.clone());
+        let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
+        assert!(html.contains(r#"<option value="" selected"#), "{html}");
+        assert!(html.contains(">Custom<"));
+        assert!(html.contains(r#"<option value="take-k" selected"#));
+        assert!(html.contains("cross-v9 (not on this service)"));
+    }
+
+    #[test]
+    fn stage_choices_and_what_save_sends() {
+        let variants = crate::fake::fake_pipeline_variants();
+        let mut saved = PipelineConfig::default();
+        saved.budget.images_max = 3;
+        saved.routes.small = Some("gpt-6-luna".into());
+        assert_eq!(
+            current_variant(&saved, &variants).map(|v| v.name.as_str()),
+            Some("baseline")
+        );
+        let hybrid = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "hybrid")
+            .unwrap();
+        let draft = saved.with_stages_of(&hybrid.config);
+        assert_eq!(
+            current_variant(&draft, &variants).map(|v| v.name.as_str()),
+            Some("hybrid")
+        );
+        // Save sends the variant's stages (with their params) and keeps routes and budget.
+        let patch = stages_patch(&saved, &draft).unwrap();
+        let sent = patch.pipeline.unwrap();
+        assert_eq!(sent.retriever, hybrid.config.retriever);
+        assert_eq!(sent.retriever.params["dense_weight"], 2.0);
+        assert_eq!(sent.budget, saved.budget);
+        assert_eq!(sent.routes, saved.routes);
+        assert_eq!(stages_patch(&saved, &saved.clone()), None);
+        // A budget saved since the draft was made isn't undone by saving the stages.
+        let mut newer = saved.clone();
+        newer.budget.images_max = 9;
+        assert_eq!(
+            stages_patch(&newer, &draft)
+                .unwrap()
+                .pipeline
+                .unwrap()
+                .budget
+                .images_max,
+            9
+        );
+        // Options: registered names, plus the current one when the service lacks it.
+        let opts = stage_options("packer", "mmr-v1", &variants);
+        assert_eq!(
+            opts.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+            ["mmr-v1", "take-k"]
+        );
+        let opts = stage_options("reranker", "cross-v9", &variants);
+        assert_eq!(
+            opts[0],
+            (
+                "cross-v9".to_string(),
+                "cross-v9 (not on this service)".to_string()
+            )
+        );
+        // The picker's key ignores routes and budget.
+        assert_eq!(stages_key(&saved), stages_key(&PipelineConfig::default()));
+        assert_ne!(stages_key(&saved), stages_key(&draft));
     }
 
     #[test]

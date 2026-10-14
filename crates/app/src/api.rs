@@ -300,6 +300,11 @@ impl Api {
         self.patch(routes::SETTINGS, body).await
     }
 
+    /// The stages and named variants Settings can pick the pipeline from.
+    pub async fn pipeline_variants(&self) -> ApiResult<margin_shared::pipeline::PipelineVariants> {
+        self.get(routes::PIPELINE_VARIANTS).await
+    }
+
     pub async fn tools(&self) -> ApiResult<Vec<ToolStatus>> {
         self.get(routes::TOOLS).await
     }
@@ -1799,7 +1804,7 @@ mod tests {
     #[tokio::test]
     async fn model_slots_pipeline_budget_and_trace_retention() {
         use crate::ui::settings::{
-            budget_fields, parse_budget, reset_pipeline, slot_value, slots_patch,
+            budget_fields, parse_budget, reset_pipeline, slot_value, slots_patch, stages_patch,
         };
         use margin_shared::pipeline::{Budget, PipelineConfig, Route, StageCfg};
         let fake = FakeService::start().await;
@@ -1876,6 +1881,41 @@ mod tests {
         assert_eq!(settings.pipeline.budget, Budget::default());
         assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
         assert_eq!(reset_pipeline(&settings.pipeline), settings.pipeline);
+
+        // The stage picker: the service's choices, a variant picked and one stage changed.
+        let variants = api.pipeline_variants().await.unwrap();
+        for kind in margin_shared::pipeline::STAGE_KINDS {
+            assert!(!variants.stages[kind].is_empty(), "{kind}");
+        }
+        let hybrid = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "hybrid")
+            .unwrap();
+        let draft = settings
+            .pipeline
+            .with_stages_of(&hybrid.config)
+            .with_stage("packer", "take-k");
+        let settings = api
+            .patch_settings(&stages_patch(&settings.pipeline, &draft).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.retriever, hybrid.config.retriever);
+        assert_eq!(settings.pipeline.fusion.name, "linear");
+        assert_eq!(settings.pipeline.packer.name, "take-k");
+        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
+        // A variant naming a stage the service lacks is refused like any other.
+        let listwise = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "listwise")
+            .unwrap();
+        assert!(listwise.unavailable.is_some());
+        let err = api
+            .patch_settings(&stages_patch(&settings.pipeline, &listwise.config).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "bad_pipeline");
 
         // Trace retention, in range or refused.
         let settings = api

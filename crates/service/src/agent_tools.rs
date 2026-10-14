@@ -98,8 +98,7 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     // device (`sync_folder`); a folder's files are read on the service.
     for tool in margin_agent::device_tools() {
         let name = tool.name();
-        let device_folder_call =
-            name == SYNC_FOLDER && margin_agent::FOLDER_TOOLS.contains(&name);
+        let device_folder_call = name == SYNC_FOLDER && margin_agent::FOLDER_TOOLS.contains(&name);
         if margin_agent::APP_CONTROL_TOOLS.contains(&name) || device_folder_call {
             r.register(tool);
         }
@@ -864,7 +863,8 @@ fn search_output(
         }
         if !unread.is_empty() {
             // A folder still being read can name hundreds of files.
-            let mut names: Vec<String> = unread.iter().take(STILL_BEING_READ_MAX).cloned().collect();
+            let mut names: Vec<String> =
+                unread.iter().take(STILL_BEING_READ_MAX).cloned().collect();
             if unread.len() > STILL_BEING_READ_MAX {
                 names.push(format!("and {} more", unread.len() - STILL_BEING_READ_MAX));
             }
@@ -1271,27 +1271,6 @@ async fn picture_for_model(state: &AppState, c: &Citation) -> Option<margin_ai::
     }
 }
 
-/// `ToolOutput::with_image` until `margin_agent` has it (the 4-agent area adds
-/// `ToolOutput.images` and the inherent method, which takes precedence over this trait
-/// once merged; the integrator then deletes this shim). Without it a picture can't
-/// reach the model, so it is dropped here and the output keeps its text and card.
-#[allow(dead_code)]
-trait WithImageShim: Sized {
-    fn with_image(self, image: margin_ai::Image) -> Self;
-}
-
-#[allow(dead_code)]
-impl WithImageShim for ToolOutput {
-    fn with_image(self, image: margin_ai::Image) -> Self {
-        tracing::debug!(
-            "a {} picture of {} bytes isn't sent: this margin_agent has no ToolOutput.images",
-            image.media_type,
-            image.data.len()
-        );
-        self
-    }
-}
-
 /// The card title of a picture shown by `view_picture`.
 fn summary_query(c: &Citation) -> String {
     match c.page {
@@ -1418,9 +1397,11 @@ fn folder_path(path: Option<&str>) -> Result<String, ToolOutput> {
 fn file_json(f: &folders::FileView, under: &str, device: &str) -> Value {
     let path = match under {
         "" => f.row.path.as_str(),
-        u => f.row.path.strip_prefix(u).map_or(f.row.path.as_str(), |p| {
-            p.strip_prefix('/').unwrap_or(p)
-        }),
+        u => f
+            .row
+            .path
+            .strip_prefix(u)
+            .map_or(f.row.path.as_str(), |p| p.strip_prefix('/').unwrap_or(p)),
     };
     let mut v = json!({
         "path": path,

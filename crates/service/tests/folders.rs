@@ -8,7 +8,7 @@
 //! picture; the scripted model plays the agent. Manifests carry real SHA-256 stamps of
 //! the test bytes.
 //!
-//! Not here, because they need the 4-agent area's `margin_agent` (`sync_folder`,
+//! The last two need the 4-agent area's `margin_agent` (`sync_folder`,
 //! `ToolOutput.images`): `sync_folder` in `tool_choice` and its device round trip
 //! (D13 test 3), and `view_picture`'s `input_image` item in the stored `model_items`
 //! and the next request (the pixels part of test 1).
@@ -111,7 +111,11 @@ async fn upload_file(
     if !in_parts && bytes.len() as u64 <= UPLOAD_PART_BYTES {
         return h
             .post(t, routes::SOURCES)
-            .query(&[("name", path), ("workspace_id", ws), ("modified", &modified)])
+            .query(&[
+                ("name", path),
+                ("workspace_id", ws),
+                ("modified", &modified),
+            ])
             .body(bytes.to_vec())
             .send()
             .await
@@ -196,7 +200,9 @@ async fn rows(h: &Harness, ws: &str) -> Vec<FolderFileRow> {
 }
 
 async fn document(h: &Harness, id: &str) -> Option<Document> {
-    margin_service::ingest::document(&h.state, id).await.unwrap()
+    margin_service::ingest::document(&h.state, id)
+        .await
+        .unwrap()
 }
 
 async fn chat_detail(h: &Harness, t: &str, id: &str) -> ChatDetail {
@@ -260,9 +266,16 @@ fn tool_ctx(chat_id: &str, workspaces: Vec<Workspace>) -> ToolContext {
 }
 
 /// Runs a service tool directly.
-async fn run_tool(h: &Harness, ctx: &ToolContext, name: &str, args: Value) -> margin_agent::ToolOutput {
+async fn run_tool(
+    h: &Harness,
+    ctx: &ToolContext,
+    name: &str,
+    args: Value,
+) -> margin_agent::ToolOutput {
     let registry = margin_service::agent_tools::registry(&h.state);
-    let tool = registry.get(name).unwrap_or_else(|| panic!("no tool {name}"));
+    let tool = registry
+        .get(name)
+        .unwrap_or_else(|| panic!("no tool {name}"));
     tool.run(ctx, args).await
 }
 
@@ -382,7 +395,10 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     assert!(listed_files.iter().all(|s| s.media_url.is_some()));
     assert!(matches!(
         by_name(&listed_files, "paper.pdf").status,
-        SourceStatus::Ready { pages: Some(12), .. }
+        SourceStatus::Ready {
+            pages: Some(12),
+            ..
+        }
     ));
     let lib = library(&h, &t).await;
     assert!(lib.sources.is_empty(), "{:?}", lib.sources);
@@ -515,14 +531,19 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     let out = output_sent(&h, "call_other");
     let msg = out.to_string();
     assert!(
-        msg.contains("No folder attached to this chat has the workspace_id “nope”. Attached: “notes”"),
+        msg.contains(
+            "No folder attached to this chat has the workspace_id “nope”. Attached: “notes”"
+        ),
         "{msg}"
     );
     // Nothing went to the device.
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), socket.next_directed())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            socket.next_directed()
+        )
+        .await
+        .is_err(),
         "a request reached the device"
     );
 
@@ -540,7 +561,10 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     let tools = offered(&agent.requests()[n]);
     assert!(tools.iter().any(|n| n == "search"));
     for name in ["list_files", "find_files", "sync_folder"] {
-        assert!(!tools.iter().any(|n| n == name), "{name} offered: {tools:?}");
+        assert!(
+            !tools.iter().any(|n| n == name),
+            "{name} offered: {tools:?}"
+        );
     }
 
     // Turn 2: a course in the chat draws on the folder.
@@ -569,7 +593,13 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     let d = eventually(|| async {
         let d = chat_detail(&h, &t, &chat.chat.id).await;
         let carded = d.items.iter().any(|i| {
-            matches!(&i.kind, ChatItemKind::Card { card: Card::Outline(_), .. })
+            matches!(
+                &i.kind,
+                ChatItemKind::Card {
+                    card: Card::Outline(_),
+                    ..
+                }
+            )
         });
         (d.chat.state == ChatState::Idle && carded).then_some(d)
     })
@@ -612,8 +642,17 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     })
     .await;
     // Accepting moved no folder file into the topic.
-    assert!(files(&h, &t, &ws.id).await.iter().all(|s| s.topic_id.is_none()));
-    let folder_cites: Vec<&Citation> = lesson.citations.iter().filter(|c| c.file.is_some()).collect();
+    assert!(
+        files(&h, &t, &ws.id)
+            .await
+            .iter()
+            .all(|s| s.topic_id.is_none())
+    );
+    let folder_cites: Vec<&Citation> = lesson
+        .citations
+        .iter()
+        .filter(|c| c.file.is_some())
+        .collect();
     assert!(!folder_cites.is_empty(), "{:?}", lesson.citations);
     let page = lesson
         .citations
@@ -656,7 +695,12 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
         })
     })
     .await;
-    assert!(again.citations.iter().any(|c| c.source_id == pdf.id && c.file.is_some()));
+    assert!(
+        again
+            .citations
+            .iter()
+            .any(|c| c.source_id == pdf.id && c.file.is_some())
+    );
     let _ = fig;
 }
 
@@ -724,6 +768,7 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
                     workspace_id: ws.id.clone(),
                     path: "figure.png".into(),
                 }),
+                section_path: None,
             }],
         },
         proposal_id: None,
@@ -734,7 +779,11 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
         with_quiz: false,
         workspace_ids: vec![ws.id.clone()],
     };
-    h.state.store.put(db::LESSON, "l-fig", &cited).await.unwrap();
+    h.state
+        .store
+        .put(db::LESSON, "l-fig", &cited)
+        .await
+        .unwrap();
     let fig_url = library(&h, &t).await.lessons[0].citations[0]
         .image_url
         .clone()
@@ -773,7 +822,14 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
         .unwrap();
     assert!(changes.deleted.contains(&fig.id));
     // The changed file is still searchable until its new copy lands.
-    assert!(!h.state.store.passages_of(&intro.id).await.unwrap().is_empty());
+    assert!(
+        !h.state
+            .store
+            .passages_of(&intro.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // The lesson keeps its citation; the picture is gone.
     let lesson = library(&h, &t).await.lessons.remove(0);
     assert_eq!(lesson.citations[0].excerpt, "a green leaf");
@@ -792,19 +848,20 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
     .await;
     assert_eq!(doc.id, intro.id);
     let now_rows = h.state.store.passages_of(&intro.id).await.unwrap();
-    assert!(now_rows.iter().any(|r| r.id == kept_row.id), "the unchanged passage kept its id");
+    assert!(
+        now_rows.iter().any(|r| r.id == kept_row.id),
+        "the unchanged passage kept its id"
+    );
     assert!(now_rows.iter().all(|r| r.id != changed_row.id));
     assert!(now_rows.iter().any(|r| r.text.contains("Stomata")));
-    let on_disk = std::fs::read_to_string(h.data_dir.join("sources").join(&intro.id).join("file"))
-        .unwrap();
+    let on_disk =
+        std::fs::read_to_string(h.data_dir.join("sources").join(&intro.id).join("file")).unwrap();
     assert_eq!(on_disk, intro2);
     // The figure can't be found any more.
-    let resolved = margin_service::retrieval::resolve(
-        &h.state.store,
-        &Scope::Workspace { id: ws.id.clone() },
-    )
-    .await
-    .unwrap();
+    let resolved =
+        margin_service::retrieval::resolve(&h.state.store, &Scope::Workspace { id: ws.id.clone() })
+            .await
+            .unwrap();
     assert!(!resolved.source_ids.contains(&fig.id));
     assert_eq!(files(&h, &t, &ws.id).await.len(), 3);
 
@@ -879,7 +936,11 @@ async fn folder_uploads_are_checked() {
         .unwrap();
     let r = h
         .post(&t, routes::SOURCES)
-        .query(&[("name", "a.md"), ("workspace_id", &ws.id), ("topic_id", &topic.id)])
+        .query(&[
+            ("name", "a.md"),
+            ("workspace_id", &ws.id),
+            ("topic_id", &topic.id),
+        ])
         .body("hi")
         .send()
         .await
@@ -896,14 +957,21 @@ async fn folder_uploads_are_checked() {
     // The folder query value is ignored: the folder's name is used.
     let r = h
         .post(&t, routes::SOURCES)
-        .query(&[("name", "sub/a.md"), ("workspace_id", &ws.id), ("folder", "other")])
+        .query(&[
+            ("name", "sub/a.md"),
+            ("workspace_id", &ws.id),
+            ("folder", "other"),
+        ])
         .body("hi")
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
     let s: Source = r.json().await.unwrap();
-    assert_eq!((s.folder.as_deref(), s.name.as_str()), (Some("notes"), "sub/a.md"));
+    assert_eq!(
+        (s.folder.as_deref(), s.name.as_str()),
+        (Some("notes"), "sub/a.md")
+    );
 
     // No size limit for a folder's files (in parts), but the topic limit stands.
     let big = {
@@ -963,7 +1031,10 @@ async fn folder_files_stay_out_of_topics_and_chats_and_go_with_their_folder() {
         .unwrap();
     let (status, err) = api_error(r).await;
     assert_eq!((status, err.code.as_str()), (400, "unknown_source"));
-    assert_eq!(err.message, "That file belongs to a folder; attach the folder instead.");
+    assert_eq!(
+        err.message,
+        "That file belongs to a folder; attach the folder instead."
+    );
     let ctx = tool_ctx(&chat.chat.id, vec![ws.clone()]);
     let out = run_tool(&h, &ctx, "list_sources", json!({"topic_id": null})).await;
     assert!(out.ok);
@@ -986,11 +1057,26 @@ async fn folder_files_stay_out_of_topics_and_chats_and_go_with_their_folder() {
     )
     .await;
     assert!(!out.ok, "{}", out.output);
-    assert!(files(&h, &t, &ws.id).await.iter().all(|s| s.topic_id.is_none()));
+    assert!(
+        files(&h, &t, &ws.id)
+            .await
+            .iter()
+            .all(|s| s.topic_id.is_none())
+    );
 
     // A sub-folder listing, a bad path and a bad pattern.
-    let out = run_tool(&h, &ctx, "list_files", json!({"workspace_id": ws.id, "path": "../x"})).await;
-    assert!(out.output.contains("isn't a path inside the folder"), "{}", out.output);
+    let out = run_tool(
+        &h,
+        &ctx,
+        "list_files",
+        json!({"workspace_id": ws.id, "path": "../x"}),
+    )
+    .await;
+    assert!(
+        out.output.contains("isn't a path inside the folder"),
+        "{}",
+        out.output
+    );
     let out = run_tool(
         &h,
         &ctx,
@@ -998,12 +1084,23 @@ async fn folder_files_stay_out_of_topics_and_chats_and_go_with_their_folder() {
         json!({"workspace_id": ws.id, "path": null, "pattern": "["}),
     )
     .await;
-    assert!(out.output.contains("isn't a valid pattern"), "{}", out.output);
-    let none = tool_ctx(&chat.chat.id, vec![]);
-    let out = run_tool(&h, &none, "list_files", json!({"workspace_id": ws.id, "path": null})).await;
     assert!(
+        out.output.contains("isn't a valid pattern"),
+        "{}",
         out.output
-            .contains("No folder is attached to this chat. The owner can attach one with Attach folder."),
+    );
+    let none = tool_ctx(&chat.chat.id, vec![]);
+    let out = run_tool(
+        &h,
+        &none,
+        "list_files",
+        json!({"workspace_id": ws.id, "path": null}),
+    )
+    .await;
+    assert!(
+        out.output.contains(
+            "No folder is attached to this chat. The owner can attach one with Attach folder."
+        ),
         "{}",
         out.output
     );
@@ -1054,7 +1151,14 @@ async fn folder_files_stay_out_of_topics_and_chats_and_go_with_their_folder() {
         assert!(!h.data_dir.join("sources").join(id).exists());
     }
     assert!(rows(&h, &ws.id).await.is_empty());
-    assert_eq!(h.get(&t, &routes::workspace_files(&ws.id)).send().await.unwrap().status(), 404);
+    assert_eq!(
+        h.get(&t, &routes::workspace_files(&ws.id))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1066,7 +1170,14 @@ async fn revoking_the_holding_device_deletes_its_folders_files() {
     sync(&h, &mac, &ws.id, vec![listed("a.md", b"Roots grow down.")]).await;
     let s = upload_ok(&h, &mac, &ws.id, "a.md", b"Roots grow down.").await;
     folder_read(&h, &mac, &ws.id, 1).await;
-    let me: Value = h.get(&mac, routes::ME).send().await.unwrap().json().await.unwrap();
+    let me: Value = h
+        .get(&mac, routes::ME)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let device_id = me["device"]["id"]
         .as_str()
         .or_else(|| me["id"].as_str())
@@ -1137,7 +1248,10 @@ async fn a_chat_file_is_read_before_queued_folder_files() {
         }
     }
     let chat_at = ready.iter().position(|id| *id == chat_file.id).unwrap();
-    assert!(chat_at <= 1, "the chat file was read {chat_at}th: {ready:?}");
+    assert!(
+        chat_at <= 1,
+        "the chat file was read {chat_at}th: {ready:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,16 +1262,28 @@ async fn a_chat_file_is_read_before_queued_folder_files() {
 async fn a_folders_passages_are_found_through_that_folder_only() {
     let (h, t, a) = synced_notes().await;
     let b = new_folder(&h, &t, "other").await;
-    sync(&h, &t, &b.id, vec![listed("b.md", b"Glaciers move slowly.")]).await;
+    sync(
+        &h,
+        &t,
+        &b.id,
+        vec![listed("b.md", b"Glaciers move slowly.")],
+    )
+    .await;
     let other = upload_ok(&h, &t, &b.id, "b.md", b"Glaciers move slowly.").await;
     folder_read(&h, &t, &b.id, 1).await;
-    let a_files: HashSet<String> = files(&h, &t, &a.id).await.into_iter().map(|s| s.id).collect();
-    let in_a = margin_service::retrieval::resolve(&h.state.store, &Scope::Workspace { id: a.id.clone() })
+    let a_files: HashSet<String> = files(&h, &t, &a.id)
         .await
-        .unwrap();
-    let in_b = margin_service::retrieval::resolve(&h.state.store, &Scope::Workspace { id: b.id.clone() })
-        .await
-        .unwrap();
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let in_a =
+        margin_service::retrieval::resolve(&h.state.store, &Scope::Workspace { id: a.id.clone() })
+            .await
+            .unwrap();
+    let in_b =
+        margin_service::retrieval::resolve(&h.state.store, &Scope::Workspace { id: b.id.clone() })
+            .await
+            .unwrap();
     for id in &a_files {
         assert!(in_a.source_ids.contains(id));
         assert!(!in_b.source_ids.contains(id));
@@ -1167,26 +1293,34 @@ async fn a_folders_passages_are_found_through_that_folder_only() {
     // And through the context API, the same.
     let hits: Vec<margin_shared::context::Hit> = h
         .post(&t, routes::CONTEXT_SEARCH)
-        .json(&json!({"text": "glaciers move", "scope": {"scope": "workspace", "id": a.id}, "k": 8}))
+        .json(
+            &json!({"text": "glaciers move", "scope": {"scope": "workspace", "id": a.id}, "k": 8}),
+        )
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert!(hits.iter().all(|hit| a_files.contains(&hit.document_id)), "{hits:?}");
+    assert!(
+        hits.iter().all(|hit| a_files.contains(&hit.document_id)),
+        "{hits:?}"
+    );
     let _: Option<Chat> = None;
 }
 
 // ---------------------------------------------------------------------------
-// Needing 4-agent's margin_agent (`sync_folder`, `ToolOutput.images`): ignored until
-// agent/p4-agent is merged; the integrator removes the `ignore`s then.
+// Needing 4-agent's margin_agent (`sync_folder`, `ToolOutput.images`).
 // ---------------------------------------------------------------------------
 
 /// A chat with `ws` attached whose model makes `calls` then answers; waits for it.
 async fn folder_turn(h: &Harness, t: &str, ws: &str, calls: &[(&str, &str, &str)]) -> ChatDetail {
-    h.generator.agent.push(Scripted::Events(tool_calls_reply(calls)));
-    h.generator.agent.push(Scripted::Events(text_reply(&["Done."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(tool_calls_reply(calls)));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Done."])));
     let r = h
         .post(t, "/api/chats")
         .json(&json!({"workspace_ids": [ws], "message": {"text": "Look at my folder"}}))
@@ -1201,7 +1335,6 @@ async fn folder_turn(h: &Harness, t: &str, ws: &str, calls: &[(&str, &str, &str)
 /// D13 test 3: `sync_folder` goes to the holding device; offline and unattached folders
 /// get their texts.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs agent/p4-agent"]
 async fn sync_folder_asks_the_holding_device() {
     let h = start().await;
     let t = h.sign_in("MacBook Pro").await;
@@ -1227,8 +1360,7 @@ async fn sync_folder_asks_the_holding_device() {
                 request_id: request.request_id,
                 result: margin_shared::DeviceToolResult::Ok {
                     output: margin_shared::DeviceToolOutput::Done {
-                        message: "Synced “notes”: 3 files to send, 1 removed; sending now."
-                            .into(),
+                        message: "Synced “notes”: 3 files to send, 1 removed; sending now.".into(),
                     },
                 },
             })
@@ -1242,7 +1374,10 @@ async fn sync_folder_asks_the_holding_device() {
     assert!(d.items.iter().any(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, ok: true, .. } if call_id == "call_sync")));
     let offered_tools = offered(&h.generator.agent.requests()[0]);
     for name in ["list_files", "find_files", "sync_folder"] {
-        assert!(offered_tools.iter().any(|n| n == name), "{name}: {offered_tools:?}");
+        assert!(
+            offered_tools.iter().any(|n| n == name),
+            "{name}: {offered_tools:?}"
+        );
     }
 
     // With the device gone: the offline text.
@@ -1258,7 +1393,11 @@ async fn sync_folder_asks_the_holding_device() {
         &h,
         &t,
         &ws.id,
-        &[("call_bad", "sync_folder", &json!({"workspace_id": "nope"}).to_string())],
+        &[(
+            "call_bad",
+            "sync_folder",
+            &json!({"workspace_id": "nope"}).to_string(),
+        )],
     )
     .await;
     let out = output_sent(&h, "call_bad").to_string();
@@ -1271,7 +1410,6 @@ async fn sync_folder_asks_the_holding_device() {
 /// D13 test 1, the pixels: `view_picture` stores a user message with the picture right
 /// after its `function_call_output`, and the next request carries it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs agent/p4-agent"]
 async fn view_picture_sends_the_picture_to_the_model() {
     let (h, t, ws) = synced_notes().await;
     let pdf = by_name(&files(&h, &t, &ws.id).await, "paper.pdf").clone();

@@ -25,7 +25,9 @@
 //!   `RENDER_VIEWER=folder` (or `folder-gone`) on a passage of a folder's PDF (or of a
 //!   file whose folder was removed).
 //! - `RENDER_PIPELINE=changed` sets the three model slots and a changed pipeline budget
-//!   (Settings → AI, `RENDER_SETTINGS=ai`; Reset to default is offered then).
+//!   (Settings → AI, `RENDER_SETTINGS=ai`; Reset to default is offered then), and the
+//!   hybrid variant's stages with `take-k` packing ("Custom" in the variant picker).
+//!   Settings → AI always shows the stage pickers, over the fake's variants.
 //! - `RENDER_SETTINGS=advanced` shows trace retention.
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
@@ -148,7 +150,15 @@ fn Harness(props: HarnessProps) -> Element {
             settings.pipeline.routes.small = Some("gpt-6-luna".into());
             settings.pipeline.budget.share_of_window = 0.75;
             settings.pipeline.budget.images_max = 24;
+            let variants = fake::fake_pipeline_variants();
+            if let Some(hybrid) = variants.variants.iter().find(|v| v.name == "hybrid") {
+                settings.pipeline = settings
+                    .pipeline
+                    .with_stages_of(&hybrid.config)
+                    .with_stage("packer", "take-k");
+            }
         }
+        lib.pipeline_variants = Some(fake::fake_pipeline_variants());
         // The text and code sources' originals, so the viewer shows their cited lines
         // (the fetch it would make doesn't run here).
         for source in lib.sources.values() {

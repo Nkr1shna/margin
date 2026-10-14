@@ -108,10 +108,21 @@ async fn condense_calls_go_to_the_small_route() {
 async fn the_pipeline_variants_are_listed() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
-    let r = h.get(&t, "/api/pipeline/variants").send().await.unwrap();
+    let r = h
+        .get(&t, margin_shared::routes::PIPELINE_VARIANTS)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let v: PipelineVariants = r.json().await.unwrap();
-    for kind in ["chunker", "retriever", "fusion", "reranker", "packer", "prompts"] {
+    for kind in [
+        "chunker",
+        "retriever",
+        "fusion",
+        "reranker",
+        "packer",
+        "prompts",
+    ] {
         assert!(!v.stages[kind].is_empty(), "no {kind}");
     }
     assert!(v.stages["retriever"].contains(&"hybrid-linear".to_string()));

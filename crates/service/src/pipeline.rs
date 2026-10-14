@@ -391,15 +391,14 @@ impl Reranker for NoRerank {
 /// The first `k` hits, each its own passage, no budget or dedup.
 pub struct TakeK;
 
-/// The citation of one hit (`n` 0 until cited; `source_id` is the document id).
 /// The section a hit is in ("Chapter 2 > Fourier series"), for its citation; `None`
-/// when the chunker named none. `hit_citation` sets `Citation.section_path` to this
-/// once crates/shared adds the field (`section_path: citation_section_path(hit),`).
+/// when the chunker named none.
 pub fn citation_section_path(hit: &Hit) -> Option<String> {
     let s = hit.passage.section_path.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// The citation of one hit (`n` 0 until cited; `source_id` is the document id).
 pub fn hit_citation(hit: &Hit) -> Citation {
     let p = &hit.passage;
     Citation {
@@ -420,6 +419,7 @@ pub fn hit_citation(hit: &Hit) -> Citation {
         start_line: p.start_line.map(|v| v as u32),
         end_line: p.end_line.map(|v| v as u32),
         file: None,
+        section_path: citation_section_path(hit),
     }
 }
 
@@ -633,6 +633,10 @@ mod tests {
         h.passage.section_path = " Chapter 2 > Fourier series ".into();
         assert_eq!(
             citation_section_path(&h).as_deref(),
+            Some("Chapter 2 > Fourier series")
+        );
+        assert_eq!(
+            hit_citation(&h).section_path.as_deref(),
             Some("Chapter 2 > Fourier series")
         );
     }

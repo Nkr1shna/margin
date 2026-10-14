@@ -7,11 +7,11 @@
 
 use std::path::PathBuf;
 
-use axum::{Extension, Json};
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use margin_shared::{Id, Source, SourceUpload, routes::UPLOAD_PART_BYTES};
 use serde::{Deserialize, Serialize};
@@ -280,8 +280,7 @@ pub async fn finish(State(state): State<AppState>, Path(id): Path<Id>) -> AppRes
             )));
         }
     };
-    let source =
-        sources::create_or_replace(&state, &source_id, meta.upload, have, sha256).await?;
+    let source = sources::create_or_replace(&state, &source_id, meta.upload, have, sha256).await?;
     Ok(Json(source))
 }
 

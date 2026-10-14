@@ -379,6 +379,10 @@ pub struct Citation {
     /// `source_name` reads "`folder`/`path`").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<WorkspaceFile>,
+    /// The section the passage is in, as the chunker named it ("Chapter 2 > Fourier
+    /// series"); `None` when it named none, and on citations written before sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

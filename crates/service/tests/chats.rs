@@ -660,6 +660,7 @@ async fn read_tools_answer_from_the_library() {
                 start_line: None,
                 end_line: None,
                 file: None,
+                section_path: None,
             }],
         },
         proposal_id: None,

@@ -276,7 +276,9 @@ async fn hybrid_linear_weighs_both_legs_inside_the_scope() {
     cfg.retriever
         .params
         .insert("lex_weight".into(), serde_json::json!(0.0));
-    let r = crate::pipeline::Pipeline::build(&cfg, &reg).unwrap().retriever;
+    let r = crate::pipeline::Pipeline::build(&cfg, &reg)
+        .unwrap()
+        .retriever;
     let hits = r
         .search(&query("entropy", unit(0), Scope::Topic { id: "t1".into() }))
         .await

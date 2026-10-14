@@ -28,7 +28,7 @@ pub enum Plan {
     /// Open the lesson (`Route::LessonRead`) with the source viewer on a citation.
     Citation(SourceViewer),
     /// Open the source viewer on this passage.
-    Passage(Citation),
+    Passage(Box<Citation>),
     /// Show (`Some(true)`), hide or toggle (`None`) the sidebar.
     Sidebar(Option<bool>),
 }
@@ -82,7 +82,7 @@ pub fn plan(
                 Some(at) => format!("Opened “{}” at {at}.", passage.source_name),
                 None => format!("Opened “{}”.", passage.source_name),
             };
-            Ok((Plan::Passage(passage), message))
+            Ok((Plan::Passage(Box::new(passage)), message))
         }
         DeviceToolCall::ToggleSidebar { visible } => Ok((Plan::Sidebar(*visible), String::new())),
         DeviceToolCall::ListFiles { .. }
@@ -204,6 +204,7 @@ fn passage(
             start_line: None,
             end_line: None,
             file: None,
+            section_path: None,
         },
     };
     shown.n = 1;
@@ -283,7 +284,7 @@ async fn run(
         }
         Plan::Passage(passage) => {
             app.source_viewer.set(None);
-            app.shown_passage.set(Some(passage));
+            app.shown_passage.set(Some(*passage));
             message
         }
         Plan::Sidebar(visible) => {
@@ -346,6 +347,7 @@ mod tests {
             start_line: None,
             end_line: None,
             file: None,
+            section_path: None,
         }
     }
 

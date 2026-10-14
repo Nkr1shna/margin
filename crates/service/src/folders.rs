@@ -490,7 +490,10 @@ pub fn emit_changed(state: &AppState, ws: Workspace) {
 
 /// Deletes a folder's sources (each with its document, passages and file) and rows.
 /// Call with the write lock held; returns the events to send.
-pub async fn delete_files_locked(state: &AppState, workspace_id: &str) -> anyhow::Result<Vec<Event>> {
+pub async fn delete_files_locked(
+    state: &AppState,
+    workspace_id: &str,
+) -> anyhow::Result<Vec<Event>> {
     let mut events = Vec::new();
     for s in sources_of(state, workspace_id).await? {
         events.push(sources::delete_locked(state, &s.id).await?);
@@ -523,7 +526,10 @@ pub struct FileView {
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// A subfolder (its path ends with `/`) and how many files are under it.
-    Folder { path: String, files: u32 },
+    Folder {
+        path: String,
+        files: u32,
+    },
     File(Box<FileView>),
 }
 
@@ -765,7 +771,10 @@ mod tests {
         rows[0].source_id = Some("s1".into());
         rows[0].received = Some(rows[0].listed.clone());
         let c = counts(&rows, &[s], None);
-        assert_eq!((c.files, c.bytes, c.uploading, c.reading, c.failed), (1, 10, 1, 1, 0));
+        assert_eq!(
+            (c.files, c.bytes, c.uploading, c.reading, c.failed),
+            (1, 10, 1, 1, 0)
+        );
     }
 
     #[test]
@@ -821,7 +830,11 @@ mod tests {
             paths(find(files.clone(), "ch1", "*.md").unwrap()),
             vec!["ch1/a.md"]
         );
-        assert!(find(files.clone(), "", "[").unwrap_err().contains("isn't a valid pattern"));
+        assert!(
+            find(files.clone(), "", "[")
+                .unwrap_err()
+                .contains("isn't a valid pattern")
+        );
         assert!(has_folder(&files, "ch1/deep"));
         assert!(!has_folder(&files, "ch2"));
     }

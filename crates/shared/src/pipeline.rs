@@ -168,6 +168,89 @@ impl PipelineConfig {
     }
 }
 
+/// The kinds of stage a pipeline is made of, in the order Settings lists them. Each but
+/// "prompts" is a `StageCfg` of `PipelineConfig`; "prompts" is its prompt set's version.
+pub const STAGE_KINDS: [&str; 6] = [
+    "chunker",
+    "retriever",
+    "fusion",
+    "reranker",
+    "packer",
+    "prompts",
+];
+
+impl PipelineConfig {
+    /// The name of the stage of `kind` (one of `STAGE_KINDS`); `None` for another kind.
+    pub fn stage_name(&self, kind: &str) -> Option<&str> {
+        Some(match kind {
+            "chunker" => &self.chunker.name,
+            "retriever" => &self.retriever.name,
+            "fusion" => &self.fusion.name,
+            "reranker" => &self.reranker.name,
+            "packer" => &self.packer.name,
+            "prompts" => &self.prompts,
+            _ => return None,
+        })
+    }
+
+    /// This config with the stage of `kind` named `name`. A stage that changes name
+    /// loses its params (they were the old stage's); the same name keeps them. Another
+    /// kind changes nothing.
+    pub fn with_stage(&self, kind: &str, name: &str) -> PipelineConfig {
+        let mut cfg = self.clone();
+        let stage = match kind {
+            "chunker" => &mut cfg.chunker,
+            "retriever" => &mut cfg.retriever,
+            "fusion" => &mut cfg.fusion,
+            "reranker" => &mut cfg.reranker,
+            "packer" => &mut cfg.packer,
+            "prompts" => {
+                cfg.prompts = name.to_string();
+                return cfg;
+            }
+            _ => return cfg,
+        };
+        if stage.name != name {
+            *stage = StageCfg::named(name);
+        }
+        cfg
+    }
+
+    /// This config's stages and prompts from `variant`; its model routes and budget stay
+    /// (Models and the budget form set those).
+    pub fn with_stages_of(&self, variant: &PipelineConfig) -> PipelineConfig {
+        PipelineConfig {
+            routes: self.routes.clone(),
+            budget: self.budget,
+            ..variant.clone()
+        }
+    }
+
+    /// Whether the stages and prompts are `variant`'s (routes and budget aside).
+    pub fn has_stages_of(&self, variant: &PipelineConfig) -> bool {
+        self.with_stages_of(variant) == *self
+    }
+}
+
+/// `GET routes::PIPELINE_VARIANTS`: what Settings can choose a pipeline from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PipelineVariants {
+    /// The registered stage names per kind (`STAGE_KINDS`), sorted.
+    pub stages: std::collections::BTreeMap<String, Vec<String>>,
+    /// The named variants of `evals/variants/*.toml` that could be read, by name.
+    pub variants: Vec<NamedVariant>,
+}
+
+/// One `evals/variants/<name>.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedVariant {
+    pub name: String,
+    pub config: PipelineConfig,
+    /// Why this service can't build it (a stage it doesn't register); `None` when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
 fn write_canonical(value: &serde_json::Value, out: &mut String) {
     match value {
         serde_json::Value::Object(map) => {
@@ -257,6 +340,35 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(reordered.hash(), cfg.hash());
+    }
+
+    #[test]
+    fn stages_are_set_by_kind() {
+        let mut cfg = PipelineConfig::default();
+        cfg.retriever.params.insert("k".into(), json!(3));
+        cfg.routes.chat = Some("m".into());
+        for kind in STAGE_KINDS {
+            assert!(cfg.stage_name(kind).is_some(), "{kind}");
+        }
+        assert_eq!(cfg.stage_name("nope"), None);
+        // The same name keeps its params; another name drops them.
+        assert_eq!(cfg.with_stage("retriever", "hybrid-rrf"), cfg);
+        let dense = cfg.with_stage("retriever", "dense");
+        assert_eq!(dense.retriever, StageCfg::named("dense"));
+        assert_eq!(
+            dense.with_stage("prompts", "lesson-v3").prompts,
+            "lesson-v3"
+        );
+        assert_eq!(cfg.with_stage("nope", "x"), cfg);
+        // A variant's stages, with this config's routes and budget.
+        let mut variant = PipelineConfig::default().with_stage("fusion", "first");
+        variant.budget.images_max = 1;
+        let picked = cfg.with_stages_of(&variant);
+        assert_eq!(picked.fusion.name, "first");
+        assert_eq!(picked.routes, cfg.routes);
+        assert_eq!(picked.budget, cfg.budget);
+        assert!(picked.has_stages_of(&variant));
+        assert!(!cfg.has_stages_of(&variant));
     }
 
     #[test]

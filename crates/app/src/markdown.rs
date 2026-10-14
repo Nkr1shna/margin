@@ -467,6 +467,7 @@ mod tests {
             start_line: None,
             end_line: None,
             file: None,
+            section_path: None,
         }
     }
 

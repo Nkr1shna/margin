@@ -117,33 +117,7 @@ pub async fn tools(State(state): State<AppState>) -> Json<Vec<ToolStatus>> {
 }
 
 /// The stage kinds a `PipelineConfig` names, in the order the pipeline runs them.
-pub const STAGE_KINDS: [&str; 6] = [
-    "chunker",
-    "retriever",
-    "fusion",
-    "reranker",
-    "packer",
-    "prompts",
-];
-
-/// `GET /api/pipeline/variants`: what Settings can choose a pipeline from.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PipelineVariants {
-    /// The registered stage names per kind ("chunker", "retriever", …), sorted.
-    pub stages: std::collections::BTreeMap<String, Vec<String>>,
-    /// The named variants of `evals/variants/*.toml` that could be read, by name.
-    pub variants: Vec<NamedVariant>,
-}
-
-/// One `evals/variants/<name>.toml`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NamedVariant {
-    pub name: String,
-    pub config: margin_shared::pipeline::PipelineConfig,
-    /// Why this service can't build it (a stage it doesn't register); `None` when it can.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unavailable: Option<String>,
-}
+pub use margin_shared::pipeline::{NamedVariant, PipelineVariants, STAGE_KINDS};
 
 /// Where the named variants are: `MARGIN_EVALS_DIR`, else the repository's `evals/`
 /// next to this crate (the service runs from its checkout).
@@ -172,7 +146,9 @@ pub fn named_variants(
             let parsed = std::fs::read_to_string(&p)
                 .map_err(anyhow::Error::from)
                 .and_then(|t| {
-                    Ok(toml::from_str::<margin_shared::pipeline::PipelineConfig>(&t)?)
+                    Ok(toml::from_str::<margin_shared::pipeline::PipelineConfig>(
+                        &t,
+                    )?)
                 });
             match parsed {
                 Ok(config) => {
@@ -230,6 +206,9 @@ mod variant_tests {
             assert_eq!(v.unavailable, None, "{}", v.name);
         }
         assert!(named_variants(std::path::Path::new("/nonexistent"), &reg).is_empty());
-        assert!(reg.names("retriever").contains(&"hybrid-linear".to_string()));
+        assert!(
+            reg.names("retriever")
+                .contains(&"hybrid-linear".to_string())
+        );
     }
 }

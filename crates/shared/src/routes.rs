@@ -28,6 +28,7 @@
 //! | GET    | /api/search?q=                         |                    | Vec<SearchHit>      |
 //! | GET    | /api/settings                          |                    | Settings            |
 //! | PATCH  | /api/settings                          | SettingsPatch      | Settings            |
+//! | GET    | /api/pipeline/variants                 |                    | pipeline::PipelineVariants |
 //! | GET    | /api/tools                             |                    | Vec<ToolStatus>     |
 //! | GET    | /api/devices                           |                    | Vec<Device>         |
 //! | DELETE | /api/devices/{id}                      |                    | 204                 |
@@ -84,6 +85,9 @@ pub const TOPICS: &str = "/api/topics";
 pub const NOTES: &str = "/api/notes";
 pub const SEARCH: &str = "/api/search";
 pub const SETTINGS: &str = "/api/settings";
+/// `GET` → `pipeline::PipelineVariants`: the stage names the service registers per kind
+/// and the named variants (`evals/variants/*.toml`) Settings can pick a pipeline from.
+pub const PIPELINE_VARIANTS: &str = "/api/pipeline/variants";
 pub const TOOLS: &str = "/api/tools";
 pub const DEVICES: &str = "/api/devices";
 pub const EVENTS: &str = "/api/events";
@@ -103,10 +107,10 @@ pub const WORKSPACES: &str = "/api/workspaces";
 /// device's attached folder: `name` is its path inside the folder (400 "bad_path" unless
 /// `device::relative_components` accepts it), `folder` is ignored and set to the folder's
 /// name, `topic_id` must be absent (400), its type must be one
-/// `device::folder_file_type` knows (400 "unsupported"), the folder must exist (404) and
-/// be the caller's (403 "not_yours"). The kind's size limit doesn't apply (owner: no
-/// limit); only `UPLOAD_PART_BYTES` bounds one request. An earlier source of the same
-/// folder and path is replaced.
+/// `device::folder_file_type` knows (400 "unsupported_source"), the folder must exist
+/// (404) and be the caller's (403 "not_yours"). The kind's size limit doesn't apply
+/// (owner: no limit); only `UPLOAD_PART_BYTES` bounds one request. An earlier source of
+/// the same folder and path is replaced.
 pub const SOURCES: &str = "/api/sources";
 /// A source uploaded in parts. `POST ?name&folder&topic_id&bytes` (the query of
 /// `SOURCES`, plus the file's size) checks the name and size and starts it; each

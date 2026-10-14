@@ -456,8 +456,7 @@ impl Store {
                 Err(e) if attempt < CONFLICT_RETRIES && is_retryable(&e) => {
                     attempt += 1;
                     tracing::debug!("retrying after a transaction conflict ({attempt}): {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
                 }
                 Err(e) => return Err(e.into()),
             }
