@@ -306,7 +306,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                 div {
                     class: "menu below",
                     role: "menu",
-                    onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { open.set(false) },
+                    onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); open.set(false) },
                     button { role: "menuitem", autofocus: true, onclick: move |_| add(false),
                         Icon { name: "note" }
                         "Add files…"

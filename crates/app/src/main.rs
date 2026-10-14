@@ -3,6 +3,7 @@
 mod api;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
+mod commands;
 mod config;
 mod events;
 #[cfg(test)]
@@ -71,18 +72,57 @@ fn main() {
 
 /// The native menu bar. Besides the usual app and window commands it carries the Edit
 /// menu, which is what makes Cmd+Z/X/C/V/A work in text fields: the webview handles those
-/// shortcuts only through the menu's standard items.
+/// shortcuts only through the menu's standard items. The app's own commands (Settings,
+/// File, View, Go) carry their shortcuts so they can be found here; choosing one runs it
+/// like the key press (`ui::shell::Shell` handles both).
 #[cfg(feature = "desktop")]
 fn menu_bar() -> dioxus::desktop::muda::Menu {
-    use dioxus::desktop::muda::{Menu, PredefinedMenuItem, Submenu};
+    use dioxus::desktop::muda::accelerator::{Accelerator, CMD_OR_CTRL, Code, Modifiers};
+    use dioxus::desktop::muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    use crate::commands::Command;
+
+    let item = |label: &str, command: Command| {
+        let code = match command {
+            Command::Search => Code::KeyK,
+            Command::Ask | Command::AllNotes => Code::KeyN,
+            Command::Settings => Code::Comma,
+            Command::Back => Code::BracketLeft,
+            Command::Forward => Code::BracketRight,
+            Command::ToggleSidebar => Code::Backslash,
+        };
+        let mods = if command.shift() {
+            CMD_OR_CTRL | Modifiers::SHIFT
+        } else {
+            CMD_OR_CTRL
+        };
+        MenuItem::with_id(
+            command.slug(),
+            label,
+            true,
+            Some(Accelerator::new(Some(mods), code)),
+        )
+    };
+    let settings = item("Settings…", Command::Settings);
+    let new_ask = item("New Ask", Command::Ask);
+    let all_notes = item("All Notes", Command::AllNotes);
+    let toggle_sidebar = item("Toggle Sidebar", Command::ToggleSidebar);
+    let back = item("Back", Command::Back);
+    let forward = item("Forward", Command::Forward);
+    let search = item("Search…", Command::Search);
 
     let app = Submenu::new("Margin", true);
+    let file = Submenu::new("File", true);
     let edit = Submenu::new("Edit", true);
+    let view = Submenu::new("View", true);
+    let go = Submenu::new("Go", true);
     let window = Submenu::new("Window", true);
     let menu = Menu::new();
     let built = app
         .append_items(&[
             &PredefinedMenuItem::about(Some("About Margin"), None),
+            &PredefinedMenuItem::separator(),
+            &settings,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
             &PredefinedMenuItem::separator(),
@@ -92,6 +132,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::quit(Some("Quit Margin")),
         ])
+        .and_then(|_| file.append_items(&[&new_ask, &all_notes]))
         .and_then(|_| {
             edit.append_items(&[
                 &PredefinedMenuItem::undo(None),
@@ -104,6 +145,10 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
                 &PredefinedMenuItem::select_all(None),
             ])
         })
+        .and_then(|_| view.append_items(&[&toggle_sidebar]))
+        .and_then(|_| {
+            go.append_items(&[&back, &forward, &PredefinedMenuItem::separator(), &search])
+        })
         .and_then(|_| {
             window.append_items(&[
                 &PredefinedMenuItem::minimize(None),
@@ -114,7 +159,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
                 &PredefinedMenuItem::close_window(None),
             ])
         })
-        .and_then(|_| menu.append_items(&[&app, &edit, &window]));
+        .and_then(|_| menu.append_items(&[&app, &file, &edit, &view, &go, &window]));
     if let Err(error) = built {
         eprintln!("couldn't build the menu bar: {error}");
     }
@@ -191,6 +236,13 @@ fn App() -> Element {
 fn SignedIn() -> Element {
     let ctx = state::use_app();
     use_future(move || async move { live_loop(ctx).await });
+    // The menu bar's app commands run like their key presses (`ui::shell::Shell`).
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "linux")))]
+    dioxus::desktop::use_muda_event_handler(move |event| {
+        if let Some(command) = commands::Command::from_slug(&event.id().0) {
+            commands::dispatch(command);
+        }
+    });
     // Fetch the account (GitHub login, this device) once.
     use_future(move || async move {
         let Some(api) = ctx.api() else { return };

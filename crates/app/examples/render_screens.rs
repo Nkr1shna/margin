@@ -19,6 +19,8 @@
 
 #[path = "../src/api.rs"]
 mod api;
+#[path = "../src/commands.rs"]
+mod commands;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/fake.rs"]

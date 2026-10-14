@@ -9,7 +9,7 @@ use margin_shared::{Event, Id, NewNote, Note, NotePatch};
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
-use crate::ui::common::{ConfirmDialog, Icon, Loading, TopBar, ago, render_math};
+use crate::ui::common::{ConfirmDialog, CrumbLink, Icon, Loading, TopBar, ago, render_math};
 
 /// A topic breadcrumb and its notes, each with the title of the lesson it came from.
 type NoteGroup = (String, Vec<(Note, Option<String>)>);
@@ -85,50 +85,77 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
             (c, with)
         })
         .collect();
-    let selected_exists = selected.as_ref().is_some_and(|s| lib.notes.contains_key(s));
+    let selected_title = selected
+        .as_ref()
+        .and_then(|s| lib.notes.get(s).map(|n| n.title.clone()));
+    let selected_exists = selected_title.is_some();
+    // Whether a new note in topic `t` belongs in this list (else it opens in All notes).
+    let scope_of_new = |t: &str| {
+        topic
+            .clone()
+            .filter(|scope| lib.topic_path(t).iter().any(|p| &p.id == scope))
+    };
+    let scopes: Vec<(Id, Option<Id>)> = topics
+        .iter()
+        .map(|(id, _)| (id.clone(), scope_of_new(id)))
+        .collect();
     drop(lib);
 
     let heading = match &topic_title {
         Some(t) => format!("{t} · notes"),
         None => "All notes".to_string(),
     };
-    let crumbs = match &topic {
-        Some(_) => vec![heading.clone()],
-        None => vec!["All notes".to_string()],
+    // "<list> / <note>" while a note is open; the list crumb leads back to the list.
+    let (crumbs, crumb_links) = match &selected_title {
+        Some(title) => (
+            vec![heading.clone(), title.clone()],
+            vec![
+                Some(CrumbLink::Route(Route::notes_list(topic.clone()))),
+                None,
+            ],
+        ),
+        None => (vec![heading.clone()], Vec::new()),
     };
     let default_topic = topic
         .clone()
         .or_else(|| topics.first().map(|(id, _)| id.clone()));
 
-    let create = move |_| async move {
-        let chosen = new_topic.peek().clone();
-        let Some(topic_id) = chosen else {
-            create_error.set(Some("Choose a topic for the note.".into()));
-            return;
-        };
-        let Some(api) = app.api() else { return };
-        create_error.set(None);
-        let new = NewNote {
-            topic_id,
-            lesson_id: None,
-            title: "Untitled note".into(),
-            body_md: String::new(),
-            quote: None,
-        };
-        match api.create_note(&new).await {
-            Ok(note) => {
-                let id = note.id.clone();
-                let mut lib = app.lib;
-                lib.write().apply(Event::NoteChanged { note });
-                creating.set(false);
-                nav.push(Route::NoteOpen { id });
+    let create = move |_| {
+        let scopes = scopes.clone();
+        async move {
+            let chosen = new_topic.peek().clone();
+            let Some(topic_id) = chosen else {
+                create_error.set(Some("Choose a topic for the note.".into()));
+                return;
+            };
+            let Some(api) = app.api() else { return };
+            create_error.set(None);
+            let new = NewNote {
+                topic_id,
+                lesson_id: None,
+                title: "Untitled note".into(),
+                body_md: String::new(),
+                quote: None,
+            };
+            match api.create_note(&new).await {
+                Ok(note) => {
+                    let id = note.id.clone();
+                    let scope = scopes
+                        .iter()
+                        .find(|(t, _)| *t == note.topic_id)
+                        .and_then(|(_, s)| s.clone());
+                    let mut lib = app.lib;
+                    lib.write().apply(Event::NoteChanged { note });
+                    creating.set(false);
+                    nav.push(Route::note_in(scope, id));
+                }
+                Err(e) => create_error.set(Some(app.failure(&e))),
             }
-            Err(e) => create_error.set(Some(app.failure(&e))),
         }
     };
 
     rsx! {
-        TopBar { crumbs }
+        TopBar { crumbs, links: crumb_links }
         div { class: "scroll", style: "overflow: hidden",
             div { class: if selected_exists { "notes-wrap has-selection" } else { "notes-wrap" },
                 div { class: "note-list",
@@ -213,8 +240,8 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                         class: "note-item",
                                         "aria-current": (selected.as_deref() == Some(note.id.as_str())).to_string(),
                                         onclick: {
-                                            let id = note.id.clone();
-                                            move |_| { nav.push(Route::NoteOpen { id: id.clone() }); }
+                                            let route = Route::note_in(topic.clone(), note.id.clone());
+                                            move |_| { nav.push(route.clone()); }
                                         },
                                         b { "{note.title}" }
                                         span {
@@ -240,15 +267,15 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                         div {
                                             class: "menu right",
                                             role: "menu",
-                                            onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { item_menu.set(None) },
+                                            onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); item_menu.set(None) },
                                             button {
                                                 role: "menuitem",
                                                 autofocus: true,
                                                 onclick: {
-                                                    let id = note.id.clone();
+                                                    let route = Route::note_in(topic.clone(), note.id.clone());
                                                     move |_| {
                                                         item_menu.set(None);
-                                                        nav.push(Route::NoteOpen { id: id.clone() });
+                                                        nav.push(route.clone());
                                                     }
                                                 },
                                                 Icon { name: "note" }
@@ -279,7 +306,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                     match selected.clone() {
                         Some(id) if selected_exists => rsx! {
                             for id in std::iter::once(id) {
-                                NoteEditor { key: "{id}", id: id.clone() }
+                                NoteEditor { key: "{id}", id: id.clone(), scope: topic.clone() }
                             }
                         },
                         Some(_) if !loading => rsx! {
@@ -323,10 +350,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                     lib.write().apply(Event::NoteDeleted { id });
                                     confirm_note.set(None);
                                     if was_open {
-                                        nav.replace(match topic {
-                                            Some(topic_id) => Route::TopicNotes { topic_id },
-                                            None => Route::AllNotes {},
-                                        });
+                                        nav.replace(Route::notes_list(topic));
                                     }
                                 }
                                 Err(e) => del_error.set(Some(app.failure(&e))),
@@ -347,8 +371,10 @@ enum SaveState {
     Saving,
 }
 
+/// The open note. `scope` is the list it was opened in (a topic's, or All notes), where
+/// "Back to the list" and deleting it return.
 #[component]
-fn NoteEditor(id: Id) -> Element {
+fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     let app = use_app();
     let nav = navigator();
     let initial = use_hook(|| app.lib.peek().notes.get(&id).cloned());
@@ -470,7 +496,12 @@ fn NoteEditor(id: Id) -> Element {
                 button {
                     class: "icon-btn back-btn",
                     "aria-label": "Back to the list",
-                    onclick: move |_| { nav.go_back(); },
+                    // The list the note belongs to, whatever screen came before (Search,
+                    // a lesson's link, a fresh launch).
+                    onclick: {
+                        let list = Route::notes_list(scope.clone());
+                        move |_| { nav.replace(list.clone()); }
+                    },
                     Icon { name: "back" }
                 }
                 if let Some((lid, ltitle)) = lesson {
@@ -487,8 +518,8 @@ fn NoteEditor(id: Id) -> Element {
                 }
                 div { class: "note-tools",
                     div { class: "seg", role: "tablist", "aria-label": "Editor mode",
-                        button { role: "tab", "aria-selected": (!showing_preview).to_string(), onclick: move |_| preview.set(false), "Write" }
-                        button { role: "tab", "aria-selected": showing_preview.to_string(), onclick: move |_| preview.set(true), "Preview" }
+                        button { role: "tab", "aria-selected": (!showing_preview).to_string(), tabindex: if showing_preview { "-1" } else { "0" }, onclick: move |_| preview.set(false), "Write" }
+                        button { role: "tab", "aria-selected": showing_preview.to_string(), tabindex: if showing_preview { "0" } else { "-1" }, onclick: move |_| preview.set(true), "Preview" }
                     }
                     button {
                         class: "icon-btn",
@@ -550,10 +581,10 @@ fn NoteEditor(id: Id) -> Element {
                 on_cancel: move |_| confirm.set(false),
                 on_confirm: {
                     let id = id.clone();
-                    let topic_id = note.topic_id.clone();
+                    let list = Route::notes_list(scope.clone());
                     move |_| {
                         let id = id.clone();
-                        let topic_id = topic_id.clone();
+                        let list = list.clone();
                         async move {
                             let Some(api) = app.api() else { return };
                             deleting.set(true);
@@ -565,7 +596,7 @@ fn NoteEditor(id: Id) -> Element {
                                     let mut lib = app.lib;
                                     lib.write().apply(Event::NoteDeleted { id });
                                     confirm.set(false);
-                                    nav.replace(Route::TopicNotes { topic_id });
+                                    nav.replace(list);
                                 }
                                 Err(e) => {
                                     error.set(Some(app.failure(&e)));

@@ -173,7 +173,6 @@
       var sel = window.getSelection();
       if (sel) sel.removeAllRanges();
     },
-    // Global shortcuts: Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask.
     // Resizing the sidebar by its right edge, with a mouse, a finger or a pencil. The width
     // follows the pointer live (a CSS variable on .app); the final width is sent to the
     // app to save. A double click or double tap resets.
@@ -225,25 +224,93 @@
         document.removeEventListener("dblclick", onDbl, true);
       };
     },
+    // Global shortcuts (src/commands.rs). The modifier is Cmd on Apple platforms and Ctrl
+    // elsewhere, never both, so the Cocoa text keys (Ctrl+K deletes to the end of the
+    // line, Ctrl+N moves down…) keep working in macOS fields. Cmd/Ctrl+K search, +N Ask,
+    // +Shift+N All notes, +\ sidebar, +, Settings, +[ and +] back and forward.
     watchShortcuts: function (send) {
       if (window.MarginApp._stopShortcuts) window.MarginApp._stopShortcuts();
+      var apple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
+      window.MarginApp._sendCommand = send;
       function onKey(e) {
-        if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+        if (e.altKey) return;
+        if (apple ? (!e.metaKey || e.ctrlKey) : (!e.ctrlKey || e.metaKey)) return;
         var k = (e.key || "").toLowerCase();
+        var name = null;
         if (e.shiftKey) {
-          if (k === "n") { e.preventDefault(); send("notes"); }
-          return;
-        }
-        if (k === "k") { e.preventDefault(); send("search"); }
-        else if (k === "n") { e.preventDefault(); send("ask"); }
-        else if (k === "\\") { e.preventDefault(); send(drawerMode() ? "drawer" : "sidebar"); }
-        else if (k === ",") { e.preventDefault(); send("settings"); }
-        else if (k === "[") { e.preventDefault(); send("back"); }
-        else if (k === "]") { e.preventDefault(); send("forward"); }
+          if (k === "n") name = "notes";
+        } else if (k === "k") name = "search";
+        else if (k === "n") name = "ask";
+        else if (k === "\\") name = "sidebar";
+        else if (k === ",") name = "settings";
+        else if (k === "[") name = "back";
+        else if (k === "]") name = "forward";
+        if (!name) return;
+        e.preventDefault();
+        window.MarginApp.command(name);
       }
       document.addEventListener("keydown", onKey, true);
       window.MarginApp._stopShortcuts = function () {
         document.removeEventListener("keydown", onKey, true);
+        window.MarginApp._sendCommand = null;
+      };
+    },
+    // Runs a shortcut command, from a key press or the menu bar. Ignored while a modal
+    // dialog is open (except the search palette, which commands close), and when the
+    // same command just arrived by the other route (one press, one run).
+    command: function (name) {
+      var send = window.MarginApp._sendCommand;
+      if (!send) return;
+      if (document.querySelector('[aria-modal="true"]:not(.palette)')) return;
+      var now = Date.now(), last = window.MarginApp._lastCommand;
+      if (last && last.name === name && now - last.at < 150) return;
+      window.MarginApp._lastCommand = { name: name, at: now };
+      // Below 1024px the sidebar is a drawer, which the same command opens and closes.
+      if (name === "sidebar" && drawerMode()) name = "drawer";
+      send(name);
+    },
+    // Focus the first element matching `selector`, retrying for a few frames while it isn't
+    // in the page or can't take focus yet (still hidden). With `finePointerOnly`, only when
+    // there's a mouse or trackpad: on a touch screen, focusing a field pops up the
+    // on-screen keyboard.
+    focus: function (selector, finePointerOnly) {
+      if (finePointerOnly && !window.matchMedia("(any-pointer: fine)").matches) return;
+      var tries = 0;
+      (function attempt() {
+        var el = document.querySelector(selector);
+        if (el) el.focus();
+        if (el && document.activeElement === el) return;
+        if (++tries < 30) requestAnimationFrame(attempt);
+      })();
+    },
+    // A dialog opening keeps the element that had the focus, to give it back on close
+    // (or, when that's gone, the dialog underneath, so Escape still reaches it).
+    saveFocus: function () {
+      window.MarginApp._savedFocus = document.activeElement;
+    },
+    restoreFocus: function () {
+      var el = window.MarginApp._savedFocus;
+      window.MarginApp._savedFocus = null;
+      requestAnimationFrame(function () {
+        if (el && el !== document.body && document.contains(el)) { el.focus(); return; }
+        var dialog = document.querySelector('[aria-modal="true"][tabindex]');
+        if (dialog) dialog.focus();
+      });
+    },
+    // Focus `selector` inside the open drawer unless the focus is in the drawer already.
+    focusDrawer: function (selector) {
+      var sb = document.querySelector(".sb.open");
+      if (sb && sb.contains(document.activeElement)) return;
+      window.MarginApp.focus(selector);
+    },
+    // Calls send(true) when the window grows out of the narrow (drawer) layout.
+    watchWide: function (send) {
+      if (window.MarginApp._stopWide) window.MarginApp._stopWide();
+      var mq = window.matchMedia("(min-width: 1024px)");
+      function onChange() { if (mq.matches) send(true); }
+      if (mq.addEventListener) mq.addEventListener("change", onChange); else mq.addListener(onChange);
+      window.MarginApp._stopWide = function () {
+        if (mq.removeEventListener) mq.removeEventListener("change", onChange); else mq.removeListener(onChange);
       };
     },
     setTheme: function (theme) {
@@ -328,6 +395,33 @@
       // Storage unavailable: the setting still applies for this session's players.
     }
   }
+
+  // Segmented controls (role tablist or radiogroup) follow the ARIA keyboard pattern: a
+  // single tab stop (the markup gives the selected option tabindex 0, the others -1), and
+  // the arrow keys, Home and End move to another option and select it.
+  document.addEventListener("keydown", function (e) {
+    var item = e.target && e.target.closest ? e.target.closest('[role="tab"], [role="radio"]') : null;
+    if (!item || e.altKey || e.ctrlKey || e.metaKey) return;
+    var group = item.closest('[role="tablist"], [role="radiogroup"]');
+    if (!group) return;
+    var items = Array.prototype.filter.call(
+      group.querySelectorAll('[role="tab"], [role="radio"]'),
+      function (b) { return !b.disabled; }
+    );
+    var i = items.indexOf(item), next;
+    if (i < 0) return;
+    switch (e.key) {
+      case "ArrowRight": case "ArrowDown": next = (i + 1) % items.length; break;
+      case "ArrowLeft": case "ArrowUp": next = (i - 1 + items.length) % items.length; break;
+      case "Home": next = 0; break;
+      case "End": next = items.length - 1; break;
+      default: return;
+    }
+    e.preventDefault();
+    if (next === i) return;
+    items[next].focus();
+    items[next].click();
+  });
 
   // Tooltips. The macOS webview never shows native `title` tooltips, so elements with a
   // title get this one instead: after a short hover (or keyboard focus), below the

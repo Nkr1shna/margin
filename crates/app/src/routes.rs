@@ -24,8 +24,12 @@ pub enum Route {
         AllNotes {},
         #[route("/notes/topic/:topic_id")]
         TopicNotes { topic_id: String },
+        /// A note opened from All notes (or from Search, a lesson, a link).
         #[route("/note/:id")]
         NoteOpen { id: String },
+        /// A note opened from a topic's notes list: the list stays scoped to the topic.
+        #[route("/notes/topic/:topic_id/:id")]
+        TopicNoteOpen { topic_id: String, id: String },
         #[route("/:..segments")]
         NotFound { segments: Vec<String> },
 }
@@ -81,6 +85,40 @@ fn NoteOpen(id: String) -> Element {
 }
 
 #[component]
+fn TopicNoteOpen(topic_id: String, id: String) -> Element {
+    rsx! { NotesScreen { topic: Some(topic_id), selected: Some(id) } }
+}
+
+impl Route {
+    /// A notes list: a topic's (`Some`) or All notes.
+    pub fn notes_list(topic: Option<String>) -> Route {
+        match topic {
+            Some(topic_id) => Route::TopicNotes { topic_id },
+            None => Route::AllNotes {},
+        }
+    }
+
+    /// A note, opened in the given list.
+    pub fn note_in(topic: Option<String>, id: String) -> Route {
+        match topic {
+            Some(topic_id) => Route::TopicNoteOpen { topic_id, id },
+            None => Route::NoteOpen { id },
+        }
+    }
+
+    /// The notes list this route shows or belongs to (`Some(None)` is All notes).
+    pub fn notes_scope(&self) -> Option<Option<&str>> {
+        match self {
+            Route::AllNotes {} | Route::NoteOpen { .. } => Some(None),
+            Route::TopicNotes { topic_id } | Route::TopicNoteOpen { topic_id, .. } => {
+                Some(Some(topic_id))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[component]
 fn NotFound(segments: Vec<String>) -> Element {
     let nav = navigator();
     rsx! {
@@ -95,5 +133,33 @@ fn NotFound(segments: Vec<String>) -> Element {
                 "Go to Ask"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn notes_keep_their_list() {
+        let topic = Route::note_in(Some("t1".into()), "n1".into());
+        assert_eq!(topic.to_string(), "/notes/topic/t1/n1");
+        assert_eq!(
+            Route::from_str("/notes/topic/t1/n1").ok(),
+            Some(topic.clone())
+        );
+        assert_eq!(topic.notes_scope(), Some(Some("t1")));
+        assert_eq!(
+            Route::from_str("/notes/topic/t1").ok(),
+            Some(Route::notes_list(Some("t1".into())))
+        );
+
+        let all = Route::note_in(None, "n1".into());
+        assert_eq!(all.to_string(), "/note/n1");
+        assert_eq!(all.notes_scope(), Some(None));
+        assert_eq!(Route::notes_list(None).notes_scope(), Some(None));
+        assert_eq!(Route::Ask {}.notes_scope(), None);
     }
 }
