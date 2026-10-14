@@ -794,6 +794,7 @@ mod tests {
                         file("intro.md", FolderFileType::Text, small.len()),
                         file("scan.pdf", FolderFileType::Pdf, big.len()),
                     ],
+                    unreadable: vec![],
                 },
             )
             .await

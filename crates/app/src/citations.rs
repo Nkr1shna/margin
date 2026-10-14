@@ -804,6 +804,7 @@ mod tests {
             location: "~/notes".into(),
             created_at: chrono::Utc::now(),
             sync: Default::default(),
+            unreadable: Vec::new(),
         };
         assert_eq!(
             folder_line(&c, Some(&ws)).as_deref(),

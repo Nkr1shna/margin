@@ -23,7 +23,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use margin_shared::{
     Event, FileStamp, FolderFileType, Id, ManifestFile, Source, SourceStatus, SyncManifest,
-    SyncPlan, Workspace, WorkspaceSync, folder_file_type, relative_components,
+    SyncPlan, UnreadableFile, Workspace, WorkspaceSync, folder_file_type, relative_components,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -149,6 +149,19 @@ pub fn diff(
     manifest: &[ManifestFile],
     now: DateTime<Utc>,
 ) -> Diff {
+    diff_keeping(workspace_id, rows, sources, manifest, &[], now)
+}
+
+/// `diff`, keeping what the folder has of `unreadable` (paths the device saw but
+/// couldn't read this pass): their rows and sources stay, nothing is asked for.
+pub fn diff_keeping(
+    workspace_id: &str,
+    rows: Vec<FolderFileRow>,
+    sources: &[Source],
+    manifest: &[ManifestFile],
+    unreadable: &[String],
+    now: DateTime<Utc>,
+) -> Diff {
     let source_ids: HashSet<&str> = sources.iter().map(|s| s.id.as_str()).collect();
     let by_name: HashMap<&str, &str> = sources
         .iter()
@@ -162,6 +175,20 @@ pub fn diff(
         listed.entry(f.path.as_str()).or_insert(f);
     }
     let mut held: HashSet<String> = HashSet::new();
+    for path in unreadable {
+        if listed.contains_key(path.as_str()) {
+            continue;
+        }
+        if let Some(row) = rows.remove(path) {
+            if row.is_current(&source_ids) {
+                out.kept += 1;
+            }
+            held.extend(row.source_id);
+        }
+        if let Some(s) = by_name.get(path.as_str()) {
+            held.insert(s.to_string());
+        }
+    }
     for (path, f) in &listed {
         let (mut row, mut changed) = match rows.remove(*path) {
             Some(row) => (row, false),
@@ -298,6 +325,19 @@ pub async fn sync(
         }
         files.push(ManifestFile { path, ..f });
     }
+    let mut unreadable: Vec<UnreadableFile> = Vec::with_capacity(manifest.unreadable.len());
+    for f in manifest.unreadable {
+        let Some(path) = clean_path(&f.path) else {
+            return Err(bad_path(&f.path));
+        };
+        if folder_file_type(&path).is_none() || files.iter().any(|m| m.path == path) {
+            continue;
+        }
+        unreadable.push(UnreadableFile { path, ..f });
+    }
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
+    unreadable.dedup_by(|a, b| a.path == b.path);
+    let unreadable_paths: Vec<String> = unreadable.iter().map(|f| f.path.clone()).collect();
     let now = Utc::now();
     let (plan, events, ws) = {
         let _w = state.write_lock.lock().await;
@@ -314,7 +354,7 @@ pub async fn sync(
         }
         let rows = rows_of(&state, &id).await?;
         let all = sources_of(&state, &id).await?;
-        let d = diff(&id, rows, &all, &files, now);
+        let d = diff_keeping(&id, rows, &all, &files, &unreadable_paths, now);
         let mut events = Vec::new();
         for s in &d.delete_sources {
             events.push(sources::delete_locked(&state, s).await?);
@@ -330,6 +370,7 @@ pub async fn sync(
             .filter(|s| !deleted.contains(s.id.as_str()))
             .collect();
         ws.sync = counts(&rows, &left, Some(now));
+        ws.unreadable = unreadable;
         state.store.put(db::WORKSPACE, &id, &ws).await?;
         let plan = SyncPlan {
             removed: d.removed(),
@@ -753,6 +794,26 @@ mod tests {
         assert!(done.upload.is_empty());
         assert_eq!((done.kept, done.removed()), (4, 0));
         assert!(done.write.is_empty(), "nothing changed, nothing written");
+    }
+
+    /// A file the device couldn't read this pass (evicted to iCloud, locked) keeps its
+    /// row and source: nothing removed, nothing asked for, its citations still work.
+    #[test]
+    fn an_unreadable_file_keeps_its_row_and_source() {
+        let t0 = Utc::now();
+        let first = vec![file("a.md", "1"), file("evicted.pdf", "2")];
+        let d = diff("w", vec![], &[], &first, t0);
+        let (rows, sources) = apply(vec![], vec![], &d, true);
+
+        let readable = vec![file("a.md", "1")];
+        let unreadable = vec!["evicted.pdf".to_string()];
+        let d = diff_keeping("w", rows.clone(), &sources, &readable, &unreadable, t0);
+        assert!(d.upload.is_empty());
+        assert_eq!((d.kept, d.removed()), (2, 0));
+        assert!(d.gone.is_empty() && d.delete_sources.is_empty());
+        // Without it the file reads as deleted.
+        let d = diff("w", rows, &sources, &readable, t0);
+        assert_eq!(d.delete_sources, vec!["s-evicted.pdf".to_string()]);
     }
 
     #[test]

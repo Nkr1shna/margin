@@ -1325,6 +1325,7 @@ pub(crate) mod tests {
                 location: "~/margin".into(),
                 created_at: ts(0),
                 sync: Default::default(),
+                unreadable: Vec::new(),
             },
         );
         s.apply(Event::DeviceDeleted { id: "d1".into() });
@@ -1344,6 +1345,7 @@ pub(crate) mod tests {
             location: format!("~/{name}"),
             created_at: ts(0),
             sync: Default::default(),
+            unreadable: Vec::new(),
         };
         s.replace_workspaces(vec![
             ws("w2", "d2", "Photos"),

@@ -126,6 +126,11 @@ pub trait Dir {
     fn stat(&self, rel: &str) -> Result<DirEntry, DirError>;
     /// `IsADir`, `NotFound`, `Outside`.
     fn open(&self, rel: &str) -> Result<Box<dyn Read + '_>, DirError>;
+    /// Whether `rel` is a file whose contents are only in the cloud (an iCloud file
+    /// evicted from this device), so a failed `open` means "download it", not "locked".
+    fn evicted(&self, _rel: &str) -> bool {
+        false
+    }
 }
 
 /// The message for a platform whose folder access isn't built yet.

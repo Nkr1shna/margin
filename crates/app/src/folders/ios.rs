@@ -251,6 +251,10 @@ impl Dir for IosDir {
         }
         Ok(Box::new(Cursor::new(self.coordinated_read(rel)?)))
     }
+
+    fn evicted(&self, rel: &str) -> bool {
+        self.is_placeholder(rel)
+    }
 }
 
 /// "iPhone" or "iPad", for the messages that say where to attach the folder again.

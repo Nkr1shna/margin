@@ -480,6 +480,10 @@ pub struct Workspace {
     /// The service's counts of the folder's files (it keeps them up to date).
     #[serde(default)]
     pub sync: WorkspaceSync,
+    /// Files the last manifest listed that the device couldn't read (shown greyed out
+    /// with their reason; the service keeps whatever it already has of them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<UnreadableFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,6 +631,38 @@ pub struct ManifestFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncManifest {
     pub files: Vec<ManifestFile>,
+    /// Files the device saw but couldn't read this pass (evicted to iCloud, locked, no
+    /// permission). The service keeps what it has of them: not removed, not asked for;
+    /// they're sent once a later pass can read them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<UnreadableFile>,
+}
+
+/// A file of a folder the holding device lists but can't read right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadableFile {
+    /// Relative to the folder's root, `/`-separated.
+    pub path: String,
+    pub reason: UnreadableReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadableReason {
+    /// Only in the cloud (an iCloud file evicted from this device).
+    NotDownloaded,
+    /// No permission, locked, or the read failed.
+    CantRead,
+}
+
+impl UnreadableReason {
+    /// What the folder's file list shows next to the file.
+    pub fn message(self) -> &'static str {
+        match self {
+            UnreadableReason::NotDownloaded => "Not on this device — download it to include it",
+            UnreadableReason::CantRead => "Can't be read",
+        }
+    }
 }
 
 /// The answer to a manifest: the paths to upload (new or changed, in name order), how
@@ -905,6 +941,7 @@ mod tests {
                     location: "~/Developer/margin".into(),
                     created_at: at(),
                     sync: Default::default(),
+                    unreadable: Vec::new(),
                 },
             },
             Event::WorkspaceDeleted { id: "w1".into() },
@@ -1088,8 +1125,16 @@ mod tests {
                     sha256: "ab".repeat(32),
                 },
             }],
+            unreadable: vec![UnreadableFile {
+                path: "papers/evicted.pdf".into(),
+                reason: UnreadableReason::NotDownloaded,
+            }],
         };
         let json = round_trip(&manifest);
+        // An older device sends no `unreadable`.
+        let old: SyncManifest = serde_json::from_value(json!({"files": []})).unwrap();
+        assert!(old.unreadable.is_empty());
+        assert_eq!(json["unreadable"][0]["reason"], "not_downloaded");
         // The stamp is flattened into the file.
         assert_eq!(json["files"][0]["bytes"], 12);
         assert_eq!(json["files"][0]["kind"], "pdf");

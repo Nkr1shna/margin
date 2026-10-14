@@ -8,16 +8,18 @@ use margin_shared::pipeline::{
 };
 use margin_shared::{
     Device, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id, ReasoningEffort, SOURCE_KINDS,
-    Settings, SettingsPatch, Source, TRACE_RETENTION_DAYS, ToolStatus, Workspace, WorkspaceSync,
+    Settings, SettingsPatch, Source, SourceKind, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile,
+    Workspace, WorkspaceSync,
 };
 
 use crate::config::{Appearance, normalize_service_url};
 use crate::folders::sync::SyncState;
-use crate::sources::{human_bytes, status_text};
+use crate::sources::{Tone, human_bytes, status_text};
 use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
     ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js,
 };
+use crate::ui::sources::kind_icon;
 
 /// How long a Copy button says "Copied".
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1999,7 +2001,7 @@ fn HeldFolderRow(ws: Workspace) -> Element {
                     }
                 }
                 if *show_files.read() {
-                    FolderFiles { workspace_id: ws.id.clone() }
+                    FolderFiles { workspace_id: ws.id.clone(), unreadable: ws.unreadable.clone() }
                 }
             }
         }
@@ -2028,9 +2030,11 @@ fn HeldFolderRow(ws: Workspace) -> Element {
 }
 
 /// A folder's files as the service has them, each with its status; those that couldn't
-/// be read can be read again.
+/// be read can be read again. Files the holding device couldn't read on its last pass
+/// (`Workspace::unreadable`) are greyed out with the reason, whether or not the service
+/// has a copy of them.
 #[component]
-fn FolderFiles(workspace_id: Id) -> Element {
+fn FolderFiles(workspace_id: Id, unreadable: Vec<UnreadableFile>) -> Element {
     let app = use_app();
     let ws = workspace_id.clone();
     let mut load = use_resource(move || {
@@ -2066,15 +2070,40 @@ fn FolderFiles(workspace_id: Id) -> Element {
             }
             match files {
                 None => rsx! { div { class: "skel", style: "width: 60%" } },
-                Some(files) if files.is_empty() => rsx! {
+                Some(files) if files.is_empty() && unreadable.is_empty() => rsx! {
                     p { class: "faint", "The service has none of this folder's files yet." }
                 },
                 Some(files) => rsx! {
                     div { role: "list", "aria-label": "Files of the folder",
+                        for f in unreadable.iter().filter(|u| !files.iter().any(|f| f.name == u.path)).cloned() {
+                            div {
+                                key: "unreadable-{f.path}",
+                                role: "listitem",
+                                class: "unreadable",
+                                "aria-disabled": "true",
+                                div { class: "src-row",
+                                    Icon {
+                                        name: kind_icon(SourceKind::for_name(&f.path).unwrap_or(SourceKind::Text)),
+                                        class: "src-ic",
+                                    }
+                                    div { class: "src-main",
+                                        span { class: "src-name", title: "{f.path}", "{f.path}" }
+                                        span { class: "src-meta", "{f.reason.message()}" }
+                                    }
+                                }
+                            }
+                        }
                         for f in files {
-                            div { key: "{f.id}", role: "listitem",
+                            div {
+                                key: "{f.id}",
+                                role: "listitem",
+                                class: if unreadable.iter().any(|u| u.path == f.name) { "unreadable" },
+                                "aria-disabled": unreadable.iter().any(|u| u.path == f.name).then_some("true"),
                                 {
-                                    let (tone, status) = status_text(&f.status);
+                                    let (tone, status) = match unreadable.iter().find(|u| u.path == f.name) {
+                                        Some(u) => (Tone::Waiting, u.reason.message().to_string()),
+                                        None => status_text(&f.status),
+                                    };
                                     rsx! {
                                         SourceLine {
                                             kind: f.kind,
@@ -2518,6 +2547,16 @@ mod tests {
         assert!(html.contains("Processing 3/20"));
         assert!(html.contains("Failed: The PDF is encrypted."));
         assert!(html.contains(r#"aria-label="Read old.pdf again""#));
+        // Files the Mac couldn't read on its last pass: greyed out, with the reason; one
+        // the service has a copy of, one it never received.
+        assert!(html.contains("figure.png"));
+        assert!(
+            html.contains("Not on this device — download it to include it"),
+            "{html}"
+        );
+        assert!(html.contains("drafts/locked.md"));
+        assert!(html.contains("Can&#39;t be read"));
+        assert_eq!(html.matches(r#"class="unreadable""#).count(), 2, "{html}");
         // Other devices: where, on which device, synced or not, online or offline.
         assert!(html.contains("iCloud Drive/Photos · on iPhone · 18 files · Synced"));
         assert!(

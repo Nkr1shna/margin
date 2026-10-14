@@ -5166,6 +5166,7 @@ async fn create_workspace(
             location: req.location,
             created_at: Utc::now(),
             sync: Default::default(),
+            unreadable: Vec::new(),
         };
         s.workspaces.push(workspace.clone());
         workspace
@@ -5229,10 +5230,11 @@ pub fn sample_workspaces() -> Vec<Workspace> {
             location: location.into(),
             created_at: ts(40),
             sync,
+            unreadable: Vec::new(),
         };
     let mac = ("d1", "test-mac");
     let phone = ("d2", "iPhone");
-    vec![
+    let mut all = vec![
         ws(
             "w1",
             "notes",
@@ -5282,7 +5284,19 @@ pub fn sample_workspaces() -> Vec<Workspace> {
             "On My iPhone/Scans",
             WorkspaceSync::default(),
         ),
-    ]
+    ];
+    // “notes” has a file only in iCloud and one it can't read.
+    all[0].unreadable = vec![
+        UnreadableFile {
+            path: "drafts/locked.md".into(),
+            reason: UnreadableReason::CantRead,
+        },
+        UnreadableFile {
+            path: "figure.png".into(),
+            reason: UnreadableReason::NotDownloaded,
+        },
+    ];
+    all
 }
 
 /// The files of sample folder `w1` (“notes”), in every state.
@@ -5434,9 +5448,12 @@ async fn sync_workspace(
             .collect();
         let mut have = Vec::new();
         for (source_id, name) in current {
-            let same = listed
-                .get(&name)
-                .is_some_and(|stamp| s.folder_stamps.get(&source_id) == Some(stamp));
+            // Unreadable this pass (evicted, locked): kept as it is.
+            let same = (!listed.contains_key(&name)
+                && manifest.unreadable.iter().any(|f| f.path == name))
+                || listed
+                    .get(&name)
+                    .is_some_and(|stamp| s.folder_stamps.get(&source_id) == Some(stamp));
             if same {
                 kept += 1;
                 have.push(name);
@@ -5454,9 +5471,16 @@ async fn sync_workspace(
             .cloned()
             .collect();
         upload.sort();
+        let unreadable: Vec<UnreadableFile> = manifest
+            .unreadable
+            .iter()
+            .filter(|f| !listed.contains_key(&f.path))
+            .cloned()
+            .collect();
         s.manifests.insert(id.clone(), listed);
         if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == id) {
             ws.sync.last_synced_at = Some(Utc::now());
+            ws.unreadable = unreadable;
         }
         if let Some(workspace) = s.refresh_sync(&id) {
             events.push(Event::WorkspaceChanged { workspace });

@@ -52,6 +52,7 @@ pub async fn create_workspace(
         location: clean(&req.location, "location")?,
         created_at: Utc::now(),
         sync: Default::default(),
+        unreadable: Vec::new(),
     };
     {
         let _w = state.write_lock.lock().await;

@@ -139,6 +139,22 @@ impl Dir for StdDir {
         }
         Ok(Box::new(fs::File::open(path).map_err(io_error)?))
     }
+
+    /// macOS marks a file iCloud evicted "dataless" (`SF_DATALESS`).
+    fn evicted(&self, rel: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::macos::fs::MetadataExt as _;
+            const SF_DATALESS: u32 = 0x4000_0000;
+            self.resolve(rel)
+                .is_ok_and(|(_, meta)| meta.st_flags() & SF_DATALESS != 0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = rel;
+            false
+        }
+    }
 }
 
 #[cfg(test)]

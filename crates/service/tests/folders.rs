@@ -85,7 +85,10 @@ async fn new_folder(h: &Harness, t: &str, name: &str) -> Workspace {
 
 async fn sync_raw(h: &Harness, t: &str, ws: &str, files: Vec<ManifestFile>) -> reqwest::Response {
     h.post(t, &routes::workspace_sync(ws))
-        .json(&SyncManifest { files })
+        .json(&SyncManifest {
+            files,
+            unreadable: vec![],
+        })
         .send()
         .await
         .unwrap()

@@ -427,6 +427,7 @@ fn workspace() -> Workspace {
         location: "~/Developer/margin".into(),
         created_at: at(),
         sync: Default::default(),
+        unreadable: Vec::new(),
     }
 }
 

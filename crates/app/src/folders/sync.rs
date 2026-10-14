@@ -32,8 +32,8 @@ use chrono::{DateTime, Utc};
 use dioxus::prelude::{ReadableExt, WritableExt};
 use futures_util::future::{AbortHandle, Abortable};
 use margin_shared::{
-    Event, FileStamp, Id, ManifestFile, NewWorkspace, Platform, SyncManifest, SyncPlan, Workspace,
-    folder_file_type, is_skipped_name, routes,
+    Event, FileStamp, Id, ManifestFile, NewWorkspace, Platform, SyncManifest, SyncPlan,
+    UnreadableFile, UnreadableReason, Workspace, folder_file_type, is_skipped_name, routes,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -439,8 +439,8 @@ impl Engine {
             return PassEnd::Stopped;
         };
         self.set_state(id, SyncState::Scanning);
-        let files = match scan_blocking(self.0.opener.clone(), &folder, cancel.clone()).await {
-            Ok(files) => files,
+        let found = match scan_blocking(self.0.opener.clone(), &folder, cancel.clone()).await {
+            Ok(found) => found,
             Err(ScanError::Cancelled) => return PassEnd::Stopped,
             Err(ScanError::Dir(DirError::Revoked(message))) => {
                 let _ = store::lock(&self.0.store).mark_revoked(id, &message);
@@ -457,7 +457,10 @@ impl Engine {
         if cancel.load(Ordering::Relaxed) {
             return PassEnd::Stopped;
         }
-        let manifest = SyncManifest { files };
+        let manifest = SyncManifest {
+            files: found.files,
+            unreadable: found.unreadable,
+        };
         let plan = match api.sync_workspace(id, &manifest).await {
             Ok(plan) => plan,
             Err(e) if e.status == Some(404) => return PassEnd::Gone,
@@ -551,9 +554,9 @@ impl Engine {
         )
         .await
         {
-            Ok(files) => {
+            Ok(found) => {
                 let _ = store::lock(&self.0.store).clear_revoked(id);
-                Ok(files)
+                Ok(found.files)
             }
             Err(ScanError::Dir(DirError::Revoked(message))) => {
                 let _ = store::lock(&self.0.store).mark_revoked(id, &message);
@@ -952,11 +955,19 @@ impl From<DirError> for ScanError {
     }
 }
 
+/// What a walk found: the files it read, and those it saw but couldn't read (evicted
+/// to iCloud, locked, no permission), which the service must keep rather than remove.
+#[derive(Debug, Default)]
+struct Scan {
+    files: Vec<ManifestFile>,
+    unreadable: Vec<UnreadableFile>,
+}
+
 async fn scan_blocking(
     opener: Opener,
     folder: &LocalFolder,
     cancel: Arc<AtomicBool>,
-) -> Result<Vec<ManifestFile>, ScanError> {
+) -> Result<Scan, ScanError> {
     let handle = folder.handle.clone();
     tokio::task::spawn_blocking(move || {
         let dir = opener(&handle)?;
@@ -972,18 +983,13 @@ async fn scan_blocking(
 
 /// Every visible, allow-listed file of `dir` with its stamp, in walk order (depth-first,
 /// name order). Blocking.
-fn scan(dir: &dyn Dir, cancel: &AtomicBool) -> Result<Vec<ManifestFile>, ScanError> {
-    let mut files = Vec::new();
-    walk(dir, "", cancel, &mut files)?;
-    Ok(files)
+fn scan(dir: &dyn Dir, cancel: &AtomicBool) -> Result<Scan, ScanError> {
+    let mut found = Scan::default();
+    walk(dir, "", cancel, &mut found)?;
+    Ok(found)
 }
 
-fn walk(
-    dir: &dyn Dir,
-    rel: &str,
-    cancel: &AtomicBool,
-    files: &mut Vec<ManifestFile>,
-) -> Result<(), ScanError> {
+fn walk(dir: &dyn Dir, rel: &str, cancel: &AtomicBool, found: &mut Scan) -> Result<(), ScanError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(ScanError::Cancelled);
     }
@@ -1006,13 +1012,13 @@ fn walk(
             format!("{rel}/{}", entry.name)
         };
         match entry.kind {
-            DirKind::Dir => walk(dir, &path, cancel, files)?,
+            DirKind::Dir => walk(dir, &path, cancel, found)?,
             DirKind::File => {
                 let Some(kind) = folder_file_type(&entry.name) else {
                     continue;
                 };
                 match hash_file(dir, &path, cancel) {
-                    Ok((bytes, sha256)) => files.push(ManifestFile {
+                    Ok((bytes, sha256)) => found.files.push(ManifestFile {
                         path,
                         kind,
                         stamp: FileStamp {
@@ -1025,8 +1031,19 @@ fn walk(
                     Err(ScanError::Dir(DirError::Revoked(m))) => {
                         return Err(DirError::Revoked(m).into());
                     }
-                    // Unreadable (gone, a link, no permission): it can't be sent either.
-                    Err(ScanError::Dir(e)) => eprintln!("passing over {path}: {e}"),
+                    // Gone since it was listed: the service may remove it.
+                    Err(ScanError::Dir(DirError::NotFound)) => {}
+                    // Unreadable (evicted to iCloud, locked, no permission, a link): it
+                    // can't be sent, but it's still there, so the service keeps its copy.
+                    Err(ScanError::Dir(e)) => {
+                        eprintln!("passing over {path}: {e}");
+                        let reason = if dir.evicted(&path) {
+                            UnreadableReason::NotDownloaded
+                        } else {
+                            UnreadableReason::CantRead
+                        };
+                        found.unreadable.push(UnreadableFile { path, reason });
+                    }
                 }
             }
         }
@@ -1431,7 +1448,7 @@ pub mod tests {
     fn the_scan_takes_exactly_the_allow_listed_files_with_stamps() {
         let dir = d5b("scan");
         let std = StdDir::new(&dir.0).unwrap();
-        let files = scan(&std, &AtomicBool::new(false)).unwrap();
+        let files = scan(&std, &AtomicBool::new(false)).unwrap().files;
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["build/notes.md", "paper.pdf", "photo.HEIC"]);
         assert_eq!(files[0].kind, FolderFileType::Text);
@@ -1448,6 +1465,93 @@ pub mod tests {
             scan(&std, &AtomicBool::new(true)),
             Err(ScanError::Cancelled)
         ));
+    }
+
+    /// A folder where some files can be listed but not read (evicted to iCloud, locked).
+    /// Paths in the list can't be opened; those ending in `.HEIC` read as evicted.
+    struct LockedDir(StdDir, Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Dir for LockedDir {
+        fn list(&self, rel: &str) -> Result<Vec<DirEntry>, DirError> {
+            self.0.list(rel)
+        }
+        fn stat(&self, rel: &str) -> Result<DirEntry, DirError> {
+            self.0.stat(rel)
+        }
+        fn open(&self, rel: &str) -> Result<Box<dyn Read + '_>, DirError> {
+            if self.1.lock().unwrap().iter().any(|p| p == rel) {
+                return Err(DirError::Io("Operation not permitted".into()));
+            }
+            self.0.open(rel)
+        }
+        fn evicted(&self, rel: &str) -> bool {
+            rel.ends_with(".HEIC")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_file_is_kept_not_removed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dir = d5b("locked");
+                let locked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let opener: Opener = {
+                    let locked = locked.clone();
+                    Arc::new(move |handle: &FolderHandle| match handle {
+                        FolderHandle::Path { path, .. } => StdDir::new(path)
+                            .map(|d| Box::new(LockedDir(d, locked.clone())) as Box<dyn Dir>),
+                        _ => Err(DirError::NotFound),
+                    })
+                };
+                let t = setup(opener).await;
+                let id = t.attach(&dir, "notes").await;
+                t.engine.request(&id).await.unwrap().unwrap();
+                t.until(&id, idle).await;
+                assert_eq!(t.folder_names(&id).len(), 3);
+
+                // Evicted: listed, not readable. Nothing is removed or sent.
+                locked
+                    .lock()
+                    .unwrap()
+                    .extend(["paper.pdf".to_string(), "photo.HEIC".into()]);
+                let o = t.engine.request(&id).await.unwrap().unwrap();
+                assert_eq!((o.plan.kept, o.plan.removed), (3, 0));
+                assert!(o.plan.upload.is_empty());
+                t.until(&id, idle).await;
+                assert_eq!(
+                    t.folder_names(&id),
+                    vec!["build/notes.md", "paper.pdf", "photo.HEIC"]
+                );
+                {
+                    let s = t.fake.state.lock().unwrap();
+                    let manifest = &s.manifests_received.last().unwrap().1;
+                    let unreadable = vec![
+                        UnreadableFile {
+                            path: "paper.pdf".into(),
+                            reason: UnreadableReason::CantRead,
+                        },
+                        UnreadableFile {
+                            path: "photo.HEIC".into(),
+                            reason: UnreadableReason::NotDownloaded,
+                        },
+                    ];
+                    assert_eq!(manifest.unreadable, unreadable);
+                    assert_eq!(manifest.files.len(), 1);
+                    let ws = s.workspaces.iter().find(|w| w.id == id).unwrap();
+                    assert_eq!(ws.unreadable, unreadable);
+                }
+
+                // Readable again: listed as usual, and the list is clear.
+                locked.lock().unwrap().clear();
+                let o = t.engine.request(&id).await.unwrap().unwrap();
+                assert_eq!((o.plan.kept, o.plan.removed), (3, 0));
+                t.until(&id, idle).await;
+                let s = t.fake.state.lock().unwrap();
+                assert!(s.manifests_received.last().unwrap().1.unreadable.is_empty());
+                assert!(s.workspaces.iter().all(|w| w.unreadable.is_empty()));
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -724,6 +724,7 @@ mod tests {
                 location: "~/notes".into(),
                 created_at: at(),
                 sync: Default::default(),
+                unreadable: Vec::new(),
             }],
             devices,
         }
