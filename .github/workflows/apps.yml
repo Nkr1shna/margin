@@ -1,7 +1,7 @@
 # Builds the apps per environment (docs/plan-deploy.md §4, §8) on the host runner and
 # publishes them as GitHub releases, so every deployed service has a matching app:
 #
-#   after a successful deploy-dev    -> Margin-dev .dmg (+ .apk), rolling pre-release "dev-latest"
+#   after a successful deploy-dev    -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
 #   after a successful promote-prod  -> Margin-prod .dmg (+ .apk), release "prod-<sha>", marked latest
 #   a v* tag                         -> both environments, release named after the tag
 #   workflow_dispatch                -> workflow artifacts only, no release
@@ -9,7 +9,8 @@
 # Each build is of the exact commit that was deployed (the deployed-<env>-<sha> artifact).
 # A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
 # the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
-# Margin.app, signed ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer
+# Margin.app (Margin Dev.app for dev: its own name, bundle id, settings and Keychain
+# entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer
 # account, owner question 7). Android: the APK, skipped while the runner has no Android SDK.
 #
 # workflow_run triggers only take effect once this file is on the default branch (main).
@@ -105,6 +106,10 @@ jobs:
       CARGO_TERM_COLOR: always
       SHA: ${{ needs.plan.outputs.sha }}
       MARGIN_DEFAULT_SERVICE_URL: ${{ matrix.environment == 'dev' && 'https://devmargin.krishnanelloore.com' || 'https://margin.krishnanelloore.com' }}
+      # The dev build is its own app ("Margin Dev"), so it installs beside Margin with its
+      # own settings folder and Keychain entries (crates/app config.rs APP_NAME, secrets.rs).
+      MARGIN_APP_NAME: ${{ matrix.environment == 'dev' && 'Margin Dev' || 'Margin' }}
+      MARGIN_APP_ID: ${{ matrix.environment == 'dev' && 'com.krishnanelloore.margin.app.dev' || 'com.krishnanelloore.margin.app' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,15 +121,29 @@ jobs:
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
       # dx runs from the workspace root with -p margin-app (from the crate it panics).
       # The icon is only in `dx bundle` output.
+      # Renames the bundle in this checkout only (Dioxus.toml and the Info.plist template).
+      - name: App identity
+        if: matrix.environment == 'dev'
+        run: |
+          sed -i '' -e "s/^name = \"Margin\"$/name = \"$MARGIN_APP_NAME\"/" \
+            -e "s/^identifier = \".*\"$/identifier = \"$MARGIN_APP_ID\"/" \
+            -e "s/^bundle_name = \".*\"$/bundle_name = \"$MARGIN_APP_NAME\"/" crates/app/Dioxus.toml
+          plist=crates/app/macos/Info.plist
+          plutil -replace CFBundleIdentifier -string "$MARGIN_APP_ID" "$plist"
+          plutil -replace CFBundleName -string "$MARGIN_APP_NAME" "$plist"
+          plutil -replace CFBundleDisplayName -string "$MARGIN_APP_NAME" "$plist"
+          grep -E '^(name|identifier|bundle_name) =' crates/app/Dioxus.toml
       - name: Desktop bundle
         run: |
           dx --version
           dx bundle -p margin-app --platform desktop --package-types macos --release
-          app="target/dx/margin-app/bundle/macos/macos/Margin.app"
-          [ -d "$app" ] || { echo "::error::no $app"; exit 1; }
+          app="$(find target/dx/margin-app/bundle/macos -maxdepth 2 -name '*.app' -type d | head -n 1)"
+          [ -d "$app" ] || { echo "::error::dx bundled no .app"; exit 1; }
+          id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+          [ "$id" = "$MARGIN_APP_ID" ] || { echo "::error::$app is $id, expected $MARGIN_APP_ID"; exit 1; }
           codesign --force --deep --sign - "$app"
           mkdir -p dist
-          hdiutil create -volname "Margin" -srcfolder "$app" -ov -format UDZO \
+          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$app" -ov -format UDZO \
             "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
       - name: Android build
         run: |
@@ -169,8 +188,9 @@ jobs:
           cat > notes.md <<EOF
           Margin apps built from \`$short\`, the commit deployed to $KIND.
 
-          The desktop app is signed ad hoc, not notarized: after moving Margin.app to
-          Applications, run \`xattr -dr com.apple.quarantine /Applications/Margin.app\` once.
+          The desktop app is signed ad hoc, not notarized: after moving it to Applications,
+          run \`xattr -dr com.apple.quarantine "/Applications/Margin Dev.app"\` (dev) or
+          \`xattr -dr com.apple.quarantine /Applications/Margin.app\` (prod) once.
           EOF
           case "$KIND" in
             dev)
