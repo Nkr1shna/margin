@@ -20,7 +20,7 @@ use crate::ui::citations::CitationViewer;
 use crate::ui::common::{
     ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, reveal_topic,
 };
-use crate::ui::outline::{OutlineDraft, ProposalView};
+use crate::ui::outline::{OutlineDraft, ProposalView, course_open_id};
 use crate::ui::settings::SettingsPane;
 use crate::ui::sources::kind_icon;
 
@@ -1292,9 +1292,19 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
         decision_text(&card.decision, waiting, &place)
     };
     let when = ago(&item.updated_at);
+    // The settled line, which takes the focus from the button that answered.
+    let settled_id = format!(
+        "confirm-{}-done",
+        item.id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+    );
+    let settled_sel = serde_json::to_string(&format!("#{settled_id}")).unwrap_or_default();
     let answer = move |approve: bool| {
         let chat_id = chat.id.clone();
         let item_id = item_id.clone();
+        let settled_sel = settled_sel.clone();
         spawn(async move {
             let Some(api) = app.api() else { return };
             sending.set(Some(approve));
@@ -1306,10 +1316,12 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
                 Ok(chat) => {
                     let mut lib = app.lib;
                     lib.write().upsert_chat(chat);
+                    let _ = js(&format!("MarginApp.focus({settled_sel});"));
                 }
                 // Answered on another device first (or stopped): show it as it is now.
                 Err(e) if e.status == Some(409) => {
                     let _ = fetch_chat(app, chat_id).await;
+                    let _ = js(&format!("MarginApp.focus({settled_sel});"));
                 }
                 Err(e) => error.set(Some(app.failure(&e))),
             }
@@ -1364,7 +1376,7 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
                     }
                 },
                 Some(text) => rsx! {
-                    p { class: "{settled_class}", role: "status",
+                    p { id: "{settled_id}", class: "{settled_class}", role: "status", tabindex: "-1",
                         Icon { name: icon }
                         span { "{text}" }
                         if card.decision != Decision::Pending {
@@ -1458,9 +1470,11 @@ fn OutlineView(proposal_id: Id) -> Element {
     });
     let lib = app.lib.read();
     let proposal = lib.proposals.get(&proposal_id).cloned();
-    let subject_name = proposal
+    let parent = proposal
         .as_ref()
-        .and_then(|p| p.request.parent_topic_id.as_ref())
+        .and_then(|p| p.request.parent_topic_id.clone());
+    let subject_name = parent
+        .as_ref()
         .and_then(|id| lib.topics.get(id))
         .map(|t| t.title.clone());
     drop(lib);
@@ -1472,6 +1486,20 @@ fn OutlineView(proposal_id: Id) -> Element {
             None => rsx! { Loading { label: "Loading the outline…" } },
         };
     };
+    // A subject the proposal named that isn't in the library: deleted once the library is
+    // here (the course then goes under the outline's subject title), else not known yet.
+    let subject_gone = parent.is_some() && subject_name.is_none();
+    if subject_gone && proposal.status == ProposalStatus::Ready {
+        match app.lib_status.read().clone() {
+            LoadStatus::Loaded => {}
+            LoadStatus::Loading => {
+                return rsx! { Loading { label: "Loading the outline…" } };
+            }
+            LoadStatus::Failed(e) => {
+                return rsx! { ErrorNotice { message: format!("Couldn't load the library. {e}") } };
+            }
+        }
+    }
     let request = proposal.request.clone();
     rsx! {
         section { class: "chat-card outline-card", "aria-label": "Proposed course",
@@ -1479,6 +1507,7 @@ fn OutlineView(proposal_id: Id) -> Element {
                 proposal: proposal.clone(),
                 draft,
                 subject_name,
+                subject_gone,
                 accepting: *accepting.read(),
                 accept_error: accept_error.read().clone(),
                 on_accept: move |d: OutlineDraft| {
@@ -1510,6 +1539,10 @@ fn OutlineView(proposal_id: Id) -> Element {
                                 let mut collapsed = app.collapsed;
                                 collapsed.write().remove(&topic.id);
                                 announce(&format!("Created the course {}.", topic.title));
+                                // The Create lessons button is gone with the editor:
+                                // the focus goes on to the course.
+                                let open = serde_json::to_string(&format!("#{}", course_open_id(&topic.id))).unwrap_or_default();
+                                let _ = js(&format!("MarginApp.focus({open});"));
                             }
                             // Created on another device meanwhile, or no longer
                             // creatable: show the outline as it is now.

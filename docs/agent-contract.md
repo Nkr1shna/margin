@@ -307,7 +307,7 @@ nullable). Outputs are compact JSON text unless noted. `summary` is the tool row
 | `edit_lesson_title` | Write | `lesson_id`, `title` | |
 | `create_note` | Write | `topic_id`, `lesson_id: Option`, `title`, `body_md` | Agent-written; Result card |
 | `append_to_note` | Write | `note_id`, `text` | Never asks (Q2) |
-| `replace_note_body` | Write | `note_id`, `body_md` | Asks when the note is the owner's writing (Q2) |
+| `replace_note_body` | Write | `note_id`, `body_md` | Asks when the note is the owner's writing (Q2); an empty body has nothing to overwrite and never asks |
 | `propose_course` | Write | `prompt` (the learner's request), `topic_title`, `subject_title`, `lessons: [{title, summary, minutes}]` (1–12), `level`, `with_videos`, `with_quiz`, `parent_topic_id: Option`, `source_ids` | The model writes the outline; the service validates it like `ask::validate_outline`, stores a `Ready` `Proposal` with `chat_id`, card `Outline`. Options the owner didn't state are inferred; the chips on the card change them. |
 | `accept_proposal` | Write | `proposal_id` | Same as Create lessons with no edits; Result card for the topic. Only a proposal of the same chat; its result is the chat's record (no extra `Action`) |
 | `delete_topic` / `delete_lesson` / `delete_note` | Destructive | the id | Prompt names what goes with it (lessons, notes, videos, sources) |
@@ -329,6 +329,11 @@ Create lessons on the outline card: `POST proposal_accept` with the edited outli
 fine: the action takes that turn's id and lands between items; replay moves it after the
 outputs of calls still open when it was stored (4.11). Accepting through the
 `accept_proposal` tool adds no `Action` (its result is the record).
+A proposal whose `parent_topic_id` was deleted after `propose_course` is accepted under
+`outline.subject_title` instead (an existing subject of that title, else a new one; the
+stored request's `parent_topic_id` is cleared). The outline card then shows the Subject
+field, prefilled from the outline, with a notice that the named subject was deleted;
+an empty subject keeps Create lessons from going, like an empty topic title.
 
 `POST /api/ask` (`routes::ASK`), the proposal job and `margin_ai::propose_outline` with its
 prompt are gone; the model writes the outline in `propose_course`. `AskRequest` stays as

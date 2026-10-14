@@ -17,7 +17,7 @@ use margin_ai::{
     ReasoningSummary, ResponseRequest, ResponseStream, ResponsesClient, SceneRequest, StreamEvent,
     ToolChoice, write_lesson, write_scene,
 };
-use margin_shared::{Level, Outline, OutlineLesson, ReasoningEffort, Usage};
+use margin_shared::{Level, OutlineLesson, ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -159,17 +159,6 @@ fn chunked(body: &str, size: usize) -> Reply {
 
 fn whole(body: String) -> Reply {
     Reply::Sse(vec![body.into_bytes()])
-}
-
-fn message_response(text: &str) -> Value {
-    json!({
-        "id": "resp_1", "object": "response", "status": "completed",
-        "output": [
-            {"type": "reasoning", "id": "rs_1", "summary": []},
-            {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
-             "content": [{"type": "output_text", "text": text, "annotations": []}]}
-        ]
-    })
 }
 
 async fn collect(client: &ResponsesClient) -> (Result<String, AiError>, Vec<String>) {
@@ -369,84 +358,8 @@ async fn unreachable_server_is_a_network_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Structured output
+// Lessons and scenes
 // ---------------------------------------------------------------------------
-
-/// A strict schema for `Outline`, the shape the tests ask for.
-fn outline_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["topic_title", "subject_title", "lessons"],
-        "properties": {
-            "topic_title": { "type": "string" },
-            "subject_title": { "type": "string" },
-            "lessons": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["title", "summary", "minutes"],
-                    "properties": {
-                        "title": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "minutes": { "type": "integer" }
-                    }
-                }
-            }
-        }
-    })
-}
-
-async fn outline(client: &ResponsesClient) -> Result<Outline, AiError> {
-    client
-        .structured(
-            "Propose an outline.",
-            "I want to understand Fourier series",
-            "course_outline",
-            outline_schema(),
-        )
-        .await
-}
-
-fn outline_json(n: usize) -> String {
-    json!({
-        "topic_title": "Fourier series",
-        "subject_title": "Signals & Systems",
-        "lessons": (0..n).map(|i| json!({
-            "title": format!("Lesson {}", i + 1),
-            "summary": "What it covers.",
-            "minutes": 9 + i,
-        })).collect::<Vec<_>>(),
-    })
-    .to_string()
-}
-
-#[tokio::test]
-async fn structured_output_parses_and_sends_a_strict_schema() {
-    let (client, fake) = spawn(vec![Reply::Json(
-        StatusCode::OK,
-        message_response(&outline_json(3)),
-    )])
-    .await;
-    let outline = outline(&client).await.unwrap();
-    assert_eq!(outline.topic_title, "Fourier series");
-    assert_eq!(outline.subject_title, "Signals & Systems");
-    assert_eq!(outline.lessons.len(), 3);
-    assert_eq!(outline.lessons[2].minutes, 11);
-
-    let (auth, req) = last_request(&fake);
-    assert_eq!(auth.as_deref(), Some("Bearer test-key"));
-    assert_eq!(req["stream"], false);
-    assert_eq!(req["store"], false);
-    let format = &req["text"]["format"];
-    assert_eq!(format["type"], "json_schema");
-    assert_eq!(format["strict"], true);
-    assert_eq!(format["name"], "course_outline");
-    assert_eq!(format["schema"]["additionalProperties"], false);
-    assert_eq!(req["input"], "I want to understand Fourier series");
-    assert_eq!(req["instructions"], "Propose an outline.");
-}
 
 fn passages() -> Vec<Passage> {
     vec![Passage {
@@ -456,69 +369,6 @@ fn passages() -> Vec<Passage> {
         ..Default::default()
     }]
 }
-
-#[tokio::test]
-async fn structured_output_that_violates_the_schema_is_parse() {
-    // Wrong types, and plain prose instead of JSON.
-    let wrong_type = json!({"topic_title": 7, "subject_title": "S", "lessons": []}).to_string();
-    let missing = json!({"topic_title": "T", "lessons": []}).to_string();
-    let (client, _) = spawn(vec![
-        Reply::Json(StatusCode::OK, message_response(&wrong_type)),
-        Reply::Json(StatusCode::OK, message_response(&missing)),
-        Reply::Json(
-            StatusCode::OK,
-            message_response("Sure! Here is an outline."),
-        ),
-        Reply::Text(StatusCode::OK, "not json at all".into()),
-    ])
-    .await;
-    for _ in 0..4 {
-        match outline(&client).await {
-            Err(AiError::Parse(_)) => {}
-            other => panic!("expected Parse, got {other:?}"),
-        }
-    }
-}
-
-#[tokio::test]
-async fn structured_refusal_and_incomplete_are_incomplete() {
-    let refusal = json!({"status": "completed", "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "I won't."}]}]});
-    let incomplete = json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": []});
-    let failed = json!({"status": "failed", "error": {"code": "server_error", "message": "Boom."}, "output": []});
-    let (client, _) = spawn(vec![
-        Reply::Json(StatusCode::OK, refusal),
-        Reply::Json(StatusCode::OK, incomplete),
-        Reply::Json(StatusCode::OK, failed),
-    ])
-    .await;
-    for expected in ["I won't.", "token limit", "Boom."] {
-        match outline(&client).await {
-            Err(AiError::Incomplete(m)) => assert!(m.contains(expected), "{m}"),
-            other => panic!("expected Incomplete, got {other:?}"),
-        }
-    }
-}
-
-#[tokio::test]
-async fn structured_error_status_is_http() {
-    let (client, _) = spawn(vec![Reply::Json(
-        StatusCode::BAD_REQUEST,
-        json!({"error": {"message": "Invalid schema for response_format 'course_outline'.", "type": "invalid_request_error", "code": null}}),
-    )])
-    .await;
-    match outline(&client).await {
-        Err(AiError::Http {
-            status: 400,
-            message,
-            ..
-        }) => assert!(message.contains("Invalid schema")),
-        other => panic!("expected Http, got {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Lessons and scenes
-// ---------------------------------------------------------------------------
 
 fn lesson_ctx(index: usize) -> LessonContext {
     LessonContext {

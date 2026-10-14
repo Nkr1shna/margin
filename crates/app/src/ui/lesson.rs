@@ -56,7 +56,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                     div { class: "empty",
                         h2 { "This lesson isn't here any more" }
                         p { "It may have been deleted on another device." }
-                        button { class: "btn btn-primary", onclick: move |_| { nav.replace(Route::Ask {}); }, "Go to Ask" }
+                        button { class: "btn btn-primary", onclick: move |_| { nav.replace(Route::Ask {}); }, "New chat" }
                     }
                 }
             }

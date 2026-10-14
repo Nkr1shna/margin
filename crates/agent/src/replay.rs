@@ -23,9 +23,10 @@ pub const CONDENSED_HISTORY_PREFIX: &str =
 /// `output_item.done` arrived, function call outputs, `Action`s as developer messages
 /// from [`action_input`]). Cards, errors and model output that never completed have no
 /// model items. A `function_call` with no `function_call_output` anywhere gets
-/// [`cancelled_call_output`] right after it, so the input is always valid. Anything
-/// stored between a step's calls and their outputs (an `Action` recorded while the turn
-/// waited on a confirmation) is replayed after those outputs.
+/// [`cancelled_call_output`] right after it, so the input is always valid. A developer
+/// or user message stored between a step's calls and their outputs (an `Action`
+/// recorded while the turn waited on a confirmation) is replayed after those outputs;
+/// the step's own output (more calls, reasoning, a message) keeps its order.
 ///
 /// Condensed history: the input starts at the latest `compaction` item (server-side
 /// compaction carries everything before it) or the latest condensed-history `Action`
@@ -43,9 +44,9 @@ pub fn replay_input(items: &[ReplayItem<'_>]) -> Vec<Value> {
         .collect();
     let mut seen_calls = HashSet::new();
     let mut out = Vec::with_capacity(flat.len());
-    // Calls replayed whose output is still to come, and what was stored meanwhile (an
-    // `Action` recorded while the turn waited on a confirmation): it goes after the
-    // outputs, so nothing comes between a step's calls and their outputs.
+    // Calls replayed whose output is still to come, and the input messages stored
+    // meanwhile (an `Action` recorded while the turn waited on a confirmation): they go
+    // after the outputs, so no input comes between a step's calls and their outputs.
     let mut open: HashSet<&str> = HashSet::new();
     let mut deferred: Vec<Value> = Vec::new();
     for (i, value) in flat.iter().enumerate() {
@@ -70,7 +71,7 @@ pub fn replay_input(items: &[ReplayItem<'_>]) -> Vec<Value> {
                     out.append(&mut deferred);
                 }
             }
-            _ if !open.is_empty() => deferred.push((*value).clone()),
+            _ if !open.is_empty() && is_input_message(value) => deferred.push((*value).clone()),
             _ => out.push((*value).clone()),
         }
     }
@@ -162,6 +163,11 @@ fn from_last_compaction<'a>(items: &[ReplayItem<'a>]) -> Vec<&'a Value> {
         .rposition(|v| item_type(v) == Some("compaction") || is_condensed_history(v))
         .unwrap_or(0);
     flat[start..].to_vec()
+}
+
+/// Whether `value` is a developer or user message (input, not model output).
+fn is_input_message(value: &Value) -> bool {
+    matches!(value["role"].as_str(), Some("developer" | "user"))
 }
 
 /// Whether the items after a reasoning item continue the same output: more reasoning,
@@ -295,6 +301,38 @@ mod tests {
                 message_item("msg_1", "Done."),
             ]
         );
+    }
+
+    #[test]
+    fn a_steps_own_output_between_its_calls_keeps_its_order() {
+        let cases = [
+            vec![
+                vec![user("go")],
+                vec![function_call_item("fc_1", "call_1", "a", "{}")],
+                vec![reasoning_item("rs_2", "next")],
+                vec![function_call_item("fc_2", "call_2", "b", "{}")],
+                vec![function_call_output("call_1", "ok")],
+                vec![function_call_output("call_2", "ok")],
+            ],
+            vec![
+                vec![user("go")],
+                vec![function_call_item("fc_1", "call_1", "a", "{}")],
+                vec![message_item("msg_1", "Looking.")],
+                vec![function_call_output("call_1", "ok")],
+            ],
+        ];
+        for stored in cases {
+            let items: Vec<ChatItem> = (1..=stored.len() as u64).map(item).collect();
+            let replay: Vec<ReplayItem> = items
+                .iter()
+                .zip(&stored)
+                .map(|(item, m)| ReplayItem {
+                    item,
+                    model_items: m,
+                })
+                .collect();
+            assert_eq!(replay_input(&replay), stored.concat());
+        }
     }
 
     #[test]

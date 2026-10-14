@@ -256,8 +256,17 @@ pub async fn accept_proposal(
         proposal.request.lesson_count = outline.lessons.len() as u32;
         let mut events = Vec::new();
 
-        let subject = match &proposal.request.parent_topic_id {
-            Some(parent) => library::topic(state, parent).await?,
+        // A parent topic deleted since the proposal was made: the course goes under the
+        // outline's subject title instead, as the outline card shows it.
+        let parent = match &proposal.request.parent_topic_id {
+            Some(id) => state.store.get::<Topic>(db::TOPIC, id).await?,
+            None => None,
+        };
+        if parent.is_none() {
+            proposal.request.parent_topic_id = None;
+        }
+        let subject = match parent {
+            Some(parent) => parent,
             None => {
                 if outline.subject_title.is_empty() {
                     return Err(AppError::bad_request("Give the subject a title."));

@@ -1284,7 +1284,7 @@ pub struct ReplaceNoteBodyArgs {
 impl TypedTool for ReplaceNoteBody {
     type Args = ReplaceNoteBodyArgs;
     const NAME: &'static str = "replace_note_body";
-    const DESCRIPTION: &'static str = "Replace a note's whole text (its title stays). Read the note first. When the owner wrote the note, the app asks them to confirm first; notes you wrote change right away.";
+    const DESCRIPTION: &'static str = "Replace a note's whole text (its title stays). Read the note first. When the owner wrote the note's text, the app asks them to confirm first; notes you wrote, and empty notes, change right away.";
     const KIND: ToolKind = ToolKind::Write;
 
     fn label(&self, _args: &Self::Args) -> String {
@@ -1300,18 +1300,15 @@ impl TypedTool for ReplaceNoteBody {
             let row = library::stored_note(&self.0, &args.note_id)
                 .await
                 .map_err(|e| e.message)?;
-            if row.author != Author::Owner {
+            // An empty body has none of the owner's writing to overwrite.
+            let words = row.note.body_md.split_whitespace().count();
+            if row.author != Author::Owner || words == 0 {
                 return Ok(None);
             }
-            let words = row.note.body_md.split_whitespace().count();
-            let detail = if words == 0 {
-                "You wrote this note; it's empty now.".to_string()
-            } else {
-                format!(
-                    "You wrote this note. Its text ({}) would be replaced by the assistant's; this can't be undone.",
-                    plural(words, "word", "words")
-                )
-            };
+            let detail = format!(
+                "You wrote this note. Its text ({}) would be replaced by the assistant's; this can't be undone.",
+                plural(words, "word", "words")
+            );
             Ok(Some(ConfirmationPrompt {
                 title: format!(
                     "Replace the text of your note {}?",

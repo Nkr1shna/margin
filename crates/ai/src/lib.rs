@@ -4,9 +4,7 @@
 //! The service owns configuration and the API key; this crate is stateless and
 //! knows nothing about storage.
 //!
-//! Every request is sent with `store: false`. Plain text is streamed (Server-Sent
-//! Events); structured output is a single JSON response using a strict
-//! `json_schema` text format.
+//! Every request is sent with `store: false` and streamed (Server-Sent Events).
 
 use std::time::Duration;
 
@@ -37,7 +35,7 @@ pub enum AiError {
     },
     #[error("couldn't reach the model API: {0}")]
     Network(String),
-    /// The response could not be parsed, or structured output didn't match the schema.
+    /// The response could not be parsed.
     #[error("the model's answer couldn't be read: {0}")]
     Parse(String),
     /// The model refused or the response ended as `incomplete`/`failed`.
@@ -70,8 +68,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// A stalled connection: no bytes at all for this long. Streams have no overall limit;
 /// the Responses API sends events (and keep-alives) while the model works.
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
-/// Overall limit for one non-streaming request (structured output).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A configured Responses API endpoint. Cheap to clone.
 #[derive(Clone)]
@@ -127,12 +123,12 @@ impl ResponsesClient {
             .json(body))
     }
 
-    fn body(&self, instructions: &str, input: &[InputPart], stream: bool) -> Value {
+    fn body(&self, instructions: &str, input: &[InputPart]) -> Value {
         json!({
             "model": self.model,
             "instructions": instructions,
             "input": input_json(input),
-            "stream": stream,
+            "stream": true,
             "store": false,
         })
     }
@@ -160,7 +156,7 @@ impl ResponsesClient {
         input: &[InputPart],
         mut on_delta: impl FnMut(&str) + Send,
     ) -> Result<String, AiError> {
-        let body = self.body(instructions, input, true);
+        let body = self.body(instructions, input);
         let resp = self.request(&body)?.send().await.map_err(network)?;
         let resp = check_status(resp).await?;
 
@@ -183,59 +179,6 @@ impl ResponsesClient {
         Err(AiError::Network(
             "the connection closed before the response finished".into(),
         ))
-    }
-
-    /// Non-streaming structured output (`text.format = {type: "json_schema", strict: true}`),
-    /// deserialized into `T`.
-    pub async fn structured<T: serde::de::DeserializeOwned>(
-        &self,
-        instructions: &str,
-        input: &str,
-        schema_name: &str,
-        schema: serde_json::Value,
-    ) -> Result<T, AiError> {
-        self.structured_parts(
-            instructions,
-            &[InputPart::Text(input.to_string())],
-            schema_name,
-            schema,
-        )
-        .await
-    }
-
-    /// `structured` with an input of text and images, in order.
-    pub async fn structured_parts<T: serde::de::DeserializeOwned>(
-        &self,
-        instructions: &str,
-        input: &[InputPart],
-        schema_name: &str,
-        schema: serde_json::Value,
-    ) -> Result<T, AiError> {
-        let mut body = self.body(instructions, input, false);
-        body["text"] = json!({
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "schema": schema,
-                "strict": true,
-            }
-        });
-        let resp = self
-            .request(&body)?
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(network)?;
-        let resp = check_status(resp).await?;
-        let raw = resp.bytes().await.map_err(network)?;
-        let response: Value = serde_json::from_slice(&raw)
-            .map_err(|e| AiError::Parse(format!("the response isn't JSON: {e}")))?;
-        let text = response_text(&response)?;
-        serde_json::from_str(&text).map_err(|e| {
-            AiError::Parse(format!(
-                "the structured answer doesn't match the {schema_name} schema: {e}"
-            ))
-        })
     }
 }
 

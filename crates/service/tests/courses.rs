@@ -470,6 +470,49 @@ async fn proposals_are_checked_like_outlines() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_course_whose_subject_was_deleted_goes_under_the_outlines_subject() {
+    let (h, t) = signed_in().await;
+    let subject = new_topic(&h, &t, None, "Maths").await;
+    let mut req = ask_request("Laplace", 2, false);
+    req.parent_topic_id = Some(subject.id.clone());
+    let p = h.propose(&t, &req).await;
+    let r = h
+        .delete(&t, &format!("/api/topics/{}", subject.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // The card shows the subject field; what it says is where the course goes.
+    let mut outline = p.outline.unwrap();
+    outline.subject_title = "Engineering maths".into();
+    let r = h
+        .post(&t, &format!("/api/proposals/{}/accept", p.id))
+        .json(&json!({"outline": outline}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let course: Topic = r.json().await.unwrap();
+    let lib = library(&h, &t).await;
+    let parent = lib
+        .topics
+        .iter()
+        .find(|t| Some(&t.id) == course.parent_id.as_ref())
+        .unwrap();
+    assert_eq!(parent.title, "Engineering maths");
+    assert_eq!(parent.parent_id, None);
+    let stored: Proposal = h
+        .state
+        .store
+        .get(db::PROPOSAL, &p.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.request.parent_topic_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn accept_proposal_creates_the_course_when_the_owner_says_go() {
     let (h, t) = signed_in().await;
     let (p, d) = h
@@ -972,6 +1015,29 @@ async fn replacing_the_owners_note_asks_and_appending_never_does() {
     assert_eq!(
         stored_note(&h, &mine.id).await.unwrap().note.body_md,
         "Tidier, with my changes."
+    );
+
+    // An empty note of the owner's has no writing to overwrite: filling it doesn't ask.
+    let blank = owner_note(&h, &t, &topic.id, "Mirrors", "").await;
+    assert_eq!(
+        stored_note(&h, &blank.id).await.unwrap().author,
+        Author::Owner
+    );
+    script(
+        &h,
+        &[(
+            "call_r4",
+            "replace_note_body",
+            json!({"note_id": blank.id, "body_md": "Angle in equals angle out."}),
+        )],
+        "Filled.",
+    );
+    say(&h, &t, Some(&chat), "Fill in my mirrors note").await;
+    let d = wait_chat(&h, &t, &chat, idle).await;
+    assert!(!last_turn(&d).iter().any(|l| l.starts_with("card confirm")));
+    assert_eq!(
+        stored_note(&h, &blank.id).await.unwrap().note.body_md,
+        "Angle in equals angle out."
     );
 }
 

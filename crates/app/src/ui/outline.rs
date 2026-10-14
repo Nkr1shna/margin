@@ -110,8 +110,12 @@ impl OutlineDraft {
 pub fn ProposalView(
     proposal: Proposal,
     draft: Signal<Option<OutlineDraft>>,
-    /// The subject the proposal is filed under, when it names one (`parent_topic_id`).
+    /// The subject the proposal is filed under, when it names one (`parent_topic_id`)
+    /// that is still in the library.
     subject_name: Option<String>,
+    /// The proposal named a subject (`parent_topic_id`) that has since been deleted: the
+    /// course goes under the outline's subject title instead.
+    subject_gone: bool,
     accepting: bool,
     accept_error: Option<ApiFailure>,
     on_accept: EventHandler<OutlineDraft>,
@@ -155,7 +159,8 @@ pub fn ProposalView(
                         outline: d.outline,
                         options: d.options,
                         draft,
-                        fixed_subject: subject_name.clone().or_else(|| proposal.request.parent_topic_id.as_ref().map(|_| "the chosen subject".to_string())),
+                        fixed_subject: subject_name.clone(),
+                        subject_gone,
                         accepting,
                         accept_error,
                         on_accept,
@@ -277,6 +282,7 @@ fn CourseView(topic_id: String, fallback_title: String) -> Element {
                 }
                 if let Some(first) = first {
                     button {
+                        id: course_open_id(&topic_id),
                         class: "btn btn-primary",
                         onclick: move |_| {
                             nav.push(Route::LessonRead { id: first.clone() });
@@ -289,6 +295,16 @@ fn CourseView(topic_id: String, fallback_title: String) -> Element {
     }
 }
 
+/// The id of a created course's "Open the first lesson" button, which takes the focus
+/// once Create lessons has made the course.
+pub fn course_open_id(topic_id: &str) -> String {
+    let id: String = topic_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("course-{id}-open")
+}
+
 /// The editable outline with the course's chips and Create lessons. `scope` (the
 /// proposal's id) keeps its controls' ids apart from another card's in the same chat.
 #[component]
@@ -298,6 +314,8 @@ pub fn OutlineEditor(
     options: CourseOptions,
     draft: Signal<Option<OutlineDraft>>,
     fixed_subject: Option<String>,
+    /// The subject the proposal named was deleted (see `ProposalView`).
+    subject_gone: bool,
     accepting: bool,
     accept_error: Option<ApiFailure>,
     on_accept: EventHandler<OutlineDraft>,
@@ -336,23 +354,39 @@ pub fn OutlineEditor(
         keys.write().fit(n);
     }
     let row_keys = keys.peek().keys();
-    let issue = first_issue(&outline);
+    let needs_subject = fixed_subject.is_none();
+    let issue = first_issue(&outline, needs_subject);
     let topic_missing = outline.topic_title.trim().is_empty();
+    let subject_missing = needs_subject && outline.subject_title.trim().is_empty();
     let subject_label = fixed_subject
         .clone()
-        .unwrap_or_else(|| outline.subject_title.clone());
-    let (topic_id, topic_err, subject_id, add_id) = (
+        .unwrap_or_else(|| outline.subject_title.trim().to_string());
+    let (topic_id, topic_err, subject_id, subject_err, add_id) = (
         ids.topic(),
         format!("{}-err", ids.topic()),
         ids.subject(),
+        format!("{}-err", ids.subject()),
         ids.add(),
     );
+    let gone_notice = match outline.subject_title.trim() {
+        "" => "The subject this course was going into has been deleted. Give it a subject under Edit outline.".to_string(),
+        s => format!("The subject this course was going into has been deleted. It will go under “{s}” instead; you can change that under Edit outline."),
+    };
 
     rsx! {
         div { class: "outline",
             div { class: "outline-h",
                 b { "Proposed outline" }
-                small { "{subject_label} · {n} lessons · ~{total} min" }
+                small {
+                    if !subject_label.is_empty() { "{subject_label} · " }
+                    "{n} lessons · ~{total} min"
+                }
+            }
+            if subject_gone && needs_subject {
+                div { class: "notice", role: "status", style: "margin-bottom: 12px",
+                    Icon { name: "alert" }
+                    div { class: "body", "{gone_notice}" }
+                }
             }
             if *editing.read() {
                 div { class: "outline-fields",
@@ -362,6 +396,7 @@ pub fn OutlineEditor(
                             id: "{topic_id}",
                             class: "input",
                             placeholder: "Topic title",
+                            disabled: accepting,
                             "aria-invalid": topic_missing.to_string(),
                             "aria-describedby": topic_missing.then(|| topic_err.clone()),
                             initial_value: "{outline.topic_title}",
@@ -371,14 +406,21 @@ pub fn OutlineEditor(
                             span { id: "{topic_err}", class: "field-error", "Needs a title" }
                         }
                     }
-                    if fixed_subject.is_none() {
+                    if needs_subject {
                         div { class: "field",
                             label { r#for: "{subject_id}", "Subject" }
                             input {
                                 id: "{subject_id}",
                                 class: "input",
+                                placeholder: "Subject title",
+                                disabled: accepting,
+                                "aria-invalid": subject_missing.to_string(),
+                                "aria-describedby": subject_missing.then(|| subject_err.clone()),
                                 initial_value: "{outline.subject_title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.subject_title = v.clone()) },
+                            }
+                            if subject_missing {
+                                span { id: "{subject_err}", class: "field-error", "Needs a title" }
                             }
                         }
                     }
@@ -396,6 +438,7 @@ pub fn OutlineEditor(
                                 class: "input ol-title",
                                 "aria-label": "Lesson {i + 1} title",
                                 placeholder: "Lesson title",
+                                disabled: accepting,
                                 "aria-invalid": lesson.title.trim().is_empty().to_string(),
                                 "aria-describedby": lesson.title.trim().is_empty().then(|| ids.row(key, "err")),
                                 initial_value: "{lesson.title}",
@@ -408,6 +451,7 @@ pub fn OutlineEditor(
                                 class: "input",
                                 "aria-label": "Lesson {i + 1} summary",
                                 placeholder: "One-line summary",
+                                disabled: accepting,
                                 initial_value: "{lesson.summary}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].summary = v.clone()) },
                             }
@@ -419,6 +463,7 @@ pub fn OutlineEditor(
                                 min: "1",
                                 max: "180",
                                 "aria-label": "Lesson {i + 1} minutes",
+                                disabled: accepting,
                                 initial_value: "{lesson.minutes}",
                                 oninput: move |e| {
                                     if let Ok(m) = e.value().parse::<u32>() {
@@ -430,7 +475,7 @@ pub fn OutlineEditor(
                                 id: ids.row(key, "up"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} up",
-                                disabled: i == 0,
+                                disabled: accepting || i == 0,
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
@@ -445,7 +490,7 @@ pub fn OutlineEditor(
                                 id: ids.row(key, "down"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} down",
-                                disabled: i + 1 == n,
+                                disabled: accepting || i + 1 == n,
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
@@ -459,7 +504,7 @@ pub fn OutlineEditor(
                             button {
                                 class: "icon-btn ol-del",
                                 "aria-label": "Remove lesson {i + 1}",
-                                disabled: n == 1,
+                                disabled: accepting || n == 1,
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
@@ -489,6 +534,7 @@ pub fn OutlineEditor(
                     button {
                         id: "{add_id}",
                         class: "btn btn-ghost btn-sm",
+                        disabled: accepting,
                         onclick: {
                             let ids = ids.clone();
                             move |_| {
@@ -564,7 +610,7 @@ pub fn OutlineEditor(
                             return;
                         }
                         let Some(d) = draft.peek().clone() else { return };
-                        if let Some(issue) = first_issue(&d.outline) {
+                        if let Some(issue) = first_issue(&d.outline, needs_subject) {
                             editing.set(true);
                             focus_first(&issue.selector(&ids, &keys.peek()));
                             return;
@@ -672,6 +718,7 @@ impl RowKeys {
 #[derive(Debug, Clone, PartialEq)]
 enum OutlineIssue {
     TopicTitle,
+    SubjectTitle,
     NoLessons,
     LessonTitle(usize),
 }
@@ -680,6 +727,7 @@ impl OutlineIssue {
     fn message(&self) -> String {
         match self {
             OutlineIssue::TopicTitle => "The topic needs a title.".into(),
+            OutlineIssue::SubjectTitle => "The subject needs a title.".into(),
             OutlineIssue::NoLessons => "Add at least one lesson.".into(),
             OutlineIssue::LessonTitle(i) => format!("Lesson {} needs a title.", i + 1),
         }
@@ -689,6 +737,7 @@ impl OutlineIssue {
     fn selector(&self, ids: &Ids, keys: &RowKeys) -> String {
         match self {
             OutlineIssue::TopicTitle => format!("#{}", ids.topic()),
+            OutlineIssue::SubjectTitle => format!("#{}", ids.subject()),
             OutlineIssue::NoLessons => format!("#{}", ids.add()),
             OutlineIssue::LessonTitle(i) => match keys.at(*i) {
                 Some(key) => format!("#{}", ids.row(key, "title")),
@@ -710,9 +759,14 @@ fn after_move(to: usize, n: usize, up: bool) -> &'static str {
     }
 }
 
-fn first_issue(outline: &Outline) -> Option<OutlineIssue> {
+/// `needs_subject`: the course isn't filed under an existing topic, so the outline's
+/// subject title names (or makes) its subject.
+fn first_issue(outline: &Outline, needs_subject: bool) -> Option<OutlineIssue> {
     if outline.topic_title.trim().is_empty() {
         return Some(OutlineIssue::TopicTitle);
+    }
+    if needs_subject && outline.subject_title.trim().is_empty() {
+        return Some(OutlineIssue::SubjectTitle);
     }
     if outline.lessons.is_empty() {
         return Some(OutlineIssue::NoLessons);
@@ -863,7 +917,7 @@ mod tests {
             subject_title: "Maths".into(),
             lessons: vec![lesson("Series"), lesson("  "), lesson("")],
         };
-        assert_eq!(first_issue(&o), Some(OutlineIssue::LessonTitle(1)));
+        assert_eq!(first_issue(&o, true), Some(OutlineIssue::LessonTitle(1)));
         let mut keys = RowKeys::default();
         keys.fit(3);
         keys.swap(0, 1);
@@ -885,11 +939,19 @@ mod tests {
             "Lesson 2 needs a title."
         );
         o.lessons.truncate(1);
-        assert_eq!(first_issue(&o), None);
+        assert_eq!(first_issue(&o, true), None);
         o.topic_title = " ".into();
-        assert_eq!(first_issue(&o), Some(OutlineIssue::TopicTitle));
+        assert_eq!(first_issue(&o, true), Some(OutlineIssue::TopicTitle));
         o.topic_title = "Fourier".into();
+        // The subject counts only when the course isn't filed under a topic.
+        o.subject_title = "  ".into();
+        assert_eq!(first_issue(&o, true), Some(OutlineIssue::SubjectTitle));
+        assert_eq!(first_issue(&o, false), None);
+        assert_eq!(
+            OutlineIssue::SubjectTitle.selector(&ids, &keys),
+            "#ol-p1-subject"
+        );
         o.lessons.clear();
-        assert_eq!(first_issue(&o), Some(OutlineIssue::NoLessons));
+        assert_eq!(first_issue(&o, false), Some(OutlineIssue::NoLessons));
     }
 }
