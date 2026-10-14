@@ -355,7 +355,10 @@ mod tests {
         let t = Transcript { words };
         let lines = t.lines();
         let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(&texts[..3], &["Hello there.", "After this", "pause goes on"]);
+        assert_eq!(
+            &texts[..3],
+            &["Hello there.", "After this", "pause goes on"]
+        );
         assert_eq!((lines[0].start_ms, lines[0].end_ms), (0, 900));
         assert_eq!((lines[2].start_ms, lines[2].end_ms), (4_000, 5_100));
         assert!(lines[3..].iter().all(|l| l.end_ms - l.start_ms <= 12_000));

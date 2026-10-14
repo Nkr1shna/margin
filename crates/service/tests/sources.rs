@@ -420,11 +420,7 @@ async fn large_files_upload_in_parts() {
     // Names are checked up front, and ids can't point outside the folder.
     let r = start("archive.zip", 3).await.unwrap();
     assert_eq!(api_error(r).await.1.code, "unsupported_source");
-    let r = h
-        .get(&t, "/api/source-uploads/..")
-        .send()
-        .await
-        .unwrap();
+    let r = h.get(&t, "/api/source-uploads/..").send().await.unwrap();
     assert_eq!(r.status(), 404);
 }
 

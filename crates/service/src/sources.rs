@@ -34,8 +34,7 @@ use margin_embed::{
     sample_ms,
 };
 use margin_shared::{
-    Citation, Event, Id, SOURCE_KINDS, Source, SourceKind, SourceStatus, TranscriptSegment,
-    routes,
+    Citation, Event, Id, SOURCE_KINDS, Source, SourceKind, SourceStatus, TranscriptSegment, routes,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;

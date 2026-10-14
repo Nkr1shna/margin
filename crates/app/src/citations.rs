@@ -556,6 +556,9 @@ mod tests {
         let pause = whole_transcript(&frame(3_500), &[], &lines);
         assert_eq!(first_current(&pause), Some(2));
         // Without a transcript, the cited passages stand in.
-        assert_eq!(whole_transcript(&all[0], &all, &[]), super::transcript(&all[0], &all));
+        assert_eq!(
+            whole_transcript(&all[0], &all, &[]),
+            super::transcript(&all[0], &all)
+        );
     }
 }

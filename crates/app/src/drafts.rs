@@ -568,8 +568,10 @@ mod tests {
             r.load();
             r.other
                 .insert("draft-adopt-1".into(), earlier("http://adopt", "mine"));
-            r.other
-                .insert("draft-adopt-2".into(), earlier("http://elsewhere", "theirs"));
+            r.other.insert(
+                "draft-adopt-2".into(),
+                earlier("http://elsewhere", "theirs"),
+            );
             r.other
                 .insert("draft-adopt-3".into(), earlier("http://adopt", "open"));
             r.persist();
@@ -582,7 +584,10 @@ mod tests {
         assert!(to_send.contains(&"draft-adopt-1".to_string()));
         assert!(!to_send.contains(&"draft-adopt-3".to_string()));
         assert!(!to_send.contains(&"draft-adopt-2".to_string()));
-        assert_eq!(get("draft-adopt-3").unwrap().body_md.as_deref(), Some("open"));
+        assert_eq!(
+            get("draft-adopt-3").unwrap().body_md.as_deref(),
+            Some("open")
+        );
         let draft = take("draft-adopt-1").unwrap();
         assert_eq!(draft.token, "new-token");
         assert_eq!(draft.patch.body_md.as_deref(), Some("mine"));

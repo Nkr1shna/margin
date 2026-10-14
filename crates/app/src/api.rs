@@ -356,7 +356,10 @@ impl Api {
 
         query.push(("bytes", bytes.to_string()));
         let upload: SourceUpload = self
-            .json(self.request(Method::POST, routes::SOURCE_UPLOADS).query(&query))
+            .json(
+                self.request(Method::POST, routes::SOURCE_UPLOADS)
+                    .query(&query),
+            )
             .await?;
         match self.send_parts(path, &upload, &progress).await {
             Ok(()) => {
@@ -496,24 +499,21 @@ async fn file_body(path: &Path, offset: u64, len: u64) -> ApiResult<reqwest::Bod
             .await
             .map_err(fail)?;
     }
-    let stream = futures_util::stream::try_unfold(
-        (file, len),
-        |(mut file, left)| async move {
-            if left == 0 {
-                return Ok(None);
-            }
-            let mut buf = vec![0u8; left.min(256 * 1024) as usize];
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "the file got shorter while it was being uploaded",
-                ));
-            }
-            buf.truncate(n);
-            Ok::<_, std::io::Error>(Some((buf, (file, left - n as u64))))
-        },
-    );
+    let stream = futures_util::stream::try_unfold((file, len), |(mut file, left)| async move {
+        if left == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; left.min(256 * 1024) as usize];
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the file got shorter while it was being uploaded",
+            ));
+        }
+        buf.truncate(n);
+        Ok::<_, std::io::Error>(Some((buf, (file, left - n as u64))))
+    });
     Ok(reqwest::Body::wrap_stream(stream))
 }
 
@@ -769,7 +769,13 @@ mod tests {
         let api = Api::with_token(&fake.url, crate::fake::TOKEN);
         let file = TempFile::new("gibbs", b"# Gibbs & friends\n");
         let source = api
-            .upload_source(&file.0, "notes/ch 1.md", Some("Fourier notes"), None, |_| {})
+            .upload_source(
+                &file.0,
+                "notes/ch 1.md",
+                Some("Fourier notes"),
+                None,
+                |_| {},
+            )
             .await
             .unwrap();
         assert_eq!(source.name, "notes/ch 1.md");
@@ -797,7 +803,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(400));
-        assert!(err.message.contains(margin_shared::SOURCE_KINDS), "{}", err.message);
+        assert!(
+            err.message.contains(margin_shared::SOURCE_KINDS),
+            "{}",
+            err.message
+        );
 
         // Accepting a proposal that names the source attaches it to the new topic.
         let req = AskRequest {
@@ -872,18 +882,19 @@ mod tests {
         fake.state.lock().unwrap().fail_parts = 1;
         let seen = std::sync::Mutex::new(Vec::new());
         let source = api
-            .upload_source(&file.0, "talks/lecture.mp4", Some("talks"), Some("fourier"), |n| {
-                seen.lock().unwrap().push(n)
-            })
+            .upload_source(
+                &file.0,
+                "talks/lecture.mp4",
+                Some("talks"),
+                Some("fourier"),
+                |n| seen.lock().unwrap().push(n),
+            )
             .await
             .unwrap();
         assert_eq!(source.bytes, len);
         assert_eq!(source.kind, margin_shared::SourceKind::Video);
         assert_eq!(source.topic_id.as_deref(), Some("fourier"));
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![routes::UPLOAD_PART_BYTES, len]
-        );
+        assert_eq!(*seen.lock().unwrap(), vec![routes::UPLOAD_PART_BYTES, len]);
         let s = fake.state.lock().unwrap();
         assert_eq!(s.parts_received, 2);
         assert!(s.part_uploads.is_empty());

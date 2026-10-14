@@ -602,7 +602,13 @@ mod tests {
         // 50 + 500 + 499 + 480 + 450 MB fit in 2 GB; another 100 MB doesn't.
         assert_eq!(
             names,
-            vec!["notes.txt", "lecture1.mp4", "talk1.m4a", "talk2.m4a", "talk3.m4a"]
+            vec![
+                "notes.txt",
+                "lecture1.mp4",
+                "talk1.m4a",
+                "talk2.m4a",
+                "talk3.m4a"
+            ]
         );
         assert_eq!(selection.files[0].folder, None);
         assert_eq!(selection.too_large, 3);

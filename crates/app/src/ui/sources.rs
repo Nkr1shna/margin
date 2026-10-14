@@ -173,7 +173,10 @@ async fn remove(app: AppCtx, key: u64) -> Result<(), String> {
 /// was read with a warning, once what was wrong is fixed).
 pub async fn read_again(app: AppCtx, id: Id) -> Result<(), String> {
     let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
-    let source = api.reprocess_source(&id).await.map_err(|e| app.failure(&e))?;
+    let source = api
+        .reprocess_source(&id)
+        .await
+        .map_err(|e| app.failure(&e))?;
     let mut lib = app.lib;
     lib.write().apply(Event::SourceChanged { source });
     Ok(())

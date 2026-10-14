@@ -1,3 +1,12 @@
+//! iOS Simulator: embed the app's entitlements (`ios/Simulator.entitlements`) the way
+//! Xcode does for simulator builds, as the `__TEXT,__entitlements` (XML) and
+//! `__TEXT,__ents_der` (DER) sections of the executable. The simulator takes an app's
+//! entitlements from there, not from its ad-hoc code signature, and without
+//! `application-identifier` / `keychain-access-groups` the Data Protection keychain that
+//! holds the device token refuses every call (errSecMissingEntitlement: "A required
+//! entitlement isn't present"). Device builds get the real ones from the provisioning
+//! profile when dx signs them (`dx build --ios --device …` / `--codesign`).
+//!
 //! Android: put Margin's Kotlin (the source pickers, `android/`) into the Gradle project
 //! dx generates. dx tells wry where its Kotlin files go with
 //! `WRY_ANDROID_KOTLIN_FILES_OUT_DIR` and `WRY_ANDROID_PACKAGE`; Margin's files go to the
@@ -9,9 +18,42 @@ const FILES: &[&str] = &["MarginPicker.kt", "proguard-margin.pro"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
-        return;
+    match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("android") => android(),
+        Ok("ios") if is_simulator() => simulator_entitlements(),
+        _ => {}
     }
+}
+
+/// `aarch64-apple-ios-sim`, or `x86_64-apple-ios` (only ever a simulator).
+fn is_simulator() -> bool {
+    std::env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("sim")
+        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+}
+
+fn simulator_entitlements() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let xml = manifest_dir.join("ios").join("Simulator.entitlements");
+    println!("cargo:rerun-if-changed={}", xml.display());
+    let der = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("Simulator.entitlements.der");
+    // `derq` comes with macOS, where iOS builds run; Xcode encodes these with it too.
+    let status = std::process::Command::new("/usr/bin/derq")
+        .args(["query", "-f", "xml", "--raw", "-i"])
+        .arg(&xml)
+        .arg("-o")
+        .arg(&der)
+        .status()
+        .expect("couldn't run /usr/bin/derq to encode the simulator entitlements");
+    assert!(status.success(), "derq couldn't encode {}", xml.display());
+    for (section, file) in [("__entitlements", &xml), ("__ents_der", &der)] {
+        println!(
+            "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,{section},{}",
+            file.display()
+        );
+    }
+}
+
+fn android() {
     println!("cargo:rerun-if-env-changed=WRY_ANDROID_PACKAGE");
     println!("cargo:rerun-if-env-changed=WRY_ANDROID_KOTLIN_FILES_OUT_DIR");
     let Ok(out_dir) = std::env::var("WRY_ANDROID_KOTLIN_FILES_OUT_DIR") else {

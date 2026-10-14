@@ -458,7 +458,10 @@ async fn without_a_transcriber_recordings_are_ready_with_a_warning_and_read_agai
             chunks: 2,
             warning: Some(warning),
             ..
-        } => assert!(warning.starts_with("Its soundtrack wasn't transcribed"), "{warning}"),
+        } => assert!(
+            warning.starts_with("Its soundtrack wasn't transcribed"),
+            "{warning}"
+        ),
         other => panic!("expected Ready with a warning, got {other:?}"),
     }
 
@@ -472,7 +475,10 @@ async fn without_a_transcriber_recordings_are_ready_with_a_warning_and_read_agai
         .unwrap();
     assert_eq!(r.status(), 200);
     let queued: Source = r.json().await.unwrap();
-    assert_eq!((queued.id.as_str(), queued.status.clone()), (audio.id.as_str(), SourceStatus::Queued));
+    assert_eq!(
+        (queued.id.as_str(), queued.status.clone()),
+        (audio.id.as_str(), SourceStatus::Queued)
+    );
     let again = eventually(|| async {
         library(&h, &t).await.sources.into_iter().find(|s| {
             s.id == audio.id && matches!(s.status, SourceStatus::Ready { warning: None, .. })
@@ -495,16 +501,32 @@ async fn without_a_transcriber_recordings_are_ready_with_a_warning_and_read_agai
     assert!(!lines.is_empty());
     assert_eq!(lines[0].start_ms, 0);
     assert_eq!(
-        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" "),
+        lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
         TALK.split_whitespace().collect::<Vec<_>>().join(" ")
     );
 
     // Nothing to read again for a source being read, or one that doesn't exist.
-    let r = h.post(&t, &routes::source_reprocess(&video.id)).send().await.unwrap();
+    let r = h
+        .post(&t, &routes::source_reprocess(&video.id))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
-    let r = h.post(&t, &routes::source_reprocess(&video.id)).send().await.unwrap();
+    let r = h
+        .post(&t, &routes::source_reprocess(&video.id))
+        .send()
+        .await
+        .unwrap();
     assert!(matches!(r.status().as_u16(), 200 | 409), "{}", r.status());
-    let r = h.post(&t, &routes::source_reprocess("nope")).send().await.unwrap();
+    let r = h
+        .post(&t, &routes::source_reprocess("nope"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 404);
 }
 
@@ -515,7 +537,11 @@ async fn transcripts_of_other_kinds_are_empty() {
     let image = upload_ok(&h, &t, "square.png", "picture: a square wave").await;
     settled(&h, &t, &image.id).await;
     assert!(transcript(&h, &t, &image.id).await.is_empty());
-    let r = h.get(&t, &routes::source_transcript("nope")).send().await.unwrap();
+    let r = h
+        .get(&t, &routes::source_transcript("nope"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 404);
 }
 

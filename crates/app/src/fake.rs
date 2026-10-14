@@ -576,8 +576,7 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
         .route(
             "/api/sources",
-            post(upload_source)
-                .layer(DefaultBodyLimit::max(routes::MAX_ANY_SOURCE_BYTES as usize)),
+            post(upload_source).layer(DefaultBodyLimit::max(routes::MAX_ANY_SOURCE_BYTES as usize)),
         )
         .route("/api/sources/{id}", axum::routing::delete(delete_source))
         .route("/api/sources/{id}/reprocess", post(reprocess_source))
@@ -1888,12 +1887,24 @@ pub fn sample_transcript(source_id: &str) -> Vec<TranscriptSegment> {
                 13_752,
                 "Adding more terms squeezes the overshoot closer to the jump, but it never gets smaller.",
             ),
-            line(14_152, 16_420, "That stubborn ripple is the Gibbs phenomenon."),
+            line(
+                14_152,
+                16_420,
+                "That stubborn ripple is the Gibbs phenomenon.",
+            ),
         ],
         "s6" => vec![
             line(300, 2_000, "With one term it's a sine wave."),
-            line(2_200, 4_900, "With three terms the shape is already recognisable."),
-            line(5_100, 8_350, "With fifteen, only the overshoot at each jump remains."),
+            line(
+                2_200,
+                4_900,
+                "With three terms the shape is already recognisable.",
+            ),
+            line(
+                5_100,
+                8_350,
+                "With fifteen, only the overshoot at each jump remains.",
+            ),
         ],
         _ => Vec::new(),
     }
