@@ -15,11 +15,15 @@ use std::path::{Path, PathBuf};
 
 use crate::sources::Selection;
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod desktop;
 #[cfg(target_os = "ios")]
 mod ios;
 
+#[cfg(target_os = "android")]
+use android as platform;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use desktop as platform;
 #[cfg(target_os = "ios")]
@@ -38,7 +42,11 @@ fn staging_root() -> Option<PathBuf> {
     {
         Some(std::env::temp_dir().join("Margin-picked"))
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    {
+        crate::config::cache_dir().map(|dir| dir.join("Margin-picked"))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         None
     }

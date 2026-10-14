@@ -202,6 +202,8 @@ fn join_and(parts: &[String]) -> String {
 }
 
 /// Files picked one by one: each is named by its file name.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn select_files(paths: Vec<PathBuf>) -> Selection {
     let named = paths
         .into_iter()
@@ -225,6 +227,8 @@ pub fn select_named<P>(files: Vec<(P, String)>, size: impl Fn(&P) -> Option<u64>
     selection
 }
 
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn local_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.len())
 }
@@ -235,8 +239,10 @@ pub enum EntryKind {
     Folder,
     File,
     /// Symbolic links and other special files: passed over.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Other,
     /// Its type couldn't be read: counted as unreadable.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Unknown,
 }
 
@@ -260,6 +266,8 @@ pub trait Tree {
 }
 
 /// The local file system.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 struct Local;
 
 impl Tree for Local {
@@ -291,6 +299,8 @@ impl Tree for Local {
 /// Every source file under `root`, named by its path inside it. Hidden entries, symbolic
 /// links and `SKIPPED_DIRS` are passed over; files are visited in name order, so the
 /// limits keep the same files every time.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn select_folder(root: &Path) -> Selection {
     let name = root
         .file_name()
