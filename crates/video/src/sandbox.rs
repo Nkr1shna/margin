@@ -1,4 +1,9 @@
-//! The macOS `sandbox-exec` profile each ManimGX pass runs under.
+//! The sandbox each ManimGX pass runs under, chosen by `SandboxMode`: on macOS the
+//! `sandbox-exec` profile below, on Linux bubblewrap (`sandbox_linux.rs`, the `linux`
+//! module). `SandboxMode::native()` names the one this build's OS has; asking for the
+//! other one fails with `RenderError::Sandbox` before anything runs.
+//!
+//! # macOS: `sandbox-exec`
 //!
 //! The profile denies everything, then allows only what a ManimGX render was found to
 //! need on macOS 27 (Apple silicon), by removing one allowance at a time and rendering:
@@ -26,7 +31,76 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::RenderError;
+use tokio::process::Command;
+
+use crate::SandboxMode;
+
+#[path = "sandbox_linux.rs"]
+pub mod linux;
+
+impl SandboxMode {
+    /// The sandbox of the OS this was built for: `LinuxBubblewrap` on Linux,
+    /// `MacosSandboxExec` everywhere else (where rendering is then refused, as no
+    /// sandbox exists there).
+    pub const fn native() -> SandboxMode {
+        if cfg!(target_os = "linux") {
+            SandboxMode::LinuxBubblewrap
+        } else {
+            SandboxMode::MacosSandboxExec
+        }
+    }
+}
+
+/// Can `mode` run on this machine? Checked before the first pass. `Err` says why not
+/// (and how to fix it) for the video's log; the render then fails with
+/// `RenderError::Sandbox`.
+pub(crate) async fn check(mode: SandboxMode) -> Result<(), String> {
+    match mode {
+        SandboxMode::Unsandboxed => Ok(()),
+        SandboxMode::MacosSandboxExec => {
+            if !cfg!(target_os = "macos") {
+                Err("the sandbox-exec sandbox is only available on macOS".into())
+            } else if !Path::new(SANDBOX_EXEC).is_file() {
+                Err(format!("{SANDBOX_EXEC} is missing"))
+            } else {
+                Ok(())
+            }
+        }
+        SandboxMode::LinuxBubblewrap => linux::check().await,
+    }
+}
+
+/// The command for one pass of `program` (canonical) in `work_dir` (canonical) under
+/// `mode`. The caller adds the program's arguments.
+pub(crate) async fn command(
+    mode: SandboxMode,
+    program: &Path,
+    work_dir: &Path,
+) -> Result<Command, String> {
+    match mode {
+        SandboxMode::Unsandboxed => Ok(Command::new(program)),
+        SandboxMode::MacosSandboxExec => {
+            let mut cmd = Command::new(SANDBOX_EXEC);
+            cmd.args(sandbox_args(program, work_dir).await?);
+            Ok(cmd)
+        }
+        SandboxMode::LinuxBubblewrap => linux::command(program, work_dir).await,
+    }
+}
+
+/// The error for a pass the sandbox itself failed to start, from the pass's stderr: a
+/// line from `sandbox-exec` or `bwrap` rather than from the scene.
+pub(crate) fn startup_failure(stderr: &[String]) -> Option<String> {
+    stderr.iter().find_map(|line| {
+        if line.starts_with("sandbox-exec:") {
+            Some(format!("the sandbox couldn't start manimgx: {line}"))
+        } else if line.starts_with("bwrap:") {
+            Some(linux::startup_failure(line))
+        } else {
+            None
+        }
+    })
+}
 
 pub(crate) const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -57,13 +131,8 @@ const PROFILE: &str = r#"(version 1)
 /// Arguments for `sandbox-exec` that run `program` (the canonical `manimgx` path) with
 /// writes confined to `work_dir` (canonical). The caller appends the program's own
 /// arguments.
-pub(crate) async fn sandbox_args(
-    program: &Path,
-    work_dir: &Path,
-) -> Result<Vec<String>, RenderError> {
-    if !cfg!(target_os = "macos") || !Path::new(SANDBOX_EXEC).is_file() {
-        return Err(RenderError::Sandbox);
-    }
+async fn sandbox_args(program: &Path, work_dir: &Path) -> Result<Vec<String>, String> {
+    check(SandboxMode::MacosSandboxExec).await?;
     let interpreter = shebang_interpreter(program).unwrap_or_else(|| program.to_path_buf());
     let interpreter_real =
         std::fs::canonicalize(&interpreter).unwrap_or_else(|_| interpreter.clone());

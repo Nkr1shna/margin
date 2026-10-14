@@ -13,9 +13,12 @@
 //!    it draws each held frame as it is sent and, if the video ends on a hold of at
 //!    least half a second (the scene's closing poster shot), saves it as `poster.png`.
 //!
-//! Sandboxing (macOS `sandbox-exec`): no network, writes only inside `work_dir` (plus
-//! the temp dirs Python needs), reads allowed. On other platforms rendering is refused
-//! unless `SandboxMode::Unsandboxed` is chosen explicitly (the service exposes that only
+//! Sandboxing (`sandbox.rs`): macOS `sandbox-exec` (no network, writes only inside
+//! `work_dir` plus the temp dirs Python needs, reads allowed) or Linux bubblewrap (no
+//! network, a read-only root of `/usr`, `/etc` and the tool, writes only inside
+//! `work_dir` and a private `/tmp`). `SandboxMode::native()` is this OS's; another
+//! sandbox, or one that can't start, is refused with `RenderError::Sandbox` unless
+//! `SandboxMode::Unsandboxed` is chosen explicitly (the service exposes that only
 //! through `--allow-unsandboxed-render`, for testing).
 //!
 //! Files in `work_dir` after a render:
@@ -46,6 +49,10 @@ use tokio::process::Command;
 
 use crate::process::{Stream, run_streaming};
 
+/// The Linux sandbox's arguments and host checks, public so they can be checked on any
+/// OS (see `sandbox_linux.rs`).
+pub use crate::sandbox::linux as bubblewrap;
+
 /// Finds `manimgx` and `fluidaudiocli` on PATH (and in `~/.local/bin`), with versions
 /// and the install commands to show when missing.
 pub async fn detect_tools() -> Vec<ToolStatus> {
@@ -56,6 +63,9 @@ pub async fn detect_tools() -> Vec<ToolStatus> {
 pub enum SandboxMode {
     /// macOS `sandbox-exec` profile. Rendering fails with `RenderError::Sandbox` elsewhere.
     MacosSandboxExec,
+    /// Linux bubblewrap (`bwrap`). Rendering fails with `RenderError::Sandbox` on other
+    /// systems, without `bwrap`, or where user namespaces are not allowed.
+    LinuxBubblewrap,
     /// No sandbox. Only for development and tests.
     Unsandboxed,
 }
@@ -120,7 +130,10 @@ pub enum RenderError {
     Scene { message: String },
     #[error("couldn't voice the narration: {0}")]
     Voice(String),
-    #[error("rendering needs the macOS sandbox, which isn't available here")]
+    /// The chosen sandbox can't run here; the video's log says why and how to fix it.
+    #[error(
+        "rendering needs a sandbox (sandbox-exec on macOS, bubblewrap on Linux) and it can't run here; the video's log says why"
+    )]
     Sandbox,
     #[error("{0}")]
     Io(String),
@@ -154,7 +167,9 @@ pub async fn render(
     config: &RenderConfig,
     mut on_progress: impl FnMut(RenderProgress) + Send,
 ) -> Result<RenderOutput, RenderError> {
-    if config.sandbox == SandboxMode::MacosSandboxExec && !cfg!(target_os = "macos") {
+    if let Err(why) = sandbox::check(config.sandbox).await {
+        tracing::warn!("can't render: {why}");
+        on_progress(RenderProgress::Log(format!("margin: {why}")));
         return Err(RenderError::Sandbox);
     }
     let manimgx = std::fs::canonicalize(&config.manimgx)
@@ -295,12 +310,11 @@ async fn run_manimgx(
 ) -> Result<process::Finished, RenderError> {
     // ManimGX's cache of what the voice said: each pass has its own voice.
     remove_dir(&work_dir.join(MANIMGX_VOICE_CACHE))?;
-    let mut cmd = match sandbox {
-        SandboxMode::Unsandboxed => Command::new(manimgx),
-        SandboxMode::MacosSandboxExec => {
-            let mut cmd = Command::new(sandbox::SANDBOX_EXEC);
-            cmd.args(sandbox::sandbox_args(manimgx, work_dir).await?);
-            cmd
+    let mut cmd = match sandbox::command(sandbox, manimgx, work_dir).await {
+        Ok(cmd) => cmd,
+        Err(why) => {
+            on_progress(RenderProgress::Log(format!("margin: {why}")));
+            return Err(RenderError::Sandbox);
         }
     };
     tracing::debug!(?sandbox, ?args, dir = %work_dir.display(), "running manimgx");
@@ -334,10 +348,8 @@ fn check_pass(pass: &process::Finished) -> Result<(), RenderError> {
     if status.success() {
         return Ok(());
     }
-    if let Some(line) = pass.stderr.iter().find(|l| l.starts_with("sandbox-exec:")) {
-        return Err(RenderError::Io(format!(
-            "the sandbox couldn't start manimgx: {line}"
-        )));
+    if let Some(message) = sandbox::startup_failure(&pass.stderr) {
+        return Err(RenderError::Io(message));
     }
     let message = scene_error::scene_message(&pass.stderr, &pass.stdout);
     if scene_error::is_gpu_failure(&message) {
