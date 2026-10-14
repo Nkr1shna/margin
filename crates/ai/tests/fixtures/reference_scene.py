@@ -13,7 +13,8 @@ class LessonScene(m.Scene):
     def construct(self) -> None:
         title = m.Text("A tour of the reference", font_size=48, t2c={"tour": m.YELLOW})
         title.to_edge(m.UP)
-        self.say("This scene uses [every construct] in the reference.", m.Write(title))
+        self.add(title)
+        self.say("This scene uses [every construct] in the reference.", m.Indicate(title))
 
         axes = m.Axes(x_range=[0, 6, 1], y_range=[-2, 2, 1], x_length=6, y_length=3.6)
         axes.move_to([-3.2, -0.6, 0])

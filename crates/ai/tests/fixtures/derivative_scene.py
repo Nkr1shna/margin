@@ -4,10 +4,11 @@ import manimgx as m
 class LessonScene(m.Scene):
     def construct(self) -> None:
         title = m.Text("What a derivative measures", font_size=48).to_edge(m.UP)
+        self.add(title)
         self.say(
             "Today we ask one question: [how fast is a function changing] "
             "at a single point?",
-            m.Write(title),
+            m.Indicate(title),
         )
 
         axes = m.Axes(

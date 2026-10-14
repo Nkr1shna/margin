@@ -4,9 +4,10 @@ import manimgx as m
 class LessonScene(m.Scene):
     def construct(self) -> None:
         title = m.Text("The Pythagorean theorem", font_size=48).to_edge(m.UP)
+        self.add(title)
         self.say(
             "Let's look at [the Pythagorean theorem].",
-            m.FadeIn(title, shift=m.DOWN),
+            m.Indicate(title),
         )
 
         tri = m.Polygon(

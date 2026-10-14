@@ -63,6 +63,12 @@ fn fixtures_follow_the_prompt_rules_and_run_in_manimgx() {
         assert!(code.contains("class LessonScene(m.Scene):"), "{scene:?}");
         assert!(code.contains("self.say("), "{scene:?}");
         assert!(!code.contains("voice"), "no voice: {scene:?}");
+        // Rule 9: it opens on the title card, on screen from the first frame.
+        let body = &code[code.find("def construct").unwrap()..];
+        assert!(
+            body.find("self.add(title)").is_some_and(|i| body.find("self.").unwrap() == i),
+            "the first thing construct shows is the title, with self.add: {scene:?}"
+        );
         // Rule 8: it ends on the poster shot, held, with nothing fading out after it.
         assert_eq!(
             code.lines().rev().find(|l| !l.trim().is_empty()),
