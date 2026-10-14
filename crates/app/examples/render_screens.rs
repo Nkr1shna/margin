@@ -4,7 +4,11 @@
 //! ```sh
 //! cargo run -p margin-app --example render_screens -- /lesson/l1 out.html [light|dark] [WIDTHpx]
 //! cargo run -p margin-app --example render_screens -- connect out.html
+//! cargo run -p margin-app --example render_screens -- /chat/c1 out.html dark
 //! ```
+//!
+//! The sample chats are `c1` (an answered conversation with a tool call and passages)
+//! and `c2` (interrupted); `/` is a new chat.
 //!
 //! Optional environment, for screens that open over the routes:
 //! - `RENDER_SETTINGS=<pane>` opens Settings at a pane (`sources`, `ai`, …).
@@ -84,6 +88,14 @@ fn Harness(props: HarnessProps) -> Element {
     let viewer_lesson = lesson_in_route(&props.route);
     use_context_provider(move || {
         let mut lib = LibraryState::from_library(sample_library());
+        let chats = fake::sample_chats();
+        lib.replace_chats(chats.iter().map(|(c, _)| c.clone()).collect());
+        for (chat, mut items) in chats {
+            fake::rebase_chat_media(&mut items, |path| {
+                sample_media_url(path).unwrap_or_else(|| format!("http://127.0.0.1:9{path}"))
+            });
+            lib.chat_items.insert(chat.id, items);
+        }
         if std::env::var_os("RENDER_SOURCE_WARNING").is_some()
             && let Some(s5) = lib.sources.get_mut("s5")
         {
@@ -267,17 +279,21 @@ fn file_url(p: &Path) -> String {
     format!("file://{}", p.display())
 }
 
+/// A sample source's media file (`/media/sources/{id}/{file}…`) as a local file URL.
+fn sample_media_url(path: &str) -> Option<String> {
+    let mut parts = path.split('?').next().unwrap_or(path).split('/').skip(3);
+    let (id, file) = (parts.next()?, parts.next()?);
+    fake::sample_media_file(id, file).map(|p| file_url(&p))
+}
+
 /// The fake library with its sample media as local files.
 fn sample_library() -> margin_shared::Library {
     let mut library = fake::sample_library();
     fake::rebase_media(&mut library, |path| {
-        let mut parts = path.split('?').next().unwrap_or(path).split('/').skip(3);
-        match (parts.next(), parts.next()) {
-            (Some(id), Some(file)) => fake::sample_media_file(id, file)
-                .map(|p| file_url(&p))
-                .unwrap_or_else(|| format!("http://127.0.0.1:9{path}")),
-            _ => path.to_string(),
+        if path.split('/').count() < 5 {
+            return path.to_string();
         }
+        sample_media_url(path).unwrap_or_else(|| format!("http://127.0.0.1:9{path}"))
     });
     library
 }

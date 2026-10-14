@@ -118,6 +118,16 @@ const ICONS: &[(&str, &str)] = &[
         "file-add",
         r#"<path d="M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20z"/><path d="M14 3.5V8h4M12 11v6M9 14h6"/>"#,
     ),
+    // A chat: a speech bubble.
+    (
+        "chat",
+        r#"<path d="M4.5 6.5A2 2 0 0 1 6.5 4.5h11a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H11l-4.5 3.5v-3.5h0A2 2 0 0 1 4.5 14.5z"/>"#,
+    ),
+    // Stop the answer: a filled square.
+    (
+        "stop",
+        r#"<rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/>"#,
+    ),
     // A topic: stacked layers (a subject and what it holds).
     (
         "topic",

@@ -225,6 +225,36 @@ fn transcript_reveal_puts_the_line_a_quarter_down() {
     );
 }
 
+#[test]
+fn chats_follow_their_end_until_scrolled_up() {
+    run_js(
+        "eq(M.nearEnd({scrollTop:600,scrollHeight:1000,clientHeight:400}),true,'at the end');\n\
+         eq(M.nearEnd({scrollTop:540,scrollHeight:1000,clientHeight:400}),true,'a line above it');\n\
+         eq(M.nearEnd({scrollTop:200,scrollHeight:1000,clientHeight:400}),false,'scrolled up');\n\
+         eq(M.nearEnd({scrollTop:0,scrollHeight:300,clientHeight:400}),true,'shorter than the box');",
+    );
+}
+
+/// The chat's own text colors are tokens that pass the contrast checks above, and its
+/// controls follow the app's touch sizes.
+#[test]
+fn chat_styles_use_checked_tokens() {
+    for (rule, color) in [
+        (".chat-action {", "var(--fg-3)"),
+        (".chat-cut {", "var(--fg-3)"),
+        (".msg-user small {", "var(--fg-3)"),
+        (".tool-state {", "var(--fg-3)"),
+        (".tool-row.bad .tool-state {", "var(--danger)"),
+        (".pending small {", "var(--fg-3)"),
+    ] {
+        assert_eq!(token(block(rule), "color"), color, "{rule}");
+    }
+    // Rows open with the whole line on touch screens.
+    let start = CSS.find("@media (pointer: coarse) {").unwrap();
+    let touch = &CSS[start..];
+    assert!(touch.contains(".tool-head { min-height: 44px; }"));
+}
+
 /// iOS zooms into any field under 16px when it gets focus, whatever the pointer, and
 /// stays zoomed (the page then runs off the right edge): on iOS WebKit every field class
 /// is 16px, not only with a coarse pointer.

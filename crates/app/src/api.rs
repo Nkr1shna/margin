@@ -6,10 +6,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use margin_shared::{
-    AcceptProposal, ApiError, AskRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library,
-    LoginState, Me, NewNote, NewTopic, Note, NotePatch, PollLoginRequest, Proposal, SearchHit,
-    Settings, SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest,
-    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, routes,
+    AcceptProposal, ApiError, AskRequest, Chat, ChatDetail, ChatPatch, ConfirmRequest, Device,
+    EmbeddingModel, Id, Lesson, LessonPatch, Library, LoginState, Me, MessageSent, NewChat,
+    NewMessage, NewNote, NewTopic, NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal,
+    SearchHit, Settings, SettingsPatch, Source, SourceKind, SourceUpload, StartLogin,
+    StartLoginRequest, ToolOutputText, ToolStatus, Topic, TopicPatch, TranscriptSegment, Video,
+    Workspace, routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -445,6 +447,78 @@ impl Api {
     pub async fn delete_embedding(&self) -> ApiResult<EmbeddingModel> {
         self.json(self.request(Method::DELETE, routes::EMBEDDING))
             .await
+    }
+
+    /// Every chat, newest first.
+    pub async fn chats(&self) -> ApiResult<Vec<Chat>> {
+        self.get(routes::CHATS).await
+    }
+
+    /// Create a chat; with `body.message` its first turn starts (the answer streams in
+    /// as events).
+    pub async fn create_chat(&self, body: &NewChat) -> ApiResult<ChatDetail> {
+        self.post(routes::CHATS, body).await
+    }
+
+    /// A chat and its whole transcript.
+    pub async fn chat(&self, id: &str) -> ApiResult<ChatDetail> {
+        self.get(&routes::chat(id)).await
+    }
+
+    pub async fn patch_chat(&self, id: &str, body: &ChatPatch) -> ApiResult<Chat> {
+        self.patch(&routes::chat(id), body).await
+    }
+
+    /// Delete a chat (stopping its answer, if one is running).
+    pub async fn delete_chat(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::chat(id)).await
+    }
+
+    /// Send a message: it starts a turn, or waits as the chat's pending message while
+    /// one is running.
+    pub async fn send_message(&self, chat_id: &str, body: &NewMessage) -> ApiResult<MessageSent> {
+        self.post(&routes::chat_messages(chat_id), body).await
+    }
+
+    /// Drop the message waiting for the running answer.
+    pub async fn drop_pending(&self, chat_id: &str) -> ApiResult<Chat> {
+        self.json(self.request(Method::DELETE, &routes::chat_pending(chat_id)))
+            .await
+    }
+
+    pub async fn stop_chat(&self, chat_id: &str) -> ApiResult<Chat> {
+        self.post_empty(&routes::chat_stop(chat_id)).await
+    }
+
+    /// Resume an interrupted or failed answer.
+    pub async fn continue_chat(&self, chat_id: &str) -> ApiResult<Chat> {
+        self.post_empty(&routes::chat_continue(chat_id)).await
+    }
+
+    /// Answer the confirmation card the chat's turn is waiting on.
+    pub async fn confirm(&self, chat_id: &str, body: &ConfirmRequest) -> ApiResult<Chat> {
+        self.post(&routes::chat_confirm(chat_id), body).await
+    }
+
+    /// What a tool returned, in full (loaded when its row is expanded).
+    pub async fn chat_item_output(&self, chat_id: &str, item_id: &str) -> ApiResult<String> {
+        self.get::<ToolOutputText>(&routes::chat_item_output(chat_id, item_id))
+            .await
+            .map(|o| o.text)
+    }
+
+    /// The folders every device has attached.
+    pub async fn workspaces(&self) -> ApiResult<Vec<Workspace>> {
+        self.get(routes::WORKSPACES).await
+    }
+
+    /// Register a folder this device holds.
+    pub async fn create_workspace(&self, body: &NewWorkspace) -> ApiResult<Workspace> {
+        self.post(routes::WORKSPACES, body).await
+    }
+
+    pub async fn delete_workspace(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::workspace(id)).await
     }
 
     /// Fetch a text file from an absolute (signed media) URL, without the bearer token.
@@ -1002,6 +1076,311 @@ mod tests {
         old.as_object_mut().unwrap().remove("citations");
         let old: margin_shared::Lesson = serde_json::from_value(old).unwrap();
         assert!(old.citations.is_empty());
+    }
+
+    fn message(text: &str) -> NewMessage {
+        NewMessage {
+            text: text.into(),
+            source_ids: vec![],
+        }
+    }
+
+    fn kinds(detail: &ChatDetail) -> Vec<&'static str> {
+        use margin_shared::ChatItemKind::*;
+        detail
+            .items
+            .iter()
+            .map(|i| match &i.kind {
+                UserMessage { .. } => "user",
+                AssistantText { .. } => "text",
+                Reasoning { .. } => "reasoning",
+                ToolCall { .. } => "call",
+                ToolResult { .. } => "result",
+                Card { .. } => "card",
+                Action { .. } => "action",
+                Error { .. } => "error",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn chats_answer_rename_and_delete() {
+        use margin_shared::{ChatItemKind, ChatState, ItemStatus};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let before = api.chats().await.unwrap().len();
+        let empty = api
+            .create_chat(&NewChat {
+                message: Some(message("  ")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (empty.status, empty.code.as_str()),
+            (Some(400), "empty_message")
+        );
+
+        let created = api
+            .create_chat(&NewChat {
+                message: Some(message("Sums of sines\nand more")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap();
+        let id = created.chat.id.clone();
+        // Named by the first line of its first message.
+        assert_eq!(created.chat.title, "Sums of sines");
+        assert!(matches!(
+            created.items[0].kind,
+            ChatItemKind::UserMessage { .. }
+        ));
+        // The answer is in by now (the fake answers before replying).
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(detail.chat.state, ChatState::Idle);
+        assert_eq!(
+            kinds(&detail),
+            ["user", "reasoning", "call", "result", "text"]
+        );
+        assert!(detail.items.iter().all(|i| i.status == ItemStatus::Done));
+        assert!(detail.chat.usage.model_calls > 0);
+        // The tool's whole output loads on demand.
+        let result = &detail.items[3];
+        let output = api.chat_item_output(&id, &result.id).await.unwrap();
+        assert!(output.contains("Why sums of sines?"), "{output}");
+        let not_a_result = api.chat_item_output(&id, &detail.items[0].id).await;
+        assert_eq!(not_a_result.unwrap_err().status, Some(404));
+        let chats = api.chats().await.unwrap();
+        assert_eq!(chats.len(), before + 1);
+        assert_eq!(chats[0].id, id, "newest first");
+
+        let renamed = api
+            .patch_chat(
+                &id,
+                &ChatPatch {
+                    title: Some(" Fourier ".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.title, "Fourier");
+        let blank = ChatPatch {
+            title: Some(" ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            api.patch_chat(&id, &blank).await.unwrap_err().status,
+            Some(400)
+        );
+
+        let sent = api
+            .send_message(&id, &message("And sources?"))
+            .await
+            .unwrap();
+        assert!(sent.item.is_some());
+        let detail = api.chat(&id).await.unwrap();
+        // "source" also searches the sources, with a passages card.
+        assert!(kinds(&detail).ends_with(&[
+            "user",
+            "reasoning",
+            "call",
+            "result",
+            "call",
+            "result",
+            "card",
+            "text"
+        ]));
+
+        api.delete_chat(&id).await.unwrap();
+        assert_eq!(api.chat(&id).await.unwrap_err().status, Some(404));
+        assert_eq!(api.delete_chat(&id).await.unwrap_err().status, Some(404));
+    }
+
+    #[tokio::test]
+    async fn chats_stop_and_send_the_pending_message() {
+        use margin_shared::{ChatItemKind, ChatState, ItemStatus};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        fake.state.lock().unwrap().chat_hang = true;
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Fourier")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        assert!(api.chat(&id).await.unwrap().chat.state.is_busy());
+        assert_eq!(
+            api.continue_chat(&id).await.unwrap_err().code,
+            "cannot_continue"
+        );
+        // While it answers, a message waits; a second one is refused.
+        let waiting = api.send_message(&id, &message("Then?")).await.unwrap();
+        assert_eq!(waiting.item, None);
+        assert_eq!(waiting.chat.pending.as_ref().unwrap().text, "Then?");
+        let again = api.send_message(&id, &message("And?")).await.unwrap_err();
+        assert_eq!(
+            (again.status, again.code.as_str()),
+            (Some(409), "already_pending")
+        );
+        assert_eq!(api.drop_pending(&id).await.unwrap().pending, None);
+        api.send_message(&id, &message("Then?")).await.unwrap();
+
+        // Stop: the partial answer is kept, cancelled; the pending message starts next.
+        let stopped = api.stop_chat(&id).await.unwrap();
+        assert_eq!(stopped.pending, None);
+        let detail = api.chat(&id).await.unwrap();
+        let cut = detail
+            .items
+            .iter()
+            .find(|i| matches!(i.kind, ChatItemKind::AssistantText { .. }))
+            .unwrap();
+        assert_eq!(cut.status, ItemStatus::Cancelled);
+        assert!(detail.items.iter().any(
+            |i| matches!(&i.kind, ChatItemKind::Action { text } if text == "Stopped by the owner.")
+        ));
+        assert!(
+            matches!(detail.chat.state, ChatState::Running { .. }),
+            "the pending message's turn"
+        );
+        assert_eq!(kinds(&detail).iter().filter(|k| **k == "user").count(), 2);
+
+        fake.state.lock().unwrap().chat_hang = false;
+        api.stop_chat(&id).await.unwrap();
+        assert_eq!(api.stop_chat(&id).await.unwrap_err().code, "not_running");
+    }
+
+    #[tokio::test]
+    async fn chats_fail_and_retry() {
+        use margin_shared::{ChatItemKind, ChatState};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("make it fail")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let detail = api.chat(&id).await.unwrap();
+        assert!(matches!(detail.chat.state, ChatState::Failed { .. }));
+        assert!(matches!(
+            detail.items.last().unwrap().kind,
+            ChatItemKind::Error {
+                retryable: true,
+                ..
+            }
+        ));
+        let resumed = api.continue_chat(&id).await.unwrap();
+        assert!(matches!(resumed.state, ChatState::Running { .. }));
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(detail.chat.state, ChatState::Idle);
+        assert_eq!(kinds(&detail).last(), Some(&"text"));
+
+        // Without a key the answer fails the same way, retryable once there is one.
+        fake.state.lock().unwrap().has_api_key = false;
+        api.send_message(&id, &message("again")).await.unwrap();
+        let detail = api.chat(&id).await.unwrap();
+        assert!(
+            matches!(&detail.items.last().unwrap().kind, ChatItemKind::Error { message, .. } if message.contains("API key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chats_wait_for_a_confirmation() {
+        use margin_shared::{Card, ChatItemKind, ChatState, Decision};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let notes = api.library().await.unwrap().notes.len();
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Delete my first note")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let detail = api.chat(&id).await.unwrap();
+        let ChatState::WaitingForUser { item_id, .. } = &detail.chat.state else {
+            panic!("{:?}", detail.chat.state);
+        };
+        let wrong = ConfirmRequest {
+            item_id: "nope".into(),
+            approve: true,
+        };
+        assert_eq!(
+            api.confirm(&id, &wrong).await.unwrap_err().code,
+            "not_waiting"
+        );
+        let yes = ConfirmRequest {
+            item_id: item_id.clone(),
+            approve: true,
+        };
+        api.confirm(&id, &yes).await.unwrap();
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(detail.chat.state, ChatState::Idle);
+        let card = detail.items.iter().find(|i| &i.id == item_id).unwrap();
+        assert!(matches!(
+            &card.kind,
+            ChatItemKind::Card { card: Card::Confirmation(c), .. } if matches!(c.decision, Decision::Approved { .. })
+        ));
+        assert_eq!(api.library().await.unwrap().notes.len(), notes - 1);
+        // Answered: asking again is refused.
+        assert_eq!(api.confirm(&id, &yes).await.unwrap_err().status, Some(409));
+    }
+
+    #[tokio::test]
+    async fn workspaces_register_and_go() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        assert!(api.workspaces().await.unwrap().is_empty());
+        let w = api
+            .create_workspace(&NewWorkspace {
+                name: "margin".into(),
+                platform: margin_shared::Platform::Macos,
+                location: "~/Developer/margin".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(w.device_id, "d1");
+        assert_eq!(api.workspaces().await.unwrap(), vec![w.clone()]);
+        api.delete_workspace(&w.id).await.unwrap();
+        assert_eq!(
+            api.delete_workspace(&w.id).await.unwrap_err().status,
+            Some(404)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_settings_patch() {
+        use margin_shared::ReasoningEffort;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let settings = api
+            .patch_settings(&SettingsPatch {
+                reasoning_effort: Some(ReasoningEffort::High),
+                agent_model: Some(Some("gpt-6.1-sol".into())),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(settings.agent_model.as_deref(), Some("gpt-6.1-sol"));
+        let cleared = api
+            .patch_settings(&SettingsPatch {
+                agent_model: Some(None),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleared.agent_model, None);
+        assert_eq!(cleared.reasoning_effort, ReasoningEffort::High);
     }
 
     #[tokio::test]

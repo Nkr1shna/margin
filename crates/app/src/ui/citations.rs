@@ -24,13 +24,11 @@ pub fn open_viewer(app: AppCtx, lesson_id: &Id, n: u32) {
     }));
 }
 
-/// Close the source viewer and give focus back to what opened it.
-fn close_viewer(app: AppCtx, n: u32) {
-    let mut viewer = app.source_viewer;
-    viewer.set(None);
+/// Give focus back to what opened the viewer once it has closed, or else to the element
+/// `fallback` selects.
+fn viewer_closed(fallback: &str) {
     let id = serde_json::to_string(DIALOG_ID).unwrap_or_default();
-    let fallback = serde_json::to_string(&format!("#lesson-body button.cite[data-cite=\"{n}\"]"))
-        .unwrap_or_default();
+    let fallback = serde_json::to_string(fallback).unwrap_or_default();
     let _ = js(&format!("MarginApp.dialogClosed({id}, {fallback});"));
 }
 
@@ -89,11 +87,48 @@ pub fn CitationList(lesson_id: Id, citations: Vec<Citation>) -> Element {
     }
 }
 
-/// The source viewer: a dialog on one citation of the lesson, with Previous and Next
-/// through the others. Esc, the close button or a click outside closes it.
+/// The source viewer on one citation of a lesson, with Previous and Next through the
+/// others.
 #[component]
 pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     let app = use_app();
+    let all = app
+        .lib
+        .read()
+        .lessons
+        .get(&lesson_id)
+        .map(|l| citations::ordered(&l.citations))
+        .unwrap_or_default();
+    rsx! {
+        CitationViewer {
+            citations: all,
+            n,
+            fallback: format!("#lesson-body button.cite[data-cite=\"{n}\"]"),
+            on_go: move |to| open_viewer(app, &lesson_id, to),
+            on_close: move |_| {
+                let mut viewer = app.source_viewer;
+                viewer.set(None);
+            },
+        }
+    }
+}
+
+/// The source viewer: a dialog on passage `n` of `citations` (in order), with Previous
+/// and Next through the others. Esc, the close button or a click outside closes it, and
+/// focus goes back to what opened it (else to `fallback`).
+#[component]
+pub fn CitationViewer(
+    citations: Vec<Citation>,
+    n: u32,
+    fallback: String,
+    on_go: EventHandler<u32>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let app = use_app();
+    let close = use_callback(move |()| {
+        on_close.call(());
+        viewer_closed(&fallback);
+    });
     let mut open_error = use_signal(|| None::<String>);
     let retried = use_signal(|| false);
 
@@ -106,11 +141,7 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     }));
 
     let lib = app.lib.read();
-    let all = lib
-        .lessons
-        .get(&lesson_id)
-        .map(|l| citations::ordered(&l.citations))
-        .unwrap_or_default();
+    let all = citations;
     let found = all.iter().find(|c| c.n == n).cloned();
     // An audio or video source's whole transcript: what was fetched last shows at once,
     // and is fetched again each time the viewer turns to the source (a source read
@@ -127,7 +158,7 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     }));
     let Some(c) = found else {
         drop(lib);
-        // The lesson changed under the viewer (regenerated or deleted).
+        // What it cites changed under the viewer (a lesson regenerated or deleted).
         return rsx! {};
     };
     let media_url = lib
@@ -147,14 +178,11 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     let open = open_url(&c, media_url.as_deref());
     let (prev, next) = neighbors(&all, n);
     let (index, total) = position(&all, n).unwrap_or((1, all.len()));
-    let go = {
-        let lesson_id = lesson_id.clone();
-        move |to: u32| {
-            open_error.set(None);
-            open_viewer(app, &lesson_id, to);
-        }
+    let go = move |to: u32| {
+        open_error.set(None);
+        on_go.call(to);
     };
-    let (mut go_prev, mut go_next) = (go.clone(), go);
+    let (mut go_prev, mut go_next) = (go, go);
     let meta = match locator(&c) {
         Some(at) => format!("{} · {at}", kind_label(c.kind)),
         None => kind_label(c.kind).to_string(),
@@ -163,7 +191,7 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     rsx! {
         div {
             class: "modal-scrim center",
-            onclick: move |_| close_viewer(app, n),
+            onclick: move |_| close.call(()),
             div {
                 id: "{DIALOG_ID}",
                 class: "modal viewer-modal",
@@ -175,7 +203,7 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
                 onkeydown: move |e: KeyboardEvent| {
                     if e.key() == Key::Escape {
                         e.stop_propagation();
-                        close_viewer(app, n);
+                        close.call(());
                     }
                 },
                 div { class: "viewer-head",
@@ -197,7 +225,7 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
                         class: "icon-btn",
                         "aria-label": "Close",
                         title: "Close (Esc)",
-                        onclick: move |_| close_viewer(app, n),
+                        onclick: move |_| close.call(()),
                         Icon { name: "x" }
                     }
                 }

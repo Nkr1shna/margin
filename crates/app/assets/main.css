@@ -355,6 +355,69 @@ body.resizing-sb * { user-select: none !important; }
 .ol-view p { margin: 2px 0 0; font-size: 14px; font-weight: 500; color: var(--fg-2); }
 .outline-f { display: flex; gap: 8px; justify-content: flex-end; padding: 16px 0 0; flex-wrap: wrap; }
 
+/* ---------- chat ---------- */
+/* One column for the transcript and the composer docked under it. */
+.chat-col { width: 100%; max-width: 760px; margin: 0 auto; padding: 0 var(--gutter); }
+.chat-log { display: grid; gap: 16px; align-content: start; padding-top: 24px; padding-bottom: 24px; }
+.msg-user { justify-self: end; max-width: min(80%, 560px); display: grid; justify-items: end; gap: 2px; }
+.msg-user small { color: var(--fg-3); font-size: 12px; font-weight: 500; }
+.msg-user .bubble { background: var(--surface); border-radius: 18px; padding: 10px 16px; font-size: 16px; line-height: 24px; white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+.chat-md { font-size: 16px; line-height: 26px; }
+.chat-md > :first-child { margin-top: 0; }
+.chat-md > :last-child { margin-bottom: 0; }
+.chat-cut { margin: 6px 0 0; font-size: 13px; font-weight: 500; color: var(--fg-3); }
+/* Something that happened outside the answer ("Stopped by the owner."). */
+.chat-action { margin: 0; text-align: center; font-size: 13px; font-weight: 500; color: var(--fg-3); }
+.chat-working { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 500; color: var(--fg-3); }
+/* Reasoning summaries fold away under their first line. */
+.reasoning > summary .faint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.reasoning > summary { max-width: 100%; }
+.reasoning-md { font-size: 14px; line-height: 22px; letter-spacing: 0; color: var(--fg-2); padding: 4px 0 0 18px; }
+.reasoning-md p { margin: 0 0 8px; }
+.reasoning-md > :last-child { margin-bottom: 0; }
+/* A tool call: one line that opens to its arguments and output. */
+.tool-row { border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+.tool-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 0 10px; border: 0; border-radius: 10px; background: transparent; text-align: left; font-size: 13.5px; color: var(--fg-2); }
+.tool-head:hover { background: var(--hover); }
+.tool-head .chev { transform: rotate(-90deg); }
+.tool-head[aria-expanded="true"] .chev { transform: none; }
+.tool-ic { color: var(--fg-4); }
+.tool-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.tool-device { flex: none; font-size: 12.5px; font-weight: 500; color: var(--fg-3); white-space: nowrap; }
+.tool-state { color: var(--fg-3); flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; }
+.tool-row.bad .tool-state { color: var(--danger); }
+.tool-bad { color: var(--danger); width: 14px; height: 14px; }
+.tool-body { display: grid; gap: 12px; padding: 10px; border-top: 1px solid var(--line); }
+.tool-sec h4 { margin: 0 0 6px; font-size: 12.5px; font-weight: 500; color: var(--fg-2); }
+.tool-body .code { max-height: 320px; white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+/* Cards: passages, results, questions, outlines. */
+.chat-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 8px; min-width: 0; }
+.chat-card-h { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.chat-card-h b { font-weight: 500; }
+.chat-card .cite-item { margin: 0; width: calc(100% - 16px); }
+.result-card { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.result-card .grow { white-space: normal; }
+.result-card b { display: block; font-weight: 500; }
+.result-card small { display: block; font-size: 12.5px; font-weight: 500; color: var(--fg-3); }
+.confirm-card b { font-weight: 500; font-size: 15px; }
+.confirm-card p { margin: 0; color: var(--fg-2); }
+.confirm-card small { font-size: 13px; font-weight: 500; }
+.outline-card { padding-top: 16px; }
+/* The composer, docked under the transcript (and above the on-screen keyboard). */
+.chat-foot { flex: none; padding: 8px 0 calc(16px + env(safe-area-inset-bottom) + var(--kb)); background: var(--win); }
+.chat-foot .chat-col { display: grid; gap: 8px; }
+.chat-foot .composer textarea { min-height: 24px; max-height: 40vh; field-sizing: content; }
+.composer-row .stop { margin-left: auto; }
+.composer-row .stop + .send { margin-left: 0; }
+/* The message waiting for the running answer. */
+.pending { display: flex; align-items: flex-start; gap: 8px; padding: 8px 8px 8px 14px; border-radius: 12px; background: var(--surface); }
+.pending .grow { white-space: normal; display: grid; gap: 2px; }
+.pending small { color: var(--fg-3); font-size: 12.5px; font-weight: 500; }
+.pending p { margin: 0; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 4.5em; overflow: hidden; }
+/* The sidebar's chats: "Show all" under the recent ones. */
+.sb-scroll .sb-label { padding: 14px 0 4px 6px; }
+.more-row { font-size: 13px; color: var(--fg-3); }
+
 /* ---------- sources ---------- */
 /* A chip or button with a menu that opens below it. */
 .pop-anchor { position: relative; display: inline-flex; }
@@ -741,6 +804,7 @@ details.collapse[open] > summary .chev { transform: none; }
   .btn-sm, .chip { min-height: 44px; }
   .link-chip { min-height: 36px; }
   .src-toggle { min-height: 44px; padding: 0 8px; }
+  .tool-head { min-height: 44px; }
   .note-pill, .app .note-pill { height: auto; min-height: 44px; }
   .note-row .note-item { padding-right: 52px; }
   .ol-item .ol-tools { gap: 8px; }

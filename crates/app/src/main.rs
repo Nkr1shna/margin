@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use dioxus::prelude::*;
+use margin_shared::ServerFrame;
 
 use crate::api::Api;
 use crate::events::ConnectError;
@@ -181,7 +182,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
     let item = |label: &str, command: Command| {
         let code = match command {
             Command::Search => Code::KeyK,
-            Command::Ask | Command::AllNotes => Code::KeyN,
+            Command::NewChat | Command::AllNotes => Code::KeyN,
             Command::Settings => Code::Comma,
             Command::Back => Code::BracketLeft,
             Command::Forward => Code::BracketRight,
@@ -200,7 +201,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
         )
     };
     let settings = item("Settings…", Command::Settings);
-    let new_ask = item("New Ask", Command::Ask);
+    let new_chat = item("New Chat", Command::NewChat);
     let all_notes = item("All Notes", Command::AllNotes);
     let toggle_sidebar = item("Toggle Sidebar", Command::ToggleSidebar);
     let back = item("Back", Command::Back);
@@ -241,7 +242,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::quit(Some("Quit Margin")),
         ])
-        .and_then(|_| file.append_items(&[&new_ask, &all_notes]))
+        .and_then(|_| file.append_items(&[&new_chat, &all_notes]))
         .and_then(|_| {
             edit.append_items(&[
                 &PredefinedMenuItem::undo(None),
@@ -420,6 +421,7 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             status.set(LoadStatus::Loaded);
             // Note edits an earlier run (or a failed save) left unsent.
             drafts::resume(ctx, api);
+            load_chats(ctx, api).await;
             true
         }
         Err(e) => {
@@ -429,6 +431,25 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
                 status.set(LoadStatus::Failed(message));
             }
             false
+        }
+    }
+}
+
+/// The chat list, and the transcripts open this session again: events may have been
+/// missed while they were away. Failures leave what's there (the next reload tries again).
+async fn load_chats(ctx: AppCtx, api: &Api) {
+    let mut lib = ctx.lib;
+    match api.chats().await {
+        Ok(chats) => lib.write().replace_chats(chats),
+        Err(e) => {
+            ctx.failure(&e);
+            return;
+        }
+    }
+    let open: Vec<margin_shared::Id> = lib.peek().chat_items.keys().cloned().collect();
+    for id in open {
+        if let Ok(detail) = api.chat(&id).await {
+            lib.write().load_chat(detail);
         }
     }
 }
@@ -457,8 +478,12 @@ async fn live_loop(ctx: AppCtx) {
                 live.set(LiveStatus::Live);
                 loop {
                     tokio::select! {
-                        event = events::next_event(&mut socket) => match event {
-                            Some(event) => lib.write().apply(event),
+                        frame = events::next_frame(&mut socket) => match frame {
+                            Some(ServerFrame::Event(event)) => lib.write().apply(event),
+                            // Device-tool requests for this device. This build runs no
+                            // device tools; the service times the request out and tells
+                            // the model the device couldn't answer.
+                            Some(ServerFrame::Directed(_)) => {}
                             None => break,
                         },
                         _ = tokio::time::sleep(Duration::from_millis(250)) => {
