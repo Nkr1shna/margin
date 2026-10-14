@@ -15,12 +15,12 @@ use crate::citations;
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
-use crate::ui::ask::level_label;
 use crate::ui::citations::{CitationList, SourceViewerDialog, open_viewer};
 use crate::ui::common::{
     ConfirmDialog, CrumbLink, DeleteNoteDialog, ErrorNotice, Icon, Loading, RegenerateLessonDialog,
     TopBar, ago, date, js, mark_quotes, quote_marks_json, render_math_in,
 };
+use crate::ui::outline::level_label;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LessonView {

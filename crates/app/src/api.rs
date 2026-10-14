@@ -6,12 +6,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use margin_shared::{
-    AcceptProposal, ApiError, AskRequest, Chat, ChatDetail, ChatPatch, ConfirmRequest, Device,
-    EmbeddingModel, Id, Lesson, LessonPatch, Library, LoginState, Me, MessageSent, NewChat,
-    NewMessage, NewNote, NewTopic, NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal,
-    SearchHit, Settings, SettingsPatch, Source, SourceKind, SourceUpload, StartLogin,
-    StartLoginRequest, ToolOutputText, ToolStatus, Topic, TopicPatch, TranscriptSegment, Video,
-    Workspace, routes,
+    AcceptProposal, ApiError, Chat, ChatDetail, ChatPatch, ConfirmRequest, Device, EmbeddingModel,
+    Id, Lesson, LessonPatch, Library, LoginState, Me, MessageSent, NewChat, NewMessage, NewNote,
+    NewTopic, NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal, SearchHit, Settings,
+    SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest, ToolOutputText,
+    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -266,10 +265,6 @@ impl Api {
         self.delete(&routes::note(id)).await
     }
 
-    pub async fn ask(&self, body: &AskRequest) -> ApiResult<Proposal> {
-        self.post(routes::ASK, body).await
-    }
-
     pub async fn proposal(&self, id: &str) -> ApiResult<Proposal> {
         self.get(&routes::proposal(id)).await
     }
@@ -316,7 +311,7 @@ impl Api {
 
     /// Upload the file at `path` as a source, streaming it from disk (never all of it in
     /// memory). `name` is the file name, or its path inside the folder it was added with;
-    /// without `topic_id` it waits to be named in an `AskRequest`. A file over its
+    /// without `topic_id` it waits to be attached (to a chat's message or a topic). A file over its
     /// kind's limit is refused here, before anything is sent; one over
     /// `routes::UPLOAD_PART_BYTES` goes up in parts, `progress` hearing how many bytes
     /// the service has after each.
@@ -631,7 +626,7 @@ fn root_cause(err: &(dyn std::error::Error + 'static)) -> String {
 mod tests {
     use super::*;
     use crate::fake::{FakeService, sample_library};
-    use margin_shared::{Level, ProposalStatus, SearchKind};
+    use margin_shared::{ProposalStatus, SearchKind};
 
     #[tokio::test]
     async fn sign_in_flow_pending_then_approved() {
@@ -728,37 +723,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_reports_no_api_key_and_accepts_outline() {
+    async fn chats_propose_a_course_and_create_it_with_chips() {
+        use margin_shared::{Card, ChatItemKind, Level, OutlineChips};
         let fake = FakeService::start().await;
         let api = Api::with_token(&fake.url, crate::fake::TOKEN);
-        let req = AskRequest {
-            prompt: "Fourier series".into(),
-            lesson_count: 3,
-            level: Level::Intro,
-            with_videos: true,
-            with_quiz: true,
-            parent_topic_id: None,
-            source_ids: vec![],
-        };
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message(
+                    "Make me a course on control theory with videos, 3 lessons",
+                )),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(
+            kinds(&detail),
+            ["user", "reasoning", "call", "result", "card", "text"]
+        );
+        let proposal_id = detail
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Card {
+                    card: Card::Outline(card),
+                    ..
+                } => Some(card.proposal_id.clone()),
+                _ => None,
+            })
+            .expect("an outline card");
+        // The proposal belongs to the chat, with what was said and what was inferred.
+        let proposal = api.proposal(&proposal_id).await.unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Ready);
+        assert_eq!(proposal.chat_id.as_deref(), Some(id.as_str()));
+        assert_eq!(proposal.request.level, Level::Intro);
+        assert!(proposal.request.with_videos && proposal.request.with_quiz);
+        let mut outline = proposal.outline.unwrap();
+        assert_eq!(outline.topic_title, "Control theory");
+        assert_eq!(outline.lessons.len(), 3);
+
+        // Without a key the course can't be written.
         fake.state.lock().unwrap().has_api_key = false;
-        let err = api.ask(&req).await.unwrap_err();
+        let body = |outline: &margin_shared::Outline| AcceptProposal {
+            outline: outline.clone(),
+            chips: OutlineChips {
+                level: Some(Level::Advanced),
+                with_videos: Some(false),
+                with_quiz: None,
+            },
+        };
+        let err = api
+            .accept_proposal(&proposal_id, &body(&outline))
+            .await
+            .unwrap_err();
         assert!(err.is_no_api_key());
         fake.state.lock().unwrap().has_api_key = true;
-        let proposal = api.ask(&req).await.unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Drafting);
-        let fetched = api.proposal(&proposal.id).await.unwrap();
-        assert_eq!(fetched.status, ProposalStatus::Ready);
+
+        // Edited on the card (one lesson removed, one renamed), the chips changed.
+        outline.lessons.remove(1);
+        outline.lessons[0].title = "Feedback loops".into();
         let topic = api
-            .accept_proposal(
-                &proposal.id,
-                &AcceptProposal {
-                    outline: fetched.outline.unwrap(),
-                    chips: Default::default(),
-                },
-            )
+            .accept_proposal(&proposal_id, &body(&outline))
             .await
             .unwrap();
-        assert_eq!(topic.title, "Fourier series");
+        assert_eq!(topic.title, "Control theory");
+        let lib = api.library().await.unwrap();
+        let lessons: Vec<_> = lib
+            .lessons
+            .iter()
+            .filter(|l| l.topic_id == topic.id)
+            .collect();
+        assert_eq!(lessons.len(), 2);
+        assert_eq!(lessons[0].title, "Feedback loops");
+        assert!(lessons.iter().all(|l| l.level == Level::Advanced));
+        // The chip turned the videos off.
+        assert!(
+            !lib.videos
+                .iter()
+                .any(|v| lessons.iter().any(|l| l.id == v.lesson_id))
+        );
+        assert_eq!(
+            api.proposal(&proposal_id).await.unwrap().status,
+            ProposalStatus::Accepted {
+                topic_id: topic.id.clone()
+            }
+        );
+        // The chat knows, for the agent's next answer.
+        let detail = api.chat(&id).await.unwrap();
+        assert!(matches!(
+            &detail.items.last().unwrap().kind,
+            ChatItemKind::Action { text } if text == "Created the course “Control theory” with 2 lessons."
+        ));
+        // Created once: another device's Create lessons is refused.
+        let again = api
+            .accept_proposal(&proposal_id, &body(&outline))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (again.status, again.code.as_str()),
+            (Some(409), "already_accepted")
+        );
+    }
+
+    #[tokio::test]
+    async fn chats_accept_the_outline_when_told_to_go_ahead() {
+        use margin_shared::{Card, ChatItemKind, ResultTarget};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Teach me about sampling, advanced")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let sent = api.send_message(&id, &message("Go ahead")).await.unwrap();
+        assert!(sent.item.is_some());
+        let detail = api.chat(&id).await.unwrap();
+        assert!(
+            kinds(&detail).ends_with(&["user", "reasoning", "call", "result", "card", "text"]),
+            "{:?}",
+            kinds(&detail)
+        );
+        let topic_id = detail
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Card {
+                    card: Card::Result(card),
+                    ..
+                } => match &card.target {
+                    ResultTarget::Topic { topic_id } => Some(topic_id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a result card for the topic");
+        let lib = api.library().await.unwrap();
+        let topic = lib.topics.iter().find(|t| t.id == topic_id).unwrap();
+        assert_eq!(topic.title, "Sampling");
+        let lessons = lib.lessons.iter().filter(|l| l.topic_id == topic_id);
+        assert!(lessons.clone().count() == 4);
+        assert!(
+            lessons
+                .into_iter()
+                .all(|l| l.level == margin_shared::Level::Advanced)
+        );
+        // The tool's own result tells the agent; no separate note of it.
+        assert!(
+            !detail
+                .items
+                .iter()
+                .any(|i| matches!(i.kind, ChatItemKind::Action { .. }))
+        );
     }
 
     #[tokio::test]
@@ -884,23 +1005,33 @@ mod tests {
             err.message
         );
 
-        // Accepting a proposal that names the source attaches it to the new topic.
-        let req = AskRequest {
-            prompt: "Fourier series".into(),
-            lesson_count: 1,
-            level: Level::Intro,
-            with_videos: false,
-            with_quiz: false,
-            parent_topic_id: None,
-            source_ids: vec![source.id.clone()],
-        };
-        let proposal = api.ask(&req).await.unwrap();
-        let outline = api.proposal(&proposal.id).await.unwrap().outline.unwrap();
+        // A course proposed in a chat the file was sent with draws on it; creating the
+        // course attaches the file to the new topic.
+        let chat = api
+            .create_chat(&NewChat {
+                message: Some(NewMessage {
+                    text: "A course on Fourier series, 1 lesson".into(),
+                    source_ids: vec![source.id.clone()],
+                }),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap();
+        let proposal = fake
+            .state
+            .lock()
+            .unwrap()
+            .proposals
+            .values()
+            .find(|p| p.chat_id.as_deref() == Some(chat.chat.id.as_str()))
+            .cloned()
+            .expect("a proposal from the chat");
+        assert_eq!(proposal.request.source_ids, vec![source.id.clone()]);
         let topic = api
             .accept_proposal(
                 &proposal.id,
                 &AcceptProposal {
-                    outline,
+                    outline: proposal.outline.unwrap(),
                     chips: Default::default(),
                 },
             )
@@ -1333,6 +1464,71 @@ mod tests {
         assert_eq!(api.library().await.unwrap().notes.len(), notes - 1);
         // Answered: asking again is refused.
         assert_eq!(api.confirm(&id, &yes).await.unwrap_err().status, Some(409));
+
+        // Denied: nothing is deleted, the agent is told and says so.
+        let notes = api.library().await.unwrap().notes.len();
+        api.send_message(&id, &message("Delete my first note"))
+            .await
+            .unwrap();
+        let state = api.chat(&id).await.unwrap().chat.state;
+        let ChatState::WaitingForUser { item_id, .. } = state else {
+            panic!("{state:?}");
+        };
+        let no = ConfirmRequest {
+            item_id: item_id.clone(),
+            approve: false,
+        };
+        api.confirm(&id, &no).await.unwrap();
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(detail.chat.state, ChatState::Idle);
+        let card = detail.items.iter().find(|i| i.id == item_id).unwrap();
+        assert!(matches!(
+            &card.kind,
+            ChatItemKind::Card { card: Card::Confirmation(c), .. }
+                if c.decision == Decision::Denied { device_id: "d1".into(), by_stop: false }
+        ));
+        assert!(detail.items.iter().any(|i| matches!(
+            &i.kind,
+            ChatItemKind::ToolResult { ok: false, summary, .. } if summary == "Declined"
+        )));
+        assert_eq!(api.library().await.unwrap().notes.len(), notes);
+    }
+
+    #[tokio::test]
+    async fn stop_denies_a_waiting_confirmation() {
+        use margin_shared::{Card, ChatItemKind, ChatState, Decision};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Delete my first note")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let ChatState::WaitingForUser { item_id, .. } = api.chat(&id).await.unwrap().chat.state
+        else {
+            panic!("not waiting");
+        };
+        api.stop_chat(&id).await.unwrap();
+        let detail = api.chat(&id).await.unwrap();
+        let card = detail.items.iter().find(|i| i.id == item_id).unwrap();
+        assert!(matches!(
+            &card.kind,
+            ChatItemKind::Card { card: Card::Confirmation(c), .. }
+                if matches!(c.decision, Decision::Denied { by_stop: true, .. })
+        ));
+        // Too late to answer it now.
+        let late = ConfirmRequest {
+            item_id,
+            approve: true,
+        };
+        assert_eq!(
+            api.confirm(&id, &late).await.unwrap_err().code,
+            "not_waiting"
+        );
     }
 
     #[tokio::test]

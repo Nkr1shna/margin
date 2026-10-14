@@ -402,7 +402,22 @@ body.resizing-sb * { user-select: none !important; }
 .confirm-card b { font-weight: 500; font-size: 15px; }
 .confirm-card p { margin: 0; color: var(--fg-2); }
 .confirm-card small { font-size: 13px; font-weight: 500; }
+/* A question the answer waits on stands out from the settled ones. */
+.confirm-card.waiting { border-color: var(--fg-3); }
+.confirm-done { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; flex-wrap: wrap; }
+.confirm-done .ic { width: 14px; height: 14px; }
+.confirm-card p.confirm-done { color: var(--fg-3); }
 .outline-card { padding-top: 16px; }
+.outline-card .outline { margin-top: 0; }
+/* The course's options (chips), under the lessons. */
+.outline-opts { padding-top: 14px; }
+/* A created course: each lesson opens. */
+.course-lessons { list-style: none; margin: 0; padding: 0; }
+.course-lessons li:first-child .ol-link { border-top: 1px solid var(--line); }
+.ol-link { width: 100%; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; text-align: left; color: inherit; font: inherit; cursor: pointer; }
+.ol-link:hover { background: var(--hover); }
+.ol-link .ol-view { display: grid; min-width: 0; }
+.ol-state { margin-top: 2px; font-size: 13px; font-weight: 500; color: var(--fg-3); }
 /* The composer, docked under the transcript (and above the on-screen keyboard). */
 .chat-foot { flex: none; padding: 8px 0 calc(16px + env(safe-area-inset-bottom) + var(--kb)); background: var(--win); }
 .chat-foot .chat-col { display: grid; gap: 8px; }
@@ -422,7 +437,6 @@ body.resizing-sb * { user-select: none !important; }
 /* A chip or button with a menu that opens below it. */
 .pop-anchor { position: relative; display: inline-flex; }
 .menu.below { top: calc(100% + 4px); left: 0; }
-.attachments { display: grid; gap: 2px; margin-top: -12px; }
 .src-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 4px 4px 4px 10px; border-radius: var(--r-ctl); }
 .src-row:hover { background: var(--hover); }
 .src-ic { color: var(--fg-4); }

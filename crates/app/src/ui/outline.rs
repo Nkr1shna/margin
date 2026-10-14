@@ -1,30 +1,121 @@
-//! The proposed course outline: drafting, failed or accepted states, and the editor
-//! (topic, lessons with titles, summaries and minutes, reorder, add, remove) with
-//! "Create lessons". Shown under the Ask composer; a chat's outline card reuses it.
+//! A course outline the agent proposed (`propose_course`), as the chat's outline card:
+//! the editor (topic, lessons with titles, summaries and minutes, reorder, add, remove),
+//! the chips for the course's options (level, videos, quiz), "Create lessons", and once
+//! created, the course itself with links to its lessons.
 
 use dioxus::prelude::*;
-use margin_shared::{Outline, OutlineLesson, Proposal, ProposalStatus};
+use margin_shared::{
+    AskRequest, LessonStatus, Level, Outline, OutlineChips, OutlineLesson, Proposal,
+    ProposalStatus, VideoStatus,
+};
 
 use crate::api::ApiFailure;
 use crate::routes::Route;
-use crate::ui::common::{ErrorNotice, Icon, focus_first, js};
+use crate::state::{LoadStatus, use_app};
+use crate::ui::common::{ErrorNotice, Icon, Loading, focus_first, js, reveal_topic};
 
+pub fn level_label(level: Level) -> &'static str {
+    match level {
+        Level::Intro => "Intro level",
+        Level::Intermediate => "Intermediate",
+        Level::Advanced => "Advanced",
+    }
+}
+
+fn level_value(level: Level) -> &'static str {
+    match level {
+        Level::Intro => "intro",
+        Level::Intermediate => "intermediate",
+        Level::Advanced => "advanced",
+    }
+}
+
+fn parse_level(value: &str) -> Level {
+    match value {
+        "intermediate" => Level::Intermediate,
+        "advanced" => Level::Advanced,
+        _ => Level::Intro,
+    }
+}
+
+/// What the outline card's chips say the course is made with. Starts as the proposal
+/// asked (what the owner said, or what the agent inferred).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CourseOptions {
+    pub level: Level,
+    pub with_videos: bool,
+    pub with_quiz: bool,
+}
+
+impl CourseOptions {
+    pub fn of(request: &AskRequest) -> Self {
+        Self {
+            level: request.level,
+            with_videos: request.with_videos,
+            with_quiz: request.with_quiz,
+        }
+    }
+
+    /// The chips that differ from what `request` asked for (`None` keeps the proposal's).
+    pub fn chips(&self, request: &AskRequest) -> OutlineChips {
+        fn changed<T: PartialEq>(now: T, then: T) -> Option<T> {
+            (now != then).then_some(now)
+        }
+        OutlineChips {
+            level: changed(self.level, request.level),
+            with_videos: changed(self.with_videos, request.with_videos),
+            with_quiz: changed(self.with_quiz, request.with_quiz),
+        }
+    }
+}
+
+/// An outline card's edits before Create lessons. Kept in the app
+/// (`AppCtx::outline_drafts`), so they survive a look elsewhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineDraft {
+    pub outline: Outline,
+    pub options: CourseOptions,
+}
+
+impl OutlineDraft {
+    pub fn of(proposal: &Proposal) -> Option<Self> {
+        Some(Self {
+            outline: proposal.outline.clone()?,
+            options: CourseOptions::of(&proposal.request),
+        })
+    }
+
+    /// The outline as it is sent: every text trimmed.
+    pub fn cleaned(&self) -> Outline {
+        let o = &self.outline;
+        Outline {
+            topic_title: o.topic_title.trim().to_string(),
+            subject_title: o.subject_title.trim().to_string(),
+            lessons: o
+                .lessons
+                .iter()
+                .map(|l| OutlineLesson {
+                    title: l.title.trim().to_string(),
+                    summary: l.summary.trim().to_string(),
+                    minutes: l.minutes,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A proposal in whichever state it is: being drafted, failed, ready to edit and create,
+/// or created.
 #[component]
 pub fn ProposalView(
     proposal: Proposal,
-    draft: Signal<Option<Outline>>,
+    draft: Signal<Option<OutlineDraft>>,
+    /// The subject the proposal is filed under, when it names one (`parent_topic_id`).
     subject_name: Option<String>,
     accepting: bool,
     accept_error: Option<ApiFailure>,
-    /// Draft the outline again after it failed (none: no Try again).
-    #[props(default)]
-    on_retry: Option<EventHandler<()>>,
-    /// Put the outline away (none: no Discard or Start over).
-    #[props(default)]
-    on_discard: Option<EventHandler<()>>,
-    on_accept: EventHandler<Outline>,
+    on_accept: EventHandler<OutlineDraft>,
 ) -> Element {
-    let nav = navigator();
     match proposal.status.clone() {
         ProposalStatus::Drafting => rsx! {
             div { class: "outline", role: "status",
@@ -46,43 +137,27 @@ pub fn ProposalView(
             }
         },
         ProposalStatus::Failed { error } => rsx! {
-            ErrorNotice {
-                message: format!("Couldn't draft an outline. {error}"),
-                on_retry: on_retry.map(|retry| EventHandler::new(move |_| retry.call(()))),
-            }
+            ErrorNotice { message: format!("Couldn't draft an outline. {error}") }
         },
         ProposalStatus::Accepted { topic_id } => rsx! {
-            div { class: "notice",
-                Icon { name: "check" }
-                div { class: "body",
-                    span { "These lessons were created." }
-                    div { class: "row-actions",
-                        button {
-                            class: "btn btn-secondary btn-sm",
-                            onclick: move |_| {
-                                nav.push(Route::TopicNotes { topic_id: topic_id.clone() });
-                            },
-                            "Open topic notes"
-                        }
-                        if let Some(discard) = on_discard {
-                            button { class: "btn btn-ghost btn-sm", onclick: move |_| discard.call(()), "Start over" }
-                        }
-                    }
-                }
+            CourseView {
+                topic_id,
+                fallback_title: proposal.outline.as_ref().map(|o| o.topic_title.clone()).unwrap_or_default(),
             }
         },
         ProposalStatus::Ready => {
             let current = draft.read().clone();
             match current {
                 None => rsx! {},
-                Some(outline) => rsx! {
+                Some(d) => rsx! {
                     OutlineEditor {
-                        outline,
+                        scope: proposal.id.clone(),
+                        outline: d.outline,
+                        options: d.options,
                         draft,
                         fixed_subject: subject_name.clone().or_else(|| proposal.request.parent_topic_id.as_ref().map(|_| "the chosen subject".to_string())),
                         accepting,
                         accept_error,
-                        on_discard,
                         on_accept,
                     }
                 },
@@ -91,16 +166,143 @@ pub fn ProposalView(
     }
 }
 
+/// What a created course's lesson is doing, for its row on the card.
+pub fn lesson_state(status: &LessonStatus, video: Option<&VideoStatus>) -> &'static str {
+    match (status, video) {
+        (LessonStatus::Queued, _) => "Waiting to be written",
+        (LessonStatus::Generating, _) => "Writing…",
+        (LessonStatus::Failed { .. }, _) => "Couldn't be written",
+        (LessonStatus::Ready, Some(VideoStatus::Ready) | None) => "Ready",
+        (LessonStatus::Ready, Some(VideoStatus::Failed { .. })) => "Ready · the video failed",
+        (LessonStatus::Ready, Some(_)) => "Ready · making the video…",
+    }
+}
+
+/// The course an outline became, as it is now in the library: its lessons as they're
+/// written, each opening its lesson, and the topic to open or show.
+#[component]
+fn CourseView(topic_id: String, fallback_title: String) -> Element {
+    let app = use_app();
+    let nav = navigator();
+    let lib = app.lib.read();
+    let Some(topic) = lib.topics.get(&topic_id).cloned() else {
+        let loaded = *app.lib_status.read() == LoadStatus::Loaded;
+        drop(lib);
+        return if loaded {
+            rsx! {
+                div { class: "notice", role: "status",
+                    Icon { name: "check" }
+                    div { class: "body", "The course “{fallback_title}” was created, and has since been deleted." }
+                }
+            }
+        } else {
+            rsx! { Loading { label: "Loading the course…" } }
+        };
+    };
+    let subject = lib
+        .topic_path(&topic_id)
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|t| t.title.clone());
+    // (id, title, minutes, what it's doing, written)
+    let lessons: Vec<(String, String, u32, &'static str, bool)> = lib
+        .lessons_in(&topic_id)
+        .iter()
+        .map(|l| {
+            let video = lib.video_for_lesson(&l.id).map(|v| &v.status);
+            (
+                l.id.clone(),
+                l.title.clone(),
+                l.minutes,
+                lesson_state(&l.status, video),
+                l.status == LessonStatus::Ready,
+            )
+        })
+        .collect();
+    drop(lib);
+    let n = lessons.len();
+    let written = lessons.iter().filter(|l| l.4).count();
+    let first = lessons.first().map(|l| l.0.clone());
+    let count = match n {
+        1 => "1 lesson".to_string(),
+        n => format!("{n} lessons"),
+    };
+    let progress = if written == n {
+        "all written".to_string()
+    } else {
+        format!("{written} written")
+    };
+    let notes_topic = topic_id.clone();
+    rsx! {
+        div { class: "outline course",
+            div { class: "outline-h",
+                b { "Course created" }
+                small {
+                    if let Some(s) = &subject { "{s} · " }
+                    "{count} · {progress}"
+                }
+            }
+            p { class: "muted", style: "margin: 0 0 12px", "New topic: ", b { style: "font-weight: 500; color: var(--fg)", "{topic.title}" } }
+            ol { class: "course-lessons", "aria-label": "Lessons in {topic.title}",
+                for (i, (id, title, minutes, state, _)) in lessons.into_iter().enumerate() {
+                    li { key: "{id}",
+                        button {
+                            class: "ol-item ol-link",
+                            onclick: move |_| {
+                                nav.push(Route::LessonRead { id: id.clone() });
+                            },
+                            span { class: "n", "{i + 1}" }
+                            span { class: "ol-view",
+                                b { "{title}" }
+                                span { class: "ol-state", "{state}" }
+                            }
+                            span { class: "n", "~{minutes} min" }
+                        }
+                    }
+                }
+            }
+            div { class: "outline-f",
+                button {
+                    class: "btn btn-ghost",
+                    onclick: move |_| reveal_topic(app, &topic_id),
+                    "Show in sidebar"
+                }
+                button {
+                    class: "btn btn-secondary",
+                    onclick: move |_| {
+                        nav.push(Route::TopicNotes { topic_id: notes_topic.clone() });
+                    },
+                    "Topic notes"
+                }
+                if let Some(first) = first {
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| {
+                            nav.push(Route::LessonRead { id: first.clone() });
+                        },
+                        "Open the first lesson"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The editable outline with the course's chips and Create lessons. `scope` (the
+/// proposal's id) keeps its controls' ids apart from another card's in the same chat.
 #[component]
 pub fn OutlineEditor(
+    scope: String,
     outline: Outline,
-    draft: Signal<Option<Outline>>,
+    options: CourseOptions,
+    draft: Signal<Option<OutlineDraft>>,
     fixed_subject: Option<String>,
     accepting: bool,
     accept_error: Option<ApiFailure>,
-    on_discard: Option<EventHandler<()>>,
-    on_accept: EventHandler<Outline>,
+    on_accept: EventHandler<OutlineDraft>,
 ) -> Element {
+    let ids = Ids::new(&scope);
     let mut editing = use_signal(|| false);
     // A stable key per lesson row, moved and removed with it, so a row's (uncontrolled)
     // fields and the focus stay with the lesson.
@@ -118,8 +320,14 @@ pub fn OutlineEditor(
     });
     let mut edit = move |f: &dyn Fn(&mut Outline)| {
         let mut d = draft.write();
-        if let Some(o) = d.as_mut() {
-            f(o);
+        if let Some(d) = d.as_mut() {
+            f(&mut d.outline);
+        }
+    };
+    let mut set_options = move |f: &dyn Fn(&mut CourseOptions)| {
+        let mut d = draft.write();
+        if let Some(d) = d.as_mut() {
+            f(&mut d.options);
         }
     };
     let total: u32 = outline.lessons.iter().map(|l| l.minutes).sum();
@@ -133,6 +341,12 @@ pub fn OutlineEditor(
     let subject_label = fixed_subject
         .clone()
         .unwrap_or_else(|| outline.subject_title.clone());
+    let (topic_id, topic_err, subject_id, add_id) = (
+        ids.topic(),
+        format!("{}-err", ids.topic()),
+        ids.subject(),
+        ids.add(),
+    );
 
     rsx! {
         div { class: "outline",
@@ -143,25 +357,25 @@ pub fn OutlineEditor(
             if *editing.read() {
                 div { class: "outline-fields",
                     div { class: "field",
-                        label { r#for: "ol-topic", "Topic" }
+                        label { r#for: "{topic_id}", "Topic" }
                         input {
-                            id: "ol-topic",
+                            id: "{topic_id}",
                             class: "input",
                             placeholder: "Topic title",
                             "aria-invalid": topic_missing.to_string(),
-                            "aria-describedby": topic_missing.then_some("ol-topic-err"),
+                            "aria-describedby": topic_missing.then(|| topic_err.clone()),
                             initial_value: "{outline.topic_title}",
                             oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.topic_title = v.clone()) },
                         }
                         if topic_missing {
-                            span { id: "ol-topic-err", class: "field-error", "Needs a title" }
+                            span { id: "{topic_err}", class: "field-error", "Needs a title" }
                         }
                     }
                     if fixed_subject.is_none() {
                         div { class: "field",
-                            label { r#for: "ol-subject", "Subject" }
+                            label { r#for: "{subject_id}", "Subject" }
                             input {
-                                id: "ol-subject",
+                                id: "{subject_id}",
                                 class: "input",
                                 initial_value: "{outline.subject_title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.subject_title = v.clone()) },
@@ -178,17 +392,17 @@ pub fn OutlineEditor(
                     if *editing.read() {
                         div { class: "ol-main",
                             input {
-                                id: row_control(key, "title"),
+                                id: ids.row(key, "title"),
                                 class: "input ol-title",
                                 "aria-label": "Lesson {i + 1} title",
                                 placeholder: "Lesson title",
                                 "aria-invalid": lesson.title.trim().is_empty().to_string(),
-                                "aria-describedby": lesson.title.trim().is_empty().then(|| format!("ol-title-{i}-err")),
+                                "aria-describedby": lesson.title.trim().is_empty().then(|| ids.row(key, "err")),
                                 initial_value: "{lesson.title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].title = v.clone()) },
                             }
                             if lesson.title.trim().is_empty() {
-                                span { id: "ol-title-{i}-err", class: "field-error", "Needs a title" }
+                                span { id: ids.row(key, "err"), class: "field-error", "Needs a title" }
                             }
                             input {
                                 class: "input",
@@ -213,26 +427,32 @@ pub fn OutlineEditor(
                                 },
                             }
                             button {
-                                id: row_control(key, "up"),
+                                id: ids.row(key, "up"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} up",
                                 disabled: i == 0,
-                                onclick: move |_| {
-                                    edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1));
-                                    keys.write().swap(i, i - 1);
-                                    focus_next.set(Some(row_control(key, after_move(i - 1, n, true))));
+                                onclick: {
+                                    let ids = ids.clone();
+                                    move |_| {
+                                        edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1));
+                                        keys.write().swap(i, i - 1);
+                                        focus_next.set(Some(ids.row(key, after_move(i - 1, n, true))));
+                                    }
                                 },
                                 Icon { name: "up" }
                             }
                             button {
-                                id: row_control(key, "down"),
+                                id: ids.row(key, "down"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} down",
                                 disabled: i + 1 == n,
-                                onclick: move |_| {
-                                    edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1));
-                                    keys.write().swap(i, i + 1);
-                                    focus_next.set(Some(row_control(key, after_move(i + 1, n, false))));
+                                onclick: {
+                                    let ids = ids.clone();
+                                    move |_| {
+                                        edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1));
+                                        keys.write().swap(i, i + 1);
+                                        focus_next.set(Some(ids.row(key, after_move(i + 1, n, false))));
+                                    }
                                 },
                                 Icon { name: "down" }
                             }
@@ -240,14 +460,17 @@ pub fn OutlineEditor(
                                 class: "icon-btn ol-del",
                                 "aria-label": "Remove lesson {i + 1}",
                                 disabled: n == 1,
-                                onclick: move |_| {
-                                    edit(&move |o: &mut Outline| { o.lessons.remove(i); });
-                                    let next = {
-                                        let mut k = keys.write();
-                                        k.remove(i);
-                                        k.at(i.min(n - 2))
-                                    };
-                                    focus_next.set(next.map(|k| row_control(k, "title")));
+                                onclick: {
+                                    let ids = ids.clone();
+                                    move |_| {
+                                        edit(&move |o: &mut Outline| { o.lessons.remove(i); });
+                                        let next = {
+                                            let mut k = keys.write();
+                                            k.remove(i);
+                                            k.at(i.min(n - 2))
+                                        };
+                                        focus_next.set(next.map(|k| ids.row(k, "title")));
+                                    }
                                 },
                                 Icon { name: "trash" }
                             }
@@ -264,16 +487,55 @@ pub fn OutlineEditor(
             if *editing.read() && n < 12 {
                 div { style: "padding-top: 10px",
                     button {
-                        id: "ol-add",
+                        id: "{add_id}",
                         class: "btn btn-ghost btn-sm",
-                        onclick: move |_| {
-                            edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 }));
-                            let key = keys.write().push();
-                            focus_next.set(Some(row_control(key, "title")));
+                        onclick: {
+                            let ids = ids.clone();
+                            move |_| {
+                                edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 }));
+                                let key = keys.write().push();
+                                focus_next.set(Some(ids.row(key, "title")));
+                            }
                         },
                         Icon { name: "plus" }
                         "Add lesson"
                     }
+                }
+            }
+            // The course's options: what the agent understood, changed here before the
+            // lessons are created.
+            div { class: "composer-row outline-opts", role: "group", "aria-label": "Course options",
+                select {
+                    class: "chip",
+                    "aria-label": "Level",
+                    disabled: accepting,
+                    value: level_value(options.level),
+                    onchange: move |e| {
+                        let level = parse_level(&e.value());
+                        set_options(&move |o: &mut CourseOptions| o.level = level)
+                    },
+                    for l in [Level::Intro, Level::Intermediate, Level::Advanced] {
+                        option { key: "{level_value(l)}", value: level_value(l), selected: options.level == l, {level_label(l)} }
+                    }
+                }
+                button {
+                    class: "chip",
+                    "aria-pressed": options.with_videos.to_string(),
+                    disabled: accepting,
+                    onclick: move |_| set_options(&|o: &mut CourseOptions| o.with_videos = !o.with_videos),
+                    Icon { name: "video" }
+                    "With videos"
+                }
+                button {
+                    class: "chip",
+                    "aria-pressed": options.with_quiz.to_string(),
+                    disabled: accepting,
+                    onclick: move |_| set_options(&|o: &mut CourseOptions| o.with_quiz = !o.with_quiz),
+                    // The check marks the state, so it shows only when on.
+                    if options.with_quiz {
+                        Icon { name: "check" }
+                    }
+                    "Quiz at the end"
                 }
             }
             if let Some(err) = accept_error {
@@ -285,9 +547,6 @@ pub fn OutlineEditor(
                 // Why "Create lessons" won't go yet (it also jumps to the field).
                 if let Some(issue) = &issue {
                     span { class: "field-error", role: "status", style: "margin-right: auto; align-self: center", {issue.message()} }
-                }
-                if let Some(discard) = on_discard {
-                    button { class: "btn btn-ghost", disabled: accepting, onclick: move |_| discard.call(()), "Discard" }
                 }
                 button {
                     class: "btn btn-secondary",
@@ -304,18 +563,13 @@ pub fn OutlineEditor(
                         if accepting {
                             return;
                         }
-                        if let Some(issue) = first_issue(&outline) {
+                        let Some(d) = draft.peek().clone() else { return };
+                        if let Some(issue) = first_issue(&d.outline) {
                             editing.set(true);
-                            focus_first(&issue.selector(&keys.peek()));
+                            focus_first(&issue.selector(&ids, &keys.peek()));
                             return;
                         }
-                        let o = outline.clone();
-                        let cleaned = Outline {
-                            topic_title: o.topic_title.trim().to_string(),
-                            subject_title: o.subject_title.trim().to_string(),
-                            lessons: o.lessons.into_iter().map(|l| OutlineLesson { title: l.title.trim().to_string(), summary: l.summary.trim().to_string(), minutes: l.minutes }).collect(),
-                        };
-                        on_accept.call(cleaned)
+                        on_accept.call(d)
                     },
                     if accepting {
                         span { class: "spinner" }
@@ -326,6 +580,42 @@ pub fn OutlineEditor(
                 }
             }
         }
+    }
+}
+
+/// The ids of one outline editor's controls, kept apart from another card's.
+#[derive(Clone, Debug, PartialEq)]
+struct Ids {
+    prefix: String,
+}
+
+impl Ids {
+    fn new(scope: &str) -> Self {
+        // Only letters, digits and dashes, so each id is also a plain CSS selector.
+        let scope: String = scope
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        Self {
+            prefix: format!("ol-{scope}"),
+        }
+    }
+
+    fn topic(&self) -> String {
+        format!("{}-topic", self.prefix)
+    }
+
+    fn subject(&self) -> String {
+        format!("{}-subject", self.prefix)
+    }
+
+    fn add(&self) -> String {
+        format!("{}-add", self.prefix)
+    }
+
+    /// The id of a row's control: "title", "err", "up" or "down".
+    fn row(&self, key: u64, part: &str) -> String {
+        format!("{}-{key}-{part}", self.prefix)
     }
 }
 
@@ -396,21 +686,16 @@ impl OutlineIssue {
     }
 
     /// The field to fix (shown in edit mode); `keys` are the rows' keys, in order.
-    fn selector(&self, keys: &RowKeys) -> String {
+    fn selector(&self, ids: &Ids, keys: &RowKeys) -> String {
         match self {
-            OutlineIssue::TopicTitle => "#ol-topic".into(),
-            OutlineIssue::NoLessons => "#ol-add".into(),
+            OutlineIssue::TopicTitle => format!("#{}", ids.topic()),
+            OutlineIssue::NoLessons => format!("#{}", ids.add()),
             OutlineIssue::LessonTitle(i) => match keys.at(*i) {
-                Some(key) => format!("#{}", row_control(key, "title")),
-                None => "#ol-add".into(),
+                Some(key) => format!("#{}", ids.row(key, "title")),
+                None => format!("#{}", ids.add()),
             },
         }
     }
-}
-
-/// The id of a row's control: "title", "up" or "down".
-fn row_control(key: u64, part: &str) -> String {
-    format!("ol-{key}-{part}")
 }
 
 /// After a lesson moves (`up` or down) to row `to` of `n`, which of its move buttons
@@ -463,7 +748,91 @@ mod tests {
         keys.swap(0, 9);
         keys.remove(9);
         assert_eq!(keys.len(), 2);
-        assert_eq!(row_control(3, "title"), "ol-3-title");
+    }
+
+    #[test]
+    fn ids_are_kept_apart_per_card_and_usable_as_selectors() {
+        let ids = Ids::new("3f2a-9c:x");
+        assert_eq!(ids.row(3, "title"), "ol-3f2a-9c-x-3-title");
+        assert_eq!(ids.topic(), "ol-3f2a-9c-x-topic");
+        assert_eq!(ids.add(), "ol-3f2a-9c-x-add");
+        assert_ne!(Ids::new("p1").topic(), Ids::new("p2").topic());
+    }
+
+    fn request(level: Level, with_videos: bool, with_quiz: bool) -> AskRequest {
+        AskRequest {
+            prompt: "Fourier".into(),
+            lesson_count: 3,
+            level,
+            with_videos,
+            with_quiz,
+            parent_topic_id: None,
+            source_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn chips_send_only_what_changed() {
+        let req = request(Level::Intro, false, true);
+        let mut options = CourseOptions::of(&req);
+        assert_eq!(options.chips(&req), OutlineChips::default());
+        options.level = Level::Advanced;
+        options.with_videos = true;
+        assert_eq!(
+            options.chips(&req),
+            OutlineChips {
+                level: Some(Level::Advanced),
+                with_videos: Some(true),
+                with_quiz: None,
+            }
+        );
+        // Changed and changed back: nothing to override.
+        options.with_quiz = false;
+        options.with_quiz = true;
+        assert_eq!(options.chips(&req).with_quiz, None);
+    }
+
+    #[test]
+    fn drafts_send_trimmed_text() {
+        let draft = OutlineDraft {
+            outline: Outline {
+                topic_title: " Fourier ".into(),
+                subject_title: "Maths ".into(),
+                lessons: vec![OutlineLesson {
+                    title: " Series".into(),
+                    summary: "Why ".into(),
+                    minutes: 9,
+                }],
+            },
+            options: CourseOptions::of(&request(Level::Intro, false, false)),
+        };
+        let o = draft.cleaned();
+        assert_eq!(o.topic_title, "Fourier");
+        assert_eq!(o.subject_title, "Maths");
+        assert_eq!(o.lessons[0].title, "Series");
+        assert_eq!(o.lessons[0].summary, "Why");
+        assert_eq!(o.lessons[0].minutes, 9);
+    }
+
+    #[test]
+    fn created_lessons_say_what_they_are_doing() {
+        assert_eq!(
+            lesson_state(&LessonStatus::Queued, None),
+            "Waiting to be written"
+        );
+        assert_eq!(lesson_state(&LessonStatus::Generating, None), "Writing…");
+        assert_eq!(lesson_state(&LessonStatus::Ready, None), "Ready");
+        assert_eq!(
+            lesson_state(&LessonStatus::Ready, Some(&VideoStatus::Scripting)),
+            "Ready · making the video…"
+        );
+        assert_eq!(
+            lesson_state(
+                &LessonStatus::Ready,
+                Some(&VideoStatus::Failed { error: "x".into() })
+            ),
+            "Ready · the video failed"
+        );
     }
 
     #[test]
@@ -498,8 +867,19 @@ mod tests {
         let mut keys = RowKeys::default();
         keys.fit(3);
         keys.swap(0, 1);
-        assert_eq!(OutlineIssue::LessonTitle(1).selector(&keys), "#ol-0-title");
-        assert_eq!(OutlineIssue::LessonTitle(7).selector(&keys), "#ol-add");
+        let ids = Ids::new("p1");
+        assert_eq!(
+            OutlineIssue::LessonTitle(1).selector(&ids, &keys),
+            "#ol-p1-0-title"
+        );
+        assert_eq!(
+            OutlineIssue::LessonTitle(7).selector(&ids, &keys),
+            "#ol-p1-add"
+        );
+        assert_eq!(
+            OutlineIssue::TopicTitle.selector(&ids, &keys),
+            "#ol-p1-topic"
+        );
         assert_eq!(
             OutlineIssue::LessonTitle(1).message(),
             "Lesson 2 needs a title."

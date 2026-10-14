@@ -16,7 +16,7 @@ pub struct LibraryState {
     pub lessons: BTreeMap<Id, Lesson>,
     pub notes: BTreeMap<Id, Note>,
     pub videos: BTreeMap<Id, Video>,
-    /// Files added as sources: a topic's, and those waiting on an Ask in progress.
+    /// Files added as sources: a topic's, and those not attached to one yet.
     pub sources: BTreeMap<Id, Source>,
     /// Outline proposals seen in this session (they are not part of the library).
     pub proposals: BTreeMap<Id, Proposal>,
@@ -231,6 +231,14 @@ impl LibraryState {
                 self.devices.remove(&id);
                 self.workspaces.retain(|_, w| w.device_id != id);
             }
+        }
+    }
+
+    /// Devices as `GET /api/devices` lists them (this device marked `current`), over any
+    /// known before.
+    pub fn merge_devices(&mut self, devices: Vec<Device>) {
+        for device in devices {
+            self.devices.insert(device.id.clone(), device);
         }
     }
 

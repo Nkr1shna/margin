@@ -10,6 +10,7 @@ use crate::config::{self, LocalConfig};
 use crate::secrets;
 use crate::sources::Upload;
 use crate::store::LibraryState;
+use crate::ui::outline::OutlineDraft;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
@@ -47,11 +48,11 @@ pub struct AppCtx {
     pub search_open: Signal<bool>,
     pub drawer_open: Signal<bool>,
     pub collapsed: Signal<HashSet<Id>>,
-    /// The proposal shown on the Ask screen, kept while navigating elsewhere.
-    pub ask_proposal: Signal<Option<Id>>,
+    /// Outline cards' edits not yet created, by proposal, kept while navigating elsewhere.
+    pub outline_drafts: Signal<HashMap<Id, OutlineDraft>>,
+    /// The new chat's message, kept while navigating elsewhere.
     pub ask_prompt: Signal<String>,
-    /// Files being added as sources, in the order added: the Ask composer's (kept, like
-    /// the prompt, until its lessons are created) and those still uploading to a topic.
+    /// Files being added as sources, in the order added, while they upload to a topic.
     pub uploads: Signal<Vec<Upload>>,
     /// The Settings dialog, open at this pane.
     pub settings_open: Signal<Option<crate::ui::settings::SettingsPane>>,
@@ -107,7 +108,7 @@ impl AppCtx {
         this.session.set(None);
         this.lib.set(LibraryState::default());
         this.lib_status.set(LoadStatus::Loading);
-        this.ask_proposal.set(None);
+        this.outline_drafts.set(HashMap::new());
         this.uploads.set(Vec::new());
         this.source_viewer.set(None);
         this.transcripts.set(HashMap::new());
