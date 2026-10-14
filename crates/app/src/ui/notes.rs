@@ -9,7 +9,9 @@ use margin_shared::{Event, Id, NewNote, Note, NotePatch};
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
-use crate::ui::common::{ConfirmDialog, Icon, Loading, TopBar, ago, render_math};
+use crate::ui::common::{
+    DeleteNoteDialog, Icon, Loading, TopBar, ago, capitalize_first, render_math,
+};
 
 /// A topic breadcrumb and its notes, each with the title of the lesson it came from.
 type NoteGroup = (String, Vec<(Note, Option<String>)>);
@@ -86,16 +88,34 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
         })
         .collect();
     let selected_exists = selected.as_ref().is_some_and(|s| lib.notes.contains_key(s));
+    // The top bar says where you are, like a lesson's: a topic's notes are
+    // "Topic / Sub / Notes", an open note is "Topic / Sub / Its title".
+    let path = |topic_id: &str| -> Vec<String> {
+        lib.topic_path(topic_id)
+            .iter()
+            .map(|t| t.title.clone())
+            .collect()
+    };
+    let open_note = selected.as_ref().and_then(|s| lib.notes.get(s));
+    let crumbs: Vec<String> = match (&topic, open_note) {
+        (Some(t), _) if topic_title.is_some() => {
+            let mut c = path(t);
+            c.push("Notes".to_string());
+            c
+        }
+        (None, Some(note)) => {
+            let mut c = path(&note.topic_id);
+            c.push(if note.title.trim().is_empty() {
+                "Untitled note".to_string()
+            } else {
+                note.title.clone()
+            });
+            c
+        }
+        _ => vec!["All notes".to_string()],
+    };
     drop(lib);
 
-    let heading = match &topic_title {
-        Some(t) => format!("{t} · notes"),
-        None => "All notes".to_string(),
-    };
-    let crumbs = match &topic {
-        Some(_) => vec![heading.clone()],
-        None => vec!["All notes".to_string()],
-    };
     let default_topic = topic
         .clone()
         .or_else(|| topics.first().map(|(id, _)| id.clone()));
@@ -132,11 +152,20 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
         div { class: "scroll", style: "overflow: hidden",
             div { class: if selected_exists { "notes-wrap has-selection" } else { "notes-wrap" },
                 div { class: "note-list",
+                    // The top bar names the list; the filter and + share the first row.
                     div { class: "note-list-head",
-                        b { "{heading}" }
+                        input {
+                            class: "input",
+                            r#type: "search",
+                            placeholder: "Filter notes",
+                            "aria-label": "Filter notes",
+                            initial_value: "{query}",
+                            oninput: move |e| query.set(e.value()),
+                        }
                         button {
                             class: "icon-btn",
                             "aria-label": "New note",
+                            "aria-expanded": creating.read().to_string(),
                             title: "New note",
                             onclick: move |_| {
                                 new_topic.set(default_topic.clone());
@@ -171,14 +200,6 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                 }
                             }
                         }
-                    }
-                    input {
-                        class: "input",
-                        r#type: "search",
-                        placeholder: "Filter notes",
-                        "aria-label": "Filter notes",
-                        initial_value: "{query}",
-                        oninput: move |e| query.set(e.value()),
                     }
                     if loading {
                         Loading {}
@@ -217,7 +238,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                         },
                                         b { "{note.title}" }
                                         span {
-                                            "{ago(&note.updated_at)}"
+                                            {capitalize_first(&ago(&note.updated_at))}
                                             if let Some(t) = lesson_title { " · from {t}" }
                                         }
                                     }
@@ -253,6 +274,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                                 Icon { name: "note" }
                                                 "Open"
                                             }
+                                            div { class: "sep", role: "separator" }
                                             button {
                                                 role: "menuitem",
                                                 class: "danger",
@@ -298,10 +320,8 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
             }
         }
         if let Some((id, title)) = confirm_note.read().clone() {
-            ConfirmDialog {
-                title: "Delete “{title}”?",
-                message: "This note will be deleted. This can't be undone.",
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: title,
                 busy: *del_busy.read(),
                 error: del_error.read().clone(),
                 on_cancel: move |_| confirm_note.set(None),
@@ -482,7 +502,7 @@ fn NoteEditor(id: Id) -> Element {
                 }
                 span { class: if error.read().is_some() { "save-state error" } else { "save-state" }, role: "status", "{state_text}" }
                 if error.read().is_some() {
-                    button { class: "btn btn-ghost btn-sm", onclick: move |_| schedule_retry(), "Retry" }
+                    button { class: "btn btn-secondary btn-sm", onclick: move |_| schedule_retry(), "Try again" }
                 }
                 div { class: "note-tools",
                     div { class: "seg", role: "tablist", "aria-label": "Editor mode",
@@ -541,10 +561,8 @@ fn NoteEditor(id: Id) -> Element {
             }
         }
         if *confirm.read() {
-            ConfirmDialog {
-                title: "Delete “{note.title}”?",
-                message: "This note will be deleted. This can't be undone.",
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: note.title.clone(),
                 busy: *deleting.read(),
                 on_cancel: move |_| confirm.set(false),
                 on_confirm: {

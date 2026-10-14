@@ -8,7 +8,8 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::store::VideoDot;
 use crate::ui::common::{
-    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
+    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, RegenerateLessonDialog,
+    UNIFIED_TITLE_BAR, shortcut, with_shortcut,
 };
 use crate::ui::settings::SettingsPane;
 use crate::ui::sources::TopicSourcesDialog;
@@ -31,6 +32,8 @@ struct TreeCtx {
     menu: Signal<Option<Id>>,
     delete: Signal<Option<Id>>,
     delete_lesson: Signal<Option<Id>>,
+    /// The lesson whose "Regenerate…" confirmation is open.
+    regenerate: Signal<Option<Id>>,
     /// The topic whose Sources dialog is open.
     sources: Signal<Option<Id>>,
     error: Signal<Option<String>>,
@@ -46,6 +49,7 @@ pub fn Sidebar() -> Element {
         menu: Signal::new(None),
         delete: Signal::new(None),
         delete_lesson: Signal::new(None),
+        regenerate: Signal::new(None),
         sources: Signal::new(None),
         error: Signal::new(None),
     });
@@ -97,6 +101,15 @@ pub fn Sidebar() -> Element {
         .filter(|id| app.lib.read().topics.contains_key(id));
     let mut delete_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
+    let mut regenerating = tree.regenerate;
+    let regenerating_lesson = regenerating.read().clone().and_then(|id| {
+        app.lib
+            .read()
+            .lessons
+            .get(&id)
+            .map(|l| (id, l.title.clone()))
+    });
+    let mut regen_busy = use_signal(|| false);
 
     rsx! {
         aside {
@@ -121,7 +134,7 @@ pub fn Sidebar() -> Element {
                     button {
                         class: "icon-btn sb-toggle",
                         "aria-label": "Hide sidebar",
-                        title: "Hide sidebar (⌘\\)",
+                        title: with_shortcut("Hide sidebar", false, "\\"),
                         onclick: move |_| {
                             if drawer_open {
                                 app.drawer_open.set(false);
@@ -143,14 +156,14 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "spark" }
                     span { class: "grow", "Ask" }
-                    span { class: "k", "⌘N" }
+                    span { class: "k", {shortcut(false, "N")} }
                 }
                 button {
                     class: "row",
                     onclick: move |_| app.search_open.set(true),
                     Icon { name: "search" }
                     span { class: "grow", "Search" }
-                    span { class: "k", "⌘K" }
+                    span { class: "k", {shortcut(false, "K")} }
                 }
                 button {
                     class: "row",
@@ -160,7 +173,7 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "note" }
                     span { class: "grow", "All notes" }
-                    span { class: "k", "⇧⌘N" }
+                    span { class: "k", {shortcut(true, "N")} }
                 }
             }
             div { class: "sb-label",
@@ -222,7 +235,7 @@ pub fn Sidebar() -> Element {
                 button {
                     class: "icon-btn",
                     "aria-label": "Settings",
-                    title: "Settings (⌘,)",
+                    title: with_shortcut("Settings", false, ","),
                     "aria-current": app.settings_open.read().is_some().to_string(),
                     onclick: move |_| app.settings_open.set(Some(SettingsPane::General)),
                     Icon { name: "gear" }
@@ -262,6 +275,27 @@ pub fn Sidebar() -> Element {
                             Err(e) => delete_error.set(Some(app.failure(&e))),
                         }
                         delete_busy.set(false);
+                    }
+                },
+            }
+        }
+        if let Some((id, title)) = regenerating_lesson {
+            RegenerateLessonDialog {
+                lesson_title: title,
+                busy: *regen_busy.read(),
+                on_cancel: move |_| regenerating.set(None),
+                on_confirm: move |_| {
+                    let id = id.clone();
+                    async move {
+                        let Some(api) = app.api() else { return };
+                        regen_busy.set(true);
+                        error.set(None);
+                        match api.regenerate_lesson(&id).await {
+                            Ok(lesson) => app.lib.write().apply(Event::LessonChanged { lesson }),
+                            Err(e) => error.set(Some(app.failure(&e))),
+                        }
+                        regen_busy.set(false);
+                        regenerating.set(None);
                     }
                 },
             }
@@ -309,16 +343,17 @@ pub fn Sidebar() -> Element {
 }
 
 /// A lesson in the tree: opens on click; its ⋯ button or a right-click offers Rename,
-/// Regenerate and Delete, like the lesson screen's menu.
+/// Regenerate and Delete, like the lesson screen's menu. Marks only show what needs a
+/// glance: writing, a lesson that failed, and a video that is ready, rendering or failed.
 #[component]
-fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element {
-    let app = use_app();
+fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, failed: bool) -> Element {
     let nav = navigator();
     let route = use_route::<Route>();
     let tree = use_context::<TreeCtx>();
     let mut edit = tree.edit;
     let mut menu = tree.menu;
     let mut delete_lesson = tree.delete_lesson;
+    let mut regenerate = tree.regenerate;
     let mut error = tree.error;
     let menu_open = menu.read().as_deref() == Some(id.as_str());
     let renaming = *edit.read() == TreeEdit::RenameLesson(id.clone());
@@ -353,12 +388,17 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                         Icon { name: "book", class: "leaf-ic" }
                         span { class: "grow", "{title}" }
                         if generating {
-                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: "Writing" }
+                            span { class: "spinner xs", role: "img", "aria-label": "Writing", title: "Writing" }
+                        } else if failed {
+                            span { class: "row-flag bad", role: "img", "aria-label": "Couldn't be written", title: "Couldn't be written",
+                                Icon { name: "alert" }
+                            }
                         }
                         match dot {
-                            VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready" } },
-                            VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress" } },
-                            VideoDot::None => rsx! { span { class: "dot", title: "No video" } },
+                            VideoDot::Ready => rsx! { span { class: "dot ok", role: "img", "aria-label": "Video ready", title: "Video ready" } },
+                            VideoDot::InProgress => rsx! { span { class: "dot run", role: "img", "aria-label": "Video in progress", title: "Video in progress" } },
+                            VideoDot::Failed => rsx! { span { class: "dot bad", role: "img", "aria-label": "Video failed", title: "Video failed" } },
+                            VideoDot::None => rsx! {},
                         }
                     }
                     button {
@@ -406,22 +446,13 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                             move |_| {
                                 menu.set(None);
                                 error.set(None);
-                                let id = id.clone();
-                                spawn(async move {
-                                    let Some(api) = app.api() else { return };
-                                    match api.regenerate_lesson(&id).await {
-                                        Ok(lesson) => {
-                                            let mut lib = app.lib;
-                                            lib.write().apply(Event::LessonChanged { lesson });
-                                        }
-                                        Err(e) => error.set(Some(app.failure(&e))),
-                                    }
-                                });
+                                regenerate.set(Some(id.clone()));
                             }
                         },
                         Icon { name: "refresh" }
-                        "Regenerate"
+                        "Regenerate…"
                     }
+                    div { class: "sep", role: "separator" }
                     button {
                         role: "menuitem",
                         class: "danger",
@@ -541,7 +572,7 @@ fn TopicNode(id: Id) -> Element {
         .iter()
         .map(|t| t.id.clone())
         .collect();
-    let lessons: Vec<(Id, String, VideoDot, bool)> = lib
+    let lessons: Vec<(Id, String, VideoDot, bool, bool)> = lib
         .lessons_in(&id)
         .iter()
         .map(|l| {
@@ -549,11 +580,13 @@ fn TopicNode(id: Id) -> Element {
                 l.status,
                 margin_shared::LessonStatus::Generating | margin_shared::LessonStatus::Queued
             );
+            let failed = matches!(l.status, margin_shared::LessonStatus::Failed { .. });
             (
                 l.id.clone(),
                 l.title.clone(),
                 lib.video_dot(&l.id),
                 generating,
+                failed,
             )
         })
         .collect();
@@ -701,6 +734,7 @@ fn TopicNode(id: Id) -> Element {
                         Icon { name: "clip" }
                         "Sources…"
                     }
+                    div { class: "sep", role: "separator" }
                     button {
                         role: "menuitem",
                         class: "danger",
@@ -721,8 +755,8 @@ fn TopicNode(id: Id) -> Element {
                     for child in children {
                         TopicNode { key: "{child}", id: child.clone() }
                     }
-                    for (lid, title, dot, generating) in lessons {
-                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating }
+                    for (lid, title, dot, generating, failed) in lessons {
+                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating, failed }
                     }
                     if note_count > 0 {
                         li { key: "notes-{id}", role: "treeitem",

@@ -170,7 +170,7 @@ fn ServiceSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Service" }
-            p { class: "help", "The Margin service on your Mac that keeps your library." }
+            p { class: "help", "Where your library lives: the Margin service on the service Mac." }
             if *editing.read() {
                 div { class: "field",
                     label { r#for: "svc-url", "Service address" }
@@ -276,7 +276,7 @@ fn AccountSection() -> Element {
                 span { {me.as_ref().map(|m| m.device.name.clone()).unwrap_or_else(|| "Loading…".into())} }
             }
             div { class: "row-actions",
-                button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out" }
+                button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
             }
         }
         section { class: "set-sec",
@@ -301,7 +301,7 @@ fn AccountSection() -> Element {
                                     }
                                 }
                                 if d.current {
-                                    button { class: "btn btn-ghost btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out" }
+                                    button { class: "btn btn-ghost btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
                                 } else {
                                     button {
                                         class: "btn btn-secondary btn-sm",
@@ -309,7 +309,7 @@ fn AccountSection() -> Element {
                                             let d = d.clone();
                                             move |_| confirm_revoke.set(Some(d.clone()))
                                         },
-                                        "Revoke"
+                                        "Revoke…"
                                     }
                                 }
                             }
@@ -349,7 +349,7 @@ fn AccountSection() -> Element {
         if *confirm_signout.read() {
             ConfirmDialog {
                 title: "Sign out of Margin?",
-                message: "This device's key is revoked and removed from the keychain. Your library stays on the service.",
+                message: "This device's key is revoked and removed from this device. Your library stays on the service.",
                 confirm_label: "Sign out",
                 busy: *busy.read(),
                 on_cancel: move |_| confirm_signout.set(false),
@@ -486,13 +486,13 @@ fn AiSection(settings: Settings) -> Element {
                             button { class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                         }
                     }
-                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the Mac's Keychain. It is never shown again." }
+                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the service Mac's Keychain. It is never shown again." }
                 } else {
                     div { class: "key-saved",
                         Icon { name: "check" }
-                        span { class: "grow", style: "white-space: normal", "Saved in the Mac's Keychain" }
+                        span { class: "grow", style: "white-space: normal", "Saved in the service Mac's Keychain" }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| replacing.set(true), "Replace" }
-                        button { class: "btn btn-ghost btn-sm", onclick: move |_| confirm_remove.set(true), "Remove" }
+                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                     }
                 }
                 if let Some(err) = key_error.read().clone() {
@@ -503,7 +503,7 @@ fn AiSection(settings: Settings) -> Element {
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the API key?",
-                message: "The key is deleted from the Mac's Keychain. Asking and generating stop working until you add a key again.",
+                message: "The key is deleted from the service Mac's Keychain. Asking and generating stop working until you add a key again.",
                 confirm_label: "Remove key",
                 busy: *key_busy.read(),
                 on_cancel: move |_| confirm_remove.set(false),
@@ -558,7 +558,7 @@ fn SourcesSection() -> Element {
                                     class: "btn btn-primary btn-sm",
                                     disabled: *busy.read(),
                                     onclick: move |_| download(),
-                                    if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                                    if *busy.read() { span { class: "spinner" } }
                                     "Download · {human_bytes(download_bytes)}"
                                 }
                                 span { class: "faint", style: "font-size: 13px", "Downloaded once from Hugging Face. Until then, sources wait in the queue." }
@@ -761,8 +761,8 @@ fn ToolsSection() -> Element {
 
     rsx! {
         section { class: "set-sec",
-            div { style: "display: flex; align-items: center; gap: 10px",
-                h2 { style: "margin: 0; font-size: 17px; font-weight: 500; flex: 1", "Tools on the service Mac" }
+            div { class: "set-sec-head",
+                h2 { "Tools on the service Mac" }
                 button {
                     class: "btn btn-ghost btn-sm",
                     onclick: move |_| tools.restart(),
@@ -770,7 +770,7 @@ fn ToolsSection() -> Element {
                     "Check again"
                 }
             }
-            p { class: "help", "Videos need ManimGX and the FluidAudio CLI on the Mac that runs the service. Margin never installs them for you." }
+            p { class: "help", "Videos need ManimGX and the FluidAudio CLI on the service Mac. Margin never installs them for you." }
             match list {
                 None => rsx! { div { class: "skel", style: "width: 50%" } },
                 Some(Err(err)) => rsx! { ErrorNotice { message: err, on_retry: move |_| tools.restart() } },

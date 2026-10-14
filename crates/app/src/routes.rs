@@ -4,6 +4,7 @@
 use dioxus::prelude::*;
 
 use crate::ui::ask::AskScreen;
+use crate::ui::common::TopBar;
 use crate::ui::lesson::{LessonScreen, LessonView};
 use crate::ui::notes::NotesScreen;
 use crate::ui::shell::Shell;
@@ -84,15 +85,18 @@ fn NoteOpen(id: String) -> Element {
 fn NotFound(segments: Vec<String>) -> Element {
     let nav = navigator();
     rsx! {
-        div { class: "empty",
-            h2 { "Nothing here" }
-            p { "This page doesn't exist." }
-            button {
-                class: "btn btn-primary",
-                onclick: move |_| {
-                    nav.replace(Route::Ask {});
-                },
-                "Go to Ask"
+        TopBar { crumbs: vec!["Not found".to_string()] }
+        div { class: "scroll",
+            div { class: "empty",
+                h2 { "Nothing here" }
+                p { "This page doesn't exist." }
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| {
+                        nav.replace(Route::Ask {});
+                    },
+                    "Go to Ask"
+                }
             }
         }
     }

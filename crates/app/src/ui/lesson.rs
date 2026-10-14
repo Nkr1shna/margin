@@ -16,7 +16,8 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
 use crate::ui::common::{
-    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math_in,
+    ConfirmDialog, DeleteNoteDialog, ErrorNotice, Icon, Loading, RegenerateLessonDialog, TopBar,
+    ago, date, js, render_math_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -34,6 +35,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
     let mut renaming = use_signal(|| false);
     let mut rename_value = use_signal(String::new);
     let mut confirm_delete = use_signal(|| false);
+    let mut confirm_regenerate = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut action_error = use_signal(|| None::<String>);
 
@@ -133,18 +135,19 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                 }
                             },
                             Icon { name: "edit" }
-                            "Rename lesson"
+                            "Rename"
                         }
                         button {
                             role: "menuitem",
                             onclick: move |_| {
                                 menu_open.set(false);
-                                let r = regenerate_menu.clone();
-                                async move { r().await }
+                                action_error.set(None);
+                                confirm_regenerate.set(true);
                             },
                             Icon { name: "refresh" }
-                            "Regenerate lesson"
+                            "Regenerate…"
                         }
+                        div { class: "sep", role: "separator" }
                         button {
                             role: "menuitem",
                             class: "danger",
@@ -154,7 +157,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                 confirm_delete.set(true);
                             },
                             Icon { name: "trash" }
-                            "Delete lesson…"
+                            "Delete…"
                         }
                     }
                 }
@@ -219,6 +222,20 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                 },
                 LessonView::Notes => rsx! { LessonNotesView { lesson_id: id.clone() } },
                 LessonView::Video => rsx! { VideoView { lesson_id: id.clone() } },
+            }
+        }
+        if *confirm_regenerate.read() {
+            RegenerateLessonDialog {
+                lesson_title: lesson.title.clone(),
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_regenerate.set(false),
+                on_confirm: move |_| {
+                    let r = regenerate_menu.clone();
+                    async move {
+                        r().await;
+                        confirm_regenerate.set(false);
+                    }
+                },
             }
         }
         if *confirm_delete.read() {
@@ -406,7 +423,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                                         class: "btn btn-primary btn-sm",
                                         disabled: busy,
                                         onclick: move |_| on_regenerate.call(()),
-                                        if busy { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                                        if busy { span { class: "spinner" } }
                                         "Regenerate"
                                     }
                                 }
@@ -606,7 +623,7 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                     button {
                         class: "icon-btn sm",
                         "aria-label": "Edit note",
-                        title: "Edit",
+                        title: "Edit note",
                         onclick: {
                             let text = note.body_md.clone();
                             move |_| {
@@ -620,7 +637,7 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                     button {
                         class: "icon-btn sm",
                         "aria-label": "Delete note",
-                        title: "Delete",
+                        title: "Delete note",
                         onclick: move |_| confirm.set(true),
                         Icon { name: "trash" }
                     }
@@ -631,10 +648,8 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
             }
         }
         if *confirm.read() {
-            ConfirmDialog {
-                title: "Delete this note?",
-                message: format!("“{}” will be deleted. This can't be undone.", note.title),
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: note.title.clone(),
                 busy: *busy.read(),
                 on_cancel: move |_| confirm.set(false),
                 on_confirm: {
@@ -767,8 +782,8 @@ fn LessonNotesView(lesson_id: Id) -> Element {
 
     rsx! {
         div { class: "note-cards",
-            div { style: "display: flex; align-items: center; gap: 12px",
-                h2 { style: "margin: 0; font-size: 22px; font-weight: 500; flex: 1", "Notes on this lesson" }
+            div { class: "view-head",
+                h1 { "Notes on this lesson" }
                 button {
                     class: "btn btn-secondary btn-sm",
                     disabled: *adding.read(),
@@ -895,7 +910,7 @@ fn VideoView(lesson_id: Id) -> Element {
 
     rsx! {
         div { class: "studio",
-            div { class: "studio-head",
+            div { class: "view-head studio-head",
                 h1 { "{lesson.title}" }
                 span { class: "status", role: "status", span { class: "{status_dot}" } "{status_text}" }
                 if !in_progress {
@@ -904,7 +919,7 @@ fn VideoView(lesson_id: Id) -> Element {
                         disabled: *busy.read() || !lesson_ready,
                         title: if lesson_ready { "" } else { "The lesson must finish writing first" },
                         onclick: make,
-                        if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                        if *busy.read() { span { class: "spinner" } }
                         Icon { name: make_icon }
                         if video.is_some() { "Re-render" } else { "Make video" }
                     }
@@ -919,7 +934,7 @@ fn VideoView(lesson_id: Id) -> Element {
                         h2 { "No video for this lesson" }
                         p {
                             if lesson_ready {
-                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on your Mac."
+                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on the service Mac."
                             } else {
                                 "You can make a video once the lesson has finished writing."
                             }
@@ -1027,7 +1042,7 @@ fn VideoDetails(video: Video) -> Element {
         VideoPlayer { video: video.clone() }
         if !video.log.is_empty() {
             details { class: "collapse",
-                summary { "Render log" }
+                summary { Icon { name: "chev", class: "chev" } "Render log" }
                 pre { class: "log", "{video.log}" }
             }
         }
