@@ -12,7 +12,7 @@ use margin_ai::{
 };
 use margin_shared::{
     Card, ChatItem, ChatItemKind, ConfirmationCard, Decision, DeviceRef, Id, ItemStatus,
-    ReasoningEffort, Usage, Workspace,
+    ReasoningEffort, Usage, Workspace, error_code,
 };
 use serde_json::{Value, json};
 
@@ -65,14 +65,27 @@ impl RetryPolicy {
     }
 
     /// The pause before retry number `attempt + 1`: `retry_after` when the API sent
-    /// one, else `base_delay · 2^attempt`; never more than `max_delay`.
+    /// one, as asked however long (owner decision) plus up to a second of jitter, so
+    /// two turns told the same thing don't retry at the same instant; else
+    /// `base_delay · 2^attempt`, never more than `max_delay`.
     pub fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        let wait = retry_after.unwrap_or_else(|| {
-            self.base_delay
+        match retry_after {
+            Some(wait) => wait.saturating_add(jitter()),
+            None => self
+                .base_delay
                 .saturating_mul(2u32.saturating_pow(attempt.min(16)))
-        });
-        wait.min(self.max_delay)
+                .min(self.max_delay),
+        }
     }
+}
+
+/// A random pause of 0–1 s (to the millisecond).
+fn jitter() -> Duration {
+    use std::hash::BuildHasher;
+    // `RandomState` is seeded randomly per instance: enough randomness for spreading
+    // retries, without a dependency.
+    let random = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    Duration::from_millis(random % 1001)
 }
 
 /// One turn (or one Continue of it).
@@ -173,7 +186,7 @@ pub async fn run_turn(deps: TurnDeps<'_>, input: TurnInput) -> TurnOutcome {
                     ChatItemKind::Error {
                         message: error.clone(),
                         retryable: true,
-                        code: None,
+                        code: Some(error_code::STORAGE.into()),
                     },
                     ItemRecord::default(),
                 )
@@ -216,6 +229,8 @@ struct CallError {
     message: String,
     retryable: bool,
     retry_after: Option<Duration>,
+    /// The `error_code` of the Error item, if this ends the turn.
+    code: &'static str,
     /// The input is longer than the model's context window.
     too_long: bool,
     /// The API doesn't know `context_management`.
@@ -240,9 +255,36 @@ impl CallError {
             message: error_text(e),
             retryable: e.is_retryable(),
             retry_after: e.retry_after(),
+            code: if too_long {
+                error_code::CONTEXT_TOO_LONG
+            } else {
+                ai_error_code(e)
+            },
             too_long,
             rejects_compaction,
         }
+    }
+}
+
+/// The `error_code` an `AiError` ends a turn with.
+fn ai_error_code(e: &AiError) -> &'static str {
+    match e {
+        AiError::Http { status: 429, .. } => error_code::RATE_LIMITED,
+        AiError::Http { status, .. } if *status >= 500 => error_code::SERVER_ERROR,
+        AiError::Http { .. } => error_code::BAD_REQUEST,
+        AiError::Network(_) => error_code::NETWORK,
+        AiError::Parse(_) => error_code::SERVER_ERROR,
+        AiError::Incomplete(_) => error_code::INCOMPLETE,
+    }
+}
+
+/// Why the loop waits before retrying, by the error's code, for the chat
+/// (`Chat.waiting.reason`).
+fn wait_reason(code: &str) -> &'static str {
+    match code {
+        error_code::RATE_LIMITED => "The model API asked Margin to slow down.",
+        error_code::NETWORK => "Margin couldn't reach the model API.",
+        _ => "The model API had a problem.",
     }
 }
 
@@ -250,7 +292,9 @@ impl CallError {
 fn incomplete_reason(reason: &str) -> &str {
     match reason {
         "max_output_tokens" => "it reached the output length limit",
+        "max_messages" => "it reached the message limit",
         "content_filter" => "the content filter stopped it",
+        "steered" => "the model API ended it early",
         other => other,
     }
 }
@@ -481,24 +525,40 @@ impl<'t, 'a> Turn<'t, 'a> {
                 let wait = self.deps.retry.delay(attempt, error.retry_after);
                 attempt += 1;
                 tracing::info!(chat = %self.input.chat_id, attempt, ?wait, error = %error.message, "retrying the model call");
-                tokio::time::sleep(wait).await;
+                self.wait_to_retry(wait, wait_reason(error.code)).await?;
                 continue;
             }
             return self
-                .fail(error.message, error.retryable && !error.too_long)
+                .fail(
+                    error.message,
+                    error.retryable && !error.too_long,
+                    error.code,
+                )
                 .await;
         }
     }
 
-    /// Stores the Error item; the turn ends.
-    async fn fail(&self, error: String, retryable: bool) -> Result<Step, SinkError> {
+    /// Sleeps `wait` before a retry, with the chat showing until when and why.
+    async fn wait_to_retry(&self, wait: Duration, reason: &str) -> Result<(), SinkError> {
+        let now = chrono::Utc::now();
+        let until = chrono::TimeDelta::from_std(wait)
+            .ok()
+            .and_then(|wait| now.checked_add_signed(wait))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        self.sink().retrying(until, reason).await?;
+        tokio::time::sleep(wait).await;
+        self.sink().clear_waiting().await
+    }
+
+    /// Stores the Error item with its `error_code`; the turn ends.
+    async fn fail(&self, error: String, retryable: bool, code: &str) -> Result<Step, SinkError> {
         self.sink()
             .add_item(
                 ItemStatus::Done,
                 ChatItemKind::Error {
                     message: error.clone(),
                     retryable,
-                    code: None,
+                    code: Some(code.to_string()),
                 },
                 ItemRecord::default(),
             )
@@ -521,14 +581,18 @@ impl<'t, 'a> Turn<'t, 'a> {
                         return Ok(Attempt::NoOutput(CallError::from_ai(&e)));
                     }
                     let message = error_text(&e);
-                    return self.abandon(open, &calls, message, e.is_retryable()).await;
+                    let (retryable, code) = (e.is_retryable(), ai_error_code(&e));
+                    return self.abandon(open, &calls, message, retryable, code).await;
                 }
                 None => {
                     let e = AiError::Network("the response ended before it finished".into());
                     if !started {
                         return Ok(Attempt::NoOutput(CallError::from_ai(&e)));
                     }
-                    return self.abandon(open, &calls, error_text(&e), true).await;
+                    let message = error_text(&e);
+                    return self
+                        .abandon(open, &calls, message, true, error_code::NETWORK)
+                        .await;
                 }
             };
             match event {
@@ -636,7 +700,9 @@ impl<'t, 'a> Turn<'t, 'a> {
                     sink.add_usage(&usage).await?;
                     let message =
                         format!("The answer was cut off ({}).", incomplete_reason(&reason));
-                    return self.abandon(open, &calls, message, true).await;
+                    return self
+                        .abandon(open, &calls, message, true, error_code::INCOMPLETE)
+                        .await;
                 }
                 StreamEvent::Failed { code, message } | StreamEvent::Error { code, message } => {
                     let too_long = code.as_deref() == Some("context_length_exceeded")
@@ -646,12 +712,18 @@ impl<'t, 'a> Turn<'t, 'a> {
                             message: format!("The model couldn't answer: {message}"),
                             retryable: false,
                             retry_after: None,
+                            code: error_code::CONTEXT_TOO_LONG,
                             too_long: true,
                             rejects_compaction: false,
                         }));
                     }
                     let message = format!("The model couldn't answer: {message}");
-                    return self.abandon(open, &calls, message, true).await;
+                    let code = if too_long {
+                        error_code::CONTEXT_TOO_LONG
+                    } else {
+                        error_code::SERVER_ERROR
+                    };
+                    return self.abandon(open, &calls, message, true, code).await;
                 }
             }
         }
@@ -778,12 +850,13 @@ impl<'t, 'a> Turn<'t, 'a> {
         calls: &[Call],
         error: String,
         retryable: bool,
+        code: &str,
     ) -> Result<Attempt, SinkError> {
         for (_, o) in open {
             self.cancel_open(o).await?;
         }
         self.not_run(calls, NOT_RUN_FAILED).await?;
-        Ok(Attempt::Step(self.fail(error, retryable).await?))
+        Ok(Attempt::Step(self.fail(error, retryable, code).await?))
     }
 
     /// Appends a completed response's output to the history. A `compaction` item
@@ -1089,7 +1162,9 @@ impl<'t, 'a> Turn<'t, 'a> {
             let mut stream = match self.deps.model.stream(request.clone()).await {
                 Ok(stream) => stream,
                 Err(e) if e.is_retryable() && attempt < self.deps.retry.retries => {
-                    tokio::time::sleep(self.deps.retry.delay(attempt, e.retry_after())).await;
+                    let wait = self.deps.retry.delay(attempt, e.retry_after());
+                    self.wait_to_retry(wait, wait_reason(ai_error_code(&e)))
+                        .await?;
                     attempt += 1;
                     continue;
                 }
@@ -1184,8 +1259,9 @@ fn with_streamed_text(kind: ChatItemKind, text: String) -> ChatItemKind {
     }
 }
 
-/// Where the current message starts in `history`: its context message (the developer
-/// message just before it) or the last user message; 0 when there is none.
+/// Where the current message starts in `history`: the last user message (which carries
+/// its context), or the developer context message just before it for messages stored
+/// by older builds; 0 when there is none.
 fn current_message_start(history: &[Value]) -> usize {
     let Some(user) = history.iter().rposition(|v| v["role"] == "user") else {
         return 0;
@@ -1257,7 +1333,19 @@ fn transcript(items: &[Value]) -> String {
             (Some("compaction"), _) => {
                 "(An earlier part of the chat was condensed and can't be shown here.)".into()
             }
-            (_, Some("user")) => format!("Owner: {}", content_text(v)),
+            (_, Some("user")) => match v["content"].as_array().map(Vec::as_slice) {
+                // `user_message_input`: the context Margin adds, then the owner's words.
+                Some([context @ .., words]) if !context.is_empty() => {
+                    let context: Vec<&str> =
+                        context.iter().filter_map(|p| p["text"].as_str()).collect();
+                    format!(
+                        "Note: {}\n\nOwner: {}",
+                        context.join("\n"),
+                        words["text"].as_str().unwrap_or_default()
+                    )
+                }
+                _ => format!("Owner: {}", content_text(v)),
+            },
             (_, Some("assistant")) => format!("Assistant: {}", content_text(v)),
             (_, Some("developer" | "system")) => format!("Note: {}", content_text(v)),
             _ => continue,
@@ -1296,15 +1384,70 @@ mod tests {
         assert_eq!(p.delay(1, None), Duration::from_secs(4));
         assert_eq!(p.delay(2, None), Duration::from_secs(8));
         assert_eq!(p.delay(10, None), Duration::from_secs(60));
-        assert_eq!(
-            p.delay(0, Some(Duration::from_secs(7))),
-            Duration::from_secs(7)
-        );
-        assert_eq!(
-            p.delay(0, Some(Duration::from_secs(600))),
-            Duration::from_secs(60)
-        );
         assert_eq!(RetryPolicy::immediate().delay(3, None), Duration::ZERO);
+    }
+
+    /// `Retry-After` is waited as the server asks, however long, plus up to a second.
+    #[test]
+    fn retry_after_is_uncapped_with_jitter() {
+        let within = |wait: Duration, asked: u64| {
+            wait >= Duration::from_secs(asked) && wait <= Duration::from_millis(asked * 1000 + 1000)
+        };
+        let p = RetryPolicy::default();
+        for _ in 0..50 {
+            assert!(within(p.delay(0, Some(Duration::from_secs(7))), 7));
+            assert!(within(p.delay(2, Some(Duration::from_secs(600))), 600));
+            assert!(within(
+                RetryPolicy::immediate().delay(0, Some(Duration::from_secs(3))),
+                3
+            ));
+        }
+        // The jitter varies.
+        let waits: HashSet<Duration> = (0..20)
+            .map(|_| p.delay(0, Some(Duration::from_secs(1))))
+            .collect();
+        assert!(waits.len() > 1, "{waits:?}");
+        // A server asking for an absurd wait is still honoured, without overflowing.
+        assert_eq!(p.delay(0, Some(Duration::MAX)), Duration::MAX);
+    }
+
+    #[test]
+    fn errors_have_codes() {
+        let http = |status| AiError::Http {
+            status,
+            message: "m".into(),
+            retry_after: None,
+        };
+        assert_eq!(ai_error_code(&http(429)), error_code::RATE_LIMITED);
+        assert_eq!(ai_error_code(&http(503)), error_code::SERVER_ERROR);
+        assert_eq!(ai_error_code(&http(401)), error_code::BAD_REQUEST);
+        assert_eq!(
+            ai_error_code(&AiError::Network("x".into())),
+            error_code::NETWORK
+        );
+        let too_long = AiError::Http {
+            status: 400,
+            message: "This model's maximum context length is 400000 tokens.".into(),
+            retry_after: None,
+        };
+        assert_eq!(
+            CallError::from_ai(&too_long).code,
+            error_code::CONTEXT_TOO_LONG
+        );
+        assert_eq!(
+            wait_reason(error_code::RATE_LIMITED),
+            "The model API asked Margin to slow down."
+        );
+    }
+
+    #[test]
+    fn incomplete_reasons_in_words() {
+        assert_eq!(
+            incomplete_reason("max_messages"),
+            "it reached the message limit"
+        );
+        assert_eq!(incomplete_reason("steered"), "the model API ended it early");
+        assert_eq!(incomplete_reason("something_new"), "something_new");
     }
 
     #[test]
