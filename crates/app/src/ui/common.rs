@@ -156,6 +156,13 @@ pub fn render_math(id: &str) {
     let _ = js(&format!("MarginApp.renderMath({id});"));
 }
 
+/// Focus the first element matching `selector` once the next DOM update lands (for a
+/// field that was just added, or the first one with an error).
+pub fn focus_first(selector: &str) {
+    let sel = serde_json::to_string(selector).unwrap_or_default();
+    let _ = js(&format!("MarginApp.focusFirst({sel});"));
+}
+
 pub fn render_math_in(selector: &str) {
     let sel = serde_json::to_string(selector).unwrap_or_default();
     let _ = js(&format!("MarginApp.renderMathIn({sel});"));
@@ -357,12 +364,18 @@ pub fn ConfirmDialog(
     on_confirm: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
+    // While the action runs, the dialog can't be dismissed: it would look cancelled
+    // while the request carries on.
     rsx! {
         div {
             class: "modal-scrim",
-            onclick: move |_| on_cancel.call(()),
+            onclick: move |_| {
+                if !busy {
+                    on_cancel.call(());
+                }
+            },
             onkeydown: move |e: KeyboardEvent| {
-                if e.key() == Key::Escape {
+                if e.key() == Key::Escape && !busy {
                     on_cancel.call(());
                 }
             },
@@ -370,11 +383,12 @@ pub fn ConfirmDialog(
                 class: "modal",
                 role: "alertdialog",
                 "aria-modal": "true",
+                "aria-busy": busy.to_string(),
                 onclick: move |e| e.stop_propagation(),
                 h2 { "{title}" }
                 p { "{message}" }
                 if let Some(err) = error {
-                    div { class: "notice error",
+                    div { class: "notice error", role: "alert",
                         Icon { name: "alert" }
                         div { class: "body", "{err}" }
                     }
@@ -382,6 +396,7 @@ pub fn ConfirmDialog(
                 div { class: "row-actions",
                     button {
                         class: "btn btn-secondary btn-sm",
+                        disabled: busy,
                         onclick: move |_| on_cancel.call(()),
                         "Cancel"
                     }
@@ -389,7 +404,11 @@ pub fn ConfirmDialog(
                         class: if danger { "btn btn-danger btn-sm" } else { "btn btn-primary btn-sm" },
                         disabled: busy,
                         autofocus: true,
-                        onclick: move |_| on_confirm.call(()),
+                        onclick: move |_| {
+                            if !busy {
+                                on_confirm.call(());
+                            }
+                        },
                         if busy { span { class: "spinner" } }
                         "{confirm_label}"
                     }
