@@ -13,6 +13,8 @@ mod fake;
 mod markdown;
 mod picker;
 mod routes;
+#[cfg(target_os = "ios")]
+mod scene;
 mod secrets;
 mod sources;
 mod state;
@@ -78,6 +80,8 @@ const INDEX_HTML: &str = concat!(
 
 fn main() {
     picker::clear_staging();
+    #[cfg(target_os = "ios")]
+    scene::register();
     #[cfg(feature = "desktop")]
     {
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
@@ -283,6 +287,16 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
 fn App() -> Element {
     #[cfg(all(feature = "desktop", target_os = "macos"))]
     chrome::use_traffic_lights();
+    // iOS: the window shows once it joins the UIKit scene (src/scene.rs).
+    #[cfg(target_os = "ios")]
+    use_hook(|| {
+        #[cfg(feature = "desktop")]
+        use dioxus::desktop as host;
+        #[cfg(not(feature = "desktop"))]
+        use dioxus::mobile as host;
+        use host::tao::platform::ios::WindowExtIOS;
+        scene::adopt_window(host::window().window.ui_window());
+    });
     let ctx = use_context_provider(|| {
         let config = config::load();
         // Restore the session from the keychain, if this device signed in before.

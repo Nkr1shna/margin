@@ -15,3 +15,12 @@ info_plist_path = "macos/Info.plist"
 # Liquid Glass icon compiled from icon/Margin.icon by icon/build.sh. Assets.car holds
 # the layered icon macOS 26+ renders; Margin.icns is the flat fallback.
 files = { "Resources/Assets.car" = "icon/build/Assets.car", "Resources/Margin.icns" = "icon/build/Margin.icns" }
+
+# iOS 27 requires the UIKit scene lifecycle; tao 0.34 has none, so the app declares one
+# scene configuration whose delegate (src/scene.rs) puts tao's window into the scene.
+[ios.plist.UIApplicationSceneManifest]
+UIApplicationSupportsMultipleScenes = false
+
+[[ios.plist.UIApplicationSceneManifest.UISceneConfigurations.UIWindowSceneSessionRoleApplication]]
+UISceneConfigurationName = "Default Configuration"
+UISceneDelegateClassName = "MarginSceneDelegate"
