@@ -51,7 +51,6 @@ pub fn Sidebar() -> Element {
         .iter()
         .map(|t| t.id.clone())
         .collect();
-    let note_count = lib.notes.len();
     let loaded = *app.lib_status.read() == LoadStatus::Loaded;
     let login = app
         .session
@@ -136,10 +135,6 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "note" }
                     span { class: "grow", "All notes" }
-                    // The count only once there is something to count.
-                    if note_count > 0 {
-                        span { class: "count", "{note_count}" }
-                    }
                 }
             }
             div { class: "sb-label",
