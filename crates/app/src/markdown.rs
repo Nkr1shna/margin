@@ -5,8 +5,15 @@
 //! the webview. Math (`$…$`, `$$…$$`) is emitted as `<span class="math math-inline">`
 //! / `<span class="math math-display">` holding the TeX source; KaTeX renders those
 //! spans in the webview after each render.
+//!
+//! Lessons cite their sources with footnote references, `[^n]`, and never define the
+//! footnotes: `render_lesson` turns each reference to a known citation into a small
+//! citation button (`button.cite[data-cite=n]`) the app opens the source viewer from.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
+use std::collections::HashMap;
+
+use margin_shared::Citation;
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream, html};
 
 fn options() -> Options {
     Options::ENABLE_TABLES
@@ -22,7 +29,7 @@ pub fn render(markdown: &str) -> String {
     let parser = Parser::new_ext(markdown, options()).map(demote_heading);
     let mut raw = String::with_capacity(markdown.len() * 3 / 2);
     html::push_html(&mut raw, parser);
-    sanitize(&raw)
+    sanitize(&raw, false)
 }
 
 fn demote_heading(event: Event<'_>) -> Event<'_> {
@@ -53,25 +60,145 @@ fn demote_heading(event: Event<'_>) -> Event<'_> {
     }
 }
 
-fn sanitize(raw: &str) -> String {
-    ammonia::Builder::default()
+/// Render a lesson body to sanitized HTML, with each `[^n]` that names one of
+/// `citations` as a citation button. References to unknown numbers stay plain text, and
+/// so do references inside code, links and image descriptions.
+pub fn render_lesson(markdown: &str, citations: &[Citation]) -> String {
+    let known: HashMap<u32, &Citation> = citations.iter().map(|c| (c.n, c)).collect();
+    let mut events: Vec<Event> = Vec::new();
+    // Inside code blocks, links and images, text is left alone.
+    let mut verbatim = 0usize;
+    for event in TextMergeStream::new(Parser::new_ext(markdown, options())).map(demote_heading) {
+        match &event {
+            Event::Start(Tag::CodeBlock(_) | Tag::Link { .. } | Tag::Image { .. }) => verbatim += 1,
+            Event::End(TagEnd::CodeBlock | TagEnd::Link | TagEnd::Image) => {
+                verbatim = verbatim.saturating_sub(1)
+            }
+            _ => {}
+        }
+        match event {
+            Event::Text(text) if verbatim == 0 => {
+                let mut rest: &str = &text;
+                while let Some((start, end, n)) = next_marker(rest) {
+                    let Some(citation) = known.get(&n) else {
+                        events.push(Event::Text(CowStr::from(rest[..end].to_string())));
+                        rest = &rest[end..];
+                        continue;
+                    };
+                    if start > 0 {
+                        events.push(Event::Text(CowStr::from(rest[..start].to_string())));
+                    }
+                    events.push(Event::InlineHtml(CowStr::from(marker_html(citation))));
+                    rest = &rest[end..];
+                }
+                if !rest.is_empty() {
+                    events.push(Event::Text(CowStr::from(rest.to_string())));
+                }
+            }
+            // Only reached if a body ever defines its footnotes.
+            Event::FootnoteReference(label) => {
+                match label.parse::<u32>().ok().and_then(|n| known.get(&n)) {
+                    Some(citation) => {
+                        events.push(Event::InlineHtml(CowStr::from(marker_html(citation))))
+                    }
+                    None => events.push(Event::Text(CowStr::from(format!("[^{label}]")))),
+                }
+            }
+            other => events.push(other),
+        }
+    }
+    let mut raw = String::with_capacity(markdown.len() * 3 / 2);
+    html::push_html(&mut raw, events.into_iter());
+    sanitize(&raw, true)
+}
+
+/// The first `[^n]` in `text`: its byte range and number.
+fn next_marker(text: &str) -> Option<(usize, usize, u32)> {
+    let mut from = 0;
+    while let Some(i) = text[from..].find("[^") {
+        let start = from + i;
+        let digits = &text[start + 2..];
+        let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+        if (1..=6).contains(&len)
+            && digits[len..].starts_with(']')
+            && let Ok(n) = digits[..len].parse()
+        {
+            return Some((start, start + 2 + len + 1, n));
+        }
+        from = start + 2;
+    }
+    None
+}
+
+/// The citation button for `[^n]`: the number, named "Source n: <name>" for assistive
+/// technology, with the source and its place as the tooltip.
+fn marker_html(c: &Citation) -> String {
+    let label = crate::citations::marker_label(c.n, &c.source_name);
+    let tip = match crate::citations::locator(c) {
+        Some(at) => format!("{} · {at}", c.source_name),
+        None => c.source_name.clone(),
+    };
+    format!(
+        r#"<button type="button" class="cite" data-cite="{n}" aria-label="{label}" title="{tip}">{n}</button>"#,
+        n = c.n,
+        label = escape_attr(&label),
+        tip = escape_attr(&tip),
+    )
+}
+
+fn escape_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Sanitize rendered HTML. With `citations`, citation buttons are kept too: `button`
+/// with `class="cite"`, `type="button"`, a numeric `data-cite`, an `aria-label` and a
+/// `title`, and nothing else.
+fn sanitize(raw: &str, citations: bool) -> String {
+    let mut builder = ammonia::Builder::default();
+    builder
         .add_generic_attributes(&["class"])
         .add_tag_attributes("details", &["open"])
         .add_tag_attributes("input", &["type", "checked", "disabled"])
-        .add_tags(&["input"])
-        .clean(raw)
-        .to_string()
+        .add_tags(&["input"]);
+    if citations {
+        builder
+            .add_tags(&["button"])
+            .add_tag_attributes("button", &["type", "data-cite", "aria-label", "title"])
+            .attribute_filter(|element, attribute, value| {
+                if element != "button" {
+                    return Some(value.into());
+                }
+                let ok = match attribute {
+                    "type" => value == "button",
+                    "class" => value == "cite",
+                    "data-cite" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+                    _ => true,
+                };
+                ok.then(|| value.into())
+            });
+    }
+    builder.clean(raw).to_string()
 }
 
 /// The visible text of a Markdown document (what a reader can select), with
 /// whitespace collapsed. Math is included as its TeX source.
 pub fn plain_text(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
-    for event in Parser::new_ext(markdown, options()) {
+    for event in TextMergeStream::new(Parser::new_ext(markdown, options())) {
         match event {
-            Event::Text(t) | Event::Code(t) | Event::InlineMath(t) | Event::DisplayMath(t) => {
-                out.push_str(&t)
-            }
+            Event::Text(t) => out.push_str(&strip_markers(&t)),
+            Event::Code(t) | Event::InlineMath(t) | Event::DisplayMath(t) => out.push_str(&t),
             Event::InlineHtml(t) | Event::Html(t) => out.push_str(&strip_tags(&t)),
             Event::SoftBreak | Event::HardBreak => out.push(' '),
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item)
@@ -80,6 +207,18 @@ pub fn plain_text(markdown: &str) -> String {
         }
     }
     normalize(&out)
+}
+
+/// `text` without its citation markers (`[^n]`).
+fn strip_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((start, end, _)) = next_marker(rest) {
+        out.push_str(&rest[..start]);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn strip_tags(html: &str) -> String {
@@ -311,6 +450,84 @@ mod tests {
             (Some("Second"), "b"),
         ];
         assert_eq!(margin_order(&plain, items), vec!["a", "b", "c", "none"]);
+    }
+
+    fn citation(n: u32, name: &str) -> Citation {
+        Citation {
+            n,
+            source_id: format!("s{n}"),
+            source_name: name.into(),
+            kind: margin_shared::SourceKind::Pdf,
+            page: Some(3),
+            start_ms: None,
+            end_ms: None,
+            excerpt: "passage".into(),
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn citation_markers_become_buttons() {
+        let cites = [
+            citation(1, "Oppenheim \"ch3\".pdf"),
+            citation(2, "talk.m4a"),
+        ];
+        let html = render_lesson(
+            "The period sets it[^1]. Both agree[^2][^1], but [^7] is unknown.\n",
+            &cites,
+        );
+        assert!(
+            html.contains(
+                r#"sets it<button type="button" class="cite" data-cite="1" aria-label="Source 1: Oppenheim &quot;ch3&quot;.pdf" title="Oppenheim &quot;ch3&quot;.pdf · p. 3">1</button>."#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"data-cite="2" aria-label="Source 2: talk.m4a""#),
+            "{html}"
+        );
+        assert_eq!(html.matches("<button").count(), 3, "{html}");
+        assert!(html.contains("but [^7] is unknown."), "{html}");
+    }
+
+    #[test]
+    fn citation_markers_in_code_and_links_stay_text() {
+        let cites = [citation(1, "a.pdf")];
+        let html = render_lesson(
+            "Inline `x[^1]` and [a link[^1]](https://example.com).\n\n```\nlet a = b[^1];\n```\n\n**Bold[^1]**\n",
+            &cites,
+        );
+        assert!(html.contains("<code>x[^1]</code>"), "{html}");
+        assert!(html.contains("a link[^1]</a>"), "{html}");
+        assert!(html.contains("let a = b[^1];"), "{html}");
+        assert!(
+            html.contains(r#"<strong>Bold<button type="button" class="cite" data-cite="1""#),
+            "{html}"
+        );
+        // Notes don't cite: there the marker is text.
+        assert!(render("Bold[^1]").contains("Bold[^1]"));
+    }
+
+    #[test]
+    fn lesson_html_cant_forge_other_buttons() {
+        let html = render_lesson(
+            "<button class=\"cite\" data-cite=\"x\" onclick=\"alert(1)\" type=\"submit\">1</button>\n\n<button class=\"evil\" data-cite=\"2\">2</button>\n",
+            &[citation(1, "a.pdf")],
+        );
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("submit"), "{html}");
+        assert!(!html.contains("data-cite=\"x\""), "{html}");
+        assert!(!html.contains("evil"), "{html}");
+        // Notes keep no buttons at all.
+        assert!(!render("<button>x</button>").contains("<button"));
+    }
+
+    #[test]
+    fn plain_text_leaves_out_citation_markers() {
+        assert_eq!(
+            plain_text("The period[^1] sets it[^12]. Keep `[^3]` and [^x]."),
+            "The period sets it. Keep [^3] and [^x]."
+        );
     }
 
     #[test]

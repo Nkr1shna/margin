@@ -43,12 +43,14 @@ pub struct FakeState {
     pub public_url: String,
     pub media_dir: Option<std::path::PathBuf>,
     pub embedding: EmbeddingModelState,
+    /// Uploaded sources' bytes, served as their originals.
+    pub source_files: HashMap<Id, Vec<u8>>,
 }
 
 /// Hugging Face repo of the embedding model, as the service reports it.
 pub const EMBEDDING_REPO: &str = "FluidInference/embeddinggemma-2-coreml";
 /// What the fake says the model download weighs.
-pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 640_000_000;
+pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 1_480_000_000;
 
 #[derive(Clone)]
 pub struct Fake {
@@ -66,25 +68,25 @@ fn ts(n: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_760_000_000 + n, 0).unwrap()
 }
 
-pub const LESSON_ONE: &str = r#"Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.
+pub const LESSON_ONE: &str = r#"Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.[^1]
 
 ## The idea
 
-The slowest wave sets the period $T$. The faster ones repeat a whole number of times inside each period, so they add detail without breaking the repetition. That's why the frequencies must be whole-number multiples, and it's what makes the decomposition unique.
+The slowest wave sets the period $T$. The faster ones repeat a whole number of times inside each period, so they add detail without breaking the repetition. That's why the frequencies must be whole-number multiples, and it's what makes the decomposition unique.[^1]
 
 $$f(t) = \frac{a_0}{2} + \sum_{n=1}^{\infty} \left( a_n \cos n\omega_0 t + b_n \sin n\omega_0 t \right), \quad \omega_0 = \frac{2\pi}{T}$$
 
-Each pair $a_n, b_n$ says how much of the $n$-th harmonic the signal contains, so sines & cosines together describe the whole signal.
+Each pair $a_n, b_n$ says how much of the $n$-th harmonic the signal contains, so sines & cosines together describe the whole signal.[^2]
 
 ## Building a square wave
 
-A square wave of height 1 uses only odd harmonics, and only sines:
+A square wave of height 1 uses only odd harmonics, and only sines:[^3]
 
 $$f(t) = \frac{4}{\pi}\left[\sin \omega_0 t + \tfrac{1}{3}\sin 3\omega_0 t + \tfrac{1}{5}\sin 5\omega_0 t + \dots\right]$$
 
-With three terms the shape is already recognisable. With fifty, only a small overshoot at each jump remains. That overshoot, about 9% of the jump, never goes away.
+With three terms the shape is already recognisable.[^4] With fifty, only a small overshoot at each jump remains. That overshoot, about 9% of the jump, never goes away.[^5][^6]
 
-> **Key idea.** Every term repeats with period $T$ because its frequency is an integer multiple of $\omega_0$.
+> **Key idea.** Every term repeats with period $T$ because its frequency is an integer multiple of $\omega_0$. Adding terms moves the ripple closer to the jump without shrinking it.[^7]
 
 ## Check yourself
 
@@ -100,6 +102,112 @@ It halves, since $\omega_0 = 2\pi / T$.
 
 </details>
 "#;
+
+/// The text sources' contents, served as their originals.
+const GIBBS_MD: &str = "# Gibbs overshoot\n\nNear a jump the partial sums overshoot by about 9% of the jump, \
+whatever the number of terms. More terms squeeze the ripple towards the jump; its height stays.\n";
+const PARTIAL_SUMS_PY: &str = "import numpy as np\n\n\ndef square_coefficients(n_max):\n    \
+\"\"\"b_n of a unit square wave: 4/(n*pi) for odd n, zero for even n.\"\"\"\n    \
+n = np.arange(1, n_max + 1)\n    return np.where(n % 2 == 1, 4 / (n * np.pi), 0.0)\n";
+
+/// Where the sample sources' media live (`examples/sample-media`, made by its
+/// `generate.swift`).
+pub fn sample_media_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/sample-media")
+}
+
+/// The sample file served as `/media/sources/{source_id}/{file}`.
+pub fn sample_media_file(source_id: &str, file: &str) -> Option<std::path::PathBuf> {
+    let name = match (source_id, file) {
+        ("s1", "original") => "oppenheim-ch3.pdf",
+        ("s1", "page-3.png") => "oppenheim-ch3-page-3.png",
+        ("s4", "original") => "square-wave.png",
+        ("s5", "original") => "lecture-12.m4a",
+        ("s6", "original") => "gibbs-demo.mp4",
+        ("s6", "frame-2200.jpg") => "gibbs-demo-frame-2200.jpg",
+        _ => return None,
+    };
+    Some(sample_media_dir().join(name))
+}
+
+/// A source's signed media URL as the fake hands it out: relative in the sample library,
+/// made absolute (`rebase_media`) when a fake service starts.
+fn media_url(source_id: &str, file: &str) -> String {
+    format!("/media/sources/{source_id}/{file}?exp=1&sig=x")
+}
+
+/// Make the library's relative media URLs (`/media/…`) absolute under `base`.
+pub fn rebase_media(library: &mut Library, base: impl Fn(&str) -> String) {
+    let fix = |url: &mut Option<String>| {
+        if let Some(u) = url.as_mut()
+            && u.starts_with("/media/")
+        {
+            *u = base(u);
+        }
+    };
+    for source in &mut library.sources {
+        fix(&mut source.media_url);
+    }
+    for lesson in &mut library.lessons {
+        for c in &mut lesson.citations {
+            fix(&mut c.image_url);
+        }
+    }
+}
+
+/// What "Why sums of sines?" cites: one passage of every kind of source.
+pub fn sample_citations() -> Vec<Citation> {
+    let cite = |n, source_id: &str, source_name: &str, kind| Citation {
+        n,
+        source_id: source_id.into(),
+        source_name: source_name.into(),
+        kind,
+        page: None,
+        start_ms: None,
+        end_ms: None,
+        excerpt: String::new(),
+        image_url: None,
+    };
+    vec![
+        Citation {
+            page: Some(3),
+            excerpt: "A periodic signal x(t) with fundamental period T can be represented as a linear combination of harmonically related complex exponentials, each with a frequency that is an integer multiple of the fundamental frequency ω₀ = 2π/T.".into(),
+            image_url: Some(media_url("s1", "page-3.png")),
+            ..cite(1, "s1", "Oppenheim ch3.pdf", SourceKind::Pdf)
+        },
+        Citation {
+            excerpt: PARTIAL_SUMS_PY.trim_end().into(),
+            ..cite(2, "s7", "partial_sums.py", SourceKind::Code)
+        },
+        Citation {
+            image_url: Some(media_url("s4", "original")),
+            ..cite(3, "s4", "square-wave.png", SourceKind::Image)
+        },
+        Citation {
+            start_ms: Some(2_200),
+            end_ms: Some(4_900),
+            excerpt: "With three terms the shape is already recognisable.".into(),
+            image_url: Some(media_url("s6", "frame-2200.jpg")),
+            ..cite(4, "s6", "gibbs-demo.mp4", SourceKind::Video)
+        },
+        Citation {
+            excerpt: "Near a jump the partial sums overshoot by about 9% of the jump, whatever the number of terms.".into(),
+            ..cite(5, "s2", "notes/gibbs.md", SourceKind::Text)
+        },
+        Citation {
+            start_ms: Some(3_725),
+            end_ms: Some(8_560),
+            excerpt: "Near a discontinuity, the partial sums overshoot by about nine percent of the jump.".into(),
+            ..cite(6, "s5", "lecture-12.m4a", SourceKind::Audio)
+        },
+        Citation {
+            start_ms: Some(8_960),
+            end_ms: Some(13_752),
+            excerpt: "Adding more terms squeezes the overshoot closer to the jump, but it never gets smaller.".into(),
+            ..cite(7, "s5", "lecture-12.m4a", SourceKind::Audio)
+        },
+    ]
+}
 
 pub fn sample_library() -> Library {
     let topic = |id: &str, parent: Option<&str>, title: &str, position| Topic {
@@ -132,14 +240,17 @@ pub fn sample_library() -> Library {
             topic("linalg", None, "Linear Algebra", 1),
         ],
         lessons: vec![
-            lesson(
-                "l1",
-                "fourier",
-                "Why sums of sines?",
-                0,
-                LessonStatus::Ready,
-                LESSON_ONE,
-            ),
+            Lesson {
+                citations: sample_citations(),
+                ..lesson(
+                    "l1",
+                    "fourier",
+                    "Why sums of sines?",
+                    0,
+                    LessonStatus::Ready,
+                    LESSON_ONE,
+                )
+            },
             lesson(
                 "l2",
                 "fourier",
@@ -204,7 +315,7 @@ pub fn sample_library() -> Library {
         }],
         sources: vec![
             Source {
-                media_url: None,
+                media_url: Some(media_url("s1", "original")),
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
                 name: "Oppenheim ch3.pdf".into(),
@@ -218,7 +329,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(30),
             },
             Source {
-                media_url: None,
+                media_url: Some(media_url("s2", "original")),
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
                 name: "notes/gibbs.md".into(),
@@ -243,6 +354,59 @@ pub fn sample_library() -> Library {
                     error: "The file isn't valid UTF-8 text.".into(),
                 },
                 created_at: ts(32),
+            },
+            Source {
+                media_url: Some(media_url("s7", "original")),
+                id: "s7".into(),
+                topic_id: Some("fourier".into()),
+                name: "partial_sums.py".into(),
+                folder: Some("fourier-notes".into()),
+                kind: SourceKind::Code,
+                bytes: PARTIAL_SUMS_PY.len() as u64,
+                status: SourceStatus::Ready {
+                    chunks: 1,
+                    pages: None,
+                },
+                created_at: ts(33),
+            },
+            Source {
+                media_url: Some(media_url("s4", "original")),
+                id: "s4".into(),
+                topic_id: Some("fourier".into()),
+                name: "square-wave.png".into(),
+                folder: None,
+                kind: SourceKind::Image,
+                bytes: 53_343,
+                status: SourceStatus::Ready {
+                    chunks: 1,
+                    pages: None,
+                },
+                created_at: ts(34),
+            },
+            Source {
+                media_url: Some(media_url("s5", "original")),
+                id: "s5".into(),
+                topic_id: Some("fourier".into()),
+                name: "lecture-12.m4a".into(),
+                folder: None,
+                kind: SourceKind::Audio,
+                bytes: 70_003,
+                status: SourceStatus::Ready {
+                    chunks: 4,
+                    pages: None,
+                },
+                created_at: ts(35),
+            },
+            Source {
+                media_url: Some(media_url("s6", "original")),
+                id: "s6".into(),
+                topic_id: Some("fourier".into()),
+                name: "gibbs-demo.mp4".into(),
+                folder: None,
+                kind: SourceKind::Video,
+                bytes: 127_994,
+                status: SourceStatus::Ready { chunks: 5, pages: None },
+                created_at: ts(36),
             },
         ],
     }
@@ -296,6 +460,7 @@ impl FakeState {
             embedding: EmbeddingModelState::NotDownloaded {
                 download_bytes: EMBEDDING_DOWNLOAD_BYTES,
             },
+            source_files: HashMap::new(),
         }
     }
 
@@ -327,6 +492,7 @@ impl FakeService {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         state.public_url = url.clone();
+        rebase_media(&mut state.library, |path| format!("{url}{path}"));
         let (events, _) = broadcast::channel(1024);
         let fake = Fake {
             state: Arc::new(Mutex::new(state)),
@@ -396,6 +562,7 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/embedding/download", post(download_embedding))
         .route("/api/events", get(events))
         .route("/media/videos/{id}/{file}", get(media))
+        .route("/media/sources/{id}/{file}", get(source_media))
         .with_state(fake)
 }
 
@@ -697,6 +864,7 @@ async fn regenerate(
         };
         lesson.status = LessonStatus::Queued;
         lesson.body_md.clear();
+        lesson.citations.clear();
         (lesson.clone(), simulate)
     };
     publish(
@@ -746,10 +914,16 @@ async fn simulate_lesson(fake: Fake, id: Id) {
     }
     let lesson = {
         let mut s = fake.state.lock().unwrap();
+        // The finished lesson carries what its markers cite, like the service's.
+        let mut citations = sample_citations();
+        for url in citations.iter_mut().filter_map(|c| c.image_url.as_mut()) {
+            *url = format!("{}{url}", s.public_url);
+        }
         let Some(l) = s.library.lessons.iter_mut().find(|l| l.id == id) else {
             return;
         };
         l.status = LessonStatus::Ready;
+        l.citations = citations;
         l.clone()
     };
     publish(&fake, Event::LessonChanged { lesson });
@@ -1382,9 +1556,10 @@ async fn upload_source(
         {
             return not_found();
         }
+        let id = s.id("source");
         let source = Source {
-            media_url: None,
-            id: s.id("source"),
+            media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
+            id,
             topic_id: query.topic_id,
             name: query.name,
             folder: query.folder,
@@ -1393,6 +1568,7 @@ async fn upload_source(
             status: SourceStatus::Queued,
             created_at: Utc::now(),
         };
+        s.source_files.insert(source.id.clone(), body.to_vec());
         s.library.sources.push(source.clone());
         let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
         (source, s.simulate && ready)
@@ -1631,9 +1807,185 @@ async fn media(State(fake): State<Fake>, Path((id, file)): Path<(String, String)
     }
 }
 
+/// A source's original or picture (`original`, `page-{n}.png`, `frame-{ms}.jpg`), with
+/// byte-range support so audio and video can seek. Like the service, the signature is
+/// required; unlike it, any signature passes.
+async fn source_media(
+    State(fake): State<Fake>,
+    Path((id, file)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if !query.contains_key("exp") || !query.contains_key("sig") {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "bad_signature",
+            "This link isn't valid.",
+        );
+    }
+    let (source, uploaded) = {
+        let s = fake.state.lock().unwrap();
+        (
+            s.library.sources.iter().find(|src| src.id == id).cloned(),
+            s.source_files.get(&id).cloned(),
+        )
+    };
+    let Some(source) = source else {
+        return not_found();
+    };
+    let bytes = if let Some(path) = sample_media_file(&id, &file) {
+        match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return not_found(),
+        }
+    } else if file == "original" {
+        match (id.as_str(), uploaded) {
+            ("s2", _) => GIBBS_MD.as_bytes().to_vec(),
+            ("s7", _) => PARTIAL_SUMS_PY.as_bytes().to_vec(),
+            (_, Some(bytes)) => bytes,
+            _ => return not_found(),
+        }
+    } else {
+        return not_found();
+    };
+    let mime = if file.ends_with(".png") {
+        "image/png"
+    } else if file.ends_with(".jpg") {
+        "image/jpeg"
+    } else {
+        media_type(&source.name)
+    };
+    ranged(&headers, mime, bytes)
+}
+
+/// The media type a source file is served with, from its name.
+fn media_type(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" | "heif" => "image/heic",
+        "tif" | "tiff" => "image/tiff",
+        "bmp" => "image/bmp",
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/mp4",
+        "wav" => "audio/wav",
+        "aif" | "aiff" => "audio/aiff",
+        "flac" => "audio/flac",
+        "caf" => "audio/x-caf",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+/// `bytes` as the whole body, or the part a `Range: bytes=a-b` header asks for (206).
+fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
+    let len = bytes.len();
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes="))
+        .and_then(|v| v.split_once('-'))
+        .and_then(|(a, b)| {
+            let (start, end) = match (a.trim(), b.trim()) {
+                ("", suffix) => {
+                    let n: usize = suffix.parse().ok()?;
+                    (len.checked_sub(n.min(len))?, len.checked_sub(1)?)
+                }
+                (a, "") => (a.parse().ok()?, len.checked_sub(1)?),
+                (a, b) => (
+                    a.parse().ok()?,
+                    b.parse::<usize>().ok()?.min(len.checked_sub(1)?),
+                ),
+            };
+            (start <= end && end < len).then_some((start, end))
+        });
+    match (headers.contains_key(header::RANGE), range) {
+        (_, Some((start, end))) => (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}")),
+            ],
+            bytes[start..=end].to_vec(),
+        )
+            .into_response(),
+        (true, None) => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+        )
+            .into_response(),
+        (false, None) => (
+            [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn serves_source_media_with_ranges() {
+        let service = FakeService::start().await;
+        let lib = service.state.lock().unwrap().library.clone();
+        let audio = lib.sources.iter().find(|s| s.id == "s5").unwrap();
+        let url = audio.media_url.clone().unwrap();
+        assert!(url.starts_with(&service.url), "{url}");
+        let page = lib.lessons[0].citations[0].image_url.clone().unwrap();
+        assert_eq!(
+            page,
+            format!("{}/media/sources/s1/page-3.png?exp=1&sig=x", service.url)
+        );
+
+        let client = reqwest::Client::new();
+        let whole = client.get(&url).send().await.unwrap();
+        assert_eq!(whole.status(), 200);
+        assert_eq!(whole.headers()["content-type"], "audio/mp4");
+        let len = whole.bytes().await.unwrap().len();
+        let part = client
+            .get(&url)
+            .header("Range", "bytes=10-19")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(part.status(), 206);
+        assert_eq!(
+            part.headers()["content-range"],
+            format!("bytes 10-19/{len}").as_str()
+        );
+        assert_eq!(part.bytes().await.unwrap().len(), 10);
+        let png = client.get(&page).send().await.unwrap();
+        assert_eq!(png.headers()["content-type"], "image/png");
+        let unsigned = client
+            .get(format!("{}/media/sources/s1/original", service.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), 403);
+        let text = client
+            .get(format!(
+                "{}/media/sources/s2/original?exp=1&sig=x",
+                service.url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(text.text().await.unwrap().contains("Gibbs overshoot"));
+    }
 
     #[test]
     fn poster_is_offered_only_when_the_media_dir_has_one() {

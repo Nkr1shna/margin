@@ -3,6 +3,7 @@
 mod api;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
+mod citations;
 mod commands;
 mod config;
 mod drafts;
@@ -307,6 +308,7 @@ fn App() -> Element {
             ask_prompt: Signal::new(String::new()),
             uploads: Signal::new(Vec::new()),
             settings_open: Signal::new(None),
+            source_viewer: Signal::new(None),
         }
     });
 

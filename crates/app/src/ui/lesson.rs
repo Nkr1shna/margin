@@ -11,10 +11,12 @@ use margin_shared::{
 use serde::Deserialize;
 
 use crate::api::ApiFailure;
+use crate::citations;
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
+use crate::ui::citations::{CitationList, SourceViewerDialog, open_viewer};
 use crate::ui::common::{
     ConfirmDialog, CrumbLink, DeleteNoteDialog, ErrorNotice, Icon, Loading, RegenerateLessonDialog,
     TopBar, ago, date, js, mark_quotes, quote_marks_json, render_math_in,
@@ -359,7 +361,16 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
             .map(|l| l.body_md.clone())
             .unwrap_or_default()
     });
-    let html = use_memo(move || markdown::render(&body.read()));
+    let cites_id = lesson_id.clone();
+    let cites = use_memo(move || {
+        app.lib
+            .read()
+            .lessons
+            .get(&cites_id)
+            .map(|l| citations::ordered(&l.citations))
+            .unwrap_or_default()
+    });
+    let html = use_memo(move || markdown::render_lesson(&body.read(), &cites.read()));
     let plain = use_memo(move || markdown::plain_text(&body.read()));
 
     // Put the rendered body into the page. Only changed blocks are replaced (and typeset
@@ -383,8 +394,24 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
             }
         }
     });
-    use_drop(|| {
-        let _ = js("MarginApp.stopSelection();");
+    // Citation markers are in the HTML the body is set to, so their clicks come from the
+    // page; each opens the source viewer.
+    let marker_lesson = lesson_id.clone();
+    use_future(move || {
+        let lesson_id = marker_lesson.clone();
+        async move {
+            let mut eval = js(
+                "MarginApp.watchCitations('lesson-body', function (n) { dioxus.send(n); });\nawait new Promise(function () {});",
+            );
+            while let Ok(n) = eval.recv::<u32>().await {
+                open_viewer(app, &lesson_id, n);
+            }
+        }
+    });
+    use_drop(move || {
+        let _ = js("MarginApp.stopSelection(); MarginApp.stopCitations();");
+        let mut viewer = app.source_viewer;
+        viewer.set(None);
     });
     // Mark each margin note's passage in the text; a tap on one shows its note.
     let marks_id = lesson_id.clone();
@@ -424,6 +451,12 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     // The margin column only takes space once the lesson has notes or one is being
     // written; until then the lesson is centered and a selection gets a small button.
     let show_margins = !notes.is_empty() || quote_open.is_some();
+    let viewing = app
+        .source_viewer
+        .read()
+        .as_ref()
+        .filter(|v| v.lesson_id == lid)
+        .map(|v| v.n);
     let pill = if show_margins { None } else { sel.clone() };
 
     rsx! {
@@ -472,6 +505,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                 if status == LessonStatus::Generating {
                     div { class: "generating", role: "status", span { class: "dot run" } "Writing…" }
                 }
+                CitationList { lesson_id: lid.clone(), citations: cites.read().clone() }
                 if let Some((next_id, next_title)) = next {
                     div { class: "next",
                         div { small { "Next lesson" } "{next_title}" }
@@ -525,6 +559,9 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                 }
             }
             }
+        }
+        if let Some(n) = viewing {
+            SourceViewerDialog { lesson_id: lid.clone(), n }
         }
     }
 }
