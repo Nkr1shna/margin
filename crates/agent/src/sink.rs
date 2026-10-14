@@ -68,8 +68,10 @@ pub trait TurnSink: Send + Sync {
     ) -> BoxFuture<'a, Result<Decision, SinkError>>;
 
     /// The loop is about to sleep until `until` before retrying a model call (`reason`
-    /// says why, for the chat): the service sets `Chat.waiting` and emits
-    /// `Event::ChatChanged`. Called before every retry sleep.
+    /// says why, for the chat, e.g. "The model API asked Margin to slow down."): the
+    /// service sets `Chat.waiting` and emits `Event::ChatChanged`. Called before every
+    /// retry sleep, including a `Retry-After` far beyond `RETRY_MAX_DELAY` (honoured as
+    /// asked). An error ends the turn like any storage failure.
     fn retrying<'a>(
         &'a self,
         until: DateTime<Utc>,
