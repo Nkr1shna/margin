@@ -8,6 +8,10 @@ publish.workspace = true
 name = "margin-service"
 path = "src/main.rs"
 
+[lib]
+name = "margin_service"
+path = "src/lib.rs"
+
 [dependencies]
 margin-shared.workspace = true
 margin-ai.workspace = true
@@ -17,3 +21,23 @@ serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["form", "query"] }
+futures-util.workspace = true
+axum = { version = "=0.8.9", features = ["ws"] }
+surrealdb = { version = "=3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
+keyring = "=4.2.0"
+tower-http = { version = "=0.7.1", features = ["fs"] }
+tower = { version = "=0.5.3", features = ["util"] }
+hmac = "=0.13.0"
+sha2 = "=0.11.1"
+rand = "=0.10.3"
+toml = "=1.1.8"
+base64 = "=0.23.1"
+hex = "=0.4.3"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-tungstenite = "=0.30.0"
