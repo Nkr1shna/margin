@@ -35,6 +35,8 @@ pub struct Extra {
     pub folder_sync: BTreeMap<Id, SyncState>,
     pub ask_workspaces: Vec<Id>,
     pub shown_passage: Option<Citation>,
+    /// Signed out at this configured service URL: the sign-in screen renders instead.
+    pub connect: Option<Option<String>>,
 }
 
 #[allow(non_snake_case)]
@@ -44,15 +46,17 @@ fn Harness(props: HarnessProps) -> Element {
     let lib = props.lib.clone();
     let settings = props.settings;
     let extra = props.extra.clone();
+    let connect = extra.connect.clone();
+    let signed_in = connect.is_none();
     use_context_provider(move || AppCtx {
         config: Signal::new(LocalConfig {
-            service_url: Some("https://margin.example".into()),
+            service_url: connect.unwrap_or(Some("https://margin.example".into())),
             appearance: Appearance::System,
             sidebar_hidden: false,
             sidebar_width: None,
             zoom: 100,
         }),
-        session: Signal::new(Some(Session {
+        session: Signal::new(signed_in.then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
             me: Some(Me {
                 github_login: "Nkr1shna".into(),
@@ -88,6 +92,9 @@ fn Harness(props: HarnessProps) -> Element {
         folder_sync: Signal::new(extra.folder_sync),
         ask_workspaces: Signal::new(extra.ask_workspaces),
     });
+    if !signed_in {
+        return rsx! { crate::ui::signin::ConnectScreen {} };
+    }
     rsx! { Router::<Route> {} }
 }
 
@@ -119,4 +126,17 @@ pub fn render_with(
     );
     dom.rebuild_in_place();
     dioxus_ssr::render(&dom)
+}
+
+/// The sign-in screen's HTML for a device whose saved service URL is `service_url`.
+pub fn render_connect(service_url: Option<&str>) -> String {
+    render_with(
+        "/",
+        LibraryState::default(),
+        None,
+        Extra {
+            connect: Some(service_url.map(String::from)),
+            ..Extra::default()
+        },
+    )
 }

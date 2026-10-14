@@ -1,0 +1,142 @@
+# Shared by deploy/scripts/*.sh (sourced, never run). docs/plan-deploy.md §1, §5.
+#
+# Every guest keeps everything that must outlive the VM in ONE folder on the Mac mini,
+# shared into the guest by Orchard (`hostDirs`, i.e. `tart run --dir`). Orchard clones
+# the VM again from its image on every restart and every reschedule, so the guest's own
+# disk is scratch; this folder is not.
+#
+#   host:  $MARGIN_VMS_DIR/margin-<env>          (default ~/MarginVMs/margin-<env>)
+#   guest: /Volumes/My Shared Files/margin       (macOS automount of the share "margin")
+#
+# Inside it: .margin-persistent (marker, holds "margin-<env>"), service.toml, data/,
+# backups/, bin/ (margin-service, these scripts), cloudflared/. Logs stay on the guest
+# disk (~/Library/Logs/Margin), so launchd can open them before the share mounts.
+
+# Not `set -u` safe to source twice; scripts set their own options.
+
+MARGIN_SERVICE_LABEL="com.krishnanelloore.margin.service"
+MARGIN_BACKUP_LABEL="com.krishnanelloore.margin.backup"
+MARGIN_PERSIST_GUEST="${MARGIN_PERSIST_GUEST:-/Volumes/My Shared Files/margin}"
+MARGIN_VMS_DIR="${MARGIN_VMS_DIR:-$HOME/MarginVMs}"
+MARGIN_DEPLOY_KEY="${MARGIN_DEPLOY_KEY:-$HOME/.ssh/margin_deploy}"
+MARGIN_KNOWN_HOSTS="${MARGIN_KNOWN_HOSTS:-$HOME/.ssh/margin_known_hosts}"
+MARGIN_GUEST_USER="${MARGIN_GUEST_USER:-admin}"
+MARGIN_MARKER=".margin-persistent"
+
+die() {
+  echo "$(basename "$0"): $*" >&2
+  exit 1
+}
+
+# dev|prod -> the VM's name.
+vm_name() {
+  case "$1" in
+    dev) echo margin-dev ;;
+    prod) echo margin-prod ;;
+    *) die "the environment is dev or prod, not \"$1\"" ;;
+  esac
+}
+
+# dev|prod -> the public URL its tunnel serves.
+public_url() {
+  case "$1" in
+    dev) echo https://devmargin.krishnanelloore.com ;;
+    prod) echo https://margin.krishnanelloore.com ;;
+    *) die "the environment is dev or prod, not \"$1\"" ;;
+  esac
+}
+
+# The guest's mDNS name (its DHCP address changes; the name doesn't).
+guest_host() {
+  echo "$(vm_name "$1").local"
+}
+
+# The persistent folder of an environment on the host.
+host_persist_dir() {
+  echo "$MARGIN_VMS_DIR/$(vm_name "$1")"
+}
+
+# CI runs one environment per job: MARGIN_DEPLOY_ONLY=dev in deploy-dev.yml means this
+# process may never reach prod, whatever its arguments say.
+check_allowed_env() {
+  if [ -n "${MARGIN_DEPLOY_ONLY:-}" ] && [ "$MARGIN_DEPLOY_ONLY" != "$1" ]; then
+    die "this job may only reach $MARGIN_DEPLOY_ONLY, not $1 (MARGIN_DEPLOY_ONLY)"
+  fi
+}
+
+# ssh to the environment's guest with the deploy key and its own known_hosts.
+# A changed host key means Orchard recreated the VM: provision-guest.sh --rekey.
+guest_ssh() {
+  env_name="$1"
+  shift
+  [ -r "$MARGIN_DEPLOY_KEY" ] || die "no deploy key at $MARGIN_DEPLOY_KEY"
+  ssh -i "$MARGIN_DEPLOY_KEY" \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$MARGIN_KNOWN_HOSTS" \
+    "$MARGIN_GUEST_USER@$(guest_host "$env_name")" "$@"
+}
+
+# Copies a host file to a path in the guest (paths may contain spaces, never quotes).
+guest_put() {
+  env_name="$1"
+  src="$2"
+  dest="$3"
+  guest_ssh "$env_name" "cat > '$dest.part' && mv -f '$dest.part' '$dest'" < "$src"
+}
+
+# A top-level `key = "value"` of a TOML file.
+toml_value() {
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*\$/\1/p" "$1" | head -n 1
+}
+
+# One field of a flat JSON object on stdin (macOS plutil reads JSON).
+json_field() {
+  plutil -extract "$1" raw -o - - 2>/dev/null
+}
+
+# Which service manager this machine has. Linux guests (docs/plan-linux-service.md)
+# would use systemd; that path isn't built.
+service_manager() {
+  case "$(uname -s)" in
+    Darwin) echo launchd ;;
+    Linux) echo systemd ;;
+    *) echo unknown ;;
+  esac
+}
+
+require_launchd() {
+  if [ "$(service_manager)" != launchd ]; then
+    die "this guest is $(uname -s): only macOS guests (launchd) are supported; Linux service guests are docs/plan-linux-service.md"
+  fi
+}
+
+# In the guest: the folder is the share, mounted, and belongs to this environment.
+# Refuses a folder on the guest's own disk, which Orchard throws away.
+check_persistent_mount() {
+  env_name="$1"
+  dir="$MARGIN_PERSIST_GUEST"
+  [ -d "$dir" ] || die "$dir isn't there: is the host folder shared into this VM (Orchard hostDirs \"margin:$(host_persist_dir "$env_name")\")?"
+  [ -f "$dir/$MARGIN_MARKER" ] || die "$dir has no $MARGIN_MARKER: it isn't the persistent share (run provision-guest.sh $env_name on the host)"
+  want="$(vm_name "$env_name")"
+  got="$(cat "$dir/$MARGIN_MARKER")"
+  [ "$got" = "$want" ] || die "$dir belongs to $got, not $want: the wrong host folder is shared into this VM"
+  # A share is another file system than the guest's root disk.
+  if [ "$(stat -f %d "$dir")" = "$(stat -f %d /)" ]; then
+    die "$dir is on the guest's own disk, which Orchard recreates: refusing"
+  fi
+}
+
+# In the guest: the service config lives on the share, names this environment and keeps
+# its data_dir (and so backups/) on the share.
+check_config() {
+  env_name="$1"
+  config="$MARGIN_PERSIST_GUEST/service.toml"
+  [ -f "$config" ] || die "no $config yet: run \`margin-service setup\` in the VM's window (MARGIN_CONFIG=\"$config\")"
+  got_env="$(toml_value "$config" environment)"
+  [ "${got_env:-prod}" = "$env_name" ] || die "$config says environment \"${got_env:-prod}\", not \"$env_name\""
+  data_dir="$(toml_value "$config" data_dir)"
+  case "$data_dir" in
+    "$MARGIN_PERSIST_GUEST"/*) ;;
+    *) die "data_dir \"$data_dir\" in $config isn't on the persistent share $MARGIN_PERSIST_GUEST: refusing (it would be wiped when Orchard recreates the VM)" ;;
+  esac
+}

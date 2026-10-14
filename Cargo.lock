@@ -5414,6 +5414,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "keyring",
+ "libc",
  "margin-agent",
  "margin-ai",
  "margin-embed",

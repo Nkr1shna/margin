@@ -46,9 +46,6 @@ pub struct RunnerConfig {
     pub models: RunnerModels,
     /// The context window the lesson budget is a share of, for the writing model.
     pub window_tokens: usize,
-    /// The service the traces are read from.
-    #[serde(default)]
-    pub service_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

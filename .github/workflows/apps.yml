@@ -1,0 +1,86 @@
+# Builds the apps per environment (docs/plan-deploy.md §4, §8): a fresh install starts
+# on the service named by MARGIN_DEFAULT_SERVICE_URL at build time; the sign-in screen
+# still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled Margin.app, signed
+# ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer account, owner
+# question 7). Android: the APK.
+name: apps
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Which service a fresh install starts on"
+        required: true
+        default: prod
+        type: choice
+        options: [prod, dev, both]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    outputs:
+      environments: ${{ steps.pick.outputs.environments }}
+    steps:
+      - id: pick
+        env:
+          CHOICE: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'both' }}
+        run: |
+          case "$CHOICE" in
+            prod) echo 'environments=["prod"]' >> "$GITHUB_OUTPUT" ;;
+            dev) echo 'environments=["dev"]' >> "$GITHUB_OUTPUT" ;;
+            both) echo 'environments=["prod","dev"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unknown environment $CHOICE"; exit 1 ;;
+          esac
+
+  apps:
+    needs: plan
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    timeout-minutes: 120
+    strategy:
+      # One runner: build the environments one after the other.
+      max-parallel: 1
+      matrix:
+        environment: ${{ fromJSON(needs.plan.outputs.environments) }}
+    env:
+      CARGO_TERM_COLOR: always
+      MARGIN_DEFAULT_SERVICE_URL: ${{ matrix.environment == 'dev' && 'https://devmargin.krishnanelloore.com' || 'https://margin.krishnanelloore.com' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Put Rust, dx and Homebrew on PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+      # dx runs from the workspace root with -p margin-app (from the crate it panics).
+      # The icon is only in `dx bundle` output.
+      - name: Desktop bundle
+        run: |
+          dx --version
+          dx bundle -p margin-app --platform desktop --package-types macos --release
+          app="target/dx/margin-app/bundle/macos/macos/Margin.app"
+          [ -d "$app" ] || { echo "::error::no $app"; exit 1; }
+          codesign --force --deep --sign - "$app"
+          mkdir -p dist
+          hdiutil create -volname "Margin" -srcfolder "$app" -ov -format UDZO \
+            "dist/Margin-${{ matrix.environment }}-${GITHUB_SHA::12}.dmg"
+      - name: Android build
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
+          export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+          dx build -p margin-app --platform android --release
+          apk="$(find target/dx/margin-app -name '*.apk' -newer Cargo.toml | head -n 1)"
+          [ -n "$apk" ] || { echo "::error::dx built no APK"; exit 1; }
+          cp "$apk" "dist/Margin-${{ matrix.environment }}-${GITHUB_SHA::12}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: margin-apps-${{ matrix.environment }}-${{ github.sha }}
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error

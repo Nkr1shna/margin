@@ -1,0 +1,17 @@
+# cloudflared in a dev or prod VM (docs/plan-deploy.md §2). A template: provision-guest.sh
+# fills <HOST>, <UUID> and <CREDS_DIR> and writes it to the persistent share
+# (<CREDS_DIR>/config.yml; ~/.cloudflared is a link to <CREDS_DIR>, so the tunnel's
+# credentials and cert.pem survive Orchard recreating the VM).
+#
+#   dev:  tunnel margin-dev,  <HOST> devmargin.krishnanelloore.com
+#   prod: tunnel margin-prod, <HOST> margin.krishnanelloore.com
+#
+# Single-level subdomains, so Cloudflare's free universal certificate covers them.
+# Later, LiveKit signalling: livedevmargin. / livemargin. as another ingress rule.
+tunnel: <UUID>
+credentials-file: <CREDS_DIR>/<UUID>.json
+
+ingress:
+  - hostname: <HOST>
+    service: http://127.0.0.1:8787
+  - service: http_status:404

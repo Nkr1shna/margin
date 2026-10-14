@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use margin_evals::cli::{Command, Suite, USAGE, parse};
+use margin_evals::cli::{Command, Suite, USAGE, check_service, parse};
 use margin_evals::corpus::{EXTRACTED_FILE, Extraction, documents};
 use margin_evals::gates::{BASELINE_FILE, Baseline};
 use margin_evals::golden::evals_dir;
@@ -36,6 +36,11 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
     }
     if cli.command.is_live() {
         live::guard_env()?;
+    }
+    // run, export and report --service read the service: dev only (docs/plan-deploy.md §5).
+    if let Some(url) = &cli.service_url {
+        let v = check_service(&reqwest::Client::new(), url).await?;
+        eprintln!("service {url}: {} {} ({})", v.environment, v.version, v.sha);
     }
     let evals = cli.evals.clone().unwrap_or_else(evals_dir);
     let paths = Paths::same(&evals);
@@ -75,9 +80,11 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             );
         }
         Command::Export { filter, out } => {
-            let cfg = live::RunnerConfig::load(&evals.join("runner.toml"))?;
-            let url = cfg.service_url.context("runner.toml has no service_url")?;
-            let rows = traces::fetch(&reqwest::Client::new(), &url, &token()?, filter).await?;
+            let url = cli
+                .service_url
+                .as_deref()
+                .context("export needs --service-url")?;
+            let rows = traces::fetch(&reqwest::Client::new(), url, &token()?, filter).await?;
             traces::write_jsonl(out, &rows)?;
             println!("{} trace rows → {}", rows.len(), out.display());
         }
@@ -90,12 +97,14 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let rows = match (file, service) {
                 (Some(f), _) => Some(traces::read_file(f, &TraceFilter::default())?),
                 (None, true) => {
-                    let cfg = live::RunnerConfig::load(&evals.join("runner.toml"))?;
-                    let url = cfg.service_url.context("runner.toml has no service_url")?;
+                    let url = cli
+                        .service_url
+                        .as_deref()
+                        .context("report --service needs --service-url")?;
                     Some(
                         traces::fetch(
                             &reqwest::Client::new(),
-                            &url,
+                            url,
                             &token()?,
                             &TraceFilter::default(),
                         )

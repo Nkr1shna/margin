@@ -72,6 +72,9 @@
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
 pub const HEALTH: &str = "/health";
+/// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes }`,
+/// without a token like `/health` (`docs/plan-deploy.md` §8).
+pub const VERSION: &str = "/api/version";
 pub const AUTH_START: &str = "/auth/start";
 pub const AUTH_POLL: &str = "/auth/poll";
 pub const AUTH_GITHUB_CALLBACK: &str = "/auth/github/callback";

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  margin-service in a dev or prod VM (docs/plan-deploy.md). A template:
+  provision-guest.sh fills __PERSIST__ (the persistent share, e.g.
+  /Volumes/My Shared Files/margin) and __HOME__, and installs it as
+  ~/Library/LaunchAgents/com.krishnanelloore.margin.service.plist.
+  A LaunchAgent, not a daemon: the service needs the login Keychain.
+  It waits for the share's marker before starting, so the service never starts on
+  the guest's own (throwaway) disk while the share is still mounting.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.krishnanelloore.margin.service</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>i=0; until [ -f "$MARGIN_PERSIST/.margin-persistent" ]; do i=$((i+1)); [ $i -le 120 ] || { echo "margin: the persistent share $MARGIN_PERSIST isn't mounted" >&amp;2; exit 1; }; sleep 1; done; exec "$MARGIN_PERSIST/bin/margin-service" serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MARGIN_PERSIST</key>
+    <string>__PERSIST__</string>
+    <key>MARGIN_CONFIG</key>
+    <string>__PERSIST__/service.toml</string>
+    <!-- So the video pipeline finds manimgx and fluidaudiocli. -->
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Margin/service.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Margin/service.log</string>
+</dict>
+</plist>

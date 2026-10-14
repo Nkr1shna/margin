@@ -1,0 +1,81 @@
+# Installs a build-service artifact in the dev VM (docs/plan-deploy.md §4).
+# Only ever reaches margin-dev: MARGIN_DEPLOY_ONLY=dev makes deploy.sh refuse anything
+# else. The binary it installed is uploaded again as `deployed-dev-<sha>`, which is what
+# promote-prod.yml installs in prod (the same bytes that ran on dev).
+name: deploy-dev
+
+on:
+  workflow_run:
+    workflows: [build-service]
+    types: [completed]
+    branches: [claude/agent-build]
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "build-service run id whose artifact to deploy"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A successful build of a push or dispatch in this repository, never a fork's.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       contains(fromJSON('["push","workflow_dispatch"]'), github.event.workflow_run.event))
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    environment:
+      name: dev
+      url: https://devmargin.krishnanelloore.com
+    timeout-minutes: 30
+    env:
+      MARGIN_DEPLOY_ONLY: dev
+      BUILD_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.build_run_id || github.event.workflow_run.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the build run
+        id: build
+        run: |
+          case "$BUILD_RUN_ID" in *[!0-9]*|"") echo "::error::not a run id: $BUILD_RUN_ID"; exit 1 ;; esac
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")"
+          path="$(printf '%s' "$run" | jq -r .path)"
+          conclusion="$(printf '%s' "$run" | jq -r .conclusion)"
+          sha="$(printf '%s' "$run" | jq -r .head_sha)"
+          if [ "$path" != ".github/workflows/build-service.yml" ] || [ "$conclusion" != success ]; then
+            echo "::error::run $BUILD_RUN_ID is $path ($conclusion), not a successful build-service run"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      # The deploy scripts of the commit being deployed.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.build.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: margin-service-${{ steps.build.outputs.sha }}
+          path: dist
+          run-id: ${{ env.BUILD_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Deploy to dev
+        env:
+          SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          [ "$(cat dist/BUILD_SHA)" = "$SHA" ] || { echo "::error::the artifact is stamped $(cat dist/BUILD_SHA), not $SHA"; exit 1; }
+          chmod +x dist/margin-service
+          deploy/scripts/deploy.sh dev dist/margin-service "$SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployed-dev-${{ steps.build.outputs.sha }}
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error

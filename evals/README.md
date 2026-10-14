@@ -30,7 +30,7 @@ Two ways they run:
 | `golden/courses.jsonl`, `golden/agent.jsonl` | Course requests (prompt, documents, outline themes, must-cite documents per lesson) and chat questions for the agent suite (one has no answer in the corpus). |
 | `variants/*.toml` | Pipeline configurations, the same shape as `Settings.pipeline`. `baseline` is the shipped default. |
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
-| `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window, service URL. |
+| `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window. The service is `--service-url` (dev; prod is refused). |
 | `recorded/extracted.json` | What PDFKit/Vision read from each PDF and image (CI replays it; another macOS can't reproduce OCR byte for byte). |
 | `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |

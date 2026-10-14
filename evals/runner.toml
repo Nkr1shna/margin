@@ -9,8 +9,8 @@ anthropic_base_url = "https://api.anthropic.com"
 # The writing model's context window, which the lesson budget (share_of_window) is a
 # share of.
 window_tokens = 200000
-# Where `export` and `report --traces` read the service's trace rows from.
-service_url = "http://127.0.0.1:8787"
+# The service is not here: `run`, `export` and `report --service` take --service-url
+# (the dev service; margin-eval refuses prod, docs/plan-deploy.md §5).
 
 [models]
 # Chats (the agent suite runs Margin's agent loop on the Responses API).

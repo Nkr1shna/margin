@@ -8,6 +8,14 @@ Cloudflare and forwards requests to it.
 Steps marked **[your GitHub account]** or **[your Cloudflare account]** have to be
 done by you, signed in to that account. Everything else is a command on the Mac.
 
+**Dev and prod VMs on the Mac mini** follow the same steps, automated and with two
+differences: everything durable (`service.toml`, `data/`, backups, the tunnel's
+credentials, the binary) lives on a host folder shared into the VM, because Orchard
+re-clones a VM's disk whenever it restarts it; and `service.toml` names its
+`environment` (`dev` or `prod`), which `margin-service setup` asks first. See
+`docs/plan-deploy.md` (§5 for what persists, §7 for the runbook) and `deploy/`. A config
+written before that has no `environment` and counts as `prod`.
+
 ---
 
 ## 1. Build and install the binary

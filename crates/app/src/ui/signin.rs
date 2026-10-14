@@ -9,7 +9,7 @@ use dioxus::prelude::*;
 use margin_shared::{LoginState, StartLogin};
 
 use crate::api::Api;
-use crate::config::normalize_service_url;
+use crate::config::{PRESETS, normalize_service_url, preset_for};
 use crate::secrets;
 use crate::state::{Session, use_app};
 use crate::ui::common::{BrandMark, DragRegion, Icon, focus_first, open_external};
@@ -52,6 +52,17 @@ fn device_name() -> String {
 pub fn ConnectScreen() -> Element {
     let mut app = use_app();
     let mut url = use_signal(|| app.service_url());
+    // Which service: one of `PRESETS`, or `None` for an address typed in (Custom).
+    let mut preset = use_signal(|| preset_for(&url.peek()));
+    // The last address typed for Custom, restored when Custom is picked again.
+    let mut custom_url = use_signal(|| {
+        let u = url.peek().clone();
+        if preset_for(&u).is_some() {
+            String::new()
+        } else {
+            u
+        }
+    });
     // Bumped when the address is rewritten by code (normalized), to remount the field.
     let mut url_rev = use_signal(|| 0u64);
     let mut phase = use_signal(|| Phase::Idle);
@@ -76,6 +87,9 @@ pub fn ConnectScreen() -> Element {
         if *url.peek() != base {
             url.set(base.clone());
             url_rev += 1;
+        }
+        if preset.peek().is_none() {
+            custom_url.set(base.clone());
         }
         app.signed_out_reason.set(None);
         let handle = spawn(async move {
@@ -132,6 +146,22 @@ pub fn ConnectScreen() -> Element {
     );
     let reason = app.signed_out_reason.read().clone();
     let url_invalid = url_error.read().is_some();
+    let chosen = *preset.read();
+    let mut choose = move |choice: Option<usize>| {
+        if *preset.peek() == choice {
+            return;
+        }
+        preset.set(choice);
+        url_error.set(None);
+        match choice {
+            Some(i) => url.set(PRESETS[i].1.to_string()),
+            None => {
+                url.set(custom_url.peek().clone());
+                url_rev += 1;
+                focus_first("#service-url");
+            }
+        }
+    };
 
     rsx! {
         div { class: "connect",
@@ -142,7 +172,7 @@ pub fn ConnectScreen() -> Element {
                     "Margin"
                 }
                 h1 { "Connect to your Margin service" }
-                p { "Margin keeps your library on your own Mac. Enter the service's address, then sign in with GitHub to give this device its own key." }
+                p { "Margin keeps your library on your own Mac. Pick your Margin service, or enter its address, then sign in with GitHub to give this device its own key." }
                 if let Some(reason) = reason {
                     div { class: "notice", role: "status",
                         Icon { name: "alert" }
@@ -157,6 +187,34 @@ pub fn ConnectScreen() -> Element {
                             start();
                         }
                     },
+                    span { class: "label", id: "service-choice-label", "Service" }
+                    div { class: "seg", role: "radiogroup", "aria-labelledby": "service-choice-label",
+                        for (i, (name, _)) in PRESETS.iter().enumerate() {
+                            button {
+                                key: "{name}",
+                                r#type: "button",
+                                role: "radio",
+                                disabled: busy,
+                                "aria-checked": (chosen == Some(i)).to_string(),
+                                // One tab stop; the arrow keys move between options (margin.js).
+                                tabindex: if chosen == Some(i) { "0" } else { "-1" },
+                                onclick: move |_| choose(Some(i)),
+                                "{name}"
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            role: "radio",
+                            disabled: busy,
+                            "aria-checked": chosen.is_none().to_string(),
+                            tabindex: if chosen.is_none() { "0" } else { "-1" },
+                            onclick: move |_| choose(None),
+                            "Custom"
+                        }
+                    }
+                    if let Some(i) = chosen {
+                        span { class: "faint", style: "font-size: 13px", "{PRESETS[i].1}" }
+                    } else {
                     label { r#for: "service-url", "Service address" }
                     for rev in std::iter::once(url_rev()) {
                     input {
@@ -175,12 +233,14 @@ pub fn ConnectScreen() -> Element {
                         placeholder: "e.g. margin.example.com",
                         oninput: move |e| {
                             url_error.set(None);
+                            custom_url.set(e.value());
                             url.set(e.value());
                         },
                     }
                     }
                     if let Some(err) = url_error.read().clone() {
                         span { id: "service-url-err", class: "field-error", role: "alert", "{err}" }
+                    }
                     }
                 }
                 match current {
@@ -297,5 +357,45 @@ fn set_poll_error(phase: &mut Signal<Phase>, error: Option<String>) {
         if let Phase::Waiting { poll_error, .. } = &mut *p {
             *poll_error = error;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::test_render::render_connect;
+
+    #[test]
+    fn a_preset_address_selects_its_preset() {
+        let html = render_connect(Some("https://devmargin.krishnanelloore.com"));
+        assert!(html.contains(r#"role="radiogroup""#), "{html}");
+        assert!(
+            html.contains(r#"aria-checked="true" tabindex="0">Dev</button>"#),
+            "{html}"
+        );
+        assert!(html.contains(">https://devmargin.krishnanelloore.com</span>"));
+        // The address field is only for Custom.
+        assert!(!html.contains(r#"id="service-url""#));
+    }
+
+    #[test]
+    fn a_fresh_install_starts_on_the_default_service() {
+        let html = render_connect(None);
+        if option_env!("MARGIN_DEFAULT_SERVICE_URL").is_none() {
+            assert!(
+                html.contains(r#"aria-checked="true" tabindex="0">Prod</button>"#),
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_address_is_custom_with_the_field() {
+        let html = render_connect(Some("http://127.0.0.1:8787"));
+        assert!(
+            html.contains(r#"aria-checked="true" tabindex="0">Custom</button>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"id="service-url""#));
+        assert!(html.contains("http://127.0.0.1:8787"));
     }
 }

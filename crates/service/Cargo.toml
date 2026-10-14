@@ -46,3 +46,7 @@ ulid = "=1.2.1"
 
 [dev-dependencies]
 tokio-tungstenite = "=0.30.0"
+
+# proc_pidinfo and hw.memsize for GET /api/version (version.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.190"

@@ -13,6 +13,10 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_ALLOWED_LOGIN: &str = "Nkr1shna";
 pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 pub const DEFAULT_GITHUB_OAUTH_URL: &str = "https://github.com";
+/// What a config without `environment` is (the owner's own Mac, set up before deploys).
+pub const DEFAULT_ENVIRONMENT: &str = "prod";
+/// The deploy environments (`docs/plan-deploy.md` §1); `GET /api/version` reports it.
+pub const ENVIRONMENTS: [&str; 2] = ["dev", "prod"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -31,6 +35,10 @@ pub struct Config {
     pub github_api_url: String,
     #[serde(default = "default_github_oauth_url")]
     pub github_oauth_url: String,
+    /// `"dev"` or `"prod"`: which deploy this service is (`docs/plan-deploy.md`).
+    /// `deploy.sh` and `margin-eval` check it through `GET /api/version`.
+    #[serde(default = "default_environment")]
+    pub environment: String,
 }
 
 fn default_public_url() -> String {
@@ -47,6 +55,9 @@ fn default_github_api_url() -> String {
 }
 fn default_github_oauth_url() -> String {
     DEFAULT_GITHUB_OAUTH_URL.into()
+}
+fn default_environment() -> String {
+    DEFAULT_ENVIRONMENT.into()
 }
 fn default_data_dir() -> PathBuf {
     app_support_dir().join("data")
@@ -80,6 +91,7 @@ impl Default for Config {
             allowed_github_login: default_allowed_login(),
             github_api_url: default_github_api_url(),
             github_oauth_url: default_github_oauth_url(),
+            environment: default_environment(),
         }
     }
 }
@@ -120,6 +132,7 @@ impl Config {
         }
         self.github_client_id = self.github_client_id.trim().to_string();
         self.allowed_github_login = self.allowed_github_login.trim().to_string();
+        self.environment = self.environment.trim().to_ascii_lowercase();
     }
 
     pub fn validate_for_serving(&self) -> anyhow::Result<()> {
@@ -128,6 +141,12 @@ impl Config {
         }
         if self.allowed_github_login.is_empty() {
             bail!("allowed_github_login is empty — run `margin-service setup`");
+        }
+        if !ENVIRONMENTS.contains(&self.environment.as_str()) {
+            bail!(
+                "environment is \"{}\"; it must be \"dev\" or \"prod\" (run `margin-service setup`)",
+                self.environment
+            );
         }
         for (name, url) in [
             ("public_url", &self.public_url),
@@ -165,8 +184,8 @@ impl Config {
     }
 }
 
-/// `margin-service setup`: asks for the public URL, the GitHub OAuth app's client id and
-/// secret, and the allowed GitHub login; stores the secret in the Keychain and writes
+/// `margin-service setup`: asks for the environment (dev or prod), the public URL, the
+/// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret in the Keychain and writes
 /// the config file.
 pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
     let existing = if path.exists() {
@@ -181,6 +200,7 @@ pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
     println!("Margin service setup — writes {}", path.display());
     println!("Press Return to keep the value in [brackets].\n");
 
+    config.environment = ask_environment(&mut input, &config.environment)?;
     config.public_url = ask(&mut input, "Public URL", &config.public_url)?;
     loop {
         config.github_client_id = ask(
@@ -230,6 +250,19 @@ pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
         config.bind
     );
     Ok(())
+}
+
+/// Asks until the answer is `dev` or `prod` (any case); Return keeps `current`.
+fn ask_environment(input: &mut impl BufRead, current: &str) -> anyhow::Result<String> {
+    loop {
+        let answer = ask(input, "Environment (dev or prod)", current)?
+            .trim()
+            .to_ascii_lowercase();
+        if ENVIRONMENTS.contains(&answer.as_str()) {
+            return Ok(answer);
+        }
+        println!("  Type dev or prod.");
+    }
 }
 
 fn ask(input: &mut impl BufRead, label: &str, current: &str) -> anyhow::Result<String> {
@@ -296,7 +329,29 @@ mod tests {
         assert_eq!(c.bind, DEFAULT_BIND);
         assert_eq!(c.allowed_github_login, "Nkr1shna");
         assert_eq!(c.github_oauth_url, "https://github.com");
+        // A config from before deploys is the owner's own instance: prod.
+        assert_eq!(c.environment, "prod");
         c.validate_for_serving().unwrap();
+    }
+
+    #[test]
+    fn environment_is_dev_or_prod() {
+        let mut c: Config =
+            toml::from_str("github_client_id = \"abc\"\nenvironment = \" Dev \"\n").unwrap();
+        c.normalize();
+        assert_eq!(c.environment, "dev");
+        c.validate_for_serving().unwrap();
+        c.environment = "staging".into();
+        let err = c.validate_for_serving().unwrap_err().to_string();
+        assert!(err.contains("\"dev\" or \"prod\""), "{err}");
+    }
+
+    #[test]
+    fn setup_asks_until_the_environment_is_known() {
+        let mut input = std::io::Cursor::new(b"staging\nDEV\n".to_vec());
+        assert_eq!(ask_environment(&mut input, "prod").unwrap(), "dev");
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        assert_eq!(ask_environment(&mut input, "prod").unwrap(), "prod");
     }
 
     #[test]

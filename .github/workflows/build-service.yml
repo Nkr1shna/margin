@@ -1,0 +1,63 @@
+# Builds margin-service for the VMs (docs/plan-deploy.md §4): tests first, then a
+# release build stamped with the commit (MARGIN_BUILD_SHA, reported by GET /api/version),
+# signed with the stable self-signed identity "Margin Service Signing" so the guests'
+# Keychain ACLs keep matching across deploys. deploy-dev.yml installs the artifact.
+name: build-service
+
+on:
+  push:
+    branches: [claude/agent-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-service-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: test
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      MARGIN_BUILD_SHA: ${{ github.sha }}
+      SIGNING_IDENTITY: Margin Service Signing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Put Rust on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked -p margin-service
+      - name: Sign
+        run: |
+          if ! security find-identity -v -p codesigning | grep -q "\"$SIGNING_IDENTITY\""; then
+            echo "::error::No code-signing identity \"$SIGNING_IDENTITY\" in the runner's Keychain (runbook step 8)."
+            exit 1
+          fi
+          codesign --force --sign "$SIGNING_IDENTITY" --identifier com.krishnanelloore.margin.service \
+            target/release/margin-service
+          codesign --verify --verbose target/release/margin-service
+      - name: Check the stamp
+        run: |
+          out="$(target/release/margin-service version)"
+          echo "$out"
+          case "$out" in *"($MARGIN_BUILD_SHA)"*) ;; *) echo "::error::the binary isn't stamped with $MARGIN_BUILD_SHA"; exit 1 ;; esac
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/margin-service dist/
+          echo "$MARGIN_BUILD_SHA" > dist/BUILD_SHA
+      - uses: actions/upload-artifact@v4
+        with:
+          name: margin-service-${{ github.sha }}
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error
