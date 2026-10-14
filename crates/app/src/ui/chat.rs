@@ -26,8 +26,8 @@ use crate::ui::common::{
 use crate::ui::outline::{OutlineDraft, ProposalView};
 use crate::ui::settings::SettingsPane;
 use crate::ui::sources::{
-    AddSourcesMenu, ChatAttachments, EmbeddingNotice, composer_files, forget_sent, kind_icon,
-    refresh_embedding,
+    AddSourcesMenu, ChatAttachments, EmbeddingNotice, composer_files, detach_folder, forget_sent,
+    kind_icon, refresh_embedding,
 };
 
 /// The composer's text field, focused by Cmd+N (`ui::shell`).
@@ -421,7 +421,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                     None => {
                         let body = NewChat {
                             message: Some(message),
-                            workspace_ids: vec![],
+                            workspace_ids: app.ask_workspaces.peek().clone(),
                         };
                         match api.create_chat(&body).await {
                             Ok(detail) => {
@@ -434,6 +434,9 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                                 l.stale_chats.insert(id.clone());
                                 drop(l);
                                 forget_sent(app, None, &source_ids);
+                                // The new chat has its folders now.
+                                let mut ask = app.ask_workspaces;
+                                ask.set(Vec::new());
                                 sources_note.set(None);
                                 draft.set(String::new());
                                 draft_rev += 1;
@@ -556,6 +559,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         }
     };
     let files = rsx! {
+        ChatFolders { chat_id: id.clone(), on_error: move |e| sources_note.set(Some(e)) }
         ChatAttachments { chat_id: id.clone() }
         if let Some(note) = sources_note.read().clone() {
             div { class: "notice", role: "status",
@@ -804,6 +808,111 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                         title: "{full}",
                         span { class: "sr-only", "{full}" }
                         span { "aria-hidden": "true", "{short}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How a folder's chip reads after its name: "12 files", "uploading 3", "reading 2",
+/// "1 couldn't be read", "Not synced yet".
+pub fn folder_chip_notes(sync: &margin_shared::WorkspaceSync) -> Vec<String> {
+    let mut notes = vec![match sync.files {
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    }];
+    if sync.uploading > 0 {
+        notes.push(format!("uploading {}", sync.uploading));
+    }
+    if sync.reading > 0 {
+        notes.push(format!("reading {}", sync.reading));
+    }
+    if sync.failed > 0 {
+        notes.push(format!("{} couldn't be read", sync.failed));
+    }
+    if sync.last_synced_at.is_none() {
+        notes.push("Not synced yet".into());
+    }
+    notes
+}
+
+/// The folders attached to a chat (or to the new chat), under its composer: one chip each
+/// with its device and how its files are doing, and Detach. Detaching deletes nothing.
+#[component]
+fn ChatFolders(chat_id: Option<Id>, on_error: EventHandler<String>) -> Element {
+    let app = use_app();
+    let ids = match &chat_id {
+        Some(id) => app
+            .lib
+            .read()
+            .chats
+            .get(id)
+            .map(|c| c.workspace_ids.clone())
+            .unwrap_or_default(),
+        None => app.ask_workspaces.read().clone(),
+    };
+    if ids.is_empty() {
+        return rsx! {};
+    }
+    let lib = app.lib.read();
+    let held = app.folders.read();
+    let chips: Vec<(Id, Option<margin_shared::Workspace>, Option<String>)> = ids
+        .iter()
+        .map(|id| {
+            let ws = lib.workspaces.get(id).cloned();
+            let revoked = held.revoked(id).map(str::to_string);
+            (id.clone(), ws, revoked)
+        })
+        .collect();
+    drop(held);
+    drop(lib);
+    rsx! {
+        div { class: "folder-strip", role: "list", "aria-label": "Folders attached to this chat",
+            for (id, ws, revoked) in chips {
+                div {
+                    key: "{id}",
+                    role: "listitem",
+                    class: if ws.is_none() || revoked.is_some() { "folder-chip bad" } else { "folder-chip" },
+                    Icon { name: "folder" }
+                    span { class: "folder-chip-text",
+                        match &ws {
+                            Some(ws) => rsx! {
+                                b { "{ws.name}" }
+                                " on {ws.device_name}"
+                                for note in folder_chip_notes(&ws.sync) {
+                                    " · {note}"
+                                }
+                                if revoked.is_some() {
+                                    span { class: "note-bad", title: revoked.clone().unwrap_or_default(),
+                                        " · No longer accessible on {ws.device_name} — attach it again"
+                                    }
+                                }
+                            },
+                            None => rsx! { span { class: "note-bad", "No longer attached" } },
+                        }
+                    }
+                    button {
+                        class: "icon-btn sm",
+                        "aria-label": match &ws {
+                            Some(ws) => format!("Detach {}", ws.name),
+                            None => "Detach the folder".to_string(),
+                        },
+                        title: "Detach (the folder stays on its device and the service)",
+                        onclick: {
+                            let id = id.clone();
+                            let chat_id = chat_id.clone();
+                            move |_| {
+                                let id = id.clone();
+                                let chat_id = chat_id.clone();
+                                spawn(async move {
+                                    if let Err(e) = detach_folder(app, chat_id.as_deref(), &id).await {
+                                        on_error.call(e);
+                                    }
+                                });
+                            }
+                        },
+                        Icon { name: "x" }
                     }
                 }
             }
@@ -2013,6 +2122,63 @@ mod tests {
             lib.chat_items.insert(chat.id, items);
         }
         lib
+    }
+
+    #[test]
+    fn the_strip_shows_each_attached_folder_and_how_it_is_doing() {
+        use crate::folders::store::{FolderStatus, LocalFolders};
+        use crate::ui::test_render::{Extra, render_with};
+        let mut lib = sample();
+        lib.replace_workspaces(fake::sample_workspaces());
+        // w1 mid-sync with a failure, w4 never synced, w2 revoked here, one removed.
+        lib.chats.get_mut("c1").unwrap().workspace_ids =
+            vec!["w1".into(), "w4".into(), "w2".into(), "w-gone".into()];
+        let extra = Extra {
+            folders: LocalFolders {
+                held: [
+                    ("w1".to_string(), FolderStatus::Ok),
+                    (
+                        "w2".to_string(),
+                        FolderStatus::Revoked("macOS didn't let Margin read “Papers”.".into()),
+                    ),
+                ]
+                .into(),
+            },
+            ..Default::default()
+        };
+        let html = render_with("/chat/c1", lib, None, extra);
+        assert!(
+            html.contains(r#"aria-label="Folders attached to this chat""#),
+            "{html}"
+        );
+        assert!(html.contains("<b>notes</b> on test-mac"), "{html}");
+        assert!(html.contains(" · 5 files"));
+        assert!(html.contains(" · uploading 3"));
+        assert!(html.contains(" · reading 1"));
+        assert!(html.contains(" · 1 couldn&#39;t be read"), "{html}");
+        assert!(html.contains("<b>Scans</b> on iPhone"));
+        assert!(html.contains(" · Not synced yet"));
+        assert!(html.contains("No longer accessible on test-mac — attach it again"));
+        assert!(html.contains("No longer attached"));
+        assert!(html.contains(r#"aria-label="Detach notes""#));
+        assert!(html.contains(r#"aria-label="Detach the folder""#));
+        // No online or offline on the strip: reading doesn't need the device.
+        assert!(!html.contains("Offline"));
+
+        // The new chat lists the folders its first message will carry.
+        let mut lib = sample();
+        lib.replace_workspaces(fake::sample_workspaces());
+        let extra = Extra {
+            ask_workspaces: vec!["w3".into()],
+            ..Default::default()
+        };
+        let html = render_with("/", lib, None, extra);
+        assert!(html.contains("<b>Photos</b> on iPhone"), "{html}");
+        assert!(html.contains(" · 18 files"));
+        assert_eq!(
+            folder_chip_notes(&Default::default()),
+            vec!["0 files".to_string(), "Not synced yet".to_string()]
+        );
     }
 
     #[test]

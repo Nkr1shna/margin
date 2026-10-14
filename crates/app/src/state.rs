@@ -1,6 +1,6 @@
 //! App-wide reactive state, shared through Dioxus context.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use dioxus::prelude::*;
@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api::{Api, ApiFailure};
 use crate::config::{self, LocalConfig};
+use crate::folders::store::LocalFolders;
+use crate::folders::sync::SyncState;
 use crate::secrets;
 use crate::sources::Upload;
 use crate::store::LibraryState;
@@ -84,6 +86,13 @@ pub struct AppCtx {
     /// socket while it isn't (the system suspends the app soon after); computers are
     /// always in the foreground here.
     pub foreground: Signal<bool>,
+    /// The folders this device holds and whether it can still read them (copied from
+    /// `folders::store`).
+    pub folders: Signal<LocalFolders>,
+    /// What each held folder's sync is doing (copied from the sync engine).
+    pub folder_sync: Signal<BTreeMap<Id, SyncState>>,
+    /// Folders attached to the new chat, sent with its first message.
+    pub ask_workspaces: Signal<Vec<Id>>,
 }
 
 /// An app-control tool call for the shell to run, and where its answer goes.
@@ -169,6 +178,10 @@ impl AppCtx {
         this.transcripts.set(HashMap::new());
         this.agent_commands.set(VecDeque::new());
         this.device_frames.set(None);
+        this.ask_workspaces.set(Vec::new());
+        this.folder_sync.set(BTreeMap::new());
+        // Handles stay on this device; their syncs stop until it signs in again.
+        crate::folders::sync::engine().set_api(None);
     }
 
     /// Sign out: revoke this device on the service (best effort), then forget the token.

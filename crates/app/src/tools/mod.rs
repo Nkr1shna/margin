@@ -4,8 +4,10 @@
 //! one; a dropped connection abandons them all (the service has given up on them).
 //!
 //! App-control calls (`navigate`, `open_citation`, `show_passage`, `toggle_sidebar`) go
-//! to the shell, which runs them on the main thread (`app_control`). Folder tools answer
-//! an error: this build reads no folders yet.
+//! to the shell, which runs them on the main thread (`app_control`). Folder calls
+//! (`sync_folder`, `manifest`, `fetch_file`) go to the folder sync engine
+//! (`crate::folders::sync`). The old on-request reads of a folder (`list_files`,
+//! `find_files`, `search_text`, `read_file`) answer that the service reads folders now.
 
 pub mod app_control;
 
@@ -26,8 +28,9 @@ use tokio::sync::oneshot;
 
 use crate::state::{AgentCommand, AppCtx};
 
-/// What folder tools answer until this build can read folders.
-pub const FOLDERS_NOT_YET: &str = "This build can't read folders yet.";
+/// What the old on-request folder reads answer: a folder's files are copied to the
+/// service and read there.
+pub const READ_ON_SERVICE: &str = "This device doesn't read folders on request any more: an attached folder's files are copied to the Margin service, which searches them.";
 
 /// The shortest time a request is given, whatever its deadline says: the deadline is the
 /// service's clock, and this device's may be ahead of it. The service cancels the
@@ -45,6 +48,8 @@ pub trait Host: Clone + 'static {
         chat_id: Id,
         call: DeviceToolCall,
     ) -> Pin<Box<dyn Future<Output = DeviceToolResult>>>;
+    /// Run a folder call (`SyncFolder`, `Manifest`, `FetchFile`) and give its answer.
+    fn folder(&self, call: DeviceToolCall) -> Pin<Box<dyn Future<Output = DeviceToolResult>>>;
     /// Send a frame to the service (dropped when there's no connection).
     fn send(&self, frame: DeviceFrame);
 }
@@ -131,12 +136,14 @@ async fn answer_within<H: Host>(
         DeviceToolCall::ListFiles { .. }
         | DeviceToolCall::FindFiles { .. }
         | DeviceToolCall::SearchText { .. }
-        | DeviceToolCall::ReadFile { .. }
-        | DeviceToolCall::SyncFolder { .. }
-        | DeviceToolCall::Manifest { .. }
-        | DeviceToolCall::FetchFile { .. } => DeviceToolResult::Err {
-            message: FOLDERS_NOT_YET.into(),
+        | DeviceToolCall::ReadFile { .. } => DeviceToolResult::Err {
+            message: READ_ON_SERVICE.into(),
         },
+        call @ (DeviceToolCall::SyncFolder { .. }
+        | DeviceToolCall::Manifest { .. }
+        | DeviceToolCall::FetchFile { .. }) => {
+            tokio::time::timeout(wait, host.folder(call)).await.ok()?
+        }
         call @ (DeviceToolCall::Navigate { .. }
         | DeviceToolCall::OpenCitation { .. }
         | DeviceToolCall::ShowPassage { .. }
@@ -177,11 +184,55 @@ impl Host for AppHost {
         })
     }
 
+    fn folder(&self, call: DeviceToolCall) -> Pin<Box<dyn Future<Output = DeviceToolResult>>> {
+        run_folder_call(crate::folders::sync::engine(), call)
+    }
+
     fn send(&self, frame: DeviceFrame) {
         if let Some(sender) = self.0.device_frames.peek().as_ref() {
             let _ = sender.send(frame);
         }
     }
+}
+
+/// A folder call answered by a sync engine: `SyncFolder` once the service has the
+/// manifest (the uploads go on after the answer), `Manifest` with the walk, `FetchFile`
+/// once the file is sent.
+pub fn run_folder_call(
+    engine: crate::folders::sync::Engine,
+    call: DeviceToolCall,
+) -> Pin<Box<dyn Future<Output = DeviceToolResult>>> {
+    use margin_shared::DeviceToolOutput;
+    Box::pin(async move {
+        let result = match call {
+            DeviceToolCall::SyncFolder { workspace_id } => {
+                match engine.request(&workspace_id).await {
+                    Ok(Ok(outcome)) => Ok(DeviceToolOutput::Done {
+                        message: outcome.message(),
+                    }),
+                    Ok(Err(message)) => Err(message),
+                    Err(_) => Err("The sync stopped before the service answered.".into()),
+                }
+            }
+            DeviceToolCall::Manifest { workspace_id } => engine
+                .manifest(&workspace_id)
+                .await
+                .map(|files| DeviceToolOutput::Manifest { files }),
+            DeviceToolCall::FetchFile {
+                workspace_id,
+                path,
+                stamp,
+            } => engine
+                .fetch(&workspace_id, &path, &stamp)
+                .await
+                .map(|message| DeviceToolOutput::Done { message }),
+            _ => Err(READ_ON_SERVICE.into()),
+        };
+        match result {
+            Ok(output) => DeviceToolResult::Ok { output },
+            Err(message) => DeviceToolResult::Err { message },
+        }
+    })
 }
 
 #[cfg(test)]
@@ -196,6 +247,7 @@ mod tests {
         reply: Option<String>,
         sent: mpsc::UnboundedSender<DeviceFrame>,
         asked: Rc<RefCell<Vec<(Id, DeviceToolCall)>>>,
+        engine: Option<crate::folders::sync::Engine>,
     }
 
     impl Host for FakeHost {
@@ -218,6 +270,13 @@ mod tests {
             })
         }
 
+        fn folder(&self, call: DeviceToolCall) -> Pin<Box<dyn Future<Output = DeviceToolResult>>> {
+            match &self.engine {
+                Some(engine) => run_folder_call(engine.clone(), call),
+                None => Box::pin(async { unreachable!("no folder calls in this test") }),
+            }
+        }
+
         fn send(&self, frame: DeviceFrame) {
             let _ = self.sent.send(frame);
         }
@@ -230,6 +289,7 @@ mod tests {
                 reply: reply.map(str::to_string),
                 sent,
                 asked: Rc::default(),
+                engine: None,
             },
             rx,
         )
@@ -296,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn folder_tools_answer_that_this_build_cant_read_folders() {
+    async fn old_folder_reads_answer_that_the_service_reads_folders() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -337,12 +397,78 @@ mod tests {
                         DeviceFrame::ToolResult {
                             request_id: id,
                             result: DeviceToolResult::Err {
-                                message: FOLDERS_NOT_YET.into()
+                                message: READ_ON_SERVICE.into()
                             }
                         }
                     );
                 }
                 assert!(host.asked.borrow().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sync_folder_runs_the_sync_and_answers_with_the_plan() {
+        use crate::folders::sync::tests::{d5b, setup, std_opener};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dir = d5b("tool");
+                let t = setup(std_opener()).await;
+                let id = t.attach(&dir, "notes").await;
+                let (mut host, mut sent) = host(None);
+                host.engine = Some(t.engine.clone());
+                let runner = Runner::new();
+                let sync = |w: &str| DeviceToolCall::SyncFolder {
+                    workspace_id: w.into(),
+                };
+                runner.handle(
+                    request("r1", sync(&id), chrono::Duration::seconds(60)),
+                    &host,
+                    spawn_local,
+                );
+                assert_eq!(
+                    sent.recv().await.unwrap(),
+                    DeviceFrame::ToolResult {
+                        request_id: "r1".into(),
+                        result: DeviceToolResult::Ok {
+                            output: DeviceToolOutput::Done {
+                                message: "Synced “notes”: 3 files to send; sending now.".into()
+                            }
+                        }
+                    }
+                );
+                // A folder this device doesn't hold.
+                runner.handle(
+                    request("r2", sync("w-other"), chrono::Duration::seconds(60)),
+                    &host,
+                    spawn_local,
+                );
+                assert_eq!(
+                    sent.recv().await.unwrap(),
+                    DeviceFrame::ToolResult {
+                        request_id: "r2".into(),
+                        result: DeviceToolResult::Err {
+                            message: crate::folders::sync::NOT_HELD.into()
+                        }
+                    }
+                );
+                // A cancelled request answers nothing.
+                runner.handle(
+                    request("r3", sync(&id), chrono::Duration::seconds(60)),
+                    &host,
+                    spawn_local,
+                );
+                runner.handle(
+                    DirectedFrame::ToolCancel {
+                        request_id: "r3".into(),
+                    },
+                    &host,
+                    spawn_local,
+                );
+                assert_eq!(runner.running(), 0);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(sent.try_recv().is_err());
             })
             .await;
     }

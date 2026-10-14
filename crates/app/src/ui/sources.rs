@@ -182,7 +182,7 @@ pub async fn read_again(app: AppCtx, id: Id) -> Result<(), String> {
 
 /// The "Read again" button, while the request is out it shows a spinner.
 #[component]
-fn ReadAgainButton(id: Id, name: String, on_error: EventHandler<String>) -> Element {
+pub fn ReadAgainButton(id: Id, name: String, on_error: EventHandler<String>) -> Element {
     let app = use_app();
     let mut busy = use_signal(|| false);
     rsx! {
@@ -246,7 +246,7 @@ fn upload_status(upload: &Upload, lib: &LibraryState) -> (Tone, String) {
 
 /// A source file: kind icon, name, size and status, then the row's actions.
 #[component]
-fn SourceLine(
+pub fn SourceLine(
     kind: SourceKind,
     name: String,
     bytes: u64,
@@ -323,9 +323,11 @@ pub fn forget_sent(app: AppCtx, chat_id: Option<&str>, sent: &[Id]) {
         .retain(|u| !(u.in_composer(chat_id) && u.source_id().is_some_and(|id| sent.contains(id))));
 }
 
-/// The chat composer's "Attach" chip: add files for the next message. Files only; a
-/// folder is attached as a workspace (read in place on the device that holds it), not
-/// uploaded. `above`: the composer is docked at the bottom, so the menu opens upwards.
+/// The chat composer's "Attach" chip: add files for the next message, attach a folder
+/// any device holds (listed, this device's first), or attach a folder of this device
+/// (picked, registered and synced, then attached). A folder's files are copied to the
+/// service and read there. `above`: the composer is docked at the bottom, so the menu
+/// opens upwards.
 #[component]
 pub fn AddSourcesMenu(
     chat_id: Option<Id>,
@@ -335,12 +337,13 @@ pub fn AddSourcesMenu(
     let app = use_app();
     let mut open = use_signal(|| false);
     let mut picking = use_signal(|| false);
+    let files_chat = chat_id.clone();
     let add = move |_| {
         open.set(false);
         if *picking.peek() {
             return;
         }
-        let to = Destination::Chat(chat_id.clone());
+        let to = Destination::Chat(files_chat.clone());
         spawn(async move {
             picking.set(true);
             let note = add_sources(app, to).await;
@@ -348,6 +351,48 @@ pub fn AddSourcesMenu(
             on_note.call(note);
         });
     };
+    let new_chat = chat_id.clone();
+    let attach_new = move |_| {
+        open.set(false);
+        if *picking.peek() {
+            return;
+        }
+        let chat = new_chat.clone();
+        spawn(async move {
+            picking.set(true);
+            let note = match crate::folders::sync::attach(app).await {
+                Ok(Some(ws)) => attach_folder(app, chat.as_deref(), ws.id).await.err(),
+                Ok(None) => None,
+                Err(e) => Some(e),
+            };
+            picking.set(false);
+            on_note.call(note);
+        });
+    };
+    // Every folder not attached to this chat yet, this device's first.
+    let attached = match &chat_id {
+        Some(id) => app
+            .lib
+            .read()
+            .chats
+            .get(id)
+            .map(|c| c.workspace_ids.clone())
+            .unwrap_or_default(),
+        None => app.ask_workspaces.read().clone(),
+    };
+    let me = app
+        .session
+        .read()
+        .as_ref()
+        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let folders: Vec<margin_shared::Workspace> = app
+        .lib
+        .read()
+        .workspaces_in_order(me.as_deref())
+        .into_iter()
+        .filter(|w| !attached.contains(&w.id))
+        .cloned()
+        .collect();
     // Placed against the chip, above it when the composer sits at the bottom.
     let placement = if above { "menu above" } else { "menu below" };
     rsx! {
@@ -377,9 +422,51 @@ pub fn AddSourcesMenu(
                         "Add files…"
                     }
                     p { class: "menu-note", {crate::sources::chat_files_text()} }
+                    FolderMenuItems {
+                        folders,
+                        on_pick: move |id: Id| {
+                            open.set(false);
+                            let chat = chat_id.clone();
+                            spawn(async move {
+                                on_note.call(attach_folder(app, chat.as_deref(), id).await.err());
+                            });
+                        },
+                        on_attach_new: attach_new,
+                    }
                 }
             }
         }
+    }
+}
+
+/// The Attach menu's folders: every folder not attached yet (`folders`), then attaching
+/// one of this device, and what attaching a folder does.
+#[component]
+pub fn FolderMenuItems(
+    folders: Vec<margin_shared::Workspace>,
+    on_pick: EventHandler<Id>,
+    on_attach_new: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div { class: "menu-label", role: "presentation", "Folders" }
+        for ws in folders {
+            button {
+                key: "{ws.id}",
+                role: "menuitem",
+                title: "{ws.location}",
+                onclick: {
+                    let id = ws.id.clone();
+                    move |_| on_pick.call(id.clone())
+                },
+                Icon { name: "folder" }
+                span { {folder_menu_label(&ws)} }
+            }
+        }
+        button { role: "menuitem", onclick: move |_| on_attach_new.call(()),
+            Icon { name: "folder" }
+            "Attach a folder from this device…"
+        }
+        p { class: "menu-note", {folders_menu_text()} }
     }
 }
 
@@ -524,6 +611,77 @@ pub fn ChatAttachments(chat_id: Option<Id>) -> Element {
             }
         }
     }
+}
+
+/// The folders attached to chat `chat_id`, or (`None`) to the new chat.
+pub fn chat_folders(app: AppCtx, chat_id: Option<&str>) -> Vec<Id> {
+    match chat_id {
+        Some(id) => app
+            .lib
+            .peek()
+            .chats
+            .get(id)
+            .map(|c| c.workspace_ids.clone())
+            .unwrap_or_default(),
+        None => app.ask_workspaces.peek().clone(),
+    }
+}
+
+/// Set the folders of chat `chat_id` (`ChatPatch.workspace_ids`), or of the new chat.
+async fn set_chat_folders(app: AppCtx, chat_id: Option<&str>, ids: Vec<Id>) -> Result<(), String> {
+    let Some(chat_id) = chat_id else {
+        let mut ask = app.ask_workspaces;
+        ask.set(ids);
+        return Ok(());
+    };
+    let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+    let patch = ChatPatch {
+        workspace_ids: Some(ids),
+        ..Default::default()
+    };
+    let chat = api
+        .patch_chat(chat_id, &patch)
+        .await
+        .map_err(|e| app.failure(&e))?;
+    let mut lib = app.lib;
+    lib.write().upsert_chat(chat);
+    Ok(())
+}
+
+/// Attach a folder (of any device) to a chat, or to the new chat.
+pub async fn attach_folder(app: AppCtx, chat_id: Option<&str>, id: Id) -> Result<(), String> {
+    let mut ids = chat_folders(app, chat_id);
+    if ids.contains(&id) {
+        return Ok(());
+    }
+    ids.push(id);
+    set_chat_folders(app, chat_id, ids).await
+}
+
+/// Take a folder off a chat. The folder stays on its device and on the service.
+pub async fn detach_folder(app: AppCtx, chat_id: Option<&str>, id: &str) -> Result<(), String> {
+    let ids: Vec<Id> = chat_folders(app, chat_id)
+        .into_iter()
+        .filter(|w| w != id)
+        .collect();
+    set_chat_folders(app, chat_id, ids).await
+}
+
+/// What the Attach menu says about folders.
+pub fn folders_menu_text() -> String {
+    format!(
+        "A folder's {} are copied to your Margin service and read there, so the agent can search inside them; other files are left alone.",
+        margin_shared::FOLDER_FILE_TYPES_TEXT
+    )
+}
+
+/// A folder as the Attach menu lists it: "notes · on test-mac · 12 files".
+pub fn folder_menu_label(ws: &margin_shared::Workspace) -> String {
+    let files = match ws.sync.files {
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    };
+    format!("{} · on {} · {files}", ws.name, ws.device_name)
 }
 
 /// Take a file off a chat (`ChatPatch.source_ids` without it). The service deletes it
@@ -959,5 +1117,40 @@ fn SourceRow(
                 Icon { name: "trash" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(non_snake_case)]
+    fn Menu() -> Element {
+        let mut lib = LibraryState::default();
+        lib.replace_workspaces(crate::fake::sample_workspaces());
+        let folders: Vec<margin_shared::Workspace> = lib
+            .workspaces_in_order(Some("d1"))
+            .into_iter()
+            .filter(|w| w.id != "w2")
+            .cloned()
+            .collect();
+        rsx! { FolderMenuItems { folders, on_pick: |_| {}, on_attach_new: |_| {} } }
+    }
+
+    #[test]
+    fn the_attach_menu_lists_every_devices_folders_and_attaching_one() {
+        let mut dom = VirtualDom::new(Menu);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        let notes = html.find("notes · on test-mac · 5 files").expect(&html);
+        let photos = html.find("Photos · on iPhone · 18 files").unwrap();
+        let scans = html.find("Scans · on iPhone · 0 files").unwrap();
+        // This device's first.
+        assert!(notes < photos && photos < scans);
+        assert!(!html.contains("Papers"));
+        assert!(html.contains("Attach a folder from this device…"));
+        assert!(html.contains(
+            "A folder&#39;s text documents (.md, .txt, .rst, .tex, .html…), PDFs and images are copied to your Margin service and read there"
+        ));
     }
 }

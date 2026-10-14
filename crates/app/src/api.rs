@@ -5,12 +5,15 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use margin_shared::{
     AcceptProposal, ApiError, Chat, ChatDetail, ChatPatch, ConfirmRequest, Device, EmbeddingModel,
     Id, Lesson, LessonPatch, Library, LoginState, Me, MessageSent, NewChat, NewMessage, NewNote,
     NewTopic, NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal, SearchHit, Settings,
-    SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest, ToolOutputText,
-    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
+    SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest, SyncManifest,
+    SyncPlan, ToolOutputText, ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace,
+    routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -516,6 +519,89 @@ impl Api {
         self.delete(&routes::workspace(id)).await
     }
 
+    /// Send a folder's manifest (this device holds it); the answer says what to upload.
+    pub async fn sync_workspace(&self, id: &str, manifest: &SyncManifest) -> ApiResult<SyncPlan> {
+        self.post(&routes::workspace_sync(id), manifest).await
+    }
+
+    /// A folder's files as the service has them (sources), newest first.
+    pub async fn workspace_files(&self, id: &str) -> ApiResult<Vec<Source>> {
+        self.get(&routes::workspace_files(id)).await
+    }
+
+    /// Upload one file of a folder this device holds, in one request (at most
+    /// `routes::UPLOAD_PART_BYTES`). `path` is its path inside the folder; an earlier copy
+    /// of the same path is replaced on the service. No size limit applies to folder files
+    /// beyond the part size per request.
+    pub async fn upload_folder_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        modified: Option<DateTime<Utc>>,
+        bytes: Vec<u8>,
+    ) -> ApiResult<Source> {
+        let len = bytes.len() as u64;
+        let builder = self
+            .request(Method::POST, routes::SOURCES)
+            .query(&folder_query(workspace_id, path, modified))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .timeout(UPLOAD_TIMEOUT)
+            .body(bytes);
+        self.json(builder).await
+    }
+
+    /// Start uploading a folder file in parts (`routes::SOURCE_UPLOADS`).
+    pub async fn start_folder_upload(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        modified: Option<DateTime<Utc>>,
+        bytes: u64,
+    ) -> ApiResult<SourceUpload> {
+        let mut query = folder_query(workspace_id, path, modified);
+        query.push(("bytes", bytes.to_string()));
+        self.json(
+            self.request(Method::POST, routes::SOURCE_UPLOADS)
+                .query(&query),
+        )
+        .await
+    }
+
+    /// How much of an upload in parts the service has.
+    pub async fn source_upload_state(&self, id: &str) -> ApiResult<SourceUpload> {
+        self.get(&routes::source_upload(id)).await
+    }
+
+    /// One part of an upload in parts, at `offset`.
+    pub async fn put_upload_part(
+        &self,
+        id: &str,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> ApiResult<SourceUpload> {
+        let len = bytes.len() as u64;
+        self.json(
+            self.request(Method::PUT, &routes::source_upload(id))
+                .query(&[("offset", offset)])
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .timeout(UPLOAD_TIMEOUT)
+                .body(bytes),
+        )
+        .await
+    }
+
+    /// Every part arrived: the source is made.
+    pub async fn finish_source_upload(&self, id: &str) -> ApiResult<Source> {
+        self.post_empty(&routes::source_upload_finish(id)).await
+    }
+
+    /// Give up on an upload in parts.
+    pub async fn cancel_source_upload(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::source_upload(id)).await
+    }
+
     /// Fetch a text file from an absolute (signed media) URL, without the bearer token.
     pub async fn fetch_text(&self, url: &str) -> ApiResult<String> {
         let response = self.send(self.http.get(url)).await?;
@@ -542,11 +628,27 @@ impl Api {
 /// How long one upload request (a whole small file, or one part) may take.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Tries per part after a failure on the way.
-const PART_RETRIES: u32 = 3;
+pub const PART_RETRIES: u32 = 3;
+
+/// The query of a folder file's upload: its path, the folder and its modification time.
+fn folder_query(
+    workspace_id: &str,
+    path: &str,
+    modified: Option<DateTime<Utc>>,
+) -> Vec<(&'static str, String)> {
+    let mut query = vec![
+        ("name", path.to_string()),
+        ("workspace_id", workspace_id.to_string()),
+    ];
+    if let Some(modified) = modified {
+        query.push(("modified", modified.to_rfc3339()));
+    }
+    query
+}
 
 /// Whether a failed part is worth sending again: the connection broke or timed out, the
 /// service had a hiccup, or it has a different amount of the file than we thought.
-fn retry_part(e: &ApiFailure) -> bool {
+pub fn retry_part(e: &ApiFailure) -> bool {
     e.status.is_none() && e.code == "network"
         || e.status.is_some_and(|s| s >= 500)
         || e.code == "wrong_offset"
@@ -650,6 +752,119 @@ mod tests {
         }
         // Only once.
         assert_eq!(api.poll_login(&login).await.unwrap(), LoginState::Expired);
+    }
+
+    #[tokio::test]
+    async fn folder_manifests_files_and_uploads() {
+        use margin_shared::{
+            FileStamp, FolderFileType, ManifestFile, NewWorkspace, Platform, SyncManifest,
+        };
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let ws = api
+            .create_workspace(&NewWorkspace {
+                name: "notes".into(),
+                platform: Platform::Macos,
+                location: "~/notes".into(),
+            })
+            .await
+            .unwrap();
+        let modified = chrono::Utc::now();
+        let small = b"# Intro\n".to_vec();
+        let big = vec![7u8; routes::UPLOAD_PART_BYTES as usize + 10];
+        let file = |path: &str, kind, bytes: usize| ManifestFile {
+            path: path.into(),
+            kind,
+            stamp: FileStamp {
+                bytes: bytes as u64,
+                modified: Some(modified),
+                sha256: "ab".repeat(32),
+            },
+        };
+        let plan = api
+            .sync_workspace(
+                &ws.id,
+                &SyncManifest {
+                    files: vec![
+                        file("intro.md", FolderFileType::Text, small.len()),
+                        file("scan.pdf", FolderFileType::Pdf, big.len()),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.upload, vec!["intro.md", "scan.pdf"]);
+
+        // One request for a small file, parts for a large one (no size limit).
+        let source = api
+            .upload_folder_file(&ws.id, "intro.md", Some(modified), small)
+            .await
+            .unwrap();
+        assert_eq!(source.workspace_id.as_deref(), Some(ws.id.as_str()));
+        assert_eq!(source.folder.as_deref(), Some("notes"));
+        assert_eq!(source.topic_id, None);
+        assert!(source.modified.is_some());
+        let upload = api
+            .start_folder_upload(&ws.id, "scan.pdf", Some(modified), big.len() as u64)
+            .await
+            .unwrap();
+        let part = routes::UPLOAD_PART_BYTES as usize;
+        let state = api
+            .put_upload_part(&upload.id, 0, big[..part].to_vec())
+            .await
+            .unwrap();
+        assert_eq!(state.received, part as u64);
+        assert_eq!(
+            api.source_upload_state(&upload.id).await.unwrap().received,
+            part as u64
+        );
+        api.put_upload_part(&upload.id, part as u64, big[part..].to_vec())
+            .await
+            .unwrap();
+        let pdf = api.finish_source_upload(&upload.id).await.unwrap();
+        assert_eq!(pdf.bytes, big.len() as u64);
+
+        let files = api.workspace_files(&ws.id).await.unwrap();
+        let mut names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["intro.md", "scan.pdf"]);
+        assert!(files.iter().all(|f| f.media_url.is_some()));
+        // Folder files never join the library's sources.
+        assert!(
+            !api.library()
+                .await
+                .unwrap()
+                .sources
+                .iter()
+                .any(|s| s.workspace_id.is_some())
+        );
+
+        // The folder takes only its kinds of files, inside it.
+        let err = api
+            .upload_folder_file(&ws.id, "main.rs", None, b"fn main(){}".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "unsupported");
+        let err = api
+            .upload_folder_file(&ws.id, "../x.md", None, b"x".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "bad_path");
+        let gone = api.sync_workspace("nope", &SyncManifest::default()).await;
+        assert_eq!(gone.unwrap_err().status, Some(404));
+        // An abandoned upload in parts can be cancelled.
+        let upload = api
+            .start_folder_upload(&ws.id, "again.pdf", None, 10)
+            .await
+            .unwrap();
+        api.cancel_source_upload(&upload.id).await.unwrap();
+        assert_eq!(
+            api.source_upload_state(&upload.id)
+                .await
+                .unwrap_err()
+                .status,
+            Some(404)
+        );
     }
 
     #[tokio::test]
