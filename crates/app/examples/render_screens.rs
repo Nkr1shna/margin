@@ -74,24 +74,26 @@ fn Harness(props: HarnessProps) -> Element {
             render_height: 1080,
             render_fps: 30,
         });
-        lib.embedding = std::env::var("RENDER_EMBEDDING").ok().map(|state| EmbeddingModel {
-            repo: fake::EMBEDDING_REPO.into(),
-            state: match state.as_str() {
-                "downloading" => EmbeddingModelState::Downloading {
-                    received: 251_000_000,
-                    total: fake::EMBEDDING_DOWNLOAD_BYTES,
+        lib.embedding = std::env::var("RENDER_EMBEDDING")
+            .ok()
+            .map(|state| EmbeddingModel {
+                repo: fake::EMBEDDING_REPO.into(),
+                state: match state.as_str() {
+                    "downloading" => EmbeddingModelState::Downloading {
+                        received: 251_000_000,
+                        total: fake::EMBEDDING_DOWNLOAD_BYTES,
+                    },
+                    "ready" => EmbeddingModelState::Ready {
+                        bytes: fake::EMBEDDING_DOWNLOAD_BYTES,
+                    },
+                    "failed" => EmbeddingModelState::Failed {
+                        error: "Hugging Face answered 503.".into(),
+                    },
+                    _ => EmbeddingModelState::NotDownloaded {
+                        download_bytes: fake::EMBEDDING_DOWNLOAD_BYTES,
+                    },
                 },
-                "ready" => EmbeddingModelState::Ready {
-                    bytes: fake::EMBEDDING_DOWNLOAD_BYTES,
-                },
-                "failed" => EmbeddingModelState::Failed {
-                    error: "Hugging Face answered 503.".into(),
-                },
-                _ => EmbeddingModelState::NotDownloaded {
-                    download_bytes: fake::EMBEDDING_DOWNLOAD_BYTES,
-                },
-            },
-        });
+            });
         let uploads = if std::env::var_os("RENDER_UPLOADS").is_some() {
             sample_uploads(&mut lib)
         } else {
@@ -188,7 +190,10 @@ fn sample_uploads(lib: &mut LibraryState) -> Vec<sources::Upload> {
         done(
             file("Signals and Systems, ch. 3.pdf", None, 4_100_000),
             "u1",
-            SourceStatus::Processing { done: 12, total: 40 },
+            SourceStatus::Processing {
+                done: 12,
+                total: 40,
+            },
             lib,
         ),
         failed,

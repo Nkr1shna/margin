@@ -13,7 +13,9 @@ use crate::routes::Route;
 use crate::sources::UploadState;
 use crate::state::use_app;
 use crate::ui::common::{ErrorNotice, Icon, TopBar};
-use crate::ui::sources::{AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding};
+use crate::ui::sources::{
+    AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding,
+};
 
 pub fn level_label(level: Level) -> &'static str {
     match level {
@@ -281,7 +283,7 @@ pub fn AskScreen() -> Element {
                     EmbeddingNotice {}
                 }
                 if let Some(err) = error.read().clone() {
-                    ErrorNotice { message: err.message.clone(), settings_pane: err.is_no_api_key().then_some(crate::ui::settings::SettingsPane::Ai) }
+                    ErrorNotice { message: err.message.clone(), settings_pane: err.settings_pane() }
                 }
                 if let Some(p) = proposal {
                     ProposalView {
@@ -553,7 +555,7 @@ fn OutlineEditor(
             }
             if let Some(err) = accept_error {
                 div { style: "padding-top: 12px",
-                    ErrorNotice { message: err.message.clone(), settings_pane: err.is_no_api_key().then_some(crate::ui::settings::SettingsPane::Ai) }
+                    ErrorNotice { message: err.message.clone(), settings_pane: err.settings_pane() }
                 }
             }
             div { class: "outline-f",

@@ -510,6 +510,17 @@ async fn wait_until_read(
         if pending == 0 {
             return Ok(sources);
         }
+        // Queued sources wait for the model; with none downloaded or downloading they
+        // would never be read, so don't hold generation up for them.
+        let processing = sources
+            .iter()
+            .any(|s| matches!(s.status, SourceStatus::Processing { .. }));
+        if !processing && !embedding::will_be_available(state).await {
+            tracing::warn!(
+                "{pending} source(s) wait for the embedding model, which isn't downloaded; writing without them"
+            );
+            return Ok(sources);
+        }
         let now = Instant::now();
         if now >= deadline {
             tracing::warn!(

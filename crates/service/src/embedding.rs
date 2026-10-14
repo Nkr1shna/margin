@@ -62,6 +62,17 @@ async fn download_bytes(state: &AppState) -> u64 {
     }
 }
 
+/// Whether the model is downloaded or downloading, so queued sources will get read.
+pub async fn will_be_available(state: &AppState) -> bool {
+    if matches!(
+        *state.model_job.lock().unwrap(),
+        ModelJob::Downloading { .. }
+    ) {
+        return true;
+    }
+    on_disk(state).await.0
+}
+
 pub async fn model(state: &AppState) -> EmbeddingModel {
     let job = state.model_job.lock().unwrap().clone();
     let model_state = match job {

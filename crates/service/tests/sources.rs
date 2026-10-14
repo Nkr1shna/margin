@@ -522,26 +522,22 @@ async fn sources_wait_for_the_model_download() {
     );
 
     let s = upload_ok(&h, &t, "fourier.md", None, FOURIER).await;
-    let r = ask(&h, &t, "Fourier coefficients", &[&s.id]).await;
-    assert_eq!(r.status(), 200);
-    let p: Proposal = r.json().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // Nothing is read without the model, and the outline waits for the source.
+    // Nothing is read without the model, and asking with sources is refused rather
+    // than writing an outline that silently ignores them.
     let lib = library(&h, &t).await;
     assert_eq!(lib.sources[0].status, SourceStatus::Queued);
     assert_eq!(h.source_tools.extracts.load(Ordering::SeqCst), 0);
-    let current: Proposal = h
-        .get(&t, &format!("/api/proposals/{}", p.id))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(current.status, ProposalStatus::Drafting);
+    let r = ask(&h, &t, "Fourier coefficients", &[&s.id]).await;
+    assert_eq!(r.status(), 409);
+    let err: margin_shared::ApiError = r.json().await.unwrap();
+    assert_eq!(err.code, "no_embedding_model");
 
     let r = h.post(&t, "/api/embedding/download").send().await.unwrap();
     assert_eq!(r.status(), 200);
+    let r = ask(&h, &t, "Fourier coefficients", &[&s.id]).await;
+    assert_eq!(r.status(), 200);
+    let p: Proposal = r.json().await.unwrap();
     let s = wait_source(&h, &t, &s.id, is_ready).await;
     assert_eq!(
         s.status,

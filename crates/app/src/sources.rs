@@ -90,10 +90,7 @@ impl Selection {
     pub fn summary(&self) -> Option<String> {
         let mut parts = Vec::new();
         if self.unsupported > 0 {
-            parts.push(format!(
-                "{} Margin can't read",
-                files(self.unsupported)
-            ));
+            parts.push(format!("{} Margin can't read", files(self.unsupported)));
         }
         if self.too_large > 0 {
             parts.push(format!(
@@ -110,7 +107,10 @@ impl Selection {
             ));
         }
         if self.unreadable > 0 {
-            parts.push(format!("{} that couldn't be opened", files(self.unreadable)));
+            parts.push(format!(
+                "{} that couldn't be opened",
+                files(self.unreadable)
+            ));
         }
         if parts.is_empty() {
             return None;
@@ -352,7 +352,10 @@ mod tests {
         dir.file("Cargo.lock", 10);
         let selection = select_folder(&dir.0);
         let names: Vec<_> = selection.files.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["README", "notes/ch1.md", "notes/ch2.md", "src/main.rs"]);
+        assert_eq!(
+            names,
+            vec!["README", "notes/ch1.md", "notes/ch2.md", "src/main.rs"]
+        );
         let folder = dir.0.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             selection
@@ -434,7 +437,9 @@ mod tests {
             "Ready · 1 page"
         );
         assert_eq!(
-            status_text(&SourceStatus::Failed { error: "Bad".into() }),
+            status_text(&SourceStatus::Failed {
+                error: "Bad".into()
+            }),
             (Tone::Failed, "Failed: Bad".into())
         );
         assert_eq!(human_bytes(812), "812 bytes");

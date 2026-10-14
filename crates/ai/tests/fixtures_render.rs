@@ -66,7 +66,8 @@ fn fixtures_follow_the_prompt_rules_and_run_in_manimgx() {
         // Rule 9: it opens on the title card, on screen from the first frame.
         let body = &code[code.find("def construct").unwrap()..];
         assert!(
-            body.find("self.add(title)").is_some_and(|i| body.find("self.").unwrap() == i),
+            body.find("self.add(title)")
+                .is_some_and(|i| body.find("self.").unwrap() == i),
             "the first thing construct shows is the title, with self.add: {scene:?}"
         );
         // Rule 8: it ends on the poster shot, held, with nothing fading out after it.

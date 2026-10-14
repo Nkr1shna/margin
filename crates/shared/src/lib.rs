@@ -323,7 +323,11 @@ impl SourceKind {
     /// The kind of source a file is, from its name; `None` for files Margin can't read
     /// (images, archives, binaries, lock files…).
     pub fn for_name(name: &str) -> Option<SourceKind> {
-        let file = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+        let file = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(name)
+            .to_ascii_lowercase();
         if file.ends_with(".lock") || file == "package-lock.json" {
             return None;
         }
@@ -337,11 +341,10 @@ impl SourceKind {
             "html", "htm", "xml", "json", "yaml", "yml", "toml", "ini", "srt", "vtt",
         ];
         const CODE: &[&str] = &[
-            "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "kts",
-            "swift", "m", "mm", "c", "h", "cc", "cpp", "cxx", "hpp", "cs", "rb", "php", "scala",
-            "hs", "ml", "ex", "exs", "erl", "clj", "lua", "r", "jl", "dart", "zig", "nim",
-            "sql", "sh", "bash", "zsh", "fish", "ps1", "css", "scss", "vue", "svelte",
-            "proto", "graphql", "ipynb",
+            "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "kts", "swift",
+            "m", "mm", "c", "h", "cc", "cpp", "cxx", "hpp", "cs", "rb", "php", "scala", "hs", "ml",
+            "ex", "exs", "erl", "clj", "lua", "r", "jl", "dart", "zig", "nim", "sql", "sh", "bash",
+            "zsh", "fish", "ps1", "css", "scss", "vue", "svelte", "proto", "graphql", "ipynb",
         ];
         if ext == "pdf" {
             Some(SourceKind::Pdf)
@@ -361,9 +364,17 @@ pub enum SourceStatus {
     /// Waiting to be read (or for the embedding model to be downloaded).
     Queued,
     /// Extracting text and embedding chunks; `done` of `total` chunks so far.
-    Processing { done: u32, total: u32 },
-    Ready { chunks: u32, pages: Option<u32> },
-    Failed { error: String },
+    Processing {
+        done: u32,
+        total: u32,
+    },
+    Ready {
+        chunks: u32,
+        pages: Option<u32>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// The local embedding model (EmbeddingGemma 2, Core ML), downloaded on demand from
@@ -378,11 +389,20 @@ pub struct EmbeddingModel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EmbeddingModelState {
-    NotDownloaded { download_bytes: u64 },
-    Downloading { received: u64, total: u64 },
+    NotDownloaded {
+        download_bytes: u64,
+    },
+    Downloading {
+        received: u64,
+        total: u64,
+    },
     /// Downloaded; the first use compiles it for this Mac (a few seconds).
-    Ready { bytes: u64 },
-    Failed { error: String },
+    Ready {
+        bytes: u64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

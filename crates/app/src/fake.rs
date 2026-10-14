@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -385,7 +385,10 @@ pub fn router(fake: Fake) -> Router {
             post(upload_source).layer(DefaultBodyLimit::max(routes::MAX_SOURCE_BYTES as usize)),
         )
         .route("/api/sources/{id}", axum::routing::delete(delete_source))
-        .route("/api/embedding", get(get_embedding).delete(delete_embedding))
+        .route(
+            "/api/embedding",
+            get(get_embedding).delete(delete_embedding),
+        )
         .route("/api/embedding/download", post(download_embedding))
         .route("/api/events", get(events))
         .route("/media/videos/{id}/{file}", get(media))

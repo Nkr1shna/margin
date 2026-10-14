@@ -5,8 +5,8 @@ use dioxus::prelude::*;
 use margin_shared::{Device, EmbeddingModelState, Event, Settings, SettingsPatch, ToolStatus};
 
 use crate::config::{Appearance, normalize_service_url};
-use crate::state::use_app;
 use crate::sources::human_bytes;
+use crate::state::use_app;
 use crate::ui::common::{ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, js};
 use crate::ui::sources::{Progress, download_embedding, refresh_embedding};
 

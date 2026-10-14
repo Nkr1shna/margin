@@ -459,7 +459,9 @@ mod tests {
         s.apply(Event::SourceDeleted { id: "src4".into() });
         assert!(!s.sources.contains_key("src4"));
         // Unknown id: ignored.
-        s.apply(Event::SourceDeleted { id: "missing".into() });
+        s.apply(Event::SourceDeleted {
+            id: "missing".into(),
+        });
         assert_eq!(s.sources.len(), 3);
     }
 

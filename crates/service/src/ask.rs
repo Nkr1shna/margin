@@ -54,6 +54,13 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
             ));
         }
     }
+    // Sources are read and searched with the local model; without it they'd be ignored.
+    if !req.source_ids.is_empty() && !crate::embedding::will_be_available(state).await {
+        return Err(AppError::conflict(
+            "no_embedding_model",
+            "Sources need the local embedding model. Download it in Settings → Sources.",
+        ));
+    }
     Ok(())
 }
 

@@ -32,6 +32,17 @@ impl ApiFailure {
         self.code == "no_api_key"
     }
 
+    /// The Settings pane that fixes this error, if one does.
+    pub fn settings_pane(&self) -> Option<crate::ui::settings::SettingsPane> {
+        use crate::ui::settings::SettingsPane;
+        match self.code.as_str() {
+            "no_api_key" => Some(SettingsPane::Ai),
+            "no_embedding_model" => Some(SettingsPane::Sources),
+            c if c.contains("tool") => Some(SettingsPane::Tools),
+            _ => None,
+        }
+    }
+
     pub fn local(message: impl Into<String>) -> Self {
         Self {
             status: None,
@@ -638,14 +649,20 @@ mod tests {
         assert_eq!(attached.topic_id.as_deref(), Some(topic.id.as_str()));
 
         api.delete_source(&source.id).await.unwrap();
-        assert_eq!(api.delete_source(&source.id).await.unwrap_err().status, Some(404));
+        assert_eq!(
+            api.delete_source(&source.id).await.unwrap_err().status,
+            Some(404)
+        );
     }
 
     #[tokio::test]
     async fn upload_refuses_files_over_the_limit_locally() {
         let api = Api::with_token("http://127.0.0.1:9", "x");
         let big = vec![0u8; routes::MAX_SOURCE_BYTES as usize + 1];
-        let err = api.upload_source(big, "big.txt", None, None).await.unwrap_err();
+        let err = api
+            .upload_source(big, "big.txt", None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, "local");
         assert!(err.message.starts_with("big.txt is larger than 50 MB"));
     }
