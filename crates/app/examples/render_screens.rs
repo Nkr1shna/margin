@@ -13,7 +13,12 @@
 //! Optional environment, for screens that open over the routes:
 //! - `RENDER_SETTINGS=<pane>` opens Settings at a pane (`sources`, `ai`, …).
 //! - `RENDER_SOURCES=<topic id>` opens that topic's Sources dialog.
-//! - `RENDER_UPLOADS=1` attaches sample files and a folder in the Ask composer.
+//! - `RENDER_UPLOADS=1` adds sample files and a folder uploading to the topic of
+//!   `RENDER_SOURCES`.
+//! - `RENDER_OUTLINE=ready|created` adds a proposed course's outline card to chat `c1`
+//!   (`created`: made into the Fourier series topic).
+//! - `RENDER_CONFIRM=pending|approved|denied|stopped|expired` adds a confirmation card to
+//!   chat `c1` (`pending`: the answer waits on it).
 //! - `RENDER_EMBEDDING=missing|downloading|ready|failed` sets the embedding model's state.
 //! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
@@ -141,11 +146,13 @@ fn Harness(props: HarnessProps) -> Element {
                     },
                 },
             });
-        let uploads = if std::env::var_os("RENDER_UPLOADS").is_some() {
-            sample_uploads(&mut lib)
-        } else {
-            Vec::new()
+        let uploads = match std::env::var("RENDER_SOURCES") {
+            Ok(topic_id) if std::env::var_os("RENDER_UPLOADS").is_some() => {
+                sample_uploads(&mut lib, &topic_id)
+            }
+            _ => Vec::new(),
         };
+        add_sample_cards(&mut lib);
         let settings_open = std::env::var("RENDER_SETTINGS").ok().and_then(|name| {
             ui::settings::SettingsPane::ALL
                 .into_iter()
@@ -182,7 +189,7 @@ fn Harness(props: HarnessProps) -> Element {
             search_open: Signal::new(false),
             drawer_open: Signal::new(false),
             collapsed: Signal::new(HashSet::new()),
-            ask_proposal: Signal::new(None),
+            outline_drafts: Signal::new(Default::default()),
             ask_prompt: Signal::new(String::new()),
             uploads: Signal::new(uploads),
             settings_open: Signal::new(settings_open),
@@ -214,8 +221,67 @@ fn Harness(props: HarnessProps) -> Element {
     }
 }
 
-/// Files attached in the Ask composer, in each state, with their sources in the store.
-fn sample_uploads(lib: &mut LibraryState) -> Vec<sources::Upload> {
+/// The cards `RENDER_OUTLINE` and `RENDER_CONFIRM` ask for, at the end of chat `c1`.
+fn add_sample_cards(lib: &mut LibraryState) {
+    use margin_shared::{Card, ChatState, ConfirmationCard, Decision, OutlineCard};
+    let mut cards = Vec::new();
+    if let Ok(outline) = std::env::var("RENDER_OUTLINE") {
+        let created = (outline == "created").then_some("fourier");
+        let proposal = fake::sample_proposal("c1", created);
+        cards.push(fake::sample_card(
+            "c1",
+            20,
+            Card::Outline(OutlineCard {
+                proposal_id: proposal.id.clone(),
+            }),
+        ));
+        lib.proposals.insert(proposal.id.clone(), proposal);
+    }
+    if let Ok(confirm) = std::env::var("RENDER_CONFIRM") {
+        let decision = match confirm.as_str() {
+            "approved" => Decision::Approved {
+                device_id: "d1".into(),
+            },
+            "denied" => Decision::Denied {
+                device_id: "d2".into(),
+                by_stop: false,
+            },
+            "stopped" => Decision::Denied {
+                device_id: "d1".into(),
+                by_stop: true,
+            },
+            "expired" => Decision::Expired,
+            _ => Decision::Pending,
+        };
+        let card = fake::sample_card(
+            "c1",
+            21,
+            Card::Confirmation(ConfirmationCard {
+                tool: "delete_note".into(),
+                title: "Delete the note “Questions for Friday”?".into(),
+                detail: "The note and its 2 paragraphs are deleted. This can't be undone.".into(),
+                approve_label: "Delete".into(),
+                decision: decision.clone(),
+            }),
+        );
+        if decision == Decision::Pending
+            && let Some(chat) = lib.chats.get_mut("c1")
+        {
+            chat.state = ChatState::WaitingForUser {
+                turn_id: "t2".into(),
+                device_id: "d1".into(),
+                item_id: card.id.clone(),
+            };
+        }
+        cards.push(card);
+    }
+    if let Some(items) = lib.chat_items.get_mut("c1") {
+        items.extend(cards);
+    }
+}
+
+/// Files uploading to `topic_id`, in each state, with their sources in the store.
+fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload> {
     use sources::{Candidate, Upload, UploadState};
     let file = |name: &str, folder: Option<&str>, bytes| {
         Upload::new(
@@ -226,14 +292,14 @@ fn sample_uploads(lib: &mut LibraryState) -> Vec<sources::Upload> {
                 kind: SourceKind::for_name(name).unwrap(),
                 bytes,
             },
-            None,
+            Some(topic_id.to_string()),
         )
     };
     let done = |mut upload: Upload, id: &str, status: SourceStatus, lib: &mut LibraryState| {
         let source = margin_shared::Source {
             media_url: None,
             id: id.into(),
-            topic_id: None,
+            topic_id: Some(topic_id.to_string()),
             name: upload.name.clone(),
             folder: upload.folder.clone(),
             kind: upload.kind,

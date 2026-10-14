@@ -321,7 +321,7 @@ fn App() -> Element {
             search_open: Signal::new(false),
             drawer_open: Signal::new(false),
             collapsed: Signal::new(HashSet::new()),
-            ask_proposal: Signal::new(None),
+            outline_drafts: Signal::new(Default::default()),
             ask_prompt: Signal::new(String::new()),
             uploads: Signal::new(Vec::new()),
             settings_open: Signal::new(None),

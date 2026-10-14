@@ -612,7 +612,6 @@ pub fn router(fake: Fake) -> Router {
             "/api/notes/{id}",
             axum::routing::patch(patch_note).delete(delete_note),
         )
-        .route("/api/ask", post(ask))
         .route("/api/proposals/{id}", get(get_proposal))
         .route("/api/proposals/{id}/accept", post(accept))
         .route("/api/videos/{id}", get(get_video))
@@ -1232,16 +1231,10 @@ async fn delete_note(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn outline_for(req: &AskRequest) -> Outline {
-    let topic_title = req
-        .prompt
-        .split([',', '.'])
-        .next()
-        .unwrap_or("New topic")
-        .trim()
-        .to_string();
+/// A drafted outline for `req`: `lesson_count` lessons on the topic the prompt names.
+fn outline_for(topic_title: &str, req: &AskRequest) -> Outline {
     Outline {
-        topic_title: topic_title.clone(),
+        topic_title: topic_title.to_string(),
         subject_title: "Signals & Systems".into(),
         lessons: (1..=req.lesson_count)
             .map(|n| OutlineLesson {
@@ -1253,60 +1246,6 @@ fn outline_for(req: &AskRequest) -> Outline {
     }
 }
 
-async fn ask(
-    State(fake): State<Fake>,
-    headers: HeaderMap,
-    Json(req): Json<AskRequest>,
-) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
-    let (proposal, simulate) = {
-        let mut s = fake.state.lock().unwrap();
-        if !s.has_api_key {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "no_api_key",
-                "Add an OpenAI API key in Settings first.",
-            );
-        }
-        let proposal = Proposal {
-            id: s.id("proposal"),
-            request: req,
-            status: ProposalStatus::Drafting,
-            outline: None,
-            created_at: Utc::now(),
-            chat_id: None,
-        };
-        s.proposals.insert(proposal.id.clone(), proposal.clone());
-        (proposal, s.simulate)
-    };
-    publish(
-        &fake,
-        Event::ProposalChanged {
-            proposal: proposal.clone(),
-        },
-    );
-    if simulate {
-        let fake = fake.clone();
-        let id = proposal.id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let ready = {
-                let mut s = fake.state.lock().unwrap();
-                let Some(p) = s.proposals.get_mut(&id) else {
-                    return;
-                };
-                p.outline = Some(outline_for(&p.request));
-                p.status = ProposalStatus::Ready;
-                p.clone()
-            };
-            publish(&fake, Event::ProposalChanged { proposal: ready });
-        });
-    }
-    Json(proposal).into_response()
-}
-
 async fn get_proposal(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -1315,36 +1254,83 @@ async fn get_proposal(
     if let Err(r) = authorized(&headers) {
         return r;
     }
-    let mut s = fake.state.lock().unwrap();
-    let simulate = s.simulate;
-    let Some(p) = s.proposals.get_mut(&id) else {
-        return not_found();
-    };
-    if !simulate && p.status == ProposalStatus::Drafting {
-        p.outline = Some(outline_for(&p.request));
-        p.status = ProposalStatus::Ready;
+    let s = fake.state.lock().unwrap();
+    match s.proposals.get(&id) {
+        Some(p) => Json(p.clone()).into_response(),
+        None => not_found(),
     }
-    Json(p.clone()).into_response()
 }
 
-async fn accept(
-    State(fake): State<Fake>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(req): Json<AcceptProposal>,
-) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
-    let (topic, created, simulate, proposal) = {
-        let mut s = fake.state.lock().unwrap();
-        let Some(p) = s.proposals.get(&id).cloned() else {
-            return not_found();
+/// What accepting a proposal made: the topic, its lessons, and the events to publish.
+struct Accepted {
+    topic: Topic,
+    lessons: Vec<Lesson>,
+    videos: Vec<Video>,
+    events: Vec<Event>,
+}
+
+impl FakeState {
+    /// Accept proposal `id` as `req` (Create lessons, or the agent's `accept_proposal`):
+    /// the topic and its lessons are created with the chips' options, the proposal's
+    /// sources move to the topic, and (`tell_chat`, for Create lessons) the chat that
+    /// proposed it hears about it.
+    #[allow(clippy::result_large_err)]
+    fn accept_proposal(
+        &mut self,
+        id: &str,
+        req: &AcceptProposal,
+        tell_chat: bool,
+    ) -> Result<Accepted, Response> {
+        let Some(p) = self.proposals.get(id).cloned() else {
+            return Err(not_found());
         };
+        match &p.status {
+            ProposalStatus::Ready => {}
+            ProposalStatus::Accepted { .. } => {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "already_accepted",
+                    "This outline was already turned into lessons.",
+                ));
+            }
+            ProposalStatus::Drafting => {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "proposal_not_ready",
+                    "The outline is still being written.",
+                ));
+            }
+            ProposalStatus::Failed { .. } => {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "proposal_failed",
+                    "This outline failed. Ask again.",
+                ));
+            }
+        }
+        if req.outline.topic_title.trim().is_empty()
+            || req.outline.lessons.is_empty()
+            || req.outline.lessons.len() > 12
+            || req
+                .outline
+                .lessons
+                .iter()
+                .any(|l| l.title.trim().is_empty())
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "The outline needs a topic title and 1 to 12 lessons with titles.",
+            ));
+        }
+        let level = req.chips.level.unwrap_or(p.request.level);
+        let with_videos = req.chips.with_videos.unwrap_or(p.request.with_videos);
+        let with_quiz = req.chips.with_quiz.unwrap_or(p.request.with_quiz);
+        let mut events = Vec::new();
         let parent = match p.request.parent_topic_id.clone() {
             Some(parent) => parent,
             None => {
-                let existing = s
+                let existing = self
                     .library
                     .topics
                     .iter()
@@ -1357,7 +1343,7 @@ async fn accept(
                     Some(id) => id,
                     None => {
                         let subject = Topic {
-                            id: s.id("topic"),
+                            id: self.id("topic"),
                             parent_id: None,
                             title: req.outline.subject_title.clone(),
                             position: 99,
@@ -1365,87 +1351,174 @@ async fn accept(
                             updated_at: Utc::now(),
                         };
                         let sid = subject.id.clone();
-                        s.library.topics.push(subject);
+                        self.library.topics.push(subject.clone());
+                        events.push(Event::TopicChanged { topic: subject });
                         sid
                     }
                 }
             }
         };
         let topic = Topic {
-            id: s.id("topic"),
+            id: self.id("topic"),
             parent_id: Some(parent),
             title: req.outline.topic_title.clone(),
             position: 99,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        s.library.topics.push(topic.clone());
-        let mut created = Vec::new();
+        self.library.topics.push(topic.clone());
+        events.push(Event::TopicChanged {
+            topic: topic.clone(),
+        });
+        let mut lessons = Vec::new();
         for (i, l) in req.outline.lessons.iter().enumerate() {
             let lesson = Lesson {
                 citations: Vec::new(),
-                id: s.id("lesson"),
+                id: self.id("lesson"),
                 topic_id: topic.id.clone(),
                 title: l.title.clone(),
                 summary: l.summary.clone(),
                 position: i as i64,
-                level: p.request.level,
+                level,
                 minutes: l.minutes,
                 body_md: String::new(),
                 status: LessonStatus::Queued,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             };
-            s.library.lessons.push(lesson.clone());
-            created.push(lesson);
+            self.library.lessons.push(lesson.clone());
+            events.push(Event::LessonChanged {
+                lesson: lesson.clone(),
+            });
+            lessons.push(lesson);
+        }
+        // With videos: each lesson's video waits for its lesson.
+        let mut videos = Vec::new();
+        if with_videos {
+            for lesson in &lessons {
+                let video = Video {
+                    id: self.id("video"),
+                    lesson_id: lesson.id.clone(),
+                    status: VideoStatus::Queued,
+                    scene_code: None,
+                    log: String::new(),
+                    duration_seconds: None,
+                    media: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                self.library.videos.push(video.clone());
+                events.push(Event::VideoChanged {
+                    video: video.clone(),
+                });
+                videos.push(video);
+            }
         }
         // The proposal's sources now belong to the new topic.
-        for src in s.library.sources.iter_mut() {
+        for src in self.library.sources.iter_mut() {
             if src.topic_id.is_none() && p.request.source_ids.contains(&src.id) {
                 src.topic_id = Some(topic.id.clone());
+                events.push(Event::SourceChanged {
+                    source: src.clone(),
+                });
             }
         }
         let proposal = {
-            let p = s.proposals.get_mut(&id).unwrap();
+            let p = self.proposals.get_mut(id).unwrap();
             p.status = ProposalStatus::Accepted {
                 topic_id: topic.id.clone(),
             };
             p.outline = Some(req.outline.clone());
+            // What it was made with, chips included.
+            p.request.level = level;
+            p.request.with_videos = with_videos;
+            p.request.with_quiz = with_quiz;
             p.clone()
         };
-        (topic, created, s.simulate, proposal)
-    };
-    let topics: Vec<Topic> = fake.state.lock().unwrap().library.topics.clone();
-    for t in topics {
-        publish(&fake, Event::TopicChanged { topic: t });
-    }
-    for lesson in &created {
-        publish(
-            &fake,
-            Event::LessonChanged {
-                lesson: lesson.clone(),
-            },
-        );
-    }
-    let attached: Vec<Source> = {
-        let s = fake.state.lock().unwrap();
-        s.library
-            .sources
-            .iter()
-            .filter(|src| src.topic_id.as_deref() == Some(topic.id.as_str()))
-            .cloned()
-            .collect()
-    };
-    for source in attached {
-        publish(&fake, Event::SourceChanged { source });
-    }
-    publish(&fake, Event::ProposalChanged { proposal });
-    if simulate {
-        for lesson in created {
-            tokio::spawn(simulate_lesson(fake.clone(), lesson.id));
+        events.push(Event::ProposalChanged { proposal });
+        // The chat that proposed it knows, for its next answer.
+        if let Some(chat_id) = p.chat_id.as_ref().filter(|_| tell_chat) {
+            let turn_id = self.chats.iter().find(|c| &c.id == chat_id).and_then(|c| {
+                c.state.turn_id().map(str::to_string).or_else(|| {
+                    self.chat_items
+                        .get(chat_id)
+                        .and_then(|items| items.last())
+                        .map(|i| i.turn_id.clone())
+                })
+            });
+            if let Some(turn_id) = turn_id {
+                let n = lessons.len();
+                let action = self.add_item(
+                    chat_id,
+                    &turn_id,
+                    ItemStatus::Done,
+                    ChatItemKind::Action {
+                        text: format!(
+                            "Created the course “{}” with {n} {}.",
+                            topic.title,
+                            if n == 1 { "lesson" } else { "lessons" }
+                        ),
+                    },
+                );
+                events.push(Event::ChatItemChanged { item: action });
+            }
         }
+        Ok(Accepted {
+            topic,
+            lessons,
+            videos,
+            events,
+        })
     }
-    Json(topic).into_response()
+}
+
+/// While simulating, the new lessons are written and then their videos made.
+fn simulate_course(fake: &Fake, accepted: &Accepted) {
+    if !fake.state.lock().unwrap().simulate {
+        return;
+    }
+    for lesson in &accepted.lessons {
+        let video = accepted
+            .videos
+            .iter()
+            .find(|v| v.lesson_id == lesson.id)
+            .map(|v| v.id.clone());
+        let (fake, lesson_id) = (fake.clone(), lesson.id.clone());
+        tokio::spawn(async move {
+            simulate_lesson(fake.clone(), lesson_id).await;
+            if let Some(video) = video {
+                simulate_video(fake, video).await;
+            }
+        });
+    }
+}
+
+async fn accept(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AcceptProposal>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let accepted = {
+        let mut s = fake.state.lock().unwrap();
+        if !s.has_api_key {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "no_api_key",
+                "Add an OpenAI API key in Settings first.",
+            );
+        }
+        match s.accept_proposal(&id, &req, true) {
+            Ok(accepted) => accepted,
+            Err(r) => return r,
+        }
+    };
+    publish_all(&fake, accepted.events.clone());
+    simulate_course(&fake, &accepted);
+    Json(accepted.topic).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -2357,7 +2430,10 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
 // Chats: a scripted stand-in for the agent. A message is answered with a reasoning
 // summary, a `search_library` call over the fake library and a short Markdown answer;
 // "source" adds a `search_sources` call with a Passages card, "delete" asks to delete a
-// note (a confirmation card), "fail" ends the turn on a retryable error. With
+// note (a confirmation card), "fail" ends the turn on a retryable error. Asking for a
+// course ("course", "outline", "teach me", …) proposes one with `propose_course` (an
+// outline card); "go ahead" then accepts the chat's outline with `accept_proposal` (a
+// result card). With
 // `simulate` the answer streams in over a few seconds; otherwise it is written before
 // the request is answered, or, with `chat_hang`, stops part-way and stays running.
 // ---------------------------------------------------------------------------
@@ -2514,6 +2590,66 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             c2,
         ),
     ]
+}
+
+/// A course the agent proposed in chat `chat_id` (`p-sample`), Ready, or created as the
+/// topic `created`. For screenshots and render tests of the outline card.
+pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
+    let request = AskRequest {
+        prompt: "A course on control theory".into(),
+        lesson_count: 3,
+        level: Level::Intermediate,
+        with_videos: false,
+        with_quiz: true,
+        parent_topic_id: None,
+        source_ids: vec![],
+    };
+    let mut outline = outline_for("Control theory", &request);
+    outline.subject_title = "Engineering".into();
+    for (lesson, (title, summary)) in outline.lessons.iter_mut().zip([
+        (
+            "Feedback loops",
+            "Why feeding the output back steadies a system",
+        ),
+        (
+            "Transfer functions",
+            "Systems as ratios of polynomials in s",
+        ),
+        ("Stability", "What the poles say about where a system goes"),
+    ]) {
+        lesson.title = title.into();
+        lesson.summary = summary.into();
+    }
+    Proposal {
+        id: "p-sample".into(),
+        request,
+        status: match created {
+            Some(topic_id) => ProposalStatus::Accepted {
+                topic_id: topic_id.into(),
+            },
+            None => ProposalStatus::Ready,
+        },
+        outline: Some(outline),
+        created_at: ts(60),
+        chat_id: Some(chat_id.into()),
+    }
+}
+
+/// A card in chat `chat_id`, as the last item of turn `t2`.
+pub fn sample_card(chat_id: &str, seq: u64, card: Card) -> ChatItem {
+    ChatItem {
+        id: format!("{chat_id}-card{seq}"),
+        chat_id: chat_id.into(),
+        turn_id: "t2".into(),
+        seq,
+        status: ItemStatus::Done,
+        created_at: ts(40 + seq as i64),
+        updated_at: ts(40 + seq as i64),
+        kind: ChatItemKind::Card {
+            call_id: format!("call_card{seq}"),
+            card,
+        },
+    }
 }
 
 /// What the sample chat's tool calls returned (`call_1`, `call_2`).
@@ -2964,6 +3100,266 @@ fn library_matches(s: &FakeState, prompt: &str) -> Vec<SearchHit> {
     hits
 }
 
+/// Whether a message asks for a course (the agent proposes an outline).
+fn wants_course(lower: &str) -> bool {
+    [
+        "course",
+        "outline",
+        "teach me",
+        "lessons on",
+        "lessons about",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// Whether a message says to go ahead with the chat's outline (the agent accepts it).
+fn wants_accept(lower: &str) -> bool {
+    [
+        "go ahead",
+        "create it",
+        "create the lessons",
+        "create lessons",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// What a message asking for a course says, the rest inferred as the agent would: the
+/// topic ("… on control theory, with videos" → "Control theory") and the request (a
+/// number in the message is the lesson count, else 4; "intermediate"/"advanced" set the
+/// level; "video" asks for videos; "no quiz" leaves the quiz out).
+fn course_request(prompt: &str, source_ids: Vec<Id>) -> (String, AskRequest) {
+    let lower = prompt.to_lowercase();
+    let start = [" on ", " about "]
+        .iter()
+        .filter_map(|w| lower.find(w).map(|at| at + w.len()))
+        .min()
+        .unwrap_or(0);
+    let rest = &prompt[start..];
+    let end = [",", ".", "?", "!", " with ", " in "]
+        .iter()
+        .filter_map(|w| rest.find(w))
+        .min()
+        .unwrap_or(rest.len());
+    let mut chars = rest[..end].trim().chars();
+    let topic: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    };
+    let topic = if topic.is_empty() {
+        "New topic".to_string()
+    } else {
+        topic
+    };
+    let lesson_count = prompt
+        .split(|c: char| !c.is_ascii_digit())
+        .find_map(|n| n.parse::<u32>().ok())
+        .filter(|n| (1..=12).contains(n))
+        .unwrap_or(4);
+    let level = if lower.contains("advanced") {
+        Level::Advanced
+    } else if lower.contains("intermediate") {
+        Level::Intermediate
+    } else {
+        Level::Intro
+    };
+    let request = AskRequest {
+        prompt: prompt.trim().to_string(),
+        lesson_count,
+        level,
+        with_videos: lower.contains("video"),
+        with_quiz: !lower.contains("no quiz"),
+        parent_topic_id: None,
+        source_ids,
+    };
+    (topic, request)
+}
+
+/// `propose_course`: the outline is stored as a Ready proposal of this chat and shown as
+/// an outline card, then the answer says what to do with it.
+async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str) {
+    let source_ids = {
+        let s = fake.state.lock().unwrap();
+        s.chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .map(|c| c.source_ids.clone())
+            .unwrap_or_default()
+    };
+    let (topic, request) = course_request(prompt, source_ids);
+    let outline = outline_for(&topic, &request);
+    let arguments = serde_json::json!({
+        "prompt": request.prompt,
+        "topic_title": outline.topic_title,
+        "subject_title": outline.subject_title,
+        "lessons": outline.lessons,
+        "level": request.level,
+        "with_videos": request.with_videos,
+        "with_quiz": request.with_quiz,
+        "parent_topic_id": null,
+        "source_ids": request.source_ids,
+    });
+    let n = outline.lessons.len();
+    let Some(proposal) = step(fake, chat_id, turn_id, |s| {
+        let proposal = Proposal {
+            id: s.id("proposal"),
+            request: request.clone(),
+            status: ProposalStatus::Ready,
+            outline: Some(outline.clone()),
+            created_at: Utc::now(),
+            chat_id: Some(chat_id.into()),
+        };
+        s.proposals.insert(proposal.id.clone(), proposal.clone());
+        (
+            vec![Event::ProposalChanged {
+                proposal: proposal.clone(),
+            }],
+            proposal,
+        )
+    }) else {
+        return;
+    };
+    let Some(call_id) = tool_call(
+        fake,
+        chat_id,
+        turn_id,
+        "propose_course",
+        arguments,
+        format!("Outlining a course on “{topic}”"),
+        format!("Proposed {n} lessons"),
+        serde_json::json!({ "proposal_id": proposal.id, "lessons": n }).to_string(),
+    )
+    .await
+    else {
+        return;
+    };
+    if step(fake, chat_id, turn_id, |s| {
+        let card = s.add_item(
+            chat_id,
+            turn_id,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id,
+                card: Card::Outline(OutlineCard {
+                    proposal_id: proposal.id.clone(),
+                }),
+            },
+        );
+        (vec![Event::ChatItemChanged { item: card }], ())
+    })
+    .is_none()
+    {
+        return;
+    }
+    let mut options = vec![match request.level {
+        Level::Intro => "at an intro level",
+        Level::Intermediate => "at an intermediate level",
+        Level::Advanced => "at an advanced level",
+    }];
+    if request.with_videos {
+        options.push("with a video for each lesson");
+    }
+    if request.with_quiz {
+        options.push("ending with a quiz");
+    }
+    let answer = format!(
+        "Here's an outline for **{topic}**: {n} lessons {}. Edit the lessons or change the options on the card, then press **Create lessons** (or tell me to go ahead).",
+        options.join(", ")
+    );
+    if streamed_item(
+        fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::AssistantText {
+            text: String::new(),
+        },
+        &answer,
+    )
+    .await
+    .is_some()
+    {
+        finish_turn(fake, chat_id, turn_id).await;
+    }
+}
+
+/// `accept_proposal` ("go ahead"): the chat's outline becomes a course as it was
+/// proposed, shown as a result card for the topic.
+async fn accept_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, proposal: Proposal) {
+    let Some(outline) = proposal.outline.clone() else {
+        return;
+    };
+    let Some(accepted) = step(fake, chat_id, turn_id, |s| {
+        let req = AcceptProposal {
+            outline,
+            chips: OutlineChips::default(),
+        };
+        match s.accept_proposal(&proposal.id, &req, false) {
+            Ok(accepted) => (accepted.events.clone(), Some(accepted)),
+            Err(_) => (vec![], None),
+        }
+    })
+    .flatten() else {
+        return;
+    };
+    simulate_course(fake, &accepted);
+    let n = accepted.lessons.len();
+    let topic = accepted.topic.clone();
+    let Some(call_id) = tool_call(
+        fake,
+        chat_id,
+        turn_id,
+        "accept_proposal",
+        serde_json::json!({ "proposal_id": proposal.id }),
+        format!("Creating the course “{}”", topic.title),
+        format!("Created {n} lessons"),
+        serde_json::json!({ "topic_id": topic.id, "lessons": n }).to_string(),
+    )
+    .await
+    else {
+        return;
+    };
+    if step(fake, chat_id, turn_id, |s| {
+        let card = s.add_item(
+            chat_id,
+            turn_id,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id,
+                card: Card::Result(ResultCard {
+                    target: ResultTarget::Topic {
+                        topic_id: topic.id.clone(),
+                    },
+                    title: topic.title.clone(),
+                }),
+            },
+        );
+        (vec![Event::ChatItemChanged { item: card }], ())
+    })
+    .is_none()
+    {
+        return;
+    }
+    let answer = format!(
+        "Created **{}** with {n} lessons. They're being written now; open the first one from the card when it's ready.",
+        topic.title
+    );
+    if streamed_item(
+        fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::AssistantText {
+            text: String::new(),
+        },
+        &answer,
+    )
+    .await
+    .is_some()
+    {
+        finish_turn(fake, chat_id, turn_id).await;
+    }
+}
+
 /// The scripted answer to `prompt` (see the section comment). `retry` is a Continue or
 /// Retry, which never fails again.
 async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry: bool) {
@@ -3014,6 +3410,27 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
     else {
         return;
     };
+
+    if wants_accept(&lower) {
+        let ready = {
+            let s = fake.state.lock().unwrap();
+            s.proposals
+                .values()
+                .filter(|p| {
+                    p.chat_id.as_deref() == Some(chat_id) && p.status == ProposalStatus::Ready
+                })
+                .max_by_key(|p| p.created_at)
+                .cloned()
+        };
+        if let Some(p) = ready {
+            accept_in_turn(&fake, chat_id, turn_id, p).await;
+            return;
+        }
+    }
+    if wants_course(&lower) {
+        propose_in_turn(&fake, chat_id, turn_id, &prompt).await;
+        return;
+    }
 
     if lower.contains("delete") {
         let note = fake.state.lock().unwrap().library.notes.first().cloned();

@@ -7,7 +7,7 @@
 use dioxus::prelude::*;
 use margin_shared::{
     AcceptProposal, Card, Chat, ChatItem, ChatItemKind, ChatState, ConfirmRequest,
-    ConfirmationCard, Decision, Event, Id, ItemStatus, LessonStatus, NewChat, NewMessage, Outline,
+    ConfirmationCard, Decision, Event, Id, ItemStatus, LessonStatus, NewChat, NewMessage,
     PassagesCard, ProposalStatus, ResultCard, ResultTarget, VideoStatus,
 };
 
@@ -17,8 +17,10 @@ use crate::markdown;
 use crate::routes::{Route, chat_title};
 use crate::state::{AppCtx, LoadStatus, use_app};
 use crate::ui::citations::CitationViewer;
-use crate::ui::common::{ErrorNotice, Icon, Loading, TopBar, focus_first, js, reveal_topic};
-use crate::ui::outline::ProposalView;
+use crate::ui::common::{
+    ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, reveal_topic,
+};
+use crate::ui::outline::{OutlineDraft, ProposalView};
 use crate::ui::settings::SettingsPane;
 use crate::ui::sources::kind_icon;
 
@@ -545,6 +547,17 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         .then(|| error.clone()),
         _ => None,
     };
+    // The question the answer waits on (its card is in the transcript, answerable here).
+    let asking = match &chat.state {
+        ChatState::WaitingForUser { item_id, .. } => items.iter().find_map(|i| match &i.kind {
+            ChatItemKind::Card {
+                card: Card::Confirmation(c),
+                ..
+            } if &i.id == item_id => Some(c.title.clone()),
+            _ => None,
+        }),
+        _ => None,
+    };
     let interrupted = matches!(chat.state, ChatState::Interrupted { .. });
     let pending = chat.pending.clone();
     let acting_now = *acting.read();
@@ -572,6 +585,12 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                     div { class: "chat-working", role: "status",
                         span { class: "spinner xs" }
                         "Working…"
+                    }
+                }
+                if let Some(question) = asking {
+                    div { class: "chat-working", role: "status",
+                        Icon { name: "alert" }
+                        "Waiting for your answer: {question}"
                     }
                 }
                 if let Some(error) = bare_failure {
@@ -1005,7 +1024,7 @@ fn CardRow(item: ChatItem, chat: Chat) -> Element {
         Card::Passages(card) => rsx! { PassagesView { item_id: item.id.clone(), card } },
         Card::Result(card) => rsx! { ResultView { card } },
         Card::Confirmation(card) => {
-            rsx! { ConfirmationView { item_id: item.id.clone(), card, chat } }
+            rsx! { ConfirmationView { item: item.clone(), card, chat } }
         }
         Card::Outline(card) => rsx! { OutlineView { proposal_id: card.proposal_id } },
     }
@@ -1175,36 +1194,110 @@ fn ResultView(card: ResultCard) -> Element {
     }
 }
 
-/// What the agent wants to do that needs the owner's OK; answerable from any device
-/// while the answer waits on it.
-#[component]
-fn ConfirmationView(item_id: Id, card: ConfirmationCard, chat: Chat) -> Element {
-    let app = use_app();
-    let mut busy = use_signal(|| false);
-    let mut error = use_signal(|| None::<String>);
-    let waiting = matches!(&chat.state, ChatState::WaitingForUser { item_id: w, .. } if *w == item_id)
-        && card.decision == Decision::Pending;
-    let device_name = |id: &str| app.lib.read().devices.get(id).map(|d| d.name.clone());
-    let outcome = match &card.decision {
+/// Where a confirmation was answered, for its settled line: "this device", the device's
+/// name, or "another device" for one this app doesn't know (since revoked, say).
+pub fn decided_where(device_id: &str, me: Option<&str>, name: Option<&str>) -> String {
+    if me == Some(device_id) {
+        "this device".to_string()
+    } else {
+        name.map_or_else(|| "another device".to_string(), str::to_string)
+    }
+}
+
+/// How a settled confirmation went, in a line ("Approved on iPhone"); `None` while it
+/// waits for an answer. `waiting`: the turn is parked on this card.
+pub fn decision_text(
+    decision: &Decision,
+    waiting: bool,
+    place: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    match decision {
         Decision::Pending if waiting => None,
         Decision::Pending => Some("No longer waiting for an answer".to_string()),
-        Decision::Approved { device_id } => Some(match device_name(device_id) {
-            Some(name) => format!("Approved on {name}"),
-            None => "Approved".to_string(),
-        }),
-        Decision::Denied { by_stop: true, .. } => Some("Stopped before you answered".to_string()),
-        Decision::Denied { device_id, .. } => Some(match device_name(device_id) {
-            Some(name) => format!("Declined on {name}"),
-            None => "Declined".to_string(),
-        }),
-        Decision::Expired => Some("The service restarted before you answered".to_string()),
+        Decision::Approved { device_id } => Some(format!("Approved on {}", place(device_id))),
+        Decision::Denied {
+            device_id,
+            by_stop: false,
+        } => Some(format!("Denied on {}", place(device_id))),
+        Decision::Denied {
+            device_id,
+            by_stop: true,
+        } => Some(format!(
+            "Stopped on {} before anyone answered",
+            place(device_id)
+        )),
+        Decision::Expired => {
+            Some("Expired: the service restarted before anyone answered".to_string())
+        }
+    }
+}
+
+/// What the agent wants to do that needs the owner's OK: the action in plain words, then
+/// Deny or Approve (the tool's own word, "Delete" or "Replace"), answerable from any
+/// device while the answer waits on it. Once settled it says how, where and when.
+#[component]
+fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Element {
+    let app = use_app();
+    // The answer being sent: Some(true) approving, Some(false) denying.
+    let mut sending = use_signal(|| None::<bool>);
+    let mut error = use_signal(|| None::<String>);
+    let item_id = item.id.clone();
+    let waiting = matches!(&chat.state, ChatState::WaitingForUser { item_id: w, .. } if *w == item_id)
+        && card.decision == Decision::Pending;
+    let decided_on = match &card.decision {
+        Decision::Approved { device_id } | Decision::Denied { device_id, .. } => {
+            Some(device_id.clone())
+        }
+        _ => None,
     };
+    // Name the device it was answered on, fetching the devices when it isn't known here.
+    let lookup = decided_on.clone();
+    use_effect(use_reactive!(|lookup| {
+        let Some(id) = lookup else { return };
+        if app.lib.peek().devices.contains_key(&id) {
+            return;
+        }
+        spawn(async move {
+            let Some(api) = app.api() else { return };
+            if let Ok(devices) = api.devices().await {
+                let mut lib = app.lib;
+                lib.write().merge_devices(devices);
+            }
+        });
+    }));
+    let me = app
+        .session
+        .read()
+        .as_ref()
+        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let outcome = {
+        let lib = app.lib.read();
+        let items = lib.chat_items.get(&chat.id);
+        let place = |id: &str| {
+            // A device's name as the service knows it, else as it signed a message here.
+            let name = lib.devices.get(id).map(|d| d.name.clone()).or_else(|| {
+                items.and_then(|items| {
+                    items.iter().find_map(|i| match &i.kind {
+                        ChatItemKind::UserMessage {
+                            device_id,
+                            device_name,
+                            ..
+                        } if device_id == id => Some(device_name.clone()),
+                        _ => None,
+                    })
+                })
+            });
+            decided_where(id, me.as_deref(), name.as_deref())
+        };
+        decision_text(&card.decision, waiting, &place)
+    };
+    let when = ago(&item.updated_at);
     let answer = move |approve: bool| {
         let chat_id = chat.id.clone();
         let item_id = item_id.clone();
         spawn(async move {
             let Some(api) = app.api() else { return };
-            busy.set(true);
+            sending.set(Some(approve));
             error.set(None);
             match api
                 .confirm(&chat_id, &ConfirmRequest { item_id, approve })
@@ -1214,19 +1307,34 @@ fn ConfirmationView(item_id: Id, card: ConfirmationCard, chat: Chat) -> Element 
                     let mut lib = app.lib;
                     lib.write().upsert_chat(chat);
                 }
+                // Answered on another device first (or stopped): show it as it is now.
                 Err(e) if e.status == Some(409) => {
                     let _ = fetch_chat(app, chat_id).await;
                 }
                 Err(e) => error.set(Some(app.failure(&e))),
             }
-            busy.set(false);
+            sending.set(None);
         });
     };
     let (deny, approve) = (answer.clone(), answer);
     let danger = card.tool.starts_with("delete");
+    let in_flight = *sending.read();
+    let head_icon = if danger { "trash" } else { "alert" };
+    let (icon, settled_class) = match &card.decision {
+        Decision::Approved { .. } => ("check", "confirm-done ok"),
+        Decision::Denied { by_stop: true, .. } => ("stop", "confirm-done"),
+        Decision::Denied { .. } => ("x", "confirm-done"),
+        _ => ("alert", "confirm-done"),
+    };
     rsx! {
-        section { class: "chat-card confirm-card", role: "group", "aria-label": "{card.title}",
-            b { "{card.title}" }
+        section {
+            class: if waiting { "chat-card confirm-card waiting" } else { "chat-card confirm-card" },
+            role: "group",
+            "aria-label": "{card.title}",
+            div { class: "chat-card-h",
+                Icon { name: head_icon }
+                b { "{card.title}" }
+            }
             if !card.detail.is_empty() {
                 p { "{card.detail}" }
             }
@@ -1241,31 +1349,55 @@ fn ConfirmationView(item_id: Id, card: ConfirmationCard, chat: Chat) -> Element 
                     div { class: "row-actions",
                         button {
                             class: "btn btn-secondary btn-sm",
-                            disabled: *busy.read(),
+                            disabled: in_flight.is_some(),
                             onclick: move |_| deny(false),
-                            "Don't"
+                            if in_flight == Some(false) { span { class: "spinner" } }
+                            "Deny"
                         }
                         button {
                             class: if danger { "btn btn-danger btn-sm" } else { "btn btn-primary btn-sm" },
-                            disabled: *busy.read(),
+                            disabled: in_flight.is_some(),
                             onclick: move |_| approve(true),
-                            if *busy.read() { span { class: "spinner" } }
+                            if in_flight == Some(true) { span { class: "spinner" } }
                             "{card.approve_label}"
                         }
                     }
                 },
-                Some(text) => rsx! { small { class: "faint", "{text}" } },
+                Some(text) => rsx! {
+                    p { class: "{settled_class}", role: "status",
+                        Icon { name: icon }
+                        span { "{text}" }
+                        if card.decision != Decision::Pending {
+                            span { class: "faint", " · {when}" }
+                        }
+                    }
+                },
             }
         }
     }
 }
 
-/// A proposed course outline: the outline editor with Create lessons.
+/// A proposed course outline: the outline editor with its chips and Create lessons, and
+/// once created (here or on another device), the course with links to it.
 #[component]
 fn OutlineView(proposal_id: Id) -> Element {
     let app = use_app();
-    let nav = navigator();
-    let mut draft = use_signal(|| None::<Outline>);
+    // Edits not yet created survive a look elsewhere (`AppCtx::outline_drafts`); else the
+    // outline as proposed, when it's here and ready.
+    let initial = app
+        .outline_drafts
+        .peek()
+        .get(&proposal_id)
+        .cloned()
+        .or_else(|| {
+            app.lib
+                .peek()
+                .proposals
+                .get(&proposal_id)
+                .filter(|p| p.status == ProposalStatus::Ready)
+                .and_then(OutlineDraft::of)
+        });
+    let mut draft = use_signal(|| initial);
     let mut accepting = use_signal(|| false);
     let mut accept_error = use_signal(|| None::<ApiFailure>);
     let mut fetch_error = use_signal(|| None::<ApiFailure>);
@@ -1283,7 +1415,10 @@ fn OutlineView(proposal_id: Id) -> Element {
                     let mut lib = app.lib;
                     lib.write().apply(Event::ProposalChanged { proposal });
                 }
-                Err(e) => fetch_error.set(Some(e)),
+                Err(e) => {
+                    app.failure(&e);
+                    fetch_error.set(Some(e));
+                }
             }
         }
     });
@@ -1294,12 +1429,41 @@ fn OutlineView(proposal_id: Id) -> Element {
         if let Some(p) = p
             && p.status == ProposalStatus::Ready
             && draft.peek().is_none()
-            && let Some(outline) = p.outline
+            && let Some(d) = OutlineDraft::of(&p)
         {
-            draft.set(Some(outline));
+            draft.set(Some(d));
         }
     });
-    let proposal = app.lib.read().proposals.get(&proposal_id).cloned();
+    // Keep the edits in the app while they're not created; drop them once the outline is
+    // created (here or on another device).
+    let keep_id = proposal_id.clone();
+    use_effect(move || {
+        let ready = app
+            .lib
+            .read()
+            .proposals
+            .get(&keep_id)
+            .map(|p| p.status == ProposalStatus::Ready);
+        let d = draft.read().clone();
+        let mut drafts = app.outline_drafts;
+        match (ready, d) {
+            (Some(true), Some(d)) => {
+                drafts.write().insert(keep_id.clone(), d);
+            }
+            (Some(false), _) if drafts.peek().contains_key(&keep_id) => {
+                drafts.write().remove(&keep_id);
+            }
+            _ => {}
+        }
+    });
+    let lib = app.lib.read();
+    let proposal = lib.proposals.get(&proposal_id).cloned();
+    let subject_name = proposal
+        .as_ref()
+        .and_then(|p| p.request.parent_topic_id.as_ref())
+        .and_then(|id| lib.topics.get(id))
+        .map(|t| t.title.clone());
+    drop(lib);
     let Some(proposal) = proposal else {
         return match fetch_error.read().clone() {
             Some(e) => {
@@ -1308,39 +1472,61 @@ fn OutlineView(proposal_id: Id) -> Element {
             None => rsx! { Loading { label: "Loading the outline…" } },
         };
     };
+    let request = proposal.request.clone();
     rsx! {
-        div { class: "chat-card outline-card",
+        section { class: "chat-card outline-card", "aria-label": "Proposed course",
             ProposalView {
                 proposal: proposal.clone(),
                 draft,
-                subject_name: None,
+                subject_name,
                 accepting: *accepting.read(),
                 accept_error: accept_error.read().clone(),
-                on_accept: move |outline: Outline| {
+                on_accept: move |d: OutlineDraft| {
                     let id = proposal_id.clone();
+                    let body = AcceptProposal {
+                        outline: d.cleaned(),
+                        chips: d.options.chips(&request),
+                    };
                     spawn(async move {
                         let Some(api) = app.api() else { return };
                         accepting.set(true);
                         accept_error.set(None);
-                        let body = AcceptProposal { outline, chips: Default::default() };
+                        let mut lib = app.lib;
                         match api.accept_proposal(&id, &body).await {
                             Ok(topic) => {
-                                // The new lessons are here before the first one opens.
-                                let mut lib = app.lib;
+                                // The new lessons are here before the card lists them.
                                 if let Ok(library) = api.library().await {
                                     lib.write().replace_library(library);
                                 }
                                 lib.write().apply(Event::TopicChanged { topic: topic.clone() });
-                                let first = lib.peek().first_lesson_in(&topic.id).map(|l| l.id.clone());
+                                // Created: the card shows the course (the service's
+                                // ProposalChanged says the same).
+                                let created = lib.peek().proposals.get(&id).cloned();
+                                if let Some(mut p) = created {
+                                    p.status = ProposalStatus::Accepted { topic_id: topic.id.clone() };
+                                    p.outline = Some(body.outline.clone());
+                                    lib.write().apply(Event::ProposalChanged { proposal: p });
+                                }
                                 let mut collapsed = app.collapsed;
                                 collapsed.write().remove(&topic.id);
-                                accepting.set(false);
-                                match first {
-                                    Some(lesson) => nav.push(Route::LessonRead { id: lesson }),
-                                    None => nav.push(Route::TopicNotes { topic_id: topic.id }),
-                                };
-                                return;
+                                announce(&format!("Created the course {}.", topic.title));
                             }
+                            // Created on another device meanwhile, or no longer
+                            // creatable: show the outline as it is now.
+                            Err(e) if e.status == Some(409) => match api.proposal(&id).await {
+                                Ok(proposal) => {
+                                    let created = matches!(proposal.status, ProposalStatus::Accepted { .. });
+                                    lib.write().apply(Event::ProposalChanged { proposal });
+                                    if created {
+                                        if let Ok(library) = api.library().await {
+                                            lib.write().replace_library(library);
+                                        }
+                                    } else {
+                                        accept_error.set(Some(e));
+                                    }
+                                }
+                                Err(_) => accept_error.set(Some(e)),
+                            },
                             Err(e) => {
                                 app.failure(&e);
                                 accept_error.set(Some(e));
@@ -1713,8 +1899,199 @@ mod tests {
         assert!(html.contains("Note · Deleted"));
         // The question waits for an answer, with the tool's own button.
         assert!(html.contains("Delete the note “Questions for Friday”?"));
-        assert!(html.contains(">Don&#39;t<"), "{html}");
+        assert!(html.contains(">Deny<"), "{html}");
         assert!(html.contains(r#"class="btn btn-danger btn-sm""#), "{html}");
+        assert!(html.contains(r#"class="chat-card confirm-card waiting""#));
+        // The chat says what it waits on.
+        assert!(html.contains("Waiting for your answer: Delete the note “Questions for Friday”?"));
+    }
+
+    fn confirmation(id: &str, seq: u64, decision: Decision) -> ChatItem {
+        item(
+            id,
+            seq,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id: format!("call_{id}"),
+                card: Card::Confirmation(ConfirmationCard {
+                    tool: "replace_note_body".into(),
+                    title: format!("Replace the text of your note “{id}”?"),
+                    detail: "Your own writing in it is replaced.".into(),
+                    approve_label: "Replace".into(),
+                    decision,
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn settled_confirmations_say_how_and_where() {
+        let mut lib = sample();
+        lib.devices.insert(
+            "d2".into(),
+            margin_shared::Device {
+                id: "d2".into(),
+                name: "iPhone".into(),
+                created_at: Utc::now(),
+                last_seen_at: None,
+                current: false,
+                online: false,
+            },
+        );
+        let items = lib.chat_items.get_mut("c1").unwrap();
+        items.push(confirmation(
+            "a",
+            50,
+            Decision::Approved {
+                device_id: "d1".into(),
+            },
+        ));
+        items.push(confirmation(
+            "b",
+            51,
+            Decision::Denied {
+                device_id: "d2".into(),
+                by_stop: false,
+            },
+        ));
+        items.push(confirmation(
+            "c",
+            52,
+            Decision::Denied {
+                device_id: "gone".into(),
+                by_stop: true,
+            },
+        ));
+        items.push(confirmation("d", 53, Decision::Expired));
+        // Pending, but the turn isn't waiting on it any more.
+        items.push(confirmation("e", 54, Decision::Pending));
+        let html = render_route("/chat/c1", lib);
+        assert!(html.contains("Approved on this device"), "{html}");
+        assert!(html.contains("Denied on iPhone"));
+        assert!(html.contains("Stopped on another device before anyone answered"));
+        assert!(html.contains("Expired: the service restarted before anyone answered"));
+        assert!(html.contains("No longer waiting for an answer"));
+        // Nothing left to answer, and not a delete: no buttons, no danger.
+        assert!(!html.contains(">Deny<"));
+        assert!(!html.contains(">Replace<"));
+        assert!(!html.contains("Waiting for your answer"));
+    }
+
+    #[test]
+    fn where_a_confirmation_was_answered() {
+        assert_eq!(decided_where("d1", Some("d1"), Some("Mac")), "this device");
+        assert_eq!(decided_where("d2", Some("d1"), Some("iPhone")), "iPhone");
+        assert_eq!(decided_where("d3", Some("d1"), None), "another device");
+        let place = |id: &str| format!("<{id}>");
+        assert_eq!(decision_text(&Decision::Pending, true, &place), None);
+        assert_eq!(
+            decision_text(
+                &Decision::Denied {
+                    device_id: "x".into(),
+                    by_stop: true
+                },
+                false,
+                &place
+            )
+            .as_deref(),
+            Some("Stopped on <x> before anyone answered")
+        );
+    }
+
+    fn proposal(status: ProposalStatus) -> margin_shared::Proposal {
+        margin_shared::Proposal {
+            id: "p1".into(),
+            request: margin_shared::AskRequest {
+                prompt: "A course on control theory".into(),
+                lesson_count: 2,
+                level: margin_shared::Level::Intermediate,
+                with_videos: false,
+                with_quiz: true,
+                parent_topic_id: None,
+                source_ids: vec![],
+            },
+            status,
+            outline: Some(margin_shared::Outline {
+                topic_title: "Control theory".into(),
+                subject_title: "Engineering".into(),
+                lessons: vec![
+                    margin_shared::OutlineLesson {
+                        title: "Feedback loops".into(),
+                        summary: "Why feedback steadies a system".into(),
+                        minutes: 10,
+                    },
+                    margin_shared::OutlineLesson {
+                        title: "Stability".into(),
+                        summary: "Poles and what they say".into(),
+                        minutes: 12,
+                    },
+                ],
+            }),
+            created_at: Utc::now(),
+            chat_id: Some("c1".into()),
+        }
+    }
+
+    fn with_outline_card(status: ProposalStatus) -> LibraryState {
+        let mut lib = sample();
+        let p = proposal(status);
+        lib.proposals.insert(p.id.clone(), p);
+        lib.chat_items.get_mut("c1").unwrap().push(item(
+            "k-outline",
+            60,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id: "call_p".into(),
+                card: Card::Outline(margin_shared::OutlineCard {
+                    proposal_id: "p1".into(),
+                }),
+            },
+        ));
+        lib
+    }
+
+    #[test]
+    fn outline_card_offers_its_chips_and_create_lessons() {
+        let html = render_route("/chat/c1", with_outline_card(ProposalStatus::Ready));
+        assert!(html.contains("Proposed outline"), "{html}");
+        assert!(html.contains("Engineering · 2 lessons · ~22 min"));
+        assert!(html.contains("Feedback loops"));
+        assert!(html.contains("Poles and what they say"));
+        // The chips start as the proposal asked: intermediate, no videos, a quiz.
+        assert!(html.contains(r#"aria-label="Course options""#));
+        assert!(
+            html.contains(r#"<option value="intermediate" selected"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-pressed="false">"#));
+        assert!(html.contains("With videos"));
+        assert!(html.contains("Quiz at the end"));
+        assert!(html.contains(">Edit outline<"));
+        assert!(html.contains(">Create lessons<"));
+        // The old composer's Discard is gone with it.
+        assert!(!html.contains(">Discard<"));
+    }
+
+    #[test]
+    fn created_outline_card_shows_the_course() {
+        let mut lib = with_outline_card(ProposalStatus::Accepted {
+            topic_id: "fourier".into(),
+        });
+        let html = render_route("/chat/c1", lib.clone());
+        assert!(html.contains("Course created"), "{html}");
+        assert!(html.contains("New topic: "));
+        assert!(html.contains("Lessons in Fourier series"));
+        assert!(html.contains("Why sums of sines?"));
+        assert!(html.contains(">Open the first lesson<"));
+        assert!(html.contains(">Topic notes<"));
+        assert!(html.contains(">Show in sidebar<"));
+        assert!(!html.contains(">Create lessons<"));
+        // The course deleted since: the card says so.
+        lib.topics.remove("fourier");
+        let html = render_route("/chat/c1", lib);
+        assert!(
+            html.contains("The course “Control theory” was created, and has since been deleted.")
+        );
     }
 
     #[test]

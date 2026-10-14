@@ -1,12 +1,9 @@
 //! Sources in the app: adding files and folders (with the platform's picker, see
-//! `crate::picker`), the upload queue, rows with live status, the Ask composer's
-//! attachments, a topic's Sources dialog, and the notice for the embedding model the
-//! service needs to read them.
-
-use std::collections::HashSet;
+//! `crate::picker`), the upload queue, rows with live status, a topic's Sources
+//! dialog, and the notice for the embedding model the service needs to read them.
 
 use dioxus::prelude::*;
-use margin_shared::{EmbeddingModelState, Event, Id, SOURCE_KINDS, Source, SourceKind};
+use margin_shared::{EmbeddingModelState, Event, Id, Source, SourceKind};
 
 use crate::picker;
 use crate::sources::{Tone, Upload, UploadState, human_bytes, status_text};
@@ -29,9 +26,9 @@ pub fn kind_icon(kind: SourceKind) -> &'static str {
     }
 }
 
-/// Pick files (or a folder), queue them for upload to `topic_id` (`None`: the Ask
-/// composer), and say what was left out.
-pub async fn add_sources(app: AppCtx, topic_id: Option<Id>, folder: bool) -> Option<String> {
+/// Pick files (or a folder), queue them for upload to `topic_id`, and say what was left
+/// out.
+pub async fn add_sources(app: AppCtx, topic_id: Id, folder: bool) -> Option<String> {
     let selection = picker::pick(folder).await?;
     let mut note = selection.summary();
     if selection.files.is_empty() && note.is_none() {
@@ -45,7 +42,7 @@ pub async fn add_sources(app: AppCtx, topic_id: Option<Id>, folder: bool) -> Opt
         selection
             .files
             .into_iter()
-            .map(|c| Upload::new(c, topic_id.clone())),
+            .map(|c| Upload::new(c, Some(topic_id.clone()))),
     );
     pump(app);
     note
@@ -308,253 +305,6 @@ fn UploadActions(
     }
 }
 
-/// The Ask composer's "Sources" chip: add files or a folder.
-#[component]
-pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
-    let app = use_app();
-    let mut open = use_signal(|| false);
-    let mut picking = use_signal(|| false);
-    let mut add = move |folder: bool| {
-        open.set(false);
-        if *picking.peek() {
-            return;
-        }
-        spawn(async move {
-            picking.set(true);
-            let note = add_sources(app, None, folder).await;
-            picking.set(false);
-            on_note.call(note);
-        });
-    };
-    rsx! {
-        div { class: "pop-anchor",
-            button {
-                class: "chip",
-                "aria-haspopup": "menu",
-                "aria-expanded": open.read().to_string(),
-                title: "Add {SOURCE_KINDS} files, or a folder of them, for the lessons to draw on",
-                disabled: *picking.read(),
-                onclick: move |_| open.toggle(),
-                if *picking.read() {
-                    span { class: "spinner" }
-                } else {
-                    Icon { name: "clip" }
-                }
-                "Sources"
-            }
-            if *open.read() {
-                div { class: "pop-scrim", onclick: move |_| open.set(false) }
-                div {
-                    class: "menu below",
-                    role: "menu",
-                    onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); open.set(false) },
-                    button { role: "menuitem", onmounted: crate::ui::common::focus_on_mount, onclick: move |_| add(false),
-                        Icon { name: "file-add" }
-                        "Add files…"
-                    }
-                    button { role: "menuitem", onclick: move |_| add(true),
-                        Icon { name: "folder" }
-                        "Add folder…"
-                    }
-                    p { class: "menu-note", {crate::sources::kinds_text()} }
-                }
-            }
-        }
-    }
-}
-
-/// One line in the composer's list, with its status worked out.
-#[derive(Clone, PartialEq)]
-struct Line {
-    upload: Upload,
-    tone: Tone,
-    status: String,
-}
-
-#[derive(Clone, PartialEq)]
-enum Entry {
-    File(Box<Line>),
-    Folder(String, Vec<Line>),
-}
-
-/// "12 files · 9 ready · 2 in progress · 1 failed", and the dot for the whole folder.
-fn folder_status(lines: &[Line]) -> (Tone, String) {
-    let count = |tone: Tone| lines.iter().filter(|l| l.tone == tone).count();
-    let (warned, failed) = (count(Tone::Warning), count(Tone::Failed));
-    let ready = count(Tone::Ready) + warned;
-    let working = count(Tone::Working) + count(Tone::Waiting);
-    let mut parts = vec![if lines.len() == 1 {
-        "1 file".to_string()
-    } else {
-        format!("{} files", lines.len())
-    }];
-    if ready > 0 {
-        parts.push(format!("{ready} ready"));
-    }
-    if warned > 0 {
-        parts.push(format!("{warned} not fully read"));
-    }
-    if working > 0 {
-        parts.push(format!("{working} in progress"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    let tone = if working > 0 {
-        Tone::Working
-    } else if failed > 0 {
-        Tone::Failed
-    } else if warned > 0 {
-        Tone::Warning
-    } else {
-        Tone::Ready
-    };
-    (tone, parts.join(" · "))
-}
-
-/// The files added in the Ask composer, under it: loose files, and folders that open to
-/// show their files. Each can be removed; removing an uploaded one deletes it.
-#[component]
-pub fn AskAttachments() -> Element {
-    let app = use_app();
-    let mut expanded = use_signal(HashSet::<String>::new);
-    let mut error = use_signal(|| None::<String>);
-
-    let lib = app.lib.read();
-    let mut entries: Vec<Entry> = Vec::new();
-    for upload in app.uploads.read().iter().filter(|u| u.topic_id.is_none()) {
-        let (tone, status) = upload_status(upload, &lib);
-        let line = Line {
-            upload: upload.clone(),
-            tone,
-            status,
-        };
-        match &upload.folder {
-            None => entries.push(Entry::File(Box::new(line))),
-            Some(folder) => {
-                let existing = entries
-                    .iter_mut()
-                    .find(|e| matches!(e, Entry::Folder(name, _) if name == folder));
-                match existing {
-                    Some(Entry::Folder(_, lines)) => lines.push(line),
-                    _ => entries.push(Entry::Folder(folder.clone(), vec![line])),
-                }
-            }
-        }
-    }
-    drop(lib);
-    if entries.is_empty() {
-        return rsx! {};
-    }
-
-    let mut remove_all = move |keys: Vec<u64>| {
-        error.set(None);
-        spawn(async move {
-            for key in keys {
-                if let Err(e) = remove(app, key).await {
-                    error.set(Some(e));
-                    break;
-                }
-            }
-        });
-    };
-
-    rsx! {
-        div { class: "attachments", role: "list", "aria-label": "Sources",
-            for entry in entries {
-                match entry {
-                    Entry::File(line) => rsx! {
-                        div { key: "{line.upload.key}", role: "listitem",
-                            SourceLine {
-                                kind: line.upload.kind,
-                                name: line.upload.name.clone(),
-                                bytes: line.upload.bytes,
-                                tone: line.tone,
-                                status: line.status.clone(),
-                                UploadActions {
-                                    upload: line.upload.clone(),
-                                    on_remove: move |_| remove_all(vec![line.upload.key]),
-                                    on_error: move |e| error.set(Some(e)),
-                                }
-                            }
-                        }
-                    },
-                    Entry::Folder(name, lines) => {
-                        let open = expanded.read().contains(&name);
-                        let (tone, status) = folder_status(&lines);
-                        let bytes: u64 = lines.iter().map(|l| l.upload.bytes).sum();
-                        let keys: Vec<u64> = lines.iter().map(|l| l.upload.key).collect();
-                        let toggle_name = name.clone();
-                        let toggle_label = if open {
-                            format!("Hide the files in {name}")
-                        } else {
-                            format!("Show the files in {name}")
-                        };
-                        rsx! {
-                            div { key: "folder-{name}", role: "listitem", class: if open { "src-group" } else { "src-group collapsed" },
-                                div { class: "src-row",
-                                    button {
-                                        class: "src-toggle",
-                                        "aria-expanded": open.to_string(),
-                                        "aria-label": toggle_label,
-                                        onclick: move |_| {
-                                            let mut set = expanded.write();
-                                            if !set.remove(&toggle_name) {
-                                                set.insert(toggle_name.clone());
-                                            }
-                                        },
-                                        Icon { name: "chev", class: "chev" }
-                                        Icon { name: "folder", class: "src-ic" }
-                                    }
-                                    div { class: "src-main",
-                                        span { class: "src-name", title: "{name}", "{name}" }
-                                        span { class: tone.meta_class(),
-                                            span { class: tone.dot_class() }
-                                            span { "{human_bytes(bytes)} · {status}" }
-                                        }
-                                    }
-                                    button {
-                                        class: "icon-btn sm",
-                                        "aria-label": "Remove the folder {name}",
-                                        title: "Remove folder",
-                                        onclick: move |_| remove_all(keys.clone()),
-                                        Icon { name: "x" }
-                                    }
-                                }
-                                if open {
-                                    div { class: "src-nested",
-                                        for line in lines {
-                                            SourceLine {
-                                                key: "{line.upload.key}",
-                                                kind: line.upload.kind,
-                                                name: line.upload.name.clone(),
-                                                bytes: line.upload.bytes,
-                                                tone: line.tone,
-                                                status: line.status.clone(),
-                                                UploadActions {
-                                                    upload: line.upload.clone(),
-                                                    on_remove: move |_| remove_all(vec![line.upload.key]),
-                                                    on_error: move |e| error.set(Some(e)),
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(err) = error.read().clone() {
-            div { class: "notice error", role: "alert",
-                Icon { name: "alert" }
-                div { class: "body", "{err}" }
-            }
-        }
-    }
-}
-
 /// Shown while the service's embedding model isn't ready: sources wait for it. Offers the
 /// download (with its progress) and the Sources settings.
 #[component]
@@ -729,7 +479,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
             }
             spawn(async move {
                 picking.set(true);
-                let added = add_sources(app, Some(topic_id), folder).await;
+                let added = add_sources(app, topic_id, folder).await;
                 picking.set(false);
                 note.set(added);
             });

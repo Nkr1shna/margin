@@ -1,4 +1,3 @@
-pub mod ask;
 pub mod chat;
 pub mod citations;
 pub mod common;

@@ -350,12 +350,12 @@ fn walk<T: Tree>(tree: &T, dir: &T::Node, prefix: &str, selection: &mut Selectio
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
-/// A file on its way to the service, or one uploaded from the Ask composer.
+/// A file on its way to the service.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Upload {
     /// Local identity, unique in this run of the app.
     pub key: u64,
-    /// The topic it's added to; `None` for the Ask composer.
+    /// The topic it's added to; `None` for a file not attached to one.
     pub topic_id: Option<Id>,
     pub path: PathBuf,
     pub name: String,
