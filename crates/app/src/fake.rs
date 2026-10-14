@@ -197,6 +197,9 @@ pub fn sample_citations() -> Vec<Citation> {
         end_ms: None,
         excerpt: String::new(),
         image_url: None,
+        document_id: None,
+        start_line: None,
+        end_line: None,
     };
     vec![
         Citation {
@@ -458,6 +461,8 @@ fn default_settings() -> Settings {
         render_fps: 30,
         reasoning_effort: ReasoningEffort::Medium,
         agent_model: None,
+        pipeline: Default::default(),
+        trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
     }
 }
 

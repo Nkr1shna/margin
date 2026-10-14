@@ -107,6 +107,7 @@ impl Transcript {
                     page: None,
                     start_ms: Some(first.start_ms),
                     end_ms: Some(last.end_ms.max(first.start_ms)),
+                    ..Default::default()
                 });
             }
             current.clear();

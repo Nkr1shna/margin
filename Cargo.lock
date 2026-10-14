@@ -5278,10 +5278,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "margin-evals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "margin-shared",
+ "serde",
+ "serde_json",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
 name = "margin-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -5309,6 +5321,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "ulid",
  "uuid",
 ]
 

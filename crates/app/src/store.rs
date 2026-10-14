@@ -231,6 +231,9 @@ impl LibraryState {
                 self.devices.remove(&id);
                 self.workspaces.retain(|_, w| w.device_id != id);
             }
+            // Documents and traces are for agents and the eval runner; the app shows
+            // neither (yet).
+            Event::DocumentChanged { .. } | Event::Trace { .. } => {}
         }
     }
 
@@ -1297,6 +1300,8 @@ pub(crate) mod tests {
             render_fps: 30,
             reasoning_effort: ReasoningEffort::Medium,
             agent_model: None,
+            pipeline: Default::default(),
+            trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
         };
         s.apply(Event::SettingsChanged {
             settings: settings.clone(),

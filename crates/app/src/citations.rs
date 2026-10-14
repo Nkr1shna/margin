@@ -317,6 +317,9 @@ mod tests {
             end_ms: None,
             excerpt: format!("passage {n}"),
             image_url: None,
+            document_id: None,
+            start_line: None,
+            end_line: None,
         }
     }
 

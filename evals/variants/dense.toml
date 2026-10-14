@@ -1,0 +1,17 @@
+# The vector (HNSW) leg alone: what the lexical leg adds is baseline minus this.
+prompts = "lesson-v2"
+
+[chunker]
+name = "sections-v2"
+
+[retriever]
+name = "dense"
+
+[fusion]
+name = "first"
+
+[reranker]
+name = "none"
+
+[packer]
+name = "mmr-v1"

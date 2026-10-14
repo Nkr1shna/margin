@@ -7,6 +7,7 @@ use common::*;
 use margin_service::db::{self, Store};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::state::{INTERRUPTED, SETTINGS_ID, SettingsRow, StoredLesson, StoredVideo};
+use margin_shared::pipeline::PipelineConfig;
 use margin_shared::{
     ApiError, Device, Event, Lesson, LessonStatus, Level, Library, LoginState, Me, Note, Proposal,
     ProposalStatus, SearchHit, SearchKind, Settings, Topic, Video, VideoStatus,
@@ -843,6 +844,70 @@ async fn generation_needs_an_api_key_and_a_model() {
     )
     .await;
     assert_eq!((status, e.code.as_str()), (400, "no_api_key"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_switch_the_pipeline_by_name() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s: Settings = h
+        .get(&t, "/api/settings")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.pipeline, PipelineConfig::default());
+    assert_eq!(s.trace_retention_days, 90);
+    assert_eq!(
+        h.state.pipeline.load().hash,
+        PipelineConfig::default().hash()
+    );
+
+    // An unknown stage is refused and changes nothing.
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"pipeline": {"retriever": {"name": "telepathy"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let e: ApiError = r.json().await.unwrap();
+    assert_eq!(e.code, "bad_pipeline");
+    assert!(e.message.contains("telepathy"), "{}", e.message);
+    assert_eq!(h.state.pipeline.load().retriever.name(), "hybrid-rrf");
+
+    // A known one is stored, sent back and used from now on.
+    let s: Settings = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"pipeline": {"retriever": {"name": "dense-brute"}, "budget": {"images_max": 2}}, "trace_retention_days": 30}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.pipeline.retriever.name, "dense-brute");
+    assert_eq!(s.pipeline.budget.images_max, 2);
+    assert_eq!(s.trace_retention_days, 30);
+    let live = h.state.pipeline.load();
+    assert_eq!(live.retriever.name(), "dense-brute");
+    assert_eq!(live.hash, s.pipeline.hash());
+    for bad in [
+        json!({"trace_retention_days": 0}),
+        json!({"trace_retention_days": 5000}),
+    ] {
+        assert_eq!(
+            h.patch(&t, "/api/settings")
+                .json(&bad)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

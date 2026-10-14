@@ -55,6 +55,7 @@ pub(crate) fn chunk(
                 page: page.number,
                 start_ms: None,
                 end_ms: None,
+                ..Default::default()
             });
         }
     }
@@ -305,7 +306,8 @@ mod tests {
                 text: "Hello there.\n\nSecond paragraph.".into(),
                 page: None,
                 start_ms: None,
-                end_ms: None
+                end_ms: None,
+                ..Default::default()
             }]
         );
     }
@@ -428,7 +430,8 @@ mod tests {
                 text: "Short first page.".into(),
                 page: Some(1),
                 start_ms: None,
-                end_ms: None
+                end_ms: None,
+                ..Default::default()
             }
         );
         assert!(chunks.len() > 2);

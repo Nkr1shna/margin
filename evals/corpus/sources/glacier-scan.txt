@@ -1,0 +1,10 @@
+How glaciers move
+Written for the Margin evaluation corpus. Released under CC0.
+
+A glacier forms where more snow falls each winter than melts each summer. Buried snow is compressed into firn, granular ice that has survived at least one melt season, and over decades the firn becomes dense glacier ice.
+
+The upper part of a glacier, where snowfall exceeds melting over a year, is the accumulation zone. The lower part, where melting and sublimation exceed snowfall, is the ablation zone. The boundary between them is the equilibrium line, and its altitude is a sensitive indicator of climate: when summers warm, the equilibrium line altitude rises and the glacier shrinks.
+
+Glaciers move in two ways. Internal deformation is the slow creep of ice crystals under the glacier's own weight, fastest near the surface. Basal sliding happens when meltwater at the bed lubricates the contact between ice and rock, and it can make a glacier surge many times faster than its normal speed.
+
+Rock debris carried by the ice is dropped where the ice melts. Ridges of this debris along the sides of a glacier are lateral moraines, and the ridge left at the glacier's furthest advance is the terminal moraine.

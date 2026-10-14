@@ -1,0 +1,17 @@
+# The full-text (BM25) leg alone: what the vector leg adds is baseline minus this.
+prompts = "lesson-v2"
+
+[chunker]
+name = "sections-v2"
+
+[retriever]
+name = "bm25"
+
+[fusion]
+name = "first"
+
+[reranker]
+name = "none"
+
+[packer]
+name = "mmr-v1"

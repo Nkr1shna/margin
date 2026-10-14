@@ -22,6 +22,21 @@ uses) is a contract change: report it rather than making it, unless it only adds
 | **service** | `crates/service` | Storage (`chats`, `workspaces`), the routes, `turns` (sink, stop/continue/confirm/pending, recovery), `devices::DeviceHub` and the events socket, `agent_tools` (library/course/source/job tools), settings, provenance for Q2. Integration tests in `tests/` with `FakeGenerator.agent` (a `ScriptedModel`). |
 | **app** | `crates/app` | `api.rs` calls for every new route, the store (already applies the new events), the chat screen and cards, the Chats sidebar section, Settings (agent model, reasoning effort, Folders pane), the device-tool runner (app control, folders per platform), the fake service in `fake.rs`. |
 
+**R1 (retrieval core, traces, context API, evals; `docs/agent-rag-architecture.md` §6).**
+Frozen after R1's first commit and changed only through the orchestrator:
+`crates/shared` (`pipeline.rs`, `context.rs`, the `routes.rs` context/trace rows),
+`crates/service/src/pipeline.rs` (stage traits, `Query`, `Hit`, `Packed`, `PackBudget`,
+`Prompt`, `Registry`, `Pipeline::build`) and `server.rs`. Areas own, exclusively:
+
+| Area | Owns |
+|---|---|
+| **R1-embed** | `crates/embed/src/{chunk,extract,pdf,image,vision,coreml,fake,lib}.rs`, `crates/embed/tests/*` |
+| **R1-store** | `crates/service/src/{ingest,sources,embedding,engines,state,db,library}.rs` (`db.rs` additive), `tests/sources.rs`, `tests/common/mod.rs` |
+| **R1-retrieve** | `crates/service/src/{retrieval,search,agent_tools,ask,context_api}.rs`, `tests/{courses,api}.rs`, the search-tool tests in `tests/agent_e2e.rs` |
+| **R1-ai** | `crates/ai/src/{lib,prompts,responses}.rs`, `crates/ai/src/prompts/evals.rs`, `crates/ai/tests/{fake_responses,fixtures_render}.rs` |
+| **R1-trace** | `crates/service/src/{trace,turns,video,chats}.rs` (`chats.rs` only the `?traces=1` flag), `tests/{chats,media}.rs` |
+| **R1-evals** | `crates/evals/**`, `evals/**` |
+
 `crates/shared` is the contract and is changed only through the orchestrator. It already
 contains everything below; `crates/video` and `crates/embed` are untouched.
 
@@ -37,6 +52,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
 | **4 Folders** | — | Folder device tools | `workspaces` routes, folder tools allowed only with workspaces, folder-file citations (Q4: `Citation.file`, passages read through the device), folder context in `propose_course` | 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: Attach folder, handle storage, the four folder tools with the rules in `margin_shared::device`, Folders pane in Settings, "Attached: … on … · online/offline", stale/revoked handling, opening folder-file citations |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
+| **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
 Between the phase 1 and phase 2 merges courses can't be created (the old composer is
 unrouted until phase 2 reuses its outline editor); no release happens in between.
@@ -79,6 +95,31 @@ All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
 Service storage (`db.rs`): table `chat` holds `Chat`; `chat_item` holds
 `chats::StoredChatItem { item, model_items, full_output }` keyed by item id (query by
 `chat_id`); `workspace` holds `Workspace`. No migration of existing data.
+
+R1 storage (`db.rs`, `docs/agent-rag-architecture.md` §2.2, §2.11): `project` and
+`document` are `{ doc }` tables like the others (`context::Project`,
+`context::Document`; `document` indexed on `doc.project_id` and `doc.access.*`).
+`passage` is SCHEMAFULL with top-level fields (`db::PassageRow`: `project_id`,
+`document_id`, `origin`, `scope_ids`, `access`, `unit_id`, `modality`, `ord`, `page`,
+`start_line`/`end_line`, `start_ms`/`end_ms`, `section_path`, `text`, `file`,
+`chunk_hash`, `embedder`, `vector`), indexed by `document_id`, `scope_ids.*`, `access.*`,
+unique `(document_id, chunk_hash)`, FULLTEXT on `text` (analyzer `prose`, BM25,
+highlights) and HNSW on `vector` (768, cosine, F32, EFC 200, M 16). `None` fields are
+left out when written (`option<…>` takes `NONE`, not JSON `null`). `trace` is SCHEMAFULL
+with ids `trace:[kind, at, ulid]` (`context::TraceRow` minus `id`), read and deleted by
+record range (`Store::range`, `Store::delete_range`); `trace_hourly` and `trace_daily` are
+table views. The analyzer, the two search indexes and the views are applied with
+`OVERWRITE` once per change of their text (fingerprint in `schema_meta:indexes`).
+`Store::insert_many` writes at most `db::INSERT_MANY_MAX` (64) rows per statement.
+`SettingsRow` gains `pipeline`, `trace_retention_days` and `migrations`.
+
+R1 shared types: `Settings.pipeline: pipeline::PipelineConfig` and
+`Settings.trace_retention_days` (+ patch fields; an unknown stage name is 400
+`bad_pipeline`); `Citation.document_id`, `start_line`, `end_line`;
+`Event::DocumentChanged { document }`, `Event::Trace { row }` (only to `?traces=1`
+sockets); `context.rs`: `Project`, `Document` (with `generation`, `actor`, `access`),
+`Origin`, `Modality`, `Scope`, `ContextQuery` (with the caller's `access`), `Hit`,
+`DocumentOutline`, `ContextIngest`, `ContextChanges`, `TraceRow`, `TraceRollup`.
 
 Title (owner decision): set from the first message, its first line cut to
 `CHAT_TITLE_MAX` (60) characters (`title_by: FirstLine`; the app shows it in placeholder
@@ -433,6 +474,17 @@ the service reads those spans through the holding device (`read_file`) and passe
 as passages; opening such a citation reads the file on that device, or says it's
 offline.
 
+### R1, the retrieval tool family (service, replaces `search_sources`)
+
+`search {query, scope: {topic_id?, source_ids?, workspace_ids?, chat_files?, library?},
+k ≤ TOOL_SEARCH_K_MAX, modalities}` → hits with `n`, locator, `section_path`, text cut to
+`TOOL_OUTPUT_PASSAGE_CHARS`, score, and a Passages card; default scope this chat's files
+and folders, then its topic (never every source). `read_passage {document_id, page? |
+ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outline
+{document_id}` → section paths with page/line ranges. `view_picture {document_id, page?}`
+→ the stored picture, counted against the turn's picture budget. Each output ≤ 16 KB;
+`search_library` keeps its name and runs on the FULLTEXT index.
+
 ## 6. Device tool transport
 
 - The events socket registers with `DeviceHub::register` on open (`DeviceChanged` with
@@ -456,6 +508,16 @@ offline.
 - Revoking a device: `DeviceHub::forget_device`, its workspaces deleted (detached from
   chats → `ChatChanged`, `WorkspaceDeleted`), `DeviceDeleted`.
 
+### R1, the context API (device token today; per-agent tokens later)
+
+`GET /api/projects`; `POST /api/context/search` (`ContextQuery` → `Vec<Hit>`, 400
+`bad_scope`); `GET /api/context/documents/{id}/outline` and `…/passages?from&to` (404,
+409 `not_ready`); `POST /api/context/ingest` (`ContextIngest` → `Document`, 400
+`bad_origin`; `actor = agent:<name>`); `GET /api/context/changes?since`;
+`GET /api/traces?kind&from&to&trace_id` (JSON lines, oldest first, 400 `bad_range`);
+`GET /api/traces/rollup?bucket&from&to`. The handlers call the same functions as the
+agent's tools: one retrieval path for Margin's agent, external agents and the GUI.
+
 ## 7. Limits (constants)
 
 `margin_agent`: `MAX_STEPS` 40, `TOOL_OUTPUT_MAX_BYTES` 64 KB, `TURN_OUTPUT_MAX_BYTES`
@@ -466,6 +528,13 @@ offline.
 `READ_FILE_MAX_BYTES_TOTAL` 2 MB, `SEARCH_MAX_BYTES` 50 MB, `SEARCH_MAX_SECONDS` 20,
 `MAX_LISTED_ENTRIES` 500, `MAX_TEXT_MATCHES` 200, `MATCH_LINE_MAX_CHARS` 300.
 `margin_shared::CHAT_TITLE_MAX` 60; `chats::MAX_MESSAGE_BYTES` 32 KB.
+R1, `margin_shared::routes`: `RETRIEVAL_K_DENSE` 40, `RETRIEVAL_K_LEX` 40,
+`RETRIEVAL_K_FUSED` 24, `RRF_K` 60, `MMR_LAMBDA` 0.7, `TOOL_SEARCH_K_MAX` 12,
+`TOOL_OUTPUT_PASSAGE_CHARS` 1 200, `TOOL_READ_PASSAGES_MAX` 4;
+`margin_shared::TRACE_RETENTION_DAYS` 90; `db::INSERT_MANY_MAX` 64;
+`retrieval::RETRIEVAL_CACHE_ENTRIES` 256; `trace::TRACE_CHANNEL` 4 096. `Budget`
+defaults: `share_of_window` 0.5, `min_score_pct` 25, `images_max` 8, `passages_min` 0
+(no fixed token cap; owner Q3).
 
 ## 8. Tests each owner adds
 
@@ -492,6 +561,18 @@ offline.
   folder access code.
 
 Never call the real OpenAI API; never touch the running service or its data folder.
+
+**R1** (first commit, already in): the SurrealQL the design relies on runs on `kv-mem`
+(`db.rs` tests: HNSW nearest with scope and access pre-filters and `EXPLAIN` showing
+`KnnScan` on `passage_vector`, the scope index on its own, FULLTEXT score and highlight
+with stemming, `search::rrf` of two legs, trace range by kind and window, the hourly and
+daily views following inserts and range deletes); `PipelineConfig` round trip, pinned
+default hash, unknown params kept; `Pipeline::build` of the default and trivial configs,
+an unknown stage named in the error, fakes registered under real names; settings switch
+the pipeline by name; `margin-evals` metrics against hand-worked values and the golden
+set's anchors against the corpus. Each R1 area adds the tests of §6.2/§6.4 of the
+architecture doc; the eval gates (`cargo test -p margin-evals`) run on
+`RecordedEmbedder` and `kv-mem` only.
 
 ## 9. Open points for the owner
 

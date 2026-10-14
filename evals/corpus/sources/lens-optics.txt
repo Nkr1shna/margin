@@ -1,0 +1,16 @@
+Thin lenses
+Written for the Margin evaluation corpus. Released under CC0.
+
+A thin converging lens brings parallel rays to a focus at its focal point, a distance f from the lens. For an object at distance d_o from the lens, the image forms at distance d_i given by the thin lens equation
+
+1/f = 1/d_o + 1/d_i
+
+The lateral magnification is m = -d_i / d_o. A negative magnification means the image is inverted. When the object is further than 2f from the lens, the real image is smaller than the object; between f and 2f it is larger; at exactly 2f the image is the same size and also at 2f on the other side.
+
+An object inside the focal length, closer than f, gives a negative d_i: the image is virtual, upright and magnified, on the same side as the object. That is how a magnifying glass works.
+
+Example: an object 30 cm from a lens of focal length 10 cm forms a real, inverted image 15 cm behind the lens, half the size of the object.
+
+The ray diagram on the next page traces the three principal rays for this example.
+\f
+Figure: ray diagram for an object at 30 cm from a converging lens with focal length 10 cm.

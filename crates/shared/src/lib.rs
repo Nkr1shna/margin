@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod chat;
+pub mod context;
 pub mod device;
+pub mod pipeline;
 pub mod routes;
 
 pub use chat::*;
@@ -354,6 +356,15 @@ pub struct Citation {
     /// Signed URL of a picture for it: the image itself, the rendered PDF page, or the
     /// video frame.
     pub image_url: Option<String>,
+    /// The indexed document the passage is from (`context::Document`); `None` on
+    /// citations written before documents existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<Id>,
+    /// The lines of a text document the passage spans (1-based, inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,6 +575,19 @@ pub struct Settings {
     /// scenes always use).
     #[serde(default)]
     pub agent_model: Option<String>,
+    /// The retrieval and generation pipeline: stages by name, budgets, model routes.
+    #[serde(default)]
+    pub pipeline: pipeline::PipelineConfig,
+    /// Raw trace rows older than this are deleted; rollups stay.
+    #[serde(default = "default_trace_retention_days")]
+    pub trace_retention_days: u32,
+}
+
+/// `Settings.trace_retention_days` unless changed.
+pub const TRACE_RETENTION_DAYS: u32 = 90;
+
+fn default_trace_retention_days() -> u32 {
+    TRACE_RETENTION_DAYS
 }
 
 /// Responses API `reasoning.effort` for the agent. Settings offers `ALL`, Medium by
@@ -629,6 +653,11 @@ pub struct SettingsPatch {
         with = "double_option"
     )]
     pub agent_model: Option<Option<String>>,
+    /// Replaces the whole pipeline config; a stage name the service doesn't know is 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<pipeline::PipelineConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_retention_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -802,6 +831,14 @@ pub enum Event {
     /// A device was revoked.
     DeviceDeleted {
         id: Id,
+    },
+    /// A document was indexed again (its `generation` went up) or its status changed.
+    DocumentChanged {
+        document: context::Document,
+    },
+    /// A trace row, sent only to sockets that subscribed with `?traces=1`.
+    Trace {
+        row: Box<context::TraceRow>,
     },
 }
 

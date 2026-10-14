@@ -187,9 +187,15 @@ impl Model {
     }
 
     /// `<bos>`, the prefixed text's tokens (at most `MAX_TOKENS - 2`), `<eos>`.
-    fn token_ids(&self, text: &str, purpose: Purpose) -> Result<Vec<u32>, EmbedError> {
+    fn token_ids(&self, text: &str, purpose: &Purpose) -> Result<Vec<u32>, EmbedError> {
+        let titled;
         let prompt = match purpose {
-            Purpose::Document => &self.document_prompt,
+            Purpose::Document { title: None } => &self.document_prompt,
+            Purpose::Document { title: Some(title) } => {
+                // The model's prompt is "title: none | text: "; a title replaces "none".
+                titled = self.document_prompt.replacen("none", title.trim(), 1);
+                &titled
+            }
             Purpose::Query => &self.query_prompt,
         };
         let encoding = self
@@ -223,7 +229,7 @@ impl Model {
         rows
     }
 
-    fn embed_one(&self, text: &str, purpose: Purpose) -> Result<Vec<f32>, EmbedError> {
+    fn embed_one(&self, text: &str, purpose: &Purpose) -> Result<Vec<f32>, EmbedError> {
         let ids = self.token_ids(text, purpose)?;
         self.embed_rows(self.rows_of(&ids))
     }
@@ -313,7 +319,7 @@ impl Embedder for Model {
     fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
         texts
             .iter()
-            .map(|text| self.embed_one(text, purpose))
+            .map(|text| self.embed_one(text, &purpose))
             .collect()
     }
 
@@ -711,8 +717,8 @@ mod tests {
     fn real_model_vectors_are_unit_length_and_repeatable() {
         let Some(model) = model() else { return };
         let texts = ["Hello, world.", "", "Ünïcödé ﬁ ligature and ① circled 東京"];
-        let first = embed(model, &texts, Purpose::Document);
-        let again = embed(model, &texts, Purpose::Document);
+        let first = embed(model, &texts, Purpose::DOCUMENT);
+        let again = embed(model, &texts, Purpose::DOCUMENT);
         for (a, b) in first.iter().zip(&again) {
             assert_eq!(a.len(), DIM);
             let norm = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -735,7 +741,7 @@ mod tests {
             "To bake sourdough bread, feed the starter the night before and proof the dough slowly.",
             "The Treaty of Westphalia ended the Thirty Years' War in 1648.",
         ];
-        let docs = embed(model, &passages, Purpose::Document);
+        let docs = embed(model, &passages, Purpose::DOCUMENT);
         let query = &embed(
             model,
             &["How do plants turn light into food?"],
@@ -785,7 +791,7 @@ mod tests {
         let ids = |n: usize| {
             model
                 .0
-                .token_ids(&text(n), Purpose::Document)
+                .token_ids(&text(n), &Purpose::DOCUMENT)
                 .unwrap()
                 .len()
         };
@@ -813,7 +819,7 @@ mod tests {
             .map(|(i, &s)| text_with_tokens(model, if i == 0 { 0 } else { sizes[i - 1] }, s))
             .collect();
         for (text, &size) in texts.iter().zip(&sizes) {
-            let ids = model.0.token_ids(text, Purpose::Document).unwrap();
+            let ids = model.0.token_ids(text, &Purpose::DOCUMENT).unwrap();
             let functions = model.0.functions.lock().unwrap();
             assert_eq!(
                 functions
@@ -825,7 +831,7 @@ mod tests {
                 size
             );
         }
-        let vectors = model.embed(&texts, Purpose::Document).unwrap();
+        let vectors = model.embed(&texts, Purpose::DOCUMENT).unwrap();
         for (v, size) in vectors.iter().zip(sizes) {
             assert_eq!(v.len(), DIM);
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -838,7 +844,7 @@ mod tests {
         // Past 512 tokens only the start counts: a different ending changes nothing.
         let long = "Mitochondria are the powerhouse of the cell and make ATP. ".repeat(60);
         let changed = format!("{long} Completely different ending about volcanoes.");
-        let pair = model.embed(&[long, changed], Purpose::Document).unwrap();
+        let pair = model.embed(&[long, changed], Purpose::DOCUMENT).unwrap();
         assert_eq!(pair[0], pair[1]);
     }
 
@@ -878,7 +884,7 @@ mod tests {
         assert_eq!(
             model
                 .0
-                .token_ids("Café crème, naïve résumé", Purpose::Document)
+                .token_ids("Café crème, naïve résumé", &Purpose::DOCUMENT)
                 .unwrap(),
             cases[0].1
         );
@@ -906,7 +912,7 @@ mod tests {
             let purpose = if r.purpose == "query" {
                 Purpose::Query
             } else {
-                Purpose::Document
+                Purpose::DOCUMENT
             };
             let ours = &model.embed(std::slice::from_ref(&r.text), purpose).unwrap()[0];
             let similarity = cosine(ours, &r.vector);

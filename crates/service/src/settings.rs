@@ -4,8 +4,11 @@ use axum::Json;
 use axum::extract::State;
 use margin_shared::{Event, Settings, SettingsPatch, ToolStatus};
 
+use axum::http::StatusCode;
+
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::pipeline::Pipeline;
 use crate::secrets::OPENAI_API_KEY;
 use crate::state::{AppState, SETTINGS_ID};
 
@@ -74,12 +77,33 @@ pub async fn patch_settings(
             }
             row.render_fps = fps;
         }
+        if let Some(days) = patch.trace_retention_days {
+            if !(1..=3650).contains(&days) {
+                return Err(AppError::bad_request(
+                    "Traces can be kept from 1 to 3650 days.",
+                ));
+            }
+            row.trace_retention_days = days;
+        }
+        let rebuilt = match &patch.pipeline {
+            Some(cfg) => {
+                let pipeline = Pipeline::build(cfg, &state.registry).map_err(|e| {
+                    AppError::new(StatusCode::BAD_REQUEST, "bad_pipeline", format!("{e:#}."))
+                })?;
+                row.pipeline = cfg.clone();
+                Some(pipeline)
+            }
+            None => None,
+        };
         match patch.openai_api_key.as_deref().map(str::trim) {
             Some("") => state.secret_delete(OPENAI_API_KEY).await?,
             Some(key) => state.secret_set(OPENAI_API_KEY, key.to_string()).await?,
             None => {}
         }
         state.store.put(db::SETTINGS, SETTINGS_ID, &row).await?;
+        if let Some(pipeline) = rebuilt {
+            state.pipeline.store(std::sync::Arc::new(pipeline));
+        }
     }
     let settings = state.settings().await?;
     state.emit(Event::SettingsChanged {

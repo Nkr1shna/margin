@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use margin_embed::{Embedder, ModelFiles};
+use margin_shared::pipeline::PipelineConfig;
 use margin_shared::{
     Citation, Event, Id, Lesson, Note, Proposal, ReasoningEffort, Settings, Source, Topic, Video,
     VideoMedia, VideoStatus,
@@ -24,8 +25,13 @@ use crate::devices::DeviceHub;
 use crate::embedding::ModelJob;
 use crate::engines::{AiConfig, Generator, Renderer, SourceTools};
 use crate::error::{AppError, AppResult};
+use crate::ingest::IngestQueue;
+use crate::pipeline::{Pipeline, Registry};
+use crate::retrieval::RetrievalCache;
 use crate::secrets::{OPENAI_API_KEY, SecretStore};
+use crate::trace::Tracer;
 use crate::turns::Turns;
+use arc_swap::ArcSwap;
 
 pub type AppState = Arc<App>;
 
@@ -146,6 +152,19 @@ pub struct SettingsRow {
     /// The model chats use; `None` uses `openai_model`.
     #[serde(default)]
     pub agent_model: Option<String>,
+    /// The retrieval and generation pipeline (`AppState.pipeline` is built from it).
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+    #[serde(default = "trace_retention_days")]
+    pub trace_retention_days: u32,
+    /// One-time data migrations already done, by name (e.g. "passages-v1"), so each
+    /// runs once.
+    #[serde(default)]
+    pub migrations: Vec<String>,
+}
+
+fn trace_retention_days() -> u32 {
+    margin_shared::TRACE_RETENTION_DAYS
 }
 
 impl Default for SettingsRow {
@@ -159,6 +178,9 @@ impl Default for SettingsRow {
             render_fps: DEFAULT_RENDER_FPS,
             reasoning_effort: ReasoningEffort::default(),
             agent_model: None,
+            pipeline: PipelineConfig::default(),
+            trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+            migrations: Vec::new(),
         }
     }
 }
@@ -211,6 +233,15 @@ pub struct App {
     pub turns: Turns,
     /// Which devices are online, and tool requests sent to them.
     pub devices: Arc<DeviceHub>,
+    /// Stage constructors by name (`pipeline::Registry::standard`).
+    pub registry: Registry,
+    /// The pipeline `Settings.pipeline` names, rebuilt when the settings change.
+    pub pipeline: ArcSwap<Pipeline>,
+    /// Trace rows on their way to the store.
+    pub tracer: Tracer,
+    /// Documents waiting to be indexed.
+    pub ingest_queue: IngestQueue,
+    pub retrieval_cache: RetrievalCache,
 }
 
 impl App {
@@ -422,6 +453,8 @@ impl App {
             render_fps: row.render_fps,
             reasoning_effort: row.reasoning_effort,
             agent_model: row.agent_model,
+            pipeline: row.pipeline,
+            trace_retention_days: row.trace_retention_days,
         })
     }
 

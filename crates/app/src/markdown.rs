@@ -463,6 +463,9 @@ mod tests {
             end_ms: None,
             excerpt: "passage".into(),
             image_url: None,
+            document_id: None,
+            start_line: None,
+            end_line: None,
         }
     }
 

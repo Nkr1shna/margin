@@ -25,13 +25,20 @@ use crate::devices::DeviceHub;
 use crate::embedding::ModelJob;
 use crate::engines::{Generator, Renderer, SourceTools};
 use crate::error::AppError;
+use crate::ingest::IngestQueue;
+use crate::pipeline::{Pipeline, Registry, StageDeps};
+use crate::retrieval::RetrievalCache;
 use crate::secrets::{SecretStore, media_signing_key};
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
+use crate::state::{SETTINGS_ID, SettingsRow};
+use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, embedding, events, library, media, search, settings, sources, turns, uploads,
-    video, workspaces,
+    ask, chats, context_api, embedding, events, library, media, retrieval, search, settings,
+    sources, trace, turns, uploads, video, workspaces,
 };
+use anyhow::Context;
+use arc_swap::ArcSwap;
 
 /// Events kept for a socket that hasn't sent them yet.
 pub const EVENTS_CAPACITY: usize = 4096;
@@ -83,6 +90,16 @@ impl Service {
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let model_files = ModelFiles::new(opts.config.embedding_model_dir());
+        let registry = Registry::standard(StageDeps {
+            store: opts.store.clone(),
+        });
+        let settings: SettingsRow = opts
+            .store
+            .get(db::SETTINGS, SETTINGS_ID)
+            .await?
+            .unwrap_or_default();
+        let pipeline = Pipeline::build(&settings.pipeline, &registry)
+            .context("the pipeline in Settings can't be built")?;
         let state: AppState = Arc::new(App {
             config: opts.config,
             store: opts.store,
@@ -113,6 +130,11 @@ impl Service {
             uploads_busy: Mutex::new(Default::default()),
             turns: Turns::new(),
             devices: Arc::new(DeviceHub::new()),
+            registry,
+            pipeline: ArcSwap::from_pointee(pipeline),
+            tracer: Tracer::new(),
+            ingest_queue: IngestQueue::new(),
+            retrieval_cache: RetrievalCache::new(retrieval::RETRIEVAL_CACHE_ENTRIES),
         });
 
         let resume = recover(&state).await?;
@@ -241,6 +263,20 @@ pub fn router(state: AppState) -> Router {
             get(workspaces::list_workspaces).post(workspaces::create_workspace),
         )
         .route("/api/workspaces/{id}", delete(workspaces::delete_workspace))
+        .route(routes::PROJECTS, get(context_api::projects))
+        .route(routes::CONTEXT_SEARCH, post(context_api::search))
+        .route(
+            "/api/context/documents/{id}/outline",
+            get(context_api::outline),
+        )
+        .route(
+            "/api/context/documents/{id}/passages",
+            get(context_api::passages),
+        )
+        .route(routes::CONTEXT_INGEST, post(context_api::ingest))
+        .route(routes::CONTEXT_CHANGES, get(context_api::changes))
+        .route(routes::TRACES, get(trace::list_traces))
+        .route(routes::TRACES_ROLLUP, get(trace::rollup))
         .route(routes::EVENTS, get(events::events))
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(

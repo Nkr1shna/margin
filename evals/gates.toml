@@ -1,0 +1,18 @@
+# CI regression gates (cargo test -p margin-evals), against evals/baseline.json, which is
+# committed on purpose with the change that improves it (docs/agent-rag-architecture.md
+# §3.3). Points are on a 0-100 scale.
+
+[retrieval]
+recall_at_5_max_drop = 1.0
+ndcg_at_10_max_drop = 1.0
+per_kind_max_drop = 3.0
+negative_fp_max_rise = 2.0
+# CI machines vary; loose on purpose.
+p95_latency_max_ratio = 2.0
+
+[citations]
+resolution_min = 100.0
+lexical_support_max_drop = 2.0
+
+[packing]
+tool_output_max_bytes = 16384

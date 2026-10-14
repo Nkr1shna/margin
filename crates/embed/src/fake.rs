@@ -83,6 +83,45 @@ impl Embedder for FakeEmbedder {
     }
 }
 
+/// Real EmbeddingGemma vectors recorded once by `margin-eval record-embeddings`
+/// (`evals/recorded/embeddings.bin`, f16, keyed by `embedder_version + sha256(prefix +
+/// text)`), served in CI so retrieval metrics are real without the Core ML model. A text
+/// that wasn't recorded is an error, never a made-up vector, so a chunker change that
+/// produces new chunk texts requires a deliberate re-record.
+#[derive(Debug)]
+pub struct RecordedEmbedder {
+    _private: (),
+}
+
+impl RecordedEmbedder {
+    /// Opens a recording.
+    pub fn open(_path: &std::path::Path) -> Result<Self, EmbedError> {
+        unimplemented!("R1, embed: RecordedEmbedder::open")
+    }
+}
+
+impl Embedder for RecordedEmbedder {
+    fn embed(&self, _texts: &[String], _purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
+        unimplemented!("R1, embed: RecordedEmbedder::embed")
+    }
+
+    fn count_tokens(&self, _text: &str) -> usize {
+        unimplemented!("R1, embed: RecordedEmbedder::count_tokens")
+    }
+
+    fn embed_images(
+        &self,
+        _images: &[PathBuf],
+        _tokens: ImageTokens,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        unimplemented!("R1, embed: RecordedEmbedder::embed_images")
+    }
+
+    fn embed_audio(&self, _windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        unimplemented!("R1, embed: RecordedEmbedder::embed_audio")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

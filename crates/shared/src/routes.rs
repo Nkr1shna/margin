@@ -56,7 +56,15 @@
 //! | GET    | /api/workspaces                        |                    | Vec<Workspace>      |
 //! | POST   | /api/workspaces                        | NewWorkspace       | Workspace (of the calling device) |
 //! | DELETE | /api/workspaces/{id}                   |                    | 204                 |
-//! | GET    | /api/events  (WebSocket upgrade)       | DeviceFrame frames | ServerFrame frames  |
+//! | GET    | /api/projects                          |                    | Vec<context::Project> |
+//! | POST   | /api/context/search                    | context::ContextQuery | Vec<context::Hit> (400 bad_scope) |
+//! | GET    | /api/context/documents/{id}/outline    |                    | context::DocumentOutline (404; 409 not_ready) |
+//! | GET    | /api/context/documents/{id}/passages?from&to |              | Vec<context::Hit> (404; 409 not_ready) |
+//! | POST   | /api/context/ingest                    | context::ContextIngest | context::Document (400 bad_origin) |
+//! | GET    | /api/context/changes?since             |                    | context::ContextChanges |
+//! | GET    | /api/traces?kind&from&to&trace_id      |                    | JSONL of context::TraceRow, oldest first (400 bad_range) |
+//! | GET    | /api/traces/rollup?bucket&from&to      |                    | Vec<context::TraceRollup> (400 bad_range) |
+//! | GET    | /api/events  (WebSocket upgrade; `?traces=1` adds Event::Trace) | DeviceFrame frames | ServerFrame frames  |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
@@ -93,6 +101,26 @@ pub const SOURCES: &str = "/api/sources";
 /// there turns it into a Queued `Source`. Unfinished uploads are dropped after a day.
 pub const SOURCE_UPLOADS: &str = "/api/source-uploads";
 pub const EMBEDDING: &str = "/api/embedding";
+/// The projects (corpora) on this service; today exactly one, "My library".
+pub const PROJECTS: &str = "/api/projects";
+/// Hybrid retrieval for agents: the same code path as Margin's own agent's `search`
+/// tool. `POST context::ContextQuery` → `Vec<context::Hit>`; a scope naming something
+/// that doesn't exist is 400 "bad_scope".
+pub const CONTEXT_SEARCH: &str = "/api/context/search";
+/// `POST context::ContextIngest` → the new `context::Document` (indexed in the
+/// background; `Event::DocumentChanged` when it is Ready). The origin must be
+/// `Origin::Agent` (400 "bad_origin"); the document's `actor` is `agent:<name>`.
+pub const CONTEXT_INGEST: &str = "/api/context/ingest";
+/// `GET ?since=<generation>` → `context::ContextChanges`: documents indexed or deleted
+/// since then, for agents keeping their own copy fresh.
+pub const CONTEXT_CHANGES: &str = "/api/context/changes";
+/// `GET ?kind&from&to&trace_id` → trace rows as JSON lines (`application/x-ndjson`),
+/// oldest first. `from`/`to` are RFC 3339; a missing `to` is now, a missing `from` a day
+/// before `to`; `from > to` is 400 "bad_range".
+pub const TRACES: &str = "/api/traces";
+/// `GET ?bucket=hour|day&from&to` → `Vec<context::TraceRollup>` from the pre-computed
+/// views.
+pub const TRACES_ROLLUP: &str = "/api/traces/rollup";
 pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
 
 const MB: u64 = 1024 * 1024;
@@ -223,6 +251,36 @@ pub fn chat_item_output(chat_id: &str, item_id: &str) -> String {
 pub fn workspace(id: &str) -> String {
     format!("/api/workspaces/{id}")
 }
+/// A document's sections (`context::DocumentOutline`). 404 unknown document; 409
+/// "not_ready" while it is first being indexed.
+pub fn context_document_outline(id: &str) -> String {
+    format!("/api/context/documents/{id}/outline")
+}
+/// A document's passages by position: `?from=<ord>&to=<ord>` (inclusive; at most
+/// `TOOL_READ_PASSAGES_MAX` of them) → `Vec<context::Hit>`. 404; 409 "not_ready".
+pub fn context_document_passages(id: &str) -> String {
+    format!("/api/context/documents/{id}/passages")
+}
+
+// Retrieval constants (`docs/agent-rag-architecture.md` §2.2, §2.3, §2.8). Defaults the
+// pipeline's stages start from; `PipelineConfig` params override them per variant.
+
+/// Candidates the vector (HNSW) leg returns per query string.
+pub const RETRIEVAL_K_DENSE: usize = 40;
+/// Candidates the full-text (BM25) leg returns per query string.
+pub const RETRIEVAL_K_LEX: usize = 40;
+/// Candidates kept after fusing the legs.
+pub const RETRIEVAL_K_FUSED: usize = 24;
+/// The `k` of reciprocal rank fusion.
+pub const RRF_K: u32 = 60;
+/// Relevance vs diversity in the packer's MMR (1.0 = relevance only).
+pub const MMR_LAMBDA: f32 = 0.7;
+/// Most hits the agent's `search` tool returns.
+pub const TOOL_SEARCH_K_MAX: usize = 12;
+/// Longest passage text in a `search` tool output.
+pub const TOOL_OUTPUT_PASSAGE_CHARS: usize = 1_200;
+/// Most adjacent passages one `read_passage` returns.
+pub const TOOL_READ_PASSAGES_MAX: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -255,5 +313,29 @@ mod tests {
             source_limits_text(),
             "Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
+    }
+
+    #[test]
+    fn context_routes() {
+        assert_eq!(
+            context_document_outline("d1"),
+            "/api/context/documents/d1/outline"
+        );
+        assert_eq!(
+            context_document_passages("d1"),
+            "/api/context/documents/d1/passages"
+        );
+        for path in [
+            CONTEXT_SEARCH,
+            CONTEXT_INGEST,
+            CONTEXT_CHANGES,
+            TRACES,
+            TRACES_ROLLUP,
+            PROJECTS,
+        ] {
+            assert!(path.starts_with("/api/"), "{path}");
+        }
+        const { assert!(RETRIEVAL_K_FUSED <= RETRIEVAL_K_DENSE + RETRIEVAL_K_LEX) };
+        const { assert!(TOOL_SEARCH_K_MAX <= RETRIEVAL_K_FUSED) };
     }
 }

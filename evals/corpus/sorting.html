@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Comparison sorting: algorithms and limits</title>
+</head>
+<body>
+<h1>Comparison sorting: algorithms and limits</h1>
+<p>Written for the Margin evaluation corpus. Released under CC0.</p>
+
+<h2>What a comparison sort can know</h2>
+<p>A comparison sort learns about its input only by asking whether one element is less than another. Any such algorithm can be drawn as a binary decision tree whose leaves are the possible output orders. A list of n distinct elements has n! orders, so the tree needs at least n! leaves, and a binary tree with that many leaves has height at least log2(n!). By Stirling's approximation log2(n!) grows like n log2 n, which proves that every comparison sort needs on the order of n log n comparisons in the worst case.</p>
+<p>The bound does not apply to algorithms that look inside the keys. Counting sort sorts n integers drawn from a range of size k in O(n + k) time by counting how many times each key occurs, and radix sort applies a stable counting sort digit by digit.</p>
+
+<h2>Merge sort</h2>
+<p>Merge sort splits the list in half, sorts each half recursively, and merges the two sorted halves by repeatedly taking the smaller front element. Its running time satisfies T(n) = 2T(n/2) + O(n), which solves to O(n log n) in the best, average and worst case alike. The merge needs an auxiliary array, so the usual array implementation uses O(n) extra memory. Merge sort is stable when the merge takes from the left half on ties. It is the natural choice for linked lists, where merging needs no extra array, and for external sorting of data too large for memory, because it reads its inputs sequentially.</p>
+
+<h2>Quicksort</h2>
+<p>Quicksort picks a pivot, partitions the list into the elements smaller than the pivot and those larger, and sorts the two parts recursively. Partitioning happens in place, so quicksort needs only the stack for its recursion. On average it makes about 1.39 n log2 n comparisons, and its tight inner loop makes it faster in practice than merge sort on arrays.</p>
+<p>Its weakness is the pivot. If the pivot is always the smallest or largest element, every partition peels off a single element and the running time degrades to O(n<sup>2</sup>). Choosing the first element as the pivot hits this worst case on input that is already sorted, which is common in practice. Choosing the pivot at random, or as the median of the first, middle and last elements, makes the quadratic case vanishingly unlikely. Recursing into the smaller part first and looping on the larger part bounds the stack depth by O(log n).</p>
+<p>Two partition schemes are standard. Lomuto's scheme scans once from left to right and is easy to get right. Hoare's original scheme moves two indices toward each other and swaps out-of-place pairs; it does about three times fewer swaps on average. Neither scheme is stable.</p>
+<p>Introsort, used by many standard libraries, starts as quicksort and switches to heapsort when the recursion depth exceeds a multiple of log n, guaranteeing O(n log n) in the worst case while keeping quicksort's speed on typical input.</p>
+
+<h2>Heapsort</h2>
+<p>Heapsort builds a binary max-heap in the array in O(n) time, then repeatedly swaps the root, which is the largest remaining element, to the end of the array and restores the heap. It runs in O(n log n) in the worst case using O(1) extra memory, but it is not stable and its scattered memory accesses make it slower than quicksort on modern processors.</p>
+
+<h2>Stability</h2>
+<p>A sort is stable if elements with equal keys keep their original relative order. Stability matters when sorting by several keys in turn: to order records by last name and then by first name, sort by first name and then stably by last name. Insertion sort and merge sort are stable; quicksort and heapsort, as usually implemented, are not.</p>
+
+<h2>Summary</h2>
+<table>
+<thead>
+<tr><th>Algorithm</th><th>Best</th><th>Average</th><th>Worst</th><th>Extra memory</th><th>Stable</th></tr>
+</thead>
+<tbody>
+<tr><td>Insertion sort</td><td>O(n)</td><td>O(n<sup>2</sup>)</td><td>O(n<sup>2</sup>)</td><td>O(1)</td><td>yes</td></tr>
+<tr><td>Merge sort</td><td>O(n log n)</td><td>O(n log n)</td><td>O(n log n)</td><td>O(n)</td><td>yes</td></tr>
+<tr><td>Quicksort</td><td>O(n log n)</td><td>O(n log n)</td><td>O(n<sup>2</sup>)</td><td>O(log n) stack</td><td>no</td></tr>
+<tr><td>Heapsort</td><td>O(n log n)</td><td>O(n log n)</td><td>O(n log n)</td><td>O(1)</td><td>no</td></tr>
+<tr><td>Counting sort</td><td>O(n + k)</td><td>O(n + k)</td><td>O(n + k)</td><td>O(n + k)</td><td>yes</td></tr>
+</tbody>
+</table>
+<p>Insertion sort's linear best case is not a curiosity: on nearly sorted input it does little more than one pass, which is why hybrid sorts such as Timsort hand small or already ordered runs to insertion sort.</p>
+</body>
+</html>

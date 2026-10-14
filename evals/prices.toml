@@ -1,0 +1,30 @@
+# USD per million tokens, by model id. Read by the service at start (trace rows' cost_usd
+# is priced at write time from this table) and by margin-eval's cost reports.
+#
+# Claude rows: Anthropic first-party API prices for the current models (input, output and
+# cache reads as published; cache writes at the standard 5-minute rate, 1.25 x input).
+# Claude Haiku 5.5's published price covers prompts up to 100K tokens ($0.50 / $2.50
+# beyond); its cache-read rate is taken as 0.1 x input. OpenAI rows are added when their
+# prices are checked; a model missing here records cost_usd as none, never a guess.
+checked = "2026-10-06"
+
+[models.claude-opus-5-5]
+provider = "anthropic"
+input = 4.00
+cached_input = 0.20
+cache_write = 5.00
+output = 20.00
+
+[models.claude-sonnet-5-5]
+provider = "anthropic"
+input = 2.00
+cached_input = 0.20
+cache_write = 2.50
+output = 10.00
+
+[models.claude-haiku-5-5]
+provider = "anthropic"
+input = 0.10
+cached_input = 0.01
+cache_write = 0.125
+output = 0.50

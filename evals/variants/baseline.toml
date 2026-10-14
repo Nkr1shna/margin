@@ -1,0 +1,25 @@
+# The shipped default (margin_shared::pipeline::PipelineConfig::default()): section-aware
+# chunks, dense + BM25 fused with RRF, no reranker, MMR packing. Every other variant is
+# compared against this one.
+prompts = "lesson-v2"
+
+[chunker]
+name = "sections-v2"
+
+[retriever]
+name = "hybrid-rrf"
+
+[fusion]
+name = "rrf"
+
+[reranker]
+name = "none"
+
+[packer]
+name = "mmr-v1"
+
+[budget]
+share_of_window = 0.5
+min_score_pct = 25
+images_max = 8
+passages_min = 0

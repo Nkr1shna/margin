@@ -1,0 +1,19 @@
+# Dense + BM25 fused by a weighted linear combination of min-max normalised scores
+# (search::linear) instead of RRF.
+prompts = "lesson-v2"
+
+[chunker]
+name = "sections-v2"
+
+[retriever]
+name = "hybrid-linear"
+params = { dense_weight = 2.0, lex_weight = 1.0, normalisation = "minmax" }
+
+[fusion]
+name = "linear"
+
+[reranker]
+name = "none"
+
+[packer]
+name = "mmr-v1"

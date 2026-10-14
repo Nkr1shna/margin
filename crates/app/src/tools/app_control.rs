@@ -197,6 +197,9 @@ fn passage(
                 SourceKind::Image => source.media_url.clone(),
                 _ => None,
             },
+            document_id: None,
+            start_line: None,
+            end_line: None,
         },
     };
     shown.n = 1;
@@ -335,6 +338,9 @@ mod tests {
             end_ms: start_ms.map(|s| s + 4_000),
             excerpt: format!("passage {n}"),
             image_url: None,
+            document_id: None,
+            start_line: None,
+            end_line: None,
         }
     }
 

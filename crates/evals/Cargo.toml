@@ -1,0 +1,16 @@
+[package]
+name = "margin-evals"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "margin-eval"
+path = "src/bin/margin-eval.rs"
+
+[dependencies]
+margin-shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+toml = "=1.1.8"

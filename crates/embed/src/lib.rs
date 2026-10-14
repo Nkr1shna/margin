@@ -73,12 +73,19 @@ pub enum EmbedError {
 }
 
 /// What an input is, which picks the model's task prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purpose {
-    /// A chunk of a source: `title: none | text: {chunk}`.
-    Document,
+    /// A chunk of a document: `title: {title} | text: {chunk}`, with `title: none` when
+    /// there is no title (the source name or section path, `docs/agent-rag-architecture.md`
+    /// §2.1).
+    Document { title: Option<String> },
     /// What we're looking for: `task: search result | query: {text}`.
     Query,
+}
+
+impl Purpose {
+    /// A document chunk without a title (`title: none`).
+    pub const DOCUMENT: Purpose = Purpose::Document { title: None };
 }
 
 /// How many soft tokens the image encoder spends on a picture (its `vision_70`,
@@ -315,7 +322,7 @@ pub fn jpeg_for_model(_path: &Path, _max_side: usize) -> Result<Vec<u8>, EmbedEr
 }
 
 /// A piece of a source small enough to embed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Chunk {
     pub text: String,
     /// PDF page it came from.
@@ -323,6 +330,35 @@ pub struct Chunk {
     /// Where in an audio or video source the words are (transcript passages).
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
+    /// The headings above it, "Chapter 2 > Fourier series"; empty when the document has
+    /// none (or the chunker doesn't look for them).
+    pub section_path: String,
+    /// The lines of a text document it spans (1-based, inclusive).
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    /// A content hash of `text` (hex), so re-ingesting an unchanged chunk keeps its
+    /// vector; empty from chunkers that don't set it.
+    pub hash: String,
+}
+
+impl Chunk {
+    /// A chunk of `text` from `page`, every other field empty.
+    pub fn new(text: impl Into<String>, page: Option<u32>) -> Self {
+        Self {
+            text: text.into(),
+            page,
+            ..Self::default()
+        }
+    }
+}
+
+/// Reorders retrieved passages by relevance to a query (`docs/agent-rag-architecture.md`
+/// §2.4): a local cross-encoder in R3, behind the service's `Reranker` stage. Scores are
+/// in the input's order; higher is more relevant. Blocking.
+pub trait Reranker: Send + Sync {
+    /// The model and version, recorded with eval runs and traces.
+    fn name(&self) -> &str;
+    fn score(&self, query: &str, passages: &[String]) -> Result<Vec<f32>, EmbedError>;
 }
 
 /// Cuts extracted text into chunks of at most `max_tokens` (as counted by

@@ -127,6 +127,8 @@ fn Harness(props: HarnessProps) -> Element {
             render_fps: 30,
             reasoning_effort: ReasoningEffort::Medium,
             agent_model: None,
+            pipeline: Default::default(),
+            trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
         });
         lib.embedding = std::env::var("RENDER_EMBEDDING")
             .ok()

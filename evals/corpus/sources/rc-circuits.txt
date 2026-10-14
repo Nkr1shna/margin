@@ -1,0 +1,25 @@
+RC circuits and the time constant
+Written for the Margin evaluation corpus. Released under CC0.
+
+Charging a capacitor
+When a capacitor C is connected through a resistor R to a battery of voltage V0, current flows and charge builds up on the plates. The current is largest at the start, when the capacitor is empty and the whole battery voltage appears across the resistor, and it falls as the capacitor voltage rises. Kirchhoff's voltage law gives the differential equation V0 = R dq/dt + q/C, whose solution for an initially uncharged capacitor is
+
+V(t) = V0 (1 - e^(-t/RC))
+
+The product RC has units of seconds and is called the time constant, written tau. After one time constant the capacitor has reached 63.2 percent of its final voltage. After five time constants it has reached 99.3 percent, which is why engineers treat a circuit as settled after about 5 tau.
+\f
+Discharging and energy
+A charged capacitor discharging through a resistor follows V(t) = V0 e^(-t/RC): after one time constant the voltage has fallen to 36.8 percent of its starting value. The time to fall to half is RC ln 2, about 0.69 tau.
+
+The energy stored in a capacitor charged to voltage V is one half C V squared. When a capacitor is charged from a battery through a resistor, exactly half of the energy the battery supplies is dissipated as heat in the resistor, whatever the value of R. A smaller resistor charges the capacitor faster but dissipates the same total energy with a higher peak current.
+
+Example: a 10 microfarad capacitor charged through a 100 kilohm resistor has a time constant of 1 second. Charged to 9 volts it stores 0.405 millijoules.
+\f
+The RC low-pass filter
+Taking the output across the capacitor turns the circuit into a first-order low-pass filter. At low frequencies the capacitor's impedance is large and the output follows the input; at high frequencies the capacitor shorts the signal to ground. The cutoff frequency, where the output power falls to half and the amplitude to 1/sqrt(2) of the input, is
+
+f_c = 1 / (2 pi R C)
+
+Above the cutoff the response falls by 20 decibels per decade of frequency, and the phase shift approaches 90 degrees. Swapping the resistor and capacitor, so that the output is taken across the resistor, gives a high-pass filter with the same cutoff frequency.
+
+The same time constant governs both views of the circuit: a filter with a cutoff of 159 hertz has RC equal to 1 millisecond, so its step response settles in about 5 milliseconds.

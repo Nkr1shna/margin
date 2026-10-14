@@ -644,7 +644,7 @@ async fn process(state: &AppState, id: &str) -> anyhow::Result<()> {
         let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let model = embedder.clone();
         let vectors =
-            match tokio::task::spawn_blocking(move || model.embed(&texts, Purpose::Document))
+            match tokio::task::spawn_blocking(move || model.embed(&texts, Purpose::DOCUMENT))
                 .await?
             {
                 Ok(v) => v,
@@ -1239,6 +1239,9 @@ fn retrieved(
             end_ms,
             excerpt: text.trim().to_string(),
             image_url: picture,
+            document_id: None,
+            start_line: None,
+            end_line: None,
         },
     }
 }

@@ -634,6 +634,7 @@ impl SourceTools for FakeSourceTools {
                     page: page.number,
                     start_ms: None,
                     end_ms: None,
+                    ..Default::default()
                 });
             }
         }

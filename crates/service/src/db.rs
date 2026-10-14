@@ -4,6 +4,12 @@
 //! `table:⟨id⟩`. Keeping the record nested under `doc` lets the wire types (whose own
 //! `id` field would clash with SurrealDB's record id) round-trip unchanged through
 //! serde. Libraries are personal-sized, so most filtering happens in Rust.
+//!
+//! The retrieval tables are different (`docs/agent-rag-architecture.md` §2.2, §2.11):
+//! `passage` and `trace` are SCHEMAFULL with their fields at the top level, so the
+//! HNSW, FULLTEXT and plain indexes can name them, and `trace` rows have array ids
+//! `trace:[kind, at, ulid]` so a kind and time window is a record-range scan.
+//! `trace_hourly`/`trace_daily` are table views SurrealDB keeps current on every write.
 
 use std::path::Path;
 
@@ -32,11 +38,177 @@ pub const CHAT: &str = "chat";
 pub const CHAT_ITEM: &str = "chat_item";
 /// Attached folders (`margin_shared::Workspace`).
 pub const WORKSPACE: &str = "workspace";
+/// Corpora (`margin_shared::context::Project`), `{ doc }` like the tables above.
+pub const PROJECT: &str = "project";
+/// Indexed documents (`margin_shared::context::Document`), `{ doc }`.
+pub const DOCUMENT: &str = "document";
+/// Retrievable passages (`PassageRow`): SCHEMAFULL, top-level fields, indexed.
+pub const PASSAGE: &str = "passage";
+/// Trace rows (`margin_shared::context::TraceRow`): SCHEMAFULL, ids `[kind, at, ulid]`.
+pub const TRACE: &str = "trace";
+/// Hourly and daily rollups of `trace`, as table views.
+pub const TRACE_HOURLY: &str = "trace_hourly";
+pub const TRACE_DAILY: &str = "trace_daily";
+/// Bookkeeping of this module: the fingerprint of the index definitions last applied.
+const SCHEMA_META: &str = "schema_meta";
 
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 15] = [
     TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK, MEDIA, CHAT, CHAT_ITEM,
-    WORKSPACE,
+    WORKSPACE, PROJECT, DOCUMENT,
 ];
+
+/// The `passage` and `trace` tables and their plain indexes. Idempotent (`IF NOT
+/// EXISTS`); a field added later is one more line here.
+const SCHEMA: &str = r#"
+DEFINE TABLE IF NOT EXISTS schema_meta SCHEMALESS;
+DEFINE INDEX IF NOT EXISTS document_project ON document FIELDS doc.project_id;
+DEFINE INDEX IF NOT EXISTS document_access  ON document FIELDS doc.access.*;
+
+DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS document_id  ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS origin       ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS scope_ids    ON passage TYPE array<string>;
+DEFINE FIELD IF NOT EXISTS access       ON passage TYPE array<string> DEFAULT ['company'];
+DEFINE FIELD IF NOT EXISTS unit_id      ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS modality     ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS ord          ON passage TYPE int;
+DEFINE FIELD IF NOT EXISTS page         ON passage TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS start_line   ON passage TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS end_line     ON passage TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS start_ms     ON passage TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS end_ms       ON passage TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS section_path ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS text         ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS file         ON passage TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS chunk_hash   ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS embedder     ON passage TYPE string;
+DEFINE FIELD IF NOT EXISTS vector       ON passage TYPE array<float>;
+DEFINE INDEX IF NOT EXISTS passage_document ON passage FIELDS document_id;
+DEFINE INDEX IF NOT EXISTS passage_scope    ON passage FIELDS scope_ids.*;
+DEFINE INDEX IF NOT EXISTS passage_access   ON passage FIELDS access.*;
+DEFINE INDEX IF NOT EXISTS passage_hash     ON passage FIELDS document_id, chunk_hash UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS trace SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS kind           ON trace TYPE string;
+DEFINE FIELD IF NOT EXISTS at             ON trace TYPE datetime;
+DEFINE FIELD IF NOT EXISTS duration_ms    ON trace TYPE number DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS ok             ON trace TYPE bool DEFAULT true;
+DEFINE FIELD IF NOT EXISTS error_code     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS trace_id       ON trace TYPE string DEFAULT '';
+DEFINE FIELD IF NOT EXISTS parent_id      ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS project_id     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS chat_id        ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS turn_id        ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS job_id         ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS document_id    ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS actor          ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS pipeline_hash  ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS prompt_version ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS route          ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS provider       ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS model          ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS usage          ON trace TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS cost_usd       ON trace TYPE option<number>;
+DEFINE FIELD IF NOT EXISTS stop_reason    ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS step           ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS query_hash     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS scope          ON trace TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS legs           ON trace TYPE option<object> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS hit_ids        ON trace TYPE array<string> DEFAULT [];
+DEFINE FIELD IF NOT EXISTS scores         ON trace TYPE array<number> DEFAULT [];
+DEFINE FIELD IF NOT EXISTS packed_ids     ON trace TYPE array<string> DEFAULT [];
+DEFINE FIELD IF NOT EXISTS packed_tokens  ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS images         ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS cache_hit      ON trace TYPE option<bool>;
+DEFINE FIELD IF NOT EXISTS tool           ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS output_bytes   ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS device_id      ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS chunks_new     ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS chunks_kept    ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS chunks_deleted ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
+"#;
+
+/// The analyzer, the vector and full-text indexes, and the rollup views: defined with
+/// `OVERWRITE`, and applied only when this text changes (an HNSW or analyzer change
+/// rebuilds the index once, at the next start).
+const INDEXES: &str = r#"
+DEFINE ANALYZER OVERWRITE prose TOKENIZERS blank, class FILTERS lowercase, ascii, snowball(english);
+DEFINE INDEX OVERWRITE passage_text ON passage FIELDS text FULLTEXT ANALYZER prose BM25 HIGHLIGHTS;
+DEFINE INDEX OVERWRITE passage_vector ON passage FIELDS vector HNSW DIMENSION 768 DIST COSINE TYPE F32 EFC 200 M 16;
+DEFINE TABLE OVERWRITE trace_hourly TYPE NORMAL AS
+  SELECT kind, route, provider, model, time::floor(at, 1h) AS bucket, count() AS calls,
+    math::sum(usage.input ?? 0) AS input, math::sum(usage.cached ?? 0) AS cached,
+    math::sum(usage.output ?? 0) AS output, math::sum(cost_usd ?? 0) AS cost_usd,
+    math::mean(duration_ms) AS mean_ms
+  FROM trace GROUP BY kind, route, provider, model, bucket;
+DEFINE TABLE OVERWRITE trace_daily TYPE NORMAL AS
+  SELECT kind, route, provider, model, time::floor(at, 1d) AS bucket, count() AS calls,
+    math::sum(usage.input ?? 0) AS input, math::sum(usage.cached ?? 0) AS cached,
+    math::sum(usage.output ?? 0) AS output, math::sum(cost_usd ?? 0) AS cost_usd,
+    math::mean(duration_ms) AS mean_ms
+  FROM trace GROUP BY kind, route, provider, model, bucket;
+"#;
+
+/// The most rows one `insert_many` statement writes.
+pub const INSERT_MANY_MAX: usize = 64;
+
+/// One retrievable piece of a document: a text chunk, a picture (an image, a PDF page),
+/// a video frame or a window of sound. Stored in `passage` with these fields at the top
+/// level; `id` is the record key. `None` fields are left out when written (SurrealDB
+/// tells `NONE` from JSON `null`, and `option<…>` fields take only `NONE`).
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct PassageRow {
+    pub id: String,
+    pub project_id: String,
+    pub document_id: String,
+    /// "source", "folder", "library" or "agent".
+    pub origin: String,
+    /// What may search it: topic id, chat ids, workspace id.
+    pub scope_ids: Vec<String>,
+    /// The document's access paths ("company", "company/engineering"), copied at
+    /// ingest; retrieval pre-filters on them inside the index query.
+    #[serde(default = "company_access")]
+    pub access: Vec<String>,
+    /// Shared by a page's text and its picture.
+    pub unit_id: String,
+    /// `margin_shared::context::Modality` as text.
+    pub modality: String,
+    pub ord: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    pub section_path: String,
+    /// The chunk's text; a picture's OCR or page text; what was said around a frame.
+    pub text: String,
+    /// A picture's media file name ("page-3.png"), rendered on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub chunk_hash: String,
+    /// Model and prefix version; rows with another version are re-embedded.
+    pub embedder: String,
+    pub vector: Vec<f32>,
+}
+
+fn company_access() -> Vec<String> {
+    vec![margin_shared::context::ACCESS_COMPANY.to_string()]
+}
+
+/// One element of an array record id, for `Store::range`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyPart {
+    Str(String),
+    Int(i64),
+    Time(chrono::DateTime<chrono::Utc>),
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -76,12 +248,121 @@ impl Store {
         for t in TABLES {
             defs.push_str(&format!("DEFINE TABLE IF NOT EXISTS {t} SCHEMALESS;"));
         }
+        defs.push_str(SCHEMA);
         db.query(defs)
             .await
             .context("couldn't define tables")?
             .check()
             .context("couldn't define tables")?;
-        Ok(Self { db })
+        let store = Self { db };
+        store.apply_indexes().await?;
+        Ok(store)
+    }
+
+    /// Runs `INDEXES` when its text differs from the last one applied.
+    async fn apply_indexes(&self) -> anyhow::Result<()> {
+        let fingerprint = crate::state::sha256_hex(INDEXES);
+        let applied: Option<String> = self.get(SCHEMA_META, "indexes").await?;
+        if applied.as_deref() == Some(fingerprint.as_str()) {
+            return Ok(());
+        }
+        self.db
+            .query(INDEXES)
+            .await
+            .context("couldn't define the indexes")?
+            .check()
+            .context("couldn't define the indexes")?;
+        self.put(SCHEMA_META, "indexes", &fingerprint).await
+    }
+
+    /// Writes up to `INSERT_MANY_MAX` rows in one statement (`INSERT INTO table $rows`);
+    /// each row's `id` field, when present, is its record key. More rows are an error:
+    /// callers batch, taking the write lock per statement.
+    pub async fn insert_many<T: Serialize>(
+        &self,
+        table: &'static str,
+        rows: &[T],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            rows.len() <= INSERT_MANY_MAX,
+            "insert_many takes at most {INSERT_MANY_MAX} rows, not {}",
+            rows.len()
+        );
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rows = serde_json::to_value(rows)?;
+        self.db
+            .query(format!("INSERT INTO {table} $rows RETURN NONE"))
+            .bind(("rows", rows))
+            .await?
+            .check()
+            .with_context(|| format!("couldn't insert into {table}"))?;
+        Ok(())
+    }
+
+    /// Records of `table` whose array ids lie between `from` and `to` (both inclusive),
+    /// in id order: a record-range scan, no index needed. Each row's `id` is the record
+    /// id as SurrealQL text; `key` is the id's array.
+    pub async fn range<T: DeserializeOwned>(
+        &self,
+        table: &'static str,
+        from: &[KeyPart],
+        to: &[KeyPart],
+    ) -> anyhow::Result<Vec<T>> {
+        let (range, binds) = range_expr(table, from, to);
+        let mut q = self
+            .db
+            .query(format!("SELECT *, record::id(id) AS key FROM {range}"));
+        for (name, part) in binds {
+            q = bind_part(q, name, part);
+        }
+        let mut res = q.await?.check()?;
+        let rows: Vec<serde_json::Value> = res.take(0)?;
+        rows.into_iter()
+            .map(|v| serde_json::from_value(v).with_context(|| format!("bad {table} record")))
+            .collect()
+    }
+
+    /// Deletes the records of `table` whose array ids lie between `from` and `to` (both
+    /// inclusive).
+    pub async fn delete_range(
+        &self,
+        table: &'static str,
+        from: &[KeyPart],
+        to: &[KeyPart],
+    ) -> anyhow::Result<()> {
+        let (range, binds) = range_expr(table, from, to);
+        let mut q = self.db.query(format!("DELETE {range} RETURN NONE"));
+        for (name, part) in binds {
+            q = bind_part(q, name, part);
+        }
+        q.await?.check()?;
+        Ok(())
+    }
+
+    /// Runs SurrealQL with bound parameters and returns the rows of its last statement.
+    /// Table names in `sql` must be this module's constants, never input.
+    pub async fn query_rows<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        binds: Vec<(&'static str, serde_json::Value)>,
+    ) -> anyhow::Result<Vec<T>> {
+        let mut q = self.db.query(sql.to_string());
+        for (name, value) in binds {
+            q = q.bind((name, value));
+        }
+        let mut res = q.await?.check()?;
+        let last = res.num_statements().saturating_sub(1);
+        let value: surrealdb::types::Value = res.take(last)?;
+        let rows = match value.into_json_value() {
+            serde_json::Value::Array(rows) => rows,
+            serde_json::Value::Null => Vec::new(),
+            one => vec![one],
+        };
+        rows.into_iter()
+            .map(|v| serde_json::from_value(v).context("bad query row"))
+            .collect()
     }
 
     pub async fn get<T: DeserializeOwned>(
@@ -204,6 +485,42 @@ impl Store {
     }
 }
 
+/// `table:[$f0, …]..=[$t0, …]` and the parameters it names.
+fn range_expr<'a>(
+    table: &str,
+    from: &'a [KeyPart],
+    to: &'a [KeyPart],
+) -> (String, Vec<(String, &'a KeyPart)>) {
+    let mut binds = Vec::new();
+    let mut side = |prefix: &str, parts: &'a [KeyPart]| {
+        let names: Vec<String> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let name = format!("{prefix}{i}");
+                binds.push((name.clone(), part));
+                format!("${name}")
+            })
+            .collect();
+        format!("[{}]", names.join(", "))
+    };
+    let lo = side("from_", from);
+    let hi = side("to_", to);
+    (format!("{table}:{lo}..={hi}"), binds)
+}
+
+fn bind_part<'q>(
+    q: surrealdb::method::Query<'q, Db>,
+    name: String,
+    part: &KeyPart,
+) -> surrealdb::method::Query<'q, Db> {
+    match part {
+        KeyPart::Str(s) => q.bind((name, s.clone())),
+        KeyPart::Int(i) => q.bind((name, *i)),
+        KeyPart::Time(t) => q.bind((name, *t)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +599,439 @@ mod tests {
         let left: Vec<Row> = s.list(CHUNK).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "c");
+    }
+
+    // -- the retrieval schema on the embedded engine (kv-mem) ------------------
+
+    fn unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0f32; 768];
+        v[i] = 1.0;
+        v
+    }
+
+    fn passage(
+        id: &str,
+        doc: &str,
+        scope: &[&str],
+        modality: &str,
+        text: &str,
+        v: Vec<f32>,
+    ) -> PassageRow {
+        PassageRow {
+            id: id.into(),
+            project_id: "p".into(),
+            document_id: doc.into(),
+            origin: "source".into(),
+            scope_ids: scope.iter().map(|s| s.to_string()).collect(),
+            access: vec!["company".into()],
+            unit_id: format!("{doc}/{id}"),
+            modality: modality.into(),
+            ord: 0,
+            page: None,
+            start_line: Some(1),
+            end_line: Some(3),
+            start_ms: None,
+            end_ms: None,
+            section_path: "Intro".into(),
+            text: text.into(),
+            file: None,
+            chunk_hash: format!("h-{id}"),
+            embedder: "test".into(),
+            vector: v,
+        }
+    }
+
+    async fn seeded() -> Store {
+        let s = Store::memory().await.unwrap();
+        let mut near = unit(0);
+        near[1] = 0.5;
+        s.insert_many(
+            PASSAGE,
+            &[
+                passage(
+                    "a",
+                    "d1",
+                    &["t1"],
+                    "text",
+                    "The Carnot engine sets the efficiency limit of heat engines",
+                    unit(0),
+                ),
+                passage(
+                    "b",
+                    "d1",
+                    &["t1", "c1"],
+                    "text",
+                    "Photosynthesis stores light energy in sugar",
+                    unit(1),
+                ),
+                passage(
+                    "c",
+                    "d2",
+                    &["t2"],
+                    "picture",
+                    "pressure volume diagram of a heat engine cycle",
+                    near,
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        s
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Ranked {
+        id: String,
+        #[serde(default)]
+        d: Option<f64>,
+        #[serde(default)]
+        s: Option<f64>,
+        #[serde(default)]
+        h: Option<String>,
+    }
+
+    #[tokio::test]
+    async fn schema_applies_once_and_passages_round_trip() {
+        let s = seeded().await;
+        // A second init over the same store re-applies nothing that fails.
+        s.apply_indexes().await.unwrap();
+        let rows: Vec<PassageRow> = s
+            .query_rows(
+                "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d ORDER BY id",
+                vec![("d", serde_json::json!("d1"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            passage(
+                "a",
+                "d1",
+                &["t1"],
+                "text",
+                "The Carnot engine sets the efficiency limit of heat engines",
+                unit(0)
+            )
+        );
+        // (document_id, chunk_hash) is unique.
+        let dup = passage("z", "d1", &[], "text", "again", unit(5));
+        let dup = PassageRow {
+            chunk_hash: "h-a".into(),
+            ..dup
+        };
+        assert!(s.insert_many(PASSAGE, &[dup]).await.is_err());
+        // Batches are bounded.
+        let many: Vec<PassageRow> = (0..=INSERT_MANY_MAX)
+            .map(|i| passage(&format!("m{i}"), "d9", &[], "text", "x", unit(i % 768)))
+            .collect();
+        assert!(s.insert_many(PASSAGE, &many).await.is_err());
+        // A vector of the wrong type is refused by the schema.
+        let bad: anyhow::Result<()> = s
+            .query_rows::<serde_json::Value>(
+                "CREATE passage:bad CONTENT { document_id: 'd', vector: 'no' }",
+                vec![],
+            )
+            .await
+            .map(|_| ());
+        assert!(bad.is_err());
+    }
+
+    #[tokio::test]
+    async fn hnsw_finds_the_nearest_within_a_scope() {
+        let s = seeded().await;
+        let mut q = unit(0);
+        q[1] = 0.05;
+        let hits: Vec<Ranked> = s
+            .query_rows(
+                "SELECT record::id(id) AS id, vector::distance::knn() AS d FROM passage \
+                 WHERE vector <|2, 128|> $q ORDER BY d",
+                vec![("q", serde_json::json!(q))],
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+        assert!(hits[0].d.unwrap() < hits[1].d.unwrap());
+        // Pre-filtered by scope and modality: c is outside t1.
+        let hits: Vec<Ranked> = s
+            .query_rows(
+                "SELECT record::id(id) AS id, vector::distance::knn() AS d FROM passage \
+                 WHERE vector <|2, 128|> $q AND $scope IN scope_ids AND modality IN $modalities ORDER BY d",
+                vec![
+                    ("q", serde_json::json!(q)),
+                    ("scope", serde_json::json!("t1")),
+                    ("modalities", serde_json::json!(["text", "picture"])),
+                ],
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        // Access paths pre-filter inside the KNN scan, like scope. (`$access` is a
+        // protected parameter name in SurrealDB 3.3.4, so the binding is `$paths`.)
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                "SELECT id FROM passage WHERE vector <|2, 128|> $q AND access CONTAINSANY $paths EXPLAIN",
+                vec![
+                    ("q", serde_json::json!(q)),
+                    ("paths", serde_json::json!(["company"])),
+                ],
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("KnnScan") && plan.contains("CONTAINSANY"),
+            "{plan}"
+        );
+        let none: Vec<Ranked> = s
+            .query_rows(
+                "SELECT record::id(id) AS id FROM passage WHERE vector <|2, 128|> $q AND access CONTAINSANY $paths",
+                vec![
+                    ("q", serde_json::json!(q)),
+                    ("paths", serde_json::json!(["company/finance"])),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        // The planner uses the HNSW index, and the scope index on its own.
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                "SELECT id FROM passage WHERE vector <|2, 128|> $q AND $scope IN scope_ids EXPLAIN",
+                vec![
+                    ("q", serde_json::json!(q)),
+                    ("scope", serde_json::json!("t1")),
+                ],
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("KnnScan") && plan.contains("passage_vector"),
+            "{plan}"
+        );
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                "SELECT id FROM passage WHERE $scope IN scope_ids EXPLAIN",
+                vec![("scope", serde_json::json!("c1"))],
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(plan.contains("passage_scope"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn fulltext_scores_and_highlights() {
+        let s = seeded().await;
+        let hits: Vec<Ranked> = s
+            .query_rows(
+                "SELECT record::id(id) AS id, search::score(1) AS s, \
+                 search::highlight('<b>', '</b>', 1) AS h FROM passage \
+                 WHERE text @1@ $q ORDER BY s DESC",
+                vec![("q", serde_json::json!("photosynthesis"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "b");
+        assert!(hits[0].s.unwrap() > 0.0);
+        assert_eq!(
+            hits[0].h.as_deref(),
+            Some("<b>Photosynthesis</b> stores light energy in sugar")
+        );
+        // Stemming: "engines" finds "engine".
+        let hits: Vec<Ranked> = s
+            .query_rows(
+                "SELECT record::id(id) AS id, search::score(1) AS s FROM passage \
+                 WHERE text @1@ $q ORDER BY s DESC",
+                vec![("q", serde_json::json!("engines"))],
+            )
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn rrf_fuses_the_two_legs() {
+        let s = seeded().await;
+        #[derive(Debug, serde::Deserialize)]
+        struct Fused {
+            id: String,
+            rrf_score: f64,
+        }
+        let mut q = unit(1);
+        q[0] = 0.05;
+        let fused: Vec<Fused> = s
+            .query_rows(
+                "LET $dense = SELECT id, vector::distance::knn() AS d FROM passage WHERE vector <|3, 128|> $q; \
+                 LET $lex = SELECT id, search::score(1) AS s FROM passage WHERE text @1@ $text ORDER BY s DESC LIMIT 40; \
+                 RETURN search::rrf([$dense, $lex], 24, 60);",
+                vec![
+                    ("q", serde_json::json!(q)),
+                    ("text", serde_json::json!("heat engine")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(fused.len(), 3);
+        assert!(fused.windows(2).all(|w| w[0].rrf_score >= w[1].rrf_score));
+        // b is first in the dense leg only; a and c are in both legs and outrank it.
+        assert_eq!(fused[2].id, "passage:b");
+        assert!((fused[2].rrf_score - 1.0 / 61.0).abs() < 1e-9);
+    }
+
+    async fn trace(s: &Store, kind: &str, at: &str, ulid: &str, extra: serde_json::Value) {
+        s.query_rows::<serde_json::Value>(
+            "LET $at = <datetime>$at_text; \
+             CREATE type::record('trace', [$kind, $at, $ulid]) \
+             CONTENT object::extend($extra, { kind: $kind, at: $at }) RETURN NONE;",
+            vec![
+                ("kind", serde_json::json!(kind)),
+                ("at_text", serde_json::json!(at)),
+                ("ulid", serde_json::json!(ulid)),
+                ("extra", extra),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
+        text.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn traces_by_kind_and_window_and_their_rollups() {
+        let s = Store::memory().await.unwrap();
+        let call = serde_json::json!({
+            "duration_ms": 100, "route": "small", "provider": "openai", "model": "m",
+            "cost_usd": 0.25, "usage": {"input": 100, "cached": 40, "output": 5}
+        });
+        trace(
+            &s,
+            "model_call",
+            "2026-10-14T09:59:59Z",
+            "01A",
+            call.clone(),
+        )
+        .await;
+        trace(
+            &s,
+            "model_call",
+            "2026-10-14T10:03:21.412Z",
+            "01B",
+            call.clone(),
+        )
+        .await;
+        trace(
+            &s,
+            "model_call",
+            "2026-10-14T10:40:00Z",
+            "01C",
+            call.clone(),
+        )
+        .await;
+        trace(
+            &s,
+            "retrieval",
+            "2026-10-14T10:05:00Z",
+            "01D",
+            serde_json::json!({"duration_ms": 8, "hit_ids": ["a"]}),
+        )
+        .await;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Row {
+            kind: String,
+            key: (String, String, String),
+        }
+        let window = |kind: &str, from: &str, to: &str| {
+            (
+                vec![
+                    KeyPart::Str(kind.into()),
+                    KeyPart::Time(at(from)),
+                    KeyPart::Str(String::new()),
+                ],
+                vec![
+                    KeyPart::Str(kind.into()),
+                    KeyPart::Time(at(to)),
+                    KeyPart::Str("~".into()),
+                ],
+            )
+        };
+        let (from, to) = window("model_call", "2026-10-14T10:00:00Z", "2026-10-14T11:00:00Z");
+        let rows: Vec<Row> = s.range(TRACE, &from, &to).await.unwrap();
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.2.as_str()).collect();
+        assert_eq!(keys, ["01B", "01C"]);
+        assert!(
+            rows.iter()
+                .all(|r| r.kind == "model_call" && r.key.0 == "model_call")
+        );
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Rollup {
+            kind: String,
+            bucket: chrono::DateTime<chrono::Utc>,
+            calls: u64,
+            input: f64,
+            cached: f64,
+            cost_usd: f64,
+            mean_ms: f64,
+        }
+        let hourly = |s: Store| async move {
+            s.query_rows::<Rollup>(
+                "SELECT * FROM trace_hourly WHERE kind = 'model_call' ORDER BY bucket",
+                vec![],
+            )
+            .await
+            .unwrap()
+        };
+        let rows = hourly(s.clone()).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].bucket, at("2026-10-14T10:00:00Z"));
+        assert_eq!(
+            (rows[1].calls, rows[1].input, rows[1].cached),
+            (2, 200.0, 80.0)
+        );
+        assert!((rows[1].cost_usd - 0.5).abs() < 1e-9 && rows[1].mean_ms == 100.0);
+        // The view follows a new row…
+        trace(
+            &s,
+            "model_call",
+            "2026-10-14T10:59:00Z",
+            "01E",
+            call.clone(),
+        )
+        .await;
+        assert_eq!(hourly(s.clone()).await[1].calls, 3);
+        // …and rows without usage or cost (a retrieval) count in their own group.
+        let daily: Vec<Rollup> = s
+            .query_rows("SELECT * FROM trace_daily ORDER BY kind", vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            daily
+                .iter()
+                .map(|r| (r.kind.as_str(), r.calls))
+                .collect::<Vec<_>>(),
+            [("model_call", 4), ("retrieval", 1)]
+        );
+
+        // Retention deletes by range and leaves other kinds alone.
+        let (from, to) = window("model_call", "1970-01-01T00:00:00Z", "2026-10-14T10:30:00Z");
+        s.delete_range(TRACE, &from, &to).await.unwrap();
+        let (from, to) = window("model_call", "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
+        let left: Vec<Row> = s.range(TRACE, &from, &to).await.unwrap();
+        assert_eq!(
+            left.iter().map(|r| r.key.2.as_str()).collect::<Vec<_>>(),
+            ["01C", "01E"]
+        );
+        let (from, to) = window("retrieval", "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
+        assert_eq!(s.range::<Row>(TRACE, &from, &to).await.unwrap().len(), 1);
     }
 }

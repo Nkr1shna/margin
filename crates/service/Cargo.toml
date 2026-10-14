@@ -41,6 +41,8 @@ toml = "=1.1.8"
 base64 = "=0.23.1"
 hex = "=0.4.3"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+arc-swap = "=1.9.2"
+ulid = "=1.2.1"
 
 [dev-dependencies]
 tokio-tungstenite = "=0.30.0"
