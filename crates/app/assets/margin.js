@@ -476,6 +476,18 @@
     revealTop: function (m) {
       return Math.max(0, Math.round(m.scrollTop + (m.itemTop - m.boxTop) - m.boxHeight / 4));
     },
+    // Where a long press's tooltip goes: centred above the finger at (x, y), clear of
+    // it (fingertips cover ~40px); below it when there's no room above; always inside
+    // the window. Plain numbers, so it can be tested without layout.
+    touchTipPosition: function (m) {
+      var gap = 44;
+      var top = m.y - gap - m.height;
+      if (top < 6) top = m.y + gap;
+      top = Math.max(6, Math.min(top, m.viewHeight - m.height - 6));
+      var left = m.x - m.width / 2;
+      left = Math.max(6, Math.min(left, m.viewWidth - m.width - 6));
+      return { top: Math.round(top), left: Math.round(left) };
+    },
     // Whether a box's text is cut off: an ellipsis that is in use (content wider than the
     // box) or a line clamp that hides lines. Takes plain numbers so it can be tested
     // without layout.
@@ -741,6 +753,67 @@
       document.addEventListener(type, hide, true);
     });
     window.addEventListener("blur", hide);
+
+    // Touch has no hover: a long press (~500 ms, not moving) on text that is cut off shows
+    // its full text in the same tooltip, above the finger, until the next tap anywhere or
+    // a scroll (the listeners above). Rows with an actions menu ([data-long-press]) open
+    // that instead, headed by the full name. The tap that ends the press doesn't also
+    // activate what's under it, and the system's text selection doesn't start.
+    // <html data-input> says what the last press was ("touch" or "mouse"), which the
+    // menus' headings follow.
+    var press = null, pressTimer = null, revealedAt = 0;
+    function cancelPress() { clearTimeout(pressTimer); pressTimer = null; press = null; }
+    function truncatedAt(node) {
+      for (var n = node; n && n.nodeType === 1 && n !== document.body; n = n.parentElement) {
+        if (isTruncated(n)) return n;
+      }
+      return null;
+    }
+    function reveal(t, x, y) {
+      if (!document.body.contains(t)) return;
+      var box = el();
+      box.textContent = fullText(t);
+      box.classList.add("show");
+      describe(t);
+      current = t;
+      var b = box.getBoundingClientRect();
+      var at = window.MarginApp.touchTipPosition({
+        x: x, y: y, width: b.width, height: b.height,
+        viewWidth: window.innerWidth, viewHeight: window.innerHeight,
+      });
+      box.style.top = at.top + "px";
+      box.style.left = at.left + "px";
+      revealedAt = Date.now();
+    }
+    document.addEventListener("pointerdown", function (e) {
+      cancelPress();
+      document.documentElement.setAttribute("data-input", e.pointerType === "mouse" ? "mouse" : "touch");
+      if (e.pointerType === "mouse") return;
+      if (e.target.closest && e.target.closest("[data-long-press]")) return;
+      var t = truncatedAt(e.target);
+      if (!t) return;
+      press = { x: e.clientX, y: e.clientY, target: t };
+      pressTimer = setTimeout(function () {
+        var p = press;
+        cancelPress();
+        if (p) reveal(p.target, p.x, p.y);
+      }, 500);
+    }, true);
+    document.addEventListener("pointermove", function (e) {
+      if (press && Math.abs(e.clientX - press.x) + Math.abs(e.clientY - press.y) > 10) cancelPress();
+    }, true);
+    ["pointerup", "pointercancel", "scroll"].forEach(function (type) {
+      document.addEventListener(type, cancelPress, true);
+    });
+    function justRevealed() { return Date.now() - revealedAt < 1000; }
+    document.addEventListener("click", function (e) {
+      if (justRevealed()) { revealedAt = 0; e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    ["contextmenu", "selectstart"].forEach(function (type) {
+      document.addEventListener(type, function (e) {
+        if (press || justRevealed()) e.preventDefault();
+      }, true);
+    });
   })();
 
   // Below 1024px the sidebar is a drawer (main.css); ⌘\ opens and closes it there.

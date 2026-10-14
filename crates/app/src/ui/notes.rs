@@ -322,6 +322,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                             class: "menu right",
                                             role: "menu",
                                             onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); item_menu.set(None) },
+                                            div { class: "menu-title", "aria-hidden": "true", "{note.title}" }
                                             button {
                                                 role: "menuitem",
                                                 onmounted: focus_on_mount,

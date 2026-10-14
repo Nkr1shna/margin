@@ -286,6 +286,10 @@ body.resizing-sb * { user-select: none !important; }
 .menu button:hover, .menu button:focus-visible { background: var(--hover); }
 .menu button.danger { color: var(--danger); }
 .menu .sep { height: 1px; background: var(--line); margin: 4px 6px; }
+/* A row's full name heads its menu when a long press opened it (margin.js sets
+   data-input="touch"), since there's no hover to show it on. */
+.menu .menu-title { display: none; max-width: 260px; padding: 6px 10px 8px; margin-bottom: 3px; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 18px; font-weight: 500; color: var(--fg-2); overflow-wrap: anywhere; }
+:root[data-input="touch"] .menu .menu-title { display: block; }
 .menu .menu-note { margin: 4px 0 2px; padding: 6px 10px 4px; max-width: 260px; border-top: 1px solid var(--line); font-size: 12px; line-height: 17px; color: var(--fg-3); }
 .menu.right { right: 0; }
 

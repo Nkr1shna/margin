@@ -205,6 +205,18 @@ fn run_js(body: &str) {
 }
 
 #[test]
+fn long_press_tips_sit_above_the_finger_inside_the_window() {
+    run_js(
+        "const v={width:200,height:40,viewWidth:390,viewHeight:844};\n\
+         eq(M.touchTipPosition({...v,x:195,y:400}),{top:316,left:95},'above, centred');\n\
+         eq(M.touchTipPosition({...v,x:20,y:400}),{top:316,left:6},'kept off the left edge');\n\
+         eq(M.touchTipPosition({...v,x:385,y:400}),{top:316,left:184},'kept off the right edge');\n\
+         eq(M.touchTipPosition({...v,x:195,y:60}),{top:104,left:95},'below when no room above');\n\
+         eq(M.touchTipPosition({...v,x:195,y:840,height:40}),{top:756,left:95},'near the bottom');",
+    );
+}
+
+#[test]
 fn transcript_reveal_puts_the_line_a_quarter_down() {
     run_js(
         "eq(M.revealTop({scrollTop:0,boxTop:100,boxHeight:400,itemTop:700}),500,'below');\n\

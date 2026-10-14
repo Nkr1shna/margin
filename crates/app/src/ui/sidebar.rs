@@ -480,6 +480,8 @@ fn LessonNode(
                             menu.set(None);
                         }
                     },
+                    // The full name, cut off in the row: shown when a long press opened the menu.
+                    div { class: "menu-title", "aria-hidden": "true", "{title}" }
                     button {
                         role: "menuitem",
                         onmounted: focus_on_mount,
@@ -814,6 +816,8 @@ fn TopicNode(id: Id) -> Element {
                             menu.set(None);
                         }
                     },
+                    // The full name, cut off in the row: shown when a long press opened the menu.
+                    div { class: "menu-title", "aria-hidden": "true", "{topic.title}" }
                     button {
                         role: "menuitem",
                         onmounted: focus_on_mount,
