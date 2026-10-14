@@ -40,6 +40,9 @@ ndk-context = "=0.1.1"
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 arboard = { version = "=3.6.1", default-features = false }
+# File and folder pickers for adding sources. Same version and features dioxus-desktop
+# uses (macOS: AppKit sheet; Linux: XDG portal), so no new GUI stack is pulled in.
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
 
 # Positions the traffic lights for the unified title bar (src/chrome.rs).
 [target.'cfg(target_os = "macos")'.dependencies]

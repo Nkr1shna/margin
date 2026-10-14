@@ -5085,6 +5085,7 @@ dependencies = [
  "objc2-foundation",
  "pulldown-cmark",
  "reqwest 0.13.5",
+ "rfd",
  "rustls",
  "serde",
  "serde_json",
