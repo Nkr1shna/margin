@@ -4,18 +4,23 @@
 
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2_core_foundation::{
     CFBoolean, CFDictionary, CFMutableData, CFNumber, CFRetained, CFString, CFType, CFURL, CGPoint,
     CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
-    CGInterpolationQuality, kCGColorSpaceSRGB,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
+    CGImageAlphaInfo, CGInterpolationQuality, kCGColorSpaceSRGB,
 };
+use objc2_foundation::{NSArray, NSDictionary};
 use objc2_image_io::{
     CGImageDestination, CGImageSource, kCGImageDestinationLossyCompressionQuality,
     kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailWithTransform,
     kCGImageSourceThumbnailMaxPixelSize,
+};
+use objc2_vision::{
+    VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
 };
 
 use crate::EmbedError;
@@ -95,6 +100,73 @@ pub(crate) fn rgba(image: &CGImage, width: usize, height: usize) -> Result<Vec<u
     // Done drawing into `pixels`.
     drop(context);
     Ok(pixels)
+}
+
+/// Images are decoded at most this large for text recognition.
+pub(crate) const OCR_MAX_SIDE: usize = 4096;
+
+/// The text Vision's recognizer (accurate, with language correction) reads in `image`,
+/// one recognized line per line, in its reading order. The image is first drawn on
+/// white, so dark text on a transparent background is still read.
+pub(crate) fn recognize_text(image: &CGImage) -> Result<String, EmbedError> {
+    let (width, height) = size(image);
+    if width == 0 || height == 0 {
+        return Ok(String::new());
+    }
+    let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
+        .ok_or_else(|| EmbedError::Extract("no sRGB color space".into()))?;
+    let context = unsafe {
+        CGBitmapContextCreate(
+            std::ptr::null_mut(),
+            width,
+            height,
+            8,
+            0,
+            Some(&space),
+            CGImageAlphaInfo::NoneSkipLast.0,
+        )
+    }
+    .ok_or_else(|| EmbedError::Extract(format!("can't draw a {width}x{height} image")))?;
+    let rect = CGRect::new(
+        CGPoint::new(0.0, 0.0),
+        CGSize::new(width as f64, height as f64),
+    );
+    CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
+    CGContext::fill_rect(Some(&context), rect);
+    CGContext::draw_image(Some(&context), rect, Some(image));
+    let flat = CGBitmapContextCreateImage(Some(&context))
+        .ok_or_else(|| EmbedError::Extract("couldn't draw the image".into()))?;
+    recognize(&flat)
+}
+
+/// Vision text recognition on an image as it is.
+pub(crate) fn recognize(image: &CGImage) -> Result<String, EmbedError> {
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+    request.setAutomaticallyDetectsLanguage(true);
+    let handler = unsafe {
+        VNImageRequestHandler::initWithCGImage_options(
+            VNImageRequestHandler::alloc(),
+            image,
+            &NSDictionary::new(),
+        )
+    };
+    let generic: &VNRequest = &request;
+    handler
+        .performRequests_error(&NSArray::from_slice(&[generic]))
+        .map_err(|e| EmbedError::Extract(format!("text recognition failed: {e}")))?;
+    let lines: Vec<String> = request
+        .results()
+        .map(|observations| {
+            observations
+                .iter()
+                .filter_map(|o| o.topCandidates(1).firstObject())
+                .map(|text| text.string().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(lines.join("\n"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -1,25 +1,57 @@
 //! PDF text with PDFKit, page by page. A page whose text layer is empty or nearly so
 //! (a scan) is rendered to a grayscale bitmap with Core Graphics and read with Vision's
-//! text recognition (accurate, with language correction). Each page is also rendered in
-//! color as a PNG picture, which is embedded with the image encoder and served to the app.
+//! text recognition (accurate, with language correction). Each page can also be rendered
+//! in color as a PNG picture, which is embedded with the image encoder and served to the
+//! app: all of them while extracting, or one at a time when needed (`page_picture`).
 
 use std::path::Path;
 use std::ptr;
 
 use objc2::AnyThread;
-use objc2::rc::autoreleasepool;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
     CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFPage, kCGColorSpaceSRGB,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSURL};
+use objc2_foundation::NSURL;
 use objc2_pdf_kit::{PDFDocument, PDFPage};
-use objc2_vision::{
-    VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
-};
 
 use crate::{EmbedError, Extracted, Page};
+
+/// Opens the PDF at `path`, refusing a locked one.
+fn open(path: &Path) -> Result<Retained<PDFDocument>, EmbedError> {
+    let url = NSURL::from_file_path(path)
+        .ok_or_else(|| EmbedError::Extract(format!("bad path {}", path.display())))?;
+    let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }
+        .ok_or_else(|| EmbedError::Extract("not a PDF, or it couldn't be opened".into()))?;
+    if unsafe { doc.isLocked() } {
+        return Err(EmbedError::Extract("the PDF is password-protected".into()));
+    }
+    Ok(doc)
+}
+
+/// Page `number` (from 1) drawn as `extract` draws page pictures, written to `out` as
+/// PNG.
+pub(crate) fn page_picture(path: &Path, number: u32, out: &Path) -> Result<(), EmbedError> {
+    let doc = open(path)?;
+    let count = unsafe { doc.pageCount() };
+    if number == 0 || number as usize > count {
+        return Err(EmbedError::Extract(format!(
+            "the PDF has no page {number} (it has {count})"
+        )));
+    }
+    autoreleasepool(|_| {
+        let page = unsafe { doc.pageAtIndex(number as usize - 1) }
+            .ok_or_else(|| EmbedError::Extract(format!("couldn't read page {number}")))?;
+        let image = render(&page, Color::Rgb, PICTURE_SCALE, PICTURE_MAX_SIDE)
+            .ok_or_else(|| EmbedError::Extract(format!("page {number} is empty")))?;
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        crate::image::write(&image, out, crate::image::Format::Png)
+    })
+}
 
 /// Pages with fewer non-space characters than this in their text layer are OCR'd.
 const MIN_TEXT_CHARS: usize = 16;
@@ -36,13 +68,7 @@ const PICTURE_MAX_SIDE: f64 = 2048.0;
 /// The text of every page; with `media_dir`, each page is also rendered there as
 /// `page_file(n)` and listed as a picture.
 pub(crate) fn extract(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
-    let url = NSURL::from_file_path(path)
-        .ok_or_else(|| EmbedError::Extract(format!("bad path {}", path.display())))?;
-    let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }
-        .ok_or_else(|| EmbedError::Extract("not a PDF, or it couldn't be opened".into()))?;
-    if unsafe { doc.isLocked() } {
-        return Err(EmbedError::Extract("the PDF is password-protected".into()));
-    }
+    let doc = open(path)?;
     let count = unsafe { doc.pageCount() };
     let mut pages = Vec::with_capacity(count);
     let mut pictures = Vec::new();
@@ -102,32 +128,7 @@ fn ocr_page(page: &PDFPage) -> Result<String, EmbedError> {
     let Some(image) = render(page, Color::Gray, OCR_SCALE, OCR_MAX_SIDE) else {
         return Ok(String::new());
     };
-    let request = VNRecognizeTextRequest::new();
-    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-    request.setUsesLanguageCorrection(true);
-    request.setAutomaticallyDetectsLanguage(true);
-    let handler = unsafe {
-        VNImageRequestHandler::initWithCGImage_options(
-            VNImageRequestHandler::alloc(),
-            &image,
-            &NSDictionary::new(),
-        )
-    };
-    let generic: &VNRequest = &request;
-    handler
-        .performRequests_error(&NSArray::from_slice(&[generic]))
-        .map_err(|e| EmbedError::Extract(format!("text recognition failed: {e}")))?;
-    let lines: Vec<String> = request
-        .results()
-        .map(|observations| {
-            observations
-                .iter()
-                .filter_map(|o| o.topCandidates(1).firstObject())
-                .map(|text| text.string().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(lines.join("\n"))
+    crate::image::recognize(&image)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

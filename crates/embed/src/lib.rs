@@ -42,8 +42,28 @@ pub const DIM: usize = 768;
 /// Most tokens one `embed` input may hold (the largest Core ML `embed_S` function),
 /// including the task prefix and `<bos>`/`<eos>`.
 pub const MAX_TOKENS: usize = 512;
-/// Chunk size the service cuts sources into, leaving room for the document prefix.
+/// Chunk size the service cuts sources into, leaving room for the document prefix: the
+/// hard cap every chunker keeps.
 pub const CHUNK_TOKENS: usize = 480;
+/// What the `"sections-v2"` chunker aims a chunk at (`docs/agent-rag-architecture.md`
+/// §2.1: 256–400 tokens); a chunk only goes past it, up to `CHUNK_TOKENS`, to keep a
+/// section's short tail with the rest or an atomic table or code block whole.
+pub const CHUNK_TARGET_TOKENS: usize = 384;
+/// The chunker names the service's pipeline registry knows them by.
+pub const CHUNKER_PAGES: &str = "pages-v1";
+pub const CHUNKER_SECTIONS: &str = "sections-v2";
+/// How many vectors `Embedder::embed_pipelined` hands back at a time by default: the
+/// most rows the service writes in one statement.
+pub const EMBED_BATCH: usize = 64;
+/// The model's document prompt (`config.json` `prompts.document`); a title replaces
+/// `none`.
+pub const DOCUMENT_PROMPT: &str = "title: none | text: ";
+/// The model's query prompt (`config.json` `prompts.search_query`).
+pub const QUERY_PROMPT: &str = "task: search result | query: ";
+/// The model and the way its inputs are prefixed. Stored on every passage as `embedder`;
+/// rows with another version are embedded again, and recordings are only served for
+/// their own version. Bump it when the prefix rules (`prompt`) or the model change.
+pub const EMBEDDER_VERSION: &str = "embeddinggemma-2-coreml/title-prefix-v1";
 /// Sample rate of the audio the audio encoder and the speech recognizer take (mono).
 pub const SAMPLE_RATE: u32 = 16_000;
 /// One audio embedding covers this many samples: 10 seconds.
@@ -86,6 +106,64 @@ pub enum Purpose {
 impl Purpose {
     /// A document chunk without a title (`title: none`).
     pub const DOCUMENT: Purpose = Purpose::Document { title: None };
+
+    /// A document chunk titled `title` (`None` or blank: `title: none`).
+    pub fn document(title: Option<&str>) -> Purpose {
+        Purpose::Document {
+            title: title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
+        }
+    }
+}
+
+/// The task prefix the model reads before `text`, from the model's two prompts: the
+/// document prompt with `none` replaced by the title (newlines and `|` in it become
+/// spaces, so a title can't fake the prompt's shape), or the query prompt.
+pub(crate) fn render_prompt(
+    document_prompt: &str,
+    query_prompt: &str,
+    purpose: &Purpose,
+) -> String {
+    match purpose {
+        Purpose::Document { title: None } => document_prompt.to_string(),
+        Purpose::Document { title: Some(title) } => {
+            let title: String = title
+                .chars()
+                .map(|c| if c == '|' || c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if title.is_empty() {
+                document_prompt.to_string()
+            } else {
+                document_prompt.replacen("none", &title, 1)
+            }
+        }
+        Purpose::Query => query_prompt.to_string(),
+    }
+}
+
+/// The prefix the model reads before a text with this purpose
+/// (`title: {title} | text: ` or `task: search result | query: `).
+pub fn prompt(purpose: &Purpose) -> String {
+    render_prompt(DOCUMENT_PROMPT, QUERY_PROMPT, purpose)
+}
+
+/// `EMBEDDER_VERSION`, for the service and the eval runner.
+pub fn embedder_version() -> &'static str {
+    EMBEDDER_VERSION
+}
+
+/// The title a chunk is embedded with: its section path, or the document's name when it
+/// has none (`docs/agent-rag-architecture.md` §2.1).
+pub fn chunk_title(document_name: &str, chunk: &Chunk) -> String {
+    if chunk.section_path.trim().is_empty() {
+        document_name.trim().to_string()
+    } else {
+        chunk.section_path.clone()
+    }
 }
 
 /// How many soft tokens the image encoder spends on a picture (its `vision_70`,
@@ -127,6 +205,81 @@ pub trait Embedder: Send + Sync {
     /// One vector per window of 16 kHz mono samples (at most `WINDOW_SAMPLES` each;
     /// more are cut).
     fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError>;
+
+    /// Embeds `inputs` (each text with its own purpose, so every chunk can carry its own
+    /// title) and hands the vectors back `batch` at a time, in order:
+    /// `on_batch(index of the batch's first input, vectors)`, on the calling thread, so
+    /// the caller writes one batch while the next is embedded. An error from `on_batch`
+    /// (a cancelled ingest) stops the work and is returned. The Core ML embedder prepares
+    /// inputs (tokenizing, table lookups) on one thread while the model predicts on
+    /// another; this default embeds batch by batch.
+    fn embed_pipelined(
+        &self,
+        inputs: &[(String, Purpose)],
+        batch: usize,
+        on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
+    ) -> Result<(), EmbedError> {
+        let batch = batch.max(1);
+        for (n, group) in inputs.chunks(batch).enumerate() {
+            let mut vectors = Vec::with_capacity(group.len());
+            // One `embed` call per run of inputs with the same purpose.
+            let mut start = 0;
+            while start < group.len() {
+                let purpose = &group[start].1;
+                let end = start
+                    + group[start..]
+                        .iter()
+                        .take_while(|(_, p)| p == purpose)
+                        .count();
+                let texts: Vec<String> = group[start..end].iter().map(|(t, _)| t.clone()).collect();
+                vectors.extend(self.embed(&texts, purpose.clone())?);
+                start = end;
+            }
+            on_batch(n * batch, vectors)?;
+        }
+        Ok(())
+    }
+}
+
+/// Runs `prep` over `inputs` on a second thread while `run` turns each prepared input
+/// into a vector on this one, handing vectors to `on_batch` `batch` at a time (with the
+/// index of the batch's first input). The preparing thread stays at most `batch` inputs
+/// ahead. Errors from any of the three stop both threads.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pipelined<I: Sync, P: Send>(
+    inputs: &[I],
+    batch: usize,
+    prep: &(dyn Fn(&I) -> Result<P, EmbedError> + Sync),
+    run: &mut dyn FnMut(P) -> Result<Vec<f32>, EmbedError>,
+    on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
+) -> Result<(), EmbedError> {
+    let batch = batch.max(1);
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Result<P, EmbedError>>(batch);
+        scope.spawn(move || {
+            for input in inputs {
+                let prepared = prep(input);
+                let failed = prepared.is_err();
+                // The receiver is gone when the other side stopped early.
+                if send.send(prepared).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        let mut vectors = Vec::with_capacity(batch.min(inputs.len()));
+        let mut first = 0;
+        for prepared in receive.iter() {
+            vectors.push(run(prepared?)?);
+            if vectors.len() == batch {
+                on_batch(first, std::mem::take(&mut vectors))?;
+                first += batch;
+            }
+        }
+        if !vectors.is_empty() {
+            on_batch(first, vectors)?;
+        }
+        Ok(())
+    })
 }
 
 /// The downloaded model files in one folder (`data_dir/models/embeddinggemma-2`).
@@ -211,6 +364,53 @@ impl Embedder for CoreMlEmbedder {
     fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
         self.0.embed_audio(windows)
     }
+    fn embed_pipelined(
+        &self,
+        inputs: &[(String, Purpose)],
+        batch: usize,
+        on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
+    ) -> Result<(), EmbedError> {
+        self.0.embed_pipelined(inputs, batch, on_batch)
+    }
+}
+
+/// How a text document marks its structure, which decides how the `"sections-v2"`
+/// chunker finds headings, tables and code blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextFormat {
+    /// No markup the chunker reads: paragraphs and sentences only (PDF text, OCR text,
+    /// plain notes, notebooks).
+    #[default]
+    Plain,
+    /// `#` and underlined headings, pipe tables, fenced code and `$$` math.
+    Markdown,
+    /// reStructuredText: underlined (and overlined) titles, directives, literal blocks,
+    /// grid and simple tables.
+    Rst,
+    /// HTML, already turned into text by `extract`: `h1`–`h6` as `#` headings and table
+    /// rows as `| cell | cell |` lines, so it is read like Markdown.
+    Html,
+    /// LaTeX: `\part` … `\subparagraph` headings, environments and display math as atomic
+    /// blocks.
+    Latex,
+}
+
+impl TextFormat {
+    /// The format a file name says (`.md`, `.rst`, `.tex`, `.html`…), or, for a name
+    /// that doesn't (`.txt`, none), the one `text` looks like.
+    pub fn detect(name: &str, text: &str) -> TextFormat {
+        let ext = Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "md" | "markdown" | "mdown" | "mkd" | "mdx" => TextFormat::Markdown,
+            "rst" | "rest" => TextFormat::Rst,
+            "tex" | "latex" | "ltx" => TextFormat::Latex,
+            "html" | "htm" | "xhtml" => TextFormat::Html,
+            _ => chunk::sniff_format(text),
+        }
+    }
 }
 
 /// Everything read from a source file.
@@ -226,6 +426,8 @@ pub struct Extracted {
     pub sound: Option<Vec<f32>>,
     /// Length of an audio or video source.
     pub duration_ms: Option<u64>,
+    /// How the text marks its structure (`Plain` for everything but text documents).
+    pub format: TextFormat,
 }
 
 /// A run of text: one page of a PDF (`number` from 1), or the whole of a text/code file
@@ -275,13 +477,38 @@ pub fn frame_times(duration_ms: u64) -> (u64, Vec<u64>) {
     (interval, times)
 }
 
-/// Reads a source. Text and code are decoded as UTF-8 (lossy); PDFs with PDFKit (Vision
-/// OCR for pages without a text layer), each page also rendered to `page_file(n)` in
-/// `media_dir`; images are checked to decode; audio is decoded to 16 kHz mono; videos
-/// give `frame_file(ms)` pictures in `media_dir` (see `frame_times`) and their
-/// soundtrack. Blocking.
+/// Reads a source. Text and code are decoded as UTF-8 (lossy), with `format` set from
+/// the name or the contents; PDFs with PDFKit (Vision OCR for pages without a text
+/// layer), each page also rendered to `page_file(n)` in `media_dir`; images are checked
+/// to decode and their text read with Vision OCR (one page, when there is any); audio is
+/// decoded to 16 kHz mono; videos give `frame_file(ms)` pictures in `media_dir` (see
+/// `frame_times`) and their soundtrack. Blocking.
 pub fn extract(path: &Path, kind: SourceKind, media_dir: &Path) -> Result<Extracted, EmbedError> {
-    extract::extract(path, kind, media_dir)
+    extract::extract(path, kind, media_dir, true)
+}
+
+/// `extract`, except that PDF pages aren't rendered: a PDF's `pictures` is empty, and
+/// `pdf_page_picture` draws a page when it is first needed (to embed it, cite it or show
+/// it). Everything else is as `extract`. Blocking.
+pub fn extract_lazy(
+    path: &Path,
+    kind: SourceKind,
+    media_dir: &Path,
+) -> Result<Extracted, EmbedError> {
+    extract::extract(path, kind, media_dir, false)
+}
+
+/// Renders page `page` (from 1) of the PDF at `path` as the picture `extract` would have
+/// made of it (color, 144 dpi, longer side at most 2048 px) and writes it to `out` as
+/// PNG. An error for a page past the end. Blocking.
+#[cfg(target_os = "macos")]
+pub fn pdf_page_picture(path: &Path, page: u32, out: &Path) -> Result<(), EmbedError> {
+    pdf::page_picture(path, page, out)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pdf_page_picture(_path: &Path, _page: u32, _out: &Path) -> Result<(), EmbedError> {
+    Err(EmbedError::Extract("reading PDFs needs macOS".into()))
 }
 
 /// Splits 16 kHz mono samples into the windows the audio encoder embeds: consecutive
@@ -373,6 +600,133 @@ pub fn chunk(
     chunk::chunk(doc, kind, count_tokens, max_tokens)
 }
 
+/// Settings of the `"sections-v2"` chunker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionsCfg {
+    /// No chunk counts more tokens than this.
+    pub max_tokens: usize,
+    /// Chunks are filled to about this many tokens (at most `max_tokens`).
+    pub target_tokens: usize,
+}
+
+impl Default for SectionsCfg {
+    fn default() -> Self {
+        Self {
+            max_tokens: CHUNK_TOKENS,
+            target_tokens: CHUNK_TARGET_TOKENS,
+        }
+    }
+}
+
+/// The `"sections-v2"` chunker (`docs/agent-rag-architecture.md` §2.1). Text documents
+/// are cut along their headings (Markdown, reST, HTML, LaTeX; `doc.format`): a chunk
+/// never spans two sections, and carries the headings above it as `section_path`
+/// ("Chapter 2 > Fourier series") and the lines it spans. Inside a section, prose is cut
+/// between paragraphs then sentences, filled to about `target_tokens`; tables, code
+/// fences and display math are kept whole when they fit `max_tokens`. Each chunk after
+/// the first of a section starts with the previous chunk's last sentence. PDFs (and OCR
+/// text) are cut page by page the same way, without headings or lines; code along lines.
+/// Every chunk has `hash`, the SHA-256 of its section path and text, so an unchanged
+/// chunk under an unchanged heading keeps its vector. Deterministic.
+pub fn chunk_sections(
+    doc: &Extracted,
+    kind: SourceKind,
+    count_tokens: &dyn Fn(&str) -> usize,
+    cfg: &SectionsCfg,
+) -> Vec<Chunk> {
+    chunk::chunk_sections(doc, kind, count_tokens, cfg)
+}
+
+/// SHA-256 of `bytes`, as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The hash a chunk carries: SHA-256 of its section path, a zero byte and its text.
+pub fn chunk_hash(section_path: &str, text: &str) -> String {
+    let mut bytes = Vec::with_capacity(section_path.len() + 1 + text.len());
+    bytes.extend_from_slice(section_path.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(text.as_bytes());
+    sha256_hex(&bytes)
+}
+
+/// SHA-256 (FIPS 180-4), small enough to keep here rather than take a dependency for
+/// hashing a few kilobytes per chunk.
+pub(crate) mod sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    pub(crate) fn digest(bytes: &[u8]) -> [u8; 32] {
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let mut message = bytes.to_vec();
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&((bytes.len() as u64).wrapping_mul(8)).to_be_bytes());
+        for block in message.as_chunks::<64>().0 {
+            let mut w = [0u32; 64];
+            for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+                w[i] = u32::from_be_bytes(*word);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+                *x = x.wrapping_add(y);
+            }
+        }
+        let mut out = [0u8; 32];
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// Cosine similarity of two L2-normalized vectors (their dot product).
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -383,6 +737,18 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// invoice number exactly.
 pub fn score(query_vec: &[f32], query_text: &str, chunk_vec: &[f32], chunk_text: &str) -> f32 {
     cosine(query_vec, chunk_vec) + rank::term_boost(query_text, chunk_text)
+}
+
+/// Whether tests may load real models (the Core ML embedder, the speech recognizer):
+/// only when `MARGIN_REAL_MODEL_TESTS=1`. A plain `cargo test` uses fakes and recordings
+/// only; the real-model tests skip with a message.
+#[cfg(test)]
+pub(crate) fn real_model_tests() -> bool {
+    let on = std::env::var("MARGIN_REAL_MODEL_TESTS").is_ok_and(|v| v == "1");
+    if !on {
+        eprintln!("skipping: real-model tests need MARGIN_REAL_MODEL_TESTS=1");
+    }
+    on
 }
 
 #[cfg(test)]
@@ -417,6 +783,188 @@ mod tests {
         // A short recording is one window, however short.
         assert_eq!(audio_windows(&[0.0; 100]).len(), 1);
         assert!(audio_windows(&[]).is_empty());
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // A million 'a's crosses many blocks.
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_ne!(chunk_hash("A", "b"), chunk_hash("", "Ab"));
+    }
+
+    #[test]
+    fn prompts_carry_the_title() {
+        assert_eq!(prompt(&Purpose::DOCUMENT), "title: none | text: ");
+        assert_eq!(
+            prompt(&Purpose::document(Some(" Fourier > Gibbs "))),
+            "title: Fourier > Gibbs | text: "
+        );
+        assert_eq!(
+            prompt(&Purpose::document(Some("  "))),
+            "title: none | text: "
+        );
+        // A title can't add a second "|" field or a line break.
+        assert_eq!(
+            prompt(&Purpose::Document {
+                title: Some("a | text: b\nc".into())
+            }),
+            "title: a text: b c | text: "
+        );
+        assert_eq!(prompt(&Purpose::Query), "task: search result | query: ");
+        let chunk = Chunk::new("x", None);
+        assert_eq!(chunk_title(" notes.md ", &chunk), "notes.md");
+        let chunk = Chunk {
+            section_path: "A > B".into(),
+            ..chunk
+        };
+        assert_eq!(chunk_title("notes.md", &chunk), "A > B");
+        assert_eq!(embedder_version(), EMBEDDER_VERSION);
+    }
+
+    #[test]
+    fn the_default_pipelined_embed_batches_in_order_and_stops_on_error() {
+        let fake = fake::FakeEmbedder;
+        let inputs: Vec<(String, Purpose)> = (0..10)
+            .map(|i| {
+                (
+                    format!("text number {i}"),
+                    Purpose::document(Some(&format!("t{}", i / 3))),
+                )
+            })
+            .collect();
+        let mut got = Vec::new();
+        fake.embed_pipelined(&inputs, 4, &mut |first, vectors| {
+            got.push((first, vectors.len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, vec![(0, 4), (4, 4), (8, 2)]);
+        let mut calls = 0;
+        let err = fake
+            .embed_pipelined(&inputs, 4, &mut |_, _| {
+                calls += 1;
+                Err(EmbedError::Embed("cancelled".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(err, EmbedError::Embed(m) if m == "cancelled"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn pipelined_prepares_on_another_thread_keeps_order_and_stops_early() {
+        let here = std::thread::current().id();
+        let inputs: Vec<u32> = (0..25).collect();
+        let prepared_on = std::sync::Mutex::new(Vec::new());
+        let prep = |i: &u32| -> Result<u32, EmbedError> {
+            prepared_on
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            Ok(i * 2)
+        };
+        let mut ran = Vec::new();
+        let mut batches = Vec::new();
+        pipelined(
+            &inputs,
+            8,
+            &prep,
+            &mut |p| {
+                ran.push(p);
+                Ok(vec![p as f32])
+            },
+            &mut |first, vectors| {
+                batches.push((
+                    first,
+                    vectors.iter().map(|v| v[0] as u32).collect::<Vec<_>>(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(prepared_on.lock().unwrap().iter().all(|id| *id != here));
+        assert_eq!(ran, (0..25).map(|i| i * 2).collect::<Vec<_>>());
+        assert_eq!(batches.len(), 4);
+        assert_eq!(batches[3], (24, vec![48]));
+        assert_eq!(batches[1].0, 8);
+
+        // A failing `run` stops the preparing thread too (it never prepares everything).
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let many: Vec<u32> = (0..10_000).collect();
+        let err = pipelined(
+            &many,
+            4,
+            &|i: &u32| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(*i)
+            },
+            &mut |p| {
+                if p == 5 {
+                    Err(EmbedError::Embed("model failed".into()))
+                } else {
+                    Ok(vec![0.0])
+                }
+            },
+            &mut |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EmbedError::Embed(_)));
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) < 100);
+
+        // A failing `prep` is returned as is.
+        let err = pipelined(
+            &inputs,
+            4,
+            &|i: &u32| {
+                if *i == 3 {
+                    Err(EmbedError::Extract("bad input".into()))
+                } else {
+                    Ok(*i)
+                }
+            },
+            &mut |p| Ok(vec![p as f32]),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EmbedError::Extract(_)));
+    }
+
+    #[test]
+    fn formats_come_from_the_name_then_the_contents() {
+        assert_eq!(TextFormat::detect("a.md", ""), TextFormat::Markdown);
+        assert_eq!(TextFormat::detect("a.RST", ""), TextFormat::Rst);
+        assert_eq!(TextFormat::detect("a.tex", ""), TextFormat::Latex);
+        assert_eq!(TextFormat::detect("a.htm", ""), TextFormat::Html);
+        assert_eq!(
+            TextFormat::detect("README", "# Title\n\nText."),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            TextFormat::detect("notes.txt", "Title\n=====\n\nText."),
+            TextFormat::Rst
+        );
+        assert_eq!(
+            TextFormat::detect("paper", "\\documentclass{article}\n\\section{Intro}\nText."),
+            TextFormat::Latex
+        );
+        assert_eq!(
+            TextFormat::detect("notes.txt", "Just some text.\nMore."),
+            TextFormat::Plain
+        );
     }
 
     #[test]
