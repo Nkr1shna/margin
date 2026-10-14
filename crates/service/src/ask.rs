@@ -1,4 +1,6 @@
-//! Ask: outline proposals, accepting them, and lesson generation jobs.
+//! Courses: outline proposals (written by the agent's `propose_course`), accepting them
+//! (Create lessons on the outline card, or the agent's `accept_proposal`), and lesson
+//! generation jobs.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -8,33 +10,24 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use margin_ai::{LessonContext, Passage};
+use margin_ai::LessonContext;
 use margin_shared::{
-    AcceptProposal, AskRequest, Event, Id, Lesson, LessonStatus, Outline, OutlineLesson, Proposal,
-    ProposalStatus, Source, Topic,
+    AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
+    Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
 };
 
+use crate::chats::{self, StoredChatItem};
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
-use crate::state::{AppState, StoredLesson, new_id};
+use crate::state::{AppState, Author, StoredLesson, new_id};
 use crate::{db, sources, video};
 
 pub const MAX_LESSONS: usize = 12;
 /// How often a streaming lesson's partial body is saved.
 const PARTIAL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
-fn validate_ask(req: &AskRequest) -> AppResult<()> {
-    if req.prompt.trim().is_empty() {
-        return Err(AppError::bad_request("Say what you want to learn."));
-    }
-    if !(1..=MAX_LESSONS as u32).contains(&req.lesson_count) {
-        return Err(AppError::bad_request("Choose between 1 and 12 lessons."));
-    }
-    Ok(())
-}
-
-/// Every source must exist and be unattached or already in the topic the Ask is filed
-/// under. Duplicates are dropped.
+/// Every source must exist and be unattached or already in the topic the course is
+/// filed under. Duplicates are dropped.
 async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> {
     let mut seen = HashSet::new();
     req.source_ids.retain(|id| seen.insert(id.clone()));
@@ -64,97 +57,46 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
     Ok(())
 }
 
-pub async fn ask(
-    State(state): State<AppState>,
-    ApiJson(mut req): ApiJson<AskRequest>,
-) -> AppResult<Json<Proposal>> {
-    validate_ask(&req)?;
-    if let Some(parent) = &req.parent_topic_id {
-        library::topic(&state, parent).await?;
+/// Stores a `Ready` proposal of `outline` made in chat `chat_id` (the agent's
+/// `propose_course`) and emits it. Checked like an accepted outline: a prompt, 1 to 12
+/// titled lessons, a topic title, a subject title when no parent topic is given (the
+/// parent must exist), and sources that exist and aren't another topic's.
+pub async fn propose(
+    state: &AppState,
+    chat_id: &str,
+    mut request: AskRequest,
+    outline: Outline,
+) -> AppResult<Proposal> {
+    request.prompt = request.prompt.trim().to_string();
+    if request.prompt.is_empty() {
+        return Err(AppError::bad_request("Say what the course is for."));
     }
-    check_sources(&state, &mut req).await?;
-    state.ai_config().await?;
+    let outline = validate_outline(&outline)?;
+    match &request.parent_topic_id {
+        Some(parent) => {
+            library::topic(state, parent).await?;
+        }
+        None if outline.subject_title.is_empty() => {
+            return Err(AppError::bad_request("Give the subject a title."));
+        }
+        None => {}
+    }
+    check_sources(state, &mut request).await?;
+    request.lesson_count = outline.lessons.len() as u32;
     let proposal = Proposal {
         id: new_id(),
-        request: req,
-        status: ProposalStatus::Drafting,
-        outline: None,
+        request,
+        status: ProposalStatus::Ready,
+        outline: Some(outline),
         created_at: Utc::now(),
-        chat_id: None,
+        chat_id: Some(chat_id.to_string()),
     };
     state
         .store
         .put(db::PROPOSAL, &proposal.id, &proposal)
         .await?;
     state.emit_proposal(&proposal);
-    tokio::spawn(run_proposal_job(state.clone(), proposal.id.clone()));
-    Ok(Json(proposal))
-}
-
-async fn run_proposal_job(state: AppState, id: Id) {
-    let result = draft_outline(&state, &id).await;
-    let update = async {
-        let _w = state.write_lock.lock().await;
-        let Some(mut proposal) = state.store.get::<Proposal>(db::PROPOSAL, &id).await? else {
-            return anyhow::Ok(None);
-        };
-        if proposal.status != ProposalStatus::Drafting {
-            return Ok(None);
-        }
-        match result {
-            Ok(outline) => {
-                proposal.outline = Some(outline);
-                proposal.status = ProposalStatus::Ready;
-            }
-            Err(error) => proposal.status = ProposalStatus::Failed { error },
-        }
-        state.store.put(db::PROPOSAL, &id, &proposal).await?;
-        Ok(Some(proposal))
-    };
-    match update.await {
-        Ok(Some(p)) => state.emit_proposal(&p),
-        Ok(None) => {}
-        Err(e) => tracing::error!("couldn't save proposal {id}: {e:#}"),
-    }
-}
-
-async fn draft_outline(state: &AppState, id: &str) -> Result<Outline, String> {
-    let proposal: Proposal = match state.store.get(db::PROPOSAL, id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return Err("The proposal disappeared.".into()),
-        Err(e) => return Err(format!("couldn't read the proposal: {e}")),
-    };
-    let ai = state.ai_config().await.map_err(|e| e.message)?;
-    let subjects = root_subjects(state).await.map_err(|e| e.to_string())?;
-    // Outlines see the passages (pictures included) but don't cite them.
-    let passages: Vec<Passage> = sources::passages(
-        state,
-        &proposal.request.source_ids,
-        &proposal.request.prompt,
-    )
-    .await
-    .into_iter()
-    .map(|r| r.passage)
-    .collect();
-    let outline = state
-        .generator
-        .propose_outline(&ai, &proposal.request, &subjects, &passages)
-        .await
-        .map_err(|e| e.to_string())?;
-    if outline.lessons.is_empty() {
-        return Err("The model proposed no lessons. Try asking again.".into());
-    }
-    Ok(outline)
-}
-
-async fn root_subjects(state: &AppState) -> anyhow::Result<Vec<String>> {
-    let mut topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
-    library::sort_topics(&mut topics);
-    Ok(topics
-        .into_iter()
-        .filter(|t| t.parent_id.is_none())
-        .map(|t| t.title)
-        .collect())
+    Ok(proposal)
 }
 
 pub async fn get_proposal(
@@ -169,7 +111,7 @@ pub async fn get_proposal(
     Ok(Json(p))
 }
 
-fn validate_outline(outline: &Outline) -> AppResult<Outline> {
+pub fn validate_outline(outline: &Outline) -> AppResult<Outline> {
     let topic_title = outline.topic_title.trim();
     if topic_title.is_empty() {
         return Err(AppError::bad_request("Give the topic a title."));
@@ -198,19 +140,86 @@ fn validate_outline(outline: &Outline) -> AppResult<Outline> {
     })
 }
 
+/// `POST /api/proposals/{id}/accept`: Create lessons on the outline card, with the
+/// owner's edits and chips. A proposal made in a chat records it there as an `Action`
+/// so the agent knows the course exists.
 pub async fn accept(
     State(state): State<AppState>,
     Path(id): Path<Id>,
     ApiJson(req): ApiJson<AcceptProposal>,
 ) -> AppResult<Json<Topic>> {
+    let (topic, proposal) = accept_proposal(&state, &id, req).await?;
+    if let Some(chat_id) = &proposal.chat_id {
+        let lessons = proposal.outline.as_ref().map_or(0, |o| o.lessons.len());
+        if let Err(e) = record_course_created(&state, chat_id, &topic, lessons).await {
+            tracing::error!(chat = %chat_id, "couldn't record the new course in its chat: {e:#}");
+        }
+    }
+    Ok(Json(topic))
+}
+
+/// The `Action` text a chat gets when its proposal becomes a course.
+pub fn course_created_text(topic_title: &str, lessons: usize) -> String {
+    let n = if lessons == 1 {
+        "1 lesson".to_string()
+    } else {
+        format!("{lessons} lessons")
+    };
+    format!("Created the course “{topic_title}” with {n}.")
+}
+
+/// Adds `Action "Created the course “…” with N lessons."` (replayed to the model as a
+/// developer message) to the chat, unless it was deleted. It takes the running turn's
+/// id when the chat is busy (it lands between that turn's items, in `seq` order).
+async fn record_course_created(
+    state: &AppState,
+    chat_id: &str,
+    topic: &Topic,
+    lessons: usize,
+) -> anyhow::Result<()> {
+    let _w = state.write_lock.lock().await;
+    let Some(chat) = state.store.get::<Chat>(db::CHAT, chat_id).await? else {
+        return Ok(());
+    };
+    let turn_id = chat.state.turn_id().map_or_else(new_id, str::to_string);
+    let text = course_created_text(&topic.title, lessons);
+    let item = chats::new_item_locked(
+        state,
+        chat_id,
+        &turn_id,
+        ItemStatus::Done,
+        ChatItemKind::Action { text: text.clone() },
+    )
+    .await?;
+    chats::save_item_locked(
+        state,
+        &StoredChatItem {
+            item,
+            model_items: vec![margin_agent::action_input(&text)],
+            full_output: None,
+        },
+    )
+    .await
+}
+
+/// Turns a `Ready` proposal into a topic with queued lessons (filed under its parent
+/// topic, or under the subject named by the outline, created if needed), attaches its
+/// sources to the topic and starts the lesson jobs. `req.chips` override the
+/// proposal's level, videos and quiz (and are kept on it, which the lesson jobs read).
+/// Returns the topic and the accepted proposal.
+pub async fn accept_proposal(
+    state: &AppState,
+    id: &str,
+    req: AcceptProposal,
+) -> AppResult<(Topic, Proposal)> {
     let outline = validate_outline(&req.outline)?;
     state.ai_config().await?;
 
-    let (topic, events, lesson_ids) = {
+    let (topic, events, lesson_ids, proposal) = {
         let _w = state.write_lock.lock().await;
         let mut proposal: Proposal = state
             .store
-            .get(db::PROPOSAL, &id)
+            .get(db::PROPOSAL, id)
             .await?
             .ok_or_else(|| AppError::not_found("proposal"))?;
         match &proposal.status {
@@ -234,10 +243,21 @@ pub async fn accept(
                 ));
             }
         }
+        let chips = req.chips;
+        if let Some(level) = chips.level {
+            proposal.request.level = level;
+        }
+        if let Some(with_videos) = chips.with_videos {
+            proposal.request.with_videos = with_videos;
+        }
+        if let Some(with_quiz) = chips.with_quiz {
+            proposal.request.with_quiz = with_quiz;
+        }
+        proposal.request.lesson_count = outline.lessons.len() as u32;
         let mut events = Vec::new();
 
         let subject = match &proposal.request.parent_topic_id {
-            Some(parent) => library::topic(&state, parent).await?,
+            Some(parent) => library::topic(state, parent).await?,
             None => {
                 if outline.subject_title.is_empty() {
                     return Err(AppError::bad_request("Give the subject a title."));
@@ -255,7 +275,7 @@ pub async fn accept(
                 {
                     Some(t) => t,
                     None => {
-                        let t = create_topic_locked(&state, None, &outline.subject_title).await?;
+                        let t = create_topic_locked(state, None, &outline.subject_title).await?;
                         events.push(Event::TopicChanged { topic: t.clone() });
                         t
                     }
@@ -264,7 +284,7 @@ pub async fn accept(
         };
 
         let topic =
-            create_topic_locked(&state, Some(subject.id.clone()), &outline.topic_title).await?;
+            create_topic_locked(state, Some(subject.id.clone()), &outline.topic_title).await?;
         events.push(Event::TopicChanged {
             topic: topic.clone(),
         });
@@ -290,6 +310,7 @@ pub async fn accept(
                 proposal_id: Some(proposal.id.clone()),
                 previous_body: None,
                 previous_citations: None,
+                author: Author::Agent,
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
@@ -298,9 +319,9 @@ pub async fn accept(
             });
         }
 
-        // The Ask's sources now belong to the new topic.
+        // The proposal's sources now belong to the new topic.
         events
-            .extend(sources::attach_locked(&state, &proposal.request.source_ids, &topic.id).await?);
+            .extend(sources::attach_locked(state, &proposal.request.source_ids, &topic.id).await?);
 
         proposal.outline = Some(outline);
         proposal.status = ProposalStatus::Accepted {
@@ -310,16 +331,18 @@ pub async fn accept(
             .store
             .put(db::PROPOSAL, &proposal.id, &proposal)
             .await?;
-        events.push(Event::ProposalChanged { proposal });
-        (topic, events, lesson_ids)
+        events.push(Event::ProposalChanged {
+            proposal: proposal.clone(),
+        });
+        (topic, events, lesson_ids, proposal)
     };
     for e in events {
         state.emit(e);
     }
     for lesson_id in lesson_ids {
-        spawn_lesson_job(&state, lesson_id, true);
+        spawn_lesson_job(state, lesson_id, true);
     }
-    Ok(Json(topic))
+    Ok((topic, proposal))
 }
 
 pub async fn regenerate(
@@ -520,6 +543,8 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
                 // Footnotes renumbered in reading order, with what they point at.
                 (row.lesson.body_md, row.lesson.citations) = sources::cite(body, &retrieved);
                 row.lesson.status = LessonStatus::Ready;
+                // The body is the model's writing now (owner decision Q2).
+                row.author = Author::Agent;
             }
             Err(e) => {
                 match (row.previous_body.clone(), row.previous_citations.clone()) {
@@ -591,27 +616,17 @@ async fn save_partial_bodies(state: AppState, lesson_id: Id, partial: Arc<Mutex<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use margin_shared::Level;
-
-    fn req(prompt: &str, n: u32) -> AskRequest {
-        AskRequest {
-            prompt: prompt.into(),
-            lesson_count: n,
-            level: Level::Intro,
-            with_videos: false,
-            with_quiz: false,
-            parent_topic_id: None,
-            source_ids: vec![],
-        }
-    }
 
     #[test]
-    fn ask_validation() {
-        assert!(validate_ask(&req("x", 1)).is_ok());
-        assert!(validate_ask(&req("x", 12)).is_ok());
-        assert!(validate_ask(&req("x", 0)).is_err());
-        assert!(validate_ask(&req("x", 13)).is_err());
-        assert!(validate_ask(&req("  ", 3)).is_err());
+    fn course_created_texts() {
+        assert_eq!(
+            course_created_text("Fourier series", 5),
+            "Created the course “Fourier series” with 5 lessons."
+        );
+        assert_eq!(
+            course_created_text("Laplace", 1),
+            "Created the course “Laplace” with 1 lesson."
+        );
     }
 
     #[test]

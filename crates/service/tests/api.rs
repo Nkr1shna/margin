@@ -296,7 +296,7 @@ async fn library(h: &Harness, token: &str) -> Library {
         .unwrap()
 }
 
-/// Asks, waits for the outline and accepts it; returns the topic and its lessons.
+/// Has the agent propose a course, then accepts it; returns the topic and the proposal.
 async fn create_lessons(
     h: &Harness,
     token: &str,
@@ -304,27 +304,8 @@ async fn create_lessons(
     n: u32,
     with_videos: bool,
 ) -> (Topic, Proposal) {
-    let r = h
-        .post(token, "/api/ask")
-        .json(&ask_request(prompt, n, with_videos))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let p: Proposal = r.json().await.unwrap();
-    assert_eq!(p.status, ProposalStatus::Drafting);
-    let p = eventually(|| async {
-        let p: Proposal = h
-            .get(token, &format!("/api/proposals/{}", p.id))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        (p.status == ProposalStatus::Ready).then_some(p)
-    })
-    .await;
+    let p = h.propose(token, &ask_request(prompt, n, with_videos)).await;
+    assert_eq!(p.status, ProposalStatus::Ready);
     let outline = p.outline.clone().unwrap();
     let r = h
         .post(token, &format!("/api/proposals/{}/accept", p.id))
@@ -616,36 +597,35 @@ async fn ask_accept_streams_lessons_over_the_socket() {
     h.configure_ai(&t).await;
     let mut sock = h.socket(&t).await;
 
-    for bad in [
-        json!({"prompt": " ", "lesson_count": 3}),
-        json!({"prompt": "x", "lesson_count": 0}),
-        json!({"prompt": "x", "lesson_count": 13}),
-    ] {
-        let mut body = serde_json::to_value(ask_request("x", 1, false)).unwrap();
-        body.as_object_mut()
-            .unwrap()
-            .extend(bad.as_object().unwrap().clone());
-        let (status, e) = api_error(h.post(&t, "/api/ask").json(&body).send().await.unwrap()).await;
-        assert_eq!((status, e.code.as_str()), (400, "bad_request"));
-    }
-
-    let p: Proposal = h
+    // The old one-shot Ask is gone: outlines come from the agent's propose_course.
+    let r = h
         .post(&t, "/api/ask")
-        .json(&ask_request("Fourier", 5, false))
+        .json(&ask_request("x", 1, false))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_eq!(r.status(), 404);
+    for (prompt, n, why) in [
+        (" ", 3, "Say what the course is for."),
+        ("x", 0, "An outline needs between 1 and 12 lessons."),
+        ("x", 13, "An outline needs between 1 and 12 lessons."),
+    ] {
+        let err = h
+            .propose_in_chat(&t, &ask_request(prompt, n, false))
+            .await
+            .unwrap_err();
+        assert_eq!(err, why);
+    }
+
+    let p = h.propose(&t, &ask_request("Fourier", 5, false)).await;
     let events = sock.until(|e| matches!(e, Event::ProposalChanged { proposal } if proposal.status == ProposalStatus::Ready)).await;
-    assert!(
-        matches!(&events[0], Event::ProposalChanged { proposal } if proposal.status == ProposalStatus::Drafting)
-    );
     let Event::ProposalChanged { proposal: ready } = events.last().unwrap() else {
         unreachable!()
     };
     assert_eq!(ready.id, p.id);
+    assert!(ready.chat_id.is_some(), "the proposal knows its chat");
+    assert_eq!(ready.request.lesson_count, 5);
+    assert_eq!(ready.request.level, Level::Intermediate);
     let mut outline = ready.outline.clone().unwrap();
     assert_eq!(outline.lessons.len(), 5);
     // The user edits the outline before accepting.
@@ -738,13 +718,9 @@ async fn ask_accept_streams_lessons_over_the_socket() {
         }
     );
 
-    // A second ask files under the existing subject (case-insensitive) and the model saw it.
+    // A second course files under the existing subject (case-insensitive).
     let (topic2, _) = create_lessons(&h, &t, "Laplace", 1, false).await;
     assert_eq!(topic2.parent_id.as_deref(), Some(subject.id.as_str()));
-    assert_eq!(
-        h.generator.subjects_seen.lock().unwrap().last().unwrap(),
-        &vec!["signals & SYSTEMS".to_string()]
-    );
     let lib = library(&h, &t).await;
     assert_eq!(
         lib.topics.iter().filter(|t| t.parent_id.is_none()).count(),
@@ -810,60 +786,35 @@ async fn ask_accept_streams_lessons_over_the_socket() {
         unreachable!()
     };
     assert_eq!(failed.body_md, "keep me");
-
-    // A failing outline becomes Failed.
-    let p: Proposal = h
-        .post(&t, "/api/ask")
-        .json(&ask_request("FAIL please", 2, false))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let p = eventually(|| async {
-        let p: Proposal = h
-            .get(&t, &format!("/api/proposals/{}", p.id))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        matches!(p.status, ProposalStatus::Failed { .. }).then_some(p)
-    })
-    .await;
-    assert!(matches!(p.status, ProposalStatus::Failed { error } if error.contains("500")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generation_needs_an_api_key_and_a_model() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
-    let (status, e) = api_error(
-        h.post(&t, "/api/ask")
-            .json(&ask_request("x", 2, false))
+    h.configure_ai(&t).await;
+    let p = h.propose(&t, &ask_request("x", 2, false)).await;
+    let accept = || {
+        h.post(&t, &format!("/api/proposals/{}/accept", p.id))
+            .json(&json!({"outline": p.outline.clone().unwrap()}))
             .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!((status, e.code.as_str()), (400, "no_api_key"));
-    assert!(e.message.contains("API key"));
+    };
 
+    // Lessons can't be written without a key or a model, so Create lessons refuses.
     h.patch(&t, "/api/settings")
-        .json(&json!({"openai_api_key": API_KEY}))
+        .json(&json!({"openai_api_key": ""}))
         .send()
         .await
         .unwrap();
-    let (status, e) = api_error(
-        h.post(&t, "/api/ask")
-            .json(&ask_request("x", 2, false))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (status, e) = api_error(accept().await.unwrap()).await;
+    assert_eq!((status, e.code.as_str()), (400, "no_api_key"));
+    assert!(e.message.contains("API key"));
+    h.patch(&t, "/api/settings")
+        .json(&json!({"openai_api_key": API_KEY, "openai_model": ""}))
+        .send()
+        .await
+        .unwrap();
+    let (status, e) = api_error(accept().await.unwrap()).await;
     assert_eq!((status, e.code.as_str()), (400, "no_model"));
 
     h.configure_ai(&t).await;
@@ -1546,6 +1497,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
             proposal_id: None,
             previous_body: prev.map(Into::into),
             previous_citations: None,
+            author: Default::default(),
         };
     store
         .put(

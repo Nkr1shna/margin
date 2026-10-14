@@ -13,7 +13,7 @@ use margin_shared::{
 };
 
 use crate::error::{ApiJson, AppError, AppResult};
-use crate::state::{AppState, StoredLesson, StoredVideo, new_id};
+use crate::state::{AppState, Author, StoredLesson, StoredNote, StoredVideo, new_id};
 use crate::{db, sources};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,15 @@ pub async fn lesson(state: &AppState, id: &str) -> AppResult<StoredLesson> {
 }
 
 pub async fn note(state: &AppState, id: &str) -> AppResult<Note> {
+    state
+        .store
+        .get(db::NOTE, id)
+        .await?
+        .ok_or_else(|| AppError::not_found("note"))
+}
+
+/// The note with who wrote it (owner decision Q2).
+pub async fn stored_note(state: &AppState, id: &str) -> AppResult<StoredNote> {
     state
         .store
         .get(db::NOTE, id)
@@ -146,7 +155,7 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
     }))
 }
 
-fn clean_title(title: &str, what: &str) -> AppResult<String> {
+pub fn clean_title(title: &str, what: &str) -> AppResult<String> {
     let t = title.trim();
     if t.is_empty() {
         return Err(AppError::bad_request(format!("Give the {what} a title.")));
@@ -162,20 +171,26 @@ pub async fn create_topic(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<NewTopic>,
 ) -> AppResult<Json<Topic>> {
+    Ok(Json(new_topic(&state, req).await?))
+}
+
+/// Creates a topic last among its siblings and emits it (`POST /api/topics` and the
+/// agent's `create_topic`).
+pub async fn new_topic(state: &AppState, req: NewTopic) -> AppResult<Topic> {
     let title = clean_title(&req.title, "topic")?;
     let topic = {
         let _w = state.write_lock.lock().await;
         if let Some(parent) = &req.parent_id {
-            topic(&state, parent).await?;
+            topic(state, parent).await?;
         }
-        create_topic_locked(&state, req.parent_id.clone(), &title).await?
+        create_topic_locked(state, req.parent_id.clone(), &title).await?
     };
     state.emit_topic(&topic);
-    Ok(Json(topic))
+    Ok(topic)
 }
 
 /// `id` and every topic under it.
-fn subtree(all: &[Topic], id: &str) -> Vec<Id> {
+pub fn subtree(all: &[Topic], id: &str) -> Vec<Id> {
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
     for t in all {
         if let Some(p) = &t.parent_id {
@@ -198,9 +213,15 @@ pub async fn patch_topic(
     Path(id): Path<Id>,
     ApiJson(patch): ApiJson<TopicPatch>,
 ) -> AppResult<Json<Topic>> {
+    Ok(Json(update_topic(&state, &id, patch).await?))
+}
+
+/// Renames and moves a topic and emits it (`PATCH /api/topics/{id}` and the agent's
+/// `rename_topic`).
+pub async fn update_topic(state: &AppState, id: &str, patch: TopicPatch) -> AppResult<Topic> {
     let topic = {
         let _w = state.write_lock.lock().await;
-        let mut topic = topic(&state, &id).await?;
+        let mut topic = topic(state, id).await?;
         if let Some(title) = &patch.title {
             topic.title = clean_title(title, "topic")?;
         }
@@ -209,7 +230,7 @@ pub async fn patch_topic(
         {
             if let Some(p) = new_parent {
                 let all: Vec<Topic> = state.store.list(db::TOPIC).await?;
-                if subtree(&all, &id).iter().any(|t| t == p) {
+                if subtree(&all, id).iter().any(|t| t == p) {
                     return Err(AppError::bad_request("A topic can't move inside itself."));
                 }
                 if !all.iter().any(|t| &t.id == p) {
@@ -218,7 +239,7 @@ pub async fn patch_topic(
             }
             topic.parent_id = new_parent.clone();
             if patch.position.is_none() {
-                topic.position = next_topic_position(&state, topic.parent_id.as_deref()).await?;
+                topic.position = next_topic_position(state, topic.parent_id.as_deref()).await?;
             }
         }
         if let Some(pos) = patch.position {
@@ -229,18 +250,80 @@ pub async fn patch_topic(
         topic
     };
     state.emit_topic(&topic);
-    Ok(Json(topic))
+    Ok(topic)
+}
+
+/// Moves a topic under `parent_id` (`None`: the top level) at `index` among its new
+/// siblings (0 first; `None` or past the end: last), renumbering the siblings'
+/// positions 0, 1, 2… The agent's `move_topic`. Emits every topic that changed and
+/// returns the moved one.
+pub async fn place_topic(
+    state: &AppState,
+    id: &str,
+    parent_id: Option<Id>,
+    index: Option<usize>,
+) -> AppResult<Topic> {
+    let changed = {
+        let _w = state.write_lock.lock().await;
+        let mut moved = topic(state, id).await?;
+        let all: Vec<Topic> = state.store.list(db::TOPIC).await?;
+        if let Some(p) = &parent_id {
+            if subtree(&all, id).iter().any(|t| t == p) {
+                return Err(AppError::bad_request("A topic can't move inside itself."));
+            }
+            if !all.iter().any(|t| &t.id == p) {
+                return Err(AppError::not_found("parent topic"));
+            }
+        }
+        let mut siblings: Vec<Topic> = all
+            .into_iter()
+            .filter(|t| t.parent_id == parent_id && t.id != moved.id)
+            .collect();
+        sort_topics(&mut siblings);
+        moved.parent_id = parent_id;
+        let at = index.unwrap_or(siblings.len()).min(siblings.len());
+        siblings.insert(at, moved.clone());
+        let now = Utc::now();
+        let mut changed = Vec::new();
+        for (i, mut t) in siblings.into_iter().enumerate() {
+            let position = i as i64;
+            let is_moved = t.id == moved.id;
+            if t.position == position && !is_moved {
+                continue;
+            }
+            t.position = position;
+            t.updated_at = now;
+            state.store.put(db::TOPIC, &t.id, &t).await?;
+            changed.push(t);
+        }
+        changed
+    };
+    let mut moved = None;
+    for t in changed {
+        state.emit_topic(&t);
+        if t.id == id {
+            moved = Some(t);
+        }
+    }
+    moved.ok_or_else(|| AppError::not_found("topic"))
 }
 
 pub async fn delete_topic(
     State(state): State<AppState>,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
+    remove_topic(&state, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a topic with everything under it (topics, lessons, notes, videos, sources)
+/// and emits the deletions (`DELETE /api/topics/{id}` and the agent's `delete_topic`).
+pub async fn remove_topic(state: &AppState, id: &str) -> AppResult<()> {
     let events = {
         let _w = state.write_lock.lock().await;
-        topic(&state, &id).await?;
+        topic(state, id).await?;
         let all: Vec<Topic> = state.store.list(db::TOPIC).await?;
-        let doomed = subtree(&all, &id);
+        let doomed = subtree(&all, id);
         let doomed_set: HashSet<&str> = doomed.iter().map(String::as_str).collect();
         let mut events = Vec::new();
 
@@ -249,7 +332,7 @@ pub async fn delete_topic(
             .iter()
             .filter(|l| doomed_set.contains(l.lesson.topic_id.as_str()))
         {
-            events.extend(delete_lesson_locked(&state, &l.lesson.id).await?);
+            events.extend(delete_lesson_locked(state, &l.lesson.id).await?);
         }
         let notes: Vec<Note> = state.store.list(db::NOTE).await?;
         for n in notes
@@ -265,7 +348,7 @@ pub async fn delete_topic(
                 .as_deref()
                 .is_some_and(|t| doomed_set.contains(t))
         }) {
-            events.push(sources::delete_locked(&state, &s.id).await?);
+            events.push(sources::delete_locked(state, &s.id).await?);
         }
         // Children before parents.
         for t in doomed.iter().rev() {
@@ -277,7 +360,7 @@ pub async fn delete_topic(
     for e in events {
         state.emit(e);
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +376,23 @@ pub async fn patch_lesson(
     Path(id): Path<Id>,
     ApiJson(patch): ApiJson<LessonPatch>,
 ) -> AppResult<Json<Lesson>> {
+    // An edit through the API is the owner's (owner decision Q2).
+    Ok(Json(
+        update_lesson(&state, &id, patch, Author::Owner).await?,
+    ))
+}
+
+/// Edits a lesson and emits it (`PATCH /api/lessons/{id}` and the agent's
+/// `edit_lesson_title`). A changed body becomes `by`'s writing.
+pub async fn update_lesson(
+    state: &AppState,
+    id: &str,
+    patch: LessonPatch,
+    by: Author,
+) -> AppResult<Lesson> {
     let lesson = {
         let _w = state.write_lock.lock().await;
-        let mut row = lesson(&state, &id).await?;
+        let mut row = lesson(state, id).await?;
         if let Some(title) = &patch.title {
             row.lesson.title = clean_title(title, "lesson")?;
         }
@@ -306,32 +403,42 @@ pub async fn patch_lesson(
                     "This lesson is being written. Edit it when it's ready.",
                 ));
             }
-            row.lesson.body_md = body.clone();
+            if *body != row.lesson.body_md {
+                row.lesson.body_md = body.clone();
+                row.author = by;
+            }
         }
         if let Some(pos) = patch.position {
             row.lesson.position = pos;
         }
         row.lesson.updated_at = Utc::now();
-        state.store.put(db::LESSON, &id, &row).await?;
+        state.store.put(db::LESSON, id, &row).await?;
         row.lesson
     };
     state.emit_lesson(&lesson);
-    Ok(Json(state.public_lesson(&lesson)))
+    Ok(state.public_lesson(&lesson))
 }
 
 pub async fn delete_lesson(
     State(state): State<AppState>,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
+    remove_lesson(&state, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a lesson with its notes and video and emits the deletions
+/// (`DELETE /api/lessons/{id}` and the agent's `delete_lesson`).
+pub async fn remove_lesson(state: &AppState, id: &str) -> AppResult<()> {
     let events = {
         let _w = state.write_lock.lock().await;
-        lesson(&state, &id).await?;
-        delete_lesson_locked(&state, &id).await?
+        lesson(state, id).await?;
+        delete_lesson_locked(state, id).await?
     };
     for e in events {
         state.emit(e);
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Deletes a lesson, its notes and its video (files included), stopping its jobs.
@@ -389,11 +496,18 @@ pub async fn create_note(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<NewNote>,
 ) -> AppResult<Json<Note>> {
+    // A note made through the API is the owner's (owner decision Q2).
+    Ok(Json(new_note(&state, req, Author::Owner).await?))
+}
+
+/// Creates a note written by `by` and emits it (`POST /api/notes` and the agent's
+/// `create_note`).
+pub async fn new_note(state: &AppState, req: NewNote, by: Author) -> AppResult<Note> {
     let note = {
         let _w = state.write_lock.lock().await;
-        topic(&state, &req.topic_id).await?;
+        topic(state, &req.topic_id).await?;
         if let Some(lesson_id) = &req.lesson_id {
-            let l = lesson(&state, lesson_id).await?;
+            let l = lesson(state, lesson_id).await?;
             if l.lesson.topic_id != req.topic_id {
                 return Err(AppError::bad_request(
                     "That lesson belongs to a different topic.",
@@ -401,21 +515,24 @@ pub async fn create_note(
             }
         }
         let now = Utc::now();
-        let note = Note {
-            id: new_id(),
-            topic_id: req.topic_id,
-            lesson_id: req.lesson_id,
-            title: req.title.trim().to_string(),
-            body_md: req.body_md,
-            quote: req.quote.filter(|q| !q.trim().is_empty()),
-            created_at: now,
-            updated_at: now,
+        let row = StoredNote {
+            note: Note {
+                id: new_id(),
+                topic_id: req.topic_id,
+                lesson_id: req.lesson_id,
+                title: req.title.trim().to_string(),
+                body_md: req.body_md,
+                quote: req.quote.filter(|q| !q.trim().is_empty()),
+                created_at: now,
+                updated_at: now,
+            },
+            author: by,
         };
-        state.store.put(db::NOTE, &note.id, &note).await?;
-        note
+        state.store.put(db::NOTE, &row.note.id, &row).await?;
+        row.note
     };
     state.emit(Event::NoteChanged { note: note.clone() });
-    Ok(Json(note))
+    Ok(note)
 }
 
 pub async fn patch_note(
@@ -423,34 +540,78 @@ pub async fn patch_note(
     Path(id): Path<Id>,
     ApiJson(patch): ApiJson<NotePatch>,
 ) -> AppResult<Json<Note>> {
+    // An edit through the API is the owner's (owner decision Q2).
+    Ok(Json(update_note(&state, &id, patch, Author::Owner).await?))
+}
+
+/// Edits a note and emits it (`PATCH /api/notes/{id}` and the agent's note tools). A
+/// changed body becomes `by`'s writing; a retitle alone keeps who wrote the body.
+pub async fn update_note(
+    state: &AppState,
+    id: &str,
+    patch: NotePatch,
+    by: Author,
+) -> AppResult<Note> {
     let note = {
         let _w = state.write_lock.lock().await;
-        let mut note = note(&state, &id).await?;
+        let mut row = stored_note(state, id).await?;
         if let Some(title) = patch.title {
-            note.title = title.trim().to_string();
+            row.note.title = title.trim().to_string();
         }
-        if let Some(body) = patch.body_md {
-            note.body_md = body;
+        if let Some(body) = patch.body_md
+            && body != row.note.body_md
+        {
+            row.note.body_md = body;
+            row.author = by;
         }
-        note.updated_at = Utc::now();
-        state.store.put(db::NOTE, &id, &note).await?;
-        note
+        row.note.updated_at = Utc::now();
+        state.store.put(db::NOTE, id, &row).await?;
+        row.note
     };
     state.emit(Event::NoteChanged { note: note.clone() });
-    Ok(Json(note))
+    Ok(note)
+}
+
+/// Adds `text` at the end of a note's body, after a blank line, and emits it (the
+/// agent's `append_to_note`). Who wrote the note doesn't change: appending keeps what
+/// is there (owner decision Q2).
+pub async fn append_to_note(state: &AppState, id: &str, text: &str) -> AppResult<Note> {
+    let note = {
+        let _w = state.write_lock.lock().await;
+        let mut row = stored_note(state, id).await?;
+        let body = &mut row.note.body_md;
+        if !body.trim().is_empty() {
+            while !body.ends_with("\n\n") {
+                body.push('\n');
+            }
+        }
+        body.push_str(text);
+        row.note.updated_at = Utc::now();
+        state.store.put(db::NOTE, id, &row).await?;
+        row.note
+    };
+    state.emit(Event::NoteChanged { note: note.clone() });
+    Ok(note)
 }
 
 pub async fn delete_note(
     State(state): State<AppState>,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
+    remove_note(&state, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a note and emits it (`DELETE /api/notes/{id}` and the agent's
+/// `delete_note`).
+pub async fn remove_note(state: &AppState, id: &str) -> AppResult<()> {
     {
         let _w = state.write_lock.lock().await;
-        note(&state, &id).await?;
-        state.store.delete(db::NOTE, &id).await?;
+        note(state, id).await?;
+        state.store.delete(db::NOTE, id).await?;
     }
-    state.emit(Event::NoteDeleted { id });
-    Ok(StatusCode::NO_CONTENT)
+    state.emit(Event::NoteDeleted { id: id.to_string() });
+    Ok(())
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use margin_embed::{Embedder, ModelFiles};
 use margin_shared::{
-    Citation, Event, Id, Lesson, Proposal, ReasoningEffort, Settings, Source, Topic, Video,
+    Citation, Event, Id, Lesson, Note, Proposal, ReasoningEffort, Settings, Source, Topic, Video,
     VideoMedia, VideoStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,37 @@ pub struct StoredLesson {
     /// The citations that went with `previous_body`.
     #[serde(default)]
     pub previous_citations: Option<Vec<Citation>>,
+    /// Who wrote the body as it is now (owner decision Q2): `Agent` once a lesson job
+    /// writes it, `Owner` once it is edited through `PATCH /api/lessons/{id}`. Rows
+    /// written before this field existed read as the owner's.
+    #[serde(default)]
+    pub author: Author,
+}
+
+/// Who wrote a note's or a lesson's text, for owner decision Q2: the agent changes its
+/// own writing freely but asks before overwriting the owner's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Author {
+    /// The owner's own writing; also what a row without the field reads as (the safe
+    /// default: overwriting it asks first).
+    #[default]
+    Owner,
+    /// Written by the agent (a tool) or a generation job.
+    Agent,
+}
+
+/// A note as stored in table `note`: the wire `Note` plus who wrote it. Reading a row as
+/// a plain `Note` ignores `author`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredNote {
+    #[serde(flatten)]
+    pub note: Note,
+    /// `Agent` for a note an agent tool created (and whose body it replaced), `Owner`
+    /// for one created through `POST /api/notes` or whose body was changed through
+    /// `PATCH /api/notes/{id}`. Appending never changes it.
+    #[serde(default)]
+    pub author: Author,
 }
 
 // Stored lessons keep each citation's `image_url` as the bare name of the source's media

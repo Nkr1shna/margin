@@ -301,20 +301,24 @@ nullable). Outputs are compact JSON text unless noted. `summary` is the tool row
 |---|---|---|---|
 | `create_topic` | Write | `title`, `parent_id: Option` | Result card |
 | `rename_topic` | Write | `topic_id`, `title` | |
-| `move_topic` | Write | `topic_id`, `parent_id: Option` (null = root), `position: Option` | |
+| `move_topic` | Write | `topic_id`, `parent_id: Option` (null = root), `position: Option` | `position` is the index among the new siblings (0 first, null last); siblings are renumbered 0, 1, 2… |
 | `edit_lesson_title` | Write | `lesson_id`, `title` | |
 | `create_note` | Write | `topic_id`, `lesson_id: Option`, `title`, `body_md` | Agent-written; Result card |
 | `append_to_note` | Write | `note_id`, `text` | Never asks (Q2) |
 | `replace_note_body` | Write | `note_id`, `body_md` | Asks when the note is the owner's writing (Q2) |
 | `propose_course` | Write | `prompt` (the learner's request), `topic_title`, `subject_title`, `lessons: [{title, summary, minutes}]` (1–12), `level`, `with_videos`, `with_quiz`, `parent_topic_id: Option`, `source_ids` | The model writes the outline; the service validates it like `ask::validate_outline`, stores a `Ready` `Proposal` with `chat_id`, card `Outline`. Options the owner didn't state are inferred; the chips on the card change them. |
-| `accept_proposal` | Write | `proposal_id` | Same as Create lessons with no edits; Result card for the topic |
+| `accept_proposal` | Write | `proposal_id` | Same as Create lessons with no edits; Result card for the topic. Only a proposal of the same chat; its result is the chat's record (no extra `Action`) |
 | `delete_topic` / `delete_lesson` / `delete_note` | Destructive | the id | Prompt names what goes with it (lessons, notes, videos, sources) |
 
-Q2 provenance (service-only fields): a note created by an agent tool is agent-written; a
-note created through `POST /api/notes`, or edited through `PATCH /api/notes/{id}`, is the
-owner's. A lesson whose body was changed through `PATCH /api/lessons/{id}` is
-owner-edited. `replace_note_body` on the owner's note and `regenerate_lesson` on an
-owner-edited lesson ask first. Rows without the field read as the owner's (safe default).
+Q2 provenance (service-only fields `StoredNote.author`, `StoredLesson.author`:
+`state::Author::{Owner, Agent}`): a note created by an agent tool is agent-written; a
+note created through `POST /api/notes`, or whose body was changed through
+`PATCH /api/notes/{id}`, is the owner's (a retitle alone keeps the body's author). A
+lesson whose body was changed through `PATCH /api/lessons/{id}` is owner-edited; a lesson
+job that writes the body makes it the agent's. `replace_note_body` on the owner's note
+and `regenerate_lesson` on an owner-edited lesson ask first; once replaced, the note is
+the agent's writing. Appending keeps the author. Rows without the field read as the
+owner's (safe default).
 
 Create lessons on the outline card: `POST proposal_accept` with the edited outline and
 `chips`; when the proposal has a `chat_id`, the service adds
