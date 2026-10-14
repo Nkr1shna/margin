@@ -25,7 +25,8 @@ pub const CONDENSED_HISTORY_PREFIX: &str =
 /// model items. A `function_call` with no `function_call_output` anywhere gets
 /// [`cancelled_call_output`] right after it, so the input is always valid. A developer
 /// or user message stored between a step's calls and their outputs (an `Action`
-/// recorded while the turn waited on a confirmation) is replayed after those outputs;
+/// recorded while the turn waited on a confirmation, or a call's pictures from
+/// [`tool_pictures_input`] stored with its output) is replayed after those outputs;
 /// the step's own output (more calls, reasoning, a message) keeps its order.
 ///
 /// Condensed history: the input starts at the latest `compaction` item (server-side
@@ -114,6 +115,49 @@ pub fn action_input(text: &str) -> Value {
 /// `{"type":"function_call_output","call_id":…,"output":…}`.
 pub fn function_call_output(call_id: &str, output: &str) -> Value {
     json!({"type": "function_call_output", "call_id": call_id, "output": output})
+}
+
+/// How the user message carrying a tool call's pictures starts; the call_id follows.
+pub const TOOL_PICTURES_PREFIX: &str = "Pictures from the tool call ";
+/// What stands in for a picture condensing took out.
+pub(crate) const PICTURE_REMOVED: &str = "[picture removed]";
+
+/// The input item that carries a tool call's pictures ([`ToolOutput::images`]), stored
+/// right after its `function_call_output` in the same `ItemRecord.model_items`:
+/// `{"role":"user","content":[{"type":"input_text","text":"Pictures from the tool call
+/// {call_id} ({summary}), in order."},{"type":"input_image","image_url":"data:…",
+/// "detail":"auto"},…]}`. `None` without pictures. Replay puts it after the step's
+/// outputs, like any input message stored between a step's calls and their outputs.
+///
+/// [`ToolOutput::images`]: crate::ToolOutput::images
+pub fn tool_pictures_input(
+    call_id: &str,
+    summary: &str,
+    images: &[margin_ai::Image],
+) -> Option<Value> {
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": format!("{TOOL_PICTURES_PREFIX}{call_id} ({summary}), in order."),
+    })];
+    content.extend(images.iter().map(
+        |image| json!({"type": "input_image", "image_url": image.data_url(), "detail": "auto"}),
+    ));
+    Some(json!({"role": "user", "content": content}))
+}
+
+/// The call_id of a message made by [`tool_pictures_input`]; `None` for anything else.
+/// (An owner's message never matches: it starts with the context part Margin adds.)
+pub(crate) fn tool_pictures_call_id(value: &Value) -> Option<&str> {
+    if value["role"] != "user" {
+        return None;
+    }
+    let rest = value["content"][0]["text"]
+        .as_str()?
+        .strip_prefix(TOOL_PICTURES_PREFIX)?;
+    rest.split(' ').next().filter(|id| !id.is_empty())
 }
 
 /// The output for a call that never got one: `{"error":"cancelled by the user"}`.

@@ -1,7 +1,7 @@
 //! What the model is told: the stable system prompt, and each message's context.
 
 use chrono::{DateTime, Utc};
-use margin_shared::{DeviceRef, Source, SourceStatus, Workspace};
+use margin_shared::{DeviceRef, Source, SourceStatus, Workspace, WorkspaceSync};
 use serde_json::{Value, json};
 
 /// The developer message that starts every model call's `input`. Identical for every
@@ -27,9 +27,13 @@ What you can do, through the tools you are given:
 - Change the library when the owner wants it: create, rename and move topics, write and \
 edit notes, propose courses (an outline the owner can edit before lessons are written), \
 start lessons and videos, and delete things.
-- Read folders the owner attached to this chat, through the device that holds each \
-folder. Attached folders are read-only: you can list, find, search and read files, \
-never write, move or delete them, and you can't run commands.
+- Folders the owner attached to this chat are copied to Margin's service and read there, so you search them like any other \
+source: search (name them in scope.workspace_ids, or leave scope empty for this chat's \
+files and folders), list_files and find_files to see what a folder holds, \
+read_passage, document_outline and view_picture to read more of a file. Attached \
+folders are read-only; nothing is read from a device. Call sync_folder only when the \
+owner says a folder changed on their device. You can't write, move or delete a \
+folder's files, and you can't run commands.
 - Show things in the app on the device the owner is writing from (open a lesson, a \
 citation or a source passage, show or hide the sidebar).
 There is no web search: work from the library, its sources and the attached folders, and \
@@ -108,17 +112,14 @@ fn context_text(ctx: &MessageContext) -> String {
         out.push_str("- Folders attached to this chat (read-only):\n");
         for (ws, online) in &ctx.workspaces {
             out.push_str(&format!(
-                "  - workspace_id {} (named {}, at {}) on device id {} (named {}), {}\n",
+                "  - workspace_id {} (named {}, at {}) on device id {} (named {}): {}; the device is {}\n",
                 ws.id,
                 quoted(&ws.name),
                 quoted(&ws.location),
                 ws.device_id,
                 quoted(&ws.device_name),
-                if *online {
-                    "online"
-                } else {
-                    "offline: it can't be read until Margin is open there"
-                }
+                sync_text(&ws.sync),
+                if *online { "online" } else { "offline" }
             ));
         }
     }
@@ -140,6 +141,33 @@ fn context_text(ctx: &MessageContext) -> String {
         }
     }
     out
+}
+
+/// A folder's copy on the service, from the service's counts: "14 files on the service,
+/// 3 still being sent, 1 couldn't be read; last synced 2025-10-14 09:12 UTC".
+fn sync_text(sync: &WorkspaceSync) -> String {
+    let files = |n: u32| {
+        if n == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{n} files")
+        }
+    };
+    let mut counts = vec![format!("{} on the service", files(sync.files))];
+    if sync.uploading > 0 {
+        counts.push(format!("{} still being sent", sync.uploading));
+    }
+    if sync.reading > 0 {
+        counts.push(format!("{} being read", sync.reading));
+    }
+    if sync.failed > 0 {
+        counts.push(format!("{} couldn't be read", sync.failed));
+    }
+    let synced = match sync.last_synced_at {
+        Some(at) => format!("last synced {}", at.format("%Y-%m-%d %H:%M UTC")),
+        None => "never synced".into(),
+    };
+    format!("{}; {synced}", counts.join(", "))
 }
 
 /// `text` as a JSON string: quoted, with quotes, backslashes and line breaks escaped,
@@ -220,6 +248,79 @@ mod tests {
         assert!(p.contains("no web search"));
         assert!(p.contains("$…$"));
         assert!(p.contains("starts with a context part Margin adds"));
+        assert!(p.contains("nothing is read from a device"));
+        for tool in [
+            "scope.workspace_ids",
+            "list_files",
+            "find_files",
+            "read_passage",
+            "document_outline",
+            "view_picture",
+            "sync_folder",
+        ] {
+            assert!(p.contains(tool), "{tool}");
+        }
+        assert!(!p.contains("through the device that holds each"));
+    }
+
+    #[test]
+    fn folder_lines_say_the_sync_state() {
+        let line = |sync: WorkspaceSync, online: bool| {
+            let mut c = ctx();
+            c.workspaces[0].0.sync = sync;
+            c.workspaces[0].1 = online;
+            let items = user_message_input("hi", &c);
+            let context = items[0]["content"][0]["text"].as_str().unwrap().to_string();
+            context
+                .lines()
+                .find(|l| l.contains("workspace_id w1"))
+                .unwrap()
+                .to_string()
+        };
+        let synced = DateTime::parse_from_rfc3339("2025-10-14T09:12:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            line(
+                WorkspaceSync {
+                    files: 14,
+                    bytes: 1 << 30,
+                    uploading: 3,
+                    reading: 2,
+                    failed: 1,
+                    last_synced_at: Some(synced),
+                },
+                true
+            ),
+            "  - workspace_id w1 (named \"margin\", at \"~/Developer/margin\") on device id d2 (named \"MacBook Pro\"): 14 files on the service, 3 still being sent, 2 being read, 1 couldn't be read; last synced 2025-10-14 09:12 UTC; the device is online"
+        );
+        assert_eq!(
+            line(
+                WorkspaceSync {
+                    files: 1,
+                    last_synced_at: Some(synced),
+                    ..Default::default()
+                },
+                false
+            ),
+            "  - workspace_id w1 (named \"margin\", at \"~/Developer/margin\") on device id d2 (named \"MacBook Pro\"): 1 file on the service; last synced 2025-10-14 09:12 UTC; the device is offline"
+        );
+        assert!(
+            line(WorkspaceSync::default(), true)
+                .ends_with(": 0 files on the service; never synced; the device is online")
+        );
+        assert!(
+            line(
+                WorkspaceSync {
+                    uploading: 5,
+                    ..Default::default()
+                },
+                true
+            )
+            .ends_with(
+                ": 0 files on the service, 5 still being sent; never synced; the device is online"
+            )
+        );
     }
 
     #[test]
@@ -242,9 +343,12 @@ mod tests {
         assert!(context.contains("2025"), "{context}");
         assert!(context.contains("workspace_id w1"), "{context}");
         assert!(
-            context.contains("(named \"MacBook Pro\"), offline"),
+            context.contains(
+                "on device id d2 (named \"MacBook Pro\"): 0 files on the service; never synced; the device is offline\n"
+            ),
             "{context}"
         );
+        assert!(!context.contains("can't be read until"), "{context}");
         assert!(
             context.contains("source_id s1 (named \"notes.pdf\", pdf, ready)"),
             "{context}"

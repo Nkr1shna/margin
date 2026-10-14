@@ -66,6 +66,12 @@ pub struct ToolOutput {
     pub summary: String,
     /// Inline cards to show after the result (an outline, results, passages).
     pub cards: Vec<Card>,
+    /// Pictures the model gets with the output (e.g. `view_picture`'s page or image), in
+    /// order. The loop sends them right after the `function_call_output`, as one user
+    /// message of `input_image` parts. They don't count toward `TOOL_OUTPUT_MAX_BYTES`
+    /// or `TURN_OUTPUT_MAX_BYTES` (those cut text) and have no count cap here; `output`
+    /// still carries the text the model reads without them.
+    pub images: Vec<margin_ai::Image>,
 }
 
 impl ToolOutput {
@@ -75,6 +81,7 @@ impl ToolOutput {
             output: output.into(),
             summary: summary.into(),
             cards: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -86,11 +93,18 @@ impl ToolOutput {
             output: error_output(&message),
             summary: message,
             cards: Vec::new(),
+            images: Vec::new(),
         }
     }
 
     pub fn with_card(mut self, card: Card) -> Self {
         self.cards.push(card);
+        self
+    }
+
+    /// Adds a picture sent to the model with the output (see [`ToolOutput::images`]).
+    pub fn with_image(mut self, image: margin_ai::Image) -> Self {
+        self.images.push(image);
         self
     }
 }
@@ -149,6 +163,13 @@ pub trait Tool: Send + Sync + 'static {
     /// One line for the tool row while it runs, e.g. "Searching the library for
     /// “fourier”". `args` may be malformed; fall back to a generic line.
     fn label(&self, args: &Value) -> String;
+    /// The tool row's line when the call's context can name more than `args` do (e.g.
+    /// "Syncing “notes”" from the workspace_id). The loop shows this one; it defaults to
+    /// [`Tool::label`].
+    fn context_label(&self, ctx: &ToolContext, args: &Value) -> String {
+        let _ = ctx;
+        self.label(args)
+    }
     /// For `ToolKind::Device` tools: the device the call goes to (shown on the tool row
     /// as `ToolCall.device`); `None` when `args` don't say.
     fn device(&self, ctx: &ToolContext, args: &Value) -> Option<DeviceRef> {
@@ -179,6 +200,12 @@ pub trait TypedTool: Send + Sync + 'static {
     const KIND: ToolKind;
 
     fn label(&self, args: &Self::Args) -> String;
+
+    /// See [`Tool::context_label`].
+    fn context_label(&self, ctx: &ToolContext, args: &Self::Args) -> String {
+        let _ = ctx;
+        self.label(args)
+    }
 
     /// See [`Tool::device`].
     fn device(&self, ctx: &ToolContext, args: &Self::Args) -> Option<DeviceRef> {
@@ -222,6 +249,13 @@ impl<T: TypedTool> Tool for Typed<T> {
     fn label(&self, args: &Value) -> String {
         match T::Args::deserialize(args) {
             Ok(args) => self.0.label(&args),
+            Err(_) => generic_label(T::NAME),
+        }
+    }
+
+    fn context_label(&self, ctx: &ToolContext, args: &Value) -> String {
+        match T::Args::deserialize(args) {
+            Ok(args) => self.0.context_label(ctx, &args),
             Err(_) => generic_label(T::NAME),
         }
     }

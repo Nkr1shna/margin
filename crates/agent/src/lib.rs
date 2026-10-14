@@ -35,8 +35,9 @@ pub use model::ModelClient;
 pub use prompt::{MessageContext, system_prompt, user_message_input};
 pub use registry::ToolRegistry;
 pub use replay::{
-    CONDENSED_HISTORY_PREFIX, ReplayItem, action_input, cancelled_call_output,
-    function_call_output, replay_input, unanswered_calls,
+    CONDENSED_HISTORY_PREFIX, ReplayItem, TOOL_PICTURES_PREFIX, action_input,
+    cancelled_call_output, function_call_output, replay_input, tool_pictures_input,
+    unanswered_calls,
 };
 pub use scripted::{Scripted, ScriptedModel};
 pub use sink::{ItemRecord, SinkError, TurnSink};
@@ -73,10 +74,9 @@ pub const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// Turns running at once across all chats; a further turn waits (its chat shows
 /// Running) until one ends.
 pub const MAX_CONCURRENT_TURNS: usize = 2;
-/// How long a device has to answer `list_files`, `find_files` and `read_file`.
+/// How long a device has to answer `sync_folder` (walk the folder, send the manifest
+/// and get the service's plan; the uploads go on afterwards).
 pub const FOLDER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a device has to answer `search_text`.
-pub const SEARCH_TEXT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a device has to answer an app-control tool.
 pub const APP_CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Server-side compaction threshold, in input tokens (phase 5).
