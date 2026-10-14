@@ -24,6 +24,9 @@ pub enum Scripted {
     Delayed(Duration, Box<Scripted>),
     /// Stream these events and then never finish (for Stop while streaming).
     Hang(Vec<StreamEvent>),
+    /// Stream these events, then panic while the next one is read (a bug in the loop or
+    /// a tool, for what the service does with a turn that ended that way).
+    EventsThenPanic(Vec<StreamEvent>),
 }
 
 /// See the module docs. `Default` is an empty script; a call with nothing queued fails
@@ -82,6 +85,15 @@ impl ModelClient for ScriptedModel {
                     Scripted::Hang(events) => {
                         let head = futures_util::stream::iter(events.into_iter().map(Ok));
                         return Ok(head.chain(futures_util::stream::pending()).boxed());
+                    }
+                    Scripted::EventsThenPanic(events) => {
+                        let head = futures_util::stream::iter(events.into_iter().map(Ok));
+                        let panic = futures_util::stream::poll_fn(
+                            |_| -> std::task::Poll<Option<Result<StreamEvent, AiError>>> {
+                                panic!("the scripted model panicked")
+                            },
+                        );
+                        return Ok(head.chain(panic).boxed());
                     }
                 }
             }

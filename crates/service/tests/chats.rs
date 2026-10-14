@@ -21,7 +21,8 @@ use margin_service::db::{self, Store};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY};
 use margin_service::state::{SETTINGS_ID, SettingsRow, StoredLesson};
 use margin_service::turns::{
-    CALL_INTERRUPTED, CONFIRMATION_EXPIRED, RunningTurn, STOPPED, STOPPED_BY_RESTART, ServiceSink,
+    CALL_FAILED, CALL_INTERRUPTED, CONFIRMATION_EXPIRED, RunningTurn, STOPPED, STOPPED_BY_RESTART,
+    ServiceSink,
 };
 use margin_service::{agent_tools, chats};
 use margin_shared::{
@@ -417,6 +418,46 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 4).await;
     assert_eq!(h.generator.agent.requests()[1].model, None);
+
+    // An agent model alone is enough for chats.
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_model": "", "agent_model": "gpt-6-luna"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["still here"])));
+    assert_eq!(send(&h, &t, &chat.id, "third").await.status(), 200);
+    let d = wait_chat(&h, &t, &chat.id, |d| d.items.len() == 6).await;
+    assert!(idle(&d), "{:?}", lines(&d));
+    assert_eq!(lines(&d)[5], "assistant: still here");
+    assert_eq!(
+        h.generator.agent.requests()[2].model.as_deref(),
+        Some("gpt-6-luna")
+    );
+
+    // Neither: the turn fails with `no_model`'s message.
+    h.patch(&t, "/api/settings")
+        .json(&json!({"agent_model": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(send(&h, &t, &chat.id, "fourth").await.status(), 200);
+    let d = wait_chat(&h, &t, &chat.id, |d| {
+        matches!(d.chat.state, ChatState::Failed { .. })
+    })
+    .await;
+    assert!(
+        lines(&d)
+            .last()
+            .unwrap()
+            .starts_with("error (retry): Choose a model"),
+        "{:?}",
+        lines(&d)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -984,6 +1025,56 @@ async fn a_failed_turn_can_be_continued() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_panics_finishes_what_it_left() {
+    let (h, t) = signed_in().await;
+    let mut events = tool_calls_reply(&[("call_9", "list_topics", "{}")]);
+    events.pop(); // no `Completed`: the panic comes first
+    h.generator.agent.push(Scripted::EventsThenPanic(events));
+    let chat = ask(&h, &t, "list them").await.chat;
+    let d = wait_chat(&h, &t, &chat.id, |d| {
+        matches!(d.chat.state, ChatState::Failed { .. })
+    })
+    .await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: list them",
+            "call list_topics (cancelled)",
+            "result failed: Not run",
+            "error (retry): Something went wrong on the service while answering. Check its log.",
+        ]
+    );
+    assert!(h.state.turns.live_text.lock().unwrap().is_empty());
+
+    // Continue goes on from a valid history: the call has its answer, next to it.
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["ok"])));
+    let r = h
+        .post(&t, &format!("/api/chats/{}/continue", chat.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = wait_chat(&h, &t, &chat.id, idle).await;
+    assert_eq!(lines(&d).last().unwrap(), "assistant: ok");
+    let reqs = h.generator.agent.requests();
+    let input = &reqs.last().unwrap().input;
+    assert_eq!(
+        call_outputs(input),
+        vec![(
+            "call_9".to_string(),
+            margin_agent::error_output(CALL_FAILED)
+        )]
+    );
+    let call = input
+        .iter()
+        .position(|i| i["type"] == "function_call")
+        .unwrap();
+    assert_eq!(input[call + 1]["type"], "function_call_output");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn at_most_two_turns_run_at_once() {
     let (h, t) = signed_in().await;
     h.generator.agent.push(hanging_text("a"));
@@ -1051,10 +1142,13 @@ async fn park_on_card(
             },
         );
     }
+    // Holds a slot, as a real turn does.
+    let permit = h.state.turns.slots.clone().try_acquire_owned().ok();
     let sink = Arc::new(ServiceSink {
         state: h.state.clone(),
         chat_id: chat_id.into(),
         turn_id,
+        slot: Arc::new(std::sync::Mutex::new(permit)),
     });
     let call = sink
         .add_item(
@@ -1157,6 +1251,46 @@ async fn any_device_answers_a_confirmation() {
     )));
     let (status, _) = api_error(confirm(&t, &card.id, false).await.unwrap()).await;
     assert_eq!(status, 409, "answered once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turns_waiting_on_the_owner_leave_their_slot() {
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let a = create_chat(&h, &t, json!({})).await.chat;
+    let b = create_chat(&h, &t, json!({})).await.chat;
+    let (sink_a, card_a, waiting_a) = park_on_card(&h, &a.id, &mac_id).await;
+    let (_sink_b, _card_b, _waiting_b) = park_on_card(&h, &b.id, &mac_id).await;
+    for chat in [&a, &b] {
+        wait_chat(&h, &t, &chat.id, |d| {
+            matches!(d.chat.state, ChatState::WaitingForUser { .. })
+        })
+        .await;
+    }
+    assert_eq!(h.state.turns.slots.available_permits(), 2);
+
+    // Two parked turns don't hold up a third chat.
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["third"])));
+    let c = ask(&h, &t, "three").await.chat;
+    let d = wait_chat(&h, &t, &c.id, idle).await;
+    assert_eq!(lines(&d)[1], "assistant: third");
+
+    // Answered, the turn takes a slot again before it goes on.
+    let r = h
+        .post(&t, &format!("/api/chats/{}/confirm", a.id))
+        .json(&json!({"item_id": card_a.id, "approve": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(matches!(
+        waiting_a.await.unwrap(),
+        Ok(Decision::Approved { .. })
+    ));
+    assert!(sink_a.slot.lock().unwrap().is_some());
+    assert_eq!(h.state.turns.slots.available_permits(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1972,6 +2106,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         state: h.state.clone(),
         chat_id: chat.id.clone(),
         turn_id: "turn-1".into(),
+        slot: Default::default(),
     };
     let mut sock = h.socket(&t).await;
     let item = sink
@@ -2045,8 +2180,10 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     assert_eq!(d.chat.usage.input_tokens, 11);
     assert_eq!(d.chat.usage.model_calls, 2);
 
-    // A stopped turn's sink refuses to write.
+    // A stopped turn's sink refuses to write, and its late deltas are dropped.
     h.state.turns.abort(&chat.id);
+    sink.delta(&item, "late");
+    assert!(h.state.turns.live_text.lock().unwrap().is_empty());
     assert!(
         sink.add_item(
             ItemStatus::Done,

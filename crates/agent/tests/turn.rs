@@ -12,9 +12,9 @@ use margin_agent::scripted::{
 use margin_agent::{
     BoxFuture, CONDENSED_HISTORY_PREFIX, ConfirmationPrompt, DeviceBridge, DeviceCall, DeviceError,
     ItemRecord, MAX_STEPS, NoDevices, ReplayItem, RetryPolicy, Scripted, ScriptedModel, SinkError,
-    TOOL_OUTPUT_MAX_BYTES, Tool, ToolContext, ToolKind, ToolOutput, ToolRegistry, TurnDeps,
-    TurnInput, TurnOutcome, TurnSink, check_strict_schema, device_tools, replay_input, run_turn,
-    system_prompt, unanswered_calls,
+    TOOL_OUTPUT_MAX_BYTES, TURN_OUTPUT_MAX_BYTES, Tool, ToolContext, ToolKind, ToolOutput,
+    ToolRegistry, TurnDeps, TurnInput, TurnOutcome, TurnSink, check_strict_schema, device_tools,
+    replay_input, run_turn, system_prompt, unanswered_calls,
 };
 use margin_ai::{AiError, ContextManagement, ResponseRequest, StreamEvent, ToolChoice};
 use margin_shared::{
@@ -745,6 +745,52 @@ async fn read_calls_run_together_and_answer_in_call_order() {
 }
 
 #[tokio::test]
+async fn parallel_results_are_stored_in_call_order_so_replays_match() {
+    let log = Log::default();
+    let mut slow = FakeTool::new("slow_read", ToolKind::Read, &log);
+    slow.delay = Duration::from_millis(30);
+    let fast = FakeTool::new("fast_read", ToolKind::Read, &log);
+    let tools = registry(vec![
+        slow,
+        fast,
+        FakeTool::new("write_c", ToolKind::Write, &log),
+    ]);
+    let model = ScriptedModel::new([
+        Scripted::Events(tool_calls_reply(&[
+            ("call_c", "write_c", "{}"),
+            ("call_a", "slow_read", "{}"),
+            ("call_b", "fast_read", "{}"),
+        ])),
+        Scripted::Events(text_reply(&["ok"])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.user_message("go");
+    run(&model, &tools, &sink, Arc::new(NoDevices), input(history)).await;
+    // The fast read finished first and the write ran last ...
+    assert_eq!(
+        log.get(),
+        vec![
+            "start slow_read",
+            "start fast_read",
+            "end fast_read",
+            "end slow_read",
+            "start write_c",
+            "end write_c"
+        ]
+    );
+    // ... but the results are stored in the model's call order,
+    let stored: Vec<String> = results(&sink).into_iter().map(|(c, _, _)| c).collect();
+    assert_eq!(stored, vec!["call_c", "call_a", "call_b"]);
+    // so the replay is byte for byte what the next model call was sent.
+    let replay = sink.replay();
+    let sent = &model.requests()[1].input[1..];
+    assert_eq!(
+        serde_json::to_string(&replay[..sent.len()]).unwrap(),
+        serde_json::to_string(sent).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn writes_run_after_reads_one_at_a_time_in_order() {
     let log = Log::default();
     let tools = registry(vec![
@@ -1195,7 +1241,8 @@ async fn outputs_are_cut_and_the_turn_budget_runs_out() {
     let history = sink.user_message("read it all");
     let outcome = run(&model, &tools, &sink, Arc::new(NoDevices), input(history)).await;
     assert_eq!(outcome, TurnOutcome::Finished { steps: 3 });
-    assert_eq!(log.get().len(), 18, "only the first 9 calls run");
+    // Calls running at once reserve 64 KB each: 8 fill the 512 KB, the 9th never runs.
+    assert_eq!(log.get().len(), 16, "only the first 8 calls run");
 
     let first_result = sink
         .items()
@@ -1215,12 +1262,19 @@ async fn outputs_are_cut_and_the_turn_budget_runs_out() {
     assert_eq!(output_bytes, full.len() as u64);
 
     let requests = model.requests();
-    // 9 × ~64 KB is past the turn's 512 KB: the next call is text only.
-    assert_eq!(requests[1].tool_choice, Some(ToolChoice::None));
-    assert_eq!(
-        outputs_of(&requests[2]).last().unwrap().1,
-        r#"{"error":"This answer has used up its tool output budget; answer with what you have."}"#
+    let budget_used =
+        r#"{"error":"This answer has used up its tool output budget; answer with what you have."}"#;
+    let first_outputs = outputs_of(&requests[1]);
+    assert_eq!(first_outputs.len(), 9);
+    assert_eq!(first_outputs[8], ("call_8".into(), budget_used.into()));
+    let sent: usize = first_outputs.iter().map(|(_, o)| o.len()).sum();
+    assert!(
+        sent <= TURN_OUTPUT_MAX_BYTES + TOOL_OUTPUT_MAX_BYTES,
+        "{sent}"
     );
+    // 8 × ~64 KB uses up the turn's 512 KB: the next call is text only.
+    assert_eq!(requests[1].tool_choice, Some(ToolChoice::None));
+    assert_eq!(outputs_of(&requests[2]).last().unwrap().1, budget_used);
 }
 
 #[tokio::test]

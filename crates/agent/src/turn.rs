@@ -283,8 +283,13 @@ struct Turn<'t, 'a> {
     tools: Vec<Value>,
     history: Vec<Value>,
     steps: u32,
-    /// Tool output bytes the model got in this run.
+    /// Tool output bytes the model got in this run, plus `TOOL_OUTPUT_MAX_BYTES` for
+    /// each call that is running or waits to be recorded (see `reserved`).
     output_bytes: AtomicUsize,
+    /// Calls holding a `TOOL_OUTPUT_MAX_BYTES` reservation in `output_bytes`, taken when
+    /// they start and settled to the real size when their result is recorded, so calls
+    /// running at once can't pass the budget together.
+    reserved: Mutex<HashSet<String>>,
     /// Outputs by `call_id`: a call already answered is never run again.
     answered: Mutex<HashMap<String, String>>,
     /// Whether to ask for server-side compaction (until the API rejects it).
@@ -315,6 +320,7 @@ impl<'t, 'a> Turn<'t, 'a> {
             history: input.history.clone(),
             steps: 0,
             output_bytes: AtomicUsize::new(0),
+            reserved: Mutex::new(HashSet::new()),
             answered: Mutex::new(answered),
             server_compaction: true,
             condense_next: false,
@@ -328,6 +334,21 @@ impl<'t, 'a> Turn<'t, 'a> {
 
     fn budget_used(&self) -> bool {
         self.output_bytes.load(Ordering::SeqCst) >= TURN_OUTPUT_MAX_BYTES
+    }
+
+    /// Reserves `TOOL_OUTPUT_MAX_BYTES` of the budget for `call_id` before it runs;
+    /// false when the budget is used up (counting the calls still running).
+    fn reserve_output(&self, call_id: &str) -> bool {
+        let reserved = self
+            .output_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                (used < TURN_OUTPUT_MAX_BYTES).then_some(used + TOOL_OUTPUT_MAX_BYTES)
+            })
+            .is_ok();
+        if reserved {
+            self.reserved.lock().unwrap().insert(call_id.to_string());
+        }
+        reserved
     }
 
     async fn run(mut self) -> Result<TurnOutcome, SinkError> {
@@ -799,39 +820,38 @@ impl<'t, 'a> Turn<'t, 'a> {
     }
 
     /// Runs a step's calls: Read and Device calls (and calls that can't run) at once,
-    /// then Write and Destructive calls one at a time in the model's order, then any
-    /// repeated `call_id`s (which reuse the first answer). Returns the
-    /// `function_call_output`s in the model's call order.
+    /// then Write and Destructive calls one at a time in the model's order; repeated
+    /// `call_id`s reuse the first answer. Results are recorded in the model's call order
+    /// (a Read call's result after the Write calls before it), so the stored items replay
+    /// exactly as the returned `function_call_output`s, which are in that order too.
     async fn run_calls(&self, calls: &[Call]) -> Result<Vec<Value>, SinkError> {
         let mut seen = HashSet::new();
-        let (mut concurrent, mut ordered, mut repeated) = (Vec::new(), Vec::new(), Vec::new());
+        let mut concurrent = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             if !seen.insert(call.call_id.as_str()) {
-                repeated.push(i);
                 continue;
             }
             let kind = self.deps.tools.get(&call.name).map(|t| t.kind());
-            match kind {
-                Some(ToolKind::Write | ToolKind::Destructive) => ordered.push(i),
-                _ => concurrent.push(i),
+            if !matches!(kind, Some(ToolKind::Write | ToolKind::Destructive)) {
+                concurrent.push(i);
             }
         }
-        let mut outputs: Vec<Option<Value>> = vec![None; calls.len()];
         let results =
-            futures_util::future::join_all(concurrent.iter().map(|&i| self.handle(&calls[i])))
+            futures_util::future::join_all(concurrent.iter().map(|&i| self.execute(&calls[i])))
                 .await;
+        let mut ran: HashMap<usize, ToolOutput> = HashMap::new();
         for (i, result) in concurrent.into_iter().zip(results) {
-            outputs[i] = Some(result?);
+            ran.insert(i, result?);
         }
-        for i in ordered.into_iter().chain(repeated.drain(..)) {
-            outputs[i] = Some(self.handle(&calls[i]).await?);
+        let mut outputs = Vec::with_capacity(calls.len());
+        for (i, call) in calls.iter().enumerate() {
+            let out = match ran.remove(&i) {
+                Some(out) => out,
+                None => self.execute(call).await?,
+            };
+            outputs.push(self.record(call, out).await?);
         }
-        Ok(outputs.into_iter().flatten().collect())
-    }
-
-    async fn handle(&self, call: &Call) -> Result<Value, SinkError> {
-        let output = self.execute(call).await?;
-        self.record(call, output).await
+        Ok(outputs)
     }
 
     /// What a call returns: run, refused, declined or already answered.
@@ -860,7 +880,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 )));
             }
         };
-        if self.budget_used() {
+        if !self.reserve_output(&call.call_id) {
             return Ok(ToolOutput {
                 ok: false,
                 output: error_output(BUDGET_USED),
@@ -934,6 +954,10 @@ impl<'t, 'a> Turn<'t, 'a> {
         let sink = self.sink();
         let output = truncate_output(&out.output, TOOL_OUTPUT_MAX_BYTES);
         self.output_bytes.fetch_add(output.len(), Ordering::SeqCst);
+        if self.reserved.lock().unwrap().remove(&call.call_id) {
+            self.output_bytes
+                .fetch_sub(TOOL_OUTPUT_MAX_BYTES, Ordering::SeqCst);
+        }
         let model_item = function_call_output(&call.call_id, &output);
         sink.add_item(
             ItemStatus::Done,

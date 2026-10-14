@@ -83,7 +83,11 @@ pub fn rows(items: &[ChatItem], state: &ChatState) -> Vec<Row> {
     let last_error = items
         .iter()
         .rposition(|i| matches!(i.kind, ChatItemKind::Error { .. }));
-    let failed = matches!(state, ChatState::Failed { .. });
+    // Retry resumes the failed turn, so only that turn's error offers it.
+    let failed_turn = match state {
+        ChatState::Failed { turn_id, .. } => Some(turn_id.as_str()),
+        _ => None,
+    };
     for (at, item) in items.iter().enumerate() {
         match &item.kind {
             ChatItemKind::UserMessage { .. } => rows.push(Row::User(item.clone())),
@@ -123,7 +127,9 @@ pub fn rows(items: &[ChatItem], state: &ChatState) -> Vec<Row> {
             }
             ChatItemKind::Error { retryable, .. } => rows.push(Row::Error {
                 item: item.clone(),
-                retry: failed && *retryable && Some(at) == last_error,
+                retry: failed_turn == Some(item.turn_id.as_str())
+                    && *retryable
+                    && Some(at) == last_error,
             }),
         }
     }
@@ -249,6 +255,19 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         }
     });
 
+    // Fetches the transcript (again), for the effect below and the Retry buttons.
+    let reload = use_callback(move |id: Id| {
+        spawn(async move {
+            loading.set(true);
+            match fetch_chat(app, id).await {
+                Ok(()) => load_error.set(None),
+                Err((true, _)) => gone.set(true),
+                Err((false, e)) => load_error.set(Some(e)),
+            }
+            loading.set(false);
+        });
+    });
+
     // Load the transcript when it isn't here, and again when it missed an event.
     let needs_load = id.as_ref().is_some_and(|id| {
         let lib = app.lib.read();
@@ -260,15 +279,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         if !needs_load || *loading.peek() {
             return;
         }
-        spawn(async move {
-            loading.set(true);
-            match fetch_chat(app, id).await {
-                Ok(()) => load_error.set(None),
-                Err((true, _)) => gone.set(true),
-                Err((false, e)) => load_error.set(Some(e)),
-            }
-            loading.set(false);
-        });
+        reload.call(id);
     }));
 
     // Keep the transcript at its end while the answer streams in (unless scrolled up).
@@ -318,7 +329,13 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                         match api.create_chat(&body).await {
                             Ok(detail) => {
                                 let id = detail.chat.id.clone();
-                                lib.write().load_chat(detail);
+                                let mut l = lib.write();
+                                l.load_chat(detail);
+                                // Item events sent before this answer arrived weren't
+                                // applied (the transcript wasn't here yet): fetch it once
+                                // more when the chat opens.
+                                l.stale_chats.insert(id.clone());
+                                drop(l);
                                 draft.set(String::new());
                                 draft_rev += 1;
                                 sending.set(false);
@@ -493,18 +510,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                     div { class: "gen",
                         ErrorNotice {
                             message: format!("Couldn't open this chat. {}", err.message),
-                            on_retry: move |_| {
-                                let id = id.clone();
-                                spawn(async move {
-                                    loading.set(true);
-                                    match fetch_chat(app, id).await {
-                                        Ok(()) => load_error.set(None),
-                                        Err((true, _)) => gone.set(true),
-                                        Err((false, e)) => load_error.set(Some(e)),
-                                    }
-                                    loading.set(false);
-                                });
-                            },
+                            on_retry: move |_| reload.call(id.clone()),
                         }
                     }
                 } else if deleted {
@@ -551,7 +557,13 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                     Loading { label: "Opening the chat…" }
                 }
                 if let Some(err) = load_error.read().clone() {
-                    ErrorNotice { message: format!("Couldn't load the whole chat. {}", err.message) }
+                    ErrorNotice {
+                        message: format!("Couldn't load the whole chat. {}", err.message),
+                        on_retry: {
+                            let id = id.clone();
+                            move |_| reload.call(id.clone())
+                        },
+                    }
                 }
                 for row in rows {
                     ChatRow { key: "{row.key()}", row: row.clone(), chat: chat.clone(), on_retry: move |_| act.call(ChatAction::Continue) }
@@ -886,6 +898,17 @@ fn ToolRow(chat_id: Id, call: Option<ChatItem>, result: Option<ChatItem>) -> Ele
             fetching.set(false);
         });
     };
+    // A row opened while its call ran loads the output once the result arrives.
+    let fetch_when_done = fetch.clone();
+    use_effect(use_reactive!(|result_id| {
+        if let Some(id) = result_id.clone()
+            && *open.peek()
+            && output.peek().is_none()
+            && !*fetching.peek()
+        {
+            fetch_when_done(id);
+        }
+    }));
     let toggle = {
         let result_id = result_id.clone();
         let fetch = fetch.clone();
@@ -1453,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_only_on_the_last_retryable_error_of_a_failed_chat() {
+    fn retry_only_on_the_last_retryable_error_of_the_failed_turn() {
         let items = vec![error("e1", 1, true), error("e2", 2, true)];
         let failed = ChatState::Failed {
             turn_id: "t1".into(),
@@ -1468,6 +1491,14 @@ mod tests {
         assert_eq!(retry(rows(&items, &ChatState::Idle)), [false, false]);
         let items = vec![error("e1", 1, true), error("e2", 2, false)];
         assert_eq!(retry(rows(&items, &failed)), [false, false]);
+        // A later turn failed without an error item: an earlier turn's error doesn't
+        // offer Retry (the chat's own notice does).
+        let items = vec![error("e1", 1, true)];
+        let later = ChatState::Failed {
+            turn_id: "t2".into(),
+            error: "boom".into(),
+        };
+        assert_eq!(retry(rows(&items, &later)), [false]);
     }
 
     #[test]

@@ -430,28 +430,42 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             if *status.peek() != LoadStatus::Loaded {
                 status.set(LoadStatus::Failed(message));
             }
+            // Chats load on their own (and their transcripts may have missed events).
+            load_chats(ctx, api).await;
             false
         }
     }
 }
 
+/// How long the live loop waits before asking for the chat list again after it failed.
+const CHATS_RETRY: Duration = Duration::from_secs(5);
+
 /// The chat list, and the transcripts open this session again: events may have been
-/// missed while they were away. Failures leave what's there (the next reload tries again).
-async fn load_chats(ctx: AppCtx, api: &Api) {
+/// missed while they were away. Transcripts that couldn't be fetched (all of them when
+/// the list couldn't) are marked stale, so an open chat fetches itself again; a list
+/// that never loaded is asked for again by the live loop (`CHATS_RETRY`). Whether the
+/// list loaded.
+async fn load_chats(ctx: AppCtx, api: &Api) -> bool {
     let mut lib = ctx.lib;
+    let open: Vec<margin_shared::Id> = lib.peek().chat_items.keys().cloned().collect();
     match api.chats().await {
         Ok(chats) => lib.write().replace_chats(chats),
         Err(e) => {
             ctx.failure(&e);
-            return;
+            lib.write().stale_chats.extend(open);
+            return false;
         }
     }
     let open: Vec<margin_shared::Id> = lib.peek().chat_items.keys().cloned().collect();
     for id in open {
-        if let Ok(detail) = api.chat(&id).await {
-            lib.write().load_chat(detail);
+        match api.chat(&id).await {
+            Ok(detail) => lib.write().load_chat(detail),
+            Err(_) => {
+                lib.write().stale_chats.insert(id);
+            }
         }
     }
+    true
 }
 
 async fn live_loop(ctx: AppCtx) {
@@ -463,6 +477,7 @@ async fn live_loop(ctx: AppCtx) {
     let mut lib = ctx.lib;
     let mut reload_seen = *ctx.reload.peek();
     load_library(ctx, &api).await;
+    let mut chats_retry_at = tokio::time::Instant::now() + CHATS_RETRY;
     let mut attempt: u32 = 0;
     let mut connected_before = false;
     loop {
@@ -491,6 +506,12 @@ async fn live_loop(ctx: AppCtx) {
                             if wanted != reload_seen {
                                 reload_seen = wanted;
                                 load_library(ctx, &api).await;
+                            } else if !lib.peek().chats_loaded
+                                && tokio::time::Instant::now() >= chats_retry_at
+                            {
+                                // The chat list never loaded: the sidebar waits on it.
+                                load_chats(ctx, &api).await;
+                                chats_retry_at = tokio::time::Instant::now() + CHATS_RETRY;
                             }
                         }
                     }

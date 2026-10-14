@@ -351,6 +351,9 @@ pub async fn get_chat(
     // In-progress text lives in memory until the item is done.
     let live = state.turns.live_text.lock().unwrap();
     for item in &mut items {
+        if item.status != margin_shared::ItemStatus::InProgress {
+            continue;
+        }
         if let Some(text) = live.get(&item.id) {
             match &mut item.kind {
                 ChatItemKind::AssistantText { text: t }

@@ -17,7 +17,7 @@ use margin_shared::{
     PendingMessage, Source, Usage,
 };
 use serde_json::Value;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::chats::{self, StoredChatItem};
@@ -33,6 +33,11 @@ pub const STOPPED_BY_RESTART: &str = "The service stopped while answering.";
 pub const CALL_INTERRUPTED: &str = "The service stopped before this call finished; check whether it took effect before trying again.";
 /// What the model is told about a confirmation nobody answered before a restart.
 pub const CONFIRMATION_EXPIRED: &str = "The service restarted before the owner answered.";
+/// What the model is told about a call left unanswered by a turn that failed without
+/// finishing it (a panic or a storage failure).
+pub const CALL_FAILED: &str = "The answer failed before this call finished; check whether it took effect before trying again.";
+/// What the model is told about a confirmation left unanswered by a turn that failed.
+pub const CONFIRMATION_FAILED: &str = "The answer failed before the owner answered.";
 
 /// Running turns, one per chat at most. Lives in `App`.
 pub struct Turns {
@@ -40,7 +45,8 @@ pub struct Turns {
     /// item id → the streaming text of an `InProgress` item so far, kept by
     /// `ServiceSink::delta` (for delta offsets) and overlaid by `GET /api/chats/{id}`.
     pub live_text: Mutex<HashMap<Id, String>>,
-    /// `margin_agent::MAX_CONCURRENT_TURNS` permits; a turn holds one while it runs.
+    /// `margin_agent::MAX_CONCURRENT_TURNS` permits; a turn holds one while it runs,
+    /// but not while it waits on a confirmation (see `Slot`).
     pub slots: Arc<Semaphore>,
     /// chat id → the last `seq` given to one of its items (loaded from the store on
     /// first use; see `chats::next_seq_locked`).
@@ -87,6 +93,11 @@ impl Default for Turns {
         Self::new()
     }
 }
+
+/// A turn's hold on one of `Turns::slots`: taken when the task starts, let go while the
+/// turn waits on the owner's answer to a confirmation card (so parked turns don't keep
+/// other chats waiting), taken again once it's answered, let go when the task ends.
+pub type Slot = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
 
 /// A turn's task.
 pub struct RunningTurn {
@@ -306,11 +317,12 @@ struct Early {
 /// `Idle` (finished) or `Failed`, and sends the pending message, if any, as the next
 /// turn.
 pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
-    let slot = state.turns.slots.clone().acquire_owned().await;
-    let result = AssertUnwindSafe(run_turn(&state, &chat_id, &turn_id, origin))
+    let permit = state.turns.slots.clone().acquire_owned().await.ok();
+    let slot: Slot = Arc::new(Mutex::new(permit));
+    let result = AssertUnwindSafe(run_turn(&state, &chat_id, &turn_id, origin, slot.clone()))
         .catch_unwind()
         .await;
-    drop(slot);
+    drop(slot.lock().unwrap().take());
     let (outcome, early) = match result {
         Ok(Ok(outcome)) => (outcome, None),
         Ok(Err(early)) => (
@@ -347,9 +359,10 @@ async fn run_turn(
     chat_id: &str,
     turn_id: &str,
     origin: DeviceRef,
+    slot: Slot,
 ) -> Result<TurnOutcome, Early> {
     // A missing key or model ends the turn like a failed model call.
-    let ai = state.ai_config().await.map_err(|e| Early {
+    let ai = state.agent_ai_config().await.map_err(|e| Early {
         message: e.message,
         retryable: true,
     })?;
@@ -386,6 +399,7 @@ async fn run_turn(
         state: state.clone(),
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
+        slot,
     };
     let retry = *state.turns.retry.lock().unwrap();
     let deps = TurnDeps {
@@ -410,8 +424,10 @@ async fn run_turn(
     Ok(outcome)
 }
 
-/// Ends a run: the Error item if the loop never got to add one, `Idle` or `Failed`,
-/// then the pending message.
+/// Ends a run: for a failed one, what the turn left unfinished (a panic or a storage
+/// failure leaves items `InProgress` and calls unanswered; see `wind_up_locked`) and the
+/// Error item if the loop never got to add one; then `Idle` or `Failed`, then the pending
+/// message.
 async fn finish(
     state: &AppState,
     chat_id: &str,
@@ -428,6 +444,12 @@ async fn finish(
     let Some(mut chat) = state.store.get::<Chat>(db::CHAT, chat_id).await? else {
         return Ok(());
     };
+    if matches!(outcome, TurnOutcome::Failed { .. })
+        && let Err(e) = wind_up_locked(state, chat_id, turn_id, Ending::Failed).await
+    {
+        // Still add the Error item and set `Failed` below.
+        tracing::error!(chat = %chat_id, turn = %turn_id, "couldn't finish the failed turn's items: {e:#}");
+    }
     if let Some(early) = early {
         let item = chats::new_item_locked(
             state,
@@ -660,17 +682,23 @@ pub async fn recover(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Why a busy turn is being wound up.
+/// Why a turn is being wound up.
 enum Ending {
-    Stop { by_device: String },
+    Stop {
+        by_device: String,
+    },
     Restart,
+    /// The task ended `Failed` (the loop finishes its own items when a model call fails,
+    /// so this only finds work after a panic or a storage failure). No `Action`: the
+    /// Error item says what happened.
+    Failed,
 }
 
-/// Finishes what a stopped (or interrupted) turn left behind, in this order: its
+/// Finishes what a stopped, interrupted or failed turn left behind, in this order: its
 /// `InProgress` items become `Cancelled` (keeping the text streamed so far); every
 /// unanswered call gets a failed `ToolResult`; a pending confirmation is denied (Stop)
-/// or expired (restart); then the `Action` saying what happened. Call with `write_lock`
-/// held, after the task is gone.
+/// or expired (restart, failure); then, for Stop and restart, the `Action` saying what
+/// happened. Call with `write_lock` held, after the task is gone.
 async fn wind_up_locked(
     state: &AppState,
     chat_id: &str,
@@ -733,6 +761,17 @@ async fn wind_up_locked(
                     "Interrupted",
                 )
             }
+            Ending::Failed => {
+                let why = if asked.contains(&call_id.as_str()) {
+                    CONFIRMATION_FAILED
+                } else {
+                    CALL_FAILED
+                };
+                (
+                    margin_agent::function_call_output(&call_id, &margin_agent::error_output(why)),
+                    "Not run",
+                )
+            }
         };
         let output = model_item
             .get("output")
@@ -770,7 +809,7 @@ async fn wind_up_locked(
                 device_id: by_device.clone(),
                 by_stop: true,
             },
-            Ending::Restart => Decision::Expired,
+            Ending::Restart | Ending::Failed => Decision::Expired,
         };
         set_decision(&mut row.item, decision);
         row.item.updated_at = now;
@@ -780,6 +819,7 @@ async fn wind_up_locked(
     let text = match ending {
         Ending::Stop { .. } => STOPPED,
         Ending::Restart => STOPPED_BY_RESTART,
+        Ending::Failed => return Ok(()),
     };
     let item = chats::new_item_locked(
         state,
@@ -816,6 +856,8 @@ pub struct ServiceSink {
     pub state: AppState,
     pub chat_id: Id,
     pub turn_id: Id,
+    /// The turn's slot, let go while it waits on a confirmation.
+    pub slot: Slot,
 }
 
 impl ServiceSink {
@@ -884,6 +926,12 @@ impl TurnSink for ServiceSink {
         }
         let offset = {
             let mut live = self.state.turns.live_text.lock().unwrap();
+            // A stopped or deleted turn's task can still be inside a poll; its items
+            // are already finished. Checked under the `live_text` lock: Stop ends the
+            // turn before it takes that lock to clear the item's text.
+            if !self.state.turns.is_current(&self.chat_id, &self.turn_id) {
+                return;
+            }
             let so_far = live.entry(item.id.clone()).or_insert_with(|| {
                 item.kind
                     .streaming_text()
@@ -1007,7 +1055,12 @@ impl TurnSink for ServiceSink {
                     .map_err(Self::storage)?;
                 rx
             };
-            answer.await.map_err(|_| self.stopped())
+            // Parked: other chats' turns may run meanwhile.
+            drop(self.slot.lock().unwrap().take());
+            let decision = answer.await.map_err(|_| self.stopped())?;
+            let permit = state.turns.slots.clone().acquire_owned().await.ok();
+            *self.slot.lock().unwrap() = permit;
+            Ok(decision)
         })
     }
 }

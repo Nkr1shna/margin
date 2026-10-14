@@ -390,6 +390,23 @@ impl App {
     /// The Responses API configuration, or the `no_api_key` / `no_model` error to show.
     pub async fn ai_config(&self) -> AppResult<AiConfig> {
         let row = self.settings_row().await?;
+        let model = row.openai_model.clone();
+        self.ai_config_with(row, model).await
+    }
+
+    /// The configuration chat turns use: its model is `agent_model` when set, else
+    /// `openai_model`; `no_model` only when neither is.
+    pub async fn agent_ai_config(&self) -> AppResult<AiConfig> {
+        let row = self.settings_row().await?;
+        let model = row
+            .agent_model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| row.openai_model.clone());
+        self.ai_config_with(row, model).await
+    }
+
+    async fn ai_config_with(&self, row: SettingsRow, model: String) -> AppResult<AiConfig> {
         let key = self
             .secret_get(OPENAI_API_KEY)
             .await?
@@ -401,7 +418,7 @@ impl App {
                 "Add an OpenAI API key in Settings → AI provider first. It's stored in the service Mac's Keychain and never sent back.",
             ));
         };
-        if row.openai_model.trim().is_empty() {
+        if model.trim().is_empty() {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 "no_model",
@@ -411,7 +428,7 @@ impl App {
         Ok(AiConfig {
             base_url: row.openai_base_url,
             api_key,
-            model: row.openai_model.trim().to_string(),
+            model: model.trim().to_string(),
         })
     }
 }

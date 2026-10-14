@@ -93,7 +93,8 @@ On a busy chat (Running, WaitingForUser) the message becomes `chat.pending` →
 `ChatChanged`; answer `MessageSent { item: None }`; 409 `already_pending` if one exists.
 
 `turns::run` waits for one of `MAX_CONCURRENT_TURNS` (2) slots (the chat already shows
-Running), loads the AI config (a missing key or model ends the turn like a failed model
+Running; a turn waiting on a confirmation lets its slot go and takes one again once
+answered), loads the AI config (a missing key or model ends the turn like a failed model
 call: Error item with the `no_api_key`/`no_model` message, `retryable: true`), builds
 `TurnInput` (agent model = `Settings.agent_model` else `openai_model`; reasoning effort;
 `history = replay_input(items)`; the chat's workspaces) and calls `run_turn` with
@@ -155,9 +156,13 @@ error output, no run. Otherwise:
   `ChatItemChanged`; one `add_item(Done, Card { call_id, card })` per card →
   `ChatItemChanged` each.
 - Output size: `truncate_output(output, TOOL_OUTPUT_MAX_BYTES)` (64 KB). The turn
-  counts output bytes; past 512 KB further calls get `{"error":"This answer has used up
-  its tool output budget; answer with what you have."}` without running.
-- Outputs are appended to the history in the model's call order; then the next step.
+  counts output bytes, reserving 64 KB for each call from when it starts until its result
+  is recorded (so calls running at once can't pass the budget together); past 512 KB
+  further calls get `{"error":"This answer has used up its tool output budget; answer
+  with what you have."}` without running.
+- Results are recorded, and outputs appended to the history, in the model's call order
+  (a Read call's result waits for the Write calls before it), so the stored items replay
+  exactly as sent; then the next step.
 
 Device tools call `DeviceBridge::call(device_id, DeviceCall { timeout })` with
 `FOLDER_TOOL_TIMEOUT` (60 s), `SEARCH_TEXT_TIMEOUT` (120 s) or `APP_CONTROL_TIMEOUT`
@@ -192,7 +197,10 @@ gives `msg`.
 - `Incomplete { reason }` (e.g. output token limit): items done so far are kept; Error
   "The answer was cut off (…)" `retryable: true`.
 - A `SinkError` ends the turn as `Failed { error }` (the Error item is attempted; if
-  storing it fails too, the service still sets `Failed`).
+  storing it fails too, the service still sets `Failed`). After a `SinkError` or a panic
+  the service first finishes what the turn left: `InProgress` items → `Cancelled`, each
+  unanswered call → `ToolResult { ok: false, summary: "Not run" }` with output
+  `turns::CALL_FAILED`, a pending confirmation → `Expired`; no `Action`.
 
 ### 4.6 Stop
 
@@ -249,7 +257,7 @@ unanswered calls. What stores which model items:
 
 | Item | model_items |
 |---|---|
-| `UserMessage` | `user_message_input(text, ctx)`: a developer context message (date, device, attached folders with online state, attached files with ids) then the user message. Built once, so replays are byte-identical and cache-friendly. |
+| `UserMessage` | `user_message_input(text, ctx)`: a developer context message (date, device, attached folders with online state, attached files with ids and statuses; names only as JSON strings marked as data, no warning or error text) then the user message. Built once, so replays are byte-identical and cache-friendly. |
 | `Reasoning`, `AssistantText` | `[output_item.done item]` (reasoning carries `encrypted_content`) |
 | `ToolCall` | `[output_item.done function_call]` |
 | `ToolResult` | `[function_call_output]` |
