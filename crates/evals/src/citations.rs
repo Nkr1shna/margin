@@ -15,10 +15,10 @@ const STOP: &[&str] = &[
     "during", "each", "even", "every", "from", "further", "have", "having", "here", "how", "into",
     "itself", "just", "like", "made", "make", "many", "more", "most", "much", "must", "only",
     "other", "over", "same", "should", "since", "some", "such", "than", "that", "their", "them",
-    "then", "there", "these", "they", "this", "those", "through", "under", "until", "very",
-    "what", "when", "where", "which", "while", "will", "with", "would", "your", "yours", "the",
-    "and", "for", "are", "was", "were", "its", "not", "one", "two", "use", "used", "uses",
-    "using", "way", "ways", "thing", "things", "lesson", "example", "source", "sources",
+    "then", "there", "these", "they", "this", "those", "through", "under", "until", "very", "what",
+    "when", "where", "which", "while", "will", "with", "would", "your", "yours", "the", "and",
+    "for", "are", "was", "were", "its", "not", "one", "two", "use", "used", "uses", "using", "way",
+    "ways", "thing", "things", "lesson", "example", "source", "sources",
 ];
 
 /// The content terms of `text`: lower-case words of four letters or more (or with a
@@ -327,7 +327,11 @@ mod tests {
         let body = "Near a jump the partial sums overshoot by nine percent.[^1] \
                     Efficiency depends on reservoir temperatures.[^2] \
                     Fourier invented the guillotine.[^2] And a marker to nowhere.[^7]";
-        let r = check(body, &sent(), &["fourier-series.md".into(), "bayes.md".into()]);
+        let r = check(
+            body,
+            &sent(),
+            &["fourier-series.md".into(), "bayes.md".into()],
+        );
         assert_eq!(r.markers, 4);
         assert_eq!(r.resolved, 3);
         assert_eq!(r.unresolved, vec![7]);
@@ -378,6 +382,12 @@ mod tests {
         ] {
             assert!(v.contains(want), "{want} not in {v}");
         }
-        assert_eq!(check_structure(bad, true).iter().filter(|l| l.contains("title")).count(), 1);
+        assert_eq!(
+            check_structure(bad, true)
+                .iter()
+                .filter(|l| l.contains("title"))
+                .count(),
+            1
+        );
     }
 }

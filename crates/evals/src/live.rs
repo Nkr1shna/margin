@@ -220,12 +220,17 @@ impl EvalModel for AnthropicModel {
                 .await
                 .with_context(|| format!("calling {}", self.id()))?;
             let status = resp.status();
-            let v: Value = resp.json().await.with_context(|| format!("reading {}'s answer", self.id()))?;
+            let v: Value = resp
+                .json()
+                .await
+                .with_context(|| format!("reading {}'s answer", self.id()))?;
             if !status.is_success() {
                 anyhow::bail!(
                     "{} answered {status}: {}",
                     self.id(),
-                    v.pointer("/error/message").and_then(Value::as_str).unwrap_or("")
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
                 );
             }
             let text = v["content"]
@@ -263,21 +268,40 @@ pub struct Models {
     pub chat: Option<(ResponsesClient, String)>,
 }
 
-pub fn models(cfg: &RunnerConfig, secrets: &dyn margin_service::secrets::SecretStore) -> anyhow::Result<Models> {
+pub fn models(
+    cfg: &RunnerConfig,
+    secrets: &dyn margin_service::secrets::SecretStore,
+) -> anyhow::Result<Models> {
     let openai = secrets.get(OPENAI_KEY)?.filter(|k| !k.is_empty());
     let anthropic = secrets.get(ANTHROPIC_KEY)?.filter(|k| !k.is_empty());
     let m = &cfg.models;
     let mut small: Vec<Arc<dyn EvalModel>> = Vec::new();
     let mut writer: Option<Arc<dyn EvalModel>> = None;
     if let Some(k) = &anthropic {
-        writer = Some(Arc::new(AnthropicModel::new(&cfg.anthropic_base_url, k, &m.anthropic_write)));
-        small.push(Arc::new(AnthropicModel::new(&cfg.anthropic_base_url, k, &m.anthropic_small)));
+        writer = Some(Arc::new(AnthropicModel::new(
+            &cfg.anthropic_base_url,
+            k,
+            &m.anthropic_write,
+        )));
+        small.push(Arc::new(AnthropicModel::new(
+            &cfg.anthropic_base_url,
+            k,
+            &m.anthropic_small,
+        )));
     }
     if let Some(k) = &openai {
         if writer.is_none() {
-            writer = Some(Arc::new(OpenAiModel::new(&cfg.openai_base_url, k, &m.openai_write)));
+            writer = Some(Arc::new(OpenAiModel::new(
+                &cfg.openai_base_url,
+                k,
+                &m.openai_write,
+            )));
         }
-        small.push(Arc::new(OpenAiModel::new(&cfg.openai_base_url, k, &m.openai_small)));
+        small.push(Arc::new(OpenAiModel::new(
+            &cfg.openai_base_url,
+            k,
+            &m.openai_small,
+        )));
     }
     let writer = writer.context(
         "no model API key in the Keychain (openai-api-key or anthropic-api-key); set one in Margin's Settings on the service Mac",
@@ -336,7 +360,11 @@ impl crate::recorded::Vectors for LiveVectors {
     fn version(&self) -> &str {
         crate::recorded::EMBEDDER_VERSION
     }
-    fn texts(&self, texts: &[String], purpose: &margin_embed::Purpose) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn texts(
+        &self,
+        texts: &[String],
+        purpose: &margin_embed::Purpose,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         use margin_embed::Embedder;
         Ok(self.embedder.embed(texts, purpose.clone())?)
     }
@@ -392,7 +420,11 @@ pub fn extract_corpus(
                         text: p.text.clone(),
                     })
                     .collect(),
-                pictures: ex.pictures.iter().map(|p| PictureRef { page: p.page }).collect(),
+                pictures: ex
+                    .pictures
+                    .iter()
+                    .map(|p| PictureRef { page: p.page })
+                    .collect(),
             },
         );
     }
@@ -480,7 +512,10 @@ mod tests {
         }];
         let r = m.complete(&req).await.unwrap();
         assert_eq!(r.text, "{\"grade\": 2}");
-        assert_eq!((r.usage.input, r.usage.cached, r.usage.output), (100, 90, 5));
+        assert_eq!(
+            (r.usage.input, r.usage.cached, r.usage.output),
+            (100, 90, 5)
+        );
         assert_eq!(m.id(), "anthropic:claude-haiku-5-5");
     }
 

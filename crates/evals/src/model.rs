@@ -65,7 +65,10 @@ pub fn parse_json<T: DeserializeOwned>(text: &str) -> anyhow::Result<T> {
     let end = text.rfind('}');
     match (start, end) {
         (Some(s), Some(e)) if e > s => serde_json::from_str(&text[s..=e]).map_err(|err| {
-            anyhow::anyhow!("the model's answer isn't the JSON asked for ({err}): {}", short(text))
+            anyhow::anyhow!(
+                "the model's answer isn't the JSON asked for ({err}): {}",
+                short(text)
+            )
         }),
         _ => anyhow::bail!("the model's answer has no JSON object: {}", short(text)),
     }

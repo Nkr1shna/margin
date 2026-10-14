@@ -44,14 +44,18 @@ fn level_of(i: usize) -> Level {
 }
 
 /// The context of lesson `index` of `course` with `passages`.
-pub fn lesson_context(course: &CourseRequest, index: usize, passages: Vec<Passage>) -> LessonContext {
+pub fn lesson_context(
+    course: &CourseRequest,
+    index: usize,
+    passages: Vec<Passage>,
+) -> LessonContext {
     let outline = outline(course);
     LessonContext {
         subject_title: course.themes.first().cloned().unwrap_or_default(),
         topic_title: course.prompt.chars().take(60).collect(),
         prompt: course.prompt.clone(),
         level: level_of(index),
-        with_quiz: index % 2 == 0,
+        with_quiz: index.is_multiple_of(2),
         outline,
         index,
         passages,
@@ -72,8 +76,9 @@ pub fn query_plan(course: &CourseRequest, index: usize) -> Vec<String> {
 /// A packed passage as the lesson writer gets it (pictures of image files attached).
 pub fn to_passage(corpus: &Path, p: &Packed) -> Passage {
     let first = &p.hits[0].passage;
-    let image = (first.modality == "picture" && margin_shared::SourceKind::for_name(&first.document_id)
-        == Some(margin_shared::SourceKind::Image))
+    let image = (first.modality == "picture"
+        && margin_shared::SourceKind::for_name(&first.document_id)
+            == Some(margin_shared::SourceKind::Image))
     .then(|| std::fs::read(corpus.join(&first.document_id)).ok())
     .flatten()
     .map(|data| margin_ai::Image {
@@ -101,7 +106,10 @@ pub fn check_prefixes(prompts: &[Prompt], unique: &[Vec<String>]) -> Vec<String>
     };
     for (i, p) in prompts.iter().enumerate() {
         if p.version != first.version {
-            out.push(format!("call {i} is version {}, not {}", p.version, first.version));
+            out.push(format!(
+                "call {i} is version {}, not {}",
+                p.version, first.version
+            ));
         }
         if p.constant != first.constant {
             let at = p
@@ -122,7 +130,9 @@ pub fn check_prefixes(prompts: &[Prompt], unique: &[Vec<String>]) -> Vec<String>
         }
         for s in unique.get(i).into_iter().flatten() {
             if !s.is_empty() && p.constant.contains(s.as_str()) {
-                out.push(format!("call {i}'s own text \"{s}\" is in the constant part"));
+                out.push(format!(
+                    "call {i}'s own text \"{s}\" is in the constant part"
+                ));
             }
         }
     }
@@ -216,8 +226,11 @@ pub fn generations_dir(evals_dir: &Path, prompt_version: &str, model: &str) -> P
 
 pub fn save_generation(dir: &Path, g: &Generation) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(g.file_name()), serde_json::to_string_pretty(g)? + "\n")
-        .with_context(|| format!("couldn't write {}", g.file_name()))
+    std::fs::write(
+        dir.join(g.file_name()),
+        serde_json::to_string_pretty(g)? + "\n",
+    )
+    .with_context(|| format!("couldn't write {}", g.file_name()))
 }
 
 /// Every recorded generation under `dir` (recursively), in path order.
@@ -261,12 +274,19 @@ pub async fn generate_lesson(
     };
     let ranked = index.search(&query_plan(course, lesson), &scope).await?;
     let packed = index.pack(ranked.hits, budget);
-    let passages: Vec<Passage> = packed.iter().map(|p| to_passage(&index.corpus, p)).collect();
+    let passages: Vec<Passage> = packed
+        .iter()
+        .map(|p| to_passage(&index.corpus, p))
+        .collect();
     let ctx = lesson_context(course, lesson, passages);
     let prompt = index.pipeline.prompts.lesson(&ctx);
     let mut req = ModelRequest::new(prompt.constant.clone(), prompt.variable.clone());
     req.cache_key = Some(prompt.cache_key.clone());
-    req.images = ctx.passages.iter().filter_map(|p| p.image.clone()).collect();
+    req.images = ctx
+        .passages
+        .iter()
+        .filter_map(|p| p.image.clone())
+        .collect();
     req.max_output_tokens = 8_000;
     let reply = writer.complete(&req).await?;
     let l = &ctx.outline[lesson];
@@ -286,7 +306,10 @@ pub async fn generate_lesson(
                 text: p.text.clone(),
             })
             .collect(),
-        packed_ids: packed.iter().map(|p| p.hits[0].passage.id.clone()).collect(),
+        packed_ids: packed
+            .iter()
+            .map(|p| p.hits[0].passage.id.clone())
+            .collect(),
         packed_tokens: packed.iter().map(|p| p.tokens).sum(),
         must_cite: course.must_cite.get(lesson).cloned().unwrap_or_default(),
         body: reply.text,
@@ -310,11 +333,23 @@ impl LessonScore {
     /// Metric name → value, for `eval_result` rows.
     pub fn metrics(&self) -> BTreeMap<String, f64> {
         let mut m = BTreeMap::new();
-        m.insert("citation_resolution".into(), self.citations.resolution_pct() / 100.0);
-        m.insert("citation_support".into(), self.citations.lexical_support_pct() / 100.0);
-        m.insert("cited_sentences".into(), self.citations.cited_sentence_pct() / 100.0);
+        m.insert(
+            "citation_resolution".into(),
+            self.citations.resolution_pct() / 100.0,
+        );
+        m.insert(
+            "citation_support".into(),
+            self.citations.lexical_support_pct() / 100.0,
+        );
+        m.insert(
+            "cited_sentences".into(),
+            self.citations.cited_sentence_pct() / 100.0,
+        );
         m.insert("must_cite".into(), self.citations.must_cite_pct() / 100.0);
-        m.insert("structure_ok".into(), f64::from(u8::from(self.structure_problems.is_empty())));
+        m.insert(
+            "structure_ok".into(),
+            f64::from(u8::from(self.structure_problems.is_empty())),
+        );
         m.insert("packed_tokens".into(), self.packed_tokens as f64);
         m.insert("input_tokens".into(), self.usage.input as f64);
         m.insert("output_tokens".into(), self.usage.output as f64);
@@ -375,7 +410,10 @@ mod tests {
     #[test]
     fn the_prefix_gate() {
         let long = "Write a lesson. ".repeat(300);
-        let ok = vec![prompt(&long, "Level: intro"), prompt(&long, "Level: advanced")];
+        let ok = vec![
+            prompt(&long, "Level: intro"),
+            prompt(&long, "Level: advanced"),
+        ];
         assert!(check_prefixes(&ok, &[vec!["Slow start".into()], vec![]]).is_empty());
         let mut bad = ok.clone();
         bad[1].constant = format!("{long}Level: advanced");

@@ -10,7 +10,9 @@ use serde::Deserialize;
 pub mod agent;
 #[cfg(feature = "r1-ai")]
 pub mod ai_judge;
+pub mod ci;
 pub mod citations;
+pub mod cli;
 pub mod compare;
 pub mod corpus;
 pub mod courses;
@@ -27,8 +29,8 @@ pub mod report;
 pub mod retrieval;
 pub mod runner;
 pub mod store;
-pub mod traces;
 pub mod synth;
+pub mod traces;
 
 /// `evals/gates.toml`: how far a change may move the metrics before CI fails.
 #[derive(Debug, Clone, Deserialize)]

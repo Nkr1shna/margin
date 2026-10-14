@@ -185,8 +185,10 @@ pub trait Judge: Send + Sync {
         criterion: Criterion,
         case: &'a LessonCase,
     ) -> BoxFuture<'a, anyhow::Result<Grade>>;
-    fn seriousness<'a>(&'a self, q: &'a QuestionCase)
-    -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>>;
+    fn seriousness<'a>(
+        &'a self,
+        q: &'a QuestionCase,
+    ) -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>>;
     /// Compares two bodies written for `case` (its body is ignored), both orders.
     fn pair<'a>(
         &'a self,
@@ -402,7 +404,11 @@ pub async fn question_canaries(grader: &dyn Judge) -> anyhow::Result<CanaryRepor
                 "graded {} ({}, {}); a {} question must be {}",
                 g.grade,
                 g.kind,
-                if g.supported { "supported" } else { "unsupported" },
+                if g.supported {
+                    "supported"
+                } else {
+                    "unsupported"
+                },
                 if c.trivial { "trivial" } else { "serious" },
                 if c.trivial { "rejected" } else { "kept" }
             ),
@@ -464,14 +470,21 @@ pub(crate) mod testing {
         fn id(&self) -> String {
             format!("fake:{}", self.name)
         }
-        fn grade<'a>(&'a self, c: Criterion, case: &'a LessonCase) -> BoxFuture<'a, anyhow::Result<Grade>> {
+        fn grade<'a>(
+            &'a self,
+            c: Criterion,
+            case: &'a LessonCase,
+        ) -> BoxFuture<'a, anyhow::Result<Grade>> {
             Box::pin(async move {
                 *self.calls.lock().unwrap() += 1;
                 let bad = !self.lenient && case.body.contains(&format!("[bad:{}]", c.as_str()));
                 let mut grade = if bad { 0 } else { 3 };
                 if self.order_bias
                     && c == Criterion::Relevance
-                    && case.passages.first().is_some_and(|p| p.document.starts_with('z'))
+                    && case
+                        .passages
+                        .first()
+                        .is_some_and(|p| p.document.starts_with('z'))
                 {
                     grade -= 1;
                 }
@@ -483,7 +496,10 @@ pub(crate) mod testing {
                 })
             })
         }
-        fn seriousness<'a>(&'a self, q: &'a QuestionCase) -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>> {
+        fn seriousness<'a>(
+            &'a self,
+            q: &'a QuestionCase,
+        ) -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>> {
             Box::pin(async move {
                 *self.calls.lock().unwrap() += 1;
                 let trivial = !self.lenient && q.question.contains("trivial");
@@ -496,26 +512,50 @@ pub(crate) mod testing {
                 })
             })
         }
-        fn pair<'a>(&'a self, _c: Criterion, _case: &'a LessonCase, a: &'a str, b: &'a str) -> BoxFuture<'a, anyhow::Result<PairResult>> {
+        fn pair<'a>(
+            &'a self,
+            _c: Criterion,
+            _case: &'a LessonCase,
+            a: &'a str,
+            b: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<PairResult>> {
             Box::pin(async move {
                 let (ga, gb) = (a.len() as f64, b.len() as f64);
                 Ok(PairResult {
-                    winner: if ga > gb { Winner::A } else if gb > ga { Winner::B } else { Winner::Tie },
+                    winner: if ga > gb {
+                        Winner::A
+                    } else if gb > ga {
+                        Winner::B
+                    } else {
+                        Winner::Tie
+                    },
                     consistent: true,
                     grade_a: ga.min(3.0),
                     grade_b: gb.min(3.0),
                 })
             })
         }
-        fn synth<'a>(&'a self, sections: &'a [Section], count: u32) -> BoxFuture<'a, anyhow::Result<Vec<GeneratedQuestion>>> {
+        fn synth<'a>(
+            &'a self,
+            sections: &'a [Section],
+            count: u32,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<GeneratedQuestion>>> {
             Box::pin(async move {
                 Ok(sections
                     .iter()
                     .take(count as usize)
                     .map(|s| {
-                        let quote: String = s.text.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
+                        let quote: String = s
+                            .text
+                            .split_whitespace()
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         GeneratedQuestion {
-                            question: format!("How would you apply what {} says to a new case?", s.section_path),
+                            question: format!(
+                                "How would you apply what {} says to a new case?",
+                                s.section_path
+                            ),
                             kind: "application".into(),
                             answer: quote.clone(),
                             spans: vec![Span {
@@ -539,7 +579,11 @@ pub(crate) mod testing {
                     defect: "planted".into(),
                     criterion: *c,
                     max_grade: 1,
-                    case: case("x", &format!("Body [bad:{}].[^1]", c.as_str()), &[("a", "p1"), ("zz", "p2")]),
+                    case: case(
+                        "x",
+                        &format!("Body [bad:{}].[^1]", c.as_str()),
+                        &[("a", "p1"), ("zz", "p2")],
+                    ),
                 })
                 .collect()
         }
@@ -588,7 +632,11 @@ mod tests {
         };
         let cases = [
             case("1", "Fine.[^1]", &[("a", "x"), ("zz", "y")]),
-            case("2", "Wrong [bad:faithfulness].[^1]", &[("a", "x"), ("zz", "y")]),
+            case(
+                "2",
+                "Wrong [bad:faithfulness].[^1]",
+                &[("a", "x"), ("zz", "y")],
+            ),
             case("3", "Fine.", &[("a", "x")]),
         ];
         let mut js = Vec::new();

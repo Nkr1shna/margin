@@ -152,7 +152,9 @@ impl Comparison {
             s.push_str(&format!("\n**Warning:** {w}\n"));
         }
         for (m, n) in &self.unpaired {
-            s.push_str(&format!("\n{n} {m} item(s) scored by only one run, left out.\n"));
+            s.push_str(&format!(
+                "\n{n} {m} item(s) scored by only one run, left out.\n"
+            ));
         }
         s
     }

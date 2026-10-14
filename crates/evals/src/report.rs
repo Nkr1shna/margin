@@ -70,11 +70,26 @@ pub fn retrieval_sections(r: &RetrievalReport) -> Vec<ReportSection> {
         title: "Negatives, pictures, overlap, latency".into(),
         columns: vec!["Measure".into(), "Value".into()],
         rows: vec![
-            vec!["Negatives' false-positive rate".into(), format!("{} %", f1(r.negative_fp_rate))],
-            vec!["Calibrated threshold τ (cosine)".into(), format!("{:.3}", r.fp_threshold)],
-            vec!["Cross-modal picture-hit rate".into(), format!("{} %", f1(r.picture_hit_rate))],
-            vec!["Overlapping neighbours in top 10".into(), format!("{} %", f1(r.dedup_rate))],
-            vec!["Latency p50 / p95".into(), format!("{:.1} / {:.1} ms", r.latency_p50_ms, r.latency_p95_ms)],
+            vec![
+                "Negatives' false-positive rate".into(),
+                format!("{} %", f1(r.negative_fp_rate)),
+            ],
+            vec![
+                "Calibrated threshold τ (cosine)".into(),
+                format!("{:.3}", r.fp_threshold),
+            ],
+            vec![
+                "Cross-modal picture-hit rate".into(),
+                format!("{} %", f1(r.picture_hit_rate)),
+            ],
+            vec![
+                "Overlapping neighbours in top 10".into(),
+                format!("{} %", f1(r.dedup_rate)),
+            ],
+            vec![
+                "Latency p50 / p95".into(),
+                format!("{:.1} / {:.1} ms", r.latency_p50_ms, r.latency_p95_ms),
+            ],
             vec![
                 "Index".into(),
                 format!(
@@ -117,7 +132,10 @@ pub fn retrieval_sections(r: &RetrievalReport) -> Vec<ReportSection> {
 }
 
 /// Judge sanity: canaries and agreement.
-pub fn judging_section(canaries: &[CanaryReport], agreements: &[(String, Agreement)]) -> ReportSection {
+pub fn judging_section(
+    canaries: &[CanaryReport],
+    agreements: &[(String, Agreement)],
+) -> ReportSection {
     let mut text = Vec::new();
     let invalid: Vec<&CanaryReport> = canaries.iter().filter(|c| !c.valid()).collect();
     if canaries.is_empty() {
@@ -137,15 +155,28 @@ pub fn judging_section(canaries: &[CanaryReport], agreements: &[(String, Agreeme
     }
     let mut tables = vec![Table {
         title: "Canaries".into(),
-        columns: vec!["Judge".into(), "Set".into(), "Passed".into(), "Failed".into()],
+        columns: vec![
+            "Judge".into(),
+            "Set".into(),
+            "Passed".into(),
+            "Failed".into(),
+        ],
         rows: canaries
             .iter()
             .map(|c| {
                 vec![
                     c.judge.clone(),
                     c.set.clone(),
-                    format!("{}/{}", c.outcomes.len() - c.failures().len(), c.outcomes.len()),
-                    c.failures().iter().map(|f| f.id.clone()).collect::<Vec<_>>().join(", "),
+                    format!(
+                        "{}/{}",
+                        c.outcomes.len() - c.failures().len(),
+                        c.outcomes.len()
+                    ),
+                    c.failures()
+                        .iter()
+                        .map(|f| f.id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ]
             })
             .collect(),
@@ -184,7 +215,9 @@ pub fn questions_section(grades: [usize; 4], hand: usize, kappa: Option<f64>) ->
         grades[2] + grades[3]
     )];
     if let Some(k) = kappa {
-        text.push(format!("Agreement between the two seriousness graders: κ = {k:.2}."));
+        text.push(format!(
+            "Agreement between the two seriousness graders: κ = {k:.2}."
+        ));
     }
     ReportSection {
         heading: "Golden question quality".into(),
@@ -194,7 +227,9 @@ pub fn questions_section(grades: [usize; 4], hand: usize, kappa: Option<f64>) ->
             title: "Seriousness grades of generated questions".into(),
             unit: "questions".into(),
             max: grades.iter().copied().max().unwrap_or(1).max(1) as f64,
-            bars: (0..4).map(|g| (format!("grade {g}"), grades[g] as f64)).collect(),
+            bars: (0..4)
+                .map(|g| (format!("grade {g}"), grades[g] as f64))
+                .collect(),
         }],
     }
 }
@@ -202,12 +237,24 @@ pub fn questions_section(grades: [usize; 4], hand: usize, kappa: Option<f64>) ->
 pub fn efficiency_section(e: &Efficiency) -> ReportSection {
     let mut t = Table {
         title: "Model calls by route and model (from the service's traces)".into(),
-        columns: ["Route / model", "Calls", "Input", "Cached %", "Output", "Cost (USD)", "Mean ms"]
-            .map(String::from)
-            .to_vec(),
+        columns: [
+            "Route / model",
+            "Calls",
+            "Input",
+            "Cached %",
+            "Output",
+            "Cost (USD)",
+            "Mean ms",
+        ]
+        .map(String::from)
+        .to_vec(),
         rows: Vec::new(),
     };
-    for (k, s) in e.calls.iter().chain(std::iter::once((&"**total**".to_string(), &e.total))) {
+    for (k, s) in e
+        .calls
+        .iter()
+        .chain(std::iter::once((&"**total**".to_string(), &e.total)))
+    {
         t.rows.push(vec![
             k.clone(),
             s.calls.to_string(),
@@ -250,8 +297,22 @@ fn header(run: &EvalRun) -> Vec<(String, String)> {
         ("Embedder".into(), run.embedder_version.clone()),
         ("Corpus".into(), run.corpus_hash.chars().take(12).collect()),
         ("Started".into(), run.started_at.to_rfc3339()),
-        ("Judges".into(), if run.judges.is_empty() { "none".into() } else { run.judges.join(", ") }),
-        ("Valid".into(), if run.valid { "yes".into() } else { "NO: a judge's canaries failed".into() }),
+        (
+            "Judges".into(),
+            if run.judges.is_empty() {
+                "none".into()
+            } else {
+                run.judges.join(", ")
+            },
+        ),
+        (
+            "Valid".into(),
+            if run.valid {
+                "yes".into()
+            } else {
+                "NO: a judge's canaries failed".into()
+            },
+        ),
     ]
 }
 
@@ -269,7 +330,13 @@ pub fn markdown(run: &EvalRun, sections: &[ReportSection]) -> String {
             let _ = write!(s, "{p}\n\n");
         }
         for t in &sec.tables {
-            let _ = write!(s, "### {}\n\n| {} |\n|{}\n", t.title, t.columns.join(" | "), "---|".repeat(t.columns.len()));
+            let _ = write!(
+                s,
+                "### {}\n\n| {} |\n|{}\n",
+                t.title,
+                t.columns.join(" | "),
+                "---|".repeat(t.columns.len())
+            );
             for r in &t.rows {
                 let _ = writeln!(s, "| {} |", r.join(" | "));
             }
@@ -278,7 +345,11 @@ pub fn markdown(run: &EvalRun, sections: &[ReportSection]) -> String {
         for b in &sec.bars {
             let _ = write!(s, "### {}\n\n", b.title);
             for (label, v) in &b.bars {
-                let n = if b.max > 0.0 { ((v / b.max) * 30.0).round() as usize } else { 0 };
+                let n = if b.max > 0.0 {
+                    ((v / b.max) * 30.0).round() as usize
+                } else {
+                    0
+                };
                 let _ = writeln!(s, "    {label:<14} {:<30} {v:.1}", "█".repeat(n));
             }
             s.push('\n');
@@ -306,7 +377,11 @@ fn svg_bars(b: &Bars) -> String {
     );
     for (i, (label, v)) in b.bars.iter().enumerate() {
         let y = i as f64 * row + 4.0;
-        let bw = if b.max > 0.0 { (v / b.max).clamp(0.0, 1.0) * (w - label_w - 60.0) } else { 0.0 };
+        let bw = if b.max > 0.0 {
+            (v / b.max).clamp(0.0, 1.0) * (w - label_w - 60.0)
+        } else {
+            0.0
+        };
         let _ = write!(
             s,
             r#"<text x="0" y="{ty}" class="lbl">{l}</text><rect x="{label_w}" y="{y}" width="{bw:.1}" height="18" rx="3" class="bar"/><text x="{tx:.1}" y="{ty}" class="val">{v:.1}</text>"#,
@@ -334,7 +409,11 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px}dt{color:var(
     );
     let _ = write!(s, "<h1>Eval run {}</h1><dl>", esc(&run.id));
     for (k, v) in header(run) {
-        let class = if k == "Valid" && !run.valid { " class=\"invalid\"" } else { "" };
+        let class = if k == "Valid" && !run.valid {
+            " class=\"invalid\""
+        } else {
+            ""
+        };
         let _ = write!(s, "<dt>{}</dt><dd{class}>{}</dd>", esc(&k), esc(&v));
     }
     s.push_str("</dl>");
@@ -344,7 +423,11 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px}dt{color:var(
     for sec in sections {
         let _ = write!(s, "<h2>{}</h2>", esc(&sec.heading));
         for p in &sec.text {
-            let class = if p.starts_with("INVALID") { " class=\"invalid\"" } else { "" };
+            let class = if p.starts_with("INVALID") {
+                " class=\"invalid\""
+            } else {
+                ""
+            };
             let _ = write!(s, "<p{class}>{}</p>", esc(p));
         }
         for b in &sec.bars {
@@ -373,9 +456,9 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px}dt{color:var(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::golden::QueryKind;
     use crate::judge::{CanaryOutcome, Criterion};
     use crate::retrieval::{IndexSummary, KindMetrics, QueryResult};
-    use crate::golden::QueryKind;
 
     fn run(valid: bool) -> EvalRun {
         EvalRun {
@@ -446,8 +529,10 @@ mod tests {
                 detail: String::new(),
             }],
         };
-        let mut a = Agreement::default();
-        a.n = 4;
+        let mut a = Agreement {
+            n: 4,
+            ..Default::default()
+        };
         a.kappa.insert(Criterion::Relevance, 0.8);
         secs.push(judging_section(&[canary], &[("passes".into(), a)]));
         secs.push(questions_section([1, 2, 5, 3], 60, Some(0.7)));
@@ -472,6 +557,9 @@ mod tests {
         assert!(page.contains("a note &lt;b&gt;"));
         assert!(page.contains("class=\"invalid\""));
         assert!(!page.contains("<script"), "self-contained, no scripts");
-        assert!(!page.contains("http://") && !page.contains("https://"), "no external files");
+        assert!(
+            !page.contains("http://") && !page.contains("https://"),
+            "no external files"
+        );
     }
 }

@@ -14,8 +14,7 @@ use anyhow::Context;
 use margin_embed::{CHUNK_TOKENS, Purpose, SourceKind};
 use margin_service::db::{INSERT_MANY_MAX, PASSAGE, PassageRow, Store};
 use margin_service::pipeline::{
-    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry,
-    StageDeps,
+    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry, StageDeps,
 };
 use margin_shared::context::{ACCESS_COMPANY, Scope};
 use margin_shared::pipeline::PipelineConfig;
@@ -265,10 +264,7 @@ impl<'v> EvalIndex<'v> {
                 _ => doc.name().to_string(),
             });
             r.vector = self.vectors.picture(doc, pic, &text)?;
-            r.chunk_hash = unique(sha256_hex(&format!(
-                "picture:{}#{:?}",
-                doc.path, pic.page
-            )));
+            r.chunk_hash = unique(sha256_hex(&format!("picture:{}#{:?}", doc.path, pic.page)));
             r.text = text;
             rows.push(r);
         }
@@ -349,22 +345,20 @@ pub(crate) mod testing {
         fn search<'a>(&'a self, q: &'a Query) -> BoxFuture<'a, anyhow::Result<Vec<Hit>>> {
             Box::pin(async move {
                 let rows: Vec<PassageRow> = match &q.scope {
-                    Scope::Topic { id } | Scope::Workspace { id } => {
-                        self.store
-                            .query_rows(
-                                "SELECT *, record::id(id) AS id FROM passage WHERE $scope IN scope_ids",
-                                vec![("scope", serde_json::json!(id))],
-                            )
-                            .await?
-                    }
-                    Scope::Sources { ids } => {
-                        self.store
-                            .query_rows(
-                                "SELECT *, record::id(id) AS id FROM passage WHERE document_id IN $ids",
-                                vec![("ids", serde_json::json!(ids))],
-                            )
-                            .await?
-                    }
+                    Scope::Topic { id } | Scope::Workspace { id } => self
+                        .store
+                        .query_rows(
+                            "SELECT *, record::id(id) AS id FROM passage WHERE $scope IN scope_ids",
+                            vec![("scope", serde_json::json!(id))],
+                        )
+                        .await?,
+                    Scope::Sources { ids } => self
+                        .store
+                        .query_rows(
+                            "SELECT *, record::id(id) AS id FROM passage WHERE document_id IN $ids",
+                            vec![("ids", serde_json::json!(ids))],
+                        )
+                        .await?,
                     other => anyhow::bail!("the test retriever doesn't search {other:?}"),
                 };
                 let mut hits: Vec<Hit> = rows
@@ -404,13 +398,20 @@ pub(crate) mod testing {
         }
     }
 
-    /// Take-k that also fills `tokens`, so the packing checks have something to count.
+    /// Take-k with unit dedup that also fills `tokens`, so the packing checks have
+    /// something to count.
     struct CountingTakeK;
     impl Packer for CountingTakeK {
         fn name(&self) -> &'static str {
             "mmr-v1"
         }
         fn pack(&self, hits: Vec<Hit>, budget: &PackBudget) -> Vec<Packed> {
+            // One passage per unit, as every real packer must.
+            let mut units = HashSet::new();
+            let hits: Vec<Hit> = hits
+                .into_iter()
+                .filter(|h| units.insert(h.passage.unit_id.clone()))
+                .collect();
             let mut out: Vec<Packed> = TakeK.pack(hits, budget);
             for p in &mut out {
                 p.tokens = approx_tokens(&p.text);
@@ -445,7 +446,10 @@ pub(crate) mod testing {
                 }))
             })),
         );
-        reg.register("rrf", StageCtor::Fusion(Arc::new(|_, _| Ok(Arc::new(FirstLeg)))));
+        reg.register(
+            "rrf",
+            StageCtor::Fusion(Arc::new(|_, _| Ok(Arc::new(FirstLeg)))),
+        );
         reg.register(
             "mmr-v1",
             StageCtor::Packer(Arc::new(|_, _| Ok(Arc::new(CountingTakeK)))),
@@ -483,7 +487,11 @@ mod tests {
         .unwrap();
         assert_eq!(index.stats.documents, docs.len());
         // Two PDFs of 3 + 1 pages… every PDF page and image has its picture row.
-        let pictures: usize = extraction.documents.values().map(|d| d.pictures.len()).sum();
+        let pictures: usize = extraction
+            .documents
+            .values()
+            .map(|d| d.pictures.len())
+            .sum();
         assert_eq!(index.stats.picture_passages, pictures);
         assert!(index.stats.text_passages > 20);
 

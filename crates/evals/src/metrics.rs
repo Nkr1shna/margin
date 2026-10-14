@@ -285,7 +285,9 @@ mod tests {
         assert!(i.significant());
         // Half better, half worse by the same amount: the interval straddles zero.
         let a = [0.0; 40];
-        let b: Vec<f64> = (0..40).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let b: Vec<f64> = (0..40)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let i = paired_bootstrap(&a, &b, 2000, 7);
         close(i.mean, 0.0);
         assert!(i.lo < 0.0 && i.hi > 0.0, "{i:?}");

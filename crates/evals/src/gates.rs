@@ -79,7 +79,11 @@ impl Baseline {
 }
 
 /// Every way `report` breaks the retrieval gates against `baseline`; empty = pass.
-pub fn check_retrieval(gates: &Gates, baseline: &Baseline, report: &RetrievalReport) -> Vec<String> {
+pub fn check_retrieval(
+    gates: &Gates,
+    baseline: &Baseline,
+    report: &RetrievalReport,
+) -> Vec<String> {
     let g = &gates.retrieval;
     let b = &baseline.retrieval;
     let mut out = Vec::new();
@@ -134,7 +138,8 @@ pub fn check_retrieval(gates: &Gates, baseline: &Baseline, report: &RetrievalRep
             g.negative_fp_max_rise
         ));
     }
-    if b.latency_p95_ms > 0.0 && report.latency_p95_ms > b.latency_p95_ms * g.p95_latency_max_ratio {
+    if b.latency_p95_ms > 0.0 && report.latency_p95_ms > b.latency_p95_ms * g.p95_latency_max_ratio
+    {
         out.push(format!(
             "p95 retrieval latency {:.1} ms is over {}× the baseline's {:.1} ms",
             report.latency_p95_ms, g.p95_latency_max_ratio, b.latency_p95_ms

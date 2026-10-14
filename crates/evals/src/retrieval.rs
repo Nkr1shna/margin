@@ -218,7 +218,13 @@ pub fn summarize(
         .iter()
         .filter(|r| metrics::false_positive(&[r.top_cosine], fp_threshold))
         .count();
-    let rate = |num: usize, den: usize| if den == 0 { 0.0 } else { num as f64 * 100.0 / den as f64 };
+    let rate = |num: usize, den: usize| {
+        if den == 0 {
+            0.0
+        } else {
+            num as f64 * 100.0 / den as f64
+        }
+    };
     let cross: Vec<bool> = refs.iter().filter_map(|r| r.picture_hit).collect();
     let ms: Vec<f64> = refs.iter().map(|r| r.ms).collect();
     RetrievalReport {
@@ -238,14 +244,22 @@ pub fn summarize(
 }
 
 /// Runs every query through `index`.
-pub async fn run(index: &EvalIndex<'_>, queries: &[RetrievalQuery]) -> anyhow::Result<RetrievalReport> {
+pub async fn run(
+    index: &EvalIndex<'_>,
+    queries: &[RetrievalQuery],
+) -> anyhow::Result<RetrievalReport> {
     let mut results = Vec::with_capacity(queries.len());
     for q in queries {
         let ranked = index
             .search(std::slice::from_ref(&q.query), &scope_of(q.scope))
             .await
             .map_err(|e| e.context(format!("query {}", q.id)))?;
-        results.push(score_query(q, &ranked.hits, &ranked.query_vector, ranked.ms));
+        results.push(score_query(
+            q,
+            &ranked.hits,
+            &ranked.query_vector,
+            ranked.ms,
+        ));
     }
     Ok(summarize(
         results,
@@ -313,18 +327,39 @@ mod tests {
             rel("b.pdf", Some(1), Some("real, inverted")),
         ];
         assert_eq!(
-            judge(&hit("a.md", "u", "text", 0, None, "x adding  more\nterms y"), &relevant),
+            judge(
+                &hit("a.md", "u", "text", 0, None, "x adding  more\nterms y"),
+                &relevant
+            ),
             vec![0]
         );
         // The anchor in another document doesn't count.
-        assert!(judge(&hit("c.md", "u", "text", 0, None, "Adding more terms"), &relevant).is_empty());
+        assert!(
+            judge(
+                &hit("c.md", "u", "text", 0, None, "Adding more terms"),
+                &relevant
+            )
+            .is_empty()
+        );
         // A picture of page 2 satisfies the anchorless item; text of page 2 doesn't.
-        assert_eq!(judge(&hit("b.pdf", "u", "picture", 2, Some(2), ""), &relevant), vec![1]);
+        assert_eq!(
+            judge(&hit("b.pdf", "u", "picture", 2, Some(2), ""), &relevant),
+            vec![1]
+        );
         assert!(judge(&hit("b.pdf", "u", "text", 2, Some(2), "words"), &relevant).is_empty());
         // The anchored item needs its page.
-        assert!(judge(&hit("b.pdf", "u", "text", 0, Some(2), "a real, inverted image"), &relevant).is_empty());
+        assert!(
+            judge(
+                &hit("b.pdf", "u", "text", 0, Some(2), "a real, inverted image"),
+                &relevant
+            )
+            .is_empty()
+        );
         assert_eq!(
-            judge(&hit("b.pdf", "u", "text", 0, Some(1), "a real, inverted image"), &relevant),
+            judge(
+                &hit("b.pdf", "u", "text", 0, Some(1), "a real, inverted image"),
+                &relevant
+            ),
             vec![2]
         );
     }
@@ -339,7 +374,10 @@ mod tests {
             hit("b", "b|page1", "picture", 1, Some(1), ""),
             hit("c", "c|t4", "text", 4, None, ""),
         ];
-        assert_eq!(overlaps(&hits), vec![false, true, false, false, true, false]);
+        assert_eq!(
+            overlaps(&hits),
+            vec![false, true, false, false, true, false]
+        );
     }
 
     #[test]
@@ -361,7 +399,15 @@ mod tests {
             ms: 1.0,
         };
         let mut results: Vec<QueryResult> = (0..10)
-            .map(|i| q(&format!("p{i}"), QueryKind::Semantic, Some(0.5 + i as f32 * 0.05), 0.9, 1))
+            .map(|i| {
+                q(
+                    &format!("p{i}"),
+                    QueryKind::Semantic,
+                    Some(0.5 + i as f32 * 0.05),
+                    0.9,
+                    1,
+                )
+            })
             .collect();
         results.push(q("n1", QueryKind::Negative, None, 0.40, 0));
         results.push(q("n2", QueryKind::Negative, None, 0.60, 0));
@@ -395,7 +441,11 @@ mod tests {
         let report = run(&index, &queries).await.unwrap();
         assert_eq!(report.queries.len(), queries.len());
         // Bag of words on lexical queries finds something.
-        assert!(report.per_kind["lexical"].recall_at_10 > 30.0, "{:?}", report.per_kind);
+        assert!(
+            report.per_kind["lexical"].recall_at_10 > 30.0,
+            "{:?}",
+            report.per_kind
+        );
         assert!(report.latency_p95_ms >= report.latency_p50_ms);
     }
 }

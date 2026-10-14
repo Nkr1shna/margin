@@ -106,7 +106,8 @@ impl Recording {
     }
 
     pub fn insert(&mut self, input: &str, vector: Vec<f32>) {
-        self.entries.insert(key(&self.embedder_version, input), vector);
+        self.entries
+            .insert(key(&self.embedder_version, input), vector);
     }
 
     pub fn get(&self, input: &str) -> Option<&Vec<f32>> {
@@ -124,7 +125,11 @@ impl Recording {
         out.extend_from_slice(&(header.len() as u32).to_le_bytes());
         out.extend_from_slice(&header);
         for (k, v) in &self.entries {
-            anyhow::ensure!(v.len() == DIM, "a vector has {} dimensions, not {DIM}", v.len());
+            anyhow::ensure!(
+                v.len() == DIM,
+                "a vector has {} dimensions, not {DIM}",
+                v.len()
+            );
             out.extend_from_slice(k);
             for x in v {
                 out.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
@@ -155,8 +160,10 @@ impl Recording {
         for _ in 0..header.count {
             let k: Key = bytes[pos..pos + 32].try_into()?;
             let v = bytes[pos + 32..pos + entry]
-                .chunks_exact(2)
-                .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b).to_f32())
                 .collect();
             entries.insert(k, v);
             pos += entry;
@@ -408,7 +415,12 @@ mod tests {
             "title: Fourier > Gibbs | text: x"
         );
         assert_eq!(
-            model_input(&Purpose::Document { title: Some(String::new()) }, "x"),
+            model_input(
+                &Purpose::Document {
+                    title: Some(String::new())
+                },
+                "x"
+            ),
             "title: none | text: x"
         );
         assert_eq!(
@@ -460,13 +472,19 @@ mod tests {
         };
         rec.insert(&picture_input(&doc.path, None, ImageTokens::High), unit(2));
         let r = RecordedVectors::new(rec);
-        assert_eq!(r.texts(&["known".into()], &Purpose::Query).unwrap()[0], unit(1));
+        assert_eq!(
+            r.texts(&["known".into()], &Purpose::Query).unwrap()[0],
+            unit(1)
+        );
         assert_eq!(r.picture(&doc, &pic, "").unwrap(), unit(2));
         let err = r
             .texts(&["unknown".into()], &Purpose::Query)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("re-run `margin-eval record-embeddings`"), "{err}");
+        assert!(
+            err.contains("re-run `margin-eval record-embeddings`"),
+            "{err}"
+        );
         // The same text as a document is a different input.
         assert!(r.texts(&["known".into()], &Purpose::DOCUMENT).is_err());
     }

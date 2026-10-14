@@ -239,7 +239,10 @@ mod tests {
 
     fn assert_in_corpus(id: &str, document: &str, text: &str) {
         let corpus = evals_dir().join("corpus");
-        assert!(corpus.join(document).is_file(), "{id}: {document} isn't in the corpus");
+        assert!(
+            corpus.join(document).is_file(),
+            "{id}: {document} isn't in the corpus"
+        );
         let source = source_text(&corpus, document, None).unwrap();
         assert!(
             matches_anchor(&source, text),
@@ -254,20 +257,40 @@ mod tests {
         assert_eq!(courses.len(), 8);
         for c in &courses {
             assert!(c.themes.len() >= 3, "{}", c.id);
-            assert_eq!(c.must_cite.len(), c.themes.len(), "{}: one list per lesson", c.id);
+            assert_eq!(
+                c.must_cite.len(),
+                c.themes.len(),
+                "{}: one list per lesson",
+                c.id
+            );
             for d in c.documents.iter().chain(c.must_cite.iter().flatten()) {
-                assert!(evals_dir().join("corpus").join(d).is_file(), "{}: {d}", c.id);
+                assert!(
+                    evals_dir().join("corpus").join(d).is_file(),
+                    "{}: {d}",
+                    c.id
+                );
             }
             for d in c.must_cite.iter().flatten() {
-                assert!(c.documents.contains(d), "{}: must-cite {d} isn't attached", c.id);
+                assert!(
+                    c.documents.contains(d),
+                    "{}: must-cite {d} isn't attached",
+                    c.id
+                );
             }
         }
         let tasks: Vec<AgentTask> = read_jsonl(&evals_dir().join("golden/agent.jsonl")).unwrap();
         assert_eq!(tasks.len(), 10);
-        assert!(tasks.iter().any(|t| t.must_cite.is_empty()), "an unanswerable task");
+        assert!(
+            tasks.iter().any(|t| t.must_cite.is_empty()),
+            "an unanswerable task"
+        );
         assert!(tasks.iter().any(|t| t.scope == GoldenScope::Folder));
         for t in &tasks {
-            assert!(t.question.split_whitespace().count() >= 8, "{}: not serious", t.id);
+            assert!(
+                t.question.split_whitespace().count() >= 8,
+                "{}: not serious",
+                t.id
+            );
             for a in &t.anchors {
                 assert_in_corpus(&t.id, &t.must_cite[0], a);
             }

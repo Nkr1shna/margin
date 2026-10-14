@@ -309,7 +309,10 @@ mod tests {
             assert!(!paths.contains(&never), "{never} must stay invisible");
         }
         assert!(docs.iter().filter(|d| d.in_folder).count() == 4);
-        let pdf = docs.iter().find(|d| d.path == "pdf/rc-circuits.pdf").unwrap();
+        let pdf = docs
+            .iter()
+            .find(|d| d.path == "pdf/rc-circuits.pdf")
+            .unwrap();
         assert_eq!(pdf.kind, SourceKind::Pdf);
         assert_eq!(pdf.name(), "rc-circuits.pdf");
     }
@@ -334,13 +337,20 @@ mod tests {
         let corpus = evals_dir().join("corpus");
         let docs = documents(&corpus).unwrap();
         let ex = Extraction::fixture(&corpus, &docs).unwrap();
-        let glacier = docs.iter().find(|d| d.path == "pdf/glacier-scan.pdf").unwrap();
+        let glacier = docs
+            .iter()
+            .find(|d| d.path == "pdf/glacier-scan.pdf")
+            .unwrap();
         let e = ex.extracted(&corpus, glacier).unwrap();
         assert_eq!(e.pages[0].number, Some(1));
         assert!(e.pages[0].text.contains("ablation zone"));
         assert_eq!(e.pictures.len(), e.pages.len());
         let md = docs.iter().find(|d| d.path == "bayes.md").unwrap();
-        assert!(ex.extracted(&corpus, md).unwrap().pages[0].text.contains('#'));
+        assert!(
+            ex.extracted(&corpus, md).unwrap().pages[0]
+                .text
+                .contains('#')
+        );
         // A missing recording is an error, never an empty document.
         let empty = Extraction::default();
         assert!(empty.extracted(&corpus, glacier).is_err());

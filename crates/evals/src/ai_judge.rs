@@ -15,7 +15,7 @@ use margin_service::engines::BoxFuture;
 
 use crate::citations::SentPassage;
 use crate::judge::{
-    Criterion, Grade, GeneratedQuestion, Judge, LessonCanaryCase, LessonCase, PairResult,
+    Criterion, GeneratedQuestion, Grade, Judge, LessonCanaryCase, LessonCase, PairResult,
     QuestionCanaryCase, QuestionCase, Section, SeriousnessGrade, Span, Winner,
 };
 use crate::model::{EvalModel, ModelRequest, parse_json};
@@ -117,9 +117,15 @@ impl Judge for AiJudge {
         self.model.id()
     }
 
-    fn grade<'a>(&'a self, c: Criterion, case: &'a LessonCase) -> BoxFuture<'a, anyhow::Result<Grade>> {
+    fn grade<'a>(
+        &'a self,
+        c: Criterion,
+        case: &'a LessonCase,
+    ) -> BoxFuture<'a, anyhow::Result<Grade>> {
         Box::pin(async move {
-            let v: evals::Verdict = self.ask(&evals::judge(rubric(c), &input(case), &case.body)).await?;
+            let v: evals::Verdict = self
+                .ask(&evals::judge(rubric(c), &input(case), &case.body))
+                .await?;
             Ok(Grade {
                 grade: v.grade.min(3),
                 item_mean: v.item_mean().map(f64::from),
@@ -129,7 +135,10 @@ impl Judge for AiJudge {
         })
     }
 
-    fn seriousness<'a>(&'a self, q: &'a QuestionCase) -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>> {
+    fn seriousness<'a>(
+        &'a self,
+        q: &'a QuestionCase,
+    ) -> BoxFuture<'a, anyhow::Result<SeriousnessGrade>> {
         Box::pin(async move {
             let g: evals::Seriousness = self
                 .ask(&evals::seriousness(&QuestionToGrade {
@@ -257,5 +266,43 @@ impl Judge for AiJudge {
             .map(|c| to(c, true))
             .chain(evals::SERIOUS_QUESTIONS.iter().map(|c| to(c, false)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::judge::testing::case;
+    use crate::model::ScriptedModel;
+
+    #[tokio::test]
+    async fn r1_ai_prompts_through_an_eval_model() {
+        let model = Arc::new(ScriptedModel::new("anthropic", "j", |req| {
+            assert!(req.cache_key.is_some());
+            assert!(!req.system.is_empty());
+            Ok(if req.format.as_ref().is_some_and(|f| f.0 == "verdict") {
+                r#"{"grade": 1, "items": [{"quote": "q", "passages": [1], "grade": 1, "note": ""}], "reason": "r"}"#.into()
+            } else {
+                r#"{"grade": 3, "supported": true, "kind": "application", "reason": "r"}"#.into()
+            })
+        }));
+        let j = AiJudge {
+            model: model.clone(),
+        };
+        assert_eq!(j.lesson_canaries().len(), 20);
+        let qs = j.question_canaries();
+        assert_eq!(qs.iter().filter(|q| q.trivial).count(), 10);
+        assert_eq!(qs.len(), 15);
+        let g = j
+            .grade(
+                Criterion::Faithfulness,
+                &case("x", "Body.[^1]", &[("a.md", "text")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!((g.grade, g.items), (1, 1));
+        let s = j.seriousness(&qs[0].case).await.unwrap();
+        assert!(s.keeps());
+        assert_eq!(s.kind, "application");
     }
 }

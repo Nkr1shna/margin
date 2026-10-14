@@ -184,10 +184,7 @@ pub fn efficiency(rows: &[TraceRow], prices: &Prices) -> Efficiency {
         match r.kind {
             TraceKind::ModelCall => {
                 let model = r.model.clone().unwrap_or_else(|| "?".into());
-                let key = format!(
-                    "{} / {model}",
-                    r.route.map(|x| x.as_str()).unwrap_or("?")
-                );
+                let key = format!("{} / {model}", r.route.map(|x| x.as_str()).unwrap_or("?"));
                 let u = r.usage.unwrap_or_default();
                 let cost = r.cost_usd.or_else(|| price(prices, &model, &u));
                 for s in [e.calls.entry(key.clone()).or_default(), &mut e.total] {
@@ -218,9 +215,7 @@ pub fn efficiency(rows: &[TraceRow], prices: &Prices) -> Efficiency {
             }
             TraceKind::ToolCall => {
                 e.tool_calls += 1;
-                e.tool_output_max_bytes = e
-                    .tool_output_max_bytes
-                    .max(r.output_bytes.unwrap_or(0) as u64);
+                e.tool_output_max_bytes = e.tool_output_max_bytes.max(r.output_bytes.unwrap_or(0));
             }
             TraceKind::JobStep | TraceKind::Turn => {}
         }
@@ -355,16 +350,20 @@ mod tests {
             .collect();
         let app = axum::Router::new().route(
             TRACES,
-            axum::routing::get(move |h: HeaderMap, Query(q): Query<BTreeMap<String, String>>| {
-                let body = body.clone();
-                async move {
-                    if h.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer tok") {
-                        return (axum::http::StatusCode::UNAUTHORIZED, "no".to_string());
+            axum::routing::get(
+                move |h: HeaderMap, Query(q): Query<BTreeMap<String, String>>| {
+                    let body = body.clone();
+                    async move {
+                        if h.get("authorization").and_then(|v| v.to_str().ok())
+                            != Some("Bearer tok")
+                        {
+                            return (axum::http::StatusCode::UNAUTHORIZED, "no".to_string());
+                        }
+                        assert_eq!(q.get("kind").map(String::as_str), Some("model_call"));
+                        (axum::http::StatusCode::OK, body)
                     }
-                    assert_eq!(q.get("kind").map(String::as_str), Some("model_call"));
-                    (axum::http::StatusCode::OK, body)
-                }
-            }),
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -376,8 +375,15 @@ mod tests {
         };
         let http = reqwest::Client::new();
         let rows = fetch(&http, &base, "tok", &f).await.unwrap();
-        assert_eq!(rows.len(), 7, "the service filters; the runner reads what it sends");
-        let err = fetch(&http, &base, "bad", &f).await.unwrap_err().to_string();
+        assert_eq!(
+            rows.len(),
+            7,
+            "the service filters; the runner reads what it sends"
+        );
+        let err = fetch(&http, &base, "bad", &f)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("401"), "{err}");
     }
 }

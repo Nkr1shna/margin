@@ -103,7 +103,7 @@ impl EvalStore {
     /// Every run, newest first.
     pub async fn runs(&self) -> anyhow::Result<Vec<EvalRun>> {
         let mut runs: Vec<EvalRun> = self.store.list(EVAL_RUN).await?;
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(runs)
     }
 
@@ -198,7 +198,10 @@ mod tests {
         let got = s.results("r1").await.unwrap();
         assert_eq!(got.len(), 101, "r10's row isn't r1's");
         assert_eq!(got[0].item, "q000");
-        assert!(got.iter().any(|r| r.metric == "ndcg_at_10" && r.value == 0.5));
+        assert!(
+            got.iter()
+                .any(|r| r.metric == "ndcg_at_10" && r.value == 0.5)
+        );
         assert_eq!(s.results("r10").await.unwrap().len(), 1);
         assert!(s.results("none").await.unwrap().is_empty());
     }

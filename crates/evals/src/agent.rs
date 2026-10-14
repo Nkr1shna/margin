@@ -10,15 +10,17 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use margin_agent::MessageContext;
 use margin_agent::{
     BoxFuture, ItemRecord, ModelClient, NoDevices, RetryPolicy, SinkError, Tool, ToolContext,
     ToolKind, ToolOutput, ToolRegistry, TurnDeps, TurnInput, TurnOutcome, TurnSink, run_turn,
     user_message_input,
 };
-use margin_agent::MessageContext;
 use margin_shared::context::Scope;
 use margin_shared::routes::TOOL_SEARCH_K_MAX;
-use margin_shared::{ChatItem, ChatItemKind, Decision, DeviceRef, ItemStatus, ReasoningEffort, Usage};
+use margin_shared::{
+    ChatItem, ChatItemKind, Decision, DeviceRef, ItemStatus, ReasoningEffort, Usage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -79,11 +81,12 @@ impl Tool for SearchTool {
                 Ok(a) => a,
                 Err(e) => return ToolOutput::error(format!("The arguments don't fit search: {e}")),
             };
-            let k = args
-                .k
-                .map_or(8, |k| k as usize)
-                .clamp(1, TOOL_SEARCH_K_MAX);
-            let ranked = match self.index.search(std::slice::from_ref(&args.query), &self.scope).await {
+            let k = args.k.map_or(8, |k| k as usize).clamp(1, TOOL_SEARCH_K_MAX);
+            let ranked = match self
+                .index
+                .search(std::slice::from_ref(&args.query), &self.scope)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => return ToolOutput::error(format!("Search failed: {e}")),
             };
@@ -150,7 +153,13 @@ impl TurnSink for MemorySink {
         item: &'a ChatItem,
         _record: ItemRecord,
     ) -> BoxFuture<'a, Result<(), SinkError>> {
-        if let Some(slot) = self.items.lock().unwrap().iter_mut().find(|i| i.id == item.id) {
+        if let Some(slot) = self
+            .items
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|i| i.id == item.id)
+        {
             *slot = item.clone();
         }
         Box::pin(async { Ok(()) })
@@ -159,7 +168,10 @@ impl TurnSink for MemorySink {
         self.usage.lock().unwrap().add(usage);
         Box::pin(async { Ok(()) })
     }
-    fn wait_for_decision<'a>(&'a self, _card: &'a ChatItem) -> BoxFuture<'a, Result<Decision, SinkError>> {
+    fn wait_for_decision<'a>(
+        &'a self,
+        _card: &'a ChatItem,
+    ) -> BoxFuture<'a, Result<Decision, SinkError>> {
         Box::pin(async { Err(SinkError("the eval agent has no one to ask".into())) })
     }
 }
@@ -369,7 +381,14 @@ mod tests {
         assert_eq!(r.abstained, Some(true));
         assert_eq!(r.anchors_cited, 1.0);
         let failing = ScriptedModel::default();
-        let r = run_task(&failing, None, index_again().await, &task, RetryPolicy::immediate()).await;
+        let r = run_task(
+            &failing,
+            None,
+            index_again().await,
+            &task,
+            RetryPolicy::immediate(),
+        )
+        .await;
         assert!(!r.finished);
         assert!(r.error.is_some());
     }

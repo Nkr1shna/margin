@@ -31,7 +31,11 @@ pub fn check_packing(packed: &[Packed], budget: &PackBudget) -> Vec<String> {
         ));
     }
     if packed.len() > budget.k {
-        out.push(format!("{} passages packed, at most k = {}", packed.len(), budget.k));
+        out.push(format!(
+            "{} passages packed, at most k = {}",
+            packed.len(),
+            budget.k
+        ));
     }
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for (i, p) in packed.iter().enumerate() {
@@ -91,8 +95,14 @@ pub fn context_hit(hit: &Hit) -> context::Hit {
 
 /// Bytes of the JSON a search returning the top `TOOL_SEARCH_K_MAX` of `hits` sends.
 pub fn tool_output_bytes(hits: &[Hit]) -> usize {
-    let top: Vec<context::Hit> = hits.iter().take(TOOL_SEARCH_K_MAX).map(context_hit).collect();
-    serde_json::to_string(&top).map(|s| s.len()).unwrap_or(usize::MAX)
+    let top: Vec<context::Hit> = hits
+        .iter()
+        .take(TOOL_SEARCH_K_MAX)
+        .map(context_hit)
+        .collect();
+    serde_json::to_string(&top)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

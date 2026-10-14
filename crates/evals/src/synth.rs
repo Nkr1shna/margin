@@ -12,7 +12,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::{CorpusDoc, Extraction};
-use crate::golden::{GoldenScope, QueryKind, Relevant, RetrievalQuery, matches_anchor, source_text};
+use crate::golden::{
+    GoldenScope, QueryKind, Relevant, RetrievalQuery, matches_anchor, source_text,
+};
 use crate::index::EvalIndex;
 use crate::judge::{GeneratedQuestion, Judge, QuestionCase, Section, SeriousnessGrade};
 
@@ -145,6 +147,7 @@ pub fn golden_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Generates, checks and grades; returns every candidate (kept ones with their new
 /// golden id, numbered after `existing`) and the summary.
 pub async fn generate(
@@ -166,8 +169,10 @@ pub async fn generate(
         .max()
         .unwrap_or(0)
         + 1;
-    let seen: std::collections::HashSet<String> =
-        existing.iter().map(|q| crate::golden::normalize(&q.query)).collect();
+    let seen: std::collections::HashSet<String> = existing
+        .iter()
+        .map(|q| crate::golden::normalize(&q.query))
+        .collect();
     for req in requests(sections).into_iter().take(limit) {
         summary.requests += 1;
         let qs = generator.synth(&req, per_request).await?;
@@ -237,8 +242,8 @@ mod tests {
     use crate::corpus::documents;
     use crate::golden::evals_dir;
     use crate::index::testing::register_stand_ins;
-    use crate::judge::testing::RuleJudge;
     use crate::judge::Span;
+    use crate::judge::testing::RuleJudge;
     use crate::recorded::FakeVectors;
     use margin_service::db::Store;
     use margin_shared::pipeline::PipelineConfig;
@@ -313,8 +318,20 @@ mod tests {
         };
         assert!(span_problems(&corpus, &q("bayes.md", None, "P(H) is the prior")).is_empty());
         assert!(!span_problems(&corpus, &q("bayes.md", None, "P(H) is the posterior")).is_empty());
-        assert!(span_problems(&corpus, &q("pdf/rc-circuits.pdf", Some(2), "about 0.69 tau")).is_empty());
-        assert!(!span_problems(&corpus, &q("pdf/rc-circuits.pdf", Some(1), "about 0.69 tau")).is_empty());
+        assert!(
+            span_problems(
+                &corpus,
+                &q("pdf/rc-circuits.pdf", Some(2), "about 0.69 tau")
+            )
+            .is_empty()
+        );
+        assert!(
+            !span_problems(
+                &corpus,
+                &q("pdf/rc-circuits.pdf", Some(1), "about 0.69 tau")
+            )
+            .is_empty()
+        );
         assert!(!span_problems(&corpus, &q("nope.md", None, "x")).is_empty());
         let mut none = q("bayes.md", None, "x");
         none.spans.clear();
