@@ -1,7 +1,7 @@
 //! Sidebar: workspace header, Ask, Search, All notes, the topic tree, and the footer.
 
 use dioxus::prelude::*;
-use margin_shared::{Id, NewTopic, TopicPatch};
+use margin_shared::{Event, Id, LessonPatch, NewTopic, TopicPatch};
 
 use crate::config::Appearance;
 use crate::routes::Route;
@@ -21,6 +21,7 @@ enum TreeEdit {
     /// New subtopic under this topic.
     AddChild(Id),
     Rename(Id),
+    RenameLesson(Id),
 }
 
 #[derive(Clone, Copy)]
@@ -28,6 +29,7 @@ struct TreeCtx {
     edit: Signal<TreeEdit>,
     menu: Signal<Option<Id>>,
     delete: Signal<Option<Id>>,
+    delete_lesson: Signal<Option<Id>>,
     error: Signal<Option<String>>,
 }
 
@@ -40,6 +42,7 @@ pub fn Sidebar() -> Element {
         edit: Signal::new(TreeEdit::None),
         menu: Signal::new(None),
         delete: Signal::new(None),
+        delete_lesson: Signal::new(None),
         error: Signal::new(None),
     });
     let mut edit = tree.edit;
@@ -77,6 +80,11 @@ pub fn Sidebar() -> Element {
     let deleting_title = deleting
         .as_ref()
         .and_then(|id| app.lib.read().topics.get(id).map(|t| t.title.clone()));
+    let deleting_lesson = tree.delete_lesson.read().clone();
+    let deleting_lesson_title = deleting_lesson
+        .as_ref()
+        .and_then(|id| app.lib.read().lessons.get(id).map(|l| l.title.clone()));
+    let route_now_lesson = route.clone();
     let mut delete_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
 
@@ -241,6 +249,240 @@ pub fn Sidebar() -> Element {
                 },
             }
         }
+        if let (Some(id), Some(title)) = (deleting_lesson.clone(), deleting_lesson_title) {
+            ConfirmDialog {
+                title: "Delete “{title}”?",
+                message: "This deletes the lesson with its notes and video. This can't be undone.",
+                confirm_label: "Delete lesson",
+                busy: *delete_busy.read(),
+                error: delete_error.read().clone(),
+                on_cancel: move |_| {
+                    let mut d = tree.delete_lesson;
+                    d.set(None);
+                    delete_error.set(None);
+                },
+                on_confirm: move |_| {
+                    let id = id.clone();
+                    let route = route_now_lesson.clone();
+                    async move {
+                        let Some(api) = app.api() else { return };
+                        delete_busy.set(true);
+                        delete_error.set(None);
+                        match api.delete_lesson(&id).await {
+                            Ok(()) => {
+                                let open = route_is_lesson(&route, &id);
+                                app.lib.write().apply(Event::LessonDeleted { id });
+                                let mut d = tree.delete_lesson;
+                                d.set(None);
+                                if open {
+                                    nav.replace(Route::Ask {});
+                                }
+                            }
+                            Err(e) => delete_error.set(Some(app.failure(&e))),
+                        }
+                        delete_busy.set(false);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A lesson in the tree: opens on click; its ⋯ button or a right-click offers Rename,
+/// Regenerate and Delete, like the lesson screen's menu.
+#[component]
+fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element {
+    let app = use_app();
+    let nav = navigator();
+    let route = use_route::<Route>();
+    let tree = use_context::<TreeCtx>();
+    let mut edit = tree.edit;
+    let mut menu = tree.menu;
+    let mut delete_lesson = tree.delete_lesson;
+    let mut error = tree.error;
+    let menu_open = menu.read().as_deref() == Some(id.as_str());
+    let renaming = *edit.read() == TreeEdit::RenameLesson(id.clone());
+    let open_menu = {
+        let id = id.clone();
+        move || menu.set(Some(id.clone()))
+    };
+
+    rsx! {
+        li { role: "treeitem",
+            if renaming {
+                LessonInput { id: id.clone(), initial: title.clone() }
+            } else {
+                div {
+                    class: "tree-row",
+                    oncontextmenu: {
+                        let mut open_menu = open_menu.clone();
+                        move |e: MouseEvent| {
+                            e.prevent_default();
+                            open_menu();
+                        }
+                    },
+                    button {
+                        class: "row",
+                        "aria-current": route_is_lesson(&route, &id).to_string(),
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                nav.push(Route::LessonRead { id: id.clone() });
+                            }
+                        },
+                        Icon { name: "book", class: "leaf-ic" }
+                        span { class: "grow", "{title}" }
+                        if generating {
+                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: "Writing" }
+                        }
+                        match dot {
+                            VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready" } },
+                            VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress" } },
+                            VideoDot::None => rsx! { span { class: "dot", title: "No video" } },
+                        }
+                    }
+                    button {
+                        class: "icon-btn sm more",
+                        "aria-label": "Actions for {title}",
+                        "aria-haspopup": "menu",
+                        "aria-expanded": menu_open.to_string(),
+                        onclick: {
+                            let mut open_menu = open_menu.clone();
+                            move |_| if menu_open { menu.set(None) } else { open_menu() }
+                        },
+                        Icon { name: "more" }
+                    }
+                }
+            }
+            if menu_open {
+                div { class: "pop-scrim", onclick: move |_| menu.set(None) }
+                div {
+                    class: "menu right",
+                    role: "menu",
+                    onkeydown: move |e: KeyboardEvent| {
+                        if e.key() == Key::Escape {
+                            menu.set(None);
+                        }
+                    },
+                    button {
+                        role: "menuitem",
+                        autofocus: true,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                error.set(None);
+                                edit.set(TreeEdit::RenameLesson(id.clone()));
+                            }
+                        },
+                        Icon { name: "edit" }
+                        "Rename"
+                    }
+                    button {
+                        role: "menuitem",
+                        disabled: generating,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                error.set(None);
+                                let id = id.clone();
+                                spawn(async move {
+                                    let Some(api) = app.api() else { return };
+                                    match api.regenerate_lesson(&id).await {
+                                        Ok(lesson) => {
+                                            let mut lib = app.lib;
+                                            lib.write().apply(Event::LessonChanged { lesson });
+                                        }
+                                        Err(e) => error.set(Some(app.failure(&e))),
+                                    }
+                                });
+                            }
+                        },
+                        Icon { name: "refresh" }
+                        "Regenerate"
+                    }
+                    button {
+                        role: "menuitem",
+                        class: "danger",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                delete_lesson.set(Some(id.clone()));
+                            }
+                        },
+                        Icon { name: "trash" }
+                        "Delete…"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inline field renaming a lesson. Enter or leaving the field saves; Escape cancels.
+#[component]
+fn LessonInput(id: Id, initial: String) -> Element {
+    let app = use_app();
+    let tree = use_context::<TreeCtx>();
+    let mut value = use_signal(|| initial.clone());
+    let commit = {
+        let id = id.clone();
+        let initial = initial.clone();
+        move || {
+            let id = id.clone();
+            let initial = initial.clone();
+            async move {
+                let mut edit = tree.edit;
+                let mut error = tree.error;
+                let title = value.peek().trim().to_string();
+                edit.set(TreeEdit::None);
+                if title.is_empty() || title == initial {
+                    return;
+                }
+                let Some(api) = app.api() else { return };
+                let patch = LessonPatch {
+                    title: Some(title),
+                    ..Default::default()
+                };
+                match api.patch_lesson(&id, &patch).await {
+                    Ok(lesson) => {
+                        let mut lib = app.lib;
+                        lib.write().apply(Event::LessonChanged { lesson });
+                    }
+                    Err(e) => error.set(Some(app.failure(&e))),
+                }
+            }
+        }
+    };
+    let on_blur = commit.clone();
+    rsx! {
+        input {
+            class: "input tree-input",
+            "aria-label": "Lesson title",
+            autofocus: true,
+            initial_value: "{initial}",
+            oninput: move |e| value.set(e.value()),
+            onkeydown: move |e: KeyboardEvent| {
+                match e.key() {
+                    Key::Enter => {
+                        spawn(commit());
+                    }
+                    Key::Escape => {
+                        let mut edit = tree.edit;
+                        edit.set(TreeEdit::None);
+                    }
+                    _ => {}
+                }
+            },
+            onblur: move |_| {
+                if *tree.edit.peek() == TreeEdit::None {
+                    return;
+                }
+                spawn(on_blur());
+            },
+        }
     }
 }
 
@@ -335,7 +577,16 @@ fn TopicNode(id: Id) -> Element {
             if renaming {
                 TopicInput { parent: topic.parent_id.clone(), initial: topic.title.clone(), placeholder: "Topic name", rename: Some(id.clone()) }
             } else {
-                div { class: "tree-row",
+                div {
+                    class: "tree-row",
+                    // Right-click opens the same menu as the ⋯ button.
+                    oncontextmenu: {
+                        let id = id.clone();
+                        move |e: MouseEvent| {
+                            e.prevent_default();
+                            menu.set(Some(id.clone()));
+                        }
+                    },
                     button {
                         class: "row",
                         "aria-label": toggle_label,
@@ -438,28 +689,7 @@ fn TopicNode(id: Id) -> Element {
                         TopicNode { key: "{child}", id: child.clone() }
                     }
                     for (lid, title, dot, generating) in lessons {
-                        li { key: "{lid}", role: "treeitem",
-                            button {
-                                class: "row",
-                                "aria-current": route_is_lesson(&route, &lid).to_string(),
-                                onclick: {
-                                    let lid = lid.clone();
-                                    move |_| {
-                                        nav.push(Route::LessonRead { id: lid.clone() });
-                                    }
-                                },
-                                Icon { name: "book", class: "leaf-ic" }
-                                span { class: "grow", "{title}" }
-                                if generating {
-                                    span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: "Writing" }
-                                }
-                                match dot {
-                                    VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready" } },
-                                    VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress" } },
-                                    VideoDot::None => rsx! { span { class: "dot", title: "No video" } },
-                                }
-                            }
-                        }
+                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating }
                     }
                     if note_count > 0 {
                         li { key: "notes-{id}", role: "treeitem",
@@ -474,10 +704,7 @@ fn TopicNode(id: Id) -> Element {
                                 },
                                 Icon { name: "note", class: "leaf-ic" }
                                 span { class: "grow", "Notes" }
-                                // The count only once there is something to count.
-                    if note_count > 0 {
-                        span { class: "count", "{note_count}" }
-                    }
+                                span { class: "count", "{note_count}" }
                             }
                         }
                     }

@@ -24,6 +24,10 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
     let mut creating = use_signal(|| false);
     let mut new_topic = use_signal(|| None::<Id>);
     let mut create_error = use_signal(|| None::<String>);
+    let mut item_menu = use_signal(|| None::<Id>);
+    let mut confirm_note = use_signal(|| None::<(Id, String)>);
+    let mut del_busy = use_signal(|| false);
+    let mut del_error = use_signal(|| None::<String>);
 
     let lib = app.lib.read();
     let loading = *app.lib_status.read() == LoadStatus::Loading && lib.topics.is_empty();
@@ -193,18 +197,77 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                 h4 { "{crumb}" }
                             }
                             for (note, lesson_title) in list {
-                                button {
+                                div {
                                     key: "{note.id}",
-                                    class: "note-item",
-                                    "aria-current": (selected.as_deref() == Some(note.id.as_str())).to_string(),
-                                    onclick: {
+                                    class: "note-row",
+                                    // Right-click: the same actions as the row's buttons.
+                                    oncontextmenu: {
                                         let id = note.id.clone();
-                                        move |_| { nav.push(Route::NoteOpen { id: id.clone() }); }
+                                        move |e: MouseEvent| {
+                                            e.prevent_default();
+                                            item_menu.set(Some(id.clone()));
+                                        }
                                     },
-                                    b { "{note.title}" }
-                                    span {
-                                        "{ago(&note.updated_at)}"
-                                        if let Some(t) = lesson_title { " · from {t}" }
+                                    button {
+                                        class: "note-item",
+                                        "aria-current": (selected.as_deref() == Some(note.id.as_str())).to_string(),
+                                        onclick: {
+                                            let id = note.id.clone();
+                                            move |_| { nav.push(Route::NoteOpen { id: id.clone() }); }
+                                        },
+                                        b { "{note.title}" }
+                                        span {
+                                            "{ago(&note.updated_at)}"
+                                            if let Some(t) = lesson_title { " · from {t}" }
+                                        }
+                                    }
+                                    button {
+                                        class: "icon-btn sm note-del",
+                                        "aria-label": "Delete {note.title}",
+                                        title: "Delete note",
+                                        onclick: {
+                                            let target = (note.id.clone(), note.title.clone());
+                                            move |_| {
+                                                del_error.set(None);
+                                                confirm_note.set(Some(target.clone()));
+                                            }
+                                        },
+                                        Icon { name: "trash" }
+                                    }
+                                    if item_menu.read().as_deref() == Some(note.id.as_str()) {
+                                        div { class: "pop-scrim", onclick: move |_| item_menu.set(None) }
+                                        div {
+                                            class: "menu right",
+                                            role: "menu",
+                                            onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { item_menu.set(None) },
+                                            button {
+                                                role: "menuitem",
+                                                autofocus: true,
+                                                onclick: {
+                                                    let id = note.id.clone();
+                                                    move |_| {
+                                                        item_menu.set(None);
+                                                        nav.push(Route::NoteOpen { id: id.clone() });
+                                                    }
+                                                },
+                                                Icon { name: "note" }
+                                                "Open"
+                                            }
+                                            button {
+                                                role: "menuitem",
+                                                class: "danger",
+                                                onclick: {
+                                                    let target = (note.id.clone(), note.title.clone());
+                                                    move |_| {
+                                                        item_menu.set(None);
+                                                        del_error.set(None);
+                                                        confirm_note.set(Some(target.clone()));
+                                                    }
+                                                },
+                                                Icon { name: "trash" }
+                                                "Delete…"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -232,6 +295,45 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                         },
                     }
                 }
+            }
+        }
+        if let Some((id, title)) = confirm_note.read().clone() {
+            ConfirmDialog {
+                title: "Delete “{title}”?",
+                message: "This note will be deleted. This can't be undone.",
+                confirm_label: "Delete note",
+                busy: *del_busy.read(),
+                error: del_error.read().clone(),
+                on_cancel: move |_| confirm_note.set(None),
+                on_confirm: {
+                    let topic = topic.clone();
+                    let selected = selected.clone();
+                    move |_| {
+                        let id = id.clone();
+                        let topic = topic.clone();
+                        let was_open = selected.as_deref() == Some(id.as_str());
+                        async move {
+                            let Some(api) = app.api() else { return };
+                            del_busy.set(true);
+                            del_error.set(None);
+                            match api.delete_note(&id).await {
+                                Ok(()) => {
+                                    let mut lib = app.lib;
+                                    lib.write().apply(Event::NoteDeleted { id });
+                                    confirm_note.set(None);
+                                    if was_open {
+                                        nav.replace(match topic {
+                                            Some(topic_id) => Route::TopicNotes { topic_id },
+                                            None => Route::AllNotes {},
+                                        });
+                                    }
+                                }
+                                Err(e) => del_error.set(Some(app.failure(&e))),
+                            }
+                            del_busy.set(false);
+                        }
+                    }
+                },
             }
         }
     }

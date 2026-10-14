@@ -362,6 +362,12 @@ details.collapse > summary { cursor: pointer; font-size: 13px; font-weight: 500;
 .note-group h4 { margin: 8px 8px 2px; font-size: 12px; font-weight: 500; color: var(--fg-3); }
 .note-item { padding: 10px; border-radius: var(--r-ctl); display: grid; gap: 2px; cursor: pointer; border: 0; background: transparent; text-align: left; width: 100%; }
 .note-item:hover { background: var(--hover); }
+.note-row { position: relative; }
+.note-row .note-item { padding-right: 38px; }
+.note-row .note-del { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); opacity: 0; }
+.note-row:hover .note-del, .note-row:focus-within .note-del { opacity: 1; }
+.note-row:hover .note-item { background: var(--hover); }
+.note-row .note-item[aria-current="true"] { background: var(--select); }
 .note-item[aria-current="true"] { background: var(--select); }
 .note-item b { font-weight: 500; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note-item span { font-size: 13px; font-weight: 500; color: var(--fg-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
