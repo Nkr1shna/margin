@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "margin": {
+      "command": "margin-mcp",
+      "args": ["serve"]
+    }
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "margin-mcp"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Claude Code's door into Margin: an MCP server over the context API, plus login, ingest and purge commands (docs/plan-dogfood.md)."
+
+[[bin]]
+name = "margin-mcp"
+path = "src/main.rs"
+
+[dependencies]
+margin-shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+reqwest = { workspace = true, features = ["query"] }
+schemars.workspace = true
+rmcp = { version = "=3.4.1", features = ["server", "transport-io", "macros"] }
+toml = "=1.1.8"
+gethostname = "=1.1.0"
+open = "=5.3.4"
+keyring = "=4.2.0"
+
+[dev-dependencies]
+axum = "=0.8.9"
