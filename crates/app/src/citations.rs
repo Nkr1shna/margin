@@ -2,7 +2,7 @@
 //! "1:05–1:20"), and what the source viewer shows for one. Pure data: no Dioxus here, so
 //! it is unit-tested directly.
 
-use margin_shared::{Citation, SourceKind};
+use margin_shared::{Citation, SourceKind, TranscriptSegment};
 
 /// The lesson's citations by number, each number once (the first wins).
 pub fn ordered(citations: &[Citation]) -> Vec<Citation> {
@@ -117,16 +117,18 @@ pub fn open_label(kind: SourceKind) -> &'static str {
     }
 }
 
-/// A timed passage of an audio or video source, as the viewer's transcript lists it.
+/// A timed line of an audio or video source, as the viewer's transcript lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
-    /// The citation it comes from.
+    /// The citation it comes from (0 for a line of the whole transcript).
     pub n: u32,
     pub start_ms: u64,
     pub end_ms: Option<u64>,
     pub text: String,
-    /// The passage the open citation points at.
+    /// Within the passage the open citation points at.
     pub current: bool,
+    /// Within a passage another of the lesson's citations points at.
+    pub cited: bool,
 }
 
 /// What the source viewer shows for a citation.
@@ -140,8 +142,8 @@ pub enum Viewer {
         image: Option<String>,
         excerpt: String,
     },
-    /// An audio clip: the player from `start_ms`, and the source's cited passages with
-    /// this one marked.
+    /// An audio clip: the player from `start_ms`, and the source's whole transcript (or,
+    /// without one, its cited passages) with this citation's span marked.
     Audio {
         src: Option<String>,
         start_ms: u64,
@@ -161,9 +163,15 @@ pub enum Viewer {
 }
 
 /// What to show for `c`, given the lesson's citations (for an audio or video source's
-/// other passages) and the source's `media_url` (`None` when the source is gone or the
-/// service offers no original).
-pub fn viewer(c: &Citation, all: &[Citation], media_url: Option<&str>) -> Viewer {
+/// other passages), the source's `media_url` (`None` when the source is gone or the
+/// service offers no original) and its whole transcript (`lines`; empty when there is
+/// none or it hasn't loaded).
+pub fn viewer(
+    c: &Citation,
+    all: &[Citation],
+    media_url: Option<&str>,
+    lines: &[TranscriptSegment],
+) -> Viewer {
     let excerpt = c.excerpt.trim().to_string();
     match c.kind {
         SourceKind::Image => match c.image_url.as_deref().or(media_url) {
@@ -184,13 +192,13 @@ pub fn viewer(c: &Citation, all: &[Citation], media_url: Option<&str>) -> Viewer
         SourceKind::Audio => Viewer::Audio {
             src: media_url.map(str::to_string),
             start_ms: c.start_ms.unwrap_or(0),
-            transcript: transcript(c, all),
+            transcript: whole_transcript(c, all, lines),
         },
         SourceKind::Video => Viewer::Video {
             src: media_url.map(str::to_string),
             start_ms: c.start_ms.unwrap_or(0),
             poster: c.image_url.clone(),
-            transcript: transcript(c, all),
+            transcript: whole_transcript(c, all, lines),
         },
         SourceKind::Text | SourceKind::Code if excerpt.is_empty() => Viewer::Missing,
         SourceKind::Text | SourceKind::Code => Viewer::Passage {
@@ -198,6 +206,66 @@ pub fn viewer(c: &Citation, all: &[Citation], media_url: Option<&str>) -> Viewer
             code: c.kind == SourceKind::Code,
         },
     }
+}
+
+/// The stretch of the recording a citation points at: its span, or for a moment (a
+/// video frame) that moment.
+fn cited_span(c: &Citation) -> Option<(u64, u64)> {
+    let start = c.start_ms?;
+    Some((start, c.end_ms.filter(|&e| e > start).unwrap_or(start)))
+}
+
+/// Whether a transcript line [`start`, `end`] falls within the cited `span`: they
+/// overlap, or (for a moment) the line is the one being said then.
+fn line_in(start: u64, end: u64, span: (u64, u64)) -> bool {
+    if span.0 == span.1 {
+        start <= span.0 && span.0 <= end
+    } else {
+        start < span.1 && span.0 < end.max(start + 1)
+    }
+}
+
+/// `c`'s source's whole transcript, line by line, the lines within `c`'s span marked
+/// `current` and those within the lesson's other citations of it `cited`. Without one
+/// (`lines` empty), the passages the lesson cites (`transcript`).
+pub fn whole_transcript(
+    c: &Citation,
+    all: &[Citation],
+    lines: &[TranscriptSegment],
+) -> Vec<Segment> {
+    if lines.is_empty() {
+        return transcript(c, all);
+    }
+    let here = cited_span(c);
+    let others: Vec<(u64, u64)> = all
+        .iter()
+        .filter(|o| o.source_id == c.source_id && o.n != c.n)
+        .filter_map(cited_span)
+        .collect();
+    let mut out: Vec<Segment> = lines
+        .iter()
+        .map(|l| Segment {
+            n: 0,
+            start_ms: l.start_ms,
+            end_ms: Some(l.end_ms),
+            text: l.text.clone(),
+            current: here.is_some_and(|s| line_in(l.start_ms, l.end_ms, s)),
+            cited: others.iter().any(|&s| line_in(l.start_ms, l.end_ms, s)),
+        })
+        .collect();
+    // A moment between two lines (a pause) marks the line after it.
+    if let Some(span) = here
+        && !out.iter().any(|s| s.current)
+        && let Some(next) = out.iter_mut().find(|s| s.start_ms >= span.0)
+    {
+        next.current = true;
+    }
+    out
+}
+
+/// Index of the first line the open citation points at, to scroll it into view.
+pub fn first_current(segments: &[Segment]) -> Option<usize> {
+    segments.iter().position(|s| s.current)
 }
 
 /// The timed passages of `c`'s source that the lesson cites, in time order, with `c`'s
@@ -218,6 +286,7 @@ pub fn transcript(c: &Citation, all: &[Citation]) -> Vec<Segment> {
             .find(|s| s.start_ms == start_ms && s.text == text)
         {
             seen.current |= current;
+            seen.cited = !seen.current;
             continue;
         }
         out.push(Segment {
@@ -226,6 +295,7 @@ pub fn transcript(c: &Citation, all: &[Citation]) -> Vec<Segment> {
             end_ms: other.end_ms,
             text: text.to_string(),
             current,
+            cited: !current,
         });
     }
     out.sort_by_key(|s| (s.start_ms, s.n));
@@ -335,7 +405,7 @@ mod tests {
             ..cite(1, "i", SourceKind::Image)
         };
         assert_eq!(
-            viewer(&image, &[], Some("orig")),
+            viewer(&image, &[], Some("orig"), &[]),
             Viewer::Image { url: "img".into() }
         );
         // Without a picture of its own, an image shows the original.
@@ -344,10 +414,10 @@ mod tests {
             ..cite(1, "i", SourceKind::Image)
         };
         assert_eq!(
-            viewer(&bare, &[], Some("orig")),
+            viewer(&bare, &[], Some("orig"), &[]),
             Viewer::Image { url: "orig".into() }
         );
-        assert_eq!(viewer(&bare, &[], None), Viewer::Missing);
+        assert_eq!(viewer(&bare, &[], None, &[]), Viewer::Missing);
 
         let page = Citation {
             page: Some(4),
@@ -355,7 +425,7 @@ mod tests {
             ..cite(2, "p", SourceKind::Pdf)
         };
         assert_eq!(
-            viewer(&page, &[], Some("orig")),
+            viewer(&page, &[], Some("orig"), &[]),
             Viewer::PdfPage {
                 page: Some(4),
                 image: Some("page-4.png".into()),
@@ -365,7 +435,7 @@ mod tests {
 
         let code = cite(3, "c", SourceKind::Code);
         assert_eq!(
-            viewer(&code, &[], None),
+            viewer(&code, &[], None, &[]),
             Viewer::Passage {
                 excerpt: "passage 3".into(),
                 code: true
@@ -375,7 +445,7 @@ mod tests {
             excerpt: "  ".into(),
             ..cite(4, "t", SourceKind::Text)
         };
-        assert_eq!(viewer(&empty, &[], None), Viewer::Missing);
+        assert_eq!(viewer(&empty, &[], None, &[]), Viewer::Missing);
     }
 
     #[test]
@@ -397,7 +467,7 @@ mod tests {
             src,
             start_ms,
             transcript,
-        } = viewer(&all[3], &all, Some("http://s/a.m4a"))
+        } = viewer(&all[3], &all, Some("http://s/a.m4a"), &[])
         else {
             panic!("not audio");
         };
@@ -420,7 +490,7 @@ mod tests {
             ..cite(1, "film", SourceKind::Video)
         };
         assert_eq!(
-            viewer(&frame, std::slice::from_ref(&frame), None),
+            viewer(&frame, std::slice::from_ref(&frame), None, &[]),
             Viewer::Video {
                 src: None,
                 start_ms: 4_000,
@@ -428,5 +498,64 @@ mod tests {
                 transcript: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn the_whole_transcript_marks_the_cited_spans() {
+        let line = |start_ms, end_ms, text: &str| TranscriptSegment {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        };
+        let lines = vec![
+            line(0, 1_050, "Lecture twelve."),
+            line(1_200, 3_325, "Today we look at a jump."),
+            line(3_725, 6_000, "Near a discontinuity,"),
+            line(6_000, 8_560, "the sums overshoot."),
+            line(8_960, 13_752, "More terms squeeze it."),
+            line(14_152, 16_420, "That is Gibbs."),
+        ];
+        let clip = |n, start, end| Citation {
+            start_ms: Some(start),
+            end_ms: Some(end),
+            ..cite(n, "talk", SourceKind::Audio)
+        };
+        let all = vec![
+            clip(6, 3_725, 8_560),
+            clip(7, 8_960, 13_752),
+            cite(2, "other", SourceKind::Text),
+        ];
+        let Viewer::Audio { transcript, .. } = viewer(&all[0], &all, Some("a"), &lines) else {
+            panic!("not audio");
+        };
+        // Every line, the open citation's span current, the other one's cited.
+        assert_eq!(transcript.len(), 6);
+        let marks: Vec<(bool, bool)> = transcript.iter().map(|s| (s.current, s.cited)).collect();
+        assert_eq!(
+            marks,
+            vec![
+                (false, false),
+                (false, false),
+                (true, false),
+                (true, false),
+                (false, true),
+                (false, false)
+            ]
+        );
+        assert_eq!(first_current(&transcript), Some(2));
+        assert_eq!(transcript[3].end_ms, Some(8_560));
+
+        // A video frame's moment marks the line said then, or after a pause the next.
+        let frame = |at| Citation {
+            start_ms: Some(at),
+            ..cite(1, "talk", SourceKind::Video)
+        };
+        let at = whole_transcript(&frame(2_000), &[], &lines);
+        assert_eq!(first_current(&at), Some(1));
+        assert_eq!(at.iter().filter(|s| s.current).count(), 1);
+        let pause = whole_transcript(&frame(3_500), &[], &lines);
+        assert_eq!(first_current(&pause), Some(2));
+        // Without a transcript, the cited passages stand in.
+        assert_eq!(whole_transcript(&all[0], &all, &[]), super::transcript(&all[0], &all));
     }
 }

@@ -311,6 +311,7 @@ fn App() -> Element {
             uploads: Signal::new(Vec::new()),
             settings_open: Signal::new(None),
             source_viewer: Signal::new(None),
+            transcripts: Signal::new(Default::default()),
         }
     });
 

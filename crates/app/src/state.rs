@@ -1,9 +1,9 @@
 //! App-wide reactive state, shared through Dioxus context.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
-use margin_shared::{Id, Me};
+use margin_shared::{Id, Me, TranscriptSegment};
 
 use crate::api::{Api, ApiFailure};
 use crate::config::{self, LocalConfig};
@@ -57,6 +57,8 @@ pub struct AppCtx {
     pub settings_open: Signal<Option<crate::ui::settings::SettingsPane>>,
     /// The source viewer, open on this lesson's citation.
     pub source_viewer: Signal<Option<SourceViewer>>,
+    /// Audio and video sources' whole transcripts, as last fetched for the viewer.
+    pub transcripts: Signal<HashMap<Id, Vec<TranscriptSegment>>>,
 }
 
 /// Which citation the source viewer shows.
@@ -108,6 +110,7 @@ impl AppCtx {
         this.ask_proposal.set(None);
         this.uploads.set(Vec::new());
         this.source_viewer.set(None);
+        this.transcripts.set(HashMap::new());
     }
 
     /// Sign out: revoke this device on the service (best effort), then forget the token.

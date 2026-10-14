@@ -179,3 +179,36 @@ fn truncation_check_for_tooltips() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Runs a check of margin.js's pure helpers under Node when it's installed (skipped
+/// otherwise): `body` exits non-zero with a message on failure. `eq(got, want, what)`
+/// is defined for it.
+fn run_js(body: &str) {
+    let script = format!(
+        "{DOM_STUB}\n{JS}\nconst M=window.MarginApp;\n\
+         const eq=(a,b,m)=>{{const x=JSON.stringify(a),y=JSON.stringify(b);if(x!==y){{console.error(m,x,y);process.exit(1)}}}};\n\
+         {body}"
+    );
+    let out = match std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return,
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn transcript_reveal_puts_the_line_a_quarter_down() {
+    run_js(
+        "eq(M.revealTop({scrollTop:0,boxTop:100,boxHeight:400,itemTop:700}),500,'below');\n\
+         eq(M.revealTop({scrollTop:300,boxTop:100,boxHeight:400,itemTop:150}),250,'above');\n\
+         eq(M.revealTop({scrollTop:0,boxTop:100,boxHeight:400,itemTop:120}),0,'near the top');",
+    );
+}

@@ -451,6 +451,31 @@
       var el = document.querySelector(selector);
       if (el) el.scrollIntoView({ block: "nearest" });
     },
+    // Scroll the list #id (a scroll box of its own) so its first item matching `selector`
+    // sits a quarter of the way down, without moving anything around the list. Tries for
+    // a few frames, since Rust renders asynchronously.
+    revealIn: function (id, selector) {
+      var tries = 0;
+      (function attempt() {
+        var box = document.getElementById(id);
+        var el = box && box.querySelector(selector);
+        if (!el) {
+          if (tries++ < 10) requestAnimationFrame(attempt);
+          return;
+        }
+        box.scrollTop = window.MarginApp.revealTop({
+          scrollTop: box.scrollTop,
+          boxTop: box.getBoundingClientRect().top,
+          boxHeight: box.clientHeight,
+          itemTop: el.getBoundingClientRect().top,
+        });
+      })();
+    },
+    // Where revealIn scrolls to: the item a quarter of the box's height below its top.
+    // Plain numbers, so it can be tested without layout.
+    revealTop: function (m) {
+      return Math.max(0, Math.round(m.scrollTop + (m.itemTop - m.boxTop) - m.boxHeight / 4));
+    },
     // Whether a box's text is cut off: an ellipsis that is in use (content wider than the
     // box) or a line clamp that hides lines. Takes plain numbers so it can be tested
     // without layout.

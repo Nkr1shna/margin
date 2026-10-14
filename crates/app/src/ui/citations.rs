@@ -2,7 +2,7 @@
 //! citation marker or a list entry opens, at the cited page, time, image or passage.
 
 use dioxus::prelude::*;
-use margin_shared::{Citation, Id};
+use margin_shared::{Citation, Id, SourceKind};
 
 use crate::citations::{
     self, Segment, Viewer, kind_label, locator, neighbors, open_label, open_url, position,
@@ -13,6 +13,7 @@ use crate::ui::sources::kind_icon;
 
 const DIALOG_ID: &str = "source-viewer";
 const MEDIA_ID: &str = "viewer-media";
+const TRANSCRIPT_ID: &str = "viewer-transcript";
 
 /// Open the source viewer on `n`.
 pub fn open_viewer(app: AppCtx, lesson_id: &Id, n: u32) {
@@ -110,7 +111,21 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
         .get(&lesson_id)
         .map(|l| citations::ordered(&l.citations))
         .unwrap_or_default();
-    let Some(c) = all.iter().find(|c| c.n == n).cloned() else {
+    let found = all.iter().find(|c| c.n == n).cloned();
+    // An audio or video source's whole transcript: what was fetched last shows at once,
+    // and is fetched again each time the viewer turns to the source (a source read
+    // again has a new one).
+    let recording = found
+        .as_ref()
+        .filter(|c| matches!(c.kind, SourceKind::Audio | SourceKind::Video))
+        .filter(|c| lib.sources.contains_key(&c.source_id))
+        .map(|c| c.source_id.clone());
+    use_effect(use_reactive!(|recording| {
+        if let Some(source_id) = recording {
+            spawn(fetch_transcript(app, source_id));
+        }
+    }));
+    let Some(c) = found else {
         drop(lib);
         // The lesson changed under the viewer (regenerated or deleted).
         return rsx! {};
@@ -122,7 +137,13 @@ pub fn SourceViewerDialog(lesson_id: Id, n: u32) -> Element {
     let source_gone = !lib.sources.contains_key(&c.source_id);
     drop(lib);
 
-    let view = citations::viewer(&c, &all, media_url.as_deref());
+    let lines = app
+        .transcripts
+        .read()
+        .get(&c.source_id)
+        .cloned()
+        .unwrap_or_default();
+    let view = citations::viewer(&c, &all, media_url.as_deref(), &lines);
     let open = open_url(&c, media_url.as_deref());
     let (prev, next) = neighbors(&all, n);
     let (index, total) = position(&all, n).unwrap_or((1, all.len()));
@@ -322,6 +343,21 @@ fn ViewerContent(
     }
 }
 
+/// Fetch a source's whole transcript into `AppCtx::transcripts`. A failure leaves the
+/// viewer on what it has (the cited passages, at worst).
+async fn fetch_transcript(app: AppCtx, source_id: Id) {
+    let Some(api) = app.api() else { return };
+    match api.source_transcript(&source_id).await {
+        Ok(lines) => {
+            let mut transcripts = app.transcripts;
+            if transcripts.peek().get(&source_id) != Some(&lines) {
+                transcripts.write().insert(source_id, lines);
+            }
+        }
+        Err(e) => eprintln!("couldn't fetch the transcript of {source_id}: {e}"),
+    }
+}
+
 /// Move the viewer's player to `start_ms` (once it knows its duration), optionally
 /// playing from there.
 fn seek(start_ms: u64, play: bool) {
@@ -345,21 +381,39 @@ fn Passage(excerpt: String, code: bool) -> Element {
     }
 }
 
-/// The source's cited passages, by time, with the open citation's marked. Each plays
-/// the player from its start.
+/// The source's whole transcript (or, without one, the passages the lesson cites), by
+/// time: the open citation's span marked and scrolled into view, the lesson's other
+/// citations of it tinted. Any line plays the recording from its start.
 #[component]
 fn Transcript(segments: Vec<Segment>) -> Element {
+    // Lines arrive after the viewer opens; bring the cited ones into view once they're
+    // there (and again if they change).
+    let first = citations::first_current(&segments);
+    let count = segments.len();
+    use_effect(use_reactive!(|first, count| {
+        let _ = count;
+        if first.is_some() {
+            let id = serde_json::to_string(TRANSCRIPT_ID).unwrap_or_default();
+            let _ = js(&format!("MarginApp.revealIn({id}, '.seg-line.current');"));
+        }
+    }));
     if segments.is_empty() {
         return rsx! {};
     }
+    // Lines of the whole transcript carry no citation number.
+    let whole = segments.iter().all(|s| s.n == 0);
     rsx! {
         div { class: "transcript",
-            h3 { "Transcript" }
-            ol {
+            h3 { if whole { "Transcript" } else { "Cited passages" } }
+            ol { id: "{TRANSCRIPT_ID}", class: "seg-list",
                 for s in segments {
                     li { key: "{s.n}-{s.start_ms}",
                         button {
-                            class: if s.current { "seg-line current" } else { "seg-line" },
+                            class: match (s.current, s.cited) {
+                                (true, _) => "seg-line current",
+                                (false, true) => "seg-line cited",
+                                _ => "seg-line",
+                            },
                             "aria-current": s.current.to_string(),
                             title: "Play from {citations::clock(s.start_ms)}",
                             onclick: move |_| seek(s.start_ms, true),
@@ -368,6 +422,9 @@ fn Transcript(segments: Vec<Segment>) -> Element {
                                 mark { "{s.text}" }
                             } else {
                                 span { "{s.text}" }
+                            }
+                            if s.cited && !s.current {
+                                span { class: "sr-only", " (cited elsewhere in this lesson)" }
                             }
                         }
                     }

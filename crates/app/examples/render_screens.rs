@@ -12,6 +12,9 @@
 //! - `RENDER_UPLOADS=1` attaches sample files and a folder in the Ask composer.
 //! - `RENDER_EMBEDDING=missing|downloading|ready|failed` sets the embedding model's state.
 //! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n.
+//! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
+//! - `RENDER_JS=<script>` runs a script once the page has loaded (scrolling, opening a
+//!   tooltip…), since effects don't run here.
 //!
 //! The Read view's lesson body is filled in on load, and the sample sources' media are
 //! the files in `examples/sample-media`.
@@ -80,6 +83,20 @@ fn Harness(props: HarnessProps) -> Element {
     let viewer_lesson = lesson_in_route(&props.route);
     use_context_provider(move || {
         let mut lib = LibraryState::from_library(sample_library());
+        if std::env::var_os("RENDER_SOURCE_WARNING").is_some()
+            && let Some(s5) = lib.sources.get_mut("s5")
+        {
+            s5.status = SourceStatus::Ready {
+                chunks: 2,
+                pages: None,
+                warning: Some(
+                    "It wasn't transcribed: fluidaudiocli isn't installed on the service Mac \
+                     (Settings → Tools shows how to install it). Its sound is still searched, \
+                     but lessons can't quote what's said. Read it again once that's fixed."
+                        .into(),
+                ),
+            };
+        }
         lib.settings = Some(Settings {
             openai_base_url: "https://api.openai.com/v1".into(),
             openai_model: "gpt-5".into(),
@@ -159,6 +176,12 @@ fn Harness(props: HarnessProps) -> Element {
                     .and_then(|n| n.parse().ok())
                     .zip(viewer_lesson)
                     .map(|(n, lesson_id)| state::SourceViewer { lesson_id, n }),
+            ),
+            transcripts: Signal::new(
+                ["s5", "s6"]
+                    .into_iter()
+                    .map(|id| (id.to_string(), fake::sample_transcript(id)))
+                    .collect(),
             ),
         }
     });
@@ -302,7 +325,7 @@ async fn main() {
 <script src="{kjs}"></script>
 <script src="{mjs}"></script>
 </head><body><div id="main">{body}</div>
-<script>window.addEventListener('load', function () {{ {body_script} MarginApp.renderMathIn('.md'); }});</script>
+<script>window.addEventListener('load', function () {{ {body_script} MarginApp.renderMathIn('.md'); {extra_js} }});</script>
 </body></html>"#,
         f1 = file_url(&fonts.join("AlbertSans-wght.ttf")),
         f2 = file_url(&fonts.join("AlbertSans-Italic-wght.ttf")),
@@ -310,6 +333,7 @@ async fn main() {
         kcss = file_url(&assets.join("katex/katex.min.css")),
         kjs = file_url(&assets.join("katex/katex.min.js")),
         mjs = file_url(&assets.join("margin.js")),
+        extra_js = std::env::var("RENDER_JS").unwrap_or_default(),
     );
     std::fs::write(&out, html).expect("write html");
     println!("wrote {out}");
