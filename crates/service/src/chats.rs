@@ -2,7 +2,8 @@
 //! Turns themselves run in `turns`. See `docs/agent-contract.md`.
 //!
 //! Every change is stored under `write_lock` and then broadcast: `ChatChanged` for the
-//! chat record, `ChatItemChanged` for items, `ChatDeleted` on delete.
+//! chat record (not for `updated_at` alone), `ChatItemChanged` for items, `ChatDeleted`
+//! on delete.
 
 use std::collections::HashSet;
 
@@ -73,12 +74,20 @@ pub async fn items(state: &AppState, chat_id: &str) -> anyhow::Result<Vec<Stored
     Ok(rows)
 }
 
-/// Stores the chat (bumping `updated_at`) and emits `ChatChanged`. Call with
-/// `write_lock` held.
+/// Stores the chat (bumping `updated_at`) and emits `ChatChanged` when something else
+/// changed (state, title, pending message, usage, attachments, waiting): a new item only
+/// bumps `updated_at`, which is saved silently. Call with `write_lock` held.
 pub async fn save_chat_locked(state: &AppState, chat: &mut Chat) -> anyhow::Result<()> {
+    let before: Option<Chat> = state.store.get(db::CHAT, &chat.id).await?;
     chat.updated_at = Utc::now();
     state.store.put(db::CHAT, &chat.id, &*chat).await?;
-    state.emit(Event::ChatChanged { chat: chat.clone() });
+    let changed = before.is_none_or(|mut b| {
+        b.updated_at = chat.updated_at;
+        b != *chat
+    });
+    if changed {
+        state.emit(Event::ChatChanged { chat: chat.clone() });
+    }
     Ok(())
 }
 
@@ -369,8 +378,9 @@ pub async fn get_chat(
     Ok(Json(ChatDetail { chat, items }))
 }
 
-/// `PATCH /api/chats/{id}`: rename (trimmed, not empty, at most 200 characters), replace
-/// attached folders (each must exist) or files.
+/// `PATCH /api/chats/{id}`: rename (trimmed, not empty, at most 200 characters; the
+/// title is then the owner's and the model never replaces it), replace attached folders
+/// (each must exist) or files.
 pub async fn patch_chat(
     State(state): State<AppState>,
     Path(id): Path<Id>,
@@ -399,6 +409,7 @@ pub async fn patch_chat(
         let mut chat = chat(&state, &id).await?;
         if let Some(t) = title {
             chat.title = t;
+            chat.title_by = TitleSource::Owner;
         }
         if let Some(ids) = workspace_ids {
             chat.workspace_ids = ids;
