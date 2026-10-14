@@ -6,9 +6,8 @@
 name: test
 
 on:
-  push:
-    # The deploy branches (dev, release) run these through build-service.yml before it builds.
-    branches-ignore: [dev, release]
+  # CI runs when a PR is opened or updated (the required `test` check); merging into dev or
+  # release is CD (build-service), which builds what this check tested.
   pull_request:
   workflow_call:
   workflow_dispatch:
