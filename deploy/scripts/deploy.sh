@@ -4,8 +4,10 @@
 #
 #   deploy.sh dev|prod PATH/TO/margin-service SHA
 #
-# Replaces only the binary. The data folder, backups and config stay on the persistent
-# share (common.sh) and are never touched, except for the backup taken first:
+# Replaces only the binary, and writes the GitHub Environment's secrets (MARGIN_SECRET_*)
+# into the share's secrets.toml (common.sh write_secrets). The data folder, backups and
+# config stay on the persistent share (common.sh) and are never touched, except for the
+# backup taken first:
 #   preflight (macOS guest, share mounted and belonging to this environment, config
 #   environment matches, data_dir on the share) -> copy the binary in -> stop the
 #   service -> backup-margin.sh --label <old sha> -> swap the binary -> start ->
@@ -121,6 +123,7 @@ fi
 
 host_dir="$(host_persist_dir "$env_name")"
 [ -f "$host_dir/$MARGIN_MARKER" ] || die "no $host_dir/$MARGIN_MARKER on this Mac: run provision-guest.sh $env_name first"
+write_secrets "$env_name"
 
 guest_os="$(guest_ssh "$env_name" uname -s)" || die "couldn't reach $(guest_host "$env_name") (if its host key changed, Orchard recreated the VM: provision-guest.sh $env_name --rekey)"
 [ "$guest_os" = Darwin ] || die "$(guest_host "$env_name") runs $guest_os; only macOS guests are deployed by this script (Linux: docs/plan-linux-service.md)"

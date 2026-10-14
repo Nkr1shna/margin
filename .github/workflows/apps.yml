@@ -1,11 +1,25 @@
-# Builds the apps per environment (docs/plan-deploy.md §4, §8): a fresh install starts
-# on the service named by MARGIN_DEFAULT_SERVICE_URL at build time; the sign-in screen
-# still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled Margin.app, signed
-# ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer account, owner
-# question 7). Android: the APK.
+# Builds the apps per environment (docs/plan-deploy.md §4, §8) on the host runner and
+# publishes them as GitHub releases, so every deployed service has a matching app:
+#
+#   after a successful deploy-dev    -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
+#   after a successful deploy-prod   -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
+#   a v* tag                         -> both environments, release named after the tag
+#   workflow_dispatch                -> workflow artifacts only, no release
+#
+# Each build is of the exact commit that was deployed (the deployed-<env>-<sha> artifact).
+# A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
+# the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
+# Margin.app (Margin Dev.app for dev: its own name, bundle id, settings and Keychain
+# entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer
+# account, owner question 7). Android: the APK, skipped while the runner has no Android SDK.
+#
+# workflow_run triggers only take effect once this file is on the default branch (dev).
 name: apps
 
 on:
+  workflow_run:
+    workflows: [deploy-dev, deploy-prod]
+    types: [completed]
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -19,12 +33,20 @@ on:
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  group: apps-${{ github.event.workflow_run.name || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   plan:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, macOS, ARM64, margin]
     outputs:
       environments: ${{ steps.pick.outputs.environments }}
+      sha: ${{ steps.pick.outputs.sha }}
+      release: ${{ steps.pick.outputs.release }}
     steps:
       - name: Only from main
         run: |
@@ -33,14 +55,48 @@ jobs:
           fi
       - id: pick
         env:
-          CHOICE: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'both' }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          CHOICE: ${{ inputs.environment }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
         run: |
-          case "$CHOICE" in
-            prod) echo 'environments=["prod"]' >> "$GITHUB_OUTPUT" ;;
-            dev) echo 'environments=["dev"]' >> "$GITHUB_OUTPUT" ;;
-            both) echo 'environments=["prod","dev"]' >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::unknown environment $CHOICE"; exit 1 ;;
+          case "$EVENT" in
+            workflow_run)
+              case "$RUN_NAME" in
+                deploy-dev) env=dev ;;
+                deploy-prod) env=prod ;;
+                *) echo "::error::unexpected workflow $RUN_NAME"; exit 1 ;;
+              esac
+              # The commit that was actually deployed, from the run's deployed-<env>-<sha> artifact.
+              name="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+                --jq "[.artifacts[] | select(.name | startswith(\"deployed-$env-\"))][0].name")"
+              sha="${name#deployed-$env-}"
+              environments="[\"$env\"]"
+              release="$env"
+              ;;
+            push)
+              sha="$GITHUB_SHA"
+              environments='["prod","dev"]'
+              release=tag
+              ;;
+            workflow_dispatch)
+              sha="$GITHUB_SHA"
+              case "$CHOICE" in
+                prod) environments='["prod"]' ;;
+                dev) environments='["dev"]' ;;
+                both) environments='["prod","dev"]' ;;
+                *) echo "::error::unknown environment $CHOICE"; exit 1 ;;
+              esac
+              release=none
+              ;;
           esac
+          case "$sha" in *[!0-9a-f]*|"") echo "::error::no deployed commit found (got '$sha')"; exit 1 ;; esac
+          {
+            echo "environments=$environments"
+            echo "sha=$sha"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
 
   apps:
     needs: plan
@@ -53,7 +109,12 @@ jobs:
         environment: ${{ fromJSON(needs.plan.outputs.environments) }}
     env:
       CARGO_TERM_COLOR: always
+      SHA: ${{ needs.plan.outputs.sha }}
       MARGIN_DEFAULT_SERVICE_URL: ${{ matrix.environment == 'dev' && 'https://devmargin.krishnanelloore.com' || 'https://margin.krishnanelloore.com' }}
+      # The dev build is its own app ("Margin Dev"), so it installs beside Margin with its
+      # own settings folder and Keychain entries (crates/app config.rs APP_NAME, secrets.rs).
+      MARGIN_APP_NAME: ${{ matrix.environment == 'dev' && 'Margin Dev' || 'Margin' }}
+      MARGIN_APP_ID: ${{ matrix.environment == 'dev' && 'com.krishnanelloore.margin.app.dev' || 'com.krishnanelloore.margin.app' }}
     steps:
       - name: Only from main
         run: |
@@ -62,6 +123,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
       - name: Put Rust, dx and Homebrew on PATH
         run: |
@@ -69,28 +131,90 @@ jobs:
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
       # dx runs from the workspace root with -p margin-app (from the crate it panics).
       # The icon is only in `dx bundle` output.
+      # Renames the bundle in this checkout only (Dioxus.toml and the Info.plist template).
+      - name: App identity
+        if: matrix.environment == 'dev'
+        run: |
+          sed -i '' -e "s/^name = \"Margin\"$/name = \"$MARGIN_APP_NAME\"/" \
+            -e "s/^identifier = \".*\"$/identifier = \"$MARGIN_APP_ID\"/" \
+            -e "s/^bundle_name = \".*\"$/bundle_name = \"$MARGIN_APP_NAME\"/" crates/app/Dioxus.toml
+          plist=crates/app/macos/Info.plist
+          plutil -replace CFBundleIdentifier -string "$MARGIN_APP_ID" "$plist"
+          plutil -replace CFBundleName -string "$MARGIN_APP_NAME" "$plist"
+          plutil -replace CFBundleDisplayName -string "$MARGIN_APP_NAME" "$plist"
+          grep -E '^(name|identifier|bundle_name) =' crates/app/Dioxus.toml
       - name: Desktop bundle
         run: |
           dx --version
           dx bundle -p margin-app --platform desktop --package-types macos --release
-          app="target/dx/margin-app/bundle/macos/macos/Margin.app"
-          [ -d "$app" ] || { echo "::error::no $app"; exit 1; }
+          app="$(find target/dx/margin-app/bundle/macos -maxdepth 2 -name '*.app' -type d | head -n 1)"
+          [ -d "$app" ] || { echo "::error::dx bundled no .app"; exit 1; }
+          id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+          [ "$id" = "$MARGIN_APP_ID" ] || { echo "::error::$app is $id, expected $MARGIN_APP_ID"; exit 1; }
           codesign --force --deep --sign - "$app"
           mkdir -p dist
-          hdiutil create -volname "Margin" -srcfolder "$app" -ov -format UDZO \
-            "dist/Margin-${{ matrix.environment }}-${GITHUB_SHA::12}.dmg"
+          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$app" -ov -format UDZO \
+            "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
       - name: Android build
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
           export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+          if [ ! -d "$ANDROID_NDK_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
+            echo "::warning::no Android SDK/NDK or JDK 17 on this runner; skipping the APK"
+            exit 0
+          fi
           dx build -p margin-app --platform android --release
           apk="$(find target/dx/margin-app -name '*.apk' -newer Cargo.toml | head -n 1)"
           [ -n "$apk" ] || { echo "::error::dx built no APK"; exit 1; }
-          cp "$apk" "dist/Margin-${{ matrix.environment }}-${GITHUB_SHA::12}.apk"
+          cp "$apk" "dist/Margin-${{ matrix.environment }}-${SHA::12}.apk"
       - uses: actions/upload-artifact@v4
         with:
-          name: margin-apps-${{ matrix.environment }}-${{ github.sha }}
+          name: margin-apps-${{ matrix.environment }}-${{ needs.plan.outputs.sha }}
           path: dist/
           retention-days: 90
           if-no-files-found: error
+
+  release:
+    needs: [plan, apps]
+    if: needs.plan.outputs.release != 'none'
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      KIND: ${{ needs.plan.outputs.release }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: margin-apps-*-${{ needs.plan.outputs.sha }}
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          short="${SHA::12}"
+          cat > notes.md <<EOF
+          Margin apps built from \`$short\`, the commit deployed to $KIND.
+
+          The desktop app is signed ad hoc, not notarized: after moving it to Applications,
+          run \`xattr -dr com.apple.quarantine "/Applications/Margin Dev.app"\` (dev) or
+          \`xattr -dr com.apple.quarantine /Applications/Margin.app\` (prod) once.
+          EOF
+          case "$KIND" in
+            dev)
+              # One rolling pre-release that always holds the app for what dev runs now.
+              gh release delete dev-latest -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+              gh release create dev-latest dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
+                --prerelease --title "Margin dev ($short)" --notes-file notes.md
+              ;;
+            prod)
+              gh release create "prod-$short" dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
+                --latest --title "Margin ($short)" --notes-file notes.md
+              ;;
+            tag)
+              gh release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --verify-tag \
+                --title "Margin $GITHUB_REF_NAME" --notes-file notes.md
+              ;;
+          esac

@@ -7,8 +7,8 @@ name: test
 
 on:
   push:
-    # The deploy branch runs these through build-service.yml before it builds.
-    branches-ignore: [main]
+    # The deploy branches (dev, release) run these through build-service.yml before it builds.
+    branches-ignore: [dev, release]
   pull_request:
   workflow_call:
   workflow_dispatch:

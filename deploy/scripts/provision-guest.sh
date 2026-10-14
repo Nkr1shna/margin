@@ -19,8 +19,8 @@
 # --startup-script prints the Orchard startup script that, on every (re)creation, names
 # the guest margin-<env> (so margin-<env>.local resolves) and authorizes the deploy key.
 #
-# What it can't do, and prints: Keychain secrets and `cloudflared tunnel login` need the
-# owner in the VM's own window (Screen Sharing), never over SSH.
+# What it can't do, and prints: `cloudflared tunnel login` needs the owner in the VM's own
+# window (Screen Sharing). Secrets come from the GitHub Environments through deploy.sh.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/common.sh"
@@ -48,6 +48,7 @@ bind = "127.0.0.1:8787"
 data_dir = "$p/data"
 github_client_id = ""
 allowed_github_login = "Nkr1shna"
+secrets_file = "$p/secrets.toml"
 EOF
     echo "Wrote a starter $config."
   fi
@@ -90,9 +91,34 @@ EOF
     todo="$todo
   - cloudflared tunnel create $(vm_name "$env_name") (in the guest), then
     provision-guest.sh $env_name --tunnel-uuid <UUID>"
-  elif [ ! -f "$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist" ]; then
-    "$cloudflared" service install
-    echo "Installed the cloudflared LaunchAgent."
+  else
+    # Not `cloudflared service install`: its LaunchAgent runs bare `cloudflared`, which
+    # only prints "use cloudflared tunnel run" and exits, so the tunnel never connects.
+    plist="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+    cat > "$plist.part" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cloudflare.cloudflared</string>
+  <key>ProgramArguments</key><array>
+    <string>$cloudflared</string><string>tunnel</string>
+    <string>--config</string><string>$p/cloudflared/config.yml</string><string>run</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/com.cloudflare.cloudflared.out.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/com.cloudflare.cloudflared.err.log</string>
+</dict></plist>
+EOF
+    plutil -lint "$plist.part" >/dev/null
+    if ! cmp -s "$plist.part" "$plist"; then
+      mv -f "$plist.part" "$plist"
+      launchctl bootout "gui/$(id -u)/com.cloudflare.cloudflared" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      echo "Installed the cloudflared LaunchAgent."
+    else
+      rm -f "$plist.part"
+    fi
   fi
 
   # The LaunchAgents.
@@ -112,11 +138,10 @@ EOF
     todo="$todo
   - No binary on the share yet: the next deploy-dev run (or deploy.sh $env_name …) installs it"
   fi
-  if ! security find-generic-password -s com.krishnanelloore.margin -a github-client-secret >/dev/null 2>&1; then
+  if ! grep -q '^github-client-secret' "$p/secrets.toml" 2>/dev/null; then
     todo="$todo
-  - The Keychain has no github-client-secret (a recreated VM has an empty Keychain):
-    run margin-service setup in the VM's window, then sign in from the app and enter the
-    model keys in Settings again; click Always Allow on the first Keychain prompt"
+  - No github-client-secret in $p/secrets.toml yet: the next deploy writes it from the
+    GitHub Environment secret MARGIN_GITHUB_CLIENT_SECRET (gh secret set … --env $env_name)"
   fi
 
   echo "Provisioned $(vm_name "$env_name"): config, data and backups on $p (the Mac mini's disk)."

@@ -7,7 +7,12 @@
 //!
 //! One entry per service URL, so switching services never mixes tokens.
 
-const SERVICE: &str = "com.krishnanelloore.margin.app";
+/// The Keychain service: the app's bundle identifier, which `MARGIN_APP_ID` changes at build
+/// time for apps.yml's dev build, so its tokens are its own.
+const SERVICE: &str = match option_env!("MARGIN_APP_ID") {
+    Some(id) => id,
+    None => "com.krishnanelloore.margin.app",
+};
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod platform {

@@ -1,6 +1,6 @@
 //! Local, non-secret app settings: the service URL and the appearance choice, kept in
 //! `app.json` in the platform data directory (`~/Library/Application Support/Margin` on
-//! macOS and iOS, the app's files directory on Android).
+//! macOS and iOS, the app's files directory on Android; `Margin Dev` for the dev build).
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,14 @@ pub const DEV_SERVICE_URL: &str = "https://devmargin.krishnanelloore.com";
 pub const DEFAULT_SERVICE_URL: &str = match option_env!("MARGIN_DEFAULT_SERVICE_URL") {
     Some(url) => url,
     None => PROD_SERVICE_URL,
+};
+
+/// The app's name, and its folder in the platform data directory: "Margin", or what
+/// `MARGIN_APP_NAME` says at build time ("Margin Dev" for apps.yml's dev build, so it
+/// installs and keeps its settings beside the prod app).
+pub const APP_NAME: &str = match option_env!("MARGIN_APP_NAME") {
+    Some(name) => name,
+    None => "Margin",
 };
 
 /// The sign-in screen's named services; anything else is "Custom".
@@ -125,11 +133,11 @@ pub fn normalize_service_url(input: &str) -> Result<String, String> {
 pub fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
     {
-        android_dir("getFilesDir").map(|d| d.join("Margin"))
+        android_dir("getFilesDir").map(|d| d.join(APP_NAME))
     }
     #[cfg(not(target_os = "android"))]
     {
-        dirs::data_dir().map(|d| d.join("Margin"))
+        dirs::data_dir().map(|d| d.join(APP_NAME))
     }
 }
 
