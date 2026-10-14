@@ -1,0 +1,17 @@
+# dx configuration for the Margin app.
+
+[application]
+name = "Margin"
+
+[bundle]
+identifier = "com.krishnanelloore.margin.app"
+publisher = "Krishna Nelloore"
+
+[bundle.macos]
+bundle_name = "Margin"
+minimum_system_version = "14.0"
+# The icon only appears in `dx bundle` output; `dx build` uses dx's own plist.
+info_plist_path = "macos/Info.plist"
+# Liquid Glass icon compiled from icon/Margin.icon by icon/build.sh. Assets.car holds
+# the layered icon macOS 26+ renders; Margin.icns is the flat fallback.
+files = { "Resources/Assets.car" = "icon/build/Assets.car", "Resources/Margin.icns" = "icon/build/Margin.icns" }
