@@ -13,8 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use margin_ai::{
-    AiError, FailedScene, LessonContext, Passage, ResponsesClient, SceneRequest, propose_outline,
-    write_lesson, write_scene,
+    AiError, FailedScene, Image, LessonContext, Passage, ResponsesClient, SceneRequest,
+    propose_outline, write_lesson, write_scene,
 };
 use margin_shared::{AskRequest, Level, OutlineLesson};
 use serde_json::{Value, json};
@@ -418,6 +418,7 @@ fn passages() -> Vec<Passage> {
         source: "dsp.pdf".into(),
         page: Some(12),
         text: "The coefficient a_n is the projection onto cos(n x).".into(),
+        ..Default::default()
     }]
 }
 
@@ -588,11 +589,82 @@ async fn write_lesson_sends_source_passages() {
     write_lesson(&client, &ctx, |_| {}).await.unwrap();
     let (_, req) = last_request(&fake);
     let ins = req["instructions"].as_str().unwrap();
-    assert!(ins.contains("Mention the source by name"));
+    assert!(ins.contains("Markdown footnote references"));
     let input = req["input"].as_str().unwrap();
     assert!(
         input.contains("[1] dsp.pdf, p. 12:\nThe coefficient a_n is the projection onto cos(n x).")
     );
+}
+
+/// Pictures go as `input_image` parts (base64 data URLs) inside one user message, each
+/// right after its passage's heading.
+#[tokio::test]
+async fn write_lesson_sends_pictures_as_image_inputs() {
+    let (client, fake) = spawn(vec![chunked(&text_stream(&["## Idea\n\nText.[^2]\n"]), 64)]).await;
+    let mut ctx = lesson_ctx(1);
+    ctx.passages = passages();
+    ctx.passages.push(Passage {
+        source: "board.jpg".into(),
+        image: Some(Image {
+            media_type: "image/jpeg".into(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+        }),
+        ..Default::default()
+    });
+    let body = write_lesson(&client, &ctx, |_| {}).await.unwrap();
+    assert_eq!(body, "## Idea\n\nText.[^2]\n");
+    let (_, req) = last_request(&fake);
+    let input = req["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["role"], "user");
+    let content = input[0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "input_text");
+    let before = content[0]["text"].as_str().unwrap();
+    assert!(before.contains("[1] dsp.pdf, p. 12:"));
+    assert!(before.ends_with("[2] board.jpg, picture attached below:\n"));
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["image_url"], "data:image/jpeg;base64,/9j/4A==");
+    assert_eq!(content[1]["detail"], "auto");
+    assert_eq!(content[2]["type"], "input_text");
+    assert!(
+        content[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("=== END SOURCE PASSAGES ===")
+    );
+}
+
+#[tokio::test]
+async fn propose_outline_sends_pictures_too() {
+    let (client, fake) = spawn(vec![Reply::Json(
+        StatusCode::OK,
+        message_response(&outline_json(2)),
+    )])
+    .await;
+    let picture = Passage {
+        source: "slides.pdf".into(),
+        page: Some(2),
+        text: "Slide two.".into(),
+        image: Some(Image {
+            media_type: "image/png".into(),
+            data: vec![1, 2, 3],
+        }),
+        ..Default::default()
+    };
+    propose_outline(&client, &ask(2), &[], &[picture])
+        .await
+        .unwrap();
+    let (_, req) = last_request(&fake);
+    let content = req["input"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["image_url"], "data:image/png;base64,AQID");
+    assert!(
+        content[2]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Slide two.")
+    );
+    assert_eq!(req["text"]["format"]["type"], "json_schema");
 }
 
 #[tokio::test]
