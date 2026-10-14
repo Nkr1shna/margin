@@ -28,10 +28,12 @@ pub struct LibraryState {
 /// What the sidebar dot shows for a lesson's video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoDot {
-    /// No video, or the last render failed.
+    /// No video (the sidebar shows nothing).
     None,
     InProgress,
     Ready,
+    /// The last render failed.
+    Failed,
 }
 
 impl LibraryState {
@@ -217,7 +219,8 @@ impl LibraryState {
 
     pub fn video_dot(&self, lesson_id: &str) -> VideoDot {
         match self.video_for_lesson(lesson_id).map(|v| &v.status) {
-            None | Some(VideoStatus::Failed { .. }) => VideoDot::None,
+            None => VideoDot::None,
+            Some(VideoStatus::Failed { .. }) => VideoDot::Failed,
             Some(VideoStatus::Ready) => VideoDot::Ready,
             Some(_) => VideoDot::InProgress,
         }
@@ -686,7 +689,7 @@ pub(crate) mod tests {
             ),
         });
         assert_eq!(s.videos.values().filter(|v| v.lesson_id == "l2").count(), 1);
-        assert_eq!(s.video_dot("l2"), VideoDot::None);
+        assert_eq!(s.video_dot("l2"), VideoDot::Failed);
     }
 
     #[test]

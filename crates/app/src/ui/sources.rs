@@ -255,7 +255,7 @@ fn UploadActions(upload: Upload, on_remove: EventHandler<()>) -> Element {
     let key = upload.key;
     rsx! {
         if matches!(upload.state, UploadState::Failed(_)) {
-            button { class: "btn btn-ghost btn-sm", onclick: move |_| retry(app, key), "Retry" }
+            button { class: "btn btn-secondary btn-sm", onclick: move |_| retry(app, key), "Try again" }
         }
         button {
             class: "icon-btn sm",
@@ -295,7 +295,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                 disabled: *picking.read(),
                 onclick: move |_| open.toggle(),
                 if *picking.read() {
-                    span { class: "spinner", style: "width: 14px; height: 14px" }
+                    span { class: "spinner" }
                 } else {
                     Icon { name: "clip" }
                 }
@@ -308,7 +308,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                     role: "menu",
                     onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); open.set(false) },
                     button { role: "menuitem", onmounted: crate::ui::common::focus_on_mount, onclick: move |_| add(false),
-                        Icon { name: "note" }
+                        Icon { name: "file-add" }
                         "Add files…"
                     }
                     button { role: "menuitem", onclick: move |_| add(true),
@@ -550,7 +550,7 @@ pub fn EmbeddingNotice() -> Element {
                                         class: "btn btn-primary btn-sm",
                                         disabled: *busy.read(),
                                         onclick: download,
-                                        if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                                        if *busy.read() { span { class: "spinner" } }
                                         "Download · {human_bytes(*download_bytes)}"
                                     }
                                 },
@@ -809,7 +809,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                             class: "btn btn-secondary btn-sm",
                             disabled: *picking.read(),
                             onclick: add(false),
-                            Icon { name: "note" }
+                            Icon { name: "file-add" }
                             "Add files…"
                         }
                         button {

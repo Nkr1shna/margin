@@ -11,7 +11,8 @@ use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::common::{
-    ConfirmDialog, CrumbLink, Icon, Loading, TopBar, ago, focus_on_mount, render_math,
+    CrumbLink, DeleteNoteDialog, Icon, Loading, TopBar, ago, capitalize_first, focus_on_mount,
+    render_math,
 };
 
 /// A topic breadcrumb and its notes, each with the title of the lesson it came from.
@@ -89,10 +90,8 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
             (c, with)
         })
         .collect();
-    let selected_title = selected
-        .as_ref()
-        .and_then(|s| lib.notes.get(s).map(|n| n.title.clone()));
-    let selected_exists = selected_title.is_some();
+    let open_note = selected.as_ref().and_then(|s| lib.notes.get(s));
+    let selected_exists = open_note.is_some();
     // Whether a new note in topic `t` belongs in this list (else it opens in All notes).
     let scope_of_new = |t: &str| {
         topic
@@ -103,23 +102,44 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
         .iter()
         .map(|(id, _)| (id.clone(), scope_of_new(id)))
         .collect();
+    // The top bar says where you are, like a lesson's: a topic's notes are
+    // "Topic / Sub / Notes" (and "… / Notes / Its title" with a note open), a note from
+    // All notes is "Topic / Sub / Its title". Topic crumbs show the topic in the sidebar;
+    // "Notes" leads back to the list.
+    let path = |topic_id: &str| -> (Vec<String>, Vec<Option<CrumbLink>>) {
+        lib.topic_path(topic_id)
+            .iter()
+            .map(|t| (t.title.clone(), Some(CrumbLink::Topic(t.id.clone()))))
+            .unzip()
+    };
+    let note_title = |n: &Note| {
+        if n.title.trim().is_empty() {
+            "Untitled note".to_string()
+        } else {
+            n.title.clone()
+        }
+    };
+    let (crumbs, crumb_links): (Vec<String>, Vec<Option<CrumbLink>>) = match (&topic, open_note) {
+        (Some(t), note) if topic_title.is_some() => {
+            let (mut c, mut l) = path(t);
+            c.push("Notes".to_string());
+            if let Some(note) = note {
+                l.push(Some(CrumbLink::Route(Route::notes_list(topic.clone()))));
+                c.push(note_title(note));
+            }
+            l.push(None);
+            (c, l)
+        }
+        (None, Some(note)) => {
+            let (mut c, mut l) = path(&note.topic_id);
+            c.push(note_title(note));
+            l.push(None);
+            (c, l)
+        }
+        _ => (vec!["All notes".to_string()], Vec::new()),
+    };
     drop(lib);
 
-    let heading = match &topic_title {
-        Some(t) => format!("{t} · notes"),
-        None => "All notes".to_string(),
-    };
-    // "<list> / <note>" while a note is open; the list crumb leads back to the list.
-    let (crumbs, crumb_links) = match &selected_title {
-        Some(title) => (
-            vec![heading.clone(), title.clone()],
-            vec![
-                Some(CrumbLink::Route(Route::notes_list(topic.clone()))),
-                None,
-            ],
-        ),
-        None => (vec![heading.clone()], Vec::new()),
-    };
     let default_topic = topic
         .clone()
         .or_else(|| topics.first().map(|(id, _)| id.clone()));
@@ -169,11 +189,20 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
         div { class: "scroll", style: "overflow: hidden",
             div { class: if selected_exists { "notes-wrap has-selection" } else { "notes-wrap" },
                 div { class: "note-list",
+                    // The top bar names the list; the filter and + share the first row.
                     div { class: "note-list-head",
-                        b { "{heading}" }
+                        input {
+                            class: "input",
+                            r#type: "search",
+                            placeholder: "Filter notes",
+                            "aria-label": "Filter notes",
+                            initial_value: "{query}",
+                            oninput: move |e| query.set(e.value()),
+                        }
                         button {
                             class: "icon-btn",
                             "aria-label": "New note",
+                            "aria-expanded": creating.read().to_string(),
                             title: "New note",
                             onclick: move |_| {
                                 new_topic.set(default_topic.clone());
@@ -219,14 +248,6 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                 }
                             }
                         }
-                    }
-                    input {
-                        class: "input",
-                        r#type: "search",
-                        placeholder: "Filter notes",
-                        "aria-label": "Filter notes",
-                        initial_value: "{query}",
-                        oninput: move |e| query.set(e.value()),
                     }
                     if loading {
                         Loading {}
@@ -278,7 +299,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                         },
                                         b { "{note.title}" }
                                         span {
-                                            "{ago(&note.updated_at)}"
+                                            {capitalize_first(&ago(&note.updated_at))}
                                             if let Some(t) = lesson_title { " · from {t}" }
                                         }
                                     }
@@ -314,6 +335,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                                 Icon { name: "note" }
                                                 "Open"
                                             }
+                                            div { class: "sep", role: "separator" }
                                             button {
                                                 role: "menuitem",
                                                 class: "danger",
@@ -359,10 +381,8 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
             }
         }
         if let Some((id, title)) = confirm_note.read().clone() {
-            ConfirmDialog {
-                title: "Delete “{title}”?",
-                message: "This note will be deleted. This can't be undone.",
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: title,
                 busy: *del_busy.read(),
                 error: del_error.read().clone(),
                 on_cancel: move |_| confirm_note.set(None),
@@ -591,7 +611,7 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                 }
                 span { class: if error.read().is_some() { "save-state error" } else { "save-state" }, role: "status", "{state_text}" }
                 if error.read().is_some() {
-                    button { class: "btn btn-ghost btn-sm", onclick: move |_| schedule_retry(Duration::ZERO), "Retry" }
+                    button { class: "btn btn-secondary btn-sm", onclick: move |_| schedule_retry(Duration::ZERO), "Try again" }
                 }
                 div { class: "note-tools",
                     div { class: "seg", role: "tablist", "aria-label": "Editor mode",
@@ -659,10 +679,8 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
             }
         }
         if *confirm.read() {
-            ConfirmDialog {
-                title: "Delete “{note.title}”?",
-                message: "This note will be deleted. This can't be undone.",
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: note.title.clone(),
                 busy: *deleting.read(),
                 error: del_error.read().clone(),
                 on_cancel: move |_| confirm.set(false),

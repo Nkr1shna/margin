@@ -16,8 +16,8 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
 use crate::ui::common::{
-    ConfirmDialog, CrumbLink, ErrorNotice, Icon, Loading, TopBar, ago, date, js, mark_quotes,
-    quote_marks_json, render_math_in,
+    ConfirmDialog, CrumbLink, DeleteNoteDialog, ErrorNotice, Icon, Loading, RegenerateLessonDialog,
+    TopBar, ago, date, js, mark_quotes, quote_marks_json, render_math_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -35,9 +35,9 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
     let mut renaming = use_signal(|| false);
     let mut rename_value = use_signal(String::new);
     let mut confirm_delete = use_signal(|| false);
+    let mut confirm_regenerate = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut action_error = use_signal(|| None::<String>);
-    let mut confirm_regenerate = use_signal(|| false);
     let rename_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
 
@@ -144,7 +144,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                 }
                             },
                             Icon { name: "edit" }
-                            "Rename lesson"
+                            "Rename"
                         }
                         button {
                             role: "menuitem",
@@ -161,8 +161,9 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                 }
                             },
                             Icon { name: "refresh" }
-                            if lesson_written { "Regenerate lesson…" } else { "Regenerate lesson" }
+                            if lesson_written { "Regenerate…" } else { "Regenerate" }
                         }
+                        div { class: "sep", role: "separator" }
                         button {
                             role: "menuitem",
                             class: "danger",
@@ -173,7 +174,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                 confirm_delete.set(true);
                             },
                             Icon { name: "trash" }
-                            "Delete lesson…"
+                            "Delete…"
                         }
                     }
                 }
@@ -277,10 +278,8 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
             }
         }
         if *confirm_regenerate.read() {
-            ConfirmDialog {
-                title: "Regenerate “{lesson.title}”?",
-                message: "The lesson is written again from its outline and this text is replaced. Your notes stay, but a note anchored to a quote may no longer find it. This can't be undone.",
-                confirm_label: "Regenerate",
+            RegenerateLessonDialog {
+                lesson_title: lesson.title.clone(),
                 busy: *busy.read(),
                 error: action_error.read().clone(),
                 on_cancel: move |_| confirm_regenerate.set(false),
@@ -460,7 +459,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                                         class: "btn btn-primary btn-sm",
                                         disabled: busy,
                                         onclick: move |_| on_regenerate.call(()),
-                                        if busy { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                                        if busy { span { class: "spinner" } }
                                         "Regenerate"
                                     }
                                 }
@@ -668,7 +667,7 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                     button {
                         class: "icon-btn sm",
                         "aria-label": "Edit note",
-                        title: "Edit",
+                        title: "Edit note",
                         onclick: {
                             let text = note.body_md.clone();
                             move |_| {
@@ -682,7 +681,7 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                     button {
                         class: "icon-btn sm",
                         "aria-label": "Delete note",
-                        title: "Delete",
+                        title: "Delete note",
                         onclick: move |_| confirm.set(true),
                         Icon { name: "trash" }
                     }
@@ -693,10 +692,8 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
             }
         }
         if *confirm.read() {
-            ConfirmDialog {
-                title: "Delete this note?",
-                message: format!("“{}” will be deleted. This can't be undone.", note.title),
-                confirm_label: "Delete note",
+            DeleteNoteDialog {
+                note_title: note.title.clone(),
                 busy: *busy.read(),
                 on_cancel: move |_| confirm.set(false),
                 on_confirm: {
@@ -832,8 +829,8 @@ fn LessonNotesView(lesson_id: Id) -> Element {
 
     rsx! {
         div { class: "note-cards",
-            div { style: "display: flex; align-items: center; gap: 12px",
-                h2 { style: "margin: 0; font-size: 22px; font-weight: 500; flex: 1", "Notes on this lesson" }
+            div { class: "view-head",
+                h1 { "Notes on this lesson" }
                 button {
                     class: "btn btn-secondary btn-sm",
                     disabled: *adding.read(),
@@ -970,7 +967,7 @@ fn VideoView(lesson_id: Id) -> Element {
 
     rsx! {
         div { class: "studio",
-            div { class: "studio-head",
+            div { class: "view-head studio-head",
                 h1 { "{lesson.title}" }
                 span { class: "status", span { class: "{status_dot}" } "{status_text}" }
                 // Live: the stage only, so a changing percentage isn't read out each time.
@@ -987,7 +984,7 @@ fn VideoView(lesson_id: Id) -> Element {
                                 spawn(make());
                             }
                         },
-                        if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                        if *busy.read() { span { class: "spinner" } }
                         Icon { name: make_icon }
                         if video.is_some() { "Re-render" } else { "Make video" }
                     }
@@ -1005,7 +1002,7 @@ fn VideoView(lesson_id: Id) -> Element {
                         h2 { "No video for this lesson" }
                         p {
                             if lesson_ready {
-                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on your Mac."
+                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on the service Mac."
                             } else {
                                 "You can make a video once the lesson has finished writing."
                             }
@@ -1148,7 +1145,7 @@ fn VideoDetails(video: Video) -> Element {
         VideoPlayer { video: video.clone() }
         if !video.log.is_empty() {
             details { class: "collapse",
-                summary { "Render log" }
+                summary { Icon { name: "chev", class: "chev" } "Render log" }
                 pre { class: "log", "{video.log}" }
             }
         }

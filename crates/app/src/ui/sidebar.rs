@@ -9,8 +9,8 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::store::{LibraryState, VideoDot};
 use crate::ui::common::{
-    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR, focus_first,
-    focus_on_mount,
+    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, RegenerateLessonDialog,
+    UNIFIED_TITLE_BAR, focus_first, focus_on_mount,
 };
 use crate::ui::settings::SettingsPane;
 use crate::ui::shell::close_drawer;
@@ -323,10 +323,8 @@ pub fn Sidebar() -> Element {
             }
         }
         if let (Some(id), Some(title)) = (regenerate_id.clone(), regenerate_title) {
-            ConfirmDialog {
-                title: "Regenerate “{title}”?",
-                message: "The lesson is written again from its outline and this text is replaced. Your notes stay, but a note anchored to a quote may no longer find it. This can't be undone.",
-                confirm_label: "Regenerate",
+            RegenerateLessonDialog {
+                lesson_title: title,
                 busy: tree.regenerating.read().is_some(),
                 error: error.read().clone(),
                 on_cancel: move |_| {
@@ -387,9 +385,17 @@ pub fn Sidebar() -> Element {
 }
 
 /// A lesson in the tree: opens on click; its ⋯ button or a right-click offers Rename,
-/// Regenerate and Delete, like the lesson screen's menu.
+/// Regenerate and Delete, like the lesson screen's menu. Marks only show what needs a
+/// glance: writing, a lesson that failed, and a video that is ready, rendering or failed.
 #[component]
-fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: bool) -> Element {
+fn LessonNode(
+    id: Id,
+    title: String,
+    dot: VideoDot,
+    generating: bool,
+    ready: bool,
+    failed: bool,
+) -> Element {
     let app = use_app();
     let nav = navigator();
     let route = use_route::<Route>();
@@ -435,14 +441,19 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
                         Icon { name: "book", class: "leaf-ic" }
                         span { class: "grow", "{title}" }
                         // The marks' meaning, in the row's name for screen readers.
-                        span { class: "sr-only", {lesson_state_text(generating || regenerating, dot)} }
+                        span { class: "sr-only", {lesson_state_text(generating || regenerating, failed, dot)} }
                         if generating || regenerating {
-                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: if regenerating { "Starting over" } else { "Writing" }, "aria-hidden": "true" }
+                            span { class: "spinner xs", title: if regenerating { "Starting over" } else { "Writing" }, "aria-hidden": "true" }
+                        } else if failed {
+                            span { class: "row-flag bad", title: "Couldn't be written", "aria-hidden": "true",
+                                Icon { name: "alert" }
+                            }
                         }
                         match dot {
                             VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready", "aria-hidden": "true" } },
                             VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress", "aria-hidden": "true" } },
-                            VideoDot::None => rsx! { span { class: "dot", title: "No video", "aria-hidden": "true" } },
+                            VideoDot::Failed => rsx! { span { class: "dot bad", title: "Video failed", "aria-hidden": "true" } },
+                            VideoDot::None => rsx! {},
                         }
                     }
                     button {
@@ -506,6 +517,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
                         Icon { name: "refresh" }
                         if ready { "Regenerate…" } else { "Regenerate" }
                     }
+                    div { class: "sep", role: "separator" }
                     button {
                         role: "menuitem",
                         class: "danger",
@@ -526,14 +538,17 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
 }
 
 /// The lesson row's writing and video state in words (the row shows it as marks).
-fn lesson_state_text(generating: bool, dot: VideoDot) -> String {
+fn lesson_state_text(generating: bool, failed: bool, dot: VideoDot) -> String {
     let mut parts = Vec::new();
     if generating {
         parts.push("writing");
+    } else if failed {
+        parts.push("couldn't be written");
     }
     match dot {
         VideoDot::Ready => parts.push("video ready"),
         VideoDot::InProgress => parts.push("video in progress"),
+        VideoDot::Failed => parts.push("video failed"),
         VideoDot::None => {}
     }
     parts.iter().map(|p| format!(", {p}")).collect()
@@ -680,7 +695,7 @@ fn TopicNode(id: Id) -> Element {
         .iter()
         .map(|t| t.id.clone())
         .collect();
-    let lessons: Vec<(Id, String, VideoDot, bool, bool)> = lib
+    let lessons: Vec<(Id, String, VideoDot, bool, bool, bool)> = lib
         .lessons_in(&id)
         .iter()
         .map(|l| {
@@ -688,12 +703,14 @@ fn TopicNode(id: Id) -> Element {
                 l.status,
                 margin_shared::LessonStatus::Generating | margin_shared::LessonStatus::Queued
             );
+            let failed = matches!(l.status, margin_shared::LessonStatus::Failed { .. });
             (
                 l.id.clone(),
                 l.title.clone(),
                 lib.video_dot(&l.id),
                 generating,
                 l.status == margin_shared::LessonStatus::Ready,
+                failed,
             )
         })
         .collect();
@@ -849,6 +866,7 @@ fn TopicNode(id: Id) -> Element {
                         Icon { name: "clip" }
                         "Sources…"
                     }
+                    div { class: "sep", role: "separator" }
                     button {
                         role: "menuitem",
                         class: "danger",
@@ -869,8 +887,8 @@ fn TopicNode(id: Id) -> Element {
                     for child in children {
                         TopicNode { key: "{child}", id: child.clone() }
                     }
-                    for (lid, title, dot, generating, ready) in lessons {
-                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating, ready }
+                    for (lid, title, dot, generating, ready, failed) in lessons {
+                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating, ready, failed }
                     }
                     if note_count > 0 {
                         li { key: "notes-{id}", role: "treeitem",
@@ -1090,15 +1108,19 @@ mod tests {
 
     #[test]
     fn lesson_state_reads_as_words() {
-        assert_eq!(lesson_state_text(false, VideoDot::None), "");
-        assert_eq!(lesson_state_text(true, VideoDot::None), ", writing");
+        assert_eq!(lesson_state_text(false, false, VideoDot::None), "");
+        assert_eq!(lesson_state_text(true, false, VideoDot::None), ", writing");
         assert_eq!(
-            lesson_state_text(false, VideoDot::InProgress),
+            lesson_state_text(false, false, VideoDot::InProgress),
             ", video in progress"
         );
         assert_eq!(
-            lesson_state_text(true, VideoDot::Ready),
+            lesson_state_text(true, false, VideoDot::Ready),
             ", writing, video ready"
+        );
+        assert_eq!(
+            lesson_state_text(false, true, VideoDot::Failed),
+            ", couldn't be written, video failed"
         );
     }
 }

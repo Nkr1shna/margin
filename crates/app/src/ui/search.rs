@@ -199,7 +199,7 @@ pub fn SearchPalette() -> Element {
                                         let hit = hit.clone();
                                         move |_| open_hit(hit.clone())
                                     },
-                                    Icon { name: match hit.kind { SearchKind::Lesson => "book", SearchKind::Note => "note", SearchKind::Topic => "folder" } }
+                                    Icon { name: match hit.kind { SearchKind::Lesson => "book", SearchKind::Note => "note", SearchKind::Topic => "topic" } }
                                     b { "{hit.title}" }
                                     small {
                                         match hit.kind { SearchKind::Lesson => "Lesson", SearchKind::Note => "Note", SearchKind::Topic => "Topic" }

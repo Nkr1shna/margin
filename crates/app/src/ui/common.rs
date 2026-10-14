@@ -113,6 +113,16 @@ const ICONS: &[(&str, &str)] = &[
         "folder",
         r#"<path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4.5l2 2.5H19a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z"/>"#,
     ),
+    // A page with a plus: adding files (sources).
+    (
+        "file-add",
+        r#"<path d="M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20z"/><path d="M14 3.5V8h4M12 11v6M9 14h6"/>"#,
+    ),
+    // A topic: stacked layers (a subject and what it holds).
+    (
+        "topic",
+        r#"<path d="M12 4l8.5 4.25L12 12.5 3.5 8.25z"/><path d="M3.5 12.25L12 16.5l8.5-4.25M3.5 16.25L12 20.5l8.5-4.25"/>"#,
+    ),
     // Sources: a paperclip, and the code and PDF file kinds ("note" stands for text).
     (
         "clip",
@@ -209,12 +219,16 @@ pub fn open_external(url: &str) -> Result<(), String> {
     webbrowser::open(url).map_err(|e| format!("Couldn't open the browser: {e}"))
 }
 
-/// "Oct 12", "2 h ago", "Yesterday"…
+/// "Oct 12", "2 h ago", "yesterday"…, lowercase so it reads right mid-sentence
+/// ("edited just now"); use [`capitalize_first`] where it starts a line.
 pub fn ago(t: &DateTime<Utc>) -> String {
-    let now = Utc::now();
+    ago_at(t, Utc::now())
+}
+
+fn ago_at(t: &DateTime<Utc>, now: DateTime<Utc>) -> String {
     let secs = (now - *t).num_seconds();
     if secs < 45 {
-        return "Just now".into();
+        return "just now".into();
     }
     if secs < 3600 {
         return format!("{} min ago", (secs / 60).max(1));
@@ -223,7 +237,7 @@ pub fn ago(t: &DateTime<Utc>) -> String {
         return format!("{} h ago", secs / 3600);
     }
     if secs < 2 * 86_400 {
-        return "Yesterday".into();
+        return "yesterday".into();
     }
     let local = t.with_timezone(&Local);
     if local.format("%Y").to_string() == Local::now().format("%Y").to_string() {
@@ -233,12 +247,40 @@ pub fn ago(t: &DateTime<Utc>) -> String {
     }
 }
 
+/// The text with its first letter upper-cased ("just now" → "Just now").
+pub fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// A message trimmed, capitalised and ended with terminal punctuation, so it can follow
+/// another sentence ("Couldn't load your library. {sentence(message)}").
+pub fn sentence(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let text = capitalize_first(text);
+    if text.ends_with(['.', '!', '?', '…']) {
+        text
+    } else {
+        format!("{text}.")
+    }
+}
+
 pub fn date(t: &DateTime<Utc>) -> String {
     t.with_timezone(&Local).format("%b %-d, %Y").to_string()
 }
 
 /// The app's mark: the app icon (a page with a blue margin rule) drawn small, for the
-/// sidebar and the sign-in card. Keep in step with `icon/Margin.icon`.
+/// sidebar and the sign-in card. It follows `icon/Margin.icon` (same tile, page, margin
+/// rule and note dot) but is simplified on purpose for 20–40 px: three thicker text
+/// lines instead of four and a slightly larger dot, so it stays legible when small. Keep
+/// the shared parts in step with the icon. In dark mode the tile gets a faint ring (CSS
+/// `.mark .tile`) so its edge reads against a black window.
 #[component]
 pub fn BrandMark() -> Element {
     rsx! {
@@ -252,7 +294,7 @@ pub fn BrandMark() -> Element {
                     stop { offset: "1", stop_color: "#060607" }
                 }
             }
-            rect { width: "1024", height: "1024", rx: "232", fill: "url(#mark-bg)" }
+            rect { class: "tile", width: "1024", height: "1024", rx: "232", fill: "url(#mark-bg)" }
             rect { x: "262", y: "196", width: "500", height: "632", rx: "64", fill: "#fff" }
             rect { x: "372", y: "330", width: "300", height: "40", rx: "20", fill: "#cfcfcf" }
             rect { x: "372", y: "450", width: "300", height: "40", rx: "20", fill: "#cfcfcf" }
@@ -440,6 +482,9 @@ pub fn TopBar(
             }
             {children}
         }
+        // App-wide status (offline, library failed) sits under the bar, so the title
+        // bar row stays the window chrome and lines up with the sidebar's header.
+        crate::ui::shell::StatusBanners {}
     }
 }
 
@@ -519,6 +564,52 @@ pub fn ConfirmDialog(
     }
 }
 
+/// The one "delete this note" confirmation, wherever a note is deleted from.
+#[component]
+pub fn DeleteNoteDialog(
+    note_title: String,
+    #[props(default)] busy: bool,
+    #[props(default)] error: Option<String>,
+    on_confirm: EventHandler<()>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    rsx! {
+        ConfirmDialog {
+            title: "Delete “{note_title}”?",
+            message: "This note will be deleted. This can't be undone.",
+            confirm_label: "Delete note",
+            busy,
+            error,
+            on_confirm,
+            on_cancel,
+        }
+    }
+}
+
+/// Confirmation before regenerating a lesson, which replaces its text. A failed request
+/// shows its `error` here, with the dialog left open to try again.
+#[component]
+pub fn RegenerateLessonDialog(
+    lesson_title: String,
+    #[props(default)] busy: bool,
+    #[props(default)] error: Option<String>,
+    on_confirm: EventHandler<()>,
+    on_cancel: EventHandler<()>,
+) -> Element {
+    rsx! {
+        ConfirmDialog {
+            title: "Regenerate “{lesson_title}”?",
+            message: "The lesson is written again and its current text is replaced. Your notes stay, though the passages they quote may change. This can't be undone.",
+            confirm_label: "Regenerate",
+            danger: false,
+            busy,
+            error,
+            on_confirm,
+            on_cancel,
+        }
+    }
+}
+
 /// An error notice with an optional "Open Settings" action (for `no_api_key` and
 /// similar) that opens the given settings pane (a `SettingsPane` slug).
 #[component]
@@ -589,10 +680,10 @@ pub fn mark_quotes(body_id: &str, marks_json: &str) {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use margin_shared::Note;
 
-    use super::quote_marks_json;
+    use super::*;
 
     fn note(id: &str, quote: Option<&str>) -> Note {
         Note {
@@ -629,5 +720,37 @@ mod tests {
     #[test]
     fn quote_marks_of_no_notes_is_an_empty_list() {
         assert_eq!(quote_marks_json(&[]), "[]");
+    }
+
+    #[test]
+    fn ago_is_lowercase_for_recent_times() {
+        let now = Utc::now();
+        assert_eq!(ago_at(&now, now), "just now");
+        assert_eq!(ago_at(&(now - Duration::minutes(5)), now), "5 min ago");
+        assert_eq!(ago_at(&(now - Duration::hours(3)), now), "3 h ago");
+        assert_eq!(ago_at(&(now - Duration::hours(30)), now), "yesterday");
+    }
+
+    #[test]
+    fn capitalize_first_only_touches_the_first_letter() {
+        assert_eq!(capitalize_first("just now"), "Just now");
+        assert_eq!(capitalize_first("5 min ago"), "5 min ago");
+        assert_eq!(capitalize_first("éclair"), "Éclair");
+        assert_eq!(capitalize_first(""), "");
+    }
+
+    #[test]
+    fn sentence_ends_with_one_terminal_mark() {
+        assert_eq!(sentence("connection reset"), "Connection reset.");
+        assert_eq!(
+            sentence("  The live connection closed.  "),
+            "The live connection closed."
+        );
+        assert_eq!(
+            sentence("Is the service running?"),
+            "Is the service running?"
+        );
+        assert_eq!(sentence("Waiting…"), "Waiting…");
+        assert_eq!(sentence("   "), "");
     }
 }

@@ -250,9 +250,9 @@ pub fn ConnectScreen() -> Element {
                     Phase::Expired => rsx! {
                         div { class: "notice error", role: "alert",
                             Icon { name: "alert" }
-                            div { class: "body", "The sign-in request expired before it was approved. Start again to get a new one." }
+                            div { class: "body", "The sign-in request expired before it was approved. Try again to get a new one." }
                         }
-                        button { class: "btn btn-primary", onclick: move |_| start(), "Start again" }
+                        button { class: "btn btn-primary", onclick: move |_| start(), "Try again" }
                     },
                 }
             }

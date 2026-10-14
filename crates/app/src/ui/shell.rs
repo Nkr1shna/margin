@@ -6,7 +6,7 @@ use crate::commands::Command;
 use crate::routes::{Route, page_title};
 use crate::state::{AppCtx, LiveStatus, LoadStatus, use_app};
 use crate::store::Milestones;
-use crate::ui::common::{Icon, announce, js};
+use crate::ui::common::{Icon, announce, js, sentence};
 use crate::ui::search::SearchPalette;
 use crate::ui::settings::{SettingsDialog, SettingsPane};
 use crate::ui::sidebar::Sidebar;
@@ -141,8 +141,6 @@ pub fn Shell() -> Element {
     });
 
     let title = page_title(&route, &app.lib.read());
-    let lib_status = app.lib_status.read().clone();
-    let live = app.live.read().clone();
     let sidebar_hidden = app.config.read().sidebar_hidden;
     let sidebar_style = app
         .config
@@ -169,40 +167,7 @@ pub fn Shell() -> Element {
                 class: "main",
                 // Behind the open drawer the page is out of reach, for focus and screen readers.
                 "inert": drawer_open.then_some("true"),
-                match lib_status {
-                    LoadStatus::Failed(message) => rsx! {
-                        div { class: "banner error", role: "alert",
-                            Icon { name: "alert" }
-                            span { class: "grow", "Couldn't load your library. {message}" }
-                            button {
-                                class: "btn btn-secondary btn-sm",
-                                onclick: move |_| {
-                                    let next = *app.reload.peek() + 1;
-                                    app.reload.set(next);
-                                    app.lib_status.set(LoadStatus::Loading);
-                                },
-                                "Retry"
-                            }
-                        }
-                    },
-                    _ => rsx! {},
-                }
-                if let LiveStatus::Reconnecting { error, retry_secs } = live {
-                    if *app.lib_status.read() == LoadStatus::Loaded {
-                        div { class: "banner", role: "status",
-                            span { class: "dot" }
-                            span { class: "grow", "Offline. Retrying in {retry_secs} s. {error}" }
-                            button {
-                                class: "btn btn-ghost btn-sm",
-                                onclick: move |_| {
-                                    let next = *app.reload.peek() + 1;
-                                    app.reload.set(next);
-                                },
-                                "Reload now"
-                            }
-                        }
-                    }
-                }
+                // Every screen starts with a TopBar, which shows `StatusBanners` under it.
                 Outlet::<Route> {}
             }
         }
@@ -211,6 +176,50 @@ pub fn Shell() -> Element {
         }
         if *app.search_open.read() {
             SearchPalette {}
+        }
+    }
+}
+
+/// App-wide status under the top bar: the library failed to load, or the live
+/// connection dropped and is being retried.
+#[component]
+pub fn StatusBanners() -> Element {
+    let mut app = use_app();
+    let lib_status = app.lib_status.read().clone();
+    let live = app.live.read().clone();
+    rsx! {
+        if let LoadStatus::Failed(message) = lib_status {
+            div { class: "banner error", role: "alert",
+                Icon { name: "alert" }
+                span { class: "grow", title: "{message}", "Couldn't load your library. {sentence(&message)}" }
+                button {
+                    class: "btn btn-secondary btn-sm",
+                    onclick: move |_| {
+                        let next = *app.reload.peek() + 1;
+                        app.reload.set(next);
+                        app.lib_status.set(LoadStatus::Loading);
+                    },
+                    "Try again"
+                }
+            }
+        } else if let LiveStatus::Reconnecting { error, retry_secs } = live {
+            if lib_status == LoadStatus::Loaded {
+                div { class: "banner", role: "status",
+                    span { class: "dot" }
+                    span { class: "grow", title: "{sentence(&error)}",
+                        "You're offline. Retrying in {retry_secs} s. "
+                        span { class: "faint", "{sentence(&error)}" }
+                    }
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        onclick: move |_| {
+                            let next = *app.reload.peek() + 1;
+                            app.reload.set(next);
+                        },
+                        "Try now"
+                    }
+                }
+            }
         }
     }
 }

@@ -316,7 +316,7 @@ pub fn AskScreen() -> Element {
                             disabled: !can_send,
                             onclick: move |_| submit(request()),
                             if *submitting.read() {
-                                span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" }
+                                span { class: "spinner" }
                             } else {
                                 Icon { name: "up" }
                             }
@@ -729,7 +729,7 @@ fn OutlineEditor(
                         on_accept.call(cleaned)
                     },
                     if accepting {
-                        span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" }
+                        span { class: "spinner" }
                         "Creating lessons…"
                     } else {
                         "Create lessons"
