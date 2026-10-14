@@ -5121,6 +5121,7 @@ dependencies = [
  "hmac 0.13.0",
  "keyring",
  "margin-ai",
+ "margin-embed",
  "margin-shared",
  "margin-video",
  "rand 0.10.3",

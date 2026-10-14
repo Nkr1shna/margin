@@ -4,30 +4,39 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Router, http::StatusCode};
 use chrono::Utc;
-use margin_shared::{LessonStatus, Proposal, ProposalStatus, VideoStatus, routes};
+use margin_embed::ModelFiles;
+use margin_shared::{
+    LessonStatus, Proposal, ProposalStatus, Source, SourceStatus, VideoStatus, routes,
+    routes::MAX_SOURCE_BYTES,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 
 use crate::auth::{self, RateLimiter};
 use crate::config::Config;
 use crate::db::{self, Store};
-use crate::engines::{Generator, Renderer};
+use crate::embedding::ModelJob;
+use crate::engines::{Generator, Renderer, SourceTools};
 use crate::error::AppError;
 use crate::secrets::{SecretStore, media_signing_key};
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
-use crate::{ask, events, library, media, search, settings, video};
+use crate::{ask, embedding, events, library, media, search, settings, sources, video};
 
 pub struct Options {
     pub config: Config,
     pub store: Store,
     pub secrets: Arc<dyn SecretStore>,
     pub generator: Arc<dyn Generator>,
+    /// The embedding model and source reading (`EmbedTools` in production).
+    pub source_tools: Arc<dyn SourceTools>,
+    /// Where the embedding model is downloaded from (`margin_embed::HF_BASE`).
+    pub hf_base: String,
     pub renderer: Arc<dyn Renderer>,
     pub allow_unsandboxed_render: bool,
 }
@@ -47,14 +56,23 @@ impl Service {
             tokio::task::spawn_blocking(move || media_signing_key(secrets.as_ref())).await??
         };
         std::fs::create_dir_all(opts.config.videos_dir())?;
+        std::fs::create_dir_all(opts.config.sources_dir())?;
         let (events, _) = broadcast::channel(1024);
         let (revocations, _) = broadcast::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (video_tx, video_rx) = mpsc::unbounded_channel();
+        let (source_tx, source_rx) = mpsc::unbounded_channel();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        // The model is hundreds of MB: no overall limit, only for a stalled connection.
+        let download_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(60))
+            .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let model_files = ModelFiles::new(opts.config.embedding_model_dir());
         let state: AppState = Arc::new(App {
             config: opts.config,
             store: opts.store,
@@ -74,16 +92,28 @@ impl Service {
             lesson_jobs: Mutex::new(Default::default()),
             video_queue: video_tx,
             render_job: Mutex::new(None),
+            source_tools: opts.source_tools,
+            hf_base: opts.hf_base,
+            download_http,
+            model_files,
+            embedder: tokio::sync::Mutex::new(None),
+            model_job: Mutex::new(ModelJob::Idle),
+            model_download_bytes: Mutex::new(None),
+            source_queue: source_tx,
         });
 
         let resume = recover(&state).await?;
         tokio::spawn(video::run_worker(state.clone(), video_rx));
+        tokio::spawn(sources::run_worker(state.clone(), source_rx));
         tokio::spawn(housekeeping(state.clone()));
         for lesson_id in resume.lessons {
             ask::spawn_lesson_job(&state, lesson_id, true);
         }
         for video_id in resume.videos {
             let _ = state.video_queue.send(video_id);
+        }
+        for source_id in resume.sources {
+            let _ = state.source_queue.send(source_id);
         }
 
         let router = router(state.clone());
@@ -150,6 +180,16 @@ pub fn router(state: AppState) -> Router {
         .route(routes::TOOLS, get(settings::tools))
         .route(routes::DEVICES, get(auth::list_devices))
         .route("/api/devices/{id}", delete(auth::revoke_device))
+        .route(
+            routes::SOURCES,
+            post(sources::upload).layer(DefaultBodyLimit::max(MAX_SOURCE_BYTES as usize)),
+        )
+        .route("/api/sources/{id}", delete(sources::delete_source))
+        .route(
+            routes::EMBEDDING,
+            get(embedding::get_model).delete(embedding::delete_model),
+        )
+        .route(routes::EMBEDDING_DOWNLOAD, post(embedding::start_download))
         .route(routes::EVENTS, get(events::events))
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(
@@ -187,17 +227,43 @@ async fn log_requests(State(_state): State<AppState>, req: Request, next: Next) 
 pub struct Resume {
     pub lessons: Vec<String>,
     pub videos: Vec<String>,
+    pub sources: Vec<String>,
 }
 
 /// Jobs a crash left mid-way are marked failed ("Interrupted when the service
-/// stopped."); lessons and videos still Queued are queued again.
+/// stopped."); lessons and videos still Queued are queued again. Sources being read are
+/// read again from the start; uploads never attached to a topic are deleted after 24 h.
 pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
     let _w = state.write_lock.lock().await;
     let now = Utc::now();
     let mut resume = Resume {
         lessons: Vec::new(),
         videos: Vec::new(),
+        sources: Vec::new(),
     };
+
+    let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+    sources.sort_by_key(|s| s.created_at);
+    for mut s in sources {
+        if s.topic_id.is_none() && now - s.created_at > sources::UNATTACHED_TTL {
+            tracing::info!(
+                "deleting source {} ({}): never attached to a topic",
+                s.id,
+                s.name
+            );
+            sources::delete_locked(state, &s.id).await?;
+            continue;
+        }
+        match s.status {
+            SourceStatus::Processing { .. } => {
+                s.status = SourceStatus::Queued;
+                state.store.put(db::SOURCE, &s.id.clone(), &s).await?;
+                resume.sources.push(s.id);
+            }
+            SourceStatus::Queued => resume.sources.push(s.id),
+            _ => {}
+        }
+    }
 
     let mut lessons: Vec<StoredLesson> = state.store.list(db::LESSON).await?;
     lessons.sort_by(|a, b| {
@@ -253,10 +319,11 @@ pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
             state.store.put(db::PROPOSAL, &p.id.clone(), &p).await?;
         }
     }
-    if !resume.lessons.is_empty() || !resume.videos.is_empty() {
+    if !resume.lessons.is_empty() || !resume.videos.is_empty() || !resume.sources.is_empty() {
         tracing::info!(
             lessons = resume.lessons.len(),
             videos = resume.videos.len(),
+            sources = resume.sources.len(),
             "resuming queued work"
         );
     }

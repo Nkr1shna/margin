@@ -1634,6 +1634,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
     let h = start_with(Setup {
         store: Some(store),
         secrets,
+        ..Setup::default()
     })
     .await;
     let t = h.sign_in("Mac").await;

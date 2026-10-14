@@ -16,6 +16,7 @@ path = "src/lib.rs"
 margin-shared.workspace = true
 margin-ai.workspace = true
 margin-video.workspace = true
+margin-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

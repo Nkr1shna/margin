@@ -1,27 +1,32 @@
 //! Test harness: the real router on an ephemeral port, in-memory SurrealDB and
-//! secrets, a fake GitHub, and fake Generator/Renderer.
+//! secrets, a fake GitHub, a fake Hugging Face, and fake Generator/Renderer/SourceTools.
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::Form;
-use axum::http::HeaderMap;
+use axum::body::{Body, Bytes};
+use axum::extract::{Form, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use margin_ai::{AiError, LessonContext, SceneRequest};
+use margin_ai::{AiError, LessonContext, Passage, SceneRequest};
+use margin_embed::fake::FakeEmbedder;
+use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Page};
 use margin_service::config::Config;
 use margin_service::db::Store;
-use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer};
+use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::server::{Options, Service};
 use margin_service::state::AppState;
 use margin_shared::{
-    AskRequest, Event, Level, LoginState, Outline, OutlineLesson, StartLogin, ToolStatus,
+    AskRequest, Event, Level, LoginState, Outline, OutlineLesson, SourceKind, StartLogin,
+    ToolStatus,
 };
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 use serde_json::json;
@@ -103,6 +108,10 @@ pub struct FakeGenerator {
     pub fail_lessons: Mutex<HashSet<String>>,
     pub scene_requests: Mutex<Vec<SceneRequest>>,
     pub subjects_seen: Mutex<Vec<Vec<String>>>,
+    /// The source passages each outline request carried.
+    pub outline_passages: Mutex<Vec<Vec<Passage>>>,
+    /// Every lesson request.
+    pub lesson_requests: Mutex<Vec<LessonContext>>,
     /// Delay between lesson deltas.
     pub delta_delay_ms: AtomicU32,
 }
@@ -127,6 +136,7 @@ impl Generator for FakeGenerator {
         ai: &'a AiConfig,
         req: &'a AskRequest,
         existing_subjects: &'a [String],
+        passages: &'a [Passage],
     ) -> BoxFuture<'a, Result<Outline, AiError>> {
         Box::pin(async move {
             assert_eq!(ai.api_key, API_KEY);
@@ -134,6 +144,10 @@ impl Generator for FakeGenerator {
                 .lock()
                 .unwrap()
                 .push(existing_subjects.to_vec());
+            self.outline_passages
+                .lock()
+                .unwrap()
+                .push(passages.to_vec());
             tokio::time::sleep(Duration::from_millis(30)).await;
             if req.prompt.contains("FAIL") {
                 return Err(AiError::Http {
@@ -152,6 +166,7 @@ impl Generator for FakeGenerator {
         mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<String, AiError>> {
         Box::pin(async move {
+            self.lesson_requests.lock().unwrap().push(ctx.clone());
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
             let title = &ctx.outline[ctx.index].title;
@@ -305,6 +320,206 @@ impl Renderer for FakeRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Fake Hugging Face and source tools
+// ---------------------------------------------------------------------------
+
+/// The fake model: one file, sent in `MODEL_PARTS` parts.
+pub const MODEL_FILE: &str = "model.bin";
+pub const MODEL_PARTS: usize = 8;
+pub const MODEL_PART_BYTES: usize = 64 * 1024;
+pub const MODEL_BYTES: u64 = (MODEL_PARTS * MODEL_PART_BYTES) as u64;
+
+#[derive(Default)]
+pub struct FakeHf {
+    /// Pause before each part of the download.
+    pub part_delay_ms: AtomicU64,
+    /// When set, the download answers 500.
+    pub fail: AtomicBool,
+    pub size_requests: AtomicU32,
+    pub downloads: AtomicU32,
+}
+
+fn model_path() -> String {
+    format!("/{}/resolve/main/{MODEL_FILE}", margin_embed::REPO)
+}
+
+pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
+    async fn size(State(hf): State<Arc<FakeHf>>) -> Json<serde_json::Value> {
+        hf.size_requests.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"size": MODEL_BYTES}))
+    }
+    async fn file(State(hf): State<Arc<FakeHf>>) -> Response {
+        hf.downloads.fetch_add(1, Ordering::SeqCst);
+        if hf.fail.load(Ordering::SeqCst) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+        }
+        let delay = hf.part_delay_ms.load(Ordering::SeqCst);
+        let parts = futures_util::stream::iter(0..MODEL_PARTS).then(move |i| async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            Ok::<_, std::convert::Infallible>(Bytes::from(vec![i as u8; MODEL_PART_BYTES]))
+        });
+        Response::builder()
+            .header(header::CONTENT_LENGTH, MODEL_BYTES)
+            .body(Body::from_stream(parts))
+            .unwrap()
+    }
+    let hf = Arc::new(FakeHf::default());
+    let app = Router::new()
+        .route(&format!("/api/models/{}", margin_embed::REPO), get(size))
+        .route(&model_path(), get(file))
+        .with_state(hf.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), hf)
+}
+
+/// Text in a source that makes the fake extraction fail.
+pub const UNREADABLE: &str = "%UNREADABLE%";
+
+/// Model files from the fake Hugging Face, `FakeEmbedder` as the model, and simple
+/// extraction and chunking: a "PDF" is UTF-8 with pages separated by form feeds, and
+/// chunks are paragraphs.
+#[derive(Default)]
+pub struct FakeSourceTools {
+    pub loads: AtomicU32,
+    pub extracts: AtomicU32,
+}
+
+impl SourceTools for FakeSourceTools {
+    fn is_complete(&self, files: &ModelFiles) -> bool {
+        files.dir.join(MODEL_FILE).is_file()
+    }
+
+    fn size_on_disk(&self, files: &ModelFiles) -> u64 {
+        std::fs::metadata(files.dir.join(MODEL_FILE)).map_or(0, |m| m.len())
+    }
+
+    fn remote_size<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+        Box::pin(async move {
+            let url = format!("{hf_base}/api/models/{}", margin_embed::REPO);
+            let v: serde_json::Value = http
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| EmbedError::Download(e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| EmbedError::Download(e.to_string()))?;
+            Ok(v["size"].as_u64().unwrap())
+        })
+    }
+
+    fn download<'a>(
+        &'a self,
+        files: &'a ModelFiles,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>> {
+        Box::pin(async move {
+            let r = http
+                .get(format!("{hf_base}{}", model_path()))
+                .send()
+                .await
+                .map_err(|e| EmbedError::Download(e.to_string()))?;
+            if !r.status().is_success() {
+                return Err(EmbedError::Download(format!("HTTP {}", r.status())));
+            }
+            let total = r.content_length().unwrap_or(0);
+            tokio::fs::create_dir_all(&files.dir).await?;
+            let mut data = Vec::new();
+            let mut body = r.bytes_stream();
+            while let Some(part) = body.next().await {
+                let part = part.map_err(|e| EmbedError::Download(e.to_string()))?;
+                data.extend_from_slice(&part);
+                progress(data.len() as u64, total);
+            }
+            let part = files.dir.join(format!("{MODEL_FILE}.part"));
+            tokio::fs::write(&part, &data).await?;
+            tokio::fs::rename(&part, files.dir.join(MODEL_FILE)).await?;
+            Ok(())
+        })
+    }
+
+    fn remove(&self, files: &ModelFiles) -> Result<(), EmbedError> {
+        match std::fs::remove_dir_all(&files.dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
+        assert!(
+            self.is_complete(files),
+            "load is only called once downloaded"
+        );
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(FakeEmbedder))
+    }
+
+    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
+        self.extracts.fetch_add(1, Ordering::SeqCst);
+        let text = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
+        if text.contains(UNREADABLE) {
+            return Err(EmbedError::Extract("the file is damaged".into()));
+        }
+        let pages = match kind {
+            SourceKind::Pdf => text
+                .split('\x0c')
+                .enumerate()
+                .map(|(i, t)| Page {
+                    number: Some(i as u32 + 1),
+                    text: t.to_string(),
+                })
+                .collect(),
+            _ => vec![Page { number: None, text }],
+        };
+        Ok(Extracted { pages })
+    }
+
+    fn chunk(
+        &self,
+        doc: &Extracted,
+        _kind: SourceKind,
+        count_tokens: &dyn Fn(&str) -> usize,
+        max_tokens: usize,
+    ) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        for page in &doc.pages {
+            for para in page.text.split("\n\n").map(str::trim) {
+                if para.is_empty() {
+                    continue;
+                }
+                assert!(
+                    count_tokens(para) <= max_tokens,
+                    "test paragraphs are short"
+                );
+                chunks.push(Chunk {
+                    text: para.to_string(),
+                    page: page.number,
+                });
+            }
+        }
+        chunks
+    }
+
+    fn score(
+        &self,
+        query_vec: &[f32],
+        _query_text: &str,
+        chunk_vec: &[f32],
+        _chunk_text: &str,
+    ) -> f32 {
+        margin_embed::cosine(query_vec, chunk_vec)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
@@ -315,6 +530,8 @@ pub struct Harness {
     pub secrets: Arc<MemoryStore>,
     pub generator: Arc<FakeGenerator>,
     pub renderer: Arc<FakeRenderer>,
+    pub source_tools: Arc<FakeSourceTools>,
+    pub hf: Arc<FakeHf>,
     pub data_dir: PathBuf,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -328,6 +545,10 @@ impl Drop for Harness {
 pub struct Setup {
     pub store: Option<Store>,
     pub secrets: MemoryStore,
+    /// Whether the embedding model is already downloaded.
+    pub model_downloaded: bool,
+    /// Files to put in the data folder before starting, by path inside it.
+    pub files: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for Setup {
@@ -335,6 +556,8 @@ impl Default for Setup {
         Self {
             store: None,
             secrets: MemoryStore::new().with(GITHUB_CLIENT_SECRET, CLIENT_SECRET),
+            model_downloaded: true,
+            files: Vec::new(),
         }
     }
 }
@@ -363,15 +586,29 @@ pub async fn start_with(setup: Setup) -> Harness {
         Some(s) => s,
         None => Store::memory().await.unwrap(),
     };
+    if setup.model_downloaded {
+        let model = config.embedding_model_dir();
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join(MODEL_FILE), vec![0u8; MODEL_BYTES as usize]).unwrap();
+    }
+    for (path, bytes) in &setup.files {
+        let path = data_dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let (hf_base, hf) = start_fake_hf().await;
     let secrets = Arc::new(setup.secrets);
     let generator = Arc::new(FakeGenerator::default());
     let renderer = Arc::new(FakeRenderer::default());
+    let source_tools = Arc::new(FakeSourceTools::default());
     let service = Service::start(Options {
         config,
         store,
         secrets: secrets.clone(),
         generator: generator.clone(),
         renderer: renderer.clone(),
+        source_tools: source_tools.clone(),
+        hf_base,
         allow_unsandboxed_render: true,
     })
     .await
@@ -397,6 +634,8 @@ pub async fn start_with(setup: Setup) -> Harness {
         secrets,
         generator,
         renderer,
+        source_tools,
+        hf,
         data_dir,
         stop: Some(tx),
     }
@@ -405,6 +644,27 @@ pub async fn start_with(setup: Setup) -> Harness {
 impl Harness {
     pub fn u(&self, path: &str) -> String {
         format!("{}{path}", self.url)
+    }
+
+    /// `POST /api/sources` with the file's bytes.
+    pub async fn upload(
+        &self,
+        token: &str,
+        name: &str,
+        topic_id: Option<&str>,
+        bytes: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        let mut query = vec![("name", name)];
+        if let Some(t) = topic_id {
+            query.push(("topic_id", t));
+        }
+        self.post(token, "/api/sources")
+            .query(&query)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
     }
 
     pub async fn start_login(&self, device: &str) -> StartLogin {
