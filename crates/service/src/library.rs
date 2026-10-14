@@ -12,9 +12,11 @@ use margin_shared::{
     Source, Topic, TopicPatch,
 };
 
+use margin_shared::context::{LibraryKind, Project};
+
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::state::{AppState, Author, StoredLesson, StoredNote, StoredVideo, new_id};
-use crate::{db, sources};
+use crate::{db, ingest, sources};
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -340,6 +342,7 @@ pub async fn remove_topic(state: &AppState, id: &str) -> AppResult<()> {
             .filter(|n| doomed_set.contains(n.topic_id.as_str()))
         {
             state.store.delete(db::NOTE, &n.id).await?;
+            ingest::delete_library_document_locked(state, LibraryKind::Note, &n.id).await?;
             events.push(Event::NoteDeleted { id: n.id.clone() });
         }
         let sources: Vec<Source> = state.store.list(db::SOURCE).await?;
@@ -457,9 +460,11 @@ async fn delete_lesson_locked(state: &AppState, lesson_id: &str) -> AppResult<Ve
         .await?;
     for n in notes {
         state.store.delete(db::NOTE, &n.id).await?;
+        ingest::delete_library_document_locked(state, LibraryKind::Note, &n.id).await?;
         events.push(Event::NoteDeleted { id: n.id });
     }
     state.store.delete(db::LESSON, lesson_id).await?;
+    ingest::delete_library_document_locked(state, LibraryKind::Lesson, lesson_id).await?;
     events.push(Event::LessonDeleted {
         id: lesson_id.to_string(),
     });
@@ -609,9 +614,46 @@ pub async fn remove_note(state: &AppState, id: &str) -> AppResult<()> {
         let _w = state.write_lock.lock().await;
         note(state, id).await?;
         state.store.delete(db::NOTE, id).await?;
+        ingest::delete_library_document_locked(state, LibraryKind::Note, id).await?;
     }
     state.emit(Event::NoteDeleted { id: id.to_string() });
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+/// The project every document belongs to until there is more than one ("My library"),
+/// created the first time it is asked for. Takes the write lock.
+pub async fn default_project(state: &AppState) -> anyhow::Result<Project> {
+    if let Some(p) = first_project(state).await? {
+        return Ok(p);
+    }
+    let _w = state.write_lock.lock().await;
+    default_project_locked(state).await
+}
+
+/// `default_project` with the write lock held.
+pub async fn default_project_locked(state: &AppState) -> anyhow::Result<Project> {
+    if let Some(p) = first_project(state).await? {
+        return Ok(p);
+    }
+    let project = Project {
+        id: new_id(),
+        name: crate::context_api::DEFAULT_PROJECT_NAME.to_string(),
+        created_at: Utc::now(),
+    };
+    state.store.put(db::PROJECT, &project.id, &project).await?;
+    tracing::info!("created the project \"{}\"", project.name);
+    Ok(project)
+}
+
+/// The oldest project.
+async fn first_project(state: &AppState) -> anyhow::Result<Option<Project>> {
+    let mut projects: Vec<Project> = state.store.list(db::PROJECT).await?;
+    projects.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    Ok(projects.into_iter().next())
 }
 
 #[cfg(test)]

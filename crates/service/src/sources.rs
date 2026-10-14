@@ -1,24 +1,25 @@
 //! Sources: files the learner uploads so outlines and lessons are grounded in them.
 //!
-//! An upload is stored as `data_dir/sources/{id}/file` and queued. One source at a time,
-//! the worker reads it and embeds what it finds (Queued → Processing → Ready); while the
-//! embedding model isn't downloaded sources stay Queued:
+//! An upload is stored as `data_dir/sources/{id}/file`, recorded as a `Source` and
+//! queued. The source worker gives it a document (same id) and hands it to the one
+//! ingestion pipeline (`ingest.rs`), which reads it (Queued → Processing → Ready) into
+//! `passage` rows; while the embedding model isn't downloaded sources stay Queued:
 //!
-//! - text and code, and the text of PDFs, cut into chunks (`ChunkRow`);
-//! - pictures (`MediaRow`): an image file itself, every PDF page (rendered into
-//!   `{id}/media/page-{n}.png`), frames of a video (`{id}/media/frame-{ms}.jpg`, one per
-//!   5 s, at most 120), through the image encoder;
-//! - sound (`MediaRow`): 10-second windows of an audio file or a video's soundtrack,
-//!   through the audio encoder, plus a transcript (FluidAudio speech recognition) cut
-//!   into timestamped passages (`ChunkRow` with `start_ms`/`end_ms`).
+//! - text and code, and the text of PDFs, cut into chunks;
+//! - pictures: an image file itself, every PDF page, frames of a video (one per 5 s, at
+//!   most 120), through the image encoder, each with its text (a page's text layer or
+//!   OCR, an image's OCR, what was said around a frame);
+//! - sound: 10-second windows of an audio file or a video's soundtrack, through the
+//!   audio encoder, plus a transcript (FluidAudio speech recognition) cut into
+//!   timestamped passages.
 //!
-//! Retrieval scores all of them against the prompt with the one query vector and hands
-//! the best to the outline and lesson prompts: text as text, pictures as image inputs,
-//! sound as what was said in it.
+//! This file keeps upload, delete, attach and "Read again", and the passages lessons
+//! and the agent get today (`passages`), read from the `passage` rows of the sources (or
+//! a source's old `chunk`/`media` rows until the migration has moved it), until
+//! `retrieval.rs` takes over.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -29,10 +30,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use margin_ai::{Image, Passage};
-use margin_embed::{
-    CHUNK_TOKENS, FLUIDAUDIOCLI, ImageTokens, Picture, Purpose, Transcript, audio_windows,
-    sample_ms,
-};
+use margin_embed::{Purpose, Transcript};
+use margin_shared::context::{ACCESS_COMPANY, Modality};
 use margin_shared::{
     Citation, Event, Id, SOURCE_KINDS, Source, SourceKind, SourceStatus, TranscriptSegment, routes,
 };
@@ -40,9 +39,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
-use crate::db;
+use crate::db::{self, PassageRow};
 use crate::embedding;
 use crate::error::{AppError, AppResult};
+use crate::ingest;
 use crate::library;
 use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
 
@@ -51,10 +51,6 @@ pub const FILE_NAME: &str = "file";
 /// What an audio or video source's speech recognition heard, word by word
 /// (`Transcript` as JSON), for the app's whole-transcript view.
 pub const TRANSCRIPT_FILE: &str = "transcript.json";
-/// Chunks embedded per call to the model.
-const EMBED_BATCH: usize = 16;
-/// Progress is saved and sent at most this often.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 /// Passages a prompt gets…
 pub const PASSAGES: usize = 8;
 /// …of which at most this many are pictures.
@@ -65,7 +61,8 @@ pub const SOURCE_WAIT: Duration = Duration::from_secs(10 * 60);
 /// once they're this old.
 pub const UNATTACHED_TTL: chrono::Duration = chrono::Duration::hours(24);
 
-/// One embedded piece of a source.
+/// One embedded piece of a source, as stores written before the `passage` table kept
+/// it (table `chunk`). Read only until the migration has moved every source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRow {
     pub source_id: Id,
@@ -97,7 +94,8 @@ pub enum MediaKind {
     Audio,
 }
 
-/// One embedded picture or stretch of sound of a source.
+/// One embedded picture or stretch of sound of a source, as stores written before the
+/// `passage` table kept it (table `media`). Read only until the migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaRow {
     pub source_id: Id,
@@ -336,6 +334,7 @@ pub async fn create(state: &AppState, id: &str, upload: Upload, bytes: u64) -> A
 
 /// "Read again": queue a source to be read from the start, in place (same id, topic and
 /// file). For one that failed or was read with a warning, once what was wrong is fixed.
+/// What didn't change keeps its vectors (`ingest`'s diff).
 pub async fn reprocess(
     State(state): State<AppState>,
     Path(id): Path<Id>,
@@ -379,17 +378,22 @@ pub async fn transcript(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(AppError::internal(format!("{}: {e}", path.display()))),
     }
-    let mut rows: Vec<ChunkRow> = state.store.list_where(db::CHUNK, "source_id", &id).await?;
-    rows.sort_by_key(|r| (r.start_ms, r.ord));
-    let lines = rows
+    let mut timed: Vec<(u64, u64, i64, String)> = candidates(&state, &id)
+        .await?
         .into_iter()
+        .filter(|r| r.modality == Modality::Text.as_str())
         .filter_map(|r| {
-            let start_ms = r.start_ms?;
-            Some(TranscriptSegment {
-                start_ms,
-                end_ms: r.end_ms.unwrap_or(start_ms).max(start_ms),
-                text: r.text.trim().to_string(),
-            })
+            let start = r.start_ms? as u64;
+            Some((start, r.end_ms.map_or(start, |e| e as u64), r.ord, r.text))
+        })
+        .collect();
+    timed.sort_by_key(|(start, _, ord, _)| (*start, *ord));
+    let lines = timed
+        .into_iter()
+        .map(|(start_ms, end_ms, _, text)| TranscriptSegment {
+            start_ms,
+            end_ms: end_ms.max(start_ms),
+            text: text.trim().to_string(),
         })
         .filter(|s| !s.text.is_empty())
         .collect();
@@ -409,14 +413,29 @@ pub async fn delete_source(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Deletes a source's chunks, row and file. Call with the write lock held; returns the
-/// event to emit.
+/// Deletes a source's passages, document, row and file (an ingest still running for it
+/// stops at its next write). Call with the write lock held; returns the event to emit.
 pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Event> {
-    state.store.delete_where(db::CHUNK, "source_id", id).await?;
-    state.store.delete_where(db::MEDIA, "source_id", id).await?;
+    delete_old_rows(state, id).await?;
+    ingest::delete_document_locked(state, id).await?;
     state.store.delete(db::SOURCE, id).await?;
     remove_dir(&state.source_dir(id)).await;
     Ok(Event::SourceDeleted { id: id.to_string() })
+}
+
+/// Whether the `chunk`/`media` tables of a store from before the `passage` table are
+/// still there (until the migration removes them).
+pub async fn has_old_rows(state: &AppState) -> anyhow::Result<bool> {
+    Ok(state.store.table_exists(db::CHUNK).await? && state.store.table_exists(db::MEDIA).await?)
+}
+
+/// Deletes a source's `chunk`/`media` rows, while those tables exist.
+pub(crate) async fn delete_old_rows(state: &AppState, id: &str) -> anyhow::Result<()> {
+    if has_old_rows(state).await? {
+        state.store.delete_where(db::CHUNK, "source_id", id).await?;
+        state.store.delete_where(db::MEDIA, "source_id", id).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn remove_dir(dir: &std::path::Path) {
@@ -427,9 +446,9 @@ pub(crate) async fn remove_dir(dir: &std::path::Path) {
     }
 }
 
-/// Attaches unattached sources to `topic_id` (and their chunks). Call with the write lock
-/// held; returns the events to emit. Sources that no longer exist or already belong to a
-/// topic are left alone.
+/// Attaches unattached sources to `topic_id`, and makes their passages searchable from
+/// the topic. Call with the write lock held; returns the events to emit. Sources that no
+/// longer exist or already belong to a topic are left alone.
 pub async fn attach_locked(
     state: &AppState,
     source_ids: &[Id],
@@ -445,17 +464,10 @@ pub async fn attach_locked(
         }
         source.topic_id = Some(topic_id.to_string());
         state.store.put(db::SOURCE, id, &source).await?;
-        state
-            .store
-            .set_where(db::CHUNK, "source_id", id, "topic_id", &topic_id)
-            .await?;
-        state
-            .store
-            .set_where(db::MEDIA, "source_id", id, "topic_id", &topic_id)
-            .await?;
         events.push(Event::SourceChanged {
             source: state.public_source(&source),
         });
+        events.extend(ingest::add_scope_locked(state, id, topic_id).await?);
     }
     Ok(events)
 }
@@ -476,291 +488,20 @@ pub async fn enqueue_queued(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads queued sources one at a time, forever.
+/// Starts the ingest worker (which first moves old stores to the passage index), then
+/// gives every source sent to `queue` its document and hands it to that worker, forever.
 pub async fn run_worker(state: AppState, mut queue: mpsc::UnboundedReceiver<Id>) {
+    tokio::spawn(ingest::run_worker(state.clone()));
     while let Some(id) = queue.recv().await {
-        if let Err(e) = process(&state, &id).await {
+        if let Err(e) = ingest::queue_source(&state, &id).await {
             tracing::error!("source {id}: {e:#}");
-            let _ = fail(&state, &id, &format!("{e:#}")).await;
+            let _ = ingest::fail(&state, &id, &format!("{e:#}")).await;
         }
     }
-}
-
-/// Applies `f` to the stored source under the write lock and emits it. Returns false
-/// when the source no longer exists.
-async fn update(state: &AppState, id: &str, f: impl FnOnce(&mut Source)) -> anyhow::Result<bool> {
-    let source = {
-        let _w = state.write_lock.lock().await;
-        let Some(mut s) = state.store.get::<Source>(db::SOURCE, id).await? else {
-            return Ok(false);
-        };
-        f(&mut s);
-        state.store.put(db::SOURCE, id, &s).await?;
-        s
-    };
-    state.emit_source(&source);
-    Ok(true)
-}
-
-async fn fail(state: &AppState, id: &str, error: &str) -> anyhow::Result<()> {
-    tracing::warn!("source {id} failed: {error}");
-    let error = error.to_string();
-    update(state, id, move |s| {
-        s.status = SourceStatus::Failed { error }
-    })
-    .await?;
-    Ok(())
-}
-
-/// What `process` embeds for a picture or a stretch of sound, before it has a vector.
-struct MediaItem {
-    row: MediaRow,
-    input: MediaInput,
-}
-
-enum MediaInput {
-    Image(PathBuf, ImageTokens),
-    /// A window of the sound: samples [start, end).
-    Audio(usize, usize),
-}
-
-async fn process(state: &AppState, id: &str) -> anyhow::Result<()> {
-    let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
-        return Ok(());
-    };
-    if source.status != SourceStatus::Queued {
-        return Ok(());
-    }
-    let embedder = match embedding::embedder(state).await {
-        Ok(Some(e)) => e,
-        // Stays Queued; the finished download queues it again.
-        Ok(None) => return Ok(()),
-        Err(e) => return fail(state, id, &e.to_string()).await,
-    };
-    if !update(state, id, |s| {
-        s.status = SourceStatus::Processing { done: 0, total: 0 }
-    })
-    .await?
-    {
-        return Ok(());
-    }
-
-    let kind = source.kind;
-    let path = match named_link(&state.source_dir(id), &source.name).await {
-        Ok(path) => path,
-        Err(e) => return fail(state, id, &format!("couldn't prepare the file: {e}")).await,
-    };
-    let media_dir = state.source_media_dir(id);
-    // Pages and frames of a run the service stopped in the middle of.
-    remove_dir(&media_dir).await;
-    let (tools, from, to) = (state.source_tools.clone(), path.clone(), media_dir.clone());
-    let doc = match tokio::task::spawn_blocking(move || tools.extract(&from, kind, &to)).await? {
-        Ok(doc) => doc,
-        Err(e) => return fail(state, id, &e.to_string()).await,
-    };
-    let pages = doc.pages.iter().filter_map(|p| p.number).max();
-    let sound = doc.sound.clone().map(Arc::new);
-
-    // What is said, for audio and video.
-    let mut transcript: Option<Transcript> = None;
-    let mut no_transcript: Option<String> = None;
-    if let Some(sound) = &sound {
-        let (tools, samples, work) = (
-            state.source_tools.clone(),
-            sound.clone(),
-            state.source_dir(id),
-        );
-        match tokio::task::spawn_blocking(move || tools.transcribe(&samples, &work)).await? {
-            Ok(Some(t)) => transcript = Some(t),
-            Ok(None) => {
-                no_transcript = Some(format!(
-                    "{FLUIDAUDIOCLI} isn't installed on the service Mac (Settings → Tools shows how \
-                     to install it)"
-                ))
-            }
-            Err(e) => no_transcript = Some(e.to_string()),
-        }
-        if let Some(why) = &no_transcript {
-            tracing::warn!("source {id}: no transcript: {why}");
-        }
-    }
-    // Kept for the app's whole-transcript view; a read without one drops an old one.
-    let transcript_path = state.source_dir(id).join(TRANSCRIPT_FILE);
-    match &transcript {
-        Some(t) => {
-            let json = serde_json::to_vec(t)?;
-            tokio::fs::write(&transcript_path, json)
-                .await
-                .with_context(|| format!("couldn't save {}", transcript_path.display()))?;
-        }
-        None => {
-            let _ = tokio::fs::remove_file(&transcript_path).await;
-        }
-    }
-
-    let (tools, counter, transcript_for_chunks) = (
-        state.source_tools.clone(),
-        embedder.clone(),
-        transcript.clone(),
-    );
-    let chunks = tokio::task::spawn_blocking(move || {
-        let count = |t: &str| counter.count_tokens(t);
-        let mut chunks = tools.chunk(&doc, kind, &count, CHUNK_TOKENS);
-        if let Some(t) = &transcript_for_chunks {
-            chunks.extend(t.chunks(&count, CHUNK_TOKENS));
-        }
-        (chunks, doc.pictures)
-    })
-    .await?;
-    let (chunks, pictures) = chunks;
-    let items = media_items(id, kind, &pictures, sound.as_deref(), transcript.as_ref());
-
-    if chunks.is_empty() && items.is_empty() {
-        let error = match kind {
-            SourceKind::Text | SourceKind::Code | SourceKind::Pdf => {
-                "There's no text in this file."
-            }
-            _ => "There's no picture or sound in this file.",
-        };
-        return fail(state, id, error).await;
-    }
-    let total = (chunks.len() + items.len()) as u32;
-    if !update(state, id, |s| {
-        s.status = SourceStatus::Processing { done: 0, total }
-    })
-    .await?
-    {
-        return Ok(());
-    }
-    // Leftovers of a run the service stopped in the middle of.
-    state.store.delete_where(db::CHUNK, "source_id", id).await?;
-    state.store.delete_where(db::MEDIA, "source_id", id).await?;
-
-    let mut progress = Progress {
-        done: 0,
-        total,
-        last: Instant::now(),
-    };
-    let mut ord = 0u32;
-    for batch in chunks.chunks(EMBED_BATCH) {
-        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let model = embedder.clone();
-        let vectors =
-            match tokio::task::spawn_blocking(move || model.embed(&texts, Purpose::DOCUMENT))
-                .await?
-            {
-                Ok(v) => v,
-                Err(e) => return fail(state, id, &e.to_string()).await,
-            };
-        if vectors.len() != batch.len() {
-            return fail(state, id, &wrong_count(vectors.len(), batch.len())).await;
-        }
-        let rows = batch.iter().zip(vectors).map(|(chunk, vector)| {
-            let row = ChunkRow {
-                source_id: id.to_string(),
-                topic_id: None,
-                ord,
-                page: chunk.page,
-                start_ms: chunk.start_ms,
-                end_ms: chunk.end_ms,
-                text: chunk.text.clone(),
-                vector,
-            };
-            ord += 1;
-            row
-        });
-        let rows: Vec<ChunkRow> = rows.collect();
-        if !save_rows(state, id, db::CHUNK, rows, |r, topic| r.topic_id = topic).await? {
-            return Ok(());
-        }
-        if !progress.add(state, id, batch.len()).await? {
-            return Ok(());
-        }
-    }
-
-    let mut ord = 0u32;
-    for batch in items.chunks(EMBED_BATCH) {
-        // Consecutive items embedded the same way go to the model together.
-        let mut start = 0;
-        while start < batch.len() {
-            let same = batch[start..]
-                .iter()
-                .take_while(|i| same_input(&i.input, &batch[start].input))
-                .count();
-            let group = &batch[start..start + same];
-            start += same;
-            let model = embedder.clone();
-            let vectors = match &group[0].input {
-                MediaInput::Image(_, tokens) => {
-                    let tokens = *tokens;
-                    let paths: Vec<PathBuf> = group
-                        .iter()
-                        .filter_map(|i| match &i.input {
-                            MediaInput::Image(p, _) => Some(p.clone()),
-                            MediaInput::Audio(..) => None,
-                        })
-                        .collect();
-                    tokio::task::spawn_blocking(move || model.embed_images(&paths, tokens)).await?
-                }
-                MediaInput::Audio(..) => {
-                    let samples = sound.clone().unwrap_or_default();
-                    let windows: Vec<Vec<f32>> = group
-                        .iter()
-                        .filter_map(|i| match i.input {
-                            MediaInput::Audio(from, to) => Some(samples[from..to].to_vec()),
-                            MediaInput::Image(..) => None,
-                        })
-                        .collect();
-                    tokio::task::spawn_blocking(move || model.embed_audio(&windows)).await?
-                }
-            };
-            let vectors = match vectors {
-                Ok(v) => v,
-                Err(e) => return fail(state, id, &e.to_string()).await,
-            };
-            if vectors.len() != group.len() {
-                return fail(state, id, &wrong_count(vectors.len(), group.len())).await;
-            }
-            let rows: Vec<MediaRow> = group
-                .iter()
-                .zip(vectors)
-                .map(|(item, vector)| {
-                    let row = MediaRow {
-                        ord,
-                        vector,
-                        ..item.row.clone()
-                    };
-                    ord += 1;
-                    row
-                })
-                .collect();
-            if !save_rows(state, id, db::MEDIA, rows, |r, topic| r.topic_id = topic).await? {
-                return Ok(());
-            }
-            if !progress.add(state, id, group.len()).await? {
-                return Ok(());
-            }
-        }
-    }
-
-    // A recording without a transcript gives the lesson writer less to go on (it can't
-    // listen): its sound is embedded and found, but lessons can't quote it. It's Ready,
-    // with a warning that says so and a "Read again" for once it's fixed.
-    let warning = no_transcript.map(|why| transcript_warning(kind, &why));
-    update(state, id, |s| {
-        s.status = SourceStatus::Ready {
-            chunks: total,
-            pages,
-            warning,
-        }
-    })
-    .await?;
-    tracing::info!("source {id} is ready: {total} chunks and media items");
-    Ok(())
 }
 
 /// The warning on a recording read without a transcript, `why` being what went wrong.
-fn transcript_warning(kind: SourceKind, why: &str) -> String {
+pub(crate) fn transcript_warning(kind: SourceKind, why: &str) -> String {
     if kind == SourceKind::Video {
         format!(
             "Its soundtrack wasn't transcribed: {why}. Its pictures are read, but lessons \
@@ -777,7 +518,7 @@ fn transcript_warning(kind: SourceKind, why: &str) -> String {
 /// The uploaded file under a name with the original's extension (`input.m4a`, a link to
 /// `file`): AVFoundation picks the container format by extension and won't open an
 /// audio or video file without one. `file` itself when the name has no extension.
-async fn named_link(dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+pub(crate) async fn named_link(dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
     let Some(link) = link_name(name).map(|n| dir.join(n)) else {
         return Ok(dir.join(FILE_NAME));
     };
@@ -805,143 +546,6 @@ fn input_path(dir: &std::path::Path, name: &str) -> PathBuf {
         .map(|n| dir.join(n))
         .filter(|p| p.exists())
         .unwrap_or_else(|| dir.join(FILE_NAME))
-}
-
-fn wrong_count(got: usize, wanted: usize) -> String {
-    format!("The embedding model returned {got} vectors for {wanted} inputs.")
-}
-
-fn same_input(a: &MediaInput, b: &MediaInput) -> bool {
-    match (a, b) {
-        (MediaInput::Image(_, x), MediaInput::Image(_, y)) => x == y,
-        (MediaInput::Audio(..), MediaInput::Audio(..)) => true,
-        _ => false,
-    }
-}
-
-/// Progress of a source being embedded, saved and sent at most every
-/// `PROGRESS_INTERVAL`.
-struct Progress {
-    done: u32,
-    total: u32,
-    last: Instant,
-}
-
-impl Progress {
-    /// Counts `n` more done. False when the source is gone.
-    async fn add(&mut self, state: &AppState, id: &str, n: usize) -> anyhow::Result<bool> {
-        self.done += n as u32;
-        if self.done >= self.total || self.last.elapsed() < PROGRESS_INTERVAL {
-            return Ok(true);
-        }
-        self.last = Instant::now();
-        let (done, total) = (self.done, self.total);
-        update(state, id, |s| {
-            s.status = SourceStatus::Processing { done, total }
-        })
-        .await
-    }
-}
-
-/// Saves rows of a source that still exists, with its current topic set by `set_topic`.
-/// False when it was deleted meanwhile.
-async fn save_rows<T: Serialize + RowId>(
-    state: &AppState,
-    id: &str,
-    table: &'static str,
-    mut rows: Vec<T>,
-    set_topic: impl Fn(&mut T, Option<Id>),
-) -> anyhow::Result<bool> {
-    // Under the lock, so a delete or an attach can't interleave with the write.
-    let _w = state.write_lock.lock().await;
-    let Some(current) = state.store.get::<Source>(db::SOURCE, id).await? else {
-        return Ok(false);
-    };
-    for row in &mut rows {
-        set_topic(row, current.topic_id.clone());
-        state.store.put(table, &row.row_id(), row).await?;
-    }
-    Ok(true)
-}
-
-trait RowId {
-    fn row_id(&self) -> String;
-}
-
-impl RowId for ChunkRow {
-    fn row_id(&self) -> String {
-        format!("{}-{}", self.source_id, self.ord)
-    }
-}
-
-impl RowId for MediaRow {
-    fn row_id(&self) -> String {
-        format!("{}-m{}", self.source_id, self.ord)
-    }
-}
-
-/// The pictures and sound windows of a source, each with the words said during it.
-fn media_items(
-    source_id: &str,
-    kind: SourceKind,
-    pictures: &[Picture],
-    sound: Option<&Vec<f32>>,
-    transcript: Option<&Transcript>,
-) -> Vec<MediaItem> {
-    let said = |start: u64, end: u64| transcript.map(|t| t.span(start, end)).unwrap_or_default();
-    let row = |kind, file: Option<String>, page, start_ms, end_ms, text| MediaRow {
-        source_id: source_id.to_string(),
-        topic_id: None,
-        ord: 0,
-        kind,
-        file,
-        page,
-        start_ms,
-        end_ms,
-        text,
-        vector: Vec::new(),
-    };
-    let mut items = Vec::new();
-    // Frames stand for the stretch of video around them.
-    let frame_stretch = pictures
-        .windows(2)
-        .find_map(|w| Some(w[1].at_ms? - w[0].at_ms?))
-        .unwrap_or(margin_embed::FRAME_INTERVAL_MS);
-    for p in pictures {
-        let (media_kind, file) = match (kind, p.page, p.at_ms) {
-            (SourceKind::Image, ..) => (MediaKind::Image, SOURCE_ORIGINAL.to_string()),
-            (_, Some(n), _) => (MediaKind::Page, margin_embed::page_file(n)),
-            (_, _, Some(ms)) => (MediaKind::Frame, margin_embed::frame_file(ms)),
-            _ => continue,
-        };
-        // A frame is cited at its moment (the viewer starts the video there).
-        let (start, end) = (p.at_ms, None);
-        let text = match p.at_ms {
-            Some(at) => said(at.saturating_sub(frame_stretch / 2), at + frame_stretch / 2),
-            None => String::new(),
-        };
-        items.push(MediaItem {
-            row: row(media_kind, Some(file), p.page, start, end, text),
-            input: MediaInput::Image(p.path.clone(), p.tokens),
-        });
-    }
-    if let Some(samples) = sound {
-        for (start, window) in audio_windows(samples) {
-            let (from, to) = (sample_ms(start), sample_ms(start + window.len()));
-            items.push(MediaItem {
-                row: row(
-                    MediaKind::Audio,
-                    None,
-                    None,
-                    Some(from),
-                    Some(to),
-                    said(from, to),
-                ),
-                input: MediaInput::Audio(start, start + window.len()),
-            });
-        }
-    }
-    items
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,50 +609,94 @@ pub async fn passages_within(
     retrieve(state, source_ids, query, wait).await
 }
 
-/// Something retrieval can pick.
-enum Candidate {
-    Text(ChunkRow),
-    Media(MediaRow),
+/// A source's passages: its `passage` rows (the document index), or the `chunk`/`media`
+/// rows of a store the migration hasn't moved it out of yet, as passages.
+pub async fn candidates(state: &AppState, source_id: &str) -> anyhow::Result<Vec<PassageRow>> {
+    let rows = state.store.passages_of(source_id).await?;
+    if !rows.is_empty() || !has_old_rows(state).await? {
+        return Ok(rows);
+    }
+    let chunks: Vec<ChunkRow> = state
+        .store
+        .list_where(db::CHUNK, "source_id", source_id)
+        .await?;
+    let media: Vec<MediaRow> = state
+        .store
+        .list_where(db::MEDIA, "source_id", source_id)
+        .await?;
+    let mut rows: Vec<PassageRow> = chunks.into_iter().map(old_chunk_passage).collect();
+    let offset = rows.len() as i64;
+    rows.extend(media.into_iter().map(|m| old_media_passage(m, offset)));
+    Ok(rows)
 }
 
-impl Candidate {
-    fn text(&self) -> &str {
-        match self {
-            Candidate::Text(c) => &c.text,
-            Candidate::Media(m) => &m.text,
-        }
+fn old_passage(source_id: &str, modality: Modality, ord: i64, text: String) -> PassageRow {
+    PassageRow {
+        id: format!("{source_id}:old:{ord}"),
+        project_id: String::new(),
+        document_id: source_id.to_string(),
+        origin: "source".into(),
+        scope_ids: Vec::new(),
+        access: vec![ACCESS_COMPANY.to_string()],
+        unit_id: format!("{source_id}:old:{ord}"),
+        modality: modality.as_str().into(),
+        ord,
+        page: None,
+        start_line: None,
+        end_line: None,
+        start_ms: None,
+        end_ms: None,
+        section_path: String::new(),
+        text,
+        file: None,
+        chunk_hash: String::new(),
+        embedder: String::new(),
+        vector: Vec::new(),
     }
+}
 
-    fn vector(&self) -> &[f32] {
-        match self {
-            Candidate::Text(c) => &c.vector,
-            Candidate::Media(m) => &m.vector,
-        }
+fn old_chunk_passage(c: ChunkRow) -> PassageRow {
+    PassageRow {
+        page: c.page.map(i64::from),
+        start_ms: c.start_ms.map(|v| v as i64),
+        end_ms: c.end_ms.map(|v| v as i64),
+        vector: c.vector,
+        ..old_passage(&c.source_id, Modality::Text, c.ord as i64, c.text)
     }
+}
 
-    fn source_id(&self) -> &str {
-        match self {
-            Candidate::Text(c) => &c.source_id,
-            Candidate::Media(m) => &m.source_id,
-        }
+fn old_media_passage(m: MediaRow, offset: i64) -> PassageRow {
+    let modality = match m.kind {
+        MediaKind::Image | MediaKind::Page => Modality::Picture,
+        MediaKind::Frame => Modality::Frame,
+        MediaKind::Audio => Modality::Sound,
+    };
+    PassageRow {
+        page: m.page.map(i64::from),
+        start_ms: m.start_ms.map(|v| v as i64),
+        end_ms: m.end_ms.map(|v| v as i64),
+        file: m.file,
+        vector: m.vector,
+        ..old_passage(&m.source_id, modality, offset + m.ord as i64, m.text)
     }
+}
 
-    /// The stretch of a recording it covers, when it is read as text (a transcript
-    /// passage or a sound window).
-    fn spoken_range(&self) -> Option<(u64, u64)> {
-        match self {
-            Candidate::Text(c) => Some((c.start_ms?, c.end_ms?)),
-            Candidate::Media(m) if m.kind == MediaKind::Audio => Some((m.start_ms?, m.end_ms?)),
-            Candidate::Media(_) => None,
-        }
+/// The stretch of a recording a passage covers, when it is read as text (a transcript
+/// passage or a sound window).
+fn spoken_range(p: &PassageRow) -> Option<(u64, u64)> {
+    let text = p.modality == Modality::Text.as_str();
+    let sound = p.modality == Modality::Sound.as_str();
+    if !(text || sound) {
+        return None;
     }
+    Some((p.start_ms? as u64, p.end_ms? as u64))
+}
 
-    fn picture(&self) -> Option<&str> {
-        match self {
-            Candidate::Media(m) if m.kind != MediaKind::Audio => m.file.as_deref(),
-            _ => None,
-        }
-    }
+/// The picture of a picture or frame passage.
+fn picture_of(p: &PassageRow) -> Option<&str> {
+    let pictured =
+        p.modality == Modality::Picture.as_str() || p.modality == Modality::Frame.as_str();
+    pictured.then_some(p.file.as_deref()).flatten()
 }
 
 /// Whether two stretches overlap by more than half of the shorter one.
@@ -1083,18 +731,9 @@ async fn retrieve(
         .next()
         .context("the embedding model returned no vector for the query")?;
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut rows: Vec<PassageRow> = Vec::new();
     for s in &ready {
-        let chunks: Vec<ChunkRow> = state
-            .store
-            .list_where(db::CHUNK, "source_id", &s.id)
-            .await?;
-        candidates.extend(chunks.into_iter().map(Candidate::Text));
-        let media: Vec<MediaRow> = state
-            .store
-            .list_where(db::MEDIA, "source_id", &s.id)
-            .await?;
-        candidates.extend(media.into_iter().map(Candidate::Media));
+        rows.extend(candidates(state, &s.id).await?);
     }
     let tools = state.source_tools.clone();
     let query = query.to_string();
@@ -1114,22 +753,21 @@ async fn retrieve(
     let picked = tokio::task::spawn_blocking(move || {
         // Video frames by source, for a picture of transcript passages.
         let mut frames: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-        for c in &candidates {
-            if let Candidate::Media(m) = c
-                && m.kind == MediaKind::Frame
-                && let (Some(at), Some(file)) = (m.start_ms, &m.file)
+        for r in &rows {
+            if r.modality == Modality::Frame.as_str()
+                && let (Some(at), Some(file)) = (r.start_ms, &r.file)
             {
                 frames
-                    .entry(m.source_id.clone())
+                    .entry(r.document_id.clone())
                     .or_default()
-                    .push((at, file.clone()));
+                    .push((at as u64, file.clone()));
             }
         }
-        let mut scored: Vec<(f32, Candidate)> = candidates
+        let mut scored: Vec<(f32, PassageRow)> = rows
             .into_iter()
             // A sound window without a transcript has nothing the writer can read.
-            .filter(|c| !matches!(c, Candidate::Media(m) if m.kind == MediaKind::Audio && m.text.trim().is_empty()))
-            .map(|c| (tools.score(&query_vec, &query, c.vector(), c.text()), c))
+            .filter(|r| !(r.modality == Modality::Sound.as_str() && r.text.trim().is_empty()))
+            .map(|r| (tools.score(&query_vec, &query, &r.vector, &r.text), r))
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
 
@@ -1138,24 +776,39 @@ async fn retrieve(
         let mut images = 0;
         let mut seen_images: HashSet<Vec<u8>> = HashSet::new();
         let mut picked = Vec::new();
-        for (_, c) in scored {
+        for (_, r) in scored {
             if picked.len() == PASSAGES {
                 break;
             }
-            let Some(source) = sources.get(c.source_id()) else {
+            let Some(source) = sources.get(&r.document_id) else {
                 continue;
             };
-            let Some((original, media_dir)) = media_dirs.get(c.source_id()) else {
+            let Some((original, media_dir)) = media_dirs.get(&r.document_id) else {
                 continue;
             };
-            if let Some(file) = c.picture() {
+            let (page, start_ms, end_ms) = (
+                r.page.map(|v| v as u32),
+                r.start_ms.map(|v| v as u64),
+                r.end_ms.map(|v| v as u64),
+            );
+            if let Some(file) = picture_of(&r) {
                 if images == MAX_IMAGES {
                     continue;
                 }
                 let path = if file == SOURCE_ORIGINAL {
                     original.clone()
                 } else {
-                    media_dir.join(file)
+                    match page {
+                        // Pages are rendered when first needed.
+                        Some(n) => match tools.pdf_page_picture(original, n, media_dir) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!("couldn't render page {n} of {}: {e}", source.name);
+                                continue;
+                            }
+                        },
+                        None => media_dir.join(file),
+                    }
                 };
                 let image = match tools.image_for_model(&path) {
                     Ok((media_type, data)) => Image { media_type, data },
@@ -1170,41 +823,50 @@ async fn retrieve(
                     continue;
                 }
                 images += 1;
-                let Candidate::Media(m) = c else { continue };
-                picked.push(retrieved(source, &m.text, m.page, m.start_ms, m.end_ms, Some(image), m.file.clone()));
+                picked.push(retrieved(
+                    source,
+                    &r,
+                    (page, start_ms, end_ms),
+                    Some(image),
+                    r.file.clone(),
+                ));
                 continue;
             }
-            let normalized = c.text().split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
             if normalized.is_empty() || !seen_text.insert(normalized) {
                 continue;
             }
-            if let Some(range) = c.spoken_range() {
+            if let Some(range) = spoken_range(&r) {
                 if spoken
                     .iter()
-                    .any(|(id, r)| id == c.source_id() && mostly_overlap(*r, range))
+                    .any(|(id, s)| *id == r.document_id && mostly_overlap(*s, range))
                 {
                     continue;
                 }
-                spoken.push((c.source_id().to_string(), range));
+                spoken.push((r.document_id.clone(), range));
             }
-            let (page, start_ms, end_ms) = match &c {
-                Candidate::Text(t) => (t.page, t.start_ms, t.end_ms),
-                Candidate::Media(m) => (m.page, m.start_ms, m.end_ms),
-            };
             // A picture for the citation: the PDF page, or the video frame nearest the words.
             let picture = match (page, start_ms) {
-                (Some(n), _) => Some(margin_embed::page_file(n))
-                    .filter(|f| media_dir.join(f).is_file()),
+                (Some(n), _) => tools
+                    .pdf_page_picture(original, n, media_dir)
+                    .ok()
+                    .map(|_| margin_embed::page_file(n)),
                 (None, Some(start)) => {
                     let middle = (start + end_ms.unwrap_or(start)) / 2;
                     frames
-                        .get(c.source_id())
+                        .get(&r.document_id)
                         .and_then(|f| f.iter().min_by_key(|(at, _)| at.abs_diff(middle)))
                         .map(|(_, file)| file.clone())
                 }
                 _ => None,
             };
-            picked.push(retrieved(source, c.text(), page, start_ms, end_ms, None, picture));
+            picked.push(retrieved(
+                source,
+                &r,
+                (page, start_ms, end_ms),
+                None,
+                picture,
+            ));
         }
         picked
     })
@@ -1215,18 +877,17 @@ async fn retrieve(
 /// A picked passage and its citation.
 fn retrieved(
     source: &Source,
-    text: &str,
-    page: Option<u32>,
-    start_ms: Option<u64>,
-    end_ms: Option<u64>,
+    row: &PassageRow,
+    (page, start_ms, end_ms): (Option<u32>, Option<u64>, Option<u64>),
     image: Option<Image>,
     picture: Option<String>,
 ) -> Retrieved {
+    let has_doc = !row.embedder.is_empty();
     Retrieved {
         passage: Passage {
             source: source.name.clone(),
             page,
-            text: text.to_string(),
+            text: row.text.clone(),
             start_ms,
             end_ms,
             image,
@@ -1239,11 +900,12 @@ fn retrieved(
             page,
             start_ms,
             end_ms,
-            excerpt: text.trim().to_string(),
+            excerpt: row.text.trim().to_string(),
             image_url: picture,
-            document_id: None,
-            start_line: None,
-            end_line: None,
+            // Rows the migration hasn't moved yet have no document.
+            document_id: has_doc.then(|| row.document_id.clone()),
+            start_line: row.start_line.map(|v| v as u32),
+            end_line: row.end_line.map(|v| v as u32),
             file: None,
         },
     }

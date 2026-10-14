@@ -2,7 +2,7 @@
 //! traits; the production implementations forward to the crates, and tests plug in fakes.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,6 +11,8 @@ use margin_ai::{AiError, LessonContext, ResponsesClient, SceneRequest};
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
+
+use crate::pipeline::{Chunker, ChunkerCfg};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -161,14 +163,27 @@ pub trait SourceTools: Send + Sync + 'static {
     /// An image file as the lesson writer is shown it: (media type, bytes), at most
     /// `WRITER_IMAGE_SIDE` px. Blocking.
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError>;
-    /// Cuts extracted text into chunks of at most `max_tokens`.
+    /// Cuts extracted text into chunks of at most `cfg.max_tokens` with the pipeline's
+    /// chunker, picked by name in Settings (`chunker.name()`: "sections-v2",
+    /// "pages-v1", …).
     fn chunk(
         &self,
+        chunker: &dyn Chunker,
         doc: &Extracted,
         kind: SourceKind,
         count_tokens: &dyn Fn(&str) -> usize,
-        max_tokens: usize,
+        cfg: &ChunkerCfg,
     ) -> Vec<Chunk>;
+    /// Page `page` (from 1) of the PDF at `pdf` as a picture, rendered into `media_dir`
+    /// as `margin_embed::page_file(page)` the first time it is asked for and served from
+    /// there after: pages are rendered when retrieval or a citation first needs them,
+    /// not at ingest. Blocking.
+    fn pdf_page_picture(
+        &self,
+        pdf: &Path,
+        page: u32,
+        media_dir: &Path,
+    ) -> Result<PathBuf, EmbedError>;
     /// How well a chunk matches a query; higher is better.
     fn score(
         &self,
@@ -253,12 +268,41 @@ impl SourceTools for EmbedTools {
 
     fn chunk(
         &self,
+        chunker: &dyn Chunker,
         doc: &Extracted,
         kind: SourceKind,
         count_tokens: &dyn Fn(&str) -> usize,
-        max_tokens: usize,
+        cfg: &ChunkerCfg,
     ) -> Vec<Chunk> {
-        margin_embed::chunk(doc, kind, count_tokens, max_tokens)
+        chunker.chunk(doc, kind, count_tokens, cfg)
+    }
+
+    /// Until `margin_embed` renders a single page on its own (R1-embed), the page comes
+    /// from reading the PDF into a scratch folder next to `media_dir`.
+    fn pdf_page_picture(
+        &self,
+        pdf: &Path,
+        page: u32,
+        media_dir: &Path,
+    ) -> Result<PathBuf, EmbedError> {
+        let target = media_dir.join(margin_embed::page_file(page));
+        if target.is_file() {
+            return Ok(target);
+        }
+        let scratch = media_dir.with_extension(format!("render-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let doc = margin_embed::extract(pdf, SourceKind::Pdf, &scratch)?;
+            let picture = doc
+                .pictures
+                .into_iter()
+                .find(|p| p.page == Some(page))
+                .ok_or_else(|| EmbedError::Extract(format!("the PDF has no page {page}")))?;
+            std::fs::create_dir_all(media_dir)?;
+            std::fs::rename(&picture.path, &target)?;
+            Ok(target.clone())
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        result
     }
 
     fn score(

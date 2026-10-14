@@ -42,6 +42,9 @@ pub const WORKSPACE: &str = "workspace";
 pub const PROJECT: &str = "project";
 /// Indexed documents (`margin_shared::context::Document`), `{ doc }`.
 pub const DOCUMENT: &str = "document";
+/// Tombstones of deleted documents (`ingest::Tombstone`), `{ doc }`, for the context
+/// API's change feed.
+pub const DOCUMENT_DELETED: &str = "document_deleted";
 /// Retrievable passages (`PassageRow`): SCHEMAFULL, top-level fields, indexed.
 pub const PASSAGE: &str = "passage";
 /// Trace rows (`margin_shared::context::TraceRow`): SCHEMAFULL, ids `[kind, at, ulid]`.
@@ -52,9 +55,32 @@ pub const TRACE_DAILY: &str = "trace_daily";
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
 
-const TABLES: [&str; 15] = [
-    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK, MEDIA, CHAT, CHAT_ITEM,
-    WORKSPACE, PROJECT, DOCUMENT,
+/// The tables of sources' vectors before the `passage` table: defined until the one-pass
+/// migration (`ingest::migrate`) removes them for good (`Store::remove_table`).
+const OLD_TABLES: [&str; 2] = [CHUNK, MEDIA];
+
+/// Rollup sums `trace::apply_retention` copies out of the views before it deletes raw
+/// rows, so the hourly and daily numbers outlive them (R1-trace).
+pub const TRACE_HOURLY_KEPT: &str = "trace_hourly_kept";
+pub const TRACE_DAILY_KEPT: &str = "trace_daily_kept";
+
+const TABLES: [&str; 16] = [
+    TOPIC,
+    LESSON,
+    NOTE,
+    VIDEO,
+    PROPOSAL,
+    DEVICE,
+    SETTINGS,
+    SOURCE,
+    CHAT,
+    CHAT_ITEM,
+    WORKSPACE,
+    PROJECT,
+    DOCUMENT,
+    DOCUMENT_DELETED,
+    TRACE_HOURLY_KEPT,
+    TRACE_DAILY_KEPT,
 ];
 
 /// The `passage` and `trace` tables and their plain indexes. Idempotent (`IF NOT
@@ -63,6 +89,8 @@ const SCHEMA: &str = r#"
 DEFINE TABLE IF NOT EXISTS schema_meta SCHEMALESS;
 DEFINE INDEX IF NOT EXISTS document_project ON document FIELDS doc.project_id;
 DEFINE INDEX IF NOT EXISTS document_access  ON document FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS document_generation ON document FIELDS doc.generation;
+DEFINE INDEX IF NOT EXISTS document_deleted_generation ON document_deleted FIELDS doc.generation;
 
 DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
@@ -128,6 +156,7 @@ DEFINE FIELD IF NOT EXISTS chunks_new     ON trace TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS chunks_kept    ON trace TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS chunks_deleted ON trace TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
+DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 
 /// The analyzer, the vector and full-text indexes, and the rollup views: defined with
@@ -255,8 +284,34 @@ impl Store {
             .check()
             .context("couldn't define tables")?;
         let store = Self { db };
+        store.define_old_tables().await?;
         store.apply_indexes().await?;
         Ok(store)
+    }
+
+    /// Defines `chunk` and `media` unless `remove_table` retired them: a store from
+    /// before the `passage` table, or a new one, has them until the migration is done
+    /// (reading a table that doesn't exist is an error).
+    async fn define_old_tables(&self) -> anyhow::Result<()> {
+        let retired = self.retired().await?;
+        for t in OLD_TABLES {
+            if !retired.iter().any(|r| r == t) {
+                self.db
+                    .query(format!("DEFINE TABLE IF NOT EXISTS {t} SCHEMALESS"))
+                    .await?
+                    .check()
+                    .with_context(|| format!("couldn't define {t}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tables `remove_table` removed for good.
+    async fn retired(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .get::<Vec<String>>(SCHEMA_META, "retired")
+            .await?
+            .unwrap_or_default())
     }
 
     /// Runs `INDEXES` when its text differs from the last one applied.
@@ -481,6 +536,177 @@ impl Store {
             .bind(("to", to))
             .await?
             .check()?;
+        Ok(())
+    }
+
+    // -- passages and documents (R1-store) ---------------------------------
+
+    /// The next value of the store-wide generation counter (1, 2, …). Documents take
+    /// one each time their passages change, and the context API's change feed lists what
+    /// passed a value, so one counter orders every document.
+    pub async fn next_generation(&self) -> anyhow::Result<u64> {
+        let n: Vec<u64> = self
+            .query_rows(
+                "UPSERT schema_meta:generation SET n = (n ?? 0) + 1 RETURN VALUE n",
+                vec![],
+            )
+            .await?;
+        n.into_iter()
+            .next()
+            .context("the generation counter returned nothing")
+    }
+
+    /// The generation counter as it is (0 before the first document).
+    pub async fn generation(&self) -> anyhow::Result<u64> {
+        let n: Vec<Option<u64>> = self
+            .query_rows("SELECT VALUE n FROM schema_meta:generation", vec![])
+            .await?;
+        Ok(n.into_iter().next().flatten().unwrap_or(0))
+    }
+
+    /// Every passage of a document, by `ord` (the `passage_document` index).
+    pub async fn passages_of(&self, document_id: &str) -> anyhow::Result<Vec<PassageRow>> {
+        self.query_rows(
+            "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d ORDER BY ord",
+            vec![("d", serde_json::json!(document_id))],
+        )
+        .await
+    }
+
+    /// Whether a document has any passage.
+    pub async fn has_passages(&self, document_id: &str) -> anyhow::Result<bool> {
+        let rows: Vec<serde_json::Value> = self
+            .query_rows(
+                "SELECT id FROM passage WHERE document_id = $d LIMIT 1",
+                vec![("d", serde_json::json!(document_id))],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    /// Deletes up to `INSERT_MANY_MAX` passages of a document by their ids.
+    pub async fn delete_passages(&self, document_id: &str, ids: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            ids.len() <= INSERT_MANY_MAX,
+            "delete_passages takes at most {INSERT_MANY_MAX} ids, not {}",
+            ids.len()
+        );
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.query_rows::<serde_json::Value>(
+            "DELETE passage WHERE document_id = $d AND record::id(id) IN $ids RETURN NONE",
+            vec![
+                ("d", serde_json::json!(document_id)),
+                ("ids", serde_json::json!(ids)),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes every passage of a document.
+    pub async fn delete_document_passages(&self, document_id: &str) -> anyhow::Result<()> {
+        self.query_rows::<serde_json::Value>(
+            "DELETE passage WHERE document_id = $d RETURN NONE",
+            vec![("d", serde_json::json!(document_id))],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Rewrites everything but the text, hash, embedder and vector of up to
+    /// `INSERT_MANY_MAX` stored passages (by `id`): their place in the document, scope
+    /// and access, for passages an ingest keeps.
+    pub async fn update_passages(&self, rows: &[PassageRow]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            rows.len() <= INSERT_MANY_MAX,
+            "update_passages takes at most {INSERT_MANY_MAX} rows, not {}",
+            rows.len()
+        );
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Without the vectors: only the locator fields travel.
+        let rows: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(r)?;
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("vector");
+                }
+                Ok(v)
+            })
+            .collect::<anyhow::Result<_>>()?;
+        self.query_rows::<serde_json::Value>(
+            "FOR $r IN $rows { UPDATE type::record('passage', $r.id) SET \
+               project_id = $r.project_id, origin = $r.origin, scope_ids = $r.scope_ids, \
+               access = $r.access, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
+               page = $r.page, start_line = $r.start_line, end_line = $r.end_line, \
+               start_ms = $r.start_ms, end_ms = $r.end_ms, section_path = $r.section_path, \
+               file = $r.file RETURN NONE; };",
+            vec![("rows", serde_json::Value::Array(rows))],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Adds `scope_id` to the `scope_ids` of every passage of a document.
+    pub async fn add_passage_scope(&self, document_id: &str, scope_id: &str) -> anyhow::Result<()> {
+        self.query_rows::<serde_json::Value>(
+            "UPDATE passage SET scope_ids = array::union(scope_ids, [$s]) \
+             WHERE document_id = $d RETURN NONE",
+            vec![
+                ("d", serde_json::json!(document_id)),
+                ("s", serde_json::json!(scope_id)),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes `scope_id` from the `scope_ids` of every passage of a document.
+    pub async fn remove_passage_scope(
+        &self,
+        document_id: &str,
+        scope_id: &str,
+    ) -> anyhow::Result<()> {
+        self.query_rows::<serde_json::Value>(
+            "UPDATE passage SET scope_ids = array::complement(scope_ids, [$s]) \
+             WHERE document_id = $d RETURN NONE",
+            vec![
+                ("d", serde_json::json!(document_id)),
+                ("s", serde_json::json!(scope_id)),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `table` is defined in the database.
+    pub async fn table_exists(&self, table: &'static str) -> anyhow::Result<bool> {
+        let info: Vec<serde_json::Value> = self.query_rows("INFO FOR DB", vec![]).await?;
+        Ok(info
+            .first()
+            .and_then(|i| i.get("tables"))
+            .and_then(|t| t.get(table))
+            .is_some())
+    }
+
+    /// Removes a table and its records for good: an old table (`chunk`, `media`) isn't
+    /// defined again at the next start. Reading a removed table is an error; callers
+    /// check `table_exists` first.
+    pub async fn remove_table(&self, table: &'static str) -> anyhow::Result<()> {
+        let mut retired = self.retired().await?;
+        if !retired.iter().any(|r| r == table) {
+            retired.push(table.to_string());
+            self.put(SCHEMA_META, "retired", &retired).await?;
+        }
+        self.db
+            .query(format!("REMOVE TABLE IF EXISTS {table}"))
+            .await?
+            .check()
+            .with_context(|| format!("couldn't remove the table {table}"))?;
         Ok(())
     }
 }
@@ -1033,5 +1259,92 @@ mod tests {
         );
         let (from, to) = window("retrieval", "1970-01-01T00:00:00Z", "2100-01-01T00:00:00Z");
         assert_eq!(s.range::<Row>(TRACE, &from, &to).await.unwrap().len(), 1);
+    }
+
+    // -- R1-store helpers ------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_generation_counter_counts_up_from_one() {
+        let s = Store::memory().await.unwrap();
+        assert_eq!(s.generation().await.unwrap(), 0);
+        assert_eq!(s.next_generation().await.unwrap(), 1);
+        assert_eq!(s.next_generation().await.unwrap(), 2);
+        assert_eq!(s.generation().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn passages_of_a_document_are_read_updated_scoped_and_deleted() {
+        let s = seeded().await;
+        let rows = s.passages_of("d1").await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(s.has_passages("d2").await.unwrap());
+        assert!(!s.has_passages("d9").await.unwrap());
+        // The document index serves the read.
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                "SELECT * FROM passage WHERE document_id = $d EXPLAIN",
+                vec![("d", serde_json::json!("d1"))],
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(plan.contains("passage_document"), "{plan}");
+
+        // Locators change; the vector and the text stay.
+        let mut a = rows[0].clone();
+        a.ord = 7;
+        a.page = Some(3);
+        a.start_line = None;
+        a.section_path = "Moved".into();
+        a.access = vec!["company/engineering".into()];
+        s.update_passages(std::slice::from_ref(&a)).await.unwrap();
+        let back = s.passages_of("d1").await.unwrap();
+        assert_eq!(back.iter().find(|r| r.id == "a").unwrap(), &a);
+
+        s.add_passage_scope("d1", "chat9").await.unwrap();
+        s.add_passage_scope("d1", "chat9").await.unwrap();
+        let back = s.passages_of("d1").await.unwrap();
+        assert!(
+            back.iter()
+                .all(|r| r.scope_ids.iter().filter(|x| *x == "chat9").count() == 1)
+        );
+        s.remove_passage_scope("d1", "t1").await.unwrap();
+        let back = s.passages_of("d1").await.unwrap();
+        assert!(back.iter().all(|r| !r.scope_ids.iter().any(|x| x == "t1")));
+
+        s.delete_passages("d1", &["a".to_string()]).await.unwrap();
+        assert_eq!(s.passages_of("d1").await.unwrap().len(), 1);
+        // Only the named document's passages go.
+        s.delete_passages("d1", &["c".to_string()]).await.unwrap();
+        assert!(s.has_passages("d2").await.unwrap());
+        s.delete_document_passages("d1").await.unwrap();
+        assert!(s.passages_of("d1").await.unwrap().is_empty());
+        assert!(s.has_passages("d2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn old_tables_stay_removed_once_removed() {
+        let s = Store::memory().await.unwrap();
+        assert!(s.table_exists(CHUNK).await.unwrap() && s.table_exists(MEDIA).await.unwrap());
+        s.put(CHUNK, "x", &serde_json::json!({"source_id": "s"}))
+            .await
+            .unwrap();
+        s.remove_table(CHUNK).await.unwrap();
+        assert!(!s.table_exists(CHUNK).await.unwrap());
+        // Reading it now is an error, which is why callers ask first.
+        assert!(
+            s.list_where::<serde_json::Value>(CHUNK, "source_id", "s")
+                .await
+                .is_err()
+        );
+        // The next start doesn't define it again; the other old table is still there.
+        s.define_old_tables().await.unwrap();
+        assert!(!s.table_exists(CHUNK).await.unwrap());
+        assert!(s.table_exists(MEDIA).await.unwrap());
+        s.remove_table(CHUNK).await.unwrap();
+        assert_eq!(s.retired().await.unwrap(), [CHUNK]);
     }
 }
