@@ -11,7 +11,7 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 | `docs/agent-contract.md` | Contract shared by all phases (types, routes, protocol) |
 | `docs/agent-prebuild-review.md` | Fable's architect review; section D has the original phase briefs |
 | `docs/agent-phase3-brief.md` | Phase 3 brief (built), and the shape later briefs follow |
-| `docs/agent-phase4-brief.md` | **Final phase 4 brief (folders), ready to build once the owner answers its Q1–Q3** |
+| `docs/agent-phase4-brief.md` | **Final phase 4 brief (folders), reworked for the owner's allow-list answer; Q1–Q3 decided** |
 | `docs/agent-providers-brief.md` | **Switchable model providers brief (OpenAI key / ChatGPT sign-in / Claude API)**; see the status below |
 | `docs/agent-engine-review.md` | Fable's review of the ACP/CLI-engine idea. Background only, superseded by the providers decision |
 | `docs/service-setup.md` | How the service and Cloudflare Tunnel run |
@@ -53,9 +53,9 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 - The SIWC path needs a spike first. If it fails, drop only that option.
 
 **Still open with the owner:**
-1. Phase 4 Q1: when a lesson is regenerated, use the stored folder excerpts (recommended) or re-read the device?
-2. Phase 4 Q2: a fixed skip list (`.git`, `node_modules`, `build`, `dist`, `target`, …; recommended) or `.gitignore`?
-3. Phase 4 Q3: should the device holding a folder show a notice when another device opens one of its files? Recommended: no.
+1. Phase 4 Q1–Q3 are decided (2026-10-14): stored excerpts on regenerate; an allow-list of file types (prose documents, PDFs, images) instead of a skip list, no audio/video for now; no notice on the holding device. Code from a GitHub repository becomes its own phase after phase 5. The reworked brief's own "Still open for the owner" list is the next set to confirm.
+2. (removed)
+3. (removed)
 4. How much of the ChatGPT plan Margin may use (the SIWC per-app cap).
 5. Questions left over from phase 3:
    - Should OpenAI 401/403 map to no_api_key, so the app offers "Open Settings"?
@@ -72,7 +72,7 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 
 ## Next steps
 
-1. Get the owner's answers to phase 4 Q1–Q3. Then run the phase 4 workflow from `docs/agent-phase4-brief.md` (first commit, then areas 4-S, 4-core, 4a desktop, 4b iOS and 4c Android).
+1. Confirm the reworked phase 4 brief's remaining owner items. Then run the phase 4 workflow from `docs/agent-phase4-brief.md` (first commit, then areas 4-S, 4-core, 4a desktop, 4b iOS and 4c Android).
 2. In parallel, run the SIWC spike (`docs/agent-providers-brief.md` D11). The owner runs it by hand.
 3. Get the answers to Providers Q1–Q3. Have Fable re-check its brief against phase 4 as merged, then run the providers workflow.
 4. Phase 5: have Fable write the brief, then build it.
