@@ -1,0 +1,35 @@
+# When a pull request is merged or closed, cancels its CI (`test`) runs still queued or
+# running, so the single self-hosted runner moves on to the merge's CD. Runs on a
+# GitHub-hosted runner so it never waits behind the very job it cancels.
+# (A new push to an open PR already cancels the previous run: test.yml's concurrency.)
+name: cancel-closed-pr-ci
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    # Same-repository PRs only (fork PRs get a read-only token and need approval anyway).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Cancel the PR's unfinished test runs
+        run: |
+          ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?event=pull_request&per_page=100" \
+            --jq "[.workflow_runs[] | select(.status != \"completed\") | select(any(.pull_requests[]?; .number == $PR)) | .id] | .[]")"
+          if [ -z "$ids" ]; then
+            echo "No unfinished CI for PR #$PR."
+            exit 0
+          fi
+          for id in $ids; do
+            echo "Cancelling run $id (PR #$PR)."
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null || true
+          done
