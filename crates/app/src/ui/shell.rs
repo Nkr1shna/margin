@@ -15,7 +15,7 @@ pub fn Shell() -> Element {
     let nav = navigator();
     let route = use_route::<Route>();
 
-    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+\ toggles the sidebar,
+    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+Shift+N opens All notes, Cmd/Ctrl+\ toggles the sidebar,
     // Cmd/Ctrl+[ and ] go back and forward, from anywhere in the window.
     use_future(move || async move {
         let mut eval = js(
@@ -24,6 +24,10 @@ pub fn Shell() -> Element {
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
                 "search" => app.search_open.set(true),
+                "notes" => {
+                    app.search_open.set(false);
+                    nav.push(Route::AllNotes {});
+                }
                 "settings" => app.settings_open.set(Some(SettingsPane::General)),
                 "back" => nav.go_back(),
                 "forward" => nav.go_forward(),

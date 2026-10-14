@@ -135,6 +135,7 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "note" }
                     span { class: "grow", "All notes" }
+                    span { class: "k", "⇧⌘N" }
                 }
             }
             div { class: "sb-label",

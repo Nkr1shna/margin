@@ -133,8 +133,12 @@
     watchShortcuts: function (send) {
       if (window.MarginApp._stopShortcuts) window.MarginApp._stopShortcuts();
       function onKey(e) {
-        if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+        if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
         var k = (e.key || "").toLowerCase();
+        if (e.shiftKey) {
+          if (k === "n") { e.preventDefault(); send("notes"); }
+          return;
+        }
         if (k === "k") { e.preventDefault(); send("search"); }
         else if (k === "n") { e.preventDefault(); send("ask"); }
         else if (k === "\\") { e.preventDefault(); send("sidebar"); }
