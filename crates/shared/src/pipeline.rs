@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 /// `hash()`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineConfig {
+    /// The embedding backend (`docs/plan-linux-service.md` §2.11): `"coreml"`,
+    /// `"onnx-q8"`, `"onnx-fp32"`, `"onnx-fp16"`, or the test stand-ins `"recorded"` and
+    /// `"fake"`. Left out of the JSON (and so of `hash()`) while it is `"coreml"`, so
+    /// every hash stored before it existed keeps its meaning.
+    #[serde(
+        default = "default_embedder",
+        skip_serializing_if = "is_default_embedder"
+    )]
+    pub embedder: StageCfg,
     #[serde(default = "default_chunker")]
     pub chunker: StageCfg,
     #[serde(default = "default_retriever")]
@@ -120,6 +129,15 @@ impl RouteTable {
     }
 }
 
+fn default_embedder() -> StageCfg {
+    StageCfg::named(DEFAULT_EMBEDDER)
+}
+fn is_default_embedder(cfg: &StageCfg) -> bool {
+    *cfg == default_embedder()
+}
+/// The `embedder` stage a config without one names: the backend every pipeline ran on
+/// before the stage existed.
+pub const DEFAULT_EMBEDDER: &str = "coreml";
 fn default_chunker() -> StageCfg {
     StageCfg::named("sections-v2")
 }
@@ -142,6 +160,7 @@ fn default_prompts() -> String {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            embedder: default_embedder(),
             chunker: default_chunker(),
             retriever: default_retriever(),
             fusion: default_fusion(),
@@ -238,6 +257,29 @@ mod tests {
         let mut c = PipelineConfig::default();
         c.routes.small = Some("gpt-6-luna".into());
         assert_ne!(a, c.hash());
+    }
+
+    #[test]
+    fn the_embedder_stage_defaults_to_core_ml_and_hashes_only_when_changed() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.embedder.name, "coreml");
+        assert!(
+            serde_json::to_value(&cfg)
+                .unwrap()
+                .get("embedder")
+                .is_none()
+        );
+        let onnx: PipelineConfig =
+            serde_json::from_value(json!({"embedder": {"name": "onnx-q8"}})).unwrap();
+        assert_eq!(onnx.embedder.name, "onnx-q8");
+        assert_ne!(onnx.hash(), cfg.hash());
+        let back: PipelineConfig =
+            serde_json::from_value(serde_json::to_value(&onnx).unwrap()).unwrap();
+        assert_eq!(back, onnx);
+        // Naming the default explicitly is the default.
+        let explicit: PipelineConfig =
+            serde_json::from_value(json!({"embedder": {"name": "coreml"}})).unwrap();
+        assert_eq!(explicit.hash(), cfg.hash());
     }
 
     #[test]

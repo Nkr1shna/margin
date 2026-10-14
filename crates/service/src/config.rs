@@ -17,6 +17,9 @@ pub const DEFAULT_GITHUB_OAUTH_URL: &str = "https://github.com";
 pub const DEFAULT_ENVIRONMENT: &str = "prod";
 /// The deploy environments (`docs/plan-deploy.md` §1); `GET /api/version` reports it.
 pub const ENVIRONMENTS: [&str; 2] = ["dev", "prod"];
+/// Where secrets are kept (`docs/plan-linux-service.md` §2.8): the login Keychain, or
+/// 0600 files under `data_dir/secrets` (a headless Linux service has no unlocked keyring).
+pub const SECRET_STORES: [&str; 2] = ["keychain", "file"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -39,6 +42,14 @@ pub struct Config {
     /// `deploy.sh` and `margin-eval` check it through `GET /api/version`.
     #[serde(default = "default_environment")]
     pub environment: String,
+    /// The embedding backend (`margin_embed::Backend` names: `"coreml"`, `"onnx-q8"`,
+    /// `"onnx-fp32"`, `"onnx-fp16"`). Default: Core ML on macOS, ONNX 8-bit elsewhere.
+    #[serde(default = "default_embedder")]
+    pub embedder: String,
+    /// `"keychain"` or `"file"` (`SECRET_STORES`). Default: the Keychain on macOS, files
+    /// elsewhere.
+    #[serde(default = "default_secrets")]
+    pub secrets: String,
 }
 
 fn default_public_url() -> String {
@@ -58,6 +69,16 @@ fn default_github_oauth_url() -> String {
 }
 fn default_environment() -> String {
     DEFAULT_ENVIRONMENT.into()
+}
+fn default_embedder() -> String {
+    margin_embed::Backend::default().name().into()
+}
+fn default_secrets() -> String {
+    if cfg!(target_os = "macos") {
+        "keychain".into()
+    } else {
+        "file".into()
+    }
 }
 fn default_data_dir() -> PathBuf {
     app_support_dir().join("data")
@@ -92,6 +113,8 @@ impl Default for Config {
             github_api_url: default_github_api_url(),
             github_oauth_url: default_github_oauth_url(),
             environment: default_environment(),
+            embedder: default_embedder(),
+            secrets: default_secrets(),
         }
     }
 }
@@ -133,6 +156,22 @@ impl Config {
         self.github_client_id = self.github_client_id.trim().to_string();
         self.allowed_github_login = self.allowed_github_login.trim().to_string();
         self.environment = self.environment.trim().to_ascii_lowercase();
+        self.embedder = self.embedder.trim().to_ascii_lowercase();
+        self.secrets = self.secrets.trim().to_ascii_lowercase();
+    }
+
+    /// The configured embedding backend; an error for an unknown name or one this binary
+    /// wasn't built with (never a silent fallback to another backend).
+    pub fn embedder_backend(&self) -> anyhow::Result<margin_embed::Backend> {
+        let backend: margin_embed::Backend = self.embedder.parse()?;
+        if !backend.is_built() {
+            bail!(
+                "embedder is \"{backend}\", which this build of margin-service can't run \
+                 (use \"{}\")",
+                margin_embed::Backend::default()
+            );
+        }
+        Ok(backend)
     }
 
     pub fn validate_for_serving(&self) -> anyhow::Result<()> {
@@ -146,6 +185,13 @@ impl Config {
             bail!(
                 "environment is \"{}\"; it must be \"dev\" or \"prod\" (run `margin-service setup`)",
                 self.environment
+            );
+        }
+        self.embedder_backend()?;
+        if !SECRET_STORES.contains(&self.secrets.as_str()) {
+            bail!(
+                "secrets is \"{}\"; it must be \"keychain\" or \"file\"",
+                self.secrets
             );
         }
         for (name, url) in [
@@ -178,9 +224,20 @@ impl Config {
         self.data_dir.join("uploads")
     }
 
-    /// The downloaded embedding model.
+    /// The downloaded embedding model of the configured backend (each backend has its
+    /// own folder; an unknown backend falls back to the default's, and serving refuses
+    /// it in `validate_for_serving`).
     pub fn embedding_model_dir(&self) -> PathBuf {
-        self.data_dir.join("models").join("embeddinggemma-2")
+        let backend = self.embedder.parse().unwrap_or_default();
+        self.data_dir
+            .join("models")
+            .join(margin_embed::Backend::dir_name(backend))
+    }
+
+    /// The configured backend's model files.
+    pub fn model_files(&self) -> margin_embed::ModelFiles {
+        let backend = self.embedder.parse().unwrap_or_default();
+        margin_embed::ModelFiles::with_backend(self.embedding_model_dir(), backend)
     }
 }
 
@@ -366,5 +423,51 @@ mod tests {
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embedder_and_secrets_default_per_os_and_are_checked() {
+        let c: Config = toml::from_str("github_client_id = \"id\"").unwrap();
+        let backend = margin_embed::Backend::default();
+        assert_eq!(c.embedder, backend.name());
+        assert_eq!(c.embedder_backend().unwrap(), backend);
+        assert!(c.embedding_model_dir().ends_with(backend.dir_name()));
+        assert_eq!(c.model_files().backend, backend);
+        assert_eq!(
+            c.secrets,
+            if cfg!(target_os = "macos") {
+                "keychain"
+            } else {
+                "file"
+            }
+        );
+        c.validate_for_serving().unwrap();
+        let mut bad = c.clone();
+        bad.embedder = "tensorflow".into();
+        assert!(
+            bad.validate_for_serving()
+                .unwrap_err()
+                .to_string()
+                .contains("onnx-q8")
+        );
+        let mut other = c.clone();
+        other.embedder = if cfg!(target_os = "macos") {
+            "onnx-q8"
+        } else {
+            "coreml"
+        }
+        .into();
+        // Refused when this binary can't run it (macOS builds the service without `onnx`).
+        let built = other.model_files().backend.is_built();
+        assert_eq!(other.validate_for_serving().is_ok(), built);
+        assert!(
+            other
+                .model_files()
+                .dir
+                .ends_with(other.model_files().backend.dir_name())
+        );
+        let mut secrets = c;
+        secrets.secrets = "vault".into();
+        assert!(secrets.validate_for_serving().is_err());
     }
 }

@@ -1438,6 +1438,8 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         item.row.scope_ids = scope.clone();
         item.row.access = doc.access.clone();
         item.row.project_id = doc.project_id.clone();
+        // The backend that embeds them (`Embedder::version`), not the Core ML constant.
+        item.row.embedder = embedder.version().to_string();
     }
     let passages = items.len() as u32;
 
@@ -1446,7 +1448,7 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         stored,
         items,
         |i| i.row.chunk_hash.as_str(),
-        EMBEDDER_VERSION,
+        embedder.version(),
     );
     report.chunks_kept = kept.len() as u32;
     report.chunks_new = new.len() as u32;

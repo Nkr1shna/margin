@@ -436,6 +436,9 @@ struct Filter {
     modalities: Vec<String>,
     /// Visible access paths; `None` = no access filter.
     access: Option<Vec<String>>,
+    /// The query vector's embedder version: the dense leg's `embedder = $embedder`
+    /// (empty = none).
+    embedder: String,
 }
 
 impl Filter {
@@ -453,6 +456,7 @@ impl Filter {
                 .map(|m| m.as_str().to_string())
                 .collect(),
             access,
+            embedder: q.embedder.clone(),
         })
     }
 
@@ -484,7 +488,20 @@ impl Filter {
         if let Some(paths) = &self.access {
             binds.push(("paths", json!(paths)));
         }
+        if !self.embedder.is_empty() {
+            binds.push(("embedder", json!(self.embedder)));
+        }
         binds
+    }
+
+    /// ` AND …` conditions for the dense leg: the shared ones, and only vectors of the
+    /// query's embedder (one more pre-filter conjunct inside the KNN scan).
+    fn dense_sql(&self) -> String {
+        let mut sql = self.sql();
+        if !self.embedder.is_empty() {
+            sql.push_str(" AND embedder = $embedder");
+        }
+        sql
     }
 }
 
@@ -583,7 +600,7 @@ impl IndexRetriever {
             "SELECT {fields}, vector::distance::knn() AS d FROM passage \
              WHERE vector <|{k},{ef}|> $q{cond} ORDER BY d",
             ef = self.ef.max(k),
-            cond = filter.sql(),
+            cond = filter.dense_sql(),
         )
     }
 
@@ -1484,7 +1501,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         "budget": req.budget,
         "window": req.window_tokens,
         "pipeline": pipeline.hash,
-        "embedder": embedder.is_some(),
+        "embedder": embedder.as_ref().map(|e| e.version().to_string()),
         "generation": index_generation(&state.store).await?,
     })
     .to_string();
@@ -1521,6 +1538,10 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     for (text, vector) in req.plan.queries.iter().zip(vectors) {
         let q = Query {
             text: text.clone(),
+            embedder: embedder
+                .as_ref()
+                .filter(|_| !vector.is_empty())
+                .map_or_else(String::new, |e| e.version().to_string()),
             vector,
             scope: req.scope.clone(),
             access: req.access.clone(),

@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Router, http::StatusCode};
 use chrono::Utc;
-use margin_embed::ModelFiles;
 use margin_shared::{
     Chat, LessonStatus, Proposal, ProposalStatus, Source, SourceStatus, VideoStatus, routes,
 };
@@ -89,7 +88,7 @@ impl Service {
             .read_timeout(Duration::from_secs(60))
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let model_files = ModelFiles::new(opts.config.embedding_model_dir());
+        let model_files = opts.config.model_files();
         let registry = Registry::standard(StageDeps {
             store: opts.store.clone(),
         });
