@@ -122,6 +122,10 @@ pub struct FakeGenerator {
     pub lesson_body: Mutex<Option<String>>,
     /// The model chat turns call: queue replies with `agent.push(..)`.
     pub agent: Arc<ScriptedModel>,
+    /// The model chat titles are written with (`Turns::title_model`), apart from
+    /// `agent` so a title call never takes a turn's reply. Empty, a title call fails and
+    /// the first-line title stays; queue a title with `title_reply`.
+    pub titles: Arc<ScriptedModel>,
     /// When set, chat turns call the real `ResponsesClient` at Settings' base URL
     /// instead of `agent` (point it at a fake Responses API).
     pub agent_over_http: AtomicBool,
@@ -754,6 +758,7 @@ pub async fn start_with(setup: Setup) -> Harness {
     .await
     .unwrap();
     let state = service.state.clone();
+    *state.turns.title_model.lock().unwrap() = Some(generator.titles.clone());
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         service
@@ -885,6 +890,13 @@ impl Harness {
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
+    }
+
+    /// Queues the reply of the next title call (see `FakeGenerator::titles`).
+    pub fn title_reply(&self, reply: &str) {
+        self.generator
+            .titles
+            .push(Scripted::Events(text_reply(&[reply])));
     }
 
     pub async fn socket(&self, token: &str) -> Socket {

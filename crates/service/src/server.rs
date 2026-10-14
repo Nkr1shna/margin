@@ -33,6 +33,9 @@ use crate::{
     video, workspaces,
 };
 
+/// Events kept for a socket that hasn't sent them yet.
+pub const EVENTS_CAPACITY: usize = 4096;
+
 pub struct Options {
     pub config: Config,
     pub store: Store,
@@ -62,7 +65,9 @@ impl Service {
         };
         std::fs::create_dir_all(opts.config.videos_dir())?;
         std::fs::create_dir_all(opts.config.sources_dir())?;
-        let (events, _) = broadcast::channel(1024);
+        // Room for a burst of chat deltas while a socket is slow; one that falls this
+        // far behind is closed so its app reloads (`events::CLOSE_LAGGED`).
+        let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (revocations, _) = broadcast::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (video_tx, video_rx) = mpsc::unbounded_channel();

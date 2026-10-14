@@ -14,7 +14,7 @@ use futures_util::SinkExt;
 use margin_agent::scripted::{function_call_item, text_reply, tool_calls_reply};
 use margin_agent::{
     DeviceBridge, DeviceCall, DeviceError, ItemRecord, NoDevices, RetryPolicy, Scripted,
-    ToolContext, TurnSink,
+    ToolContext, ToolOutput, TurnSink,
 };
 use margin_ai::AiError;
 use margin_service::db::{self, Store};
@@ -22,15 +22,16 @@ use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY}
 use margin_service::state::{SETTINGS_ID, SettingsRow, StoredLesson};
 use margin_service::turns::{
     CALL_FAILED, CALL_INTERRUPTED, CONFIRMATION_EXPIRED, RunningTurn, STOPPED, STOPPED_BY_RESTART,
-    ServiceSink,
+    ServiceSink, TITLE_MAX_OUTPUT_TOKENS, WRITE_UNCONFIRMED,
 };
 use margin_service::{agent_tools, chats};
 use margin_shared::{
     ApiError, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatState, Citation,
     ConfirmationCard, Decision, Device, DeviceFrame, DeviceRef, DeviceToolCall, DeviceToolOutput,
     DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus, Level, Me,
-    MessageSent, Note, PendingMessage, ReasoningEffort, Settings, Source, SourceKind, SourceStatus,
-    ToolOutputText, Topic, Usage, Workspace,
+    MessageSent, Note, PendingMessage, ReasoningEffort, ResultCard, ResultTarget, Settings, Source,
+    SourceKind, SourceStatus, TitleSource, ToolOutputText, Topic, Usage, Waiting, Workspace,
+    error_code,
 };
 use serde_json::{Value, json};
 
@@ -153,6 +154,22 @@ fn line(item: &ChatItem) -> String {
 
 fn lines(d: &ChatDetail) -> Vec<String> {
     d.items.iter().map(line).collect()
+}
+
+/// Each `ChatChanged` of a chat changes something besides `updated_at`.
+fn assert_chat_changes_are_real(events: &[Event]) {
+    let mut last: std::collections::HashMap<&str, Chat> = Default::default();
+    for e in events {
+        let Event::ChatChanged { chat } = e else {
+            continue;
+        };
+        if let Some(before) = last.get(chat.id.as_str()) {
+            let mut before = before.clone();
+            before.updated_at = chat.updated_at;
+            assert_ne!(&before, chat, "a ChatChanged that changed nothing");
+        }
+        last.insert(chat.id.as_str(), chat.clone());
+    }
 }
 
 /// The text of every `function_call_output` in a request's input, by call id.
@@ -282,6 +299,13 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     assert!(
         matches!(chat_events[2], Event::ChatChanged { chat } if matches!(chat.state, ChatState::Running { .. }))
     );
+    // New items only bump `updated_at`: the chat goes Running → usage → Idle.
+    assert_chat_changes_are_real(&events);
+    let changes = events
+        .iter()
+        .filter(|e| matches!(e, Event::ChatChanged { chat } if chat.id == chat_id))
+        .count();
+    assert_eq!(changes, 4, "created, running, usage, idle: {events:?}");
     let deltas: Vec<(u64, &str)> = events
         .iter()
         .filter_map(|e| match e {
@@ -970,10 +994,13 @@ async fn a_failed_turn_can_be_continued() {
     .await;
     match &d.items[1].kind {
         ChatItemKind::Error {
-            message, retryable, ..
+            message,
+            retryable,
+            code,
         } => {
             assert!(message.starts_with("Add an OpenAI API key"), "{message}");
             assert!(*retryable);
+            assert_eq!(code.as_deref(), Some(error_code::NO_API_KEY));
         }
         other => panic!("{other:?}"),
     }
@@ -1115,15 +1142,8 @@ async fn at_most_two_turns_run_at_once() {
 /// Puts `chat_id` in the state a turn is in while the loop asks for a confirmation, the
 /// way the loop does it (through `ServiceSink`), and returns the card and the waiting
 /// decision.
-async fn park_on_card(
-    h: &Harness,
-    chat_id: &str,
-    device_id: &str,
-) -> (
-    Arc<ServiceSink>,
-    ChatItem,
-    tokio::task::JoinHandle<Result<Decision, margin_agent::SinkError>>,
-) {
+/// Sets the chat `Running` turn "turn-1" with a stand-in task, and returns its sink.
+async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSink> {
     let turn_id = "turn-1".to_string();
     let now = Utc::now();
     {
@@ -1149,12 +1169,24 @@ async fn park_on_card(
     }
     // Holds a slot, as a real turn does.
     let permit = h.state.turns.slots.clone().try_acquire_owned().ok();
-    let sink = Arc::new(ServiceSink {
+    Arc::new(ServiceSink {
         state: h.state.clone(),
         chat_id: chat_id.into(),
         turn_id,
         slot: Arc::new(std::sync::Mutex::new(permit)),
-    });
+    })
+}
+
+async fn park_on_card(
+    h: &Harness,
+    chat_id: &str,
+    device_id: &str,
+) -> (
+    Arc<ServiceSink>,
+    ChatItem,
+    tokio::task::JoinHandle<Result<Decision, margin_agent::SinkError>>,
+) {
+    let sink = fake_turn(h, chat_id, device_id).await;
     let call = sink
         .add_item(
             ItemStatus::InProgress,
@@ -1655,6 +1687,7 @@ async fn chats_are_renamed_listed_and_checked() {
     assert_eq!(r.status(), 200);
     let renamed: Chat = r.json().await.unwrap();
     assert_eq!(renamed.title, "Signals");
+    assert_eq!(renamed.title_by, TitleSource::Owner);
     let events = sock.until(|e| matches!(e, Event::ChatChanged { .. })).await;
     assert!(matches!(events.last(), Some(Event::ChatChanged { chat }) if chat.title == "Signals"));
     let long: Chat = h
@@ -2051,12 +2084,17 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+    let mut phone_sock = h.socket(&phone).await;
+    eventually(|| async { h.state.devices.is_online(&phone_id).then_some(()) }).await;
     let r = h
         .delete(&mac, &format!("/api/devices/{phone_id}"))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
+    // The hub forgets it and its socket closes.
+    assert!(!h.state.devices.is_online(&phone_id));
+    phone_sock.closed().await;
     let events = sock
         .until(|e| matches!(e, Event::DeviceDeleted { .. }))
         .await;
@@ -2199,5 +2237,387 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         )
         .await
         .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stop and started writes, waiting, titles
+// ---------------------------------------------------------------------------
+
+/// Stores an in-progress call of the fake turn, as the loop does once its arguments are
+/// in.
+async fn open_call(sink: &ServiceSink, call_id: &str, name: &str) -> ChatItem {
+    sink.add_item(
+        ItemStatus::InProgress,
+        ChatItemKind::ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            label: name.into(),
+            device: None,
+        },
+        ItemRecord {
+            model_items: Some(vec![function_call_item(
+                &format!("fc_{call_id}"),
+                call_id,
+                name,
+                "{}",
+            )]),
+            full_output: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// A tool result's full output, by call id.
+async fn output_of(h: &Harness, token: &str, d: &ChatDetail, call: &str) -> String {
+    let id = &d
+        .items
+        .iter()
+        .find(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == call))
+        .unwrap()
+        .id;
+    let out: ToolOutputText = h
+        .get(
+            token,
+            &format!("/api/chats/{}/items/{id}/output", d.chat.id),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    out.text
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_waits_for_started_writes_and_records_their_real_results() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(500);
+    let sink = fake_turn(&h, &chat.id, &mac_id).await;
+    open_call(&sink, "call_topic", "create_topic").await;
+    open_call(&sink, "call_slow", "rename_topic").await;
+    open_call(&sink, "call_read", "list_topics").await;
+    // A change that finishes while Stop waits, and one that doesn't in time.
+    h.state.turns.register_write(
+        &chat.id,
+        "call_topic",
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut out = ToolOutput::ok(r#"{"id":"t9","title":"Waves"}"#, "Created “Waves”");
+            out.cards.push(Card::Result(ResultCard {
+                target: ResultTarget::Topic {
+                    topic_id: "t9".into(),
+                },
+                title: "Waves".into(),
+            }));
+            out
+        }),
+    );
+    let (slow_tx, slow_rx) = tokio::sync::oneshot::channel::<()>();
+    let slow_done = Arc::new(AtomicBool::new(false));
+    h.state.turns.register_write(&chat.id, "call_slow", {
+        let done = slow_done.clone();
+        tokio::spawn(async move {
+            let _ = slow_rx.await;
+            done.store(true, Ordering::SeqCst);
+            ToolOutput::ok("{}", "Renamed")
+        })
+    });
+
+    let mut sock = h.socket(&t).await;
+    let r = h
+        .post(&t, &format!("/api/chats/{}/stop", chat.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let stopped: Chat = r.json().await.unwrap();
+    assert_eq!(stopped.state, ChatState::Idle);
+    let d = detail(&h, &t, &chat.id).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "call create_topic".to_string(),
+            "call rename_topic (cancelled)".to_string(),
+            "call list_topics (cancelled)".to_string(),
+            "result ok: Created “Waves”".to_string(),
+            "card result".to_string(),
+            "result failed: Stopped".to_string(),
+            "result failed: Cancelled".to_string(),
+            format!("action: {STOPPED}"),
+        ]
+    );
+    assert_eq!(
+        output_of(&h, &t, &d, "call_topic").await,
+        r#"{"id":"t9","title":"Waves"}"#
+    );
+    assert_eq!(
+        output_of(&h, &t, &d, "call_slow").await,
+        margin_agent::error_output(WRITE_UNCONFIRMED)
+    );
+    // In the contract's order: the real result, the call done, its card.
+    let events = sock
+        .until(|e| matches!(e, Event::ChatChanged { chat } if chat.state == ChatState::Idle))
+        .await;
+    let order: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ChatItemChanged { item } => Some(line(item)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        &order[..3],
+        [
+            "result ok: Created “Waves”",
+            "call create_topic",
+            "card result"
+        ]
+    );
+    assert!(h.state.turns.take_writes(&chat.id).is_empty());
+
+    // The slow change still runs to its end.
+    slow_tx.send(()).unwrap();
+    eventually(|| async { slow_done.load(Ordering::SeqCst).then_some(()) }).await;
+
+    // The next turn's model sees the real result, so it doesn't make the change again.
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Done."])));
+    assert_eq!(send(&h, &t, &chat.id, "go on").await.status(), 200);
+    wait_chat(&h, &t, &chat.id, idle).await;
+    let req = h.generator.agent.requests().pop().unwrap();
+    let outputs = call_outputs(&req.input);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(
+        outputs[0],
+        (
+            "call_topic".to_string(),
+            r#"{"id":"t9","title":"Waves"}"#.to_string()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(400);
+    let sink = fake_turn(&h, &chat.id, &mac_id).await;
+    open_call(&sink, "call_slow", "rename_topic").await;
+    h.state.turns.register_write(
+        &chat.id,
+        "call_slow",
+        tokio::spawn(std::future::pending::<ToolOutput>()),
+    );
+    let first = {
+        let h_url = h.u(&format!("/api/chats/{}/stop", chat.id));
+        let http = h.http.clone();
+        let t = t.clone();
+        tokio::spawn(async move { http.post(h_url).bearer_auth(t).send().await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second = h
+        .post(&t, &format!("/api/chats/{}/stop", chat.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(first.await.unwrap().status(), 200);
+    let d = detail(&h, &t, &chat.id).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "call rename_topic (cancelled)".to_string(),
+            "result failed: Stopped".to_string(),
+            format!("action: {STOPPED}"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_turn_records_the_writes_it_finished() {
+    let (h, t) = signed_in().await;
+    let mut events = tool_calls_reply(&[("call_1", "list_topics", "{}")]);
+    events.pop(); // no `Completed`: the panic comes first
+    h.generator.agent.push(Scripted::EventsThenPanic(events));
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    // Stands in for a change the call started that finished before the turn failed.
+    h.state.turns.register_write(
+        &chat.id,
+        "call_1",
+        tokio::spawn(async { ToolOutput::ok("[]", "Listed") }),
+    );
+    assert_eq!(send(&h, &t, &chat.id, "list").await.status(), 200);
+    let d = wait_chat(&h, &t, &chat.id, |d| {
+        matches!(d.chat.state, ChatState::Failed { .. })
+    })
+    .await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: list",
+            "call list_topics",
+            "result ok: Listed",
+            "error (retry): Something went wrong on the service while answering. Check its log.",
+        ]
+    );
+    match &d.items.last().unwrap().kind {
+        ChatItemKind::Error { code, .. } => {
+            assert_eq!(code.as_deref(), Some(error_code::INTERRUPTED));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_shows_while_its_turn_waits_to_retry() {
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    let sink = fake_turn(&h, &chat.id, &mac_id).await;
+    let mut sock = h.socket(&t).await;
+    let until = Utc::now() + chrono::Duration::seconds(90);
+    let reason = "The model API asked Margin to slow down.";
+    sink.retrying(until, reason).await.unwrap();
+    let events = sock
+        .until(|e| matches!(e, Event::ChatChanged { chat } if chat.waiting.is_some()))
+        .await;
+    let Some(Event::ChatChanged { chat: c }) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(
+        c.waiting,
+        Some(Waiting {
+            until,
+            reason: reason.into()
+        })
+    );
+    sink.clear_waiting().await.unwrap();
+    let events = sock
+        .until(|e| matches!(e, Event::ChatChanged { chat } if chat.waiting.is_none()))
+        .await;
+    assert_chat_changes_are_real(&events);
+
+    // Stop clears it too.
+    sink.retrying(until, reason).await.unwrap();
+    let r = h
+        .post(&t, &format!("/api/chats/{}/stop", chat.id))
+        .send()
+        .await
+        .unwrap();
+    let c: Chat = r.json().await.unwrap();
+    assert_eq!((c.state, c.waiting), (ChatState::Idle, None));
+    // A stopped turn's sink can't set it again.
+    assert!(sink.retrying(until, reason).await.is_err());
+    assert_eq!(detail(&h, &t, &chat.id).await.chat.waiting, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_model_titles_a_chat_after_its_first_answer() {
+    let (h, t) = signed_in().await;
+    h.title_reply("“Fourier series, step by step.”");
+    h.generator.agent.push(Scripted::Events(text_reply(&[
+        "Fourier series are sums of waves.",
+    ])));
+    let created = ask(&h, &t, "Teach me Fourier series\nplease").await;
+    assert_eq!(created.chat.title_by, TitleSource::FirstLine);
+    let d = wait_chat(&h, &t, &created.chat.id, |d| {
+        d.chat.title_by == TitleSource::Model
+    })
+    .await;
+    assert_eq!(d.chat.title, "Fourier series, step by step");
+    assert_eq!(d.chat.usage.model_calls, 2, "the title call counts");
+    assert_eq!(d.items.len(), 2, "not an item");
+
+    let reqs = h.generator.titles.requests();
+    assert_eq!(reqs.len(), 1);
+    let req = &reqs[0];
+    assert!(req.tools.is_empty());
+    assert_eq!(req.max_output_tokens, Some(TITLE_MAX_OUTPUT_TOKENS));
+    assert_eq!(
+        req.reasoning.as_ref().map(|r| r.effort),
+        Some(ReasoningEffort::Low)
+    );
+    let input = serde_json::to_string(&req.input).unwrap();
+    assert!(input.contains("Teach me Fourier series"), "{input}");
+    assert!(input.contains("sums of waves"), "{input}");
+    assert_eq!(
+        h.generator.agent.requests().len(),
+        1,
+        "not the turn's model"
+    );
+
+    // Only after the first answer.
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["More."])));
+    assert_eq!(send(&h, &t, &d.chat.id, "more").await.status(), 200);
+    wait_chat(&h, &t, &d.chat.id, |d| idle(d) && d.items.len() == 4).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.generator.titles.requests().len(), 1);
+
+    // The owner's name sticks.
+    let renamed: Chat = h
+        .patch(&t, &format!("/api/chats/{}", d.chat.id))
+        .json(&json!({"title": "Waves"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (renamed.title.as_str(), renamed.title_by),
+        ("Waves", TitleSource::Owner)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_title_that_fails_or_comes_after_a_rename_changes_nothing() {
+    let (h, t) = signed_in().await;
+    // Nothing queued: the call fails and the first line stays.
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Hi!"])));
+    let a = ask(&h, &t, "Hello there").await.chat;
+    wait_chat(&h, &t, &a.id, idle).await;
+    eventually(|| async { (h.generator.titles.requests().len() == 1).then_some(()) }).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let d = detail(&h, &t, &a.id).await;
+    assert_eq!(
+        (d.chat.title.as_str(), d.chat.title_by),
+        ("Hello there", TitleSource::FirstLine)
+    );
+
+    // Renamed while the title call runs: the owner's title stays.
+    h.generator.titles.push(Scripted::Delayed(
+        Duration::from_millis(300),
+        Box::new(Scripted::Events(text_reply(&["Model title"]))),
+    ));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Hi!"])));
+    let b = ask(&h, &t, "Another one").await.chat;
+    wait_chat(&h, &t, &b.id, idle).await;
+    let r = h
+        .patch(&t, &format!("/api/chats/{}", b.id))
+        .json(&json!({"title": "Mine"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = wait_chat(&h, &t, &b.id, |d| d.chat.usage.model_calls == 2).await;
+    assert_eq!(
+        (d.chat.title.as_str(), d.chat.title_by),
+        ("Mine", TitleSource::Owner)
     );
 }
