@@ -82,21 +82,23 @@ async fn upload(app: AppCtx, key: u64) {
         return pump(app);
     };
     let Some(api) = app.api() else { return };
-    let path = upload.path.clone();
-    let result = match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
-        Ok(Ok(bytes)) => api
-            .upload_source(
-                bytes,
-                &upload.name,
-                upload.folder.as_deref(),
-                upload.topic_id.as_deref(),
-            )
-            .await
-            .map_err(|e| app.failure(&e)),
-        Ok(Err(e)) => Err(format!("Couldn't read the file ({e}).")),
-        Err(_) => Err("Couldn't read the file.".into()),
-    };
     let mut uploads = app.uploads;
+    let progress = move |sent: u64| {
+        let mut list = app.uploads;
+        if let Some(u) = list.write().iter_mut().find(|u| u.key == key) {
+            u.sent = sent;
+        }
+    };
+    let result = api
+        .upload_source(
+            &upload.path,
+            &upload.name,
+            upload.folder.as_deref(),
+            upload.topic_id.as_deref(),
+            progress,
+        )
+        .await
+        .map_err(|e| app.failure(&e));
     let mut lib = app.lib;
     let wanted = uploads.peek().iter().any(|u| u.key == key);
     if result.is_ok() || !wanted {
@@ -135,6 +137,7 @@ fn retry(app: AppCtx, key: u64) {
     let mut uploads = app.uploads;
     if let Some(u) = uploads.write().iter_mut().find(|u| u.key == key) {
         u.state = UploadState::Waiting;
+        u.sent = 0;
     }
     pump(app);
 }
@@ -166,6 +169,46 @@ async fn remove(app: AppCtx, key: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// "Read again": the service reads the source anew, in place (for one that failed or
+/// was read with a warning, once what was wrong is fixed).
+pub async fn read_again(app: AppCtx, id: Id) -> Result<(), String> {
+    let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+    let source = api.reprocess_source(&id).await.map_err(|e| app.failure(&e))?;
+    let mut lib = app.lib;
+    lib.write().apply(Event::SourceChanged { source });
+    Ok(())
+}
+
+/// The "Read again" button, while the request is out it shows a spinner.
+#[component]
+fn ReadAgainButton(id: Id, name: String, on_error: EventHandler<String>) -> Element {
+    let app = use_app();
+    let mut busy = use_signal(|| false);
+    rsx! {
+        button {
+            class: "btn btn-secondary btn-sm",
+            "aria-label": "Read {name} again",
+            title: "Read it again on the service Mac",
+            disabled: *busy.read(),
+            onclick: move |_| {
+                let id = id.clone();
+                async move {
+                    if *busy.peek() {
+                        return;
+                    }
+                    busy.set(true);
+                    if let Err(e) = read_again(app, id).await {
+                        on_error.call(e);
+                    }
+                    busy.set(false);
+                }
+            },
+            if *busy.read() { span { class: "spinner" } }
+            "Read again"
+        }
+    }
+}
+
 /// Fetch the embedding model's state into the store (events keep it current after).
 pub async fn refresh_embedding(app: AppCtx) -> Result<(), String> {
     let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
@@ -191,7 +234,7 @@ pub async fn download_embedding(app: AppCtx) -> Result<(), String> {
 fn upload_status(upload: &Upload, lib: &LibraryState) -> (Tone, String) {
     match &upload.state {
         UploadState::Waiting => (Tone::Waiting, "Waiting to upload".into()),
-        UploadState::Uploading => (Tone::Working, "Uploading…".into()),
+        UploadState::Uploading => (Tone::Working, upload.uploading_text()),
         UploadState::Done(source) => {
             let live = lib.sources.get(&source.id).unwrap_or(source);
             status_text(&live.status)
@@ -215,7 +258,7 @@ fn SourceLine(
             Icon { name: kind_icon(kind), class: "src-ic" }
             div { class: "src-main",
                 span { class: "src-name", title: "{name}", "{name}" }
-                span { class: if tone == Tone::Failed { "src-meta bad" } else { "src-meta" },
+                span { class: tone.meta_class(),
                     span { class: tone.dot_class() }
                     span { "{human_bytes(bytes)} · {status}" }
                 }
@@ -227,12 +270,30 @@ fn SourceLine(
 
 /// Actions on an upload that isn't done: Retry when it failed, and remove.
 #[component]
-fn UploadActions(upload: Upload, on_remove: EventHandler<()>) -> Element {
+fn UploadActions(
+    upload: Upload,
+    on_remove: EventHandler<()>,
+    on_error: EventHandler<String>,
+) -> Element {
     let app = use_app();
     let key = upload.key;
+    // An uploaded file the service couldn't read (all of): read it again.
+    let read_again = match &upload.state {
+        UploadState::Done(source) => app
+            .lib
+            .read()
+            .sources
+            .get(&source.id)
+            .filter(|s| s.status.can_read_again())
+            .map(|s| s.id.clone()),
+        _ => None,
+    };
     rsx! {
         if matches!(upload.state, UploadState::Failed(_)) {
             button { class: "btn btn-secondary btn-sm", onclick: move |_| retry(app, key), "Try again" }
+        }
+        if let Some(id) = read_again {
+            ReadAgainButton { id, name: upload.name.clone(), on_error }
         }
         button {
             class: "icon-btn sm",
@@ -315,7 +376,8 @@ enum Entry {
 /// "12 files · 9 ready · 2 in progress · 1 failed", and the dot for the whole folder.
 fn folder_status(lines: &[Line]) -> (Tone, String) {
     let count = |tone: Tone| lines.iter().filter(|l| l.tone == tone).count();
-    let (ready, failed) = (count(Tone::Ready), count(Tone::Failed));
+    let (warned, failed) = (count(Tone::Warning), count(Tone::Failed));
+    let ready = count(Tone::Ready) + warned;
     let working = count(Tone::Working) + count(Tone::Waiting);
     let mut parts = vec![if lines.len() == 1 {
         "1 file".to_string()
@@ -324,6 +386,9 @@ fn folder_status(lines: &[Line]) -> (Tone, String) {
     }];
     if ready > 0 {
         parts.push(format!("{ready} ready"));
+    }
+    if warned > 0 {
+        parts.push(format!("{warned} not fully read"));
     }
     if working > 0 {
         parts.push(format!("{working} in progress"));
@@ -335,6 +400,8 @@ fn folder_status(lines: &[Line]) -> (Tone, String) {
         Tone::Working
     } else if failed > 0 {
         Tone::Failed
+    } else if warned > 0 {
+        Tone::Warning
     } else {
         Tone::Ready
     };
@@ -403,6 +470,7 @@ pub fn AskAttachments() -> Element {
                                 UploadActions {
                                     upload: line.upload.clone(),
                                     on_remove: move |_| remove_all(vec![line.upload.key]),
+                                    on_error: move |e| error.set(Some(e)),
                                 }
                             }
                         }
@@ -436,7 +504,7 @@ pub fn AskAttachments() -> Element {
                                     }
                                     div { class: "src-main",
                                         span { class: "src-name", title: "{name}", "{name}" }
-                                        span { class: if tone == Tone::Failed { "src-meta bad" } else { "src-meta" },
+                                        span { class: tone.meta_class(),
                                             span { class: tone.dot_class() }
                                             span { "{human_bytes(bytes)} · {status}" }
                                         }
@@ -462,6 +530,7 @@ pub fn AskAttachments() -> Element {
                                                 UploadActions {
                                                     upload: line.upload.clone(),
                                                     on_remove: move |_| remove_all(vec![line.upload.key]),
+                                                    on_error: move |e| error.set(Some(e)),
                                                 }
                                             }
                                         }
@@ -726,6 +795,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                             status,
                             UploadActions {
                                 upload: upload.clone(),
+                                on_error: move |e| error.set(Some(e)),
                                 on_remove: move |_| {
                                     let key = upload.key;
                                     spawn(async move {
@@ -770,7 +840,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                                     title: format!("Delete “{}”?", s.name),
                                     message: "The file and the passages read from it are deleted from the service. This can't be undone.".into(),
                                     ids: vec![s.id],
-                                })) }
+                                })), on_error: move |e| error.set(Some(e)) }
                             }
                         }
                         }
@@ -833,7 +903,11 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
 
 /// A source in a topic's list, with its delete button.
 #[component]
-fn SourceRow(source: Source, on_delete: EventHandler<Source>) -> Element {
+fn SourceRow(
+    source: Source,
+    on_delete: EventHandler<Source>,
+    on_error: EventHandler<String>,
+) -> Element {
     let (tone, status) = status_text(&source.status);
     // Inside a folder, the path below it is the name.
     let label = source.name.clone();
@@ -844,6 +918,9 @@ fn SourceRow(source: Source, on_delete: EventHandler<Source>) -> Element {
             bytes: source.bytes,
             tone,
             status,
+            if source.status.can_read_again() {
+                ReadAgainButton { id: source.id.clone(), name: label.clone(), on_error }
+            }
             button {
                 class: "icon-btn sm",
                 "aria-label": "Delete {label}",

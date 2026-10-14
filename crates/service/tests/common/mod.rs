@@ -883,6 +883,9 @@ impl Harness {
     pub fn delete(&self, token: &str, path: &str) -> reqwest::RequestBuilder {
         self.http.delete(self.u(path)).bearer_auth(token)
     }
+    pub fn put(&self, token: &str, path: &str) -> reqwest::RequestBuilder {
+        self.http.put(self.u(path)).bearer_auth(token)
+    }
 
     /// Stores an API key and a model.
     pub async fn configure_ai(&self, token: &str) {

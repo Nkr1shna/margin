@@ -1,6 +1,6 @@
 //! Shared service state, the stored row shapes, and helpers every handler uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -157,6 +157,8 @@ pub struct App {
     pub model_download_bytes: Mutex<Option<u64>>,
     /// Sources to read, one at a time.
     pub source_queue: mpsc::UnboundedSender<Id>,
+    /// Uploads in parts a request is working on (`uploads`), one request at a time each.
+    pub uploads_busy: Mutex<HashSet<Id>>,
 }
 
 impl App {

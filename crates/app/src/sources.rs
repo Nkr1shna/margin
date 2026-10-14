@@ -9,8 +9,12 @@ use margin_shared::{Id, Source, SourceKind, SourceStatus, routes};
 
 /// At most this many files in one add (a pick of files, or a folder).
 pub const MAX_FILES_PER_ADD: usize = 300;
-/// At most this many bytes in one add.
-pub const MAX_BYTES_PER_ADD: u64 = 200 * 1024 * 1024;
+/// At most this many bytes in one add: room for four recordings of the largest size a
+/// source may be (`routes::MAX_MEDIA_SOURCE_BYTES`, 500 MB), or a course folder of
+/// slides, notes and a few lectures, while a folder picked by mistake (a whole drive,
+/// a photo library) stops well short of filling the service Mac's disk. Any one file
+/// a source may be always fits, so the cap never stands in the way of a single file.
+pub const MAX_BYTES_PER_ADD: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Folders a walk never enters (besides hidden ones): version control, dependencies,
 /// build output and caches.
@@ -42,7 +46,7 @@ pub struct Selection<P = PathBuf> {
     pub files: Vec<Candidate<P>>,
     /// Files Margin can't read (archives, binaries, lock files…).
     pub unsupported: usize,
-    /// Files over `routes::MAX_SOURCE_BYTES`.
+    /// Files over their kind's limit (`routes::max_source_bytes`).
     pub too_large: usize,
     /// Files past `MAX_FILES_PER_ADD` or `MAX_BYTES_PER_ADD`.
     pub over_limit: usize,
@@ -81,7 +85,7 @@ impl<P> Selection<P> {
             self.unreadable += 1;
             return;
         };
-        if bytes > routes::MAX_SOURCE_BYTES {
+        if bytes > routes::max_source_bytes(kind) {
             self.too_large += 1;
         } else if self.files.len() >= MAX_FILES_PER_ADD
             || self.total_bytes() + bytes > MAX_BYTES_PER_ADD
@@ -143,16 +147,17 @@ impl<P> Selection<P> {
         }
         if self.too_large > 0 {
             parts.push(format!(
-                "{} over {} MB",
+                "{} over the size limit ({} for audio and video, {} for other files)",
                 files(self.too_large),
-                routes::MAX_SOURCE_BYTES / (1024 * 1024)
+                human_bytes(routes::MAX_MEDIA_SOURCE_BYTES),
+                human_bytes(routes::MAX_OTHER_SOURCE_BYTES),
             ));
         }
         if self.over_limit > 0 {
             parts.push(format!(
-                "{} past the limit of {MAX_FILES_PER_ADD} files or {} MB per add",
+                "{} past the limit of {MAX_FILES_PER_ADD} files or {} per add",
                 files(self.over_limit),
-                MAX_BYTES_PER_ADD / (1024 * 1024)
+                human_bytes(MAX_BYTES_PER_ADD)
             ));
         }
         if self.unreadable > 0 {
@@ -357,6 +362,8 @@ pub struct Upload {
     pub folder: Option<String>,
     pub kind: SourceKind,
     pub bytes: u64,
+    /// How much of a file sent in parts the service has so far.
+    pub sent: u64,
     pub state: UploadState,
 }
 
@@ -379,6 +386,7 @@ impl Upload {
             folder: candidate.folder,
             kind: candidate.kind,
             bytes: candidate.bytes,
+            sent: 0,
             state: UploadState::Waiting,
         }
     }
@@ -386,6 +394,15 @@ impl Upload {
     /// Still waiting for, or in the middle of, its upload.
     pub fn pending(&self) -> bool {
         matches!(self.state, UploadState::Waiting | UploadState::Uploading)
+    }
+
+    /// "Uploading…", with how far along a file sent in parts is.
+    pub fn uploading_text(&self) -> String {
+        if self.bytes > 0 && self.sent > 0 && self.sent < self.bytes {
+            format!("Uploading… {}%", self.sent * 100 / self.bytes)
+        } else {
+            "Uploading…".into()
+        }
     }
 }
 
@@ -395,6 +412,8 @@ pub enum Tone {
     Waiting,
     Working,
     Ready,
+    /// Ready, but not all of it was read (`SourceStatus::Ready::warning`).
+    Warning,
     Failed,
 }
 
@@ -404,7 +423,17 @@ impl Tone {
             Tone::Waiting => "dot",
             Tone::Working => "dot run",
             Tone::Ready => "dot ok",
+            Tone::Warning => "dot warn",
             Tone::Failed => "dot bad",
+        }
+    }
+
+    /// The class of a source's size-and-status line (long messages wrap).
+    pub fn meta_class(self) -> &'static str {
+        match self {
+            Tone::Failed => "src-meta bad",
+            Tone::Warning => "src-meta warn",
+            _ => "src-meta",
         }
     }
 }
@@ -415,13 +444,20 @@ pub fn status_text(status: &SourceStatus) -> (Tone, String) {
         SourceStatus::Processing { done, total } => {
             (Tone::Working, format!("Processing {done}/{total}"))
         }
-        SourceStatus::Ready {
-            pages: Some(pages), ..
-        } => (
-            Tone::Ready,
-            format!("Ready · {pages} page{}", if *pages == 1 { "" } else { "s" }),
-        ),
-        SourceStatus::Ready { .. } => (Tone::Ready, "Ready".into()),
+        SourceStatus::Ready { pages, warning, .. } => {
+            let mut text = match pages {
+                Some(n) => format!("Ready · {n} page{}", if *n == 1 { "" } else { "s" }),
+                None => "Ready".into(),
+            };
+            match warning {
+                Some(w) => {
+                    text.push_str(" · ");
+                    text.push_str(w);
+                    (Tone::Warning, text)
+                }
+                None => (Tone::Ready, text),
+            }
+        }
         SourceStatus::Failed { error } => (Tone::Failed, format!("Failed: {error}")),
     }
 }
@@ -531,30 +567,52 @@ mod tests {
         assert_eq!(selection.over_limit, 5);
         assert_eq!(
             selection.summary().as_deref(),
-            Some("Added 300 files. Skipped 5 files past the limit of 300 files or 200 MB per add.")
+            Some("Added 300 files. Skipped 5 files past the limit of 300 files or 2.0 GB per add.")
         );
 
-        // Bytes: four 49 MB files fit 200 MB, the fifth doesn't; a 51 MB file is too large.
-        let big = TempDir::new("bytes");
-        let mb = 1024 * 1024;
-        let paths: Vec<_> = (0..5)
-            .map(|i| big.file(&format!("b{i}.txt"), 49 * mb))
-            .chain([big.file("huge.txt", 51 * mb), big.file("bundle.zip", 1)])
-            .collect();
-        let selection = select_files(paths);
-        assert_eq!(selection.files.len(), 4);
-        assert_eq!(selection.files[0].name, "b0.txt");
+        // Sizes, read without writing gigabytes: per kind, 50 MB or 500 MB; per add, 2 GB.
+        let mb: u64 = 1024 * 1024;
+        let picked: Vec<(String, String)> = [
+            ("notes.txt", 50 * mb),
+            ("huge.txt", 50 * mb + 1),
+            ("scan.pdf", 51 * mb),
+            ("lecture1.mp4", 500 * mb),
+            ("lecture2.mov", 501 * mb),
+            ("talk1.m4a", 499 * mb),
+            ("talk2.m4a", 480 * mb),
+            ("talk3.m4a", 450 * mb),
+            ("talk4.m4a", 100 * mb),
+            ("bundle.zip", 1),
+        ]
+        .iter()
+        .map(|(name, bytes)| (bytes.to_string(), name.to_string()))
+        .collect();
+        let selection = select_named(picked, |size: &String| size.parse().ok());
+        let names: Vec<&str> = selection.files.iter().map(|f| f.name.as_str()).collect();
+        // 50 + 500 + 499 + 480 + 450 MB fit in 2 GB; another 100 MB doesn't.
+        assert_eq!(
+            names,
+            vec!["notes.txt", "lecture1.mp4", "talk1.m4a", "talk2.m4a", "talk3.m4a"]
+        );
         assert_eq!(selection.files[0].folder, None);
+        assert_eq!(selection.too_large, 3);
         assert_eq!(selection.over_limit, 1);
-        assert_eq!(selection.too_large, 1);
         assert_eq!(selection.unsupported, 1);
         assert_eq!(
             selection.summary().as_deref(),
             Some(
-                "Added 4 files. Skipped 1 file Margin can't read, 1 file over 50 MB and \
-                 1 file past the limit of 300 files or 200 MB per add."
+                "Added 5 files. Skipped 1 file Margin can't read, 3 files over the size limit \
+                 (500 MB for audio and video, 50 MB for other files) and 1 file past the \
+                 limit of 300 files or 2.0 GB per add."
             )
         );
+        // The per-add cap never stops a single file a source may be.
+        const { assert!(routes::MAX_MEDIA_SOURCE_BYTES <= MAX_BYTES_PER_ADD) };
+        let one = select_named(
+            vec![((500 * mb).to_string(), "film.mov".to_string())],
+            |size: &String| size.parse().ok(),
+        );
+        assert_eq!(one.files.len(), 1);
     }
 
     /// A document tree like Android's: nodes are document ids, sizes come with the
@@ -702,11 +760,21 @@ mod tests {
         assert_eq!(
             status_text(&SourceStatus::Ready {
                 chunks: 4,
-                pages: Some(1)
+                pages: Some(1),
+                warning: None,
             })
             .1,
             "Ready · 1 page"
         );
+        assert_eq!(
+            status_text(&SourceStatus::Ready {
+                chunks: 4,
+                pages: None,
+                warning: Some("It wasn't transcribed.".into()),
+            }),
+            (Tone::Warning, "Ready · It wasn't transcribed.".into())
+        );
+        assert_eq!(Tone::Warning.dot_class(), "dot warn");
         assert_eq!(
             status_text(&SourceStatus::Failed {
                 error: "Bad".into()

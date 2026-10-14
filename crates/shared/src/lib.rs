@@ -419,10 +419,55 @@ pub enum SourceStatus {
     Ready {
         chunks: u32,
         pages: Option<u32>,
+        /// Read, but not all of it: e.g. a recording that couldn't be transcribed (its
+        /// sound is embedded, but lessons can't quote it). The app shows it with a
+        /// "Read again" action (`routes::source_reprocess`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     Failed {
         error: String,
     },
+}
+
+impl SourceStatus {
+    /// Whether "Read again" can help: it failed, or it was read with a warning.
+    pub fn can_read_again(&self) -> bool {
+        matches!(
+            self,
+            SourceStatus::Failed { .. }
+                | SourceStatus::Ready {
+                    warning: Some(_),
+                    ..
+                }
+        )
+    }
+}
+
+/// What sources can be, as the app and the service say it wherever they list them (the
+/// composer, a topic's Sources dialog, the "can't read" error).
+pub const SOURCE_KINDS: &str = "text, code, PDFs, images, audio and video";
+
+/// One line of a source's transcript (`routes::source_transcript`): a sentence or so of
+/// what was said in an audio or video source, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+/// A large source on its way up in parts (`routes::SOURCE_UPLOADS`). Files bigger than
+/// `routes::UPLOAD_PART_BYTES` go up as a series of parts, so no single request is
+/// larger than the proxy in front of the service accepts (Cloudflare refuses request
+/// bodies over 100 MB).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceUpload {
+    pub id: Id,
+    /// The whole file's size, as announced when the upload began.
+    pub bytes: u64,
+    /// How much of it the service has; the next part starts here.
+    pub received: u64,
 }
 
 /// The local embedding model (EmbeddingGemma 2, Core ML), downloaded on demand from
@@ -668,6 +713,33 @@ mod tests {
         assert_eq!(SourceKind::for_name("archive.zip"), None);
         assert_eq!(SourceKind::for_name("Cargo.lock"), None);
         assert_eq!(SourceKind::for_name("noextension"), None);
+    }
+
+    #[test]
+    fn ready_sources_may_carry_a_warning() {
+        // Records from before warnings read as plain Ready.
+        let old: SourceStatus =
+            serde_json::from_str(r#"{"state":"ready","chunks":3,"pages":null}"#).unwrap();
+        assert_eq!(
+            old,
+            SourceStatus::Ready {
+                chunks: 3,
+                pages: None,
+                warning: None
+            }
+        );
+        assert!(!old.can_read_again());
+        assert!(!serde_json::to_string(&old).unwrap().contains("warning"));
+        let warned = SourceStatus::Ready {
+            chunks: 3,
+            pages: None,
+            warning: Some("No transcript".into()),
+        };
+        let json = serde_json::to_string(&warned).unwrap();
+        assert_eq!(serde_json::from_str::<SourceStatus>(&json).unwrap(), warned);
+        assert!(warned.can_read_again());
+        assert!(SourceStatus::Failed { error: "x".into() }.can_read_again());
+        assert!(!SourceStatus::Queued.can_read_again());
     }
 
     #[test]

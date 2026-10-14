@@ -170,6 +170,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 32px; b
 .dot.ok { background: var(--ok); box-shadow: none; }
 .dot.run { background: var(--accent); box-shadow: none; animation: pulse 1.4s ease-in-out infinite; }
 .dot.bad { background: var(--danger); box-shadow: none; }
+.dot.warn { background: var(--warn); box-shadow: none; }
 @keyframes pulse { 50% { opacity: .35; } }
 
 .notice { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border-radius: var(--r-card); background: var(--surface); font-size: 14px; }
@@ -362,10 +363,10 @@ body.resizing-sb * { user-select: none !important; }
 .src-meta { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 500; color: var(--fg-3); min-width: 0; }
 .src-meta > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src-meta.bad { color: var(--danger); }
-.src-meta.bad { align-items: flex-start; }
-.src-meta.bad > span:last-child { white-space: normal; }
+.src-meta.bad, .src-meta.warn { align-items: flex-start; }
+.src-meta.bad > span:last-child, .src-meta.warn > span:last-child { white-space: normal; }
 /* A wrapped error keeps its dot beside the first line. */
-.src-meta.bad .dot { margin-top: 6px; margin-top: calc((1lh - 6px) / 2); }
+.src-meta.bad .dot, .src-meta.warn .dot { margin-top: 6px; margin-top: calc((1lh - 6px) / 2); }
 .src-toggle { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; padding: 0; color: var(--fg-3); }
 .src-toggle:hover { color: var(--fg); }
 .src-nested { margin-left: 17px; padding-left: 10px; border-left: 1px solid var(--line); }

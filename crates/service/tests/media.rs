@@ -12,7 +12,18 @@ use margin_shared::{
     Citation, Event, Lesson, LessonStatus, Library, Proposal, ProposalStatus, Source, SourceKind,
     SourceStatus, Topic,
 };
+use margin_shared::{TranscriptSegment, routes};
 use serde_json::json;
+
+async fn transcript(h: &Harness, token: &str, id: &str) -> Vec<TranscriptSegment> {
+    let r = h
+        .get(token, &routes::source_transcript(id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
 
 async fn library(h: &Harness, token: &str) -> Library {
     h.get(token, "/api/library")
@@ -151,7 +162,8 @@ async fn images_are_embedded_shown_to_the_writer_and_cited() {
         image.status,
         SourceStatus::Ready {
             chunks: 1,
-            pages: None
+            pages: None,
+            warning: None,
         }
     );
     expect_signed(
@@ -278,7 +290,8 @@ async fn pdf_pages_are_pictures_and_citations_point_at_pages() {
         pdf.status,
         SourceStatus::Ready {
             chunks: 4,
-            pages: Some(2)
+            pages: Some(2),
+            warning: None,
         }
     );
     let rows = media_rows(&h, &pdf.id).await;
@@ -348,7 +361,8 @@ async fn audio_is_embedded_transcribed_and_cited_with_times() {
         audio.status,
         SourceStatus::Ready {
             chunks: 4,
-            pages: None
+            pages: None,
+            warning: None,
         }
     );
     let windows = media_rows(&h, &audio.id).await;
@@ -402,22 +416,26 @@ async fn audio_is_embedded_transcribed_and_cited_with_times() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_a_transcriber_audio_says_so_and_video_keeps_its_frames() {
+async fn without_a_transcriber_recordings_are_ready_with_a_warning_and_read_again() {
+    use std::sync::atomic::Ordering;
     let h = start().await;
     let t = h.sign_in("Mac").await;
-    h.source_tools
-        .no_transcriber
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.source_tools.no_transcriber.store(true, Ordering::SeqCst);
     let audio = upload_ok(&h, &t, "talk.mp3", TALK).await;
     let audio = settled(&h, &t, &audio.id).await;
     match &audio.status {
-        SourceStatus::Failed { error } => {
-            assert!(error.contains("fluidaudiocli"), "{error}");
-            assert!(error.contains("talk.mp3"), "{error}");
+        SourceStatus::Ready {
+            chunks: 3,
+            warning: Some(warning),
+            ..
+        } => {
+            assert!(warning.contains("fluidaudiocli"), "{warning}");
+            assert!(warning.contains("wasn't transcribed"), "{warning}");
         }
-        other => panic!("expected Failed, got {other:?}"),
+        other => panic!("expected Ready with a warning, got {other:?}"),
     }
-    // The sound was embedded all the same.
+    assert!(audio.status.can_read_again());
+    // The sound was embedded all the same, and there's no transcript to show.
     assert_eq!(media_rows(&h, &audio.id).await.len(), 3);
     assert!(
         media_rows(&h, &audio.id)
@@ -425,6 +443,7 @@ async fn without_a_transcriber_audio_says_so_and_video_keeps_its_frames() {
             .iter()
             .all(|w| w.text.is_empty())
     );
+    assert!(transcript(&h, &t, &audio.id).await.is_empty());
 
     let video = upload_ok(
         &h,
@@ -434,11 +453,70 @@ async fn without_a_transcriber_audio_says_so_and_video_keeps_its_frames() {
     )
     .await;
     let video = settled(&h, &t, &video.id).await;
-    assert!(
-        matches!(video.status, SourceStatus::Ready { chunks: 2, .. }),
-        "{:?}",
-        video.status
+    match &video.status {
+        SourceStatus::Ready {
+            chunks: 2,
+            warning: Some(warning),
+            ..
+        } => assert!(warning.starts_with("Its soundtrack wasn't transcribed"), "{warning}"),
+        other => panic!("expected Ready with a warning, got {other:?}"),
+    }
+
+    // Once the transcriber is there, Read again reads it in place: same id and topic,
+    // no warning, and its transcript.
+    h.source_tools.no_transcriber.store(false, Ordering::SeqCst);
+    let r = h
+        .post(&t, &routes::source_reprocess(&audio.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let queued: Source = r.json().await.unwrap();
+    assert_eq!((queued.id.as_str(), queued.status.clone()), (audio.id.as_str(), SourceStatus::Queued));
+    let again = eventually(|| async {
+        library(&h, &t).await.sources.into_iter().find(|s| {
+            s.id == audio.id && matches!(s.status, SourceStatus::Ready { warning: None, .. })
+        })
+    })
+    .await;
+    assert_eq!(again.topic_id, audio.topic_id);
+    assert_eq!(
+        again.status,
+        SourceStatus::Ready {
+            chunks: 4,
+            pages: None,
+            warning: None
+        }
     );
+    // Its rows were replaced, not added to.
+    assert_eq!(media_rows(&h, &audio.id).await.len(), 3);
+    assert_eq!(chunk_rows(&h, &audio.id).await.len(), 1);
+    let lines = transcript(&h, &t, &audio.id).await;
+    assert!(!lines.is_empty());
+    assert_eq!(lines[0].start_ms, 0);
+    assert_eq!(
+        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" "),
+        TALK.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+
+    // Nothing to read again for a source being read, or one that doesn't exist.
+    let r = h.post(&t, &routes::source_reprocess(&video.id)).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = h.post(&t, &routes::source_reprocess(&video.id)).send().await.unwrap();
+    assert!(matches!(r.status().as_u16(), 200 | 409), "{}", r.status());
+    let r = h.post(&t, &routes::source_reprocess("nope")).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transcripts_of_other_kinds_are_empty() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let image = upload_ok(&h, &t, "square.png", "picture: a square wave").await;
+    settled(&h, &t, &image.id).await;
+    assert!(transcript(&h, &t, &image.id).await.is_empty());
+    let r = h.get(&t, &routes::source_transcript("nope")).send().await.unwrap();
+    assert_eq!(r.status(), 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -476,7 +554,8 @@ async fn video_frames_go_to_the_writer_with_what_was_said() {
         video.status,
         SourceStatus::Ready {
             chunks: 6,
-            pages: None
+            pages: None,
+            warning: None,
         }
     ));
 

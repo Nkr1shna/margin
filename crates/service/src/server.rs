@@ -13,7 +13,6 @@ use chrono::Utc;
 use margin_embed::ModelFiles;
 use margin_shared::{
     LessonStatus, Proposal, ProposalStatus, Source, SourceStatus, VideoStatus, routes,
-    routes::MAX_SOURCE_BYTES,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
@@ -26,7 +25,7 @@ use crate::engines::{Generator, Renderer, SourceTools};
 use crate::error::AppError;
 use crate::secrets::{SecretStore, media_signing_key};
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
-use crate::{ask, embedding, events, library, media, search, settings, sources, video};
+use crate::{ask, embedding, events, library, media, search, settings, sources, uploads, video};
 
 pub struct Options {
     pub config: Config,
@@ -100,9 +99,13 @@ impl Service {
             model_job: Mutex::new(ModelJob::Idle),
             model_download_bytes: Mutex::new(None),
             source_queue: source_tx,
+            uploads_busy: Mutex::new(Default::default()),
         });
 
         let resume = recover(&state).await?;
+        if let Err(e) = uploads::purge_stale(&state).await {
+            tracing::warn!("couldn't clear unfinished uploads: {e:#}");
+        }
         tokio::spawn(video::run_worker(state.clone(), video_rx));
         tokio::spawn(sources::run_worker(state.clone(), source_rx));
         tokio::spawn(housekeeping(state.clone()));
@@ -180,11 +183,23 @@ pub fn router(state: AppState) -> Router {
         .route(routes::TOOLS, get(settings::tools))
         .route(routes::DEVICES, get(auth::list_devices))
         .route("/api/devices/{id}", delete(auth::revoke_device))
+        // Upload bodies are streamed to disk, each against its kind's limit.
         .route(
             routes::SOURCES,
-            post(sources::upload).layer(DefaultBodyLimit::max(MAX_SOURCE_BYTES as usize)),
+            post(sources::upload).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/sources/{id}", delete(sources::delete_source))
+        .route("/api/sources/{id}/reprocess", post(sources::reprocess))
+        .route("/api/sources/{id}/transcript", get(sources::transcript))
+        .route(routes::SOURCE_UPLOADS, post(uploads::start))
+        .route(
+            "/api/source-uploads/{id}",
+            get(uploads::get)
+                .put(uploads::put_part)
+                .delete(uploads::cancel)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/source-uploads/{id}/finish", post(uploads::finish))
         .route(
             routes::EMBEDDING,
             get(embedding::get_model).delete(embedding::delete_model),

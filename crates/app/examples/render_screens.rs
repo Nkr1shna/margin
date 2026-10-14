@@ -227,6 +227,7 @@ fn sample_uploads(lib: &mut LibraryState) -> Vec<sources::Upload> {
             SourceStatus::Ready {
                 chunks: 3,
                 pages: None,
+                warning: None,
             },
             lib,
         ),

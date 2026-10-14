@@ -154,6 +154,11 @@ impl Config {
         self.data_dir.join("sources")
     }
 
+    /// Sources being uploaded in parts, each as `{id}/file` and `{id}/upload.json`.
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.data_dir.join("uploads")
+    }
+
     /// The downloaded embedding model.
     pub fn embedding_model_dir(&self) -> PathBuf {
         self.data_dir.join("models").join("embeddinggemma-2")

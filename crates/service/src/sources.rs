@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Json;
-use axum::body::Bytes;
-use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::body::Body;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use margin_ai::{Image, Passage};
 use margin_embed::{
@@ -34,7 +34,8 @@ use margin_embed::{
     sample_ms,
 };
 use margin_shared::{
-    Citation, Event, Id, Source, SourceKind, SourceStatus, routes::MAX_SOURCE_BYTES,
+    Citation, Event, Id, SOURCE_KINDS, Source, SourceKind, SourceStatus, TranscriptSegment,
+    routes,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
@@ -48,6 +49,9 @@ use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
 
 /// The uploaded file's name inside its folder; the original name is kept in the row.
 pub const FILE_NAME: &str = "file";
+/// What an audio or video source's speech recognition heard, word by word
+/// (`Transcript` as JSON), for the app's whole-transcript view.
+pub const TRANSCRIPT_FILE: &str = "transcript.json";
 /// Chunks embedded per call to the model.
 const EMBED_BATCH: usize = 16;
 /// Progress is saved and sent at most this often.
@@ -134,54 +138,148 @@ pub async fn source(state: &AppState, id: &str) -> AppResult<Source> {
 // Upload and delete
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UploadQuery {
     #[serde(default)]
-    name: String,
-    folder: Option<String>,
-    topic_id: Option<Id>,
+    pub name: String,
+    pub folder: Option<String>,
+    pub topic_id: Option<Id>,
+}
+
+/// An upload's file name, folder and topic, checked: a name Margin can read, and a topic
+/// that exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Upload {
+    pub name: String,
+    pub folder: Option<String>,
+    pub topic_id: Option<Id>,
+    pub kind: SourceKind,
+}
+
+impl Upload {
+    pub async fn check(state: &AppState, q: UploadQuery) -> AppResult<Upload> {
+        let name: String = q.name.trim().chars().take(500).collect();
+        if name.is_empty() {
+            return Err(AppError::bad_request("Say what the file is called."));
+        }
+        let Some(kind) = SourceKind::for_name(&name) else {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_source",
+                format!("Margin can't read {name}. Sources can be {SOURCE_KINDS} files."),
+            ));
+        };
+        let folder = q
+            .folder
+            .map(|f| f.trim().chars().take(500).collect::<String>())
+            .filter(|f| !f.is_empty());
+        if let Some(topic_id) = &q.topic_id {
+            library::topic(state, topic_id).await?;
+        }
+        Ok(Upload {
+            name,
+            folder,
+            topic_id: q.topic_id,
+            kind,
+        })
+    }
+
+    /// The largest file of its kind.
+    pub fn limit(&self) -> u64 {
+        routes::max_source_bytes(self.kind)
+    }
+
+    /// 413 "too_large", naming its kind's limit.
+    pub fn too_large(&self) -> AppError {
+        AppError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            routes::too_large_text(&self.name, self.kind),
+        )
+    }
+}
+
+/// The request's Content-Length, when it sent one.
+pub fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Why a request body couldn't be saved.
+#[derive(Debug)]
+pub enum ReceiveError {
+    /// More than the limit came; what was written of it was taken back off.
+    TooLarge,
+    /// The client stopped sending (or the connection broke).
+    Body(String),
+    Io(std::io::Error),
+}
+
+impl ReceiveError {
+    pub fn into_app_error(self, upload: &Upload, path: &std::path::Path) -> AppError {
+        match self {
+            ReceiveError::TooLarge => upload.too_large(),
+            ReceiveError::Body(e) => AppError::new(
+                StatusCode::BAD_REQUEST,
+                "incomplete_upload",
+                format!("The upload of {} broke off ({e}).", upload.name),
+            ),
+            ReceiveError::Io(e) => {
+                AppError::internal(format!("couldn't save {}: {e}", path.display()))
+            }
+        }
+    }
+}
+
+/// Streams `body` onto the end of `path` (created if missing) without holding it in
+/// memory, refusing more than `max` bytes of it. Returns how many bytes it added. On
+/// any failure the file is cut back to where it was.
+pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64, ReceiveError> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(ReceiveError::Io)?;
+    let start = file.metadata().await.map_err(ReceiveError::Io)?.len();
+    let mut written = 0u64;
+    let mut stream = body.into_data_stream();
+    let result = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ReceiveError::Body(e.to_string()))?;
+            written += chunk.len() as u64;
+            if written > max {
+                return Err(ReceiveError::TooLarge);
+            }
+            file.write_all(&chunk).await.map_err(ReceiveError::Io)?;
+        }
+        file.flush().await.map_err(ReceiveError::Io)?;
+        Ok(written)
+    }
+    .await;
+    if result.is_err() {
+        let _ = file.set_len(start).await;
+    }
+    result
 }
 
 pub async fn upload(
     State(state): State<AppState>,
+    headers: HeaderMap,
     query: Result<Query<UploadQuery>, QueryRejection>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> AppResult<Json<Source>> {
     let Query(q) =
         query.map_err(|rej| AppError::new(rej.status(), "bad_request", rej.body_text()))?;
-    let bytes = body.map_err(|rej| {
-        if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            AppError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "too_large",
-                format!(
-                    "That file is too big: sources can be at most {} MB.",
-                    MAX_SOURCE_BYTES / (1024 * 1024)
-                ),
-            )
-        } else {
-            AppError::new(rej.status(), "bad_request", rej.body_text())
-        }
-    })?;
-    let name: String = q.name.trim().chars().take(500).collect();
-    if name.is_empty() {
-        return Err(AppError::bad_request("Say what the file is called."));
-    }
-    let Some(kind) = SourceKind::for_name(&name) else {
-        return Err(AppError::new(
-            StatusCode::BAD_REQUEST,
-            "unsupported_source",
-            format!(
-                "Margin can't read {name}. Sources are text, code, PDF, image, audio and video files."
-            ),
-        ));
-    };
-    let folder = q
-        .folder
-        .map(|f| f.trim().chars().take(500).collect::<String>())
-        .filter(|f| !f.is_empty());
-    if let Some(topic_id) = &q.topic_id {
-        library::topic(&state, topic_id).await?;
+    let upload = Upload::check(&state, q).await?;
+    // Refused before a byte is read when the size is known up front.
+    if content_length(&headers).is_some_and(|n| n > upload.limit()) {
+        return Err(upload.too_large());
     }
 
     let id = new_id();
@@ -189,21 +287,30 @@ pub async fn upload(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::internal(format!("couldn't create {}: {e}", dir.display())))?;
-    if let Err(e) = tokio::fs::write(dir.join(FILE_NAME), &bytes).await {
-        remove_dir(&dir).await;
-        return Err(AppError::internal(format!(
-            "couldn't save the source in {}: {e}",
-            dir.display()
-        )));
-    }
+    let path = dir.join(FILE_NAME);
+    let bytes = match receive(body, &path, upload.limit()).await {
+        Ok(n) => n,
+        Err(e) => {
+            remove_dir(&dir).await;
+            return Err(e.into_app_error(&upload, &path));
+        }
+    };
+    let source = create(&state, &id, upload, bytes).await?;
+    Ok(Json(source))
+}
+
+/// Records the source whose file is now in `source_dir(id)` and queues it to be read.
+/// Removes the folder when the topic went away meanwhile. Returns the wire record.
+pub async fn create(state: &AppState, id: &str, upload: Upload, bytes: u64) -> AppResult<Source> {
+    let dir = state.source_dir(id);
     let source = Source {
         media_url: None,
-        id: id.clone(),
-        topic_id: q.topic_id,
-        name,
-        folder,
-        kind,
-        bytes: bytes.len() as u64,
+        id: id.to_string(),
+        topic_id: upload.topic_id,
+        name: upload.name,
+        folder: upload.folder,
+        kind: upload.kind,
+        bytes,
         status: SourceStatus::Queued,
         created_at: Utc::now(),
     };
@@ -211,16 +318,81 @@ pub async fn upload(
         let _w = state.write_lock.lock().await;
         // The topic may have been deleted while the file was being saved.
         if let Some(topic_id) = &source.topic_id
-            && let Err(e) = library::topic(&state, topic_id).await
+            && let Err(e) = library::topic(state, topic_id).await
         {
             remove_dir(&dir).await;
             return Err(e);
         }
-        state.store.put(db::SOURCE, &id, &source).await?;
+        if let Err(e) = state.store.put(db::SOURCE, id, &source).await {
+            remove_dir(&dir).await;
+            return Err(e.into());
+        }
     }
+    state.emit_source(&source);
+    let _ = state.source_queue.send(id.to_string());
+    Ok(state.public_source(&source))
+}
+
+/// "Read again": queue a source to be read from the start, in place (same id, topic and
+/// file). For one that failed or was read with a warning, once what was wrong is fixed.
+pub async fn reprocess(
+    State(state): State<AppState>,
+    Path(id): Path<Id>,
+) -> AppResult<Json<Source>> {
+    let source = {
+        let _w = state.write_lock.lock().await;
+        let mut s = source(&state, &id).await?;
+        if is_pending(&s.status) {
+            return Err(AppError::conflict(
+                "source_busy",
+                format!("{} is already being read.", s.name),
+            ));
+        }
+        s.status = SourceStatus::Queued;
+        state.store.put(db::SOURCE, &id, &s).await?;
+        s
+    };
     state.emit_source(&source);
     let _ = state.source_queue.send(id);
     Ok(Json(state.public_source(&source)))
+}
+
+/// An audio or video source's whole transcript, line by line: from the words kept when it
+/// was read, or (sources read before those were kept) its timed passages. Empty for
+/// other kinds and recordings without one.
+pub async fn transcript(
+    State(state): State<AppState>,
+    Path(id): Path<Id>,
+) -> AppResult<Json<Vec<TranscriptSegment>>> {
+    let source = source(&state, &id).await?;
+    if !matches!(source.kind, SourceKind::Audio | SourceKind::Video) {
+        return Ok(Json(Vec::new()));
+    }
+    let path = state.source_dir(&id).join(TRANSCRIPT_FILE);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let words: Transcript = serde_json::from_slice(&bytes)
+                .map_err(|e| AppError::internal(format!("{}: {e}", path.display())))?;
+            return Ok(Json(words.lines()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(AppError::internal(format!("{}: {e}", path.display()))),
+    }
+    let mut rows: Vec<ChunkRow> = state.store.list_where(db::CHUNK, "source_id", &id).await?;
+    rows.sort_by_key(|r| (r.start_ms, r.ord));
+    let lines = rows
+        .into_iter()
+        .filter_map(|r| {
+            let start_ms = r.start_ms?;
+            Some(TranscriptSegment {
+                start_ms,
+                end_ms: r.end_ms.unwrap_or(start_ms).max(start_ms),
+                text: r.text.trim().to_string(),
+            })
+        })
+        .filter(|s| !s.text.is_empty())
+        .collect();
+    Ok(Json(lines))
 }
 
 pub async fn delete_source(
@@ -246,7 +418,7 @@ pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Event> 
     Ok(Event::SourceDeleted { id: id.to_string() })
 }
 
-async fn remove_dir(dir: &std::path::Path) {
+pub(crate) async fn remove_dir(dir: &std::path::Path) {
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -401,7 +573,7 @@ async fn process(state: &AppState, id: &str) -> anyhow::Result<()> {
             Ok(Some(t)) => transcript = Some(t),
             Ok(None) => {
                 no_transcript = Some(format!(
-                    "{FLUIDAUDIOCLI} isn't installed on the service Mac (Settings shows how \
+                    "{FLUIDAUDIOCLI} isn't installed on the service Mac (Settings → Tools shows how \
                      to install it)"
                 ))
             }
@@ -409,6 +581,19 @@ async fn process(state: &AppState, id: &str) -> anyhow::Result<()> {
         }
         if let Some(why) = &no_transcript {
             tracing::warn!("source {id}: no transcript: {why}");
+        }
+    }
+    // Kept for the app's whole-transcript view; a read without one drops an old one.
+    let transcript_path = state.source_dir(id).join(TRANSCRIPT_FILE);
+    match &transcript {
+        Some(t) => {
+            let json = serde_json::to_vec(t)?;
+            tokio::fs::write(&transcript_path, json)
+                .await
+                .with_context(|| format!("couldn't save {}", transcript_path.display()))?;
+        }
+        None => {
+            let _ = tokio::fs::remove_file(&transcript_path).await;
         }
     }
 
@@ -557,30 +742,35 @@ async fn process(state: &AppState, id: &str) -> anyhow::Result<()> {
         }
     }
 
-    // A recording without a transcript gives the lesson writer nothing to read (it can't
-    // listen), so it isn't Ready; its sound is embedded all the same.
-    if kind == SourceKind::Audio
-        && let Some(why) = no_transcript
-    {
-        return fail(
-            state,
-            id,
-            &format!(
-                "Couldn't transcribe {}: {why}. Remove it and add it again once that's fixed.",
-                source.name
-            ),
-        )
-        .await;
-    }
+    // A recording without a transcript gives the lesson writer less to go on (it can't
+    // listen): its sound is embedded and found, but lessons can't quote it. It's Ready,
+    // with a warning that says so and a "Read again" for once it's fixed.
+    let warning = no_transcript.map(|why| transcript_warning(kind, &why));
     update(state, id, |s| {
         s.status = SourceStatus::Ready {
             chunks: total,
             pages,
+            warning,
         }
     })
     .await?;
     tracing::info!("source {id} is ready: {total} chunks and media items");
     Ok(())
+}
+
+/// The warning on a recording read without a transcript, `why` being what went wrong.
+fn transcript_warning(kind: SourceKind, why: &str) -> String {
+    if kind == SourceKind::Video {
+        format!(
+            "Its soundtrack wasn't transcribed: {why}. Its pictures are read, but lessons \
+             can't quote what's said. Read it again once that's fixed."
+        )
+    } else {
+        format!(
+            "It wasn't transcribed: {why}. Its sound is still searched, but lessons can't \
+             quote what's said. Read it again once that's fixed."
+        )
+    }
 }
 
 /// The uploaded file under a name with the original's extension (`input.m4a`, a link to

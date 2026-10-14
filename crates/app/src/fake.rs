@@ -45,6 +45,22 @@ pub struct FakeState {
     pub embedding: EmbeddingModelState,
     /// Uploaded sources' bytes, served as their originals.
     pub source_files: HashMap<Id, Vec<u8>>,
+    /// Uploads in parts (`routes::SOURCE_UPLOADS`) still arriving.
+    pub part_uploads: HashMap<Id, PartUpload>,
+    /// How many parts have arrived, for tests.
+    pub parts_received: u32,
+    /// Fail the next this many parts with a 503, for tests of the retries.
+    pub fail_parts: u32,
+}
+
+/// An upload in parts the fake is receiving.
+#[derive(Debug, Clone)]
+pub struct PartUpload {
+    pub name: String,
+    pub folder: Option<String>,
+    pub topic_id: Option<Id>,
+    pub bytes: u64,
+    pub data: Vec<u8>,
 }
 
 /// Hugging Face repo of the embedding model, as the service reports it.
@@ -325,6 +341,7 @@ pub fn sample_library() -> Library {
                 status: SourceStatus::Ready {
                     chunks: 48,
                     pages: Some(32),
+                    warning: None,
                 },
                 created_at: ts(30),
             },
@@ -339,6 +356,7 @@ pub fn sample_library() -> Library {
                 status: SourceStatus::Ready {
                     chunks: 3,
                     pages: None,
+                    warning: None,
                 },
                 created_at: ts(31),
             },
@@ -366,6 +384,7 @@ pub fn sample_library() -> Library {
                 status: SourceStatus::Ready {
                     chunks: 1,
                     pages: None,
+                    warning: None,
                 },
                 created_at: ts(33),
             },
@@ -380,6 +399,7 @@ pub fn sample_library() -> Library {
                 status: SourceStatus::Ready {
                     chunks: 1,
                     pages: None,
+                    warning: None,
                 },
                 created_at: ts(34),
             },
@@ -394,6 +414,7 @@ pub fn sample_library() -> Library {
                 status: SourceStatus::Ready {
                     chunks: 4,
                     pages: None,
+                    warning: None,
                 },
                 created_at: ts(35),
             },
@@ -405,7 +426,7 @@ pub fn sample_library() -> Library {
                 folder: None,
                 kind: SourceKind::Video,
                 bytes: 127_994,
-                status: SourceStatus::Ready { chunks: 5, pages: None },
+                status: SourceStatus::Ready { chunks: 5, pages: None, warning: None, },
                 created_at: ts(36),
             },
         ],
@@ -461,6 +482,9 @@ impl FakeState {
                 download_bytes: EMBEDDING_DOWNLOAD_BYTES,
             },
             source_files: HashMap::new(),
+            part_uploads: HashMap::new(),
+            parts_received: 0,
+            fail_parts: 0,
         }
     }
 
@@ -552,9 +576,21 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
         .route(
             "/api/sources",
-            post(upload_source).layer(DefaultBodyLimit::max(routes::MAX_SOURCE_BYTES as usize)),
+            post(upload_source)
+                .layer(DefaultBodyLimit::max(routes::MAX_ANY_SOURCE_BYTES as usize)),
         )
         .route("/api/sources/{id}", axum::routing::delete(delete_source))
+        .route("/api/sources/{id}/reprocess", post(reprocess_source))
+        .route("/api/sources/{id}/transcript", get(source_transcript))
+        .route("/api/source-uploads", post(start_part_upload))
+        .route(
+            "/api/source-uploads/{id}",
+            get(get_part_upload)
+                .put(put_part)
+                .delete(cancel_part_upload)
+                .layer(DefaultBodyLimit::max(routes::UPLOAD_PART_BYTES as usize)),
+        )
+        .route("/api/source-uploads/{id}/finish", post(finish_part_upload))
         .route(
             "/api/embedding",
             get(get_embedding).delete(delete_embedding),
@@ -1542,20 +1578,54 @@ async fn upload_source(
     if let Err(r) = authorized(&headers) {
         return r;
     }
+    let kind = match check_upload(&fake, &query, body.len() as u64) {
+        Ok(kind) => kind,
+        Err(r) => return r,
+    };
+    add_source(&fake, query, kind, body.to_vec())
+}
+
+/// The kind of an upload's file, or the service's refusal: a name Margin can't read,
+/// a size over its kind's limit, a topic that doesn't exist.
+#[allow(clippy::result_large_err)]
+fn check_upload(fake: &Fake, query: &UploadQuery, bytes: u64) -> Result<SourceKind, Response> {
     let Some(kind) = SourceKind::for_name(&query.name) else {
-        return api_error(
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_source",
-            "Margin can't read this kind of file.",
-        );
+            &format!(
+                "Margin can't read {}. Sources can be {SOURCE_KINDS} files.",
+                query.name
+            ),
+        ));
     };
+    if bytes > routes::max_source_bytes(kind) {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            &routes::too_large_text(&query.name, kind),
+        ));
+    }
+    if let Some(topic_id) = &query.topic_id
+        && !fake
+            .state
+            .lock()
+            .unwrap()
+            .library
+            .topics
+            .iter()
+            .any(|t| &t.id == topic_id)
+    {
+        return Err(not_found());
+    }
+    Ok(kind)
+}
+
+/// Records an uploaded file as a Queued source (read over a couple of seconds when
+/// simulating with the model downloaded).
+fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) -> Response {
     let (source, process) = {
         let mut s = fake.state.lock().unwrap();
-        if let Some(topic_id) = &query.topic_id
-            && !s.library.topics.iter().any(|t| &t.id == topic_id)
-        {
-            return not_found();
-        }
         let id = s.id("source");
         let source = Source {
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
@@ -1568,10 +1638,206 @@ async fn upload_source(
             status: SourceStatus::Queued,
             created_at: Utc::now(),
         };
-        s.source_files.insert(source.id.clone(), body.to_vec());
+        s.source_files.insert(source.id.clone(), body);
         s.library.sources.push(source.clone());
         let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
         (source, s.simulate && ready)
+    };
+    publish(
+        fake,
+        Event::SourceChanged {
+            source: source.clone(),
+        },
+    );
+    if process {
+        tokio::spawn(simulate_source(fake.clone(), source.id.clone()));
+    }
+    Json(source).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct StartPartsQuery {
+    name: String,
+    folder: Option<String>,
+    topic_id: Option<String>,
+    bytes: u64,
+}
+
+async fn start_part_upload(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Query(q): Query<StartPartsQuery>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let query = UploadQuery {
+        name: q.name,
+        folder: q.folder,
+        topic_id: q.topic_id,
+    };
+    if let Err(r) = check_upload(&fake, &query, q.bytes) {
+        return r;
+    }
+    let mut s = fake.state.lock().unwrap();
+    let id = s.id("upload");
+    s.part_uploads.insert(
+        id.clone(),
+        PartUpload {
+            name: query.name,
+            folder: query.folder,
+            topic_id: query.topic_id,
+            bytes: q.bytes,
+            data: Vec::new(),
+        },
+    );
+    Json(SourceUpload {
+        id,
+        bytes: q.bytes,
+        received: 0,
+    })
+    .into_response()
+}
+
+async fn get_part_upload(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    match s.part_uploads.get(&id) {
+        Some(u) => Json(SourceUpload {
+            id,
+            bytes: u.bytes,
+            received: u.data.len() as u64,
+        })
+        .into_response(),
+        None => not_found(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PartQuery {
+    offset: u64,
+}
+
+async fn put_part(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<PartQuery>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let mut s = fake.state.lock().unwrap();
+    if s.fail_parts > 0 {
+        s.fail_parts -= 1;
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "internal", "Try again.");
+    }
+    s.parts_received += 1;
+    let Some(u) = s.part_uploads.get_mut(&id) else {
+        return not_found();
+    };
+    if q.offset != u.data.len() as u64 {
+        return api_error(
+            StatusCode::CONFLICT,
+            "wrong_offset",
+            "The next part starts elsewhere.",
+        );
+    }
+    if u.data.len() as u64 + body.len() as u64 > u.bytes {
+        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "Too much.");
+    }
+    u.data.extend_from_slice(&body);
+    Json(SourceUpload {
+        id,
+        bytes: u.bytes,
+        received: u.data.len() as u64,
+    })
+    .into_response()
+}
+
+async fn finish_part_upload(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let upload = {
+        let mut s = fake.state.lock().unwrap();
+        match s.part_uploads.get(&id) {
+            None => return not_found(),
+            Some(u) if u.data.len() as u64 != u.bytes => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "incomplete_upload",
+                    "Parts are missing.",
+                );
+            }
+            Some(_) => s.part_uploads.remove(&id).unwrap(),
+        }
+    };
+    let query = UploadQuery {
+        name: upload.name,
+        folder: upload.folder,
+        topic_id: upload.topic_id,
+    };
+    match check_upload(&fake, &query, upload.bytes) {
+        Ok(kind) => add_source(&fake, query, kind, upload.data),
+        Err(r) => r,
+    }
+}
+
+async fn cancel_part_upload(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    match fake.state.lock().unwrap().part_uploads.remove(&id) {
+        Some(_) => StatusCode::NO_CONTENT.into_response(),
+        None => not_found(),
+    }
+}
+
+/// "Read again": Queued, then read anew when simulating with the model downloaded; the
+/// sample recording read without a transcript comes back with one.
+async fn reprocess_source(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (source, process) = {
+        let mut s = fake.state.lock().unwrap();
+        let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
+        let simulate = s.simulate;
+        let Some(src) = s.library.sources.iter_mut().find(|src| src.id == id) else {
+            return not_found();
+        };
+        if matches!(
+            src.status,
+            SourceStatus::Queued | SourceStatus::Processing { .. }
+        ) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "source_busy",
+                &format!("{} is already being read.", src.name),
+            );
+        }
+        src.status = SourceStatus::Queued;
+        (src.clone(), simulate && ready)
     };
     publish(
         &fake,
@@ -1583,6 +1849,54 @@ async fn upload_source(
         tokio::spawn(simulate_source(fake.clone(), source.id.clone()));
     }
     Json(source).into_response()
+}
+
+async fn source_transcript(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    if !s.library.sources.iter().any(|src| src.id == id) {
+        return not_found();
+    }
+    Json(sample_transcript(&id)).into_response()
+}
+
+/// What the sample recordings say, line by line (the sentence times printed by
+/// `examples/sample-media/generate.swift`).
+pub fn sample_transcript(source_id: &str) -> Vec<TranscriptSegment> {
+    let line = |start_ms, end_ms, text: &str| TranscriptSegment {
+        start_ms,
+        end_ms,
+        text: text.into(),
+    };
+    match source_id {
+        "s5" => vec![
+            line(0, 1_050, "Lecture twelve."),
+            line(1_200, 3_325, "Today we look at what happens near a jump."),
+            line(
+                3_725,
+                8_560,
+                "Near a discontinuity, the partial sums overshoot by about nine percent of the jump.",
+            ),
+            line(
+                8_960,
+                13_752,
+                "Adding more terms squeezes the overshoot closer to the jump, but it never gets smaller.",
+            ),
+            line(14_152, 16_420, "That stubborn ripple is the Gibbs phenomenon."),
+        ],
+        "s6" => vec![
+            line(300, 2_000, "With one term it's a sine wave."),
+            line(2_200, 4_900, "With three terms the shape is already recognisable."),
+            line(5_100, 8_350, "With fifteen, only the overshoot at each jump remains."),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Read and embed a source over a couple of seconds, a chunk at a time.
@@ -1612,6 +1926,7 @@ async fn simulate_source(fake: Fake, id: Id) {
     let status = SourceStatus::Ready {
         chunks: total,
         pages: pdf.then_some(2),
+        warning: None,
     };
     if let Some(source) = set(status) {
         publish(&fake, Event::SourceChanged { source });

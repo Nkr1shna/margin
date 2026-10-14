@@ -2,13 +2,14 @@
 //! Every failure comes back as an [`ApiFailure`] whose `message` is fit to show in the UI.
 
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use margin_shared::{
     AcceptProposal, ApiError, AskRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library,
     LoginState, Me, NewNote, NewTopic, Note, NotePatch, PollLoginRequest, Proposal, SearchHit,
-    Settings, SettingsPatch, Source, StartLogin, StartLoginRequest, ToolStatus, Topic, TopicPatch,
-    Video, routes,
+    Settings, SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest,
+    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -311,40 +312,120 @@ impl Api {
         self.delete(&routes::device(id)).await
     }
 
-    /// Upload one file as a source. `name` is the file name, or its path inside the folder
-    /// it was added with; without `topic_id` it waits to be named in an `AskRequest`.
+    /// Upload the file at `path` as a source, streaming it from disk (never all of it in
+    /// memory). `name` is the file name, or its path inside the folder it was added with;
+    /// without `topic_id` it waits to be named in an `AskRequest`. A file over its
+    /// kind's limit is refused here, before anything is sent; one over
+    /// `routes::UPLOAD_PART_BYTES` goes up in parts, `progress` hearing how many bytes
+    /// the service has after each.
     pub async fn upload_source(
         &self,
-        bytes: Vec<u8>,
+        path: &Path,
         name: &str,
         folder: Option<&str>,
         topic_id: Option<&str>,
+        progress: impl Fn(u64),
     ) -> ApiResult<Source> {
-        if bytes.len() as u64 > routes::MAX_SOURCE_BYTES {
-            return Err(ApiFailure::local(format!(
-                "{name} is larger than {} MB, the most a source can be.",
-                routes::MAX_SOURCE_BYTES / (1024 * 1024)
-            )));
+        let bytes = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| ApiFailure::local(format!("Couldn't read {name} ({e}).")))?
+            .len();
+        if let Some(kind) = SourceKind::for_name(name)
+            && bytes > routes::max_source_bytes(kind)
+        {
+            return Err(ApiFailure::local(routes::too_large_text(name, kind)));
         }
-        let mut query = vec![("name", name)];
+        let mut query = vec![("name", name.to_string())];
         if let Some(folder) = folder {
-            query.push(("folder", folder));
+            query.push(("folder", folder.to_string()));
         }
         if let Some(topic_id) = topic_id {
-            query.push(("topic_id", topic_id));
+            query.push(("topic_id", topic_id.to_string()));
         }
-        let builder = self
-            .request(Method::POST, routes::SOURCES)
-            .query(&query)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            // Large files over a slow link take longer than the default 60 s.
-            .timeout(Duration::from_secs(600))
-            .body(bytes);
-        self.json(builder).await
+        if bytes <= routes::UPLOAD_PART_BYTES {
+            let builder = self
+                .request(Method::POST, routes::SOURCES)
+                .query(&query)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .header(reqwest::header::CONTENT_LENGTH, bytes)
+                // Large files over a slow link take longer than the default 60 s.
+                .timeout(UPLOAD_TIMEOUT)
+                .body(file_body(path, 0, bytes).await?);
+            return self.json(builder).await;
+        }
+
+        query.push(("bytes", bytes.to_string()));
+        let upload: SourceUpload = self
+            .json(self.request(Method::POST, routes::SOURCE_UPLOADS).query(&query))
+            .await?;
+        match self.send_parts(path, &upload, &progress).await {
+            Ok(()) => {
+                self.post_empty(&routes::source_upload_finish(&upload.id))
+                    .await
+            }
+            Err(e) => {
+                // Best effort: the service drops unfinished uploads after a day anyway.
+                let _ = self.delete(&routes::source_upload(&upload.id)).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Sends `path` from where the service's copy ends, part by part. A part that fails
+    /// on the way is retried (from wherever the service says it got to) a few times.
+    async fn send_parts(
+        &self,
+        path: &Path,
+        upload: &SourceUpload,
+        progress: &impl Fn(u64),
+    ) -> ApiResult<()> {
+        let mut received = upload.received;
+        let mut failures = 0;
+        while received < upload.bytes {
+            let len = routes::UPLOAD_PART_BYTES.min(upload.bytes - received);
+            let builder = self
+                .request(Method::PUT, &routes::source_upload(&upload.id))
+                .query(&[("offset", received)])
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .timeout(UPLOAD_TIMEOUT)
+                .body(file_body(path, received, len).await?);
+            match self.json::<SourceUpload>(builder).await {
+                Ok(state) => {
+                    received = state.received;
+                    failures = 0;
+                    progress(received);
+                }
+                // A broken connection or a part the service has (some of) already:
+                // ask where it got to and go on from there.
+                Err(e) if retry_part(&e) && failures < PART_RETRIES => {
+                    failures += 1;
+                    tokio::time::sleep(Duration::from_secs(1 << failures)).await;
+                    if let Ok(state) = self
+                        .get::<SourceUpload>(&routes::source_upload(&upload.id))
+                        .await
+                    {
+                        received = state.received;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     pub async fn delete_source(&self, id: &str) -> ApiResult<()> {
         self.delete(&routes::source(id)).await
+    }
+
+    /// "Read again": the service reads the source anew, in place.
+    pub async fn reprocess_source(&self, id: &str) -> ApiResult<Source> {
+        self.post_empty(&routes::source_reprocess(id)).await
+    }
+
+    /// An audio or video source's whole transcript.
+    pub async fn source_transcript(&self, id: &str) -> ApiResult<Vec<TranscriptSegment>> {
+        self.get(&routes::source_transcript(id)).await
     }
 
     pub async fn embedding(&self) -> ApiResult<EmbeddingModel> {
@@ -384,6 +465,56 @@ impl Api {
             url
         }
     }
+}
+
+/// How long one upload request (a whole small file, or one part) may take.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Tries per part after a failure on the way.
+const PART_RETRIES: u32 = 3;
+
+/// Whether a failed part is worth sending again: the connection broke or timed out, the
+/// service had a hiccup, or it has a different amount of the file than we thought.
+fn retry_part(e: &ApiFailure) -> bool {
+    e.status.is_none() && e.code == "network"
+        || e.status.is_some_and(|s| s >= 500)
+        || e.code == "wrong_offset"
+        || e.code == "upload_busy"
+}
+
+/// `len` bytes of the file at `path` from `offset`, as a streamed request body read in
+/// 256 KB pieces.
+async fn file_body(path: &Path, offset: u64, len: u64) -> ApiResult<reqwest::Body> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fail = |e: std::io::Error| ApiFailure::local(format!("Couldn't read {name} ({e})."));
+    let mut file = tokio::fs::File::open(path).await.map_err(fail)?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(fail)?;
+    }
+    let stream = futures_util::stream::try_unfold(
+        (file, len),
+        |(mut file, left)| async move {
+            if left == 0 {
+                return Ok(None);
+            }
+            let mut buf = vec![0u8; left.min(256 * 1024) as usize];
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the file got shorter while it was being uploaded",
+                ));
+            }
+            buf.truncate(n);
+            Ok::<_, std::io::Error>(Some((buf, (file, left - n as u64))))
+        },
+    );
+    Ok(reqwest::Body::wrap_stream(stream))
 }
 
 async fn failure_from(response: Response) -> ApiFailure {
@@ -598,17 +729,47 @@ mod tests {
         assert_eq!(lesson.status, margin_shared::LessonStatus::Queued);
     }
 
+    /// A scratch file removed when dropped.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str, contents: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "margin-api-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        /// A file of `len` bytes that takes no room (sparse), for size limits.
+        fn sized(tag: &str, len: u64) -> Self {
+            let file = Self::new(tag, b"");
+            std::fs::File::options()
+                .write(true)
+                .open(&file.0)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+            file
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[tokio::test]
     async fn sources_upload_with_query_and_attach_on_accept() {
         let fake = FakeService::start().await;
         let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let file = TempFile::new("gibbs", b"# Gibbs & friends\n");
         let source = api
-            .upload_source(
-                b"# Gibbs & friends\n".to_vec(),
-                "notes/ch 1.md",
-                Some("Fourier notes"),
-                None,
-            )
+            .upload_source(&file.0, "notes/ch 1.md", Some("Fourier notes"), None, |_| {})
             .await
             .unwrap();
         assert_eq!(source.name, "notes/ch 1.md");
@@ -624,17 +785,19 @@ mod tests {
             "# Gibbs & friends\n"
         );
 
+        let code = TempFile::new("main", b"fn main() {}");
         let in_topic = api
-            .upload_source(b"fn main() {}".to_vec(), "main.rs", None, Some("fourier"))
+            .upload_source(&code.0, "main.rs", None, Some("fourier"), |_| {})
             .await
             .unwrap();
         assert_eq!(in_topic.topic_id.as_deref(), Some("fourier"));
         assert!(api.library().await.unwrap().sources.contains(&in_topic));
         let err = api
-            .upload_source(b"x".to_vec(), "archive.zip", None, None)
+            .upload_source(&code.0, "archive.zip", None, None, |_| {})
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(400));
+        assert!(err.message.contains(margin_shared::SOURCE_KINDS), "{}", err.message);
 
         // Accepting a proposal that names the source attaches it to the new topic.
         let req = AskRequest {
@@ -664,15 +827,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_refuses_files_over_the_limit_locally() {
+    async fn upload_refuses_files_over_their_kinds_limit_locally() {
         let api = Api::with_token("http://127.0.0.1:9", "x");
-        let big = vec![0u8; routes::MAX_SOURCE_BYTES as usize + 1];
+        let big = TempFile::sized("big", routes::MAX_OTHER_SOURCE_BYTES + 1);
         let err = api
-            .upload_source(big, "big.txt", None, None)
+            .upload_source(&big.0, "big.txt", None, None, |_| {})
             .await
             .unwrap_err();
         assert_eq!(err.code, "local");
-        assert!(err.message.starts_with("big.txt is larger than 50 MB"));
+        assert_eq!(
+            err.message,
+            "big.txt is too big: text, code, PDF and image sources can be at most 50 MB."
+        );
+        let long = TempFile::sized("long", routes::MAX_MEDIA_SOURCE_BYTES + 1);
+        let err = api
+            .upload_source(&long.0, "long.mov", None, None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "local");
+        assert!(err.message.ends_with("at most 500 MB."), "{}", err.message);
+        // Under the limit, it goes to the service (unreachable here).
+        let err = api
+            .upload_source(&big.0, "big.mov", None, None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "network");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_files_go_up_in_parts_and_retry_failed_ones() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        // Two parts: a whole one and a bit; the ends are marked to check the order.
+        let len = routes::UPLOAD_PART_BYTES + 1000;
+        let file = TempFile::sized("lecture", len);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::options().write(true).open(&file.0).unwrap();
+            f.write_all(b"START").unwrap();
+            f.seek(SeekFrom::Start(len - 3)).unwrap();
+            f.write_all(b"END").unwrap();
+        }
+        // The first try at a part fails; it's sent again.
+        fake.state.lock().unwrap().fail_parts = 1;
+        let seen = std::sync::Mutex::new(Vec::new());
+        let source = api
+            .upload_source(&file.0, "talks/lecture.mp4", Some("talks"), Some("fourier"), |n| {
+                seen.lock().unwrap().push(n)
+            })
+            .await
+            .unwrap();
+        assert_eq!(source.bytes, len);
+        assert_eq!(source.kind, margin_shared::SourceKind::Video);
+        assert_eq!(source.topic_id.as_deref(), Some("fourier"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![routes::UPLOAD_PART_BYTES, len]
+        );
+        let s = fake.state.lock().unwrap();
+        assert_eq!(s.parts_received, 2);
+        assert!(s.part_uploads.is_empty());
+        let data = &s.source_files[&source.id];
+        assert_eq!(data.len() as u64, len);
+        assert!(data.starts_with(b"START") && data.ends_with(b"END"));
+    }
+
+    #[tokio::test]
+    async fn sources_read_again_and_transcripts() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let lines = api.source_transcript("s5").await.unwrap();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[2].start_ms, 3_725);
+        assert!(api.source_transcript("s1").await.unwrap().is_empty());
+        assert_eq!(
+            api.source_transcript("nope").await.unwrap_err().status,
+            Some(404)
+        );
+        let again = api.reprocess_source("s3").await.unwrap();
+        assert_eq!(again.id, "s3");
+        assert_eq!(again.status, margin_shared::SourceStatus::Queued);
+        let err = api.reprocess_source("s3").await.unwrap_err();
+        assert_eq!((err.status, err.code.as_str()), (Some(409), "source_busy"));
     }
 
     #[tokio::test]

@@ -10,10 +10,10 @@ use common::*;
 use margin_service::db::{self, Store};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore};
 use margin_service::sources::ChunkRow;
-use margin_shared::routes::MAX_SOURCE_BYTES;
+use margin_shared::routes::{self, MAX_MEDIA_SOURCE_BYTES, MAX_OTHER_SOURCE_BYTES};
 use margin_shared::{
     ApiError, EmbeddingModel, EmbeddingModelState, Event, Library, Proposal, ProposalStatus,
-    Source, SourceKind, SourceStatus, Topic,
+    Source, SourceKind, SourceStatus, SourceUpload, Topic,
 };
 use serde_json::json;
 
@@ -161,7 +161,8 @@ async fn uploads_are_read_embedded_and_listed() {
         statuses.last(),
         Some(&SourceStatus::Ready {
             chunks: 3,
-            pages: None
+            pages: None,
+            warning: None,
         })
     );
 
@@ -171,7 +172,8 @@ async fn uploads_are_read_embedded_and_listed() {
         lib.sources[0].status,
         SourceStatus::Ready {
             chunks: 3,
-            pages: None
+            pages: None,
+            warning: None,
         }
     );
     let rows = chunks(&h, &s.id).await;
@@ -206,7 +208,8 @@ async fn uploads_are_read_embedded_and_listed() {
         SourceStatus::Ready {
             // Three paragraphs and two pages as pictures.
             chunks: 5,
-            pages: Some(2)
+            pages: Some(2),
+            warning: None,
         }
     );
     let rows = chunks(&h, &pdf.id).await;
@@ -255,25 +258,174 @@ async fn unsupported_oversized_and_misfiled_uploads_are_rejected() {
     let (status, err) = api_error(h.upload(&t, "a.md", Some("no-such-topic"), "x").await).await;
     assert_eq!((status, err.code.as_str()), (404, "not_found"));
 
-    let too_big = vec![b'a'; MAX_SOURCE_BYTES as usize + 1];
-    let (status, err) = api_error(h.upload(&t, "big.txt", None, too_big).await).await;
+    // Text, code, PDFs and images: 50 MB. Refused up front by its Content-Length…
+    let too_big = vec![b'a'; MAX_OTHER_SOURCE_BYTES as usize + 1];
+    let (status, err) = api_error(h.upload(&t, "big.txt", None, too_big.clone()).await).await;
     assert_eq!(status, 413);
     assert_eq!(err.code, "too_large");
+    assert_eq!(
+        err.message,
+        "big.txt is too big: text, code, PDF and image sources can be at most 50 MB."
+    );
+    // …or, sent without one, once more than that has arrived.
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> = too_big
+        .chunks(1024 * 1024)
+        .map(|c| Ok(c.to_vec()))
+        .collect();
+    let streamed = reqwest::Body::wrap_stream(futures_util::stream::iter(chunks));
+    let (status, err) = api_error(h.upload(&t, "big.pdf", None, streamed).await).await;
+    assert_eq!((status, err.code.as_str()), (413, "too_large"));
+    assert!(err.message.contains("50 MB"), "{}", err.message);
     // Exactly the limit is fine.
-    let at_limit = vec![b'a'; MAX_SOURCE_BYTES as usize];
+    let at_limit = vec![b'a'; MAX_OTHER_SOURCE_BYTES as usize];
     let r = h.upload(&t, "big.txt", None, at_limit).await;
     assert_eq!(r.status(), 200);
     let s: Source = r.json().await.unwrap();
-    assert_eq!(s.bytes, MAX_SOURCE_BYTES);
+    assert_eq!(s.bytes, MAX_OTHER_SOURCE_BYTES);
+    // Audio and video may be ten times that.
+    let r = h
+        .upload(&t, "lecture.mp4", None, vec![0u8; 60 * 1024 * 1024])
+        .await;
+    assert_eq!(r.status(), 200);
+    let video: Source = r.json().await.unwrap();
+    assert_eq!(video.kind, SourceKind::Video);
+    let r = h
+        .post(&t, "/api/source-uploads")
+        .query(&[
+            ("name", "long.mov"),
+            ("bytes", &(MAX_MEDIA_SOURCE_BYTES + 1).to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let (status, err) = api_error(r).await;
+    assert_eq!((status, err.code.as_str()), (413, "too_large"));
+    assert_eq!(
+        err.message,
+        "long.mov is too big: audio and video sources can be at most 500 MB."
+    );
 
     let lib = library(&h, &t).await;
-    assert_eq!(lib.sources.len(), 1);
+    assert_eq!(lib.sources.len(), 2);
     assert_eq!(
         std::fs::read_dir(h.data_dir.join("sources"))
             .unwrap()
             .count(),
-        1
+        2
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_files_upload_in_parts() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let topic = new_topic(&h, &t, None, "Signals").await;
+    let start = |name: &str, bytes: usize| {
+        h.post(&t, "/api/source-uploads")
+            .query(&[
+                ("name", name),
+                ("folder", "talks"),
+                ("topic_id", topic.id.as_str()),
+                ("bytes", &bytes.to_string()),
+            ])
+            .send()
+    };
+    let r = start("talks/fourier.md", FOURIER.len()).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let up: SourceUpload = r.json().await.unwrap();
+    assert_eq!((up.bytes, up.received), (FOURIER.len() as u64, 0));
+    let part = |offset: usize, data: &[u8]| {
+        h.put(&t, &routes::source_upload(&up.id))
+            .query(&[("offset", offset)])
+            .body(data.to_vec())
+            .send()
+    };
+    let (a, b) = FOURIER.as_bytes().split_at(100);
+    let r = part(0, a).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<SourceUpload>().await.unwrap().received, 100);
+    // Finishing early, or a part at the wrong place, is refused.
+    let r = h
+        .post(&t, &routes::source_upload_finish(&up.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api_error(r).await.1.code, "incomplete_upload");
+    let (status, err) = api_error(part(0, a).await.unwrap()).await;
+    assert_eq!((status, err.code.as_str()), (409, "wrong_offset"));
+    // A part longer than what's left of the announced size is refused, and leaves the
+    // upload where it was.
+    let mut long = b.to_vec();
+    long.push(b'!');
+    let (status, _) = api_error(part(100, &long).await.unwrap()).await;
+    assert_eq!(status, 413);
+    let r = h
+        .get(&t, &routes::source_upload(&up.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.json::<SourceUpload>().await.unwrap().received, 100);
+
+    assert_eq!(part(100, b).await.unwrap().status(), 200);
+    let r = h
+        .post(&t, &routes::source_upload_finish(&up.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let source: Source = r.json().await.unwrap();
+    assert_eq!(
+        (
+            source.name.as_str(),
+            source.folder.as_deref(),
+            source.topic_id.as_deref(),
+            source.bytes
+        ),
+        (
+            "talks/fourier.md",
+            Some("talks"),
+            Some(topic.id.as_str()),
+            FOURIER.len() as u64
+        )
+    );
+    let ready = wait_source(&h, &t, &source.id, is_ready).await;
+    assert_eq!(chunks(&h, &ready.id).await.len(), 3);
+    assert_eq!(
+        std::fs::read(h.data_dir.join("sources").join(&source.id).join("file")).unwrap(),
+        FOURIER.as_bytes()
+    );
+    // The upload is gone once finished.
+    let r = h
+        .get(&t, &routes::source_upload(&up.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Given up on: deleted.
+    let r = start("talks/cooking.md", COOKING.len()).await.unwrap();
+    let up: SourceUpload = r.json().await.unwrap();
+    let r = h
+        .delete(&t, &routes::source_upload(&up.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(
+        std::fs::read_dir(h.data_dir.join("uploads"))
+            .unwrap()
+            .count(),
+        0
+    );
+    // Names are checked up front, and ids can't point outside the folder.
+    let r = start("archive.zip", 3).await.unwrap();
+    assert_eq!(api_error(r).await.1.code, "unsupported_source");
+    let r = h
+        .get(&t, "/api/source-uploads/..")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -558,7 +710,8 @@ async fn sources_wait_for_the_model_download() {
         s.status,
         SourceStatus::Ready {
             chunks: 3,
-            pages: None
+            pages: None,
+            warning: None,
         }
     );
     let p = wait_proposal(&h, &t, &p.id).await;
@@ -756,6 +909,7 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
             SourceStatus::Ready {
                 chunks: 3,
                 pages: None,
+                warning: None,
             },
             25,
         ),
@@ -795,7 +949,8 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
         proc.status,
         SourceStatus::Ready {
             chunks: 3,
-            pages: None
+            pages: None,
+            warning: None,
         }
     );
     let rows = chunks(&h, "s-proc").await;

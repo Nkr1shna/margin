@@ -18,4 +18,5 @@ pub mod server;
 pub mod settings;
 pub mod sources;
 pub mod state;
+pub mod uploads;
 pub mod video;
