@@ -5,13 +5,12 @@
 //! through `NSFileCoordinator` into memory, so a file that's only in iCloud is downloaded
 //! first and a file being written is read whole. Dropping the `IosDir` stops the scope.
 //! A bookmark the system calls stale still resolves; it is made again inside the scope
-//! and handed to the store through `take_resaved`.
+//! and queued for the store with `folders::resaved` (the sync engine saves it).
 
 use std::cell::RefCell;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 
 use base64::Engine as _;
 use block2::StackBlock;
@@ -19,22 +18,11 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{ClassType, msg_send};
 use objc2_foundation::{
-    NSArray, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSString,
-    NSURL, NSURLBookmarkCreationOptions, NSURLBookmarkResolutionOptions,
+    NSArray, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSString, NSURL,
+    NSURLBookmarkCreationOptions, NSURLBookmarkResolutionOptions,
 };
 
 use super::{Dir, DirEntry, DirError, DirKind, FolderHandle, StdDir};
-
-/// Bookmarks that went stale and were made again when their folder was opened: (the
-/// handle as it was, the handle to keep). The store swaps each (`store::update_handle`)
-/// after the sync's `open`.
-static RESAVED: Mutex<Vec<(FolderHandle, FolderHandle)>> = Mutex::new(Vec::new());
-
-/// The handles `open` made again since the last call, to save in place of the old ones.
-#[allow(dead_code)] // The sync engine (4-core) saves them through the store.
-pub fn take_resaved() -> Vec<(FolderHandle, FolderHandle)> {
-    std::mem::take(&mut *RESAVED.lock().unwrap_or_else(|e| e.into_inner()))
-}
 
 pub fn open(handle: &FolderHandle) -> Result<Box<dyn Dir>, DirError> {
     let FolderHandle::IosBookmark { bookmark_b64 } = handle else {
@@ -77,10 +65,7 @@ pub fn open(handle: &FolderHandle) -> Result<Box<dyn Dir>, DirError> {
             let fresh = FolderHandle::IosBookmark {
                 bookmark_b64: base64::engine::general_purpose::STANDARD.encode(fresh.to_vec()),
             };
-            RESAVED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((handle.clone(), fresh));
+            super::resaved(handle.clone(), fresh);
         }
         let root = PathBuf::from(
             scope
@@ -122,9 +107,8 @@ fn bookmark_name(data: &NSData) -> Option<String> {
     let keys = NSArray::from_slice(&[&*key]);
     // SAFETY: `+[NSURL resourceValuesForKeys:fromBookmarkData:]` takes an array of
     // resource keys and bookmark data, and returns a dictionary or nil.
-    let values: Option<Retained<AnyObject>> = unsafe {
-        msg_send![NSURL::class(), resourceValuesForKeys: &*keys, fromBookmarkData: data]
-    };
+    let values: Option<Retained<AnyObject>> =
+        unsafe { msg_send![NSURL::class(), resourceValuesForKeys: &*keys, fromBookmarkData: data] };
     // SAFETY: `-[NSDictionary objectForKey:]` with a string key.
     let value: Option<Retained<AnyObject>> = unsafe { msg_send![&*values?, objectForKey: &*key] };
     Some(value?.downcast::<NSString>().ok()?.to_string())
@@ -185,7 +169,10 @@ impl IosDir {
     /// only in iCloud); the read itself goes through `StdDir`, so its rules apply.
     fn coordinated_read(&self, rel: &str) -> Result<Vec<u8>, DirError> {
         let mut path = self.root.clone();
-        for part in rel.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".") {
+        for part in rel
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty() && *p != ".")
+        {
             path.push(part);
         }
         autoreleasepool(|_| {

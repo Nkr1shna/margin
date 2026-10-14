@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::{Path, State};
 use chrono::Utc;
-use margin_ai::{FailedScene, SceneRequest};
+use margin_ai::{CallOptions, FailedScene, Generated, SceneRequest};
 use margin_shared::context::TraceKind;
 use margin_shared::pipeline::Route;
 use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus};
@@ -233,7 +233,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         )
         .await;
     };
-    let ai = match state.ai_config().await {
+    let ai = match state.route_ai_config(Route::Write).await {
         Ok(ai) => ai,
         Err(e) => return fail(state, id, &e.message, None).await,
     };
@@ -285,8 +285,10 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         );
         call.row().job_id = Some(id.to_string());
         call.row().step = Some(attempt);
-        let code = match state.generator.write_scene(&ai, &request).await {
-            Ok(code) => {
+        let opts = CallOptions::new(Route::Write);
+        let code = match state.generator.write_scene(&ai, &request, &opts).await {
+            Ok(Generated { value: code, usage }) => {
+                call.row().usage = Some(trace::trace_usage(&usage));
                 call.finish(true);
                 code
             }
@@ -355,9 +357,8 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The scene prompt's version as traces record it: today's prompt, before R1-ai's
-/// constant-first `scene-v2` (which replaces this with `margin_ai`'s own version).
-const SCENE_PROMPT_VERSION: &str = "scene-v1";
+/// The scene prompt's version as traces record it (`margin_ai`'s constant-first prompt).
+const SCENE_PROMPT_VERSION: &str = margin_ai::prompts::SCENE_VERSION;
 
 /// A render failure as a trace code (never its message).
 fn render_error_code(e: &RenderError) -> &'static str {

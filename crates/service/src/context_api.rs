@@ -7,8 +7,6 @@
 //! `retrieval::document_outline`, `retrieval::read_passages`): one retrieval path for
 //! Margin's agent, external agents and the GUI.
 
-use std::path::PathBuf;
-
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -26,30 +24,6 @@ use crate::state::{AppState, new_id};
 
 /// The project every scope resolves inside until there is more than one.
 pub const DEFAULT_PROJECT_NAME: &str = "My library";
-
-/// The folder (in the data folder) of documents that aren't sources, one per id; the
-/// layout `ingest::document_dir` uses.
-pub const DOCUMENTS_DIR: &str = "documents";
-/// The table of deleted documents (`{ doc: Tombstone }` by id), read by the change feed.
-const DOCUMENT_DELETED: &str = "document_deleted";
-
-/// Where the text of an agent's document `id` is kept, for `ingest` to read.
-pub fn agent_document_path(state: &AppState, id: &str) -> PathBuf {
-    state
-        .config
-        .data_dir
-        .join(DOCUMENTS_DIR)
-        .join(id)
-        .join(crate::sources::FILE_NAME)
-}
-
-/// A deleted document, for `changes` (the shape of R1-store's `ingest::Tombstone`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-pub struct Tombstone {
-    pub id: String,
-    pub generation: u64,
-    pub deleted_at: chrono::DateTime<chrono::Utc>,
-}
 
 fn bad_scope(message: String) -> AppError {
     AppError::new(StatusCode::BAD_REQUEST, "bad_scope", message)
@@ -145,8 +119,9 @@ pub async fn passages(
     ))
 }
 
-/// `POST routes::CONTEXT_INGEST`: the document is created (`actor: agent:<name>`), its
-/// text kept at `agent_document_path`, and it is queued for `ingest`.
+/// `POST routes::CONTEXT_INGEST`: `ingest::ingest_text` (the same agent and name
+/// replaces that document's text; the diff keeps unchanged passages), `actor:
+/// agent:<name>`.
 pub async fn ingest(
     State(state): State<AppState>,
     ApiJson(doc): ApiJson<ContextIngest>,
@@ -161,35 +136,17 @@ pub async fn ingest(
             ));
         }
     };
-    let name = doc.name.trim();
-    if name.is_empty() {
+    if doc.name.trim().is_empty() {
         return Err(AppError::bad_request("Give the document a name."));
     }
     if doc.text.trim().is_empty() {
         return Err(AppError::bad_request("The document has no text."));
     }
-    let actor = format!("agent:{agent}");
-    let document = crate::ingest::upsert_document(
-        &state,
-        Origin::Agent { name: agent },
-        name,
-        doc.kind,
-        &actor,
-    )
-    .await?;
-    let path = agent_document_path(&state, &document.id);
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(AppError::internal)?;
-    }
-    tokio::fs::write(&path, doc.text.as_bytes())
-        .await
-        .map_err(AppError::internal)?;
-    state.ingest_queue.push(crate::ingest::IngestJob {
-        document_id: document.id.clone(),
-    });
-    Ok(Json(document))
+    let req = ContextIngest {
+        origin: Origin::Agent { name: agent },
+        ..doc
+    };
+    Ok(Json(crate::ingest::ingest_text(&state, &req).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,62 +155,15 @@ pub struct ChangesQuery {
     pub since: u64,
 }
 
-/// `GET routes::CONTEXT_CHANGES?since`: the documents whose generation passed `since`,
-/// oldest change first.
+/// `GET routes::CONTEXT_CHANGES?since`: `ingest::changes_since`.
 pub async fn changes(
     State(state): State<AppState>,
     Query(q): Query<ChangesQuery>,
 ) -> AppResult<Json<ContextChanges>> {
-    let since = serde_json::json!(q.since);
-    let mut changed: Vec<Document> = state
-        .store
-        .query_rows(
-            "SELECT VALUE doc FROM document WHERE doc.generation > $since",
-            vec![("since", since.clone())],
-        )
-        .await?;
-    changed.sort_by(|a, b| a.generation.cmp(&b.generation).then(a.id.cmp(&b.id)));
-    let mut deleted: Vec<Tombstone> = state
-        .store
-        .query_rows(
-            "DEFINE TABLE IF NOT EXISTS document_deleted SCHEMALESS; \
-             SELECT VALUE doc FROM document_deleted WHERE doc.generation > $since",
-            vec![("since", since)],
-        )
-        .await?;
-    deleted.sort_by_key(|t| t.generation);
-    let generation = current_generation(&state).await?.max(q.since);
-    Ok(Json(ContextChanges {
-        generation,
-        changed,
-        deleted: deleted.into_iter().map(|t| t.id).collect(),
-    }))
+    Ok(Json(crate::ingest::changes_since(&state, q.since).await?))
 }
 
-/// The highest generation any document or deletion has reached.
-async fn current_generation(state: &AppState) -> anyhow::Result<u64> {
-    #[derive(Deserialize)]
-    struct Max {
-        #[serde(default)]
-        d: Option<f64>,
-        #[serde(default)]
-        t: Option<f64>,
-    }
-    let rows: Vec<Max> = state
-        .store
-        .query_rows(
-            "DEFINE TABLE IF NOT EXISTS document_deleted SCHEMALESS; \
-             RETURN { d: math::max(SELECT VALUE doc.generation FROM document), \
-             t: math::max(SELECT VALUE doc.generation FROM document_deleted) };",
-            vec![],
-        )
-        .await?;
-    Ok(rows
-        .first()
-        .map_or(0.0, |m| m.d.unwrap_or(0.0).max(m.t.unwrap_or(0.0))) as u64)
-}
-
-/// `DELETE /api/context/documents/{id}`: an agent's document and its passages go, and
+/// `DELETE routes::context_document(id)`: an agent's document and its passages go, and
 /// the change feed lists it as deleted. 404 unknown; 403 `forbidden` for a document
 /// that isn't an agent's (sources, folder files and library items are deleted where
 /// they live).
@@ -272,39 +182,6 @@ pub async fn delete_document(
             "Only documents an agent added can be deleted here.",
         ));
     }
-    state
-        .store
-        .query_rows::<serde_json::Value>(
-            "DELETE passage WHERE document_id = $d RETURN NONE",
-            vec![("d", serde_json::json!(id))],
-        )
-        .await?;
-    state.store.delete(db::DOCUMENT, &id).await?;
-    let tomb = Tombstone {
-        id: id.clone(),
-        generation: current_generation(&state).await? + 1,
-        deleted_at: chrono::Utc::now(),
-    };
-    state
-        .store
-        .query_rows::<serde_json::Value>(
-            "UPSERT type::record($table, $id) CONTENT { doc: $doc } RETURN NONE",
-            vec![
-                ("table", serde_json::json!(DOCUMENT_DELETED)),
-                ("id", serde_json::json!(id)),
-                (
-                    "doc",
-                    serde_json::to_value(&tomb).map_err(AppError::internal)?,
-                ),
-            ],
-        )
-        .await?;
-    state.retrieval_cache.invalidate(&id);
-    let dir = state.config.data_dir.join(DOCUMENTS_DIR).join(&id);
-    if let Err(e) = tokio::fs::remove_dir_all(&dir).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("couldn't remove {}: {e}", dir.display());
-    }
+    crate::ingest::delete_document_locked(&state, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

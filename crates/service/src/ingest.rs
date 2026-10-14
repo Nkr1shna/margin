@@ -26,7 +26,6 @@
 //! page, unit, scope, access) is rewritten when that moved.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,7 +43,6 @@ use margin_shared::context::{
 use margin_shared::{Chat, ChatItemKind, Event, Id, Note, Source, SourceStatus};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::chats::StoredChatItem;
 use crate::db::{self, INSERT_MANY_MAX, PassageRow};
@@ -58,10 +56,11 @@ use crate::state::{AppState, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson, new_id,
 /// `SettingsRow.migrations`.
 pub const PASSAGES_MIGRATION: &str = "passages-v1";
 
-/// The embedding model and how its document inputs are prefixed: EmbeddingGemma 2 with
-/// `title: {section path or document name} | text: …`. Stored on every passage; a
-/// passage embedded under another version is embedded again at its next ingest.
-pub const EMBEDDER_VERSION: &str = "embeddinggemma-2/title-v1";
+/// The embedding model and how its document inputs are prefixed
+/// (`margin_embed::EMBEDDER_VERSION`: EmbeddingGemma 2 with `title: {section path or
+/// document name} | text: …`). Stored on every passage; a passage embedded under
+/// another version is embedded again at its next ingest.
+pub const EMBEDDER_VERSION: &str = margin_embed::EMBEDDER_VERSION;
 
 /// Who wrote a document when no agent did.
 pub const ACTOR_OWNER: &str = "owner";
@@ -409,6 +408,27 @@ pub async fn index_library(
     Ok(doc)
 }
 
+/// Indexes a library item again after it changed (a lesson written or edited, a note,
+/// a chat turn finished), in the background: what the owner writes in the app is
+/// context for agents (`docs/plan-dogfood.md` §1). Nothing for an item without text.
+/// Unchanged passages keep their vectors (the ingest diff), so a re-index is cheap.
+pub fn spawn_reindex(state: &AppState, kind: LibraryKind, id: &str) {
+    let (state, id) = (state.clone(), id.to_string());
+    tokio::spawn(async move {
+        let result = async {
+            match library_text(&state, kind, &id).await? {
+                Some((_, text, _)) if !text.trim().is_empty() => {
+                    index_library(&state, kind, &id).await.map(|_| ())
+                }
+                _ => Ok(()),
+            }
+        };
+        if let Err(e) = result.await {
+            tracing::warn!("couldn't index {kind:?} {id}: {e:#}");
+        }
+    });
+}
+
 /// A library item's name, text and scope ids; `None` when it is gone.
 async fn library_text(
     state: &AppState,
@@ -465,7 +485,7 @@ pub async fn delete_document_locked(state: &AppState, id: &str) -> anyhow::Resul
             deleted_at: Utc::now(),
         };
         state.store.put(db::DOCUMENT_DELETED, id, &tomb).await?;
-        until_area_lands("retrieval cache", || state.retrieval_cache.invalidate(id));
+        state.retrieval_cache.invalidate(id);
     }
     // A file kept for a document that isn't a source.
     sources::remove_dir(&document_dir(state, id)).await;
@@ -529,9 +549,7 @@ async fn rescope_locked(
     doc.generation = state.store.next_generation().await?;
     doc.updated_at = Utc::now();
     state.store.put(db::DOCUMENT, document_id, &doc).await?;
-    until_area_lands("retrieval cache", || {
-        state.retrieval_cache.invalidate(document_id)
-    });
+    state.retrieval_cache.invalidate(document_id);
     Ok(Some(Event::DocumentChanged { document: doc }))
 }
 
@@ -555,6 +573,12 @@ pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<Conte
         )
         .await?;
     deleted.sort_by_key(|t| t.generation);
+    // Never behind what it lists, nor behind what the caller has seen.
+    let generation = changed
+        .iter()
+        .map(|d| d.generation)
+        .chain(deleted.iter().map(|t| t.generation))
+        .fold(generation.max(since), u64::max);
     Ok(ContextChanges {
         generation,
         changed,
@@ -563,7 +587,7 @@ pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<Conte
 }
 
 /// What may search a document's passages: the topic and chats of its source, its
-/// folder, the topic of a lesson or note, a chat.
+/// folder. Library items and agents' documents have none (only `Scope::Library`).
 async fn scope_ids(state: &AppState, doc: &Document) -> anyhow::Result<Vec<String>> {
     let mut ids = Vec::new();
     match &doc.origin {
@@ -583,11 +607,10 @@ async fn scope_ids(state: &AppState, doc: &Document) -> anyhow::Result<Vec<Strin
                 );
             }
         }
-        Origin::Library { kind, id } => {
-            if let Some((_, _, scope)) = library_text(state, *kind, id).await? {
-                ids.extend(scope);
-            }
-        }
+        // Lessons, notes and chats are found through the whole library (the context
+        // API's `Scope::Library`), not from a topic or a chat: a lesson isn't material
+        // for another lesson of its course, nor a chat's transcript for that chat.
+        Origin::Library { .. } => {}
         Origin::Agent { .. } => {}
     }
     let mut seen = HashSet::new();
@@ -664,9 +687,10 @@ fn split<T>(
     (kept, fresh, gone)
 }
 
-/// The chunker `sections-v2` (§2.1): Markdown/reST/HTML/LaTeX headings, section paths,
-/// line ranges, sentence overlap, atomic tables and fences. Its cutting is
-/// `margin_embed`'s (R1-embed); this stage forwards to it and fills hashes.
+/// The chunker `sections-v2` (§2.1, `margin_embed::chunk_sections`): Markdown/reST/
+/// HTML/LaTeX headings, section paths, line ranges, sentence overlap, atomic tables and
+/// fences. Params: `target_tokens` (default `margin_embed::CHUNK_TARGET_TOKENS`); the
+/// hard cap is the stage config's `max_tokens`.
 pub struct SectionsV2;
 
 /// Registers this file's stages: the default chunker name now.
@@ -688,9 +712,16 @@ impl Chunker for SectionsV2 {
         tok: &dyn Fn(&str) -> usize,
         cfg: &ChunkerCfg,
     ) -> Vec<Chunk> {
-        // margin_embed's section-aware cutting arrives with R1-embed; until it is merged
-        // this is the page- and sentence-aware chunker every source was cut with so far.
-        let mut chunks = margin_embed::chunk(doc, kind, tok, cfg.max_tokens);
+        let target = cfg
+            .params
+            .get("target_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(margin_embed::CHUNK_TARGET_TOKENS, |t| t as usize);
+        let sections = margin_embed::SectionsCfg {
+            max_tokens: cfg.max_tokens,
+            target_tokens: target.clamp(1, cfg.max_tokens.max(1)),
+        };
+        let mut chunks = margin_embed::chunk_sections(doc, kind, tok, &sections);
         fill_hashes(&mut chunks);
         chunks
     }
@@ -803,8 +834,30 @@ async fn prepare(
             // Pages and frames of a run the service stopped in the middle of.
             sources::remove_dir(&media_dir).await;
             let (tools, from, to) = (state.source_tools.clone(), path.clone(), media_dir);
-            let extracted =
-                tokio::task::spawn_blocking(move || tools.extract(&from, kind, &to)).await??;
+            // PDF pages aren't rendered while reading; each page is drawn once here for its
+            // picture passage (the encoder reads the picture) and kept in the media folder
+            // for retrieval and citations.
+            let extracted = tokio::task::spawn_blocking(move || {
+                let mut doc = tools.extract_lazy(&from, kind, &to)?;
+                if kind == SourceKind::Pdf && doc.pictures.is_empty() {
+                    for n in doc
+                        .pages
+                        .iter()
+                        .filter_map(|p| p.number)
+                        .collect::<Vec<_>>()
+                    {
+                        let path = tools.pdf_page_picture(&from, n, &to)?;
+                        doc.pictures.push(margin_embed::Picture {
+                            path,
+                            page: Some(n),
+                            at_ms: None,
+                            tokens: ImageTokens::High,
+                        });
+                    }
+                }
+                Ok::<_, margin_embed::EmbedError>(doc)
+            })
+            .await??;
             if let Some(sound) = &extracted.sound {
                 let (tools, samples, work) =
                     (state.source_tools.clone(), sound.clone(), work_dir.clone());
@@ -1143,6 +1196,59 @@ fn embed_batch(
     Ok(vectors)
 }
 
+/// Vectors for every input, handed to `on_batch(index of the batch's first input,
+/// vectors)` at most `batch` at a time, in order: runs of text through
+/// `Embedder::embed_pipelined` (each with its own title), pictures and sound through
+/// `embed_batch`. An error from `on_batch` stops the work. Blocking.
+fn embed_all(
+    embedder: &dyn Embedder,
+    inputs: &[(Input, String)],
+    sound: Option<&[f32]>,
+    batch: usize,
+    on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), margin_embed::EmbedError>,
+) -> anyhow::Result<()> {
+    let batch = batch.max(1);
+    let is_text = |i: &Input| matches!(i, Input::Text { .. });
+    let mut start = 0;
+    while start < inputs.len() {
+        let text = is_text(&inputs[start].0);
+        let end = start
+            + inputs[start..]
+                .iter()
+                .take_while(|(i, _)| is_text(i) == text)
+                .count();
+        if text {
+            let texts: Vec<(String, Purpose)> = inputs[start..end]
+                .iter()
+                .map(|(input, t)| {
+                    let title = match input {
+                        Input::Text { title } => Some(title.as_str()),
+                        _ => None,
+                    };
+                    (t.clone(), Purpose::document(title))
+                })
+                .collect();
+            let mut n = 0;
+            embedder.embed_pipelined(&texts, batch, &mut |first, vectors| {
+                n += vectors.len();
+                on_batch(start + first, vectors)
+            })?;
+            anyhow::ensure!(
+                n == end - start,
+                "The embedding model returned {n} vectors for {} inputs.",
+                end - start
+            );
+        } else {
+            for (k, group) in inputs[start..end].chunks(batch).enumerate() {
+                let vectors = embed_batch(embedder, group, sound)?;
+                on_batch(start + k * batch, vectors)?;
+            }
+        }
+        start = end;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Ingest
 // ---------------------------------------------------------------------------
@@ -1278,7 +1384,7 @@ pub async fn ingest(state: &AppState, document_id: &str) -> anyhow::Result<Inges
         row.chunks_deleted = Some(r.chunks_deleted);
         row.embed_ms = Some(r.embed_ms as f64);
     }
-    until_area_lands("trace", || state.tracer.record(row));
+    state.tracer.record(row);
     result
 }
 
@@ -1387,32 +1493,44 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         }
     }
 
-    // The new ones: the next batch is embedded while this one is written.
-    let batches: Vec<Vec<Item>> = new.chunks(INSERT_MANY_MAX).map(<[Item]>::to_vec).collect();
-    let spawn = |batch: &[Item]| -> JoinHandle<anyhow::Result<(Vec<Vec<f32>>, u64)>> {
-        let inputs: Vec<(Input, String)> = batch
-            .iter()
-            .map(|i| (i.input.clone(), i.row.text.clone()))
-            .collect();
-        let (model, sound) = (embedder.clone(), prepared.sound.clone());
-        tokio::task::spawn_blocking(move || {
-            let t = Instant::now();
-            let v = embed_batch(&*model, &inputs, sound.as_deref().map(|s| s.as_slice()))?;
-            Ok((v, t.elapsed().as_millis() as u64))
-        })
-    };
+    // The new ones, embedded on a blocking thread and written as they come, so the model
+    // works on the next batch while this one is written (`Embedder::embed_pipelined`
+    // for text; pictures and sound a batch at a time).
+    let inputs: Vec<(Input, String)> = new
+        .iter()
+        .map(|i| (i.input.clone(), i.row.text.clone()))
+        .collect();
+    let (tx, mut rx) = mpsc::channel::<(usize, Vec<Vec<f32>>)>(1);
+    let (model, sound) = (embedder.clone(), prepared.sound.clone());
+    let embedding = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let started = Instant::now();
+        let mut waited = Duration::ZERO;
+        embed_all(
+            &*model,
+            &inputs,
+            sound.as_deref().map(|s| s.as_slice()),
+            INSERT_MANY_MAX,
+            &mut |first, vectors| {
+                let t = Instant::now();
+                let sent = tx.blocking_send((first, vectors));
+                waited += t.elapsed();
+                sent.map_err(|_| margin_embed::EmbedError::Embed("the ingest stopped".into()))
+            },
+        )?;
+        Ok(started.elapsed().saturating_sub(waited).as_millis() as u64)
+    });
     let mut progress = Progress {
         done: 0,
         total,
         last: Instant::now(),
     };
-    let mut next = batches.first().map(|b| spawn(b));
-    for (i, batch) in batches.iter().enumerate() {
-        let Some(running) = next.take() else { break };
-        let (vectors, ms) = running.await??;
-        report.embed_ms += ms;
-        next = batches.get(i + 1).map(|b| spawn(b));
-        let rows: Vec<PassageRow> = batch
+    let mut written_count = 0usize;
+    while let Some((first, vectors)) = rx.recv().await {
+        anyhow::ensure!(
+            first == written_count && first + vectors.len() <= new.len(),
+            "The embedding model returned vectors out of order."
+        );
+        let rows: Vec<PassageRow> = new[first..first + vectors.len()]
             .iter()
             .zip(vectors)
             .map(|(item, vector)| PassageRow {
@@ -1420,18 +1538,25 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
                 ..item.row.clone()
             })
             .collect();
+        written_count += rows.len();
         let store = &state.store;
         let written = while_exists(state, id, async || {
             store.insert_many(db::PASSAGE, &rows).await
         })
         .await?;
         if written.is_none() || !progress.add(state, id, rows.len()).await? {
-            if let Some(n) = next.take() {
-                n.abort();
-            }
+            // The thread stops at its next batch, its channel being closed.
+            drop(rx);
+            let _ = embedding.await;
             return Ok(report);
         }
     }
+    report.embed_ms = embedding.await??;
+    anyhow::ensure!(
+        written_count == new.len(),
+        "The embedding model returned {written_count} vectors for {} inputs.",
+        new.len()
+    );
 
     // Done: a new generation when anything changed (or on the first read).
     let changed = report.chunks_new > 0 || report.chunks_deleted > 0 || !moved_rows.is_empty();
@@ -1461,7 +1586,7 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         (doc, source)
     };
     if changed {
-        until_area_lands("retrieval cache", || state.retrieval_cache.invalidate(id));
+        state.retrieval_cache.invalidate(id);
     }
     if let Some(s) = &source {
         state.emit_source(s);
@@ -1474,16 +1599,6 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         report.chunks_deleted
     );
     Ok(report)
-}
-
-/// Calls into another R1 area's seam that may still be a stub in this branch
-/// (`unimplemented!`), without letting the stub take the ingest down. Once R1-trace and
-/// R1-retrieve are merged the calls simply run; the integrator may then call them
-/// directly.
-fn until_area_lands(what: &str, f: impl FnOnce()) {
-    if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
-        tracing::debug!("the {what} seam isn't built yet");
-    }
 }
 
 // ---------------------------------------------------------------------------

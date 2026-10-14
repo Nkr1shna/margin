@@ -1886,6 +1886,7 @@ impl TypedTool for ProposeCourse {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         let chat_id = ctx.chat_id.clone();
+        let turn_id = ctx.turn_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
             let request = AskRequest {
                 prompt: args.prompt,
@@ -1910,11 +1911,19 @@ impl TypedTool for ProposeCourse {
                     .collect(),
             };
             let survey = args.survey;
-            let proposal =
-                match ask::propose_planned(&state, &chat_id, request, outline, survey).await {
-                    Ok(p) => p,
-                    Err(e) => return failed(e),
-                };
+            let proposal = match ask::propose_planned(
+                &state,
+                &chat_id,
+                request,
+                outline,
+                survey,
+                Some(&turn_id),
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let Some(outline) = &proposal.outline else {
                 return ToolOutput::error("The outline wasn't kept.");
             };

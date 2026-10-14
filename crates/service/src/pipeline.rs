@@ -14,13 +14,12 @@ use std::sync::Arc;
 use anyhow::Context;
 use margin_ai::LessonContext;
 use margin_embed::{Chunk, Extracted, SourceKind};
+use margin_shared::Citation;
 use margin_shared::context::{Modality, Scope};
 use margin_shared::pipeline::{PipelineConfig, RouteTable, StageCfg};
-use margin_shared::{Citation, Id};
 
-use crate::db::{self, PassageRow, Store};
+use crate::db::{PassageRow, Store};
 use crate::engines::BoxFuture;
-use crate::sources::{ChunkRow, MediaKind, MediaRow};
 
 // ---------------------------------------------------------------------------
 // What flows between stages
@@ -324,14 +323,6 @@ fn register_trivial(reg: &mut Registry) {
         StageCtor::Chunker(Arc::new(|_, _| Ok(Arc::new(PagesV1)))),
     );
     reg.register(
-        "dense-brute",
-        StageCtor::Retriever(Arc::new(|_, deps| {
-            Ok(Arc::new(DenseBrute {
-                store: deps.store.clone(),
-            }))
-        })),
-    );
-    reg.register(
         "first",
         StageCtor::Fusion(Arc::new(|_, _| Ok(Arc::new(First)))),
     );
@@ -364,129 +355,6 @@ impl Chunker for PagesV1 {
         cfg: &ChunkerCfg,
     ) -> Vec<Chunk> {
         margin_embed::chunk(doc, kind, tok, cfg.max_tokens)
-    }
-}
-
-/// Today's ranking (cosine over every `chunk`/`media` row of the named sources, in
-/// Rust), kept only until the migration to `passage` rows finishes; R1-retrieve deletes
-/// it. Searches `Scope::Sources` only.
-pub struct DenseBrute {
-    store: Store,
-}
-
-impl DenseBrute {
-    fn source_ids(scope: &Scope) -> anyhow::Result<Vec<Id>> {
-        match scope {
-            Scope::Sources { ids } => Ok(ids.clone()),
-            Scope::Union { scopes } => {
-                let mut ids = Vec::new();
-                for s in scopes {
-                    ids.extend(Self::source_ids(s)?);
-                }
-                Ok(ids)
-            }
-            other => anyhow::bail!("dense-brute only searches sources, not {other:?}"),
-        }
-    }
-}
-
-fn brute_row(
-    source_id: &str,
-    modality: Modality,
-    ord: u32,
-    (page, start_ms, end_ms): (Option<u32>, Option<u64>, Option<u64>),
-    text: &str,
-    file: Option<String>,
-    vector: &[f32],
-) -> PassageRow {
-    PassageRow {
-        id: format!("{source_id}:{}:{ord}", modality.as_str()),
-        project_id: String::new(),
-        document_id: source_id.to_string(),
-        origin: "source".into(),
-        scope_ids: Vec::new(),
-        access: vec![margin_shared::context::ACCESS_COMPANY.to_string()],
-        unit_id: match page {
-            Some(p) => format!("{source_id}:page:{p}"),
-            None => format!("{source_id}:{}:{ord}", modality.as_str()),
-        },
-        modality: modality.as_str().into(),
-        ord: ord as i64,
-        page: page.map(i64::from),
-        start_line: None,
-        end_line: None,
-        start_ms: start_ms.map(|v| v as i64),
-        end_ms: end_ms.map(|v| v as i64),
-        section_path: String::new(),
-        text: text.to_string(),
-        file,
-        chunk_hash: String::new(),
-        embedder: String::new(),
-        vector: vector.to_vec(),
-    }
-}
-
-impl Retriever for DenseBrute {
-    fn name(&self) -> &'static str {
-        "dense-brute"
-    }
-    fn search<'a>(&'a self, q: &'a Query) -> BoxFuture<'a, anyhow::Result<Vec<Hit>>> {
-        Box::pin(async move {
-            let mut rows = Vec::new();
-            for id in Self::source_ids(&q.scope)? {
-                let chunks: Vec<ChunkRow> =
-                    self.store.list_where(db::CHUNK, "source_id", &id).await?;
-                rows.extend(chunks.iter().map(|c| {
-                    brute_row(
-                        &id,
-                        Modality::Text,
-                        c.ord,
-                        (c.page, c.start_ms, c.end_ms),
-                        &c.text,
-                        None,
-                        &c.vector,
-                    )
-                }));
-                let media: Vec<MediaRow> =
-                    self.store.list_where(db::MEDIA, "source_id", &id).await?;
-                rows.extend(media.iter().map(|m| {
-                    let modality = match m.kind {
-                        MediaKind::Image | MediaKind::Page => Modality::Picture,
-                        MediaKind::Frame => Modality::Frame,
-                        MediaKind::Audio => Modality::Sound,
-                    };
-                    brute_row(
-                        &id,
-                        modality,
-                        m.ord,
-                        (m.page, m.start_ms, m.end_ms),
-                        &m.text,
-                        m.file.clone(),
-                        &m.vector,
-                    )
-                }));
-            }
-            let wanted =
-                |m: &str| q.modalities.is_empty() || q.modalities.iter().any(|x| x.as_str() == m);
-            let mut hits: Vec<Hit> = rows
-                .into_iter()
-                .filter(|r| wanted(&r.modality))
-                .map(|passage| Hit {
-                    score: margin_embed::cosine(&q.vector, &passage.vector),
-                    passage,
-                    dense_rank: None,
-                    lex_rank: None,
-                    rerank: None,
-                    highlight: None,
-                })
-                .collect();
-            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-            hits.truncate(q.k);
-            for (i, h) in hits.iter_mut().enumerate() {
-                h.dense_rank = Some(i as u32);
-            }
-            Ok(hits)
-        })
     }
 }
 
@@ -564,22 +432,82 @@ impl Packer for TakeK {
     }
 }
 
-/// The constant-first lesson, planner and rerank prompts (§2.6), written by R1-ai in
-/// `margin_ai::prompts`; this adapter is wired to them when that area merges.
+/// The constant-first lesson, planner and rerank prompts of `margin_ai::prompts`
+/// (§2.6), laid out as the pipeline's `Prompt`: the request and passages follow the
+/// variable instructions (pictures are left out of this text form).
 pub struct LessonV2;
+
+fn from_ai(p: margin_ai::Prompt) -> Prompt {
+    let cache_key = p.cache_key();
+    let input = p.input_text();
+    let variable = match (p.variable.is_empty(), input.is_empty()) {
+        (_, true) => p.variable,
+        (true, false) => input,
+        (false, false) => format!("{}\n\n{input}", p.variable),
+    };
+    Prompt {
+        version: p.version.to_string(),
+        constant: p.constant.to_string(),
+        variable,
+        cache_key,
+    }
+}
+
+/// A packed passage as the prompts number it.
+fn packed_passage(p: &Packed) -> margin_ai::Passage {
+    margin_ai::Passage {
+        source: p.citation.source_name.clone(),
+        page: p.citation.page,
+        text: p.text.clone(),
+        start_ms: p.citation.start_ms,
+        end_ms: p.citation.end_ms,
+        image: None,
+    }
+}
 
 impl PromptSet for LessonV2 {
     fn version(&self) -> &'static str {
-        "lesson-v2"
+        margin_ai::prompts::PROMPT_SET_VERSION
     }
-    fn lesson(&self, _ctx: &LessonContext) -> Prompt {
-        unimplemented!("R1, ai: lesson-v2 lesson prompt")
+    fn lesson(&self, ctx: &LessonContext) -> Prompt {
+        from_ai(margin_ai::prompts::lesson(ctx))
     }
-    fn plan(&self, _input: &PlanInput) -> Prompt {
-        unimplemented!("R1, ai: lesson-v2 plan prompt")
+    /// `PlanInput` carries the course's options inside `request` (the service builds a
+    /// full `margin_ai::PlanRequest` itself, `ask::survey`); here they keep the prompt's
+    /// defaults.
+    fn plan(&self, input: &PlanInput) -> Prompt {
+        let req = margin_ai::PlanRequest {
+            prompt: input.request.clone(),
+            level: margin_shared::Level::Intermediate,
+            lesson_count: 0,
+            with_quiz: false,
+            draft: None,
+            contents: input
+                .contents
+                .iter()
+                .map(|c| margin_ai::DocumentContents {
+                    document: c.clone(),
+                    sections: Vec::new(),
+                })
+                .collect(),
+            survey: input.survey.iter().map(packed_passage).collect(),
+        };
+        from_ai(margin_ai::prompts::plan(&req))
     }
-    fn rerank(&self, _query: &str, _hits: &[Hit]) -> Prompt {
-        unimplemented!("R1, ai: lesson-v2 rerank prompt")
+    fn rerank(&self, query: &str, hits: &[Hit]) -> Prompt {
+        let candidates: Vec<margin_ai::RerankCandidate> = hits
+            .iter()
+            .map(|h| margin_ai::RerankCandidate {
+                id: h.passage.id.clone(),
+                label: if h.passage.section_path.is_empty() {
+                    h.passage.document_id.clone()
+                } else {
+                    format!("{}, {}", h.passage.document_id, h.passage.section_path)
+                },
+                text: h.passage.text.clone(),
+            })
+            .collect();
+        from_ai(margin_ai::prompts::rerank(query, &candidates))
     }
 }
 
@@ -596,7 +524,7 @@ mod tests {
     fn trivial() -> PipelineConfig {
         PipelineConfig {
             chunker: StageCfg::named("pages-v1"),
-            retriever: StageCfg::named("dense-brute"),
+            retriever: StageCfg::named("dense"),
             fusion: StageCfg::named("first"),
             reranker: StageCfg::named("none"),
             packer: StageCfg::named("take-k"),
@@ -616,7 +544,7 @@ mod tests {
         assert_eq!(p.prompts.version(), "lesson-v2");
         assert_eq!(p.hash, PipelineConfig::default().hash());
         let p = Pipeline::build(&trivial(), &reg).unwrap();
-        assert_eq!(p.retriever.name(), "dense-brute");
+        assert_eq!(p.retriever.name(), "dense");
         assert_eq!(p.packer.name(), "take-k");
     }
 
@@ -629,7 +557,7 @@ mod tests {
         };
         let err = Pipeline::build(&cfg, &reg).err().unwrap().to_string();
         assert!(err.contains("retriever \"telepathy\""), "{err}");
-        assert!(err.contains("dense-brute"), "{err}");
+        assert!(err.contains("hybrid-rrf"), "{err}");
         // A name registered for another kind doesn't count.
         let cfg = PipelineConfig {
             packer: StageCfg::named("none"),
@@ -658,46 +586,43 @@ mod tests {
         assert_eq!(p.fusion.name(), "fake");
     }
 
-    #[tokio::test]
-    async fn the_trivial_stages_work() {
-        let store = Store::memory().await.unwrap();
-        let mut a = vec![0f32; 768];
-        a[0] = 1.0;
-        let mut b = vec![0f32; 768];
-        b[1] = 1.0;
-        for (i, (text, v)) in [("alpha", a.clone()), ("beta", b)].into_iter().enumerate() {
-            let row = ChunkRow {
-                source_id: "s1".into(),
-                topic_id: None,
-                ord: i as u32,
+    fn hit(text: &str, ord: i64, score: f32) -> Hit {
+        Hit {
+            passage: PassageRow {
+                id: format!("s1:{ord}"),
+                project_id: String::new(),
+                document_id: "s1".into(),
+                origin: "source".into(),
+                scope_ids: Vec::new(),
+                access: vec![margin_shared::context::ACCESS_COMPANY.to_string()],
+                unit_id: format!("s1:page:{ord}"),
+                modality: "text".into(),
+                ord,
                 page: Some(1),
+                start_line: None,
+                end_line: None,
                 start_ms: None,
                 end_ms: None,
+                section_path: String::new(),
                 text: text.into(),
-                vector: v,
-            };
-            store
-                .put(db::CHUNK, &format!("s1-{i}"), &row)
-                .await
-                .unwrap();
-        }
-        let reg = Registry::standard(StageDeps { store });
-        let p = Pipeline::build(&trivial(), &reg).unwrap();
-        let q = Query {
-            text: "alpha".into(),
-            vector: a,
-            scope: Scope::Sources {
-                ids: vec!["s1".into()],
+                file: None,
+                chunk_hash: String::new(),
+                embedder: String::new(),
+                vector: Vec::new(),
             },
-            access: None,
-            modalities: Vec::new(),
-            k: 5,
-            budget_tokens: 1_000,
-            images_max: 0,
-            diversity: Diversity::default(),
-        };
-        let hits = p.retriever.search(&q).await.unwrap();
-        assert_eq!(hits[0].passage.text, "alpha");
+            score,
+            dense_rank: None,
+            lex_rank: None,
+            rerank: None,
+            highlight: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trivial_stages_work() {
+        let reg = registry().await;
+        let p = Pipeline::build(&trivial(), &reg).unwrap();
+        let hits = vec![hit("alpha", 0, 0.9), hit("beta", 1, 0.5)];
         let hits = p.reranker.rerank("alpha", hits).await.unwrap();
         let fused = p.fusion.fuse(
             vec![hits],
@@ -708,6 +633,7 @@ mod tests {
             },
         );
         assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].passage.text, "alpha");
         let packed = p.packer.pack(
             fused,
             &PackBudget {
@@ -737,15 +663,47 @@ mod tests {
             },
         );
         assert_eq!(chunks.len(), 1);
-        let err = p
-            .retriever
-            .search(&Query {
-                scope: Scope::Library,
-                ..q
-            })
-            .await
-            .err()
-            .unwrap();
-        assert!(err.to_string().contains("only searches sources"));
+    }
+
+    #[test]
+    fn lesson_v2_lays_out_margin_ais_prompts_constant_first() {
+        let ctx = LessonContext {
+            subject_title: "Signals".into(),
+            topic_title: "Fourier".into(),
+            prompt: "Teach me Fourier series".into(),
+            level: margin_shared::Level::Intro,
+            with_quiz: false,
+            outline: vec![margin_shared::OutlineLesson {
+                title: "Series".into(),
+                summary: "Sums of sines".into(),
+                minutes: 10,
+            }],
+            index: 0,
+            passages: Vec::new(),
+        };
+        let a = LessonV2.lesson(&ctx);
+        assert_eq!(a.version, margin_ai::prompts::LESSON_VERSION);
+        assert_eq!(a.constant, margin_ai::prompts::LESSON_CONSTANT);
+        assert!(
+            a.variable.contains("Teach me Fourier series"),
+            "{}",
+            a.variable
+        );
+        assert_eq!(a.cache_key, "lesson:lesson-v2");
+        let other = LessonContext {
+            prompt: "Something else".into(),
+            ..ctx
+        };
+        assert_eq!(LessonV2.lesson(&other).constant, a.constant);
+        let plan = LessonV2.plan(&PlanInput {
+            request: "Learn DSP".into(),
+            contents: vec!["dsp.md".into()],
+            survey: Vec::new(),
+        });
+        assert_eq!(plan.constant, margin_ai::prompts::PLAN_CONSTANT);
+        assert!(plan.variable.contains("dsp.md"));
+        let rerank = LessonV2.rerank("gibbs", &[hit("ringing", 0, 1.0)]);
+        assert!(rerank.variable.contains("s1:0"), "{}", rerank.variable);
+        assert_eq!(LessonV2.version(), "lesson-v2");
     }
 }

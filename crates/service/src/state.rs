@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use margin_embed::{Embedder, ModelFiles};
 use margin_shared::pipeline::PipelineConfig;
+use margin_shared::pipeline::Route;
 use margin_shared::{
     Citation, Event, Id, Lesson, Note, Proposal, ReasoningEffort, Settings, Source, Topic, Video,
     VideoMedia, VideoStatus,
@@ -462,6 +463,29 @@ impl App {
     pub async fn ai_config(&self) -> AppResult<AiConfig> {
         let row = self.settings_row().await?;
         let model = row.openai_model.clone();
+        self.ai_config_with(row, model).await
+    }
+
+    /// The configuration a call on `route` uses: the pipeline's route table names its
+    /// model, else Settings (`agent_model` for chats, `openai_model` otherwise).
+    pub async fn route_ai_config(&self, route: Route) -> AppResult<AiConfig> {
+        let row = self.settings_row().await?;
+        let routed = self
+            .pipeline
+            .load()
+            .routes
+            .get(route)
+            .filter(|m| !m.trim().is_empty())
+            .map(str::to_string);
+        let model = match (routed, route) {
+            (Some(m), _) => m,
+            (None, Route::Chat) => row
+                .agent_model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| row.openai_model.clone()),
+            (None, Route::Write | Route::Small) => row.openai_model.clone(),
+        };
         self.ai_config_with(row, model).await
     }
 

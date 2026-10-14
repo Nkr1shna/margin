@@ -419,6 +419,9 @@ pub async fn update_lesson(
         row.lesson
     };
     state.emit_lesson(&lesson);
+    if lesson.status == LessonStatus::Ready {
+        ingest::spawn_reindex(state, LibraryKind::Lesson, &lesson.id);
+    }
     Ok(state.public_lesson(&lesson))
 }
 
@@ -537,6 +540,7 @@ pub async fn new_note(state: &AppState, req: NewNote, by: Author) -> AppResult<N
         row.note
     };
     state.emit(Event::NoteChanged { note: note.clone() });
+    ingest::spawn_reindex(state, LibraryKind::Note, &note.id);
     Ok(note)
 }
 
@@ -574,6 +578,7 @@ pub async fn update_note(
         row.note
     };
     state.emit(Event::NoteChanged { note: note.clone() });
+    ingest::spawn_reindex(state, LibraryKind::Note, &note.id);
     Ok(note)
 }
 
@@ -596,6 +601,7 @@ pub async fn append_to_note(state: &AppState, id: &str, text: &str) -> AppResult
         row.note
     };
     state.emit(Event::NoteChanged { note: note.clone() });
+    ingest::spawn_reindex(state, LibraryKind::Note, &note.id);
     Ok(note)
 }
 

@@ -35,7 +35,7 @@ keyring = "=4.2.0"
 tower-http = { version = "=0.7.1", features = ["fs"] }
 tower = { version = "=0.5.3", features = ["util"] }
 hmac = "=0.13.0"
-sha2 = "=0.11.1"
+sha2 = { workspace = true }
 rand = "=0.10.3"
 toml = "=1.1.8"
 base64 = "=0.23.1"

@@ -234,6 +234,12 @@ pub async fn start_locked(
             for id in &attached {
                 if !chat.source_ids.contains(id) {
                     chat.source_ids.push(id.clone());
+                    // Searchable from this chat (an already read file's passages).
+                    if let Some(event) =
+                        crate::ingest::add_scope_locked(state, id, &chat.id).await?
+                    {
+                        state.emit(event);
+                    }
                 }
             }
             let turn_id = crate::state::new_id();
@@ -612,6 +618,9 @@ async fn finish(
     if finished && chat.title_by == TitleSource::FirstLine {
         spawn_title(state, chat_id, turn_id);
     }
+    if finished {
+        crate::ingest::spawn_reindex(state, margin_shared::context::LibraryKind::Chat, chat_id);
+    }
     send_pending_locked(state, &mut chat).await;
     Ok(())
 }
@@ -898,9 +907,6 @@ pub async fn queue_locked(
 /// the owner answered; an `Action` "The service stopped while answering." is added.
 /// Pending messages are kept. Called from `server::recover` (which holds `write_lock`).
 pub async fn recover(state: &AppState) -> anyhow::Result<()> {
-    // The trace writer and retention job start with the service (`server::recover`
-    // runs this once at startup); a second call does nothing.
-    trace::start(state);
     let chats: Vec<Chat> = state.store.list(db::CHAT).await?;
     for mut chat in chats {
         if !chat.state.is_busy() {

@@ -60,6 +60,7 @@
 //! | GET    | /api/workspaces/{id}/files             |                    | Vec<Source> (newest first, with media_url; 404) |
 //! | GET    | /api/projects                          |                    | Vec<context::Project> |
 //! | POST   | /api/context/search                    | context::ContextQuery | Vec<context::Hit> (400 bad_scope) |
+//! | DELETE | /api/context/documents/{id}            |                    | 204 (404; 403 forbidden: not an agent's) |
 //! | GET    | /api/context/documents/{id}/outline    |                    | context::DocumentOutline (404; 409 not_ready) |
 //! | GET    | /api/context/documents/{id}/passages?from&to |              | Vec<context::Hit> (404; 409 not_ready) |
 //! | POST   | /api/context/ingest                    | context::ContextIngest | context::Document (400 bad_origin) |
@@ -274,6 +275,11 @@ pub fn workspace_sync(id: &str) -> String {
 /// The folder's files as sources, newest first, with `media_url`. 404.
 pub fn workspace_files(id: &str) -> String {
     format!("/api/workspaces/{id}/files")
+}
+/// `DELETE`: a document an agent added (`Origin::Agent`) and its passages; the change
+/// feed lists it as deleted. 204; 404 unknown; 403 "forbidden" for any other document.
+pub fn context_document(id: &str) -> String {
+    format!("/api/context/documents/{id}")
 }
 /// A document's sections (`context::DocumentOutline`). 404 unknown document; 409
 /// "not_ready" while it is first being indexed.

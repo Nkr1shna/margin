@@ -24,7 +24,8 @@ use crate::auth::CurrentDevice;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::state::{AppState, new_id};
 use crate::turns::{self, Start};
-use crate::{db, sources, workspaces};
+use crate::{db, ingest, sources, workspaces};
+use margin_shared::context::LibraryKind;
 
 /// Longest message accepted, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
@@ -415,6 +416,7 @@ pub async fn patch_chat(
             chat.workspace_ids = ids;
         }
         let mut dropped = Vec::new();
+        let mut added = Vec::new();
         if let Some(ids) = source_ids {
             dropped = chat
                 .source_ids
@@ -422,11 +424,24 @@ pub async fn patch_chat(
                 .filter(|s| !ids.contains(s))
                 .cloned()
                 .collect();
+            added = ids
+                .iter()
+                .filter(|s| !chat.source_ids.contains(s))
+                .cloned()
+                .collect();
             chat.source_ids = ids;
         }
         save_chat_locked(&state, &mut chat).await?;
+        let mut events = Vec::new();
+        // What the chat searches follows its files.
+        for source_id in &added {
+            events.extend(ingest::add_scope_locked(&state, source_id, &id).await?);
+        }
+        for source_id in &dropped {
+            events.extend(ingest::remove_scope_locked(&state, source_id, &id).await?);
+        }
         // The chat no longer lists them, so they go unless a topic or another chat has them.
-        let events = delete_chat_only_sources_locked(&state, &id, &dropped).await?;
+        events.extend(delete_chat_only_sources_locked(&state, &id, &dropped).await?);
         (chat, events)
     };
     for e in events {
@@ -460,7 +475,15 @@ pub async fn delete_chat(
             .await?;
         state.store.delete(db::CHAT, &id).await?;
         state.turns.forget_chat(&id);
-        delete_chat_only_sources_locked(&state, &id, &chat.source_ids).await?
+        // Its transcript leaves the index; files that stay (a topic's or another chat's)
+        // are no longer searched from it.
+        ingest::delete_library_document_locked(&state, LibraryKind::Chat, &id).await?;
+        let mut events = Vec::new();
+        for source_id in &chat.source_ids {
+            events.extend(ingest::remove_scope_locked(&state, source_id, &id).await?);
+        }
+        events.extend(delete_chat_only_sources_locked(&state, &id, &chat.source_ids).await?);
+        events
     };
     for e in events {
         state.emit(e);

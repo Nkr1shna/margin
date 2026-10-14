@@ -259,6 +259,9 @@ fn renders_pdf_pages_as_pictures() {
 
 #[test]
 fn transcribes_speech_with_word_times() {
+    if !crate::real_model_tests() {
+        return;
+    }
     let Some(cli) = crate::find_fluidaudiocli() else {
         eprintln!("skipping: fluidaudiocli isn't installed");
         return;

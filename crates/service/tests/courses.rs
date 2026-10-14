@@ -2164,8 +2164,17 @@ mod lesson_retrieval {
                 lesson("B", &[]),
             ],
         };
-        assert!(plan.clone().checked(3).is_none());
-        let checked = plan.checked(2).unwrap();
+        let req = |lesson_count| margin_ai::PlanRequest {
+            prompt: "p".into(),
+            level: Level::Intro,
+            lesson_count,
+            with_quiz: false,
+            draft: None,
+            contents: Vec::new(),
+            survey: Vec::new(),
+        };
+        assert!(plan.clone().checked(&req(3)).is_err());
+        let checked = plan.checked(&req(2)).unwrap();
         assert_eq!(checked.lessons[0].title, "A");
         assert_eq!(checked.lessons[0].queries, ["q", "r", "s"]);
         assert_eq!(checked.lessons[1].queries, ["B: s"]);

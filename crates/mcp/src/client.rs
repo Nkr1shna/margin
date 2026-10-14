@@ -15,10 +15,8 @@ use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 /// `DELETE /api/context/documents/{id}`: removes a document an agent ingested, with its
-/// passages. Not in `routes.rs` yet (requested of R1); `purge` and `ingest-dir` use it.
-pub fn context_document(id: &str) -> String {
-    format!("/api/context/documents/{id}")
-}
+/// passages; `purge` and `ingest-dir` use it.
+pub use routes::context_document;
 
 #[derive(Clone)]
 pub struct Client {

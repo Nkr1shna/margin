@@ -360,7 +360,10 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
         "read_lesson",
         "read_note",
         "list_notes",
-        "search_sources",
+        "search",
+        "read_passage",
+        "document_outline",
+        "view_picture",
         "list_sources",
     ] {
         assert!(names.contains(&name), "{name} missing from {names:?}");
@@ -764,8 +767,8 @@ async fn read_tools_answer_from_the_library() {
     assert_eq!(v["sources"][0]["attached_to_this_chat"], false);
 
     let (out, v) = run(
-        "search_sources",
-        json!({"query": "Gibbs ringing", "topic_id": subject.id, "source_ids": null}),
+        "search",
+        json!({"query": "Gibbs ringing", "scope": {"topic_id": subject.id, "source_ids": null, "workspace_ids": null, "chat_files": null, "library": null}, "k": null, "modalities": null}),
     )
     .await;
     assert!(out.ok, "{}", out.output);
@@ -785,19 +788,21 @@ async fn read_tools_answer_from_the_library() {
         other => panic!("{other:?}"),
     }
     let (out, _) = run(
-        "search_sources",
-        json!({"query": "x", "topic_id": null, "source_ids": ["gone"]}),
+        "search",
+        json!({"query": "x", "scope": {"topic_id": null, "source_ids": ["gone"], "workspace_ids": null, "chat_files": null, "library": null}, "k": null, "modalities": null}),
     )
     .await;
     assert!(!out.ok);
+    // A topic without files is searched all the same (its lessons and notes are
+    // documents too); it just finds nothing.
     let empty = new_topic(&h, &t, None, "Empty").await;
-    let (out, _) = run(
-        "search_sources",
-        json!({"query": "x", "topic_id": empty.id, "source_ids": null}),
+    let (out, v) = run(
+        "search",
+        json!({"query": "x", "scope": {"topic_id": empty.id, "source_ids": null, "workspace_ids": null, "chat_files": null, "library": null}, "k": null, "modalities": null}),
     )
     .await;
-    assert!(!out.ok);
-    assert!(out.summary.starts_with("There are no sources to search"));
+    assert!(out.ok, "{}", out.output);
+    assert_eq!(v["passages"].as_array().map(Vec::len), Some(0), "{v}");
 }
 
 // ---------------------------------------------------------------------------

@@ -881,18 +881,18 @@ async fn settings_switch_the_pipeline_by_name() {
     // A known one is stored, sent back and used from now on.
     let s: Settings = h
         .patch(&t, "/api/settings")
-        .json(&json!({"pipeline": {"retriever": {"name": "dense-brute"}, "budget": {"images_max": 2}}, "trace_retention_days": 30}))
+        .json(&json!({"pipeline": {"retriever": {"name": "dense"}, "budget": {"images_max": 2}}, "trace_retention_days": 30}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(s.pipeline.retriever.name, "dense-brute");
+    assert_eq!(s.pipeline.retriever.name, "dense");
     assert_eq!(s.pipeline.budget.images_max, 2);
     assert_eq!(s.trace_retention_days, 30);
     let live = h.state.pipeline.load();
-    assert_eq!(live.retriever.name(), "dense-brute");
+    assert_eq!(live.retriever.name(), "dense");
     assert_eq!(live.hash, s.pipeline.hash());
     for bad in [
         json!({"trace_retention_days": 0}),

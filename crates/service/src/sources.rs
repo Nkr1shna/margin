@@ -251,6 +251,7 @@ pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64
             let chunk = chunk.map_err(|e| ReceiveError::Body(e.to_string()))?;
             written += chunk.len() as u64;
             if written > max {
+                drain(&mut stream).await;
                 return Err(ReceiveError::TooLarge);
             }
             file.write_all(&chunk).await.map_err(ReceiveError::Io)?;
@@ -265,6 +266,33 @@ pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64
     result
 }
 
+/// Most of a refused body read and dropped so the client gets to read the refusal.
+pub const DRAIN_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// How long a refused body is read for at most.
+pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads and drops what is left of a refused upload (at most `DRAIN_MAX_BYTES`, for at
+/// most `DRAIN_TIMEOUT`). Answering while the client is still sending makes the server
+/// close the connection under it, and the client sees a reset or a broken pipe instead
+/// of the 413; past the bounds the connection is closed all the same.
+async fn drain<S, E>(stream: &mut S)
+where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut left = DRAIN_MAX_BYTES;
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let n = chunk.len() as u64;
+            if n >= left {
+                break;
+            }
+            left -= n;
+        }
+    })
+    .await;
+}
+
 pub async fn upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -276,6 +304,7 @@ pub async fn upload(
     let upload = Upload::check(&state, q).await?;
     // Refused before a byte is read when the size is known up front.
     if content_length(&headers).is_some_and(|n| n > upload.limit()) {
+        drain(&mut body.into_data_stream()).await;
         return Err(upload.too_large());
     }
 
@@ -491,7 +520,6 @@ pub async fn enqueue_queued(state: &AppState) -> anyhow::Result<()> {
 /// Starts the ingest worker (which first moves old stores to the passage index), then
 /// gives every source sent to `queue` its document and hands it to that worker, forever.
 pub async fn run_worker(state: AppState, mut queue: mpsc::UnboundedReceiver<Id>) {
-    tokio::spawn(ingest::run_worker(state.clone()));
     while let Some(id) = queue.recv().await {
         if let Err(e) = ingest::queue_source(&state, &id).await {
             tracing::error!("source {id}: {e:#}");

@@ -19,24 +19,22 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use futures_util::StreamExt;
-use margin_ai::{LessonContext, ReasoningConfig, ResponseRequest, StreamEvent};
-use margin_shared::context::{Scope, TraceKind, TraceRow, TraceUsage};
+use margin_ai::{CallOptions, DocumentContents, Generated, LessonContext, PlanRequest};
+use margin_shared::context::{LibraryKind, Scope};
 use margin_shared::pipeline::Route;
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
-    Level, Outline, OutlineLesson, Proposal, ProposalStatus, ReasoningEffort, Source, Topic,
+    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
 };
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::chats::{self, StoredChatItem};
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
-use crate::pipeline::{Packed, PlanInput};
+use crate::pipeline::Packed;
 use crate::retrieval::{self, QueryPlan};
 use crate::state::{AppState, Author, StoredLesson, new_id};
+use crate::trace::{self, SpanGuard};
 use crate::{db, sources, video};
 
 pub const MAX_LESSONS: usize = 12;
@@ -86,19 +84,21 @@ pub async fn propose(
     request: AskRequest,
     outline: Outline,
 ) -> AppResult<Proposal> {
-    propose_planned(state, chat_id, request, outline, None).await
+    propose_planned(state, chat_id, request, outline, None, None).await
 }
 
 /// `propose`, surveying the sources and running the outline planner first when
 /// `survey` is true, or when it is `None` and the course draws on sources or the chat's
-/// folders (§2.5). A planner that fails or isn't available leaves the agent's outline
-/// as it is.
+/// folders (§2.5). A planner that fails leaves the agent's outline as it is. The survey
+/// and the planner call are traced under `trace_id` (the turn that proposed), or a new
+/// id.
 pub async fn propose_planned(
     state: &AppState,
     chat_id: &str,
     mut request: AskRequest,
     outline: Outline,
     survey: Option<bool>,
+    trace_id: Option<&str>,
 ) -> AppResult<Proposal> {
     request.prompt = request.prompt.trim().to_string();
     if request.prompt.is_empty() {
@@ -123,7 +123,8 @@ pub async fn propose_planned(
     let wanted = survey.unwrap_or(!request.source_ids.is_empty() || !workspaces.is_empty());
     let mut plan = None;
     if wanted {
-        match plan_course(state, &request, &outline, &workspaces, chat_id).await {
+        let trace_id = trace_id.map_or_else(new_id, str::to_string);
+        match plan_course(state, &request, &outline, &workspaces, chat_id, &trace_id).await {
             Ok(Some(p)) => match validate_outline(&p.outline()) {
                 Ok(planned) => {
                     outline = planned;
@@ -709,103 +710,25 @@ pub struct StoredProposal {
     pub pipeline_hash: Option<String>,
 }
 
-/// The planner's answer, the shape of `margin_ai::prompts::CoursePlan` (`plan-v1`): the
-/// outline plus, per lesson, its retrieval questions and the sections it must cite.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct CoursePlan {
-    /// The new topic's title.
-    pub topic_title: String,
-    /// The subject to file it under.
-    pub subject_title: String,
-    /// The lessons in reading order.
-    pub lessons: Vec<PlannedLesson>,
-}
+/// The planner's answer (`margin_ai::prompts`, `plan-v1`): the outline plus, per
+/// lesson, its retrieval questions and the sections it must cite.
+pub use margin_ai::{CoursePlan, PlannedLesson, SectionRef};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct PlannedLesson {
-    pub title: String,
-    /// One line on what it covers.
-    pub summary: String,
-    /// Estimated reading time in minutes.
-    pub minutes: u32,
-    /// 2 or 3 questions that find this lesson's material in the sources.
-    pub queries: Vec<String>,
-    /// Sections of the sources the lesson must draw on, as listed in the contents.
-    pub must_cite: Vec<SectionRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SectionRef {
-    pub document: String,
-    pub section: String,
-}
-
-/// Most retrieval questions kept per planned lesson.
-pub const PLAN_QUERIES_MAX: usize = 3;
 /// How long the survey waits for sources still being read.
 pub const PLAN_WAIT: Duration = Duration::from_secs(15);
-/// The function the planner answers through (a strict schema of `CoursePlan`).
-pub const PLAN_TOOL: &str = "record_course_plan";
 /// Characters of a document's first passage used as its survey query.
 const SURVEY_QUERY_CHARS: usize = 500;
 
-impl CoursePlan {
-    /// The outline part.
-    pub fn outline(&self) -> Outline {
-        Outline {
-            topic_title: self.topic_title.clone(),
-            subject_title: self.subject_title.clone(),
-            lessons: self
-                .lessons
-                .iter()
-                .map(|l| OutlineLesson {
-                    title: l.title.clone(),
-                    summary: l.summary.clone(),
-                    minutes: l.minutes,
-                })
-                .collect(),
-        }
-    }
-
-    /// Usable for a draft of `lessons` lessons: the same count, every lesson titled;
-    /// questions trimmed, deduplicated and cut to `PLAN_QUERIES_MAX` (a lesson with
-    /// none gets "title: summary").
-    pub fn checked(mut self, lessons: usize) -> Option<Self> {
-        if self.lessons.len() != lessons || self.topic_title.trim().is_empty() {
-            return None;
-        }
-        for l in &mut self.lessons {
-            l.title = l.title.trim().to_string();
-            l.summary = l.summary.trim().to_string();
-            if l.title.is_empty() {
-                return None;
-            }
-            let mut queries: Vec<String> = Vec::new();
-            for q in &l.queries {
-                let q = q.trim();
-                if !q.is_empty() && !queries.iter().any(|k| k.eq_ignore_ascii_case(q)) {
-                    queries.push(q.to_string());
-                }
-            }
-            queries.truncate(PLAN_QUERIES_MAX);
-            if queries.is_empty() {
-                queries.push(format!("{}: {}", l.title, l.summary));
-            }
-            l.queries = queries;
-        }
-        Some(self)
-    }
-}
-
-/// The planner's input: the request (with the agent's draft outline and the course's
-/// options), each document's table of contents, and the survey passages.
+/// The planner's input: the request with the course's options and the agent's draft,
+/// each document's table of contents, and the survey passages (also returned packed,
+/// as retrieval traced them). `None` when the course has nothing to survey.
 pub async fn survey(
     state: &AppState,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
     trace_id: &str,
-) -> anyhow::Result<Option<PlanInput>> {
+) -> anyhow::Result<Option<(PlanRequest, Vec<Packed>)>> {
     let mut scopes = Vec::new();
     if !request.source_ids.is_empty() {
         scopes.push(Scope::Sources {
@@ -845,16 +768,15 @@ pub async fn survey(
             continue;
         };
         queries.push(first.text.chars().take(SURVEY_QUERY_CHARS).collect());
-        let sections: Vec<String> = retrieval::document_outline(&state.store, &info.document_id)
-            .await?
-            .into_iter()
-            .map(|s| s.section_path)
-            .filter(|s| !s.is_empty())
-            .collect();
-        contents.push(if sections.is_empty() {
-            info.name.clone()
-        } else {
-            format!("{}: {}", info.name, sections.join("; "))
+        let mut sections: Vec<String> = Vec::new();
+        for s in retrieval::document_outline(&state.store, &info.document_id).await? {
+            if !s.section_path.is_empty() && !sections.contains(&s.section_path) {
+                sections.push(s.section_path);
+            }
+        }
+        contents.push(DocumentContents {
+            document: info.name.clone(),
+            sections,
         });
     }
     let pipeline = state.pipeline.load_full();
@@ -872,145 +794,59 @@ pub async fn survey(
         },
     )
     .await?;
-    let level = match request.level {
-        Level::Intro => "intro",
-        Level::Intermediate => "intermediate",
-        Level::Advanced => "advanced",
-    };
-    let mut text = format!(
-        "{}\n\nLessons: exactly {}. Level: {level}. Quiz: {}.\n\nDraft outline: \"{}\" (filed under \"{}\")\n",
-        request.prompt.trim(),
-        draft.lessons.len(),
-        if request.with_quiz { "yes" } else { "no" },
-        draft.topic_title,
-        draft.subject_title,
-    );
-    for (i, l) in draft.lessons.iter().enumerate() {
-        text.push_str(&format!(
-            "{}. {} ({} min): {}\n",
-            i + 1,
-            l.title,
-            l.minutes,
-            l.summary
-        ));
-    }
-    Ok(Some(PlanInput {
-        request: text,
+    let req = PlanRequest {
+        prompt: request.prompt.trim().to_string(),
+        level: request.level,
+        lesson_count: draft.lessons.len() as u32,
+        with_quiz: request.with_quiz,
+        draft: Some(draft.clone()),
         contents,
-        survey,
-    }))
+        survey: retrieval::for_writer(state, &survey).await,
+    };
+    Ok(Some((req, survey)))
 }
 
-/// Surveys the course's sources and folders and asks the planner (the writing route)
-/// for the outline with per-lesson questions and sections. `Ok(None)` when there is
-/// nothing to survey, no planner prompt in this build, or the answer doesn't fit the
-/// draft.
+/// Surveys the course's sources and folders and asks the planner (the writing route,
+/// `Generator::plan_course`) for the outline with per-lesson questions and sections.
+/// `Ok(None)` when there is nothing to survey or the planner's answer doesn't fit the
+/// draft (the call is traced as failed).
 pub async fn plan_course(
     state: &AppState,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
     chat_id: &str,
+    trace_id: &str,
 ) -> anyhow::Result<Option<CoursePlan>> {
-    let trace_id = new_id();
-    let Some(input) = survey(state, request, draft, workspaces, &trace_id).await? else {
+    let Some((req, _survey)) = survey(state, request, draft, workspaces, trace_id).await? else {
         return Ok(None);
     };
-    let pipeline = state.pipeline.load_full();
-    let prompts = pipeline.prompts.clone();
-    // The prompt set is R1-ai's, wired into the pipeline's `LessonV2` when that area
-    // merges; a build without it plans nothing rather than failing the proposal.
-    let prompt =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prompts.plan(&input))) {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::debug!("no planner prompt in this build; the agent's outline stays");
-                return Ok(None);
-            }
-        };
     let ai = state
-        .ai_config()
+        .route_ai_config(Route::Write)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
-    let model = state.generator.agent_model(&ai);
-    let routed = retrieval::route_model(state, Route::Write).await?;
-    let survey_text: String = retrieval::for_writer(state, &input.survey)
-        .await
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("[{}] {}: {}\n", i + 1, p.source, p.text))
-        .collect();
-    let tool = json!({
-        "type": "function",
-        "name": PLAN_TOOL,
-        "description": "Record the course plan.",
-        "parameters": margin_agent::strict_schema::<CoursePlan>(),
-        "strict": true,
-    });
-    let req = ResponseRequest {
-        model: Some(routed.clone()).filter(|m| !m.is_empty()),
-        input: vec![
-            json!({"role": "developer", "content": [{"type": "input_text", "text": prompt.constant}]}),
-            json!({"role": "user", "content": [{"type": "input_text", "text": format!("{}\n\n{survey_text}", prompt.variable)}]}),
-        ],
-        tools: vec![tool],
-        tool_choice: Some(margin_ai::ToolChoice::Function(PLAN_TOOL.into())),
-        reasoning: Some(ReasoningConfig {
-            effort: ReasoningEffort::Medium,
-            summary: None,
-        }),
-        prompt_cache_key: Some(prompt.cache_key.clone()),
-        ..Default::default()
-    };
-    let started = std::time::Instant::now();
-    let mut row = TraceRow::new(TraceKind::ModelCall, new_id(), Utc::now());
-    row.trace_id = trace_id;
-    row.chat_id = Some(chat_id.to_string());
-    row.route = Some(Route::Write);
-    row.model = Some(routed);
-    row.prompt_version = Some(prompt.version.clone());
-    row.pipeline_hash = Some(pipeline.hash.clone());
-    let answer = async {
-        let mut stream = model.stream(req).await?;
-        let mut arguments = None;
-        while let Some(event) = stream.next().await {
-            match event? {
-                StreamEvent::OutputItemDone { item, .. }
-                    if item["type"] == "function_call" && item["name"] == PLAN_TOOL =>
-                {
-                    arguments = item["arguments"].as_str().map(str::to_string);
-                }
-                StreamEvent::Completed { usage, .. } => return Ok((arguments, Some(usage))),
-                StreamEvent::Incomplete { usage, .. } => return Ok((None, Some(usage))),
-                StreamEvent::Failed { message, .. } | StreamEvent::Error { message, .. } => {
-                    anyhow::bail!("the planner call failed: {message}")
-                }
-                _ => {}
-            }
+    let opts = CallOptions::new(Route::Write);
+    let mut call = SpanGuard::new(
+        trace::model_call(
+            state,
+            trace_id,
+            Route::Write,
+            &ai.model,
+            trace::provider_of(&ai.base_url),
+            margin_ai::prompts::PLAN_VERSION.to_string(),
+        ),
+        state,
+    );
+    call.row().chat_id = Some(chat_id.to_string());
+    match state.generator.plan_course(&ai, &req, &opts).await {
+        Ok(Generated { value, usage }) => {
+            call.row().usage = Some(trace::trace_usage(&usage));
+            call.finish(true);
+            Ok(Some(value))
         }
-        anyhow::bail!("the planner call ended without finishing")
-    }
-    .await;
-    row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-    row.ok = answer.is_ok();
-    if let Ok((_, Some(u))) = &answer {
-        row.usage = Some(TraceUsage {
-            input: u.input_tokens,
-            cached: u.cached_input_tokens,
-            output: u.output_tokens,
-            reasoning: u.reasoning_tokens,
-            ..Default::default()
-        });
-    }
-    retrieval::record_trace(state, row);
-    let (arguments, _) = answer?;
-    let Some(arguments) = arguments else {
-        return Ok(None);
-    };
-    match serde_json::from_str::<CoursePlan>(&arguments) {
-        Ok(plan) => Ok(plan.checked(draft.lessons.len())),
         Err(e) => {
-            tracing::warn!("the planner's answer isn't a plan: {e}");
+            call.fail(trace::ai_error_code(&e));
+            tracing::warn!("the outline planner's answer isn't usable: {e}");
             Ok(None)
         }
     }
@@ -1027,7 +863,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         else {
             return Ok(());
         };
-        let ai = match state.ai_config().await {
+        let ai = match state.route_ai_config(Route::Write).await {
             Ok(ai) => ai,
             Err(e) => {
                 row.lesson.status = LessonStatus::Failed { error: e.message };
@@ -1072,7 +908,31 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
             });
         })
     };
-    let result = state.generator.write_lesson(&ai, &ctx, on_delta).await;
+    let opts = CallOptions::new(Route::Write);
+    let mut call = SpanGuard::new(
+        trace::model_call(
+            state,
+            lesson_id,
+            Route::Write,
+            &ai.model,
+            trace::provider_of(&ai.base_url),
+            margin_ai::prompts::LESSON_VERSION.to_string(),
+        ),
+        state,
+    );
+    call.row().job_id = Some(lesson_id.to_string());
+    let result = state
+        .generator
+        .write_lesson(&ai, &ctx, &opts, on_delta)
+        .await
+        .map(|Generated { value, usage }| {
+            call.row().usage = Some(trace::trace_usage(&usage));
+            value
+        });
+    match &result {
+        Ok(_) => call.finish(true),
+        Err(e) => call.fail(trace::ai_error_code(e)),
+    }
     saver.abort();
     let _ = saver.await;
 
@@ -1117,6 +977,9 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         row.lesson
     };
     state.emit_lesson(&lesson);
+    if lesson.status == LessonStatus::Ready {
+        crate::ingest::spawn_reindex(state, LibraryKind::Lesson, lesson_id);
+    }
 
     if result.is_ok()
         && first_write

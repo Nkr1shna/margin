@@ -176,7 +176,8 @@ pub struct ContextQuery {
     pub modalities: Vec<Modality>,
     /// Most hits returned.
     pub k: u32,
-    /// Pack the hits to this budget instead of returning the top `k` as they rank.
+    /// The budget the hits are packed to (against the chat route's window), at most `k`
+    /// of them; `None` packs to the pipeline's `PipelineConfig.budget`.
     #[serde(default)]
     pub budget: Option<Budget>,
     /// The caller's access paths: only passages whose `access` the caller may see are

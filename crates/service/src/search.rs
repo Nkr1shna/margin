@@ -1,7 +1,7 @@
 //! ⌘K search (and the agent's `search_library`) over topics, lessons and notes.
 //!
 //! Lessons and notes are found through FULLTEXT indexes on their title, body and quote
-//! (`LIBRARY_INDEXES`; analyzer `library`, which indexes every word's beginnings so a
+//! (`db::LIBRARY_INDEXES`; analyzer `library`, which indexes every word's beginnings so a
 //! word being typed already matches), not by reading every body. What the index finds
 //! is then checked and ranked as before: a case-insensitive match of the whole query in
 //! one field, topics first, then lessons, then notes, title matches first.
@@ -20,17 +20,6 @@ use crate::state::{AppState, StoredLesson};
 pub const MAX_HITS: usize = 30;
 const SNIPPET_BEFORE: usize = 60;
 const SNIPPET_LEN: usize = 160;
-
-/// The analyzer and the FULLTEXT indexes library search runs on. Idempotent; applied
-/// before each search (a catalog lookup once they exist).
-pub const LIBRARY_INDEXES: &str = r#"
-DEFINE ANALYZER IF NOT EXISTS library TOKENIZERS blank, class FILTERS lowercase, ascii, edgengram(1, 12);
-DEFINE INDEX IF NOT EXISTS lesson_title ON lesson FIELDS doc.title FULLTEXT ANALYZER library BM25;
-DEFINE INDEX IF NOT EXISTS lesson_body  ON lesson FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
-DEFINE INDEX IF NOT EXISTS note_title   ON note FIELDS doc.title FULLTEXT ANALYZER library BM25;
-DEFINE INDEX IF NOT EXISTS note_body    ON note FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
-DEFINE INDEX IF NOT EXISTS note_quote   ON note FIELDS doc.quote FULLTEXT ANALYZER library BM25;
-"#;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -52,9 +41,6 @@ pub async fn find(store: &Store, query: &str) -> anyhow::Result<Vec<SearchHit>> 
     if needle.is_empty() {
         return Ok(Vec::new());
     }
-    store
-        .query_rows::<serde_json::Value>(LIBRARY_INDEXES, vec![])
-        .await?;
     let topics: Vec<Topic> = store.list(db::TOPIC).await?;
     let q = serde_json::json!(needle);
     let lessons: Vec<StoredLesson> = store

@@ -155,7 +155,7 @@ fn resaved_queue() -> &'static std::sync::Mutex<Vec<(FolderHandle, FolderHandle)
 
 /// The platform's `open` (4a, 4b) made a new handle for a folder it was given `old`
 /// for: the store replaces it after the open (`store::update_handle`). Any thread.
-#[allow(dead_code)] // 4a and 4b call it.
+#[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 pub fn resaved(old: FolderHandle, new: FolderHandle) {
     resaved_queue()
         .lock()
@@ -206,10 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn unbuilt_platforms_say_so() {
+    fn another_platforms_folder_is_revoked_here() {
         let handle = FolderHandle::AndroidTree { uri: "x".into() };
-        // Not a folder this platform can open: a message for the Folders pane, whatever
-        // the platform says (4a/4b/4c word it for themselves).
+        // A folder attached on an Android device can't be opened on a desktop: the
+        // Folders pane says to attach it again here.
         let err = open(&handle).err().unwrap();
         assert!(matches!(err, DirError::Revoked(_)), "{err:?}");
         assert!(!err.to_string().is_empty());

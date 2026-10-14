@@ -17,7 +17,9 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
-use margin_ai::{AiError, LessonContext, SceneRequest};
+use margin_ai::{
+    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, SceneRequest,
+};
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
     Chunk, EmbedError, Embedder, Extracted, ImageTokens, ModelFiles, Page, Picture, Transcript,
@@ -128,8 +130,27 @@ pub struct FakeGenerator {
     /// the first-line title stays; queue a title with `title_reply`.
     pub titles: Arc<ScriptedModel>,
     /// When set, chat turns call the real `ResponsesClient` at Settings' base URL
-    /// instead of `agent` (point it at a fake Responses API).
+    /// instead of `agent` (point it at a fake Responses API), and so does the outline
+    /// planner.
     pub agent_over_http: AtomicBool,
+    /// Every outline planner request, with its call options.
+    pub plan_requests: Mutex<Vec<(PlanRequest, CallOptions)>>,
+    /// The planner's answer (checked against the request like the real one); `None`
+    /// fails the call, which leaves the agent's outline as it is.
+    pub plan_reply: Mutex<Option<CoursePlan>>,
+    /// The call options of every lesson and scene request.
+    pub call_options: Mutex<Vec<CallOptions>>,
+}
+
+/// The usage every fake generation call reports.
+pub fn fake_usage() -> margin_shared::Usage {
+    margin_shared::Usage {
+        input_tokens: 1_000,
+        cached_input_tokens: 400,
+        output_tokens: 200,
+        reasoning_tokens: 0,
+        model_calls: 1,
+    }
 }
 
 pub fn outline_for(req: &AskRequest) -> Outline {
@@ -151,10 +172,12 @@ impl Generator for FakeGenerator {
         &'a self,
         _ai: &'a AiConfig,
         ctx: &'a LessonContext,
+        opts: &'a CallOptions,
         mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
-    ) -> BoxFuture<'a, Result<String, AiError>> {
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
             self.lesson_requests.lock().unwrap().push(ctx.clone());
+            self.call_options.lock().unwrap().push(opts.clone());
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
             let title = &ctx.outline[ctx.index].title;
@@ -187,7 +210,10 @@ impl Generator for FakeGenerator {
             if self.fail_lessons.lock().unwrap().contains(title) {
                 return Err(AiError::Incomplete("the model stopped".into()));
             }
-            Ok(out)
+            Ok(Generated {
+                value: out,
+                usage: fake_usage(),
+            })
         })
     }
 
@@ -195,13 +221,48 @@ impl Generator for FakeGenerator {
         &'a self,
         _ai: &'a AiConfig,
         req: &'a SceneRequest,
-    ) -> BoxFuture<'a, Result<String, AiError>> {
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
             self.scene_requests.lock().unwrap().push(req.clone());
+            self.call_options.lock().unwrap().push(opts.clone());
             let n = self.scene_requests.lock().unwrap().len();
-            Ok(format!(
-                "import manimgx as m\n\nclass LessonScene(m.Scene):\n    # attempt {n}\n    pass\n"
-            ))
+            Ok(Generated {
+                value: format!(
+                    "import manimgx as m\n\nclass LessonScene(m.Scene):\n    # attempt {n}\n    pass\n"
+                ),
+                usage: fake_usage(),
+            })
+        })
+    }
+
+    fn plan_course<'a>(
+        &'a self,
+        ai: &'a AiConfig,
+        req: &'a PlanRequest,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
+        Box::pin(async move {
+            self.plan_requests
+                .lock()
+                .unwrap()
+                .push((req.clone(), opts.clone()));
+            if self.agent_over_http.load(Ordering::SeqCst) {
+                let client = margin_ai::ResponsesClient::new(
+                    ai.base_url.clone(),
+                    ai.api_key.clone(),
+                    ai.model.clone(),
+                );
+                return margin_ai::plan_course(&client, req, opts).await;
+            }
+            let reply = self.plan_reply.lock().unwrap().clone();
+            match reply {
+                Some(plan) => Ok(Generated {
+                    value: plan.checked(req)?,
+                    usage: fake_usage(),
+                }),
+                None => Err(AiError::Incomplete("no plan scripted".into())),
+            }
         })
     }
 
@@ -578,6 +639,22 @@ impl SourceTools for FakeSourceTools {
                 doc.duration_ms = Some(frames * 5_000);
             }
             SourceKind::Text | SourceKind::Code => doc.pages.push(Page { number: None, text }),
+        }
+        Ok(doc)
+    }
+
+    /// As `extract`, with no page pictures for a PDF (ingest asks `pdf_page_picture`).
+    fn extract_lazy(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError> {
+        let mut doc = self.extract(path, kind, media_dir)?;
+        if kind == SourceKind::Pdf {
+            for p in doc.pictures.drain(..) {
+                std::fs::remove_file(&p.path)?;
+            }
         }
         Ok(doc)
     }

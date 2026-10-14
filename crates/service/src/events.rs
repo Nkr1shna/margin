@@ -6,10 +6,12 @@
 use std::time::Duration;
 
 use axum::Extension;
-use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::{Query, State};
 use axum::response::Response;
+use margin_shared::context::TraceRow;
 use margin_shared::{DeviceFrame, DirectedFrame, Event, Id};
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -21,12 +23,22 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// "Try again later": the client fell behind and should reload.
 const CLOSE_LAGGED: u16 = 1013;
 
+/// `?traces=1`: also send `Event::Trace` for `model_call` and `retrieval` rows as they
+/// are written (nothing is pushed by default).
+#[derive(Debug, Default, Deserialize)]
+pub struct EventsQuery {
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
 pub async fn events(
     State(state): State<AppState>,
     Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    Query(q): Query<EventsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| run(state, device.id, socket))
+    let traces = matches!(q.traces.as_deref(), Some("1" | "true"));
+    ws.on_upgrade(move |socket| run(state, device.id, traces, socket))
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
@@ -44,9 +56,11 @@ struct Feeds {
     revocations: broadcast::Receiver<Id>,
     shutdown: watch::Receiver<bool>,
     directed: mpsc::UnboundedReceiver<DirectedFrame>,
+    /// Trace rows, when the socket asked for them.
+    traces: Option<broadcast::Receiver<TraceRow>>,
 }
 
-async fn run(state: AppState, device_id: String, mut socket: WebSocket) {
+async fn run(state: AppState, device_id: String, traces: bool, mut socket: WebSocket) {
     let revocations = state.revocations.subscribe();
     let shutdown = state.shutdown.clone();
     // A revoke that landed between authenticating and subscribing.
@@ -70,6 +84,7 @@ async fn run(state: AppState, device_id: String, mut socket: WebSocket) {
         revocations,
         shutdown,
         directed,
+        traces: traces.then(|| state.tracer.subscribe()),
     };
     serve(&state, &device_id, &mut socket, feeds).await;
     if state.devices.unregister(&device_id, conn) {
@@ -116,6 +131,16 @@ async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut fe
                     return;
                 }
             },
+            row = next_trace(&mut feeds.traces) => match row {
+                Ok(row) => {
+                    if send_json(socket, &Event::Trace { row: Box::new(row) }).await.is_err() {
+                        return;
+                    }
+                }
+                // Traces are a best-effort tail: a slow socket skips what it missed.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => feeds.traces = None,
+            },
             // `None` once the hub forgot the device (revoked): the revocation closes it.
             Some(frame) = feeds.directed.recv() => {
                 if send_json(socket, &frame).await.is_err() {
@@ -150,6 +175,16 @@ async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut fe
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+/// The next trace row, or never when the socket didn't ask for them.
+async fn next_trace(
+    traces: &mut Option<broadcast::Receiver<TraceRow>>,
+) -> Result<TraceRow, RecvError> {
+    match traces {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

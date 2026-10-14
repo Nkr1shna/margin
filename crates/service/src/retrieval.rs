@@ -964,7 +964,8 @@ impl MmrV1 {
         out
     }
 
-    /// Merges selected text passages of one document whose `ord`s follow each other.
+    /// Merges selected text passages of one document (and one page) whose `ord`s follow
+    /// each other.
     fn merge_adjacent(&self, picked: Vec<Candidate>) -> Vec<Packed> {
         // Groups of picks, in pick order; a pick joins a group of its document whose
         // ord range it extends by one.
@@ -974,7 +975,10 @@ impl MmrV1 {
             if mergeable {
                 for g in &mut groups {
                     let first = &g[0];
+                    // One locator per passage: text of another page isn't merged in
+                    // (its citation would point at the wrong page).
                     if first.hit.passage.document_id != c.hit.passage.document_id
+                        || first.hit.passage.page != c.hit.passage.page
                         || !is_text(&first.hit)
                         || g.iter().any(|x| x.picture.is_some())
                     {
@@ -1412,16 +1416,22 @@ pub fn register(reg: &mut Registry) {
     );
 }
 
-/// Records a trace row through `AppState.tracer`.
-///
-/// The tracer is R1-trace's; until that area merges its `record` is `unimplemented!`,
-/// and a missing trace must not fail a retrieval, so a panic there is contained here.
-pub(crate) fn record_trace(state: &AppState, row: TraceRow) {
-    let tracer = &state.tracer;
-    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracer.record(row)));
-    if recorded.is_err() {
-        tracing::debug!("the trace row wasn't recorded (no tracer yet)");
+/// A source's rows in the old `chunk`/`media` tables, while they exist (the migration
+/// to `passage` removes them; reading a removed table is an error).
+async fn legacy_rows<T: serde::de::DeserializeOwned>(
+    store: &Store,
+    table: &'static str,
+    source_id: &str,
+) -> anyhow::Result<Vec<T>> {
+    if !store.table_exists(table).await? {
+        return Ok(Vec::new());
     }
+    store.list_where(table, "source_id", source_id).await
+}
+
+/// Records a trace row through `AppState.tracer`.
+pub(crate) fn record_trace(state: &AppState, row: TraceRow) {
+    state.tracer.record(row);
 }
 
 fn hash_hex(text: &str) -> String {
@@ -1655,10 +1665,7 @@ async fn legacy_hits(
     }
     let mut rows = Vec::new();
     for s in sources {
-        let chunks: Vec<ChunkRow> = state
-            .store
-            .list_where(db::CHUNK, "source_id", &s.id)
-            .await?;
+        let chunks: Vec<ChunkRow> = legacy_rows(&state.store, db::CHUNK, &s.id).await?;
         rows.extend(chunks.iter().map(|c| {
             legacy_row(
                 &s.id,
@@ -1670,10 +1677,7 @@ async fn legacy_hits(
                 &c.vector,
             )
         }));
-        let media: Vec<MediaRow> = state
-            .store
-            .list_where(db::MEDIA, "source_id", &s.id)
-            .await?;
+        let media: Vec<MediaRow> = legacy_rows(&state.store, db::MEDIA, &s.id).await?;
         rows.extend(media.iter().filter_map(|m| {
             let modality = match m.kind {
                 MediaKind::Image | MediaKind::Page => Modality::Picture,
@@ -1845,10 +1849,7 @@ async fn text_picture(
         .filter_map(|f| Some((f.start_ms?, f.file?)))
         .collect();
     if frames.is_empty() {
-        let media: Vec<MediaRow> = state
-            .store
-            .list_where(db::MEDIA, "source_id", source_id)
-            .await?;
+        let media: Vec<MediaRow> = legacy_rows(&state.store, db::MEDIA, source_id).await?;
         frames = media
             .into_iter()
             .filter(|m| m.kind == MediaKind::Frame)
@@ -2103,9 +2104,7 @@ pub async fn read_passages(
     if !rows.is_empty() {
         return Ok(rows);
     }
-    let mut chunks: Vec<ChunkRow> = store
-        .list_where(db::CHUNK, "source_id", document_id)
-        .await?;
+    let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
     chunks.sort_by_key(|c| c.ord);
     let mut rows: Vec<PassageRow> = chunks
         .iter()
@@ -2226,9 +2225,7 @@ pub async fn document_outline(
         .await?;
     if rows.is_empty() {
         // A source not yet moved to passages: its old chunks (pages, no sections).
-        let mut chunks: Vec<ChunkRow> = store
-            .list_where(db::CHUNK, "source_id", document_id)
-            .await?;
+        let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
         chunks.sort_by_key(|c| c.ord);
         rows = chunks
             .into_iter()
@@ -2301,9 +2298,7 @@ pub async fn document_picture(
         return Ok(Some(row));
     }
     // A source not yet moved to passages: its old picture rows.
-    let media: Vec<MediaRow> = store
-        .list_where(db::MEDIA, "source_id", document_id)
-        .await?;
+    let media: Vec<MediaRow> = legacy_rows(store, db::MEDIA, document_id).await?;
     Ok(media
         .into_iter()
         .filter(|m| matches!(m.kind, MediaKind::Image | MediaKind::Page))

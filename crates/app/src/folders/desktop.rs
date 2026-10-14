@@ -111,10 +111,11 @@ fn current(handle: &FolderHandle) -> FolderHandle {
 fn store_refreshed(old: &FolderHandle, new: FolderHandle) {
     if let Ok(mut map) = refreshed().lock() {
         match map.iter_mut().find(|(held, _)| held == old) {
-            Some((_, slot)) => *slot = new,
-            None => map.push((old.clone(), new)),
+            Some((_, slot)) => *slot = new.clone(),
+            None => map.push((old.clone(), new.clone())),
         }
     }
+    super::resaved(old.clone(), new);
 }
 
 /// Where the folder is now.

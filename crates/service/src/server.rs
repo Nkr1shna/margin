@@ -34,8 +34,8 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, context_api, embedding, events, library, media, retrieval, search, settings,
-    sources, trace, turns, uploads, video, workspaces,
+    ask, chats, context_api, embedding, events, ingest, library, media, retrieval, search,
+    settings, sources, trace, turns, uploads, video, workspaces,
 };
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -137,11 +137,15 @@ impl Service {
             retrieval_cache: RetrievalCache::new(retrieval::RETRIEVAL_CACHE_ENTRIES),
         });
 
+        // Traces first, so recovery and the workers are traced.
+        trace::start(&state);
         let resume = recover(&state).await?;
         if let Err(e) = uploads::purge_stale(&state).await {
             tracing::warn!("couldn't clear unfinished uploads: {e:#}");
         }
         tokio::spawn(video::run_worker(state.clone(), video_rx));
+        // The ingest worker runs the one-pass migration to `passage` first (§2.2).
+        tokio::spawn(ingest::run_worker(state.clone()));
         tokio::spawn(sources::run_worker(state.clone(), source_rx));
         tokio::spawn(housekeeping(state.clone()));
         for lesson_id in resume.lessons {
@@ -265,6 +269,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/workspaces/{id}", delete(workspaces::delete_workspace))
         .route(routes::PROJECTS, get(context_api::projects))
         .route(routes::CONTEXT_SEARCH, post(context_api::search))
+        .route(
+            "/api/context/documents/{id}",
+            delete(context_api::delete_document),
+        )
         .route(
             "/api/context/documents/{id}/outline",
             get(context_api::outline),

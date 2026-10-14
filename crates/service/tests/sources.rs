@@ -498,6 +498,14 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
+    // Every hit is packed whatever its score: the test checks where passages come from.
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"pipeline": {"budget": {"min_score_pct": 0}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
     let fourier = upload_ok(&h, &t, "notes/fourier.md", None, FOURIER).await;
     let pdf = upload_ok(
         &h,
@@ -599,7 +607,8 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
         let requests = h.generator.lesson_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for ctx in requests.iter() {
-            assert_eq!(ctx.passages.len(), 7);
+            // Seven chunks match; adjacent ones of a document come merged.
+            assert!((1..=7).contains(&ctx.passages.len()), "{:?}", ctx.passages);
             assert!(ctx.passages.iter().any(|p| p.source == "dsp.pdf"));
             assert!(!ctx.passages.iter().any(|p| p.source == "bread.md"));
         }
@@ -693,7 +702,11 @@ async fn sources_wait_for_the_model_download() {
         requests.first().map(|ctx| ctx.passages.clone())
     })
     .await;
-    assert_eq!(passages.len(), 3);
+    // All three chunks, adjacent ones merged into one passage.
+    let sent: String = passages.iter().map(|p| p.text.as_str()).collect();
+    for row in h.state.store.passages_of(&s.id).await.unwrap() {
+        assert!(sent.contains(row.text.trim()), "{} not in {sent}", row.text);
+    }
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 }
 
@@ -1301,7 +1314,7 @@ async fn agents_documents_and_library_items_are_indexed_too() {
     assert!(!rows.is_empty());
     assert!(
         rows.iter()
-            .all(|r| r.origin == "library" && r.scope_ids == [topic.id.clone()])
+            .all(|r| r.origin == "library" && r.scope_ids.is_empty())
     );
     let r = h
         .delete(&t, &format!("/api/notes/{}", note.id))

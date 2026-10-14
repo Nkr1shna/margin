@@ -385,8 +385,7 @@ pub fn sanitize_code(code: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Starts the writer and the retention job and loads the price table. Called once at
-/// startup (from `turns::recover`, which `server::recover` runs); later calls do
-/// nothing.
+/// startup (`server::Service::start`); later calls do nothing.
 pub fn start(state: &AppState) {
     let Some(rx) = state.tracer.take_receiver() else {
         return;

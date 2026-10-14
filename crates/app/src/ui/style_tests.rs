@@ -327,7 +327,10 @@ fn chat_transcript_never_scrolls_sideways() {
     assert_eq!(token(block(".tool-label {"), "min-width"), "0");
     assert_eq!(token(block(".tool-row {"), "min-width"), "0");
     assert_eq!(token(block(".chat-card {"), "min-width"), "0");
-    assert_eq!(token(block(".msg-user .bubble {"), "overflow-wrap"), "anywhere");
+    assert_eq!(
+        token(block(".msg-user .bubble {"), "overflow-wrap"),
+        "anywhere"
+    );
 }
 
 /// A title that only repeats an element's own text (a tool row's label) shows as a

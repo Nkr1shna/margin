@@ -159,6 +159,18 @@ DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
 DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 
+/// The analyzer and the FULLTEXT indexes ⌘K and `search_library` run on (lessons' and
+/// notes' title, body and quote; analyzer `library`, every word's beginnings). Applied
+/// at every open; `IF NOT EXISTS` makes that a catalog lookup once they exist.
+pub const LIBRARY_INDEXES: &str = r#"
+DEFINE ANALYZER IF NOT EXISTS library TOKENIZERS blank, class FILTERS lowercase, ascii, edgengram(1, 12);
+DEFINE INDEX IF NOT EXISTS lesson_title ON lesson FIELDS doc.title FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS lesson_body  ON lesson FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_title   ON note FIELDS doc.title FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_body    ON note FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_quote   ON note FIELDS doc.quote FULLTEXT ANALYZER library BM25;
+"#;
+
 /// The analyzer, the vector and full-text indexes, and the rollup views: defined with
 /// `OVERWRITE`, and applied only when this text changes (an HNSW or analyzer change
 /// rebuilds the index once, at the next start).
@@ -286,6 +298,13 @@ impl Store {
         let store = Self { db };
         store.define_old_tables().await?;
         store.apply_indexes().await?;
+        store
+            .db
+            .query(LIBRARY_INDEXES)
+            .await
+            .context("couldn't define the library indexes")?
+            .check()
+            .context("couldn't define the library indexes")?;
         Ok(store)
     }
 
@@ -547,7 +566,12 @@ impl Store {
     pub async fn next_generation(&self) -> anyhow::Result<u64> {
         let n: Vec<u64> = self
             .query_rows(
-                "UPSERT schema_meta:generation SET n = (n ?? 0) + 1 RETURN VALUE n",
+                // Never at or below a generation a document or tombstone already has
+                // (rows written before the counter, or restored from a backup).
+                "UPSERT schema_meta:generation SET n = math::max([n ?? 0, \
+                   math::max(SELECT VALUE doc.generation FROM document) ?? 0, \
+                   math::max(SELECT VALUE doc.generation FROM document_deleted) ?? 0]) + 1 \
+                 RETURN VALUE n",
                 vec![],
             )
             .await?;

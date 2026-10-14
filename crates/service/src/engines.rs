@@ -7,7 +7,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use margin_agent::ModelClient;
-use margin_ai::{AiError, LessonContext, ResponsesClient, SceneRequest};
+use margin_ai::{
+    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, ResponsesClient,
+    SceneRequest,
+};
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
@@ -39,21 +42,34 @@ impl std::fmt::Debug for AiConfig {
     }
 }
 
-/// The model work jobs need. Course outlines aren't here: the agent writes them as
-/// `propose_course` arguments in a chat turn (through `agent_model`).
+/// The model work jobs need. Every call takes its `CallOptions` (the route it runs on,
+/// the prompt cache key, an output cap) and returns the answer with its usage, which the
+/// caller records as a `model_call` trace row. Course outlines are the agent's
+/// `propose_course` arguments (through `agent_model`); `plan_course` turns one into the
+/// planned outline with per-lesson questions when the course has sources (§2.5).
 pub trait Generator: Send + Sync + 'static {
     fn write_lesson<'a>(
         &'a self,
         ai: &'a AiConfig,
         ctx: &'a LessonContext,
+        opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
-    ) -> BoxFuture<'a, Result<String, AiError>>;
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>>;
 
     fn write_scene<'a>(
         &'a self,
         ai: &'a AiConfig,
         req: &'a SceneRequest,
-    ) -> BoxFuture<'a, Result<String, AiError>>;
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>>;
+
+    /// The outline planner: one strict-JSON call, checked against `req`.
+    fn plan_course<'a>(
+        &'a self,
+        ai: &'a AiConfig,
+        req: &'a PlanRequest,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>>;
 
     /// The model the agent loop calls for a chat turn. The turn picks the agent model
     /// (Settings' `agent_model`, else `ai.model`) per request.
@@ -83,17 +99,30 @@ impl Generator for AiGenerator {
         &'a self,
         ai: &'a AiConfig,
         ctx: &'a LessonContext,
+        opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
-    ) -> BoxFuture<'a, Result<String, AiError>> {
-        Box::pin(async move { margin_ai::write_lesson(&client(ai), ctx, on_delta).await })
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
+        Box::pin(
+            async move { margin_ai::write_lesson_with(&client(ai), ctx, opts, on_delta).await },
+        )
     }
 
     fn write_scene<'a>(
         &'a self,
         ai: &'a AiConfig,
         req: &'a SceneRequest,
-    ) -> BoxFuture<'a, Result<String, AiError>> {
-        Box::pin(async move { margin_ai::write_scene(&client(ai), req).await })
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
+        Box::pin(async move { margin_ai::write_scene_with(&client(ai), req, opts).await })
+    }
+
+    fn plan_course<'a>(
+        &'a self,
+        ai: &'a AiConfig,
+        req: &'a PlanRequest,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
+        Box::pin(async move { margin_ai::plan_course(&client(ai), req, opts).await })
     }
 
     fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
@@ -153,6 +182,17 @@ pub trait SourceTools: Send + Sync + 'static {
         kind: SourceKind,
         media_dir: &Path,
     ) -> Result<Extracted, EmbedError>;
+    /// `extract`, except that a PDF's pages aren't rendered (its `pictures` is empty):
+    /// ingest renders each page through `pdf_page_picture`, which keeps the render in
+    /// `media_dir` for retrieval and citations. Blocking.
+    fn extract_lazy(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError> {
+        self.extract(path, kind, media_dir)
+    }
     /// What is said in 16 kHz mono `samples`, word by word, using `work_dir` for
     /// temporary files. `Ok(None)` when no speech recognizer is installed. Blocking.
     fn transcribe(
@@ -249,6 +289,15 @@ impl SourceTools for EmbedTools {
         margin_embed::extract(path, kind, media_dir)
     }
 
+    fn extract_lazy(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError> {
+        margin_embed::extract_lazy(path, kind, media_dir)
+    }
+
     /// With `fluidaudiocli` (Parakeet), found like the video pipeline finds it.
     fn transcribe(
         &self,
@@ -277,8 +326,7 @@ impl SourceTools for EmbedTools {
         chunker.chunk(doc, kind, count_tokens, cfg)
     }
 
-    /// Until `margin_embed` renders a single page on its own (R1-embed), the page comes
-    /// from reading the PDF into a scratch folder next to `media_dir`.
+    /// Rendered once into `media_dir` and served from there after.
     fn pdf_page_picture(
         &self,
         pdf: &Path,
@@ -289,20 +337,15 @@ impl SourceTools for EmbedTools {
         if target.is_file() {
             return Ok(target);
         }
-        let scratch = media_dir.with_extension(format!("render-{}", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let doc = margin_embed::extract(pdf, SourceKind::Pdf, &scratch)?;
-            let picture = doc
-                .pictures
-                .into_iter()
-                .find(|p| p.page == Some(page))
-                .ok_or_else(|| EmbedError::Extract(format!("the PDF has no page {page}")))?;
-            std::fs::create_dir_all(media_dir)?;
-            std::fs::rename(&picture.path, &target)?;
-            Ok(target.clone())
-        })();
-        let _ = std::fs::remove_dir_all(&scratch);
-        result
+        std::fs::create_dir_all(media_dir)?;
+        // Written beside the target, then moved, so a half-written page is never served.
+        let partial = media_dir.join(format!(".{}.part", uuid::Uuid::new_v4()));
+        let result = margin_embed::pdf_page_picture(pdf, page, &partial)
+            .and_then(|()| std::fs::rename(&partial, &target).map_err(EmbedError::from));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result.map(|()| target)
     }
 
     fn score(

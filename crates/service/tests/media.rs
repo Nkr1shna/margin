@@ -6,7 +6,6 @@
 mod common;
 
 use common::*;
-use margin_service::db;
 use margin_service::sources::{ChunkRow, MediaKind, MediaRow};
 use margin_shared::{
     Citation, Event, Lesson, LessonStatus, Library, ProposalStatus, Source, SourceKind,
@@ -55,26 +54,58 @@ async fn settled(h: &Harness, token: &str, id: &str) -> Source {
     .await
 }
 
+/// A source's picture and sound passages, in order, in the shape the old `media` table
+/// had.
 async fn media_rows(h: &Harness, source_id: &str) -> Vec<MediaRow> {
-    let mut rows: Vec<MediaRow> = h
-        .state
+    h.state
         .store
-        .list_where(db::MEDIA, "source_id", source_id)
+        .passages_of(source_id)
         .await
-        .unwrap();
-    rows.sort_by_key(|r| r.ord);
-    rows
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.modality != "text")
+        .enumerate()
+        .map(|(i, p)| MediaRow {
+            kind: match (p.modality.as_str(), p.file.as_deref()) {
+                ("sound", _) => MediaKind::Audio,
+                ("frame", _) => MediaKind::Frame,
+                (_, Some("original")) => MediaKind::Image,
+                _ => MediaKind::Page,
+            },
+            source_id: p.document_id,
+            topic_id: p.scope_ids.first().cloned(),
+            ord: i as u32,
+            file: p.file,
+            page: p.page.map(|v| v as u32),
+            start_ms: p.start_ms.map(|v| v as u64),
+            end_ms: p.end_ms.map(|v| v as u64),
+            text: p.text,
+            vector: p.vector,
+        })
+        .collect()
 }
 
+/// A source's text passages, in order, in the shape the old `chunk` table had.
 async fn chunk_rows(h: &Harness, source_id: &str) -> Vec<ChunkRow> {
-    let mut rows: Vec<ChunkRow> = h
-        .state
+    h.state
         .store
-        .list_where(db::CHUNK, "source_id", source_id)
+        .passages_of(source_id)
         .await
-        .unwrap();
-    rows.sort_by_key(|r| r.ord);
-    rows
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.modality == "text")
+        .enumerate()
+        .map(|(i, p)| ChunkRow {
+            source_id: p.document_id,
+            topic_id: p.scope_ids.first().cloned(),
+            ord: i as u32,
+            page: p.page.map(|v| v as u32),
+            start_ms: p.start_ms.map(|v| v as u64),
+            end_ms: p.end_ms.map(|v| v as u64),
+            text: p.text,
+            vector: p.vector,
+        })
+        .collect()
 }
 
 /// Has the agent propose a one-lesson course on the sources, accepts it and waits for
@@ -99,6 +130,18 @@ async fn lesson_from(h: &Harness, token: &str, prompt: &str, sources: &[&Source]
         })
     })
     .await
+}
+
+/// Every retrieved hit is packed, whatever its score (`Budget.min_score_pct` 0), and at
+/// most `images_max` pictures: the tests below check what is sent, not the cut-off.
+async fn keep_every_hit(h: &Harness, token: &str, images_max: u32) {
+    let r = h
+        .patch(token, "/api/settings")
+        .json(&json!({"pipeline": {"budget": {"min_score_pct": 0, "images_max": images_max}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
 }
 
 /// Fetches a signed URL: status, content type, body.
@@ -263,6 +306,7 @@ async fn pdf_pages_are_pictures_and_citations_point_at_pages() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
+    keep_every_hit(&h, &t, 8).await;
     let pdf = upload_ok(
         &h,
         &t,
@@ -338,6 +382,7 @@ async fn audio_is_embedded_transcribed_and_cited_with_times() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
+    keep_every_hit(&h, &t, 8).await;
     let audio = upload_ok(&h, &t, "talk.m4a", TALK).await;
     assert_eq!(audio.kind, SourceKind::Audio);
     let audio = settled(&h, &t, &audio.id).await;
@@ -535,6 +580,7 @@ async fn video_frames_go_to_the_writer_with_what_was_said() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
+    keep_every_hit(&h, &t, 8).await;
     let video = upload_ok(
         &h,
         &t,
@@ -577,8 +623,8 @@ async fn video_frames_go_to_the_writer_with_what_was_said() {
         .clone();
     let frame = passages
         .iter()
-        .find(|p| p.image.is_some())
-        .expect("a frame among the passages");
+        .find(|p| p.image.is_some() && p.start_ms == Some(7_500))
+        .expect("the cycloid frame among the passages");
     assert_eq!(frame.start_ms, Some(7_500));
     assert_eq!(frame.text, "we draw a cycloid with");
     assert!(
@@ -603,10 +649,11 @@ async fn video_frames_go_to_the_writer_with_what_was_said() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn at_most_four_pictures_among_eight_passages() {
+async fn pictures_are_capped_by_the_budgets_images_max() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
+    keep_every_hit(&h, &t, 4).await;
     let mut sources = Vec::new();
     for i in 0..6 {
         sources.push(
@@ -636,8 +683,9 @@ async fn at_most_four_pictures_among_eight_passages() {
     let passages = h.generator.lesson_requests.lock().unwrap()[0]
         .passages
         .clone();
-    assert_eq!(passages.len(), 8);
+    // Six figures match; the budget lets four pictures in, and the notes come too.
     assert_eq!(passages.iter().filter(|p| p.image.is_some()).count(), 4);
+    assert!(passages.iter().any(|p| p.image.is_none()), "{passages:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -689,6 +737,10 @@ async fn a_failed_regeneration_keeps_the_old_citations() {
 /// `~/Library/Caches/margin-embed-test/media`. Transcription needs `fluidaudiocli`.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_media_end_to_end_when_the_model_is_here() {
+    if std::env::var("MARGIN_REAL_MODEL_TESTS").map_or(true, |v| v != "1") {
+        eprintln!("skipping: real-model tests need MARGIN_REAL_MODEL_TESTS=1");
+        return;
+    }
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
     let model = std::env::var_os("MARGIN_EMBED_MODEL_DIR")
         .map(std::path::PathBuf::from)
@@ -894,7 +946,7 @@ async fn video_jobs_are_traced_under_their_id() {
         assert_eq!(s.route, Some(Route::Write));
         assert_eq!(s.job_id.as_deref(), Some(v.id.as_str()));
         assert_eq!(s.step, Some(i as u32 + 1));
-        assert_eq!(s.prompt_version.as_deref(), Some("scene-v1"));
+        assert_eq!(s.prompt_version.as_deref(), Some("scene-v2"));
         assert_eq!(s.model.as_deref(), Some("test-model"));
         assert!(s.pipeline_hash.is_some());
     }
