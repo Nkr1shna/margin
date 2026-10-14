@@ -12,7 +12,7 @@ Every decision below was made explicitly by the owner. Do not change one without
 | Area | Decision |
 | --- | --- |
 | UI framework | **Dioxus 0.7.9** (webview renderer) for desktop, iOS and Android from one codebase. |
-| Layout | Mockup **Option D · Notebook + Ask** (`../mockups/study-app/index.html`, `data-option="d"`), styled with openai.com's Oct 2026 tokens (the `.win` / `.app-scope` CSS block in that file). Sidebar becomes a drawer on narrow screens. |
+| Layout | Mockup **Option D · Notebook + Ask** (`mockups/study-app/index.html`, `data-option="d"`), styled with openai.com's Oct 2026 tokens (the `.win` / `.app-scope` CSS block in that file). Sidebar becomes a drawer on narrow screens. |
 | Scope | Sidebar topic tree, Ask (outline → lessons), Lesson with Read / Notes / Video views, **margin notes from text selection**, Notes, Video, Settings, **⌘K search**. **No** document tabs, **no** separate Videos page. |
 | UI rule | Every UI element is fully functional. No mock or placeholder controls. If something can't be built, leave it out and ask. |
 | Data | A **service** on the owner's Mac with **SurrealDB embedded** (`kv-surrealkv` on disk; `kv-mem` in tests). Apps talk only to the service and receive live updates over a WebSocket. |

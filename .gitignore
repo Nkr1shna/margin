@@ -1,2 +1,3 @@
 target/
 .margin-data/
+.DS_Store
