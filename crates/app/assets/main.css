@@ -563,6 +563,15 @@ body.resizing-sb * { user-select: none !important; }
 .viewer-figure figcaption, .viewer-label { margin: 0; font-size: 13px; font-weight: 500; color: var(--fg-2); }
 .viewer-excerpt { margin: 0; padding: 12px 14px; border-radius: var(--r-card); background: var(--surface); font-size: 15px; line-height: 24px; white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
 .viewer-code { max-height: none; white-space: pre-wrap; color: var(--fg); background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+/* A text or code file's lines around a citation: numbered, the cited ones marked. The
+   list scrolls on its own so the cited lines can be brought into view. */
+.src-lines { list-style: none; margin: 0; padding: 8px 0; border-radius: var(--r-card); background: var(--surface); max-height: min(56vh, 520px); overflow: auto; overscroll-behavior: contain; font-size: 14px; line-height: 22px; -webkit-user-select: text; user-select: text; }
+.src-lines.code-lines { font-family: var(--font-mono); font-size: 12.5px; line-height: 20px; }
+.src-line { display: flex; gap: 12px; padding: 0 14px 0 0; color: var(--fg-2); }
+.src-line.cited { color: var(--fg); background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.src-ln { flex: none; min-width: 44px; text-align: right; color: var(--fg-3); font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; -webkit-user-select: none; user-select: none; }
+.src-text { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.src-line mark.src-text { background: transparent; color: inherit; }
 .viewer-excerpt mark, .transcript mark { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 1px 2px; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
 .viewer-audio { width: 100%; display: block; }
 .viewer-video { aspect-ratio: auto; max-height: min(56vh, 520px); }

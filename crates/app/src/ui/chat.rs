@@ -154,12 +154,24 @@ fn call_id_of(item: &ChatItem) -> Option<&str> {
 /// A tool's name as words, for a call whose own label hasn't arrived yet:
 /// "search_library" → "Search library".
 pub fn tool_words(name: &str) -> String {
-    crate::ui::common::capitalize_first(&name.replace('_', " "))
+    match name {
+        // The retrieval tools, as their rows say them before the call's own label
+        // ("Searching for “…”", "Reading page 3") arrives.
+        "search" => "Searching the documents".into(),
+        "read_passage" => "Reading a passage".into(),
+        "document_outline" => "Reading a document's outline".into(),
+        "view_picture" => "Looking at a picture".into(),
+        _ => crate::ui::common::capitalize_first(&name.replace('_', " ")),
+    }
 }
 
 /// The icon of a tool's row.
 fn tool_icon(name: &str) -> &'static str {
     match name {
+        "search" => "search",
+        "read_passage" => "note",
+        "document_outline" => "book",
+        "view_picture" => "image",
         n if n.starts_with("search_") => "search",
         "list_topics" | "get_topic" | "create_topic" | "rename_topic" | "move_topic" => "topic",
         "read_lesson" | "write_lesson" | "regenerate_lesson" | "edit_lesson_title" => "book",
@@ -2093,6 +2105,16 @@ mod tests {
     fn text_helpers() {
         assert_eq!(tool_words("search_library"), "Search library");
         assert_eq!(tool_icon("search_sources"), "search");
+        // The retrieval tools: their own words and icons.
+        for (name, words, icon) in [
+            ("search", "Searching the documents", "search"),
+            ("read_passage", "Reading a passage", "note"),
+            ("document_outline", "Reading a document's outline", "book"),
+            ("view_picture", "Looking at a picture", "image"),
+        ] {
+            assert_eq!(tool_words(name), words);
+            assert_eq!(tool_icon(name), icon);
+        }
         assert_eq!(tool_icon("read_lesson"), "book");
         assert_eq!(tool_icon("list_files"), "folder");
         assert_eq!(tool_icon("anything"), "wrench");
@@ -2196,9 +2218,20 @@ mod tests {
         assert!(html.contains("2 matches: 1 lesson, 1 note"));
         assert!(html.contains(r#"aria-expanded="false""#));
         assert!(!html.contains(r#"class="tool-body""#));
-        // The passages card lists each passage to open.
+        // The passages card lists each passage to open, with where in its document.
         assert!(html.contains("Passages for “partial sums overshoot”"));
         assert!(html.contains("Oppenheim ch3.pdf"));
+        assert!(html.contains("PDF · p. 3"));
+        assert!(html.contains("Code · lines 1–7"), "{html}");
+        // The retrieval tools' rows: label, icon, what they found.
+        assert!(html.contains("Searching for “partial sums overshoot”"));
+        assert!(html.contains("3 passages from 3 documents"));
+        assert!(html.contains("Reading a document&#39;s outline"));
+        assert!(html.contains("3 sections"));
+        assert!(html.contains("Reading page 3"));
+        assert!(html.contains("Looking at page 3"));
+        assert!(html.contains("Page 3 of Oppenheim ch3.pdf"));
+        assert!(html.contains("Passages for “Oppenheim ch3.pdf, page 3”"));
         // An idle chat: Send, no Stop, no pending message.
         assert!(html.contains(r#"aria-label="Send""#));
         assert!(!html.contains(">Stop<"));

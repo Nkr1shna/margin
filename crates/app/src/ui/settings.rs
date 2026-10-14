@@ -1,10 +1,12 @@
-//! Settings: service, account and devices, AI provider and key, the embedding model for
-//! sources, voice, render size, tools on the service Mac, and appearance.
+//! Settings: service, account and devices, AI provider and key, the three model slots
+//! and the retrieval pipeline's budget, the embedding model for sources, voice, render
+//! size, tools on the service Mac, trace retention, and appearance.
 
 use dioxus::prelude::*;
+use margin_shared::pipeline::{Budget, PipelineConfig, Route};
 use margin_shared::{
     Device, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id, ReasoningEffort, SOURCE_KINDS,
-    Settings, SettingsPatch, Source, ToolStatus, Workspace, WorkspaceSync,
+    Settings, SettingsPatch, Source, TRACE_RETENTION_DAYS, ToolStatus, Workspace, WorkspaceSync,
 };
 
 use crate::config::{Appearance, normalize_service_url};
@@ -63,10 +65,11 @@ pub enum SettingsPane {
     Folders,
     Video,
     Tools,
+    Advanced,
 }
 
 impl SettingsPane {
-    pub const ALL: [SettingsPane; 8] = [
+    pub const ALL: [SettingsPane; 9] = [
         SettingsPane::General,
         SettingsPane::Account,
         SettingsPane::Service,
@@ -75,6 +78,7 @@ impl SettingsPane {
         SettingsPane::Folders,
         SettingsPane::Video,
         SettingsPane::Tools,
+        SettingsPane::Advanced,
     ];
 
     pub fn label(self) -> &'static str {
@@ -87,6 +91,7 @@ impl SettingsPane {
             SettingsPane::Folders => "Folders",
             SettingsPane::Video => "Voice & video",
             SettingsPane::Tools => "Tools",
+            SettingsPane::Advanced => "Advanced",
         }
     }
 
@@ -100,6 +105,7 @@ impl SettingsPane {
             SettingsPane::Folders => "folder",
             SettingsPane::Video => "video",
             SettingsPane::Tools => "wrench",
+            SettingsPane::Advanced => "gear",
         }
     }
 }
@@ -216,7 +222,9 @@ pub fn SettingsDialog() -> Element {
                             SettingsPane::Service => rsx! { ServiceSection {} },
                             SettingsPane::Ai => service_settings(|s| rsx! {
                                 AiSection { settings: s.clone() }
-                                AgentSection { settings: s }
+                                ModelsSection { settings: s.clone() }
+                                AgentSection { settings: s.clone() }
+                                PipelineSection { settings: s }
                             }),
                             SettingsPane::Sources => rsx! { SourcesSection {} },
                             SettingsPane::Folders => rsx! { FoldersSection {} },
@@ -225,6 +233,9 @@ pub fn SettingsDialog() -> Element {
                                 RenderSection { settings: s }
                             }),
                             SettingsPane::Tools => rsx! { ToolsSection {} },
+                            SettingsPane::Advanced => service_settings(|s| rsx! {
+                                TracesSection { settings: s }
+                            }),
                         }
                     }
                 }
@@ -555,7 +566,7 @@ fn AiSection(settings: Settings) -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "AI provider" }
-            p { class: "help", "Margin uses an OpenAI-compatible Responses API for chats, outlines, lessons and video scenes." }
+            p { class: "help", "Margin uses an OpenAI-compatible Responses API for chats, outlines, lessons and video scenes. The default model is used wherever a slot under Models names none." }
             form {
                 style: "display: grid; gap: 14px",
                 onsubmit: {
@@ -613,7 +624,7 @@ fn AiSection(settings: Settings) -> Element {
                         }
                     }
                     div { class: "field",
-                        label { r#for: "ai-model", "Model" }
+                        label { r#for: "ai-model", "Default model" }
                         input {
                             id: "ai-model",
                             class: "input",
@@ -735,50 +746,134 @@ pub fn shown_effort(effort: ReasoningEffort) -> ReasoningEffort {
     }
 }
 
-/// The model chats use (when not the one above) and how hard it thinks before answering.
+/// The label of a model slot (Settings → AI → Models).
+pub fn slot_label(route: Route) -> &'static str {
+    match route {
+        Route::Chat => "Model for chats",
+        Route::Write => "Model for writing",
+        Route::Small => "Model for small tasks",
+    }
+}
+
+/// What a model slot is used for.
+pub fn slot_help(route: Route) -> &'static str {
+    match route {
+        Route::Chat => "Answers in chats and uses the agent's tools.",
+        Route::Write => "Writes lessons, video scenes and course outlines.",
+        Route::Small => "Names chats and condenses long ones.",
+    }
+}
+
+/// The model a slot names now, "" for the default model. Chats run on `agent_model`;
+/// writing and small tasks on the pipeline's route for them.
+pub fn slot_value(settings: &Settings, route: Route) -> String {
+    match route {
+        Route::Chat => settings.agent_model.clone().unwrap_or_default(),
+        Route::Write | Route::Small => settings
+            .pipeline
+            .routes
+            .get(route)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// The patch that sets the slots to `wanted` (in `Route::ALL` order; "" = the default
+/// model): only what changed, the pipeline sent whole with its routes updated.
+pub fn slots_patch(settings: &Settings, wanted: &[String; 3]) -> SettingsPatch {
+    let mut patch = SettingsPatch::default();
+    let mut routes = settings.pipeline.routes.clone();
+    let mut routes_changed = false;
+    for (route, value) in Route::ALL.into_iter().zip(wanted) {
+        let value = value.trim();
+        if value == slot_value(settings, route) {
+            continue;
+        }
+        let model = (!value.is_empty()).then(|| value.to_string());
+        match route {
+            Route::Chat => patch.agent_model = Some(model),
+            Route::Write => {
+                routes.write = model;
+                routes_changed = true;
+            }
+            Route::Small => {
+                routes.small = model;
+                routes_changed = true;
+            }
+        }
+    }
+    if routes_changed {
+        patch.pipeline = Some(PipelineConfig {
+            routes,
+            ..settings.pipeline.clone()
+        });
+    }
+    patch
+}
+
+/// The three model slots: which model chats, writing and small tasks use.
 #[component]
-fn AgentSection(settings: Settings) -> Element {
+fn ModelsSection(settings: Settings) -> Element {
     let app = use_app();
-    let current = settings.agent_model.clone().unwrap_or_default();
-    let mut model = use_signal(|| current.clone());
+    let current = Route::ALL.map(|r| slot_value(&settings, r));
+    let mut values = use_signal(|| current.clone());
     let error = use_signal(|| None::<String>);
     let busy = use_signal(|| false);
-    let effort_error = use_signal(|| None::<String>);
-    let effort_busy = use_signal(|| false);
     let mut saved_note = use_signal(|| false);
-    let dirty = model.read().trim() != current;
-    let effort = shown_effort(settings.reasoning_effort);
+    let dirty = values
+        .read()
+        .iter()
+        .zip(current.iter())
+        .any(|(v, c)| v.trim() != c);
+    let default_model = settings.openai_model.clone();
 
     rsx! {
         section { class: "set-sec",
-            h2 { "Chats" }
-            p { class: "help", "The model that answers in chats, and how much it reasons first. More reasoning answers harder questions better but takes longer and costs more." }
+            h2 { "Models" }
+            p { class: "help", "Which model each kind of work uses. Leave a slot empty to use the default model ({default_model})." }
             form {
-                class: "field",
-                onsubmit: move |e: FormEvent| async move {
-                    e.prevent_default();
-                    if *busy.peek() {
-                        return;
-                    }
-                    let m = model.peek().trim().to_string();
-                    let patch = SettingsPatch {
-                        agent_model: Some((!m.is_empty()).then_some(m)),
-                        ..Default::default()
-                    };
-                    if save_settings(app, patch, error, busy).await {
-                        saved_note.set(true);
+                style: "display: grid; gap: 14px",
+                onsubmit: {
+                    let settings = settings.clone();
+                    move |e: FormEvent| {
+                        e.prevent_default();
+                        let settings = settings.clone();
+                        async move {
+                            if *busy.peek() {
+                                return;
+                            }
+                            let patch = slots_patch(&settings, &values.peek());
+                            if patch == SettingsPatch::default() {
+                                return;
+                            }
+                            if save_settings(app, patch, error, busy).await {
+                                saved_note.set(true);
+                            }
+                        }
                     }
                 },
-                label { r#for: "ai-agent-model", "Model for chats" }
-                div { class: "row-actions",
-                    input {
-                        id: "ai-agent-model",
-                        class: "input",
-                        style: "flex: 1; min-width: 220px",
-                        placeholder: "Same as above ({settings.openai_model})",
-                        initial_value: "{model}",
-                        oninput: move |e| { saved_note.set(false); model.set(e.value()) },
+                for (i, route) in Route::ALL.into_iter().enumerate() {
+                    div { key: "{route.as_str()}", class: "field",
+                        label { r#for: "ai-slot-{route.as_str()}", {slot_label(route)} }
+                        input {
+                            id: "ai-slot-{route.as_str()}",
+                            class: "input",
+                            autocomplete: "off",
+                            "aria-describedby": "ai-slot-{route.as_str()}-help",
+                            placeholder: "Default model ({default_model})",
+                            initial_value: "{current[i]}",
+                            oninput: move |e| {
+                                saved_note.set(false);
+                                values.write()[i] = e.value();
+                            },
+                        }
+                        span { id: "ai-slot-{route.as_str()}-help", class: "faint", style: "font-size: 13px", {slot_help(route)} }
                     }
+                }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+                div { class: "row-actions",
                     button {
                         r#type: "submit",
                         class: "btn btn-primary btn-sm",
@@ -789,10 +884,23 @@ fn AgentSection(settings: Settings) -> Element {
                         span { class: "save-state", role: "status", "Saved" }
                     }
                 }
-                if let Some(err) = error.read().clone() {
-                    span { class: "save-state error", role: "alert", "{err}" }
-                }
             }
+        }
+    }
+}
+
+/// How hard the agent thinks before answering in chats.
+#[component]
+fn AgentSection(settings: Settings) -> Element {
+    let app = use_app();
+    let effort_error = use_signal(|| None::<String>);
+    let effort_busy = use_signal(|| false);
+    let effort = shown_effort(settings.reasoning_effort);
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Chats" }
+            p { class: "help", "How much the chat model reasons before answering. More reasoning answers harder questions better but takes longer and costs more." }
             div { class: "field",
                 span { class: "label", id: "ai-effort-label", "Reasoning" }
                 div { class: "seg", role: "radiogroup", "aria-labelledby": "ai-effort-label", "aria-busy": effort_busy.read().to_string(),
@@ -815,6 +923,399 @@ fn AgentSection(settings: Settings) -> Element {
                     }
                 }
                 if let Some(err) = effort_error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+            }
+        }
+    }
+}
+
+/// The numbers of the pipeline's `Budget`, as Settings edits them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BudgetField {
+    Share,
+    MinScore,
+    Images,
+    PassagesMin,
+}
+
+impl BudgetField {
+    pub const ALL: [BudgetField; 4] = [
+        BudgetField::Share,
+        BudgetField::MinScore,
+        BudgetField::Images,
+        BudgetField::PassagesMin,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            BudgetField::Share => "pl-share",
+            BudgetField::MinScore => "pl-score",
+            BudgetField::Images => "pl-images",
+            BudgetField::PassagesMin => "pl-min",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetField::Share => "Share of the model's window",
+            BudgetField::MinScore => "Leave out passages below",
+            BudgetField::Images => "Pictures per call, at most",
+            BudgetField::PassagesMin => "Passages to keep, at least",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            BudgetField::Share => "Percent of the model's context window passages may fill.",
+            BudgetField::MinScore => {
+                "Percentile of the best passages' scores; passages under it are dropped."
+            }
+            BudgetField::Images => "Pages, figures and frames sent with one model call.",
+            BudgetField::PassagesMin => "Kept even when they score under the cut-off.",
+        }
+    }
+
+    fn unit(self) -> Option<&'static str> {
+        match self {
+            BudgetField::Share => Some("%"),
+            BudgetField::MinScore => Some("th percentile"),
+            BudgetField::Images | BudgetField::PassagesMin => None,
+        }
+    }
+
+    fn range(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            BudgetField::Share => ("1", Some("100")),
+            BudgetField::MinScore => ("0", Some("100")),
+            BudgetField::Images | BudgetField::PassagesMin => ("0", None),
+        }
+    }
+}
+
+/// `budget`'s numbers as the form shows them, in `BudgetField::ALL` order (the share as
+/// a percentage).
+pub fn budget_fields(budget: &Budget) -> [String; 4] {
+    let pct = budget.share_of_window * 100.0;
+    let share = if (pct - pct.round()).abs() < 0.01 {
+        format!("{}", pct.round() as i64)
+    } else {
+        format!("{pct:.1}")
+    };
+    [
+        share,
+        budget.min_score_pct.to_string(),
+        budget.images_max.to_string(),
+        budget.passages_min.to_string(),
+    ]
+}
+
+/// The budget the form's numbers make, or the first field that's wrong and why.
+pub fn parse_budget(fields: &[String; 4]) -> Result<Budget, (BudgetField, &'static str)> {
+    let [share, score, images, min] = fields;
+    let share = share
+        .trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && (1.0..=100.0).contains(v))
+        .ok_or((BudgetField::Share, "Enter a share from 1 to 100%."))?;
+    let min_score_pct = score
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .filter(|v| *v <= 100)
+        .ok_or((BudgetField::MinScore, "Enter a percentile from 0 to 100."))?;
+    let whole = |v: &str, field| {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|_| (field, "Enter a whole number, 0 or more."))
+    };
+    Ok(Budget {
+        share_of_window: share / 100.0,
+        min_score_pct,
+        images_max: whole(images, BudgetField::Images)?,
+        passages_min: whole(min, BudgetField::PassagesMin)?,
+    })
+}
+
+/// `cfg` with its stages, prompts and budget back to the defaults; the model slots (its
+/// routes) are kept, since Models sets them.
+pub fn reset_pipeline(cfg: &PipelineConfig) -> PipelineConfig {
+    PipelineConfig {
+        routes: cfg.routes.clone(),
+        ..PipelineConfig::default()
+    }
+}
+
+/// The pipeline's stages as Settings lists them: (label, value).
+pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
+    vec![
+        ("Chunker", cfg.chunker.name.clone()),
+        ("Retriever", cfg.retriever.name.clone()),
+        ("Fusion", cfg.fusion.name.clone()),
+        ("Reranker", cfg.reranker.name.clone()),
+        ("Packer", cfg.packer.name.clone()),
+        ("Prompts", cfg.prompts.clone()),
+        ("Fingerprint", cfg.hash()),
+    ]
+}
+
+/// The retrieval pipeline: its stages, its budget (editable), and Reset to default.
+#[component]
+fn PipelineSection(settings: Settings) -> Element {
+    let app = use_app();
+    let cfg = settings.pipeline.clone();
+    let initial = budget_fields(&cfg.budget);
+    let mut fields = use_signal(|| initial.clone());
+    // Bumped when the fields are set by code, to remount them with the new numbers.
+    let mut rev = use_signal(|| 0u64);
+    let mut problem = use_signal(|| None::<(BudgetField, &'static str)>);
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
+    let mut confirm_reset = use_signal(|| false);
+    let reset_error = use_signal(|| None::<String>);
+    let reset_busy = use_signal(|| false);
+    let dirty = *fields.read() != initial;
+    let is_default = reset_pipeline(&cfg) == cfg;
+    let rows = pipeline_rows(&cfg);
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Pipeline" }
+            p { class: "help", "How the service finds passages in your sources and packs them for lessons, outlines and the agent's search. The budget is a share of each model's context window, not a fixed size." }
+            div { class: "kv", "aria-label": "Stages",
+                for (label, value) in rows {
+                    span { key: "{label}", "{label}" }
+                    span { class: "mono", "{value}" }
+                }
+            }
+            form {
+                style: "display: grid; gap: 14px",
+                novalidate: true,
+                onsubmit: {
+                    let cfg = cfg.clone();
+                    move |e: FormEvent| {
+                        e.prevent_default();
+                        let cfg = cfg.clone();
+                        async move {
+                            if *busy.peek() {
+                                return;
+                            }
+                            let budget = match parse_budget(&fields.peek()) {
+                                Ok(b) => b,
+                                Err((field, message)) => {
+                                    problem.set(Some((field, message)));
+                                    focus_first(&format!("#{}", field.id()));
+                                    return;
+                                }
+                            };
+                            problem.set(None);
+                            if budget == cfg.budget {
+                                return;
+                            }
+                            let patch = SettingsPatch {
+                                pipeline: Some(PipelineConfig { budget, ..cfg }),
+                                ..Default::default()
+                            };
+                            if save_settings(app, patch, error, busy).await {
+                                // The numbers as the service keeps them.
+                                fields.set(budget_fields(&budget));
+                                rev += 1;
+                                saved_note.set(true);
+                            }
+                        }
+                    }
+                },
+                div { class: "grid2",
+                    for (i, field) in BudgetField::ALL.into_iter().enumerate() {
+                        div { key: "{field.id()}-{rev}", class: "field",
+                            label { r#for: "{field.id()}", {field.label()} }
+                            div { class: "row-actions", style: "flex-wrap: nowrap",
+                                input {
+                                    id: "{field.id()}",
+                                    class: "input",
+                                    style: "flex: 1; min-width: 80px",
+                                    r#type: "number",
+                                    inputmode: if field == BudgetField::Share { "decimal" } else { "numeric" },
+                                    min: field.range().0,
+                                    max: field.range().1,
+                                    step: if field == BudgetField::Share { "any" } else { "1" },
+                                    "aria-invalid": problem.read().is_some_and(|(f, _)| f == field).to_string(),
+                                    "aria-describedby": "{field.id()}-help",
+                                    initial_value: "{fields.peek()[i]}",
+                                    oninput: move |e| {
+                                        saved_note.set(false);
+                                        problem.set(None);
+                                        fields.write()[i] = e.value();
+                                    },
+                                }
+                                if let Some(unit) = field.unit() {
+                                    span { class: "faint", "{unit}" }
+                                }
+                            }
+                            match *problem.read() {
+                                Some((f, message)) if f == field => rsx! {
+                                    span { id: "{field.id()}-help", class: "field-error", "{message}" }
+                                },
+                                _ => rsx! {
+                                    span { id: "{field.id()}-help", class: "faint", style: "font-size: 13px", {field.help()} }
+                                },
+                            }
+                        }
+                    }
+                }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+                div { class: "row-actions",
+                    button {
+                        r#type: "submit",
+                        class: "btn btn-primary btn-sm",
+                        disabled: !dirty || *busy.read(),
+                        SaveLabel { busy: *busy.read() }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-secondary btn-sm",
+                        disabled: is_default || *reset_busy.read(),
+                        title: if is_default { "The pipeline is at its defaults" } else { "" },
+                        onclick: move |_| confirm_reset.set(true),
+                        "Reset to default…"
+                    }
+                    if *saved_note.read() && !dirty {
+                        span { class: "save-state", role: "status", "Saved" }
+                    }
+                }
+                if let Some(err) = reset_error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+            }
+        }
+        if *confirm_reset.read() {
+            ConfirmDialog {
+                title: "Reset the pipeline to its defaults?",
+                message: "Its stages, prompts and budget go back to Margin's defaults. The models chosen above stay. Lessons written from now on use the defaults.",
+                confirm_label: "Reset",
+                danger: false,
+                busy: *reset_busy.read(),
+                on_cancel: move |_| confirm_reset.set(false),
+                on_confirm: {
+                    let cfg = cfg.clone();
+                    move |_| {
+                        let cfg = cfg.clone();
+                        async move {
+                            let patch = SettingsPatch {
+                                pipeline: Some(reset_pipeline(&cfg)),
+                                ..Default::default()
+                            };
+                            if save_settings(app, patch, reset_error, reset_busy).await {
+                                fields.set(budget_fields(&Budget::default()));
+                                problem.set(None);
+                                rev += 1;
+                            }
+                            confirm_reset.set(false);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// The number of days the retention field holds, or why it can't be saved.
+pub fn parse_retention(input: &str) -> Result<u32, &'static str> {
+    input
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|d| (1..=3650).contains(d))
+        .ok_or("Enter a number of days from 1 to 3650.")
+}
+
+/// Settings → Advanced: how long the service keeps its trace rows.
+#[component]
+fn TracesSection(settings: Settings) -> Element {
+    let app = use_app();
+    let current = settings.trace_retention_days;
+    let mut days = use_signal(|| current.to_string());
+    let mut problem = use_signal(|| None::<&'static str>);
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
+    let dirty = days.read().trim() != current.to_string();
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Traces" }
+            p { class: "help", "The service records a trace of every model call, search, tool call and job: when, how long, which model, tokens and cost, never what was said. Evaluations and reports outside the app read them. Each day, traces older than this are deleted; the hourly and daily totals stay." }
+            form {
+                class: "field",
+                novalidate: true,
+                onsubmit: move |e: FormEvent| async move {
+                    e.prevent_default();
+                    if *busy.peek() {
+                        return;
+                    }
+                    let d = match parse_retention(&days.peek()) {
+                        Ok(d) => d,
+                        Err(message) => {
+                            problem.set(Some(message));
+                            focus_first("#trace-days");
+                            return;
+                        }
+                    };
+                    problem.set(None);
+                    if d == current {
+                        return;
+                    }
+                    let patch = SettingsPatch { trace_retention_days: Some(d), ..Default::default() };
+                    if save_settings(app, patch, error, busy).await {
+                        saved_note.set(true);
+                    }
+                },
+                label { r#for: "trace-days", "Keep traces for" }
+                div { class: "row-actions", style: "justify-content: flex-start",
+                    input {
+                        id: "trace-days",
+                        class: "input",
+                        style: "width: 110px",
+                        r#type: "number",
+                        inputmode: "numeric",
+                        min: "1",
+                        max: "3650",
+                        step: "1",
+                        "aria-invalid": problem.read().is_some().to_string(),
+                        "aria-describedby": "trace-days-help",
+                        initial_value: "{days}",
+                        oninput: move |e| {
+                            saved_note.set(false);
+                            problem.set(None);
+                            days.set(e.value());
+                        },
+                    }
+                    span { "days" }
+                    button {
+                        r#type: "submit",
+                        class: "btn btn-primary btn-sm",
+                        disabled: !dirty || *busy.read(),
+                        SaveLabel { busy: *busy.read() }
+                    }
+                    if *saved_note.read() && !dirty {
+                        span { class: "save-state", role: "status", "Saved" }
+                    }
+                }
+                match *problem.read() {
+                    Some(message) => rsx! {
+                        span { id: "trace-days-help", class: "field-error", "{message}" }
+                    },
+                    None => rsx! {
+                        span { id: "trace-days-help", class: "faint", style: "font-size: 13px", "From 1 to 3650 days; {TRACE_RETENTION_DAYS} unless changed." }
+                    },
+                }
+                if let Some(err) = error.read().clone() {
                     span { class: "save-state error", role: "alert", "{err}" }
                 }
             }
@@ -1835,10 +2336,143 @@ mod tests {
         lib.settings = Some(settings);
         let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
         assert!(html.contains("Model for chats"), "{html}");
-        assert!(html.contains("Same as above (gpt-5)"));
+        assert!(html.contains("Default model (gpt-5)"));
         for e in ReasoningEffort::ALL {
             assert!(html.contains(effort_label(e)));
         }
+    }
+
+    fn ai_pane(settings: Settings) -> String {
+        use crate::store::LibraryState;
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        lib.settings = Some(settings);
+        crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai))
+    }
+
+    #[test]
+    fn ai_pane_has_three_model_slots() {
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.agent_model = Some("gpt-6.1-sol".into());
+        settings.pipeline.routes.small = Some("gpt-6-luna".into());
+        let html = ai_pane(settings.clone());
+        assert!(html.contains("<h2>Models</h2>"), "{html}");
+        for route in Route::ALL {
+            assert!(html.contains(slot_label(route)));
+            assert!(html.contains(&slot_help(route).replace('\'', "&#39;")));
+            assert!(html.contains(&format!(r#"id="ai-slot-{}""#, route.as_str())));
+        }
+        // Each slot shows the model it names; an empty one says it uses the default.
+        assert!(html.contains(r#"value="gpt-6.1-sol""#));
+        assert!(html.contains(r#"value="gpt-6-luna""#));
+        assert!(html.contains(r#"placeholder="Default model (gpt-5)""#));
+        assert_eq!(slot_value(&settings, Route::Write), "");
+        // Clearing a slot sends "the default"; a route keeps the rest of the pipeline.
+        let patch = slots_patch(&settings, &["".into(), "gpt-6".into(), "gpt-6-luna".into()]);
+        assert_eq!(patch.agent_model, Some(None));
+        let pipeline = patch.pipeline.unwrap();
+        assert_eq!(pipeline.routes.write.as_deref(), Some("gpt-6"));
+        assert_eq!(pipeline.routes.small.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(pipeline.budget, settings.pipeline.budget);
+        let only_chat = slots_patch(&settings, &["gpt-6".into(), "".into(), "gpt-6-luna".into()]);
+        assert_eq!(only_chat.agent_model, Some(Some("gpt-6".into())));
+        assert_eq!(only_chat.pipeline, None);
+    }
+
+    #[test]
+    fn ai_pane_shows_the_pipeline_and_its_budget() {
+        let mut settings = crate::fake::FakeState::new().settings;
+        let html = ai_pane(settings.clone());
+        assert!(html.contains("<h2>Pipeline</h2>"), "{html}");
+        for (label, value) in pipeline_rows(&settings.pipeline) {
+            assert!(html.contains(&format!(">{label}<")), "{label}");
+            assert!(html.contains(&format!(">{value}<")), "{value}");
+        }
+        for field in BudgetField::ALL {
+            assert!(html.contains(&field.label().replace('\'', "&#39;")));
+            assert!(html.contains(&field.help().replace('\'', "&#39;")));
+        }
+        assert!(html.contains(r#"id="pl-share""#));
+        assert!(html.contains(r#"value="50""#));
+        // At the defaults, Reset has nothing to do.
+        let reset = html.find("Reset to default…").unwrap();
+        let button = &html[html[..reset].rfind("<button").unwrap()..reset];
+        assert!(button.contains("disabled"), "{button}");
+        // Changed: Reset is offered.
+        settings.pipeline.budget.images_max = 2;
+        let html = ai_pane(settings);
+        assert!(html.contains(r#"value="2""#));
+        let reset = html.find("Reset to default…").unwrap();
+        let button = &html[html[..reset].rfind("<button").unwrap()..reset];
+        assert!(!button.contains("disabled"), "{button}");
+    }
+
+    #[test]
+    fn budget_numbers_are_checked() {
+        let ok = |a: &str, b: &str, c: &str, d: &str| parse_budget(&[a, b, c, d].map(String::from));
+        assert_eq!(ok("50", "25", "8", "0").unwrap(), Budget::default());
+        let b = ok(" 12.5 ", "0", "0", "3").unwrap();
+        assert_eq!(b.share_of_window, 0.125);
+        assert_eq!((b.min_score_pct, b.images_max, b.passages_min), (0, 0, 3));
+        assert_eq!(budget_fields(&b)[0], "12.5");
+        assert_eq!(
+            ok("100%", "100", "1000", "500").unwrap().share_of_window,
+            1.0
+        );
+        // No fixed small cap on pictures or passages.
+        assert_eq!(
+            ok("50", "25", "4000000", "0").unwrap().images_max,
+            4_000_000
+        );
+        assert_eq!(ok("0", "25", "8", "0").unwrap_err().0, BudgetField::Share);
+        assert_eq!(ok("101", "25", "8", "0").unwrap_err().0, BudgetField::Share);
+        assert_eq!(
+            ok("half", "25", "8", "0").unwrap_err().0,
+            BudgetField::Share
+        );
+        assert_eq!(
+            ok("50", "101", "8", "0").unwrap_err().0,
+            BudgetField::MinScore
+        );
+        assert_eq!(
+            ok("50", "25", "-1", "0").unwrap_err().0,
+            BudgetField::Images
+        );
+        assert_eq!(
+            ok("50", "25", "8", "2.5").unwrap_err().0,
+            BudgetField::PassagesMin
+        );
+        // Reset keeps the model slots and nothing else.
+        let mut cfg = PipelineConfig::default();
+        cfg.routes.write = Some("gpt-6".into());
+        cfg.retriever.name = "dense".into();
+        cfg.budget.images_max = 1;
+        let reset = reset_pipeline(&cfg);
+        assert_eq!(reset.routes, cfg.routes);
+        assert_eq!(reset.retriever.name, "hybrid-rrf");
+        assert_eq!(reset.budget, Budget::default());
+    }
+
+    #[test]
+    fn advanced_pane_sets_trace_retention() {
+        use crate::store::LibraryState;
+        assert!(SettingsPane::ALL.contains(&SettingsPane::Advanced));
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.trace_retention_days = 45;
+        lib.settings = Some(settings);
+        let html =
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Advanced));
+        assert!(html.contains("<h1>Advanced</h1>"), "{html}");
+        assert!(html.contains("<h2>Traces</h2>"));
+        assert!(html.contains("Keep traces for"));
+        assert!(html.contains(r#"id="trace-days""#));
+        assert!(html.contains(r#"value="45""#));
+        assert!(html.contains("never what was said"));
+        assert_eq!(parse_retention(" 30 "), Ok(30));
+        assert_eq!(parse_retention("3650"), Ok(3650));
+        assert!(parse_retention("0").is_err());
+        assert!(parse_retention("3651").is_err());
+        assert!(parse_retention("a week").is_err());
     }
 
     #[test]
