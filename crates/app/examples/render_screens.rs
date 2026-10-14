@@ -37,6 +37,8 @@ mod state;
 mod store;
 #[path = "../src/ui/mod.rs"]
 mod ui;
+#[path = "../src/zoom.rs"]
+mod zoom;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -123,6 +125,7 @@ fn Harness(props: HarnessProps) -> Element {
                 appearance: config::Appearance::System,
                 sidebar_hidden: false,
                 sidebar_width: None,
+                zoom: 100,
             }),
             session: Signal::new(session),
             signed_out_reason: Signal::new(None),

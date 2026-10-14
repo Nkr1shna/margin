@@ -16,12 +16,41 @@ fn options() -> Options {
         | Options::ENABLE_FOOTNOTES
 }
 
-/// Render Markdown to sanitized HTML.
+/// Render Markdown to sanitized HTML. Headings move down a level (`#` is `<h2>`): the
+/// screen around the Markdown owns the page's `<h1>` (a lesson's or note's title).
 pub fn render(markdown: &str) -> String {
-    let parser = Parser::new_ext(markdown, options());
+    let parser = Parser::new_ext(markdown, options()).map(demote_heading);
     let mut raw = String::with_capacity(markdown.len() * 3 / 2);
     html::push_html(&mut raw, parser);
     sanitize(&raw)
+}
+
+fn demote_heading(event: Event<'_>) -> Event<'_> {
+    use pulldown_cmark::HeadingLevel::{self, *};
+    fn lower(level: HeadingLevel) -> HeadingLevel {
+        match level {
+            H1 => H2,
+            H2 => H3,
+            H3 => H4,
+            H4 => H5,
+            H5 | H6 => H6,
+        }
+    }
+    match event {
+        Event::Start(Tag::Heading {
+            level,
+            id,
+            classes,
+            attrs,
+        }) => Event::Start(Tag::Heading {
+            level: lower(level),
+            id,
+            classes,
+            attrs,
+        }),
+        Event::End(TagEnd::Heading(level)) => Event::End(TagEnd::Heading(lower(level))),
+        other => other,
+    }
 }
 
 fn sanitize(raw: &str) -> String {
@@ -202,10 +231,27 @@ mod tests {
     #[test]
     fn renders_basic_markdown() {
         let html = render("# Title\n\nSome *emphasis* and `code`.\n\n- a\n- b\n");
-        assert!(html.contains("<h1>Title</h1>"));
+        // Headings sit under the screen's own <h1>.
+        assert!(html.contains("<h2>Title</h2>"), "{html}");
         assert!(html.contains("<em>emphasis</em>"));
         assert!(html.contains("<code>code</code>"));
         assert!(html.contains("<li>a</li>"));
+    }
+
+    #[test]
+    fn demotes_every_heading_level() {
+        let html = render("# a\n\n## b\n\n### c\n\n#### d\n\n##### e\n\n###### f\n");
+        for tag in [
+            "<h2>a</h2>",
+            "<h3>b</h3>",
+            "<h4>c</h4>",
+            "<h5>d</h5>",
+            "<h6>e</h6>",
+            "<h6>f</h6>",
+        ] {
+            assert!(html.contains(tag), "{tag} in {html}");
+        }
+        assert!(!html.contains("<h1>"));
     }
 
     #[test]

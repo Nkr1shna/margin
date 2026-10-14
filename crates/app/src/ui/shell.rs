@@ -2,9 +2,10 @@
 
 use dioxus::prelude::*;
 
-use crate::routes::Route;
+use crate::routes::{Route, page_title};
 use crate::state::{LiveStatus, LoadStatus, use_app};
-use crate::ui::common::{Icon, js};
+use crate::store::Milestones;
+use crate::ui::common::{Icon, announce, js};
 use crate::ui::search::SearchPalette;
 use crate::ui::settings::{SettingsDialog, SettingsPane};
 use crate::ui::sidebar::Sidebar;
@@ -70,6 +71,22 @@ pub fn Shell() -> Element {
         );
     }));
 
+    // Tell screen readers when background work finishes: an outline drafted, a lesson
+    // written, a video made (or any of them failing). Measured against the last state seen.
+    let seen = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None::<Milestones>)));
+    use_effect(move || {
+        let lib = app.lib.read();
+        let mut seen = seen.borrow_mut();
+        if let Some(before) = seen.as_ref() {
+            let news = lib.announcements(before);
+            if !news.is_empty() {
+                announce(&news.join(" "));
+            }
+        }
+        *seen = Some(lib.milestones());
+    });
+
+    let title = page_title(&route, &app.lib.read());
     let lib_status = app.lib_status.read().clone();
     let live = app.live.read().clone();
     let drawer_open = *app.drawer_open.read();
@@ -82,6 +99,9 @@ pub fn Shell() -> Element {
         .unwrap_or_default();
 
     rsx! {
+        document::Title { "{title}" }
+        // The app's polite live region for completion messages (`common::announce`).
+        div { id: "announcer", class: "sr-only", role: "status", "aria-live": "polite" }
         div {
             class: if sidebar_hidden { "app sb-hidden" } else { "app" },
             style: "{sidebar_style}",

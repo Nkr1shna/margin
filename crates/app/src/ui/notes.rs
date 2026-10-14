@@ -9,7 +9,7 @@ use margin_shared::{Event, Id, NewNote, Note, NotePatch};
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
-use crate::ui::common::{ConfirmDialog, Icon, Loading, TopBar, ago, render_math};
+use crate::ui::common::{ConfirmDialog, Icon, Loading, TopBar, ago, focus_on_mount, render_math};
 
 /// A topic breadcrumb and its notes, each with the title of the lesson it came from.
 type NoteGroup = (String, Vec<(Note, Option<String>)>);
@@ -194,7 +194,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                     for (crumb, list) in rows {
                         div { key: "{crumb}", class: "note-group",
                             if topic.is_none() {
-                                h4 { "{crumb}" }
+                                h3 { "{crumb}" }
                             }
                             for (note, lesson_title) in list {
                                 div {
@@ -242,7 +242,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                             onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { item_menu.set(None) },
                                             button {
                                                 role: "menuitem",
-                                                autofocus: true,
+                                                onmounted: focus_on_mount,
                                                 onclick: {
                                                     let id = note.id.clone();
                                                     move |_| {
@@ -497,6 +497,10 @@ fn NoteEditor(id: Id) -> Element {
                         Icon { name: "trash" }
                     }
                 }
+            }
+            // The page's heading for screen readers; the title field shows it.
+            h1 { class: "sr-only",
+                if title.read().trim().is_empty() { "Untitled note" } else { "{title}" }
             }
             for rev in std::iter::once(remote_rev()) {
             input {

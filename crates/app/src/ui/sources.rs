@@ -307,7 +307,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                     class: "menu below",
                     role: "menu",
                     onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { open.set(false) },
-                    button { role: "menuitem", autofocus: true, onclick: move |_| add(false),
+                    button { role: "menuitem", onmounted: crate::ui::common::focus_on_mount, onclick: move |_| add(false),
                         Icon { name: "note" }
                         "Add files…"
                     }
@@ -580,16 +580,24 @@ pub fn EmbeddingNotice() -> Element {
 
 /// A download's progress bar with "received of total".
 #[component]
-pub fn Progress(received: u64, total: u64) -> Element {
+pub fn Progress(
+    received: u64,
+    total: u64,
+    /// What is downloading, the bar's accessible name.
+    #[props(default = "Downloading the embedding model".to_string())]
+    label: String,
+) -> Element {
     let pct = (received.min(total) * 100).checked_div(total).unwrap_or(0);
     rsx! {
         div { class: "progress",
             div {
                 class: "bar wide",
                 role: "progressbar",
+                "aria-label": "{label}",
                 "aria-valuemin": "0",
                 "aria-valuemax": "100",
                 "aria-valuenow": "{pct}",
+                "aria-valuetext": "{human_bytes(received)} of {human_bytes(total)}",
                 i { style: "width: {pct}%" }
             }
             span { class: "faint", "{human_bytes(received)} of {human_bytes(total)}" }

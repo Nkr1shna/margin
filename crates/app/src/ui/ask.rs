@@ -364,7 +364,8 @@ fn ProposalView(
                     span { class: "spinner" }
                 }
                 for i in 0..proposal.request.lesson_count.min(6) {
-                    div { key: "{i}", class: "ol-item",
+                    // Placeholder rows: nothing for a screen reader to read.
+                    div { key: "{i}", class: "ol-item", "aria-hidden": "true",
                         span { class: "n", "{i + 1}" }
                         div { class: "ol-main",
                             div { class: "skel", style: "width: {55 + (i * 7) % 30}%" }
