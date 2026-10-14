@@ -62,7 +62,9 @@ pub enum SandboxMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Voice {
-    /// PocketTTS through the FluidAudio CLI. `voice` is passed as `--voice` when set.
+    /// PocketTTS through `cli`: the FluidAudio CLI (`fluidaudiocli`, Core ML, macOS) or
+    /// `margin-tts` (`MARGIN_TTS_SCRIPT`, Kyutai's Python `pocket-tts` on the CPU), told
+    /// apart by the file name. `voice` is passed as `--voice` when set.
     PocketTts { cli: PathBuf, voice: Option<String> },
     /// Silence of a plausible length per line. For tests on machines without FluidAudio.
     Silent,
@@ -137,6 +139,11 @@ const SCENE_FILE: &str = "scene.py";
 const SCENE_CLASS: &str = "LessonScene";
 const VOICE_MODULE_FILE: &str = "margin_voice.py";
 const VOICE_MODULE: &str = include_str!("margin_voice.py");
+/// The name `margin-tts` is installed and found under.
+pub const MARGIN_TTS: &str = "margin-tts";
+/// `margin-tts`: a uv script that voices one line with Kyutai's `pocket-tts` on the CPU
+/// (see the file). Installed by writing it to `~/.local/bin/margin-tts`, executable.
+pub const MARGIN_TTS_SCRIPT: &str = include_str!("margin_tts.py");
 const STATE_DIR: &str = ".margin";
 const NARRATION_DIR: &str = "narration";
 const MANIMGX_VOICE_CACHE: &str = "voice";
@@ -164,7 +171,7 @@ pub async fn render(
     if let Voice::PocketTts { cli, .. } = &config.voice
         && !cli.is_file()
     {
-        return Err(RenderError::ToolMissing(tools::FLUIDAUDIOCLI.to_string()));
+        return Err(RenderError::ToolMissing(tts_name(cli).to_string()));
     }
 
     // 1. The scene, the voice module and the state folder.
@@ -411,8 +418,34 @@ async fn voice_lines(
     Ok(audio)
 }
 
-/// `fluidaudiocli tts --backend pocket --text <line> --output <wav> [--voice <name>]`,
-/// unsandboxed. Writes to a temporary name first, so a failed run leaves no WAV behind.
+/// The command line that voices `line` into `out` with the PocketTTS tool `cli`, by its
+/// file name: `margin-tts --text <line> --output <wav> [--voice <name>]` (the Python
+/// `pocket-tts` script, `margin_tts.py`, used off the Mac), anything else
+/// `fluidaudiocli tts --backend pocket --text <line> --output <wav> [--voice <name>]`.
+fn tts_args(cli: &Path, voice: Option<&str>, line: &str, out: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if tts_name(cli) != MARGIN_TTS {
+        args.extend(["tts", "--backend", "pocket"].map(Into::into));
+    }
+    args.extend(["--text".into(), line.into(), "--output".into(), out.into()]);
+    if let Some(voice) = voice {
+        args.extend(["--voice".into(), voice.into()]);
+    }
+    args
+}
+
+/// The PocketTTS tool's name for messages: `margin-tts` or `fluidaudiocli`.
+fn tts_name(cli: &Path) -> &'static str {
+    match cli.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n == MARGIN_TTS || n.starts_with("margin-tts.") || n == "margin_tts.py" => {
+            MARGIN_TTS
+        }
+        _ => tools::FLUIDAUDIOCLI,
+    }
+}
+
+/// Voices one line with PocketTTS through `cli` (see `tts_args`), unsandboxed. Writes
+/// to a temporary name first, so a failed run leaves no WAV behind.
 async fn pocket_tts(
     cli: &Path,
     voice: Option<&str>,
@@ -420,20 +453,12 @@ async fn pocket_tts(
     out: &Path,
     on_progress: &mut (impl FnMut(RenderProgress) + Send),
 ) -> Result<(), RenderError> {
-    tracing::debug!(line, "voicing with PocketTTS");
+    let name = tts_name(cli);
+    tracing::debug!(line, tool = name, "voicing with PocketTTS");
     let partial = out.with_extension("partial.wav");
     remove_file(&partial)?;
     let mut cmd = Command::new(cli);
-    cmd.arg("tts")
-        .arg("--backend")
-        .arg("pocket")
-        .arg("--text")
-        .arg(line)
-        .arg("--output")
-        .arg(&partial);
-    if let Some(voice) = voice {
-        cmd.arg("--voice").arg(voice);
-    }
+    cmd.args(tts_args(cli, voice, line, &partial));
     if let Some(dir) = out.parent() {
         cmd.current_dir(dir);
     }
@@ -449,12 +474,12 @@ async fn pocket_tts(
     })
     .await
     .map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => RenderError::ToolMissing(tools::FLUIDAUDIOCLI.to_string()),
-        _ => RenderError::Voice(format!("couldn't run fluidaudiocli: {e}")),
+        std::io::ErrorKind::NotFound => RenderError::ToolMissing(name.to_string()),
+        _ => RenderError::Voice(format!("couldn't run {name}: {e}")),
     })?;
     let Some(status) = finished.status else {
         return Err(RenderError::Voice(format!(
-            "fluidaudiocli took more than {} minutes for one line",
+            "{name} took more than {} minutes for one line",
             LINE_LIMIT.as_secs() / 60
         )));
     };
@@ -463,9 +488,9 @@ async fn pocket_tts(
         remove_file(&partial)?;
         let said = tail.join("\n");
         return Err(RenderError::Voice(if said.trim().is_empty() {
-            format!("fluidaudiocli exited with {status} without writing audio for {line:?}")
+            format!("{name} exited with {status} without writing audio for {line:?}")
         } else {
-            format!("fluidaudiocli exited with {status} for {line:?}: {said}")
+            format!("{name} exited with {status} for {line:?}: {said}")
         }));
     }
     std::fs::rename(&partial, out).map_err(io("keep the narration"))?;
@@ -613,6 +638,233 @@ mod tests {
             fps: 1,
         };
         assert_send(render(&job, &config, |_| {}));
+    }
+
+    #[test]
+    fn tts_command_lines_by_tool() {
+        let out = Path::new("/w/line.partial.wav");
+        let strings = |args: Vec<std::ffi::OsString>| -> Vec<String> {
+            args.into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            strings(tts_args(
+                Path::new("/x/fluidaudiocli"),
+                Some("alba"),
+                "Hi.",
+                out
+            )),
+            [
+                "tts",
+                "--backend",
+                "pocket",
+                "--text",
+                "Hi.",
+                "--output",
+                "/w/line.partial.wav",
+                "--voice",
+                "alba"
+            ]
+        );
+        assert_eq!(
+            strings(tts_args(
+                Path::new("/home/m/.local/bin/margin-tts"),
+                None,
+                "Hi.",
+                out
+            )),
+            ["--text", "Hi.", "--output", "/w/line.partial.wav"]
+        );
+        assert_eq!(tts_name(Path::new("/a/margin-tts")), MARGIN_TTS);
+        assert_eq!(tts_name(Path::new("/a/margin_tts.py")), MARGIN_TTS);
+        assert_eq!(
+            tts_name(Path::new("/a/fluidaudiocli")),
+            tools::FLUIDAUDIOCLI
+        );
+    }
+
+    #[test]
+    fn the_tts_script_takes_the_arguments_the_renderer_passes() {
+        assert!(MARGIN_TTS_SCRIPT.starts_with("#!/usr/bin/env -S uv run"));
+        assert!(MARGIN_TTS_SCRIPT.contains(r#""pocket-tts==3.3.0""#));
+        for flag in ["--text", "--output", "--voice", "--version"] {
+            assert!(MARGIN_TTS_SCRIPT.contains(&format!("\"{flag}\"")), "{flag}");
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("margin-video-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A stand-in for the `pocket_tts` package: half a line of samples per character,
+    /// out of range on purpose, and a voice it doesn't know.
+    const FAKE_POCKET_TTS: &str = r#"
+class TTSModel:
+    sample_rate = 24000
+
+    @classmethod
+    def load_model(cls, language=None):
+        assert language in (None, "french"), language
+        return cls()
+
+    def get_state_for_audio_prompt(self, voice):
+        if voice == "nobody":
+            raise ValueError("unknown voice nobody")
+        return voice
+
+    def generate_audio(self, state, text):
+        return [0.5, -2.0, 0.0] * len(text)
+"#;
+
+    /// `margin_tts.py` itself, with the stand-in model: the line goes in, a 16-bit WAV
+    /// at the model's rate comes out, and failures leave nothing behind.
+    #[test]
+    fn the_tts_script_writes_a_wav_with_a_fake_model() {
+        let Some(python) = tools::find_executable("python3") else {
+            eprintln!("skipping: no python3");
+            return;
+        };
+        let dir = temp_dir("tts-script");
+        std::fs::create_dir_all(dir.join("pocket_tts")).unwrap();
+        std::fs::write(dir.join("pocket_tts/__init__.py"), FAKE_POCKET_TTS).unwrap();
+        let script = dir.join("margin_tts.py");
+        std::fs::write(&script, MARGIN_TTS_SCRIPT).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new(&python)
+                .arg(&script)
+                .args(args)
+                .env("PYTHONPATH", &dir)
+                .output()
+                .unwrap()
+        };
+        let wav_path = dir.join("line.wav");
+        let wav_arg = wav_path.to_str().unwrap();
+        let out = run(&["--text", "Hello.", "--output", wav_arg, "--voice", "alba"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = std::fs::read(&wav_path).unwrap();
+        assert!(wav::is_wav_with_audio(&bytes));
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            24_000
+        );
+        assert_eq!(bytes.len(), 44 + 3 * 6 * 2);
+        // Clamped to 16 bits: 0.5, -1.0, 0.0.
+        assert_eq!(i16::from_le_bytes([bytes[44], bytes[45]]), 16384);
+        assert_eq!(i16::from_le_bytes([bytes[46], bytes[47]]), -32767);
+        let out = run(&[
+            "--text",
+            "Bonjour",
+            "--output",
+            wav_arg,
+            "--language",
+            "french",
+        ]);
+        assert!(out.status.success());
+        assert!(!dir.join("line.wav.partial").exists());
+
+        let bad = dir.join("bad.wav");
+        let bad_arg = bad.to_str().unwrap();
+        let out = run(&["--text", "Hi", "--output", bad_arg, "--voice", "nobody"]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unknown voice nobody"));
+        assert!(!bad.exists());
+        assert_eq!(
+            run(&["--text", "  ", "--output", bad_arg]).status.code(),
+            Some(2)
+        );
+        assert!(!run(&["--text", "x"]).status.success());
+        assert!(!bad.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The renderer's voicing step with a stand-in `margin-tts`: the arguments it gets,
+    /// the WAVs kept and reused, and a failing or missing tool named in the error.
+    #[tokio::test]
+    async fn voices_lines_through_margin_tts() {
+        let dir = temp_dir("margin-tts");
+        let state = dir.join("state");
+        std::fs::create_dir_all(state.join(NARRATION_DIR)).unwrap();
+        let speech = dir.join("speech.wav");
+        std::fs::write(&speech, wav::silent_wav(0.5)).unwrap();
+        let cli = dir.join(MARGIN_TTS);
+        let calls = dir.join("calls.txt");
+        executable(
+            &cli,
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && cp '{}' \"$2\"; shift; done\nexit 0\n",
+                calls.display(),
+                speech.display()
+            ),
+        );
+        let voice = Voice::PocketTts {
+            cli: cli.clone(),
+            voice: Some("javert".into()),
+        };
+        let lines = vec!["First line.".to_string(), "Second.".to_string()];
+        let mut log = Vec::new();
+        let audio = voice_lines(&lines, &voice, &state, &mut |p| log.push(p))
+            .await
+            .unwrap();
+        assert_eq!(audio.len(), 2);
+        for file in audio.values() {
+            assert!(wav::is_wav_with_audio(
+                &std::fs::read(state.join(file)).unwrap()
+            ));
+        }
+        assert!(log.contains(&RenderProgress::Voicing { done: 2, total: 2 }));
+        let called = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(called.lines().count(), 2);
+        assert!(
+            called.starts_with("--text First line. --output "),
+            "{called}"
+        );
+        assert!(called.lines().all(|l| l.ends_with("--voice javert")));
+        // The same lines again: the WAVs are reused.
+        voice_lines(&lines, &voice, &state, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+
+        executable(&cli, "#!/bin/sh\necho 'no such voice' >&2\nexit 3\n");
+        let err = voice_lines(&["Third.".to_string()], &voice, &state, &mut |_| {})
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("margin-tts exited with"), "{message}");
+        assert!(message.contains("no such voice"), "{message}");
+        let leftovers = std::fs::read_dir(state.join(NARRATION_DIR))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        let missing = Voice::PocketTts {
+            cli: dir.join("gone/margin-tts"),
+            voice: None,
+        };
+        let err = voice_lines(&["Fourth.".to_string()], &missing, &state, &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RenderError::ToolMissing(ref t) if t == MARGIN_TTS),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
