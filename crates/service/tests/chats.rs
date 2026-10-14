@@ -24,7 +24,10 @@ use margin_service::turns::{
     CALL_FAILED, CALL_INTERRUPTED, CONFIRMATION_EXPIRED, RunningTurn, STOPPED, STOPPED_BY_RESTART,
     ServiceSink, TITLE_MAX_OUTPUT_TOKENS, WRITE_UNCONFIRMED,
 };
-use margin_service::{agent_tools, chats};
+use margin_service::{agent_tools, chats, trace};
+use margin_shared::context::{TraceKind, TraceRollup, TraceRow};
+use margin_shared::pipeline::{PipelineConfig, Route};
+use margin_shared::routes;
 use margin_shared::{
     ApiError, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatState, Citation,
     ConfirmationCard, Decision, Device, DeviceFrame, DeviceRef, DeviceToolCall, DeviceToolOutput,
@@ -457,8 +460,8 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         .agent
         .push(Scripted::Events(text_reply(&["still here"])));
     assert_eq!(send(&h, &t, &chat.id, "third").await.status(), 200);
-    let d = wait_chat(&h, &t, &chat.id, |d| d.items.len() == 6).await;
-    assert!(idle(&d), "{:?}", lines(&d));
+    // Six items appear while the answer still streams; wait for the turn to end.
+    let d = wait_chat(&h, &t, &chat.id, |d| d.items.len() == 6 && idle(d)).await;
     assert_eq!(lines(&d)[5], "assistant: still here");
     assert_eq!(
         h.generator.agent.requests()[2].model.as_deref(),
@@ -2717,4 +2720,287 @@ async fn a_title_that_fails_or_comes_after_a_rename_changes_nothing() {
         (d.chat.title.as_str(), d.chat.title_by),
         ("Mine", TitleSource::Owner)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Traces
+// ---------------------------------------------------------------------------
+
+/// Prices for the test model, in the data folder (replacing the built-in table).
+const TEST_PRICES: &str = "[models.test-model]\ninput = 1.0\ncached_input = 0.5\noutput = 2.0\n";
+
+async fn traced() -> (Harness, String) {
+    let h = start_with(Setup {
+        files: vec![("prices.toml".into(), TEST_PRICES.as_bytes().to_vec())],
+        ..Setup::default()
+    })
+    .await;
+    *h.state.turns.retry.lock().unwrap() = RetryPolicy::immediate();
+    let t = h.sign_in("Mac").await;
+    h.configure_ai(&t).await;
+    (h, t)
+}
+
+/// `GET /api/traces` with `query`, as the rows and the raw body.
+async fn traces(h: &Harness, token: &str, query: &[(&str, String)]) -> (Vec<TraceRow>, String) {
+    let r = h
+        .get(token, routes::TRACES)
+        .query(query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()["content-type"].to_str().unwrap(),
+        "application/x-ndjson"
+    );
+    let body = r.text().await.unwrap();
+    let rows = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (rows, body)
+}
+
+async fn rollup(h: &Harness, token: &str, bucket: &str) -> Vec<TraceRollup> {
+    let r = h
+        .get(token, routes::TRACES_ROLLUP)
+        .query(&[("bucket", bucket)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_is_traced_with_ids_and_numbers_only() {
+    let (h, t) = traced().await;
+    let mut live = h.state.tracer.subscribe();
+    new_topic(&h, &t, None, "Zanzibar archipelago").await;
+    h.generator.agent.push(Scripted::Events(tool_calls_reply(&[
+        ("call_1", "list_topics", "{}"),
+        ("call_2", "search_library", r#"{"query":"zanzibar"}"#),
+    ])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["The quokka answer."])));
+    h.title_reply("Islands of spice");
+    let chat = ask(&h, &t, "Tell me about the narwhal secret").await.chat;
+    let d = wait_chat(&h, &t, &chat.id, |d| {
+        idle(d) && d.chat.title_by == TitleSource::Model
+    })
+    .await;
+    let turn_id = d.items[0].turn_id.clone();
+
+    let (rows, body) = traces(&h, &t, &[("trace_id", turn_id.clone())]).await;
+    assert!(rows.windows(2).all(|w| w[0].at <= w[1].at), "oldest first");
+    assert!(rows.iter().all(|r| r.trace_id == turn_id));
+    let of = |kind: TraceKind| rows.iter().filter(move |r| r.kind == kind);
+
+    let turn: Vec<&TraceRow> = of(TraceKind::Turn).collect();
+    assert_eq!(turn.len(), 1);
+    assert!(turn[0].ok && turn[0].duration_ms > 0.0);
+    assert_eq!(turn[0].chat_id.as_deref(), Some(chat.id.as_str()));
+
+    let calls: Vec<&TraceRow> = of(TraceKind::ModelCall).collect();
+    assert_eq!(calls.len(), 3, "two steps and the title: {calls:#?}");
+    let pipeline = PipelineConfig::default().hash();
+    for c in &calls {
+        assert!(c.ok);
+        assert_eq!(c.pipeline_hash.as_deref(), Some(pipeline.as_str()));
+        assert_eq!(c.model.as_deref(), Some("test-model"));
+        assert_eq!(c.provider.as_deref(), Some("openai"));
+        assert_eq!(c.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(c.actor.as_deref(), Some("owner"));
+        let u = c.usage.expect("usage");
+        assert!(u.input == 100 && u.output > 0, "{u:?}");
+        let cost = c.cost_usd.expect("priced at write time");
+        let expected = (u.input as f64 * 1.0 + u.output as f64 * 2.0) / 1e6;
+        assert!((cost - expected).abs() < 1e-12, "{cost}");
+    }
+    let steps: Vec<&&TraceRow> = calls
+        .iter()
+        .filter(|c| c.route == Some(Route::Chat))
+        .collect();
+    assert_eq!(
+        steps.iter().map(|c| c.step).collect::<Vec<_>>(),
+        [Some(1), Some(2)]
+    );
+    assert!(steps.iter().all(
+        |c| c.prompt_version.as_deref().unwrap().starts_with("agent-")
+            && c.parent_id.as_deref() == Some(turn[0].id.as_str())
+    ));
+    let title = calls
+        .iter()
+        .find(|c| c.route == Some(Route::Small))
+        .unwrap();
+    assert!(
+        title
+            .prompt_version
+            .as_deref()
+            .unwrap()
+            .starts_with("title-")
+    );
+    assert_eq!(title.step, None);
+
+    let tools: Vec<&TraceRow> = of(TraceKind::ToolCall).collect();
+    let mut names: Vec<&str> = tools.iter().map(|r| r.tool.as_deref().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["list_topics", "search_library"]);
+    let tool_outputs: Vec<u64> = d
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ChatItemKind::ToolResult { output_bytes, .. } => Some(*output_bytes),
+            _ => None,
+        })
+        .collect();
+    for r in &tools {
+        assert!(r.ok);
+        assert!(tool_outputs.contains(&r.output_bytes.unwrap()));
+        assert_eq!(r.parent_id.as_deref(), Some(turn[0].id.as_str()));
+    }
+
+    // Nothing the owner or the model wrote, no key, no tool output.
+    for secret in [
+        "narwhal",
+        "quokka",
+        "Zanzibar",
+        "zanzibar",
+        "Islands of spice",
+        API_KEY,
+        "Margin",
+    ] {
+        assert!(!body.contains(secret), "{secret} is in a trace: {body}");
+    }
+
+    // By kind and window, in order.
+    let from = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let to = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let (by_kind, _) = traces(
+        &h,
+        &t,
+        &[
+            ("kind", "model_call".into()),
+            ("from", from.clone()),
+            ("to", to.clone()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        by_kind.iter().map(|r| &r.id).collect::<Vec<_>>(),
+        calls.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+    let (none, _) = traces(
+        &h,
+        &t,
+        &[
+            ("kind", "model_call".into()),
+            ("from", to.clone()),
+            ("to", to.clone()),
+        ],
+    )
+    .await;
+    assert!(none.is_empty());
+    let r = h
+        .get(&t, routes::TRACES)
+        .query(&[("from", to.clone()), ("to", from.clone())])
+        .send()
+        .await
+        .unwrap();
+    let (status, err) = api_error(r).await;
+    assert_eq!((status, err.code.as_str()), (400, "bad_range"));
+
+    // The rollups sum them.
+    let hourly = rollup(&h, &t, "hour").await;
+    let model_calls: Vec<&TraceRollup> = hourly
+        .iter()
+        .filter(|r| r.kind == TraceKind::ModelCall)
+        .collect();
+    assert_eq!(model_calls.iter().map(|r| r.calls).sum::<u64>(), 3);
+    assert_eq!(model_calls.iter().map(|r| r.input).sum::<u64>(), 300);
+    let cost: f64 = model_calls.iter().map(|r| r.cost_usd).sum();
+    let recorded: f64 = calls.iter().map(|c| c.cost_usd.unwrap()).sum();
+    assert!((cost - recorded).abs() < 1e-12, "{cost} vs {recorded}");
+
+    // Model calls go out live to whoever subscribed.
+    let mut live_calls = 0;
+    while let Ok(row) = live.try_recv() {
+        assert!(matches!(
+            row.kind,
+            TraceKind::ModelCall | TraceKind::Retrieval
+        ));
+        live_calls += 1;
+    }
+    assert_eq!(live_calls, 3);
+
+    // Retention deletes raw rows by range and keeps the rollups.
+    let r = h
+        .patch(&t, routes::SETTINGS)
+        .json(&json!({"trace_retention_days": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let daily = rollup(&h, &t, "day").await;
+    trace::apply_retention(&h.state, Utc::now() + chrono::Duration::days(3))
+        .await
+        .unwrap();
+    let (left, _) = traces(&h, &t, &[]).await;
+    assert!(left.is_empty(), "{left:#?}");
+    assert_eq!(rollup(&h, &t, "day").await, daily);
+    assert_eq!(rollup(&h, &t, "hour").await, hourly);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_and_stopped_calls_are_traced_with_codes() {
+    let (h, t) = traced().await;
+    h.generator.agent.push(Scripted::Fail(AiError::Http {
+        status: 400,
+        message: "your prompt mentions the secret pelican".into(),
+        retry_after: None,
+    }));
+    let chat = ask(&h, &t, "Hello").await.chat;
+    let d = wait_chat(&h, &t, &chat.id, |d| {
+        matches!(d.chat.state, ChatState::Failed { .. })
+    })
+    .await;
+    let turn_id = d.items[0].turn_id.clone();
+    let (rows, body) = traces(&h, &t, &[("trace_id", turn_id)]).await;
+    assert!(!body.contains("pelican"), "{body}");
+    let call = rows
+        .iter()
+        .find(|r| r.kind == TraceKind::ModelCall)
+        .unwrap();
+    assert!(!call.ok);
+    assert_eq!(call.error_code.as_deref(), Some("bad_request"));
+    let turn = rows.iter().find(|r| r.kind == TraceKind::Turn).unwrap();
+    assert!(!turn.ok && turn.error_code.is_some());
+
+    // Stop while the model streams: the call and the turn are recorded as cancelled.
+    h.generator
+        .agent
+        .push(Scripted::Hang(text_reply(&["Partial"])[..1].to_vec()));
+    let chat = ask(&h, &t, "Again").await.chat;
+    wait_chat(&h, &t, &chat.id, running).await;
+    let r = h
+        .post(&t, &format!("/api/chats/{}/stop", chat.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = detail(&h, &t, &chat.id).await;
+    let turn_id = d.items[0].turn_id.clone();
+    let rows = eventually(|| async {
+        let (rows, _) = traces(&h, &t, &[("trace_id", turn_id.clone())]).await;
+        (rows.iter().any(|r| r.kind == TraceKind::Turn)
+            && rows.iter().any(|r| r.kind == TraceKind::ModelCall))
+        .then_some(rows)
+    })
+    .await;
+    for r in &rows {
+        assert!(!r.ok);
+        assert_eq!(r.error_code.as_deref(), Some("cancelled"), "{r:#?}");
+    }
 }

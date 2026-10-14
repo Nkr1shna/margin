@@ -4,16 +4,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::{FutureExt, StreamExt};
 use margin_agent::{
-    BoxFuture, ItemRecord, MessageContext, ModelClient, ReplayItem, RetryPolicy, SinkError,
-    TOOL_OUTPUT_MAX_BYTES, ToolOutput, TurnDeps, TurnInput, TurnOutcome, TurnSink,
+    BoxFuture, ConfirmationPrompt, ItemRecord, MessageContext, ModelClient, ReplayItem,
+    RetryPolicy, SinkError, TOOL_OUTPUT_MAX_BYTES, Tool, ToolContext, ToolKind, ToolOutput,
+    ToolRegistry, TurnDeps, TurnInput, TurnOutcome, TurnSink,
 };
-use margin_ai::{ReasoningConfig, ResponseRequest, StreamEvent};
+use margin_ai::{AiError, ReasoningConfig, ResponseRequest, ResponseStream, StreamEvent};
+use margin_shared::context::TraceKind;
+use margin_shared::pipeline::Route;
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
     PendingMessage, ReasoningEffort, Source, TitleSource, Usage, Waiting, error_code,
@@ -25,6 +29,7 @@ use tokio::task::JoinHandle;
 use crate::chats::{self, StoredChatItem};
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, DeviceRow};
+use crate::trace::{self, SpanGuard, TraceSpan, TracedStream};
 use crate::{agent_tools, db, workspaces};
 
 /// The `Action` added when the owner stops a turn.
@@ -396,11 +401,25 @@ struct Early {
 /// `Idle` (finished) or `Failed`, and sends the pending message, if any, as the next
 /// turn.
 pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
+    // The turn's own row: recorded when the run ends, or as `cancelled` when Stop
+    // aborts the task.
+    let mut turn_row = SpanGuard::new(
+        TurnTrace::new(&state, &chat_id, &turn_id, None).span(TraceKind::Turn),
+        &state,
+    );
+    let trace = TurnTrace::new(&state, &chat_id, &turn_id, Some(turn_row.row().id.clone()));
     let permit = state.turns.slots.clone().acquire_owned().await.ok();
     let slot: Slot = Arc::new(Mutex::new(permit));
-    let result = AssertUnwindSafe(run_turn(&state, &chat_id, &turn_id, origin, slot.clone()))
-        .catch_unwind()
-        .await;
+    let result = AssertUnwindSafe(run_turn(
+        &state,
+        &chat_id,
+        &turn_id,
+        origin,
+        slot.clone(),
+        &trace,
+    ))
+    .catch_unwind()
+    .await;
     drop(slot.lock().unwrap().take());
     let (outcome, early) = match result {
         Ok(Ok(outcome)) => (outcome, None),
@@ -428,6 +447,14 @@ pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
             )
         }
     };
+    match (&outcome, &early) {
+        // Stopped (or the chat deleted) while the loop was inside a poll: it ended on
+        // the sink's "stopped" rather than by the abort.
+        _ if !state.turns.is_current(&chat_id, &turn_id) => turn_row.fail("cancelled"),
+        (TurnOutcome::Finished { .. }, _) => turn_row.finish(true),
+        (_, Some(early)) => turn_row.fail(early.code),
+        _ => turn_row.fail("failed"),
+    }
     if let Err(e) = finish(&state, &chat_id, &turn_id, outcome, early).await {
         tracing::error!(chat = %chat_id, turn = %turn_id, "couldn't finish the turn: {e:#}");
     }
@@ -440,6 +467,7 @@ async fn run_turn(
     turn_id: &str,
     origin: DeviceRef,
     slot: Slot,
+    trace: &TurnTrace,
 ) -> Result<TurnOutcome, Early> {
     // A missing key or model ends the turn like a failed model call.
     let ai = state.agent_ai_config().await.map_err(|e| Early {
@@ -481,8 +509,14 @@ async fn run_turn(
     let workspaces = workspaces::by_ids(state, &chat.workspace_ids)
         .await
         .map_err(internal)?;
-    let tools = agent_tools::registry(state);
-    let model = state.generator.agent_model(&ai);
+    let tools = traced_tools(&agent_tools::registry(state), trace);
+    let model = TracedModel::new(
+        state.generator.agent_model(&ai),
+        trace.clone(),
+        &ai.model,
+        trace::provider_of(&ai.base_url),
+        None,
+    );
     let sink = ServiceSink {
         state: state.clone(),
         chat_id: chat_id.to_string(),
@@ -491,7 +525,7 @@ async fn run_turn(
     };
     let retry = *state.turns.retry.lock().unwrap();
     let deps = TurnDeps {
-        model: model.as_ref(),
+        model: &model,
         tools: &tools,
         sink: &sink,
         devices: state.devices.clone(),
@@ -864,6 +898,9 @@ pub async fn queue_locked(
 /// the owner answered; an `Action` "The service stopped while answering." is added.
 /// Pending messages are kept. Called from `server::recover` (which holds `write_lock`).
 pub async fn recover(state: &AppState) -> anyhow::Result<()> {
+    // The trace writer and retention job start with the service (`server::recover`
+    // runs this once at startup); a second call does nothing.
+    trace::start(state);
     let chats: Vec<Chat> = state.store.list(db::CHAT).await?;
     for mut chat in chats {
         if !chat.state.is_busy() {
@@ -1553,17 +1590,31 @@ async fn ask_title(
         })
         .unwrap_or_default();
     let override_model = state.turns.title_model.lock().unwrap().clone();
-    let model = match override_model {
-        Some(m) => m,
+    let settings = state.settings_row().await?;
+    let (model, model_name) = match override_model {
+        Some(m) => {
+            let name = settings
+                .agent_model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| settings.openai_model.clone());
+            (m, name)
+        }
         None => {
             let ai = state
                 .agent_ai_config()
                 .await
                 .map_err(|e| anyhow::anyhow!(e.message))?;
-            state.generator.agent_model(&ai)
+            (state.generator.agent_model(&ai), ai.model)
         }
     };
-    let settings = state.settings_row().await?;
+    let model = TracedModel::new(
+        model,
+        TurnTrace::new(state, chat_id, turn_id, None),
+        &model_name,
+        trace::provider_of(&settings.openai_base_url),
+        Some(Purpose::Title),
+    );
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
     let request = ResponseRequest {
@@ -1616,6 +1667,199 @@ pub fn model_title(reply: &str) -> Option<String> {
     let line = line.strip_suffix('.').unwrap_or(line).trim();
     let line = line.trim_matches(quotes).trim();
     (!line.is_empty()).then(|| chats::title_from(line))
+}
+
+// ---------------------------------------------------------------------------
+// Traces (`trace.rs`): the turn, each model call (steps, condense, title), each tool
+// call. `trace_id` is the turn id. Rows carry ids, counts and codes only.
+// ---------------------------------------------------------------------------
+
+/// What every trace row of a turn carries.
+#[derive(Clone)]
+pub struct TurnTrace {
+    state: AppState,
+    chat_id: Id,
+    turn_id: Id,
+    /// The turn row's id, for its model and tool calls.
+    parent: Option<String>,
+    pipeline_hash: String,
+}
+
+impl TurnTrace {
+    pub fn new(state: &AppState, chat_id: &str, turn_id: &str, parent: Option<String>) -> Self {
+        Self {
+            state: state.clone(),
+            chat_id: chat_id.to_string(),
+            turn_id: turn_id.to_string(),
+            parent,
+            pipeline_hash: state.pipeline.load().hash.clone(),
+        }
+    }
+
+    /// A row of `kind` under the turn.
+    pub fn span(&self, kind: TraceKind) -> TraceSpan {
+        let mut span = self.state.tracer.span(kind, &self.turn_id);
+        span.row.chat_id = Some(self.chat_id.clone());
+        span.row.turn_id = Some(self.turn_id.clone());
+        span.row.parent_id = self.parent.clone();
+        span.row.pipeline_hash = Some(self.pipeline_hash.clone());
+        span.row.actor = Some("owner".into());
+        span
+    }
+}
+
+/// Which side call a traced model makes when it isn't an agent step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Title,
+}
+
+/// The turn's model, recording a `model_call` row per call: agent steps (requests with
+/// tools; `route: chat`, `step` counted from 1) and condense calls (no tools; `route:
+/// small`), or the title call (`Purpose::Title`, `route: small`).
+pub struct TracedModel {
+    inner: Arc<dyn ModelClient>,
+    trace: TurnTrace,
+    model: String,
+    provider: &'static str,
+    purpose: Option<Purpose>,
+    steps: AtomicU32,
+}
+
+impl TracedModel {
+    pub fn new(
+        inner: Arc<dyn ModelClient>,
+        trace: TurnTrace,
+        model: &str,
+        provider: &'static str,
+        purpose: Option<Purpose>,
+    ) -> Self {
+        Self {
+            inner,
+            trace,
+            model: model.to_string(),
+            provider,
+            purpose,
+            steps: AtomicU32::new(0),
+        }
+    }
+
+    /// The call's row: route, model, provider, prompt version (a hash of the fixed
+    /// instructions: the system prompt for steps, the first input item for condense,
+    /// `TITLE_INSTRUCTIONS` for the title), step.
+    fn span(&self, req: &ResponseRequest) -> TraceSpan {
+        let mut span = self.trace.span(TraceKind::ModelCall);
+        let row = &mut span.row;
+        row.model = Some(req.model.clone().unwrap_or_else(|| self.model.clone()));
+        row.provider = Some(self.provider.to_string());
+        match self.purpose {
+            Some(Purpose::Title) => {
+                row.route = Some(Route::Small);
+                row.prompt_version = Some(trace::prompt_version("title", TITLE_INSTRUCTIONS));
+            }
+            None if !req.tools.is_empty() => {
+                row.route = Some(Route::Chat);
+                row.prompt_version = Some(trace::prompt_version(
+                    "agent",
+                    margin_agent::system_prompt(),
+                ));
+                row.step = Some(self.steps.fetch_add(1, Ordering::Relaxed) + 1);
+            }
+            None => {
+                // The loop's condense call: its first input item is its fixed
+                // instructions.
+                let fixed = req.input.first().map(Value::to_string).unwrap_or_default();
+                row.route = Some(Route::Small);
+                row.prompt_version = Some(trace::prompt_version("condense", &fixed));
+            }
+        }
+        span
+    }
+}
+
+impl ModelClient for TracedModel {
+    fn stream(&self, req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>> {
+        Box::pin(async move {
+            let span = self.span(&req);
+            match self.inner.stream(req).await {
+                Ok(stream) => Ok(
+                    Box::pin(TracedStream::new(stream, span, self.trace.state.clone()))
+                        as ResponseStream,
+                ),
+                Err(e) => {
+                    span.fail(&self.trace.state.tracer, trace::ai_error_code(&e));
+                    Err(e)
+                }
+            }
+        })
+    }
+}
+
+/// The turn's tools, each recording a `tool_call` row (name, device, output size, ok).
+pub fn traced_tools(tools: &ToolRegistry, trace: &TurnTrace) -> ToolRegistry {
+    let mut out = ToolRegistry::new();
+    for tool in tools.iter() {
+        out.register(Arc::new(TracedTool {
+            inner: tool.clone(),
+            trace: trace.clone(),
+        }));
+    }
+    out
+}
+
+struct TracedTool {
+    inner: Arc<dyn Tool>,
+    trace: TurnTrace,
+}
+
+impl Tool for TracedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+
+    fn kind(&self) -> ToolKind {
+        self.inner.kind()
+    }
+
+    fn label(&self, args: &Value) -> String {
+        self.inner.label(args)
+    }
+
+    fn device(&self, ctx: &ToolContext, args: &Value) -> Option<DeviceRef> {
+        self.inner.device(ctx, args)
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        self.inner.confirmation(ctx, args)
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Value) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let mut span = SpanGuard::new(self.trace.span(TraceKind::ToolCall), &self.trace.state);
+            span.row().tool = Some(self.inner.name().to_string());
+            span.row().device_id = self.inner.device(ctx, &args).map(|d| d.device_id);
+            let out = self.inner.run(ctx, args).await;
+            span.row().output_bytes = Some(out.output.len() as u64);
+            if out.ok {
+                span.finish(true);
+            } else {
+                span.fail("tool_error");
+            }
+            out
+        })
+    }
 }
 
 #[cfg(test)]
