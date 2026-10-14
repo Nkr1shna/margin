@@ -1,24 +1,19 @@
-//! Sources in the app: adding files and folders (desktop), the upload queue, rows with
-//! live status, the Ask composer's attachments, a topic's Sources dialog, and the notice
-//! for the embedding model the service needs to read them.
+//! Sources in the app: adding files and folders (with the platform's picker, see
+//! `crate::picker`), the upload queue, rows with live status, the Ask composer's
+//! attachments, a topic's Sources dialog, and the notice for the embedding model the
+//! service needs to read them.
 
 use std::collections::HashSet;
 
 use dioxus::prelude::*;
 use margin_shared::{EmbeddingModelState, Event, Id, Source, SourceKind};
 
-use crate::sources::{
-    Selection, Tone, Upload, UploadState, human_bytes, select_files, select_folder, status_text,
-};
+use crate::picker;
+use crate::sources::{Tone, Upload, UploadState, human_bytes, status_text};
 use crate::state::{AppCtx, use_app};
 use crate::store::LibraryState;
 use crate::ui::common::{ConfirmDialog, Icon, js};
 use crate::ui::settings::SettingsPane;
-
-/// Files and folders can be added here. The iOS and Android webviews can't pick files in
-/// Dioxus 0.7.9 (its file input asks the host, which has no picker there), so adding
-/// sources is desktop only; listing and deleting them works everywhere.
-pub const CAN_ADD: bool = cfg!(not(any(target_os = "ios", target_os = "android")));
 
 /// Uploads running at once.
 const CONCURRENT_UPLOADS: usize = 3;
@@ -34,35 +29,10 @@ pub fn kind_icon(kind: SourceKind) -> &'static str {
     }
 }
 
-/// Ask for files or a folder and choose what to upload; `None` when the picker was
-/// cancelled.
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
-async fn pick(folder: bool) -> Option<Selection> {
-    let dialog = rfd::AsyncFileDialog::new();
-    if folder {
-        let handle = dialog.set_title("Add a folder").pick_folder().await?;
-        let root = handle.path().to_path_buf();
-        tokio::task::spawn_blocking(move || select_folder(&root))
-            .await
-            .ok()
-    } else {
-        let handles = dialog.set_title("Add files").pick_files().await?;
-        let paths = handles.iter().map(|h| h.path().to_path_buf()).collect();
-        tokio::task::spawn_blocking(move || select_files(paths))
-            .await
-            .ok()
-    }
-}
-
-#[cfg(any(target_os = "ios", target_os = "android"))]
-async fn pick(_folder: bool) -> Option<Selection> {
-    None
-}
-
 /// Pick files (or a folder), queue them for upload to `topic_id` (`None`: the Ask
 /// composer), and say what was left out.
 pub async fn add_sources(app: AppCtx, topic_id: Option<Id>, folder: bool) -> Option<String> {
-    let selection = pick(folder).await?;
+    let selection = picker::pick(folder).await?;
     let mut note = selection.summary();
     if selection.files.is_empty() && note.is_none() {
         note = Some(match &selection.folder {
@@ -129,6 +99,9 @@ async fn upload(app: AppCtx, key: u64) {
     let mut uploads = app.uploads;
     let mut lib = app.lib;
     let wanted = uploads.peek().iter().any(|u| u.key == key);
+    if result.is_ok() || !wanted {
+        picker::release(&upload.path);
+    }
     match result {
         Ok(source) if wanted => {
             lib.write().apply(Event::SourceChanged {
@@ -183,6 +156,10 @@ async fn remove(app: AppCtx, key: u64) -> Result<(), String> {
         lib.write().apply(Event::SourceDeleted {
             id: source.id.clone(),
         });
+    }
+    if upload.state != UploadState::Uploading {
+        // An uploading one's copy goes when its upload finishes.
+        picker::release(&upload.path);
     }
     let mut uploads = app.uploads;
     uploads.write().retain(|u| u.key != key);
@@ -622,7 +599,7 @@ struct PendingDelete {
 }
 
 /// A topic's sources, grouped by folder, with their status and size: delete them, or add
-/// files and folders (desktop).
+/// files and folders.
 #[component]
 pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
     let app = use_app();
@@ -736,11 +713,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                 div { class: "src-list",
                     if empty {
                         p { class: "faint",
-                            if CAN_ADD {
-                                "No sources yet. Add documents, code, PDFs, images, audio or video, or a whole folder."
-                            } else {
-                                "No sources yet."
-                            }
+                            "No sources yet. Add documents, code, PDFs, images, audio or video, or a whole folder."
                         }
                     }
                     for (upload, tone, status) in lines {
@@ -804,25 +777,21 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                     }
                 }
                 div { class: "row-actions src-foot",
-                    if CAN_ADD {
-                        button {
-                            class: "btn btn-secondary btn-sm",
-                            disabled: *picking.read(),
-                            onclick: add(false),
-                            Icon { name: "file-add" }
-                            "Add files…"
-                        }
-                        button {
-                            class: "btn btn-secondary btn-sm",
-                            disabled: *picking.read(),
-                            onclick: add(true),
-                            Icon { name: "folder" }
-                            "Add folder…"
-                        }
-                        if *picking.read() { span { class: "spinner" } }
-                    } else {
-                        span { class: "faint", style: "font-size: 13px", "Add sources from Margin on your computer." }
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        disabled: *picking.read(),
+                        onclick: add(false),
+                        Icon { name: "file-add" }
+                        "Add files…"
                     }
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        disabled: *picking.read(),
+                        onclick: add(true),
+                        Icon { name: "folder" }
+                        "Add folder…"
+                    }
+                    if *picking.read() { span { class: "spinner" } }
                     span { class: "grow" }
                     button { class: "btn btn-primary btn-sm", onclick: move |_| on_close.call(()), "Done" }
                 }

@@ -11,6 +11,7 @@ mod events;
 #[cfg(test)]
 mod fake;
 mod markdown;
+mod picker;
 mod routes;
 mod secrets;
 mod sources;
@@ -76,6 +77,7 @@ const INDEX_HTML: &str = concat!(
 );
 
 fn main() {
+    picker::clear_staging();
     #[cfg(feature = "desktop")]
     {
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};

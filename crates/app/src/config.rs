@@ -104,7 +104,7 @@ pub fn normalize_service_url(input: &str) -> Result<String, String> {
 pub fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
     {
-        android_files_dir().map(|d| d.join("Margin"))
+        android_dir("getFilesDir").map(|d| d.join("Margin"))
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -112,10 +112,17 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
-/// `Context.getFilesDir()` of the running Android app, through the JNI context that
-/// Dioxus mobile publishes via `ndk-context`.
+/// The app's cache directory on Android (`Context.getCacheDir()`): files the system may
+/// clear when space runs low.
 #[cfg(target_os = "android")]
-fn android_files_dir() -> Option<PathBuf> {
+pub fn cache_dir() -> Option<PathBuf> {
+    android_dir("getCacheDir")
+}
+
+/// A directory of the running Android app (`Context.getFilesDir()`, `getCacheDir()`),
+/// through the JNI context that Dioxus mobile publishes via `ndk-context`.
+#[cfg(target_os = "android")]
+fn android_dir(getter: &str) -> Option<PathBuf> {
     use jni::objects::{JObject, JString};
     let ctx = ndk_context::android_context();
     // SAFETY: ndk-context hands out the process JavaVM and the application Context
@@ -124,7 +131,7 @@ fn android_files_dir() -> Option<PathBuf> {
     let mut env = vm.attach_current_thread().ok()?;
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
     let dir = env
-        .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
+        .call_method(&context, getter, "()Ljava/io/File;", &[])
         .ok()?
         .l()
         .ok()?;

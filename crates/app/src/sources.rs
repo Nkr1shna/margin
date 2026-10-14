@@ -23,10 +23,11 @@ const SKIPPED_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// A file chosen to upload.
+/// A file chosen to upload. `P` is how the file is reached: a local path, or (while a
+/// mobile picker works out what to copy) the platform's handle for it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Candidate {
-    pub path: PathBuf,
+pub struct Candidate<P = PathBuf> {
+    pub path: P,
     /// The file name, or its path inside the added folder with `/` separators.
     pub name: String,
     /// The added folder's name.
@@ -36,38 +37,49 @@ pub struct Candidate {
 }
 
 /// The files one add uploads, and how many it left out and why.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Selection {
-    pub files: Vec<Candidate>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Selection<P = PathBuf> {
+    pub files: Vec<Candidate<P>>,
     /// Files Margin can't read (archives, binaries, lock files…).
     pub unsupported: usize,
     /// Files over `routes::MAX_SOURCE_BYTES`.
     pub too_large: usize,
     /// Files past `MAX_FILES_PER_ADD` or `MAX_BYTES_PER_ADD`.
     pub over_limit: usize,
-    /// Files whose size couldn't be read.
+    /// Files whose size couldn't be read, or that couldn't be copied.
     pub unreadable: usize,
     /// The folder's name, for a folder add.
     pub folder: Option<String>,
 }
 
-impl Selection {
+impl<P> Default for Selection<P> {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            unsupported: 0,
+            too_large: 0,
+            over_limit: 0,
+            unreadable: 0,
+            folder: None,
+        }
+    }
+}
+
+impl<P> Selection<P> {
     fn total_bytes(&self) -> u64 {
         self.files.iter().map(|f| f.bytes).sum()
     }
 
-    /// Add `path` (known as `name`) if it's a source and fits the limits.
-    fn offer(&mut self, path: PathBuf, name: String) {
+    /// Add `path` (known as `name`) if it's a source and fits the limits. `size` reads
+    /// its size, and is only asked for files Margin can read.
+    fn offer(&mut self, path: P, name: String, size: impl FnOnce(&P) -> Option<u64>) {
         let Some(kind) = SourceKind::for_name(&name) else {
             self.unsupported += 1;
             return;
         };
-        let bytes = match std::fs::metadata(&path) {
-            Ok(meta) => meta.len(),
-            Err(_) => {
-                self.unreadable += 1;
-                return;
-            }
+        let Some(bytes) = size(&path) else {
+            self.unreadable += 1;
+            return;
         };
         if bytes > routes::MAX_SOURCE_BYTES {
             self.too_large += 1;
@@ -84,6 +96,43 @@ impl Selection {
                 bytes,
             });
         }
+    }
+
+    /// Copy each chosen file into `dir` with `copy(from, to)` so it can be read from there
+    /// until it's uploaded: a mobile picker's files are only reachable while its grant
+    /// lasts. A file that fails to copy counts as unreadable.
+    #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+    pub fn stage(
+        self,
+        dir: &Path,
+        mut copy: impl FnMut(&P, &Path) -> Result<(), String>,
+    ) -> Selection<PathBuf> {
+        let mut staged = Selection {
+            files: Vec::with_capacity(self.files.len()),
+            unsupported: self.unsupported,
+            too_large: self.too_large,
+            over_limit: self.over_limit,
+            unreadable: self.unreadable,
+            folder: self.folder,
+        };
+        for (i, file) in self.files.into_iter().enumerate() {
+            let to = dir.join(staged_name(i, &file.name));
+            match copy(&file.path, &to) {
+                Ok(()) => staged.files.push(Candidate {
+                    path: to,
+                    name: file.name,
+                    folder: file.folder,
+                    kind: file.kind,
+                    bytes: file.bytes,
+                }),
+                Err(error) => {
+                    eprintln!("couldn't copy {}: {error}", file.name);
+                    let _ = std::fs::remove_file(&to);
+                    staged.unreadable += 1;
+                }
+            }
+        }
+        staged
     }
 
     /// What was left out, as a sentence; `None` when nothing was.
@@ -123,6 +172,18 @@ impl Selection {
     }
 }
 
+/// A staged copy's file name: its place in the add (names inside a folder repeat once
+/// they're flattened) and the original file name, which keeps its extension.
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+fn staged_name(index: usize, name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let safe: String = base
+        .chars()
+        .map(|c| if c == '\\' || c.is_control() { '_' } else { c })
+        .collect();
+    format!("{index:04}-{safe}")
+}
+
 fn files(n: usize) -> String {
     if n == 1 {
         "1 file".into()
@@ -141,56 +202,143 @@ fn join_and(parts: &[String]) -> String {
 }
 
 /// Files picked one by one: each is named by its file name.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn select_files(paths: Vec<PathBuf>) -> Selection {
+    let named = paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (path, name)
+        })
+        .collect();
+    select_named(named, |path| local_size(path))
+}
+
+/// Files picked one by one, each with its name; `size` reads a file's size.
+pub fn select_named<P>(files: Vec<(P, String)>, size: impl Fn(&P) -> Option<u64>) -> Selection<P> {
     let mut selection = Selection::default();
-    for path in paths {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        selection.offer(path, name);
+    for (path, name) in files {
+        selection.offer(path, name, &size);
     }
     selection
+}
+
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+fn local_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
+/// What an entry in a folder is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Folder,
+    File,
+    /// Symbolic links and other special files: passed over.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    Other,
+    /// Its type couldn't be read: counted as unreadable.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    Unknown,
+}
+
+/// An entry in a folder being walked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry<N> {
+    pub name: String,
+    pub node: N,
+    pub kind: EntryKind,
+}
+
+/// Folders a walk can list: the local file system, or a picker's document tree (Android's
+/// Storage Access Framework).
+pub trait Tree {
+    /// A folder or file in the tree.
+    type Node;
+    /// The entries of the folder `dir`, in any order; `None` when it can't be listed.
+    fn entries(&self, dir: &Self::Node) -> Option<Vec<Entry<Self::Node>>>;
+    /// A file's size in bytes; `None` when it can't be read.
+    fn size(&self, file: &Self::Node) -> Option<u64>;
+}
+
+/// The local file system.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+struct Local;
+
+impl Tree for Local {
+    type Node = PathBuf;
+
+    fn entries(&self, dir: &PathBuf) -> Option<Vec<Entry<PathBuf>>> {
+        let read = std::fs::read_dir(dir).ok()?;
+        Some(
+            read.filter_map(Result::ok)
+                .map(|entry| Entry {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    kind: match entry.file_type() {
+                        Ok(t) if t.is_dir() => EntryKind::Folder,
+                        Ok(t) if t.is_file() => EntryKind::File,
+                        Ok(_) => EntryKind::Other,
+                        Err(_) => EntryKind::Unknown,
+                    },
+                    node: entry.path(),
+                })
+                .collect(),
+        )
+    }
+
+    fn size(&self, file: &PathBuf) -> Option<u64> {
+        local_size(file)
+    }
 }
 
 /// Every source file under `root`, named by its path inside it. Hidden entries, symbolic
 /// links and `SKIPPED_DIRS` are passed over; files are visited in name order, so the
 /// limits keep the same files every time.
+// Android picks documents through the Storage Access Framework, not local paths.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn select_folder(root: &Path) -> Selection {
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    select_tree(&Local, &root.to_path_buf(), name)
+}
+
+/// Every source file under `root` in `tree`, which the user knows as `name`, by the same
+/// rules as `select_folder`.
+pub fn select_tree<T: Tree>(tree: &T, root: &T::Node, name: String) -> Selection<T::Node> {
     let mut selection = Selection {
-        folder: Some(
-            root.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| root.display().to_string()),
-        ),
+        folder: Some(name),
         ..Selection::default()
     };
-    walk(root, "", &mut selection);
+    walk(tree, root, "", &mut selection);
     selection
 }
 
-fn walk(dir: &Path, prefix: &str, selection: &mut Selection) {
-    let Ok(read) = std::fs::read_dir(dir) else {
+fn walk<T: Tree>(tree: &T, dir: &T::Node, prefix: &str, selection: &mut Selection<T::Node>) {
+    let Some(mut entries) = tree.entries(dir) else {
         return;
     };
-    let mut entries: Vec<_> = read.filter_map(Result::ok).collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if entry.name.starts_with('.') {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else {
-            selection.unreadable += 1;
-            continue;
-        };
-        let rel = format!("{prefix}{name}");
-        if file_type.is_dir() {
-            if !SKIPPED_DIRS.contains(&name.as_str()) {
-                walk(&entry.path(), &format!("{rel}/"), selection);
+        let rel = format!("{prefix}{}", entry.name);
+        match entry.kind {
+            EntryKind::Folder => {
+                if !SKIPPED_DIRS.contains(&entry.name.as_str()) {
+                    walk(tree, &entry.node, &format!("{rel}/"), selection);
+                }
             }
-        } else if file_type.is_file() {
-            selection.offer(entry.path(), rel);
+            EntryKind::File => selection.offer(entry.node, rel, |node| tree.size(node)),
+            EntryKind::Other => {}
+            EntryKind::Unknown => selection.unreadable += 1,
         }
     }
 }
@@ -407,6 +555,129 @@ mod tests {
                  1 file past the limit of 300 files or 200 MB per add."
             )
         );
+    }
+
+    /// A document tree like Android's: nodes are document ids, sizes come with the
+    /// listing, and some can't be read.
+    struct Docs(Vec<(&'static str, &'static str, EntryKind, Option<u64>)>);
+
+    impl Tree for Docs {
+        type Node = String;
+
+        fn entries(&self, dir: &String) -> Option<Vec<Entry<String>>> {
+            if dir == "locked" {
+                return None;
+            }
+            Some(
+                self.0
+                    .iter()
+                    .filter(|(parent, ..)| parent == dir)
+                    .map(|(parent, name, kind, _)| Entry {
+                        name: name.to_string(),
+                        node: format!("{parent}/{name}"),
+                        kind: *kind,
+                    })
+                    .collect(),
+            )
+        }
+
+        fn size(&self, file: &String) -> Option<u64> {
+            self.0
+                .iter()
+                .find(|(parent, name, ..)| format!("{parent}/{name}") == *file)
+                .and_then(|(.., size)| *size)
+        }
+    }
+
+    #[test]
+    fn document_trees_walk_like_folders() {
+        use EntryKind::*;
+        let tree = Docs(vec![
+            ("root", "zeta.md", File, Some(5)),
+            ("root", "Alpha", Folder, None),
+            ("root", ".trash", Folder, None),
+            ("root", "node_modules", Folder, None),
+            ("root", "locked", Folder, None),
+            ("root", "link", Other, None),
+            ("root", "mystery", Unknown, None),
+            ("root", "photo.png", File, Some(7)),
+            ("root", "gone.txt", File, None),
+            ("root", "song.zip", File, Some(1)),
+            ("root/Alpha", "b.rs", File, Some(3)),
+            ("root/Alpha", "a.pdf", File, Some(2)),
+            ("root/.trash", "old.md", File, Some(1)),
+            ("root/node_modules", "x.js", File, Some(1)),
+        ]);
+        let selection = select_tree(&tree, &"root".to_string(), "Notes".into());
+        let names: Vec<_> = selection.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Alpha/a.pdf", "Alpha/b.rs", "photo.png", "zeta.md"]
+        );
+        assert_eq!(selection.files[0].path, "root/Alpha/a.pdf");
+        assert_eq!(selection.files[0].kind, SourceKind::Pdf);
+        assert_eq!(selection.files[2].kind, SourceKind::Image);
+        assert_eq!(selection.files[3].bytes, 5);
+        assert!(
+            selection
+                .files
+                .iter()
+                .all(|f| f.folder.as_deref() == Some("Notes"))
+        );
+        // `mystery` (type unknown) and `gone.txt` (no size) couldn't be read.
+        assert_eq!(selection.unreadable, 2);
+        assert_eq!(selection.unsupported, 1);
+    }
+
+    #[test]
+    fn named_picks_use_their_names_not_their_handles() {
+        let picked = vec![
+            ("content://docs/1".to_string(), "Lecture.mp3".to_string()),
+            ("content://docs/2".to_string(), "slides.key".to_string()),
+        ];
+        let selection = select_named(picked, |_| Some(10));
+        assert_eq!(selection.files.len(), 1);
+        assert_eq!(selection.files[0].name, "Lecture.mp3");
+        assert_eq!(selection.files[0].path, "content://docs/1");
+        assert_eq!(selection.files[0].kind, SourceKind::Audio);
+        assert_eq!(selection.unsupported, 1);
+    }
+
+    #[test]
+    fn staging_copies_chosen_files_and_counts_failures() {
+        let dir = TempDir::new("stage");
+        let picked = vec![
+            ("one".to_string(), "Notes/ch1.md".to_string()),
+            ("two".to_string(), "Notes/ch1.md".to_string()),
+            ("bad".to_string(), "broken.txt".to_string()),
+        ];
+        let mut selection = select_named(picked, |_| Some(3));
+        selection.folder = Some("Notes".into());
+        let staged = selection.stage(&dir.0, |from, to| {
+            if from == "bad" {
+                std::fs::write(to, "partial").unwrap();
+                return Err("gone".into());
+            }
+            std::fs::write(to, from).map_err(|e| e.to_string())
+        });
+        assert_eq!(staged.files.len(), 2);
+        assert_eq!(staged.unreadable, 1);
+        assert_eq!(staged.folder.as_deref(), Some("Notes"));
+        // Same names inside a folder still get separate copies.
+        assert_eq!(staged.files[0].path, dir.0.join("0000-ch1.md"));
+        assert_eq!(staged.files[1].path, dir.0.join("0001-ch1.md"));
+        assert_eq!(staged.files[0].name, "Notes/ch1.md");
+        assert_eq!(
+            std::fs::read_to_string(&staged.files[1].path).unwrap(),
+            "two"
+        );
+        // A failed copy leaves nothing behind.
+        assert!(!dir.0.join("0002-broken.txt").exists());
+        assert_eq!(
+            staged.summary().as_deref(),
+            Some("Added 2 files. Skipped 1 file that couldn't be opened.")
+        );
+        assert_eq!(staged_name(7, "a\\b\n.md"), "0007-a_b_.md");
     }
 
     #[test]
