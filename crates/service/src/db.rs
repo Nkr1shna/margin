@@ -11,6 +11,7 @@
 //! `trace:[kind, at, ulid]` so a kind and time window is a record-range scan.
 //! `trace_hourly`/`trace_daily` are table views SurrealDB keeps current on every write.
 
+use std::future::IntoFuture as _;
 use std::path::Path;
 
 use anyhow::Context;
@@ -385,12 +386,14 @@ impl Store {
             return Ok(());
         }
         let rows = serde_json::to_value(rows)?;
-        self.db
-            .query(format!("INSERT INTO {table} $rows RETURN NONE"))
-            .bind(("rows", rows))
-            .await?
-            .check()
-            .with_context(|| format!("couldn't insert into {table}"))?;
+        self.retrying(|| {
+            self.db
+                .query(format!("INSERT INTO {table} $rows RETURN NONE"))
+                .bind(("rows", rows.clone()))
+                .into_future()
+        })
+        .await
+        .with_context(|| format!("couldn't insert into {table}"))?;
         Ok(())
     }
 
@@ -426,12 +429,39 @@ impl Store {
         to: &[KeyPart],
     ) -> anyhow::Result<()> {
         let (range, binds) = range_expr(table, from, to);
-        let mut q = self.db.query(format!("DELETE {range} RETURN NONE"));
-        for (name, part) in binds {
-            q = bind_part(q, name, part);
-        }
-        q.await?.check()?;
+        self.retrying(|| {
+            let mut q = self.db.query(format!("DELETE {range} RETURN NONE"));
+            for (name, part) in &binds {
+                q = bind_part(q, name.clone(), part);
+            }
+            q.into_future()
+        })
+        .await?;
         Ok(())
+    }
+
+    /// Runs a query built by `build` (again for each attempt), retrying a conflict
+    /// SurrealDB says can be retried. The passage indexes (FULLTEXT, HNSW) keep shared
+    /// keys that SurrealDB's own background index work also writes, so any statement,
+    /// a plain `DELETE` of a chat or topic included, can collide with it. Every write
+    /// here holds the service's write lock, so retrying is safe.
+    async fn retrying<F, Fut>(&self, mut build: F) -> surrealdb::Result<surrealdb::IndexedResults>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = surrealdb::Result<surrealdb::IndexedResults>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match build().await.and_then(|r| r.check()) {
+                Ok(res) => return Ok(res),
+                Err(e) if attempt < CONFLICT_RETRIES && is_retryable(&e) => {
+                    attempt += 1;
+                    tracing::debug!("retrying after a transaction conflict ({attempt}): {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Runs SurrealQL with bound parameters and returns the rows of its last statement.
@@ -441,26 +471,15 @@ impl Store {
         sql: &str,
         binds: Vec<(&'static str, serde_json::Value)>,
     ) -> anyhow::Result<Vec<T>> {
-        // The passage indexes (FULLTEXT, HNSW) keep shared keys that SurrealDB's own
-        // background index work also writes; a statement that collides with it fails
-        // with a conflict SurrealDB says can be retried. Every write here holds the
-        // service's write lock, so retrying is safe.
-        let mut attempt = 0;
-        let mut res = loop {
-            let mut q = self.db.query(sql.to_string());
-            for (name, value) in &binds {
-                q = q.bind((*name, value.clone()));
-            }
-            match q.await.and_then(|r| r.check()) {
-                Ok(res) => break res,
-                Err(e) if attempt < CONFLICT_RETRIES && is_retryable(&e) => {
-                    attempt += 1;
-                    tracing::debug!("retrying after a transaction conflict ({attempt}): {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
+        let mut res = self
+            .retrying(|| {
+                let mut q = self.db.query(sql.to_string());
+                for (name, value) in &binds {
+                    q = q.bind((*name, value.clone()));
                 }
-                Err(e) => return Err(e.into()),
-            }
-        };
+                q.into_future()
+            })
+            .await?;
         let last = res.num_statements().saturating_sub(1);
         let value: surrealdb::types::Value = res.take(last)?;
         let rows = match value.into_json_value() {
@@ -535,12 +554,14 @@ impl Store {
         value: &T,
     ) -> anyhow::Result<()> {
         let doc = serde_json::to_value(value)?;
-        self.db
-            .query("UPSERT $rid CONTENT { doc: $doc } RETURN NONE")
-            .bind(("rid", RecordId::new(table, id.to_string())))
-            .bind(("doc", doc))
-            .await?
-            .check()?;
+        self.retrying(|| {
+            self.db
+                .query("UPSERT $rid CONTENT { doc: $doc } RETURN NONE")
+                .bind(("rid", RecordId::new(table, id.to_string())))
+                .bind(("doc", doc.clone()))
+                .into_future()
+        })
+        .await?;
         Ok(())
     }
 
@@ -556,24 +577,29 @@ impl Store {
                 .iter()
                 .map(|r| Ok(serde_json::json!({ "id": r.key(), "doc": serde_json::to_value(r)? })))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            self.db
-                .query(format!(
-                    "INSERT INTO {table} $rows ON DUPLICATE KEY UPDATE doc = $input.doc RETURN NONE"
-                ))
-                .bind(("rows", serde_json::Value::Array(records)))
-                .await?
-                .check()
-                .with_context(|| format!("couldn't write {table}"))?;
+            let records = serde_json::Value::Array(records);
+            self.retrying(|| {
+                self.db
+                    .query(format!(
+                        "INSERT INTO {table} $rows ON DUPLICATE KEY UPDATE doc = $input.doc RETURN NONE"
+                    ))
+                    .bind(("rows", records.clone()))
+                    .into_future()
+            })
+            .await
+            .with_context(|| format!("couldn't write {table}"))?;
         }
         Ok(())
     }
 
     pub async fn delete(&self, table: &'static str, id: &str) -> anyhow::Result<()> {
-        self.db
-            .query("DELETE $rid")
-            .bind(("rid", RecordId::new(table, id.to_string())))
-            .await?
-            .check()?;
+        self.retrying(|| {
+            self.db
+                .query("DELETE $rid")
+                .bind(("rid", RecordId::new(table, id.to_string())))
+                .into_future()
+        })
+        .await?;
         Ok(())
     }
 
@@ -584,13 +610,15 @@ impl Store {
         field: &'static str,
         value: &str,
     ) -> anyhow::Result<()> {
-        self.db
-            .query(format!(
-                "DELETE {table} WHERE doc.{field} = $value RETURN NONE"
-            ))
-            .bind(("value", value.to_string()))
-            .await?
-            .check()?;
+        self.retrying(|| {
+            self.db
+                .query(format!(
+                    "DELETE {table} WHERE doc.{field} = $value RETURN NONE"
+                ))
+                .bind(("value", value.to_string()))
+                .into_future()
+        })
+        .await?;
         Ok(())
     }
 
@@ -605,14 +633,16 @@ impl Store {
         to: &T,
     ) -> anyhow::Result<()> {
         let to = serde_json::to_value(to)?;
-        self.db
-            .query(format!(
-                "UPDATE {table} SET doc.{set} = $to WHERE doc.{field} = $value RETURN NONE"
-            ))
-            .bind(("value", value.to_string()))
-            .bind(("to", to))
-            .await?
-            .check()?;
+        self.retrying(|| {
+            self.db
+                .query(format!(
+                    "UPDATE {table} SET doc.{set} = $to WHERE doc.{field} = $value RETURN NONE"
+                ))
+                .bind(("value", value.to_string()))
+                .bind(("to", to.clone()))
+                .into_future()
+        })
+        .await?;
         Ok(())
     }
 
@@ -841,6 +871,47 @@ mod tests {
         n: i64,
         f: Option<f32>,
         status: serde_json::Value,
+    }
+
+    /// Every write retries a conflict SurrealDB says can be retried (a chat or topic
+    /// `DELETE` used not to, and failed with a 500 under load); other errors don't.
+    #[tokio::test]
+    async fn writes_retry_a_retryable_conflict_and_nothing_else() {
+        use std::pin::Pin;
+        type Fut<'a> = Pin<
+            Box<
+                dyn std::future::Future<Output = surrealdb::Result<surrealdb::IndexedResults>> + 'a,
+            >,
+        >;
+        let s = Store::memory().await.unwrap();
+        let mut calls = 0;
+        let res = s
+            .retrying(|| -> Fut<'_> {
+                calls += 1;
+                if calls < 3 {
+                    Box::pin(async {
+                        Err(surrealdb::Error::internal(
+                            "Transaction conflict: Write conflict. This transaction can be retried"
+                                .into(),
+                        ))
+                    })
+                } else {
+                    Box::pin(s.db.query("RETURN 1").into_future())
+                }
+            })
+            .await;
+        assert!(res.is_ok());
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let res = s
+            .retrying(|| -> Fut<'_> {
+                calls += 1;
+                Box::pin(async { Err(surrealdb::Error::internal("Something else broke".into())) })
+            })
+            .await;
+        assert!(res.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[tokio::test]
