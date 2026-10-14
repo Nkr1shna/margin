@@ -5,18 +5,31 @@
 //! knows nothing about storage.
 //!
 //! Every request is sent with `store: false` and streamed (Server-Sent Events).
+//!
+//! Generation calls take [`CallOptions`] (the model route, the `prompt_cache_key`, an
+//! output cap) and their instructions are laid out for prompt caching: a versioned
+//! constant block first, byte-identical across calls, then the variable part, then the
+//! input (`docs/agent-rag-architecture.md` §2.6). The prompts live in [`prompts`].
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use margin_shared::{Level, OutlineLesson};
+use margin_shared::pipeline::Route;
+use margin_shared::{Level, OutlineLesson, Usage};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 mod citations;
 mod clean;
-mod prompts;
+pub mod prompts;
 mod responses;
 mod sse;
+
+pub use prompts::evals;
+pub use prompts::{
+    CoursePlan, DocumentContents, JsonFormat, PlanRequest, PlannedLesson, Prompt, Ranked,
+    RerankCandidate, SectionRef,
+};
 
 pub use responses::{
     Backoff, ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
@@ -123,14 +136,43 @@ impl ResponsesClient {
             .json(body))
     }
 
-    fn body(&self, instructions: &str, input: &[InputPart]) -> Value {
-        json!({
+    /// The `POST /responses` body of a generation call: always streamed, never stored;
+    /// `prompt_cache_key`, `max_output_tokens` and a structured-output `text.format`
+    /// only when given.
+    fn body(
+        &self,
+        instructions: &str,
+        input: &[InputPart],
+        opts: &CallOptions,
+        format: Option<&JsonFormat>,
+    ) -> Value {
+        let mut body = json!({
             "model": self.model,
             "instructions": instructions,
             "input": input_json(input),
             "stream": true,
             "store": false,
-        })
+        });
+        if let Some(key) = &opts.cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if let Some(max) = opts.max_output_tokens {
+            body["max_output_tokens"] = json!(max);
+        }
+        if let Some(format) = format {
+            body["text"] = json!({"format": {
+                "type": "json_schema",
+                "name": format.name,
+                "strict": true,
+                "schema": format.schema,
+            }});
+        }
+        body
+    }
+
+    /// The model this client calls.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Streams a plain-text answer (`stream: true`), calling `on_delta` with each
@@ -139,11 +181,13 @@ impl ResponsesClient {
         &self,
         instructions: &str,
         input: &str,
+        opts: &CallOptions,
         on_delta: impl FnMut(&str) + Send,
     ) -> Result<String, AiError> {
         self.stream_parts(
             instructions,
             &[InputPart::Text(input.to_string())],
+            opts,
             on_delta,
         )
         .await
@@ -154,10 +198,56 @@ impl ResponsesClient {
         &self,
         instructions: &str,
         input: &[InputPart],
-        mut on_delta: impl FnMut(&str) + Send,
+        opts: &CallOptions,
+        on_delta: impl FnMut(&str) + Send,
     ) -> Result<String, AiError> {
-        let body = self.body(instructions, input);
-        let resp = self.request(&body)?.send().await.map_err(network)?;
+        let body = self.body(instructions, input, opts, None);
+        Ok(self.stream_body(&body, on_delta).await?.value)
+    }
+
+    /// Streams the answer to a [`Prompt`]: its instructions (constant block, then the
+    /// variable part) and its input. The cache key is `opts.cache_key`, or the
+    /// prompt's own (`"{job}:{version}"`) when the caller gave none.
+    pub async fn generate(
+        &self,
+        prompt: &Prompt,
+        opts: &CallOptions,
+        on_delta: impl FnMut(&str) + Send,
+    ) -> Result<Generated<String>, AiError> {
+        let opts = opts.keyed(prompt);
+        let body = self.body(&prompt.instructions(), &prompt.input, &opts, None);
+        self.stream_body(&body, on_delta).await
+    }
+
+    /// Asks for a structured answer (`text.format`: the prompt's strict JSON schema)
+    /// and parses it as `T`. An answer that isn't JSON of that shape is
+    /// `AiError::Parse`.
+    pub async fn generate_json<T: DeserializeOwned>(
+        &self,
+        prompt: &Prompt,
+        opts: &CallOptions,
+    ) -> Result<Generated<T>, AiError> {
+        let format = prompt.format.as_ref().ok_or_else(|| {
+            AiError::Parse(format!("the {} prompt has no JSON schema", prompt.job))
+        })?;
+        let opts = opts.keyed(prompt);
+        let body = self.body(&prompt.instructions(), &prompt.input, &opts, Some(format));
+        let Generated { value: text, usage } = self.stream_body(&body, |_| {}).await?;
+        let value = serde_json::from_str(json_answer(&text)).map_err(|e| {
+            AiError::Parse(format!(
+                "the {} answer isn't the JSON asked for: {e}",
+                prompt.job
+            ))
+        })?;
+        Ok(Generated { value, usage })
+    }
+
+    async fn stream_body(
+        &self,
+        body: &Value,
+        mut on_delta: impl FnMut(&str) + Send,
+    ) -> Result<Generated<String>, AiError> {
+        let resp = self.request(body)?.send().await.map_err(network)?;
         let resp = check_status(resp).await?;
 
         let mut parser = sse::SseParser::new();
@@ -180,6 +270,76 @@ impl ResponsesClient {
             "the connection closed before the response finished".into(),
         ))
     }
+}
+
+/// How one generation call is made (§2.6): the model slot it runs on, the
+/// `prompt_cache_key` that groups calls sharing a prefix, and an output cap.
+///
+/// `route` is not sent: the service resolves it to a model (`AppState::model_for`) and
+/// builds the client for that model; it travels with the call so traces and evals can
+/// record which slot a call used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallOptions {
+    pub route: Route,
+    /// `prompt_cache_key`. `None` lets [`ResponsesClient::generate`] use the prompt's
+    /// own key (`lesson:lesson-v2`, `scene:scene-v2`, …); plain `stream_*` calls then
+    /// send none.
+    pub cache_key: Option<String>,
+    /// `max_output_tokens`; `None` leaves it to the model.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl CallOptions {
+    pub fn new(route: Route) -> Self {
+        Self {
+            route,
+            cache_key: None,
+            max_output_tokens: None,
+        }
+    }
+
+    pub fn with_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.cache_key = Some(key.into());
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, max: u32) -> Self {
+        self.max_output_tokens = Some(max);
+        self
+    }
+
+    /// These options with the prompt's cache key when none was given.
+    fn keyed(&self, prompt: &Prompt) -> CallOptions {
+        let mut opts = self.clone();
+        if opts.cache_key.is_none() {
+            opts.cache_key = Some(prompt.cache_key());
+        }
+        opts
+    }
+}
+
+/// A call's answer and what it cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Generated<T> {
+    pub value: T,
+    /// `response.usage` (zeros when the server sent none); `model_calls` is 1.
+    pub usage: Usage,
+}
+
+/// The JSON of a structured answer: the text itself, or the inside of a code fence a
+/// compatible server wrapped it in.
+fn json_answer(text: &str) -> &str {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("```") else {
+        return t;
+    };
+    let Some((lang, body)) = rest.split_once('\n') else {
+        return t;
+    };
+    if !matches!(lang.trim(), "" | "json") {
+        return t;
+    }
+    body.trim_end().strip_suffix("```").map_or(t, str::trim)
 }
 
 /// A piece of a request's input.
@@ -462,12 +622,12 @@ struct StreamState {
 }
 
 impl StreamState {
-    /// Handles one SSE event. `Ok(Some(text))` when the response completed.
+    /// Handles one SSE event. `Ok(Some(text and usage))` when the response completed.
     fn handle(
         &mut self,
         event: &sse::SseEvent,
         on_delta: &mut (impl FnMut(&str) + Send),
-    ) -> Result<Option<String>, AiError> {
+    ) -> Result<Option<Generated<String>>, AiError> {
         let data = event.data.trim();
         if data.is_empty() || data == "[DONE]" {
             return Ok(None);
@@ -504,17 +664,20 @@ impl StreamState {
                 if !self.refusal.is_empty() {
                     return Err(AiError::Incomplete(refused(&self.refusal)));
                 }
-                if self.text.is_empty()
-                    && let Some(response) = v.get("response")
-                {
+                let response = v.get("response").unwrap_or(&Value::Null);
+                let usage = responses::usage(response);
+                if self.text.is_empty() && !response.is_null() {
                     // Some compatible servers send the text only in the final object.
                     let text = response_text(response)?;
                     if !text.is_empty() {
                         on_delta(&text);
                     }
-                    return Ok(Some(text));
+                    return Ok(Some(Generated { value: text, usage }));
                 }
-                return Ok(Some(std::mem::take(&mut self.text)));
+                return Ok(Some(Generated {
+                    value: std::mem::take(&mut self.text),
+                    usage,
+                }));
             }
             "response.incomplete" => {
                 let response = v.get("response").unwrap_or(&Value::Null);
@@ -586,11 +749,28 @@ pub struct LessonContext {
 /// them despite the instructions: a code fence around the whole answer and a leading
 /// `# ` title. Callers should store the returned text (the `LessonChanged` that follows
 /// the deltas is authoritative). An `index` outside `outline` is `AiError::Parse`.
+///
+/// Runs on the `Write` route with the prompt's cache key (`lesson:lesson-v2`); use
+/// [`write_lesson_with`] to choose the options and get the usage.
 pub async fn write_lesson(
     client: &ResponsesClient,
     ctx: &LessonContext,
     on_delta: impl FnMut(&str) + Send,
 ) -> Result<String, AiError> {
+    Ok(
+        write_lesson_with(client, ctx, &CallOptions::new(Route::Write), on_delta)
+            .await?
+            .value,
+    )
+}
+
+/// [`write_lesson`] with explicit call options; returns the body and the usage.
+pub async fn write_lesson_with(
+    client: &ResponsesClient,
+    ctx: &LessonContext,
+    opts: &CallOptions,
+    on_delta: impl FnMut(&str) + Send,
+) -> Result<Generated<String>, AiError> {
     if ctx.index >= ctx.outline.len() {
         return Err(AiError::Parse(format!(
             "lesson {} doesn't exist in an outline of {} lessons",
@@ -598,18 +778,14 @@ pub async fn write_lesson(
             ctx.outline.len()
         )));
     }
-    let text = client
-        .stream_parts(
-            &prompts::lesson_instructions(ctx),
-            &prompts::lesson_input(ctx),
-            on_delta,
-        )
+    let Generated { value: text, usage } = client
+        .generate(&prompts::lesson(ctx), opts, on_delta)
         .await?;
     let body = clean::lesson_markdown(&text);
     if body.trim().is_empty() {
         return Err(AiError::Parse("the lesson came back empty".into()));
     }
-    Ok(body)
+    Ok(Generated { value: body, usage })
 }
 
 #[derive(Debug, Clone)]
@@ -639,14 +815,26 @@ pub struct FailedScene {
 /// The answer is checked for `import manimgx as m` and `class LessonScene(m.Scene)`;
 /// without them the result is `AiError::Parse`. Whether the scene runs is for the
 /// renderer to find out (and to send back as `FailedScene`).
+///
+/// Runs on the `Write` route with the prompt's cache key (`scene:scene-v2`); the
+/// repair call shares the first call's cached prefix. [`write_scene_with`] chooses the
+/// options and returns the usage.
 pub async fn write_scene(client: &ResponsesClient, req: &SceneRequest) -> Result<String, AiError> {
-    let text = client
-        .stream_text(
-            &prompts::scene_instructions(),
-            &prompts::scene_input(req),
-            |_| {},
-        )
-        .await?;
+    Ok(
+        write_scene_with(client, req, &CallOptions::new(Route::Write))
+            .await?
+            .value,
+    )
+}
+
+/// [`write_scene`] with explicit call options; returns the code and the usage.
+pub async fn write_scene_with(
+    client: &ResponsesClient,
+    req: &SceneRequest,
+    opts: &CallOptions,
+) -> Result<Generated<String>, AiError> {
+    let Generated { value: text, usage } =
+        client.generate(&prompts::scene(req), opts, |_| {}).await?;
     let code = clean::scene_code(&text);
     if !code.lines().any(|l| l.trim() == "import manimgx as m") {
         return Err(AiError::Parse(
@@ -658,7 +846,56 @@ pub async fn write_scene(client: &ResponsesClient, req: &SceneRequest) -> Result
             "the scene doesn't define class LessonScene(m.Scene)".into(),
         ));
     }
-    Ok(code)
+    Ok(Generated { value: code, usage })
+}
+
+/// Plans a course from the learner's request and a survey of their sources (§2.5):
+/// the outline and, per lesson, the retrieval questions its passages are fetched with
+/// and the source sections it must cite. Runs on the route the caller gives (`Write`
+/// in the product), as one strict-JSON call with the key `plan:plan-v1` unless the
+/// options name another.
+///
+/// The answer is checked against the request ([`CoursePlan::checked`]): the lesson
+/// count, non-empty titles, 2–3 queries per lesson, `must_cite` limited to sections
+/// listed in `req.contents`.
+pub async fn plan_course(
+    client: &ResponsesClient,
+    req: &PlanRequest,
+    opts: &CallOptions,
+) -> Result<Generated<CoursePlan>, AiError> {
+    let Generated { value, usage } = client
+        .generate_json::<CoursePlan>(&prompts::plan(req), opts)
+        .await?;
+    Ok(Generated {
+        value: value.checked(req)?,
+        usage,
+    })
+}
+
+/// Listwise rerank (§2.4, option 2): the candidates graded 0–3 for `query`, best
+/// first. Every candidate comes back exactly once: ids the model made up are dropped
+/// and candidates it left out follow the ranked ones in their original order with
+/// grade 0. Unused by the product until R2; versioned (`rerank-v1`) so the eval can run
+/// it now.
+pub async fn rerank(
+    client: &ResponsesClient,
+    query: &str,
+    candidates: &[RerankCandidate],
+    opts: &CallOptions,
+) -> Result<Generated<Vec<Ranked>>, AiError> {
+    if candidates.is_empty() {
+        return Ok(Generated {
+            value: Vec::new(),
+            usage: Usage::default(),
+        });
+    }
+    let Generated { value, usage } = client
+        .generate_json::<prompts::RerankAnswer>(&prompts::rerank(query, candidates), opts)
+        .await?;
+    Ok(Generated {
+        value: prompts::complete_ranking(value, candidates),
+        usage,
+    })
 }
 
 #[cfg(test)]

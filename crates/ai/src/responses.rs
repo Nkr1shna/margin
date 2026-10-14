@@ -500,7 +500,7 @@ fn parse_event(event: &SseEvent) -> Result<Option<StreamEvent>, AiError> {
 }
 
 /// `response.usage` of a finished response, as one model call.
-fn usage(response: &Value) -> Usage {
+pub(crate) fn usage(response: &Value) -> Usage {
     let n = |path: &str| {
         response
             .pointer(&format!("/usage/{path}"))
