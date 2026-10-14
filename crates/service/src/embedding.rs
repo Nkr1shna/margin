@@ -11,8 +11,8 @@ use margin_embed::{EmbedError, Embedder};
 use margin_shared::{EmbeddingModel, EmbeddingModelState, Event};
 
 use crate::error::{AppError, AppResult};
-use crate::sources;
 use crate::state::AppState;
+use crate::{ingest, sources};
 
 /// Download progress is sent at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -175,6 +175,10 @@ async fn run_download(state: AppState) {
         // Sources uploaded meanwhile waited for the model.
         if let Err(e) = sources::enqueue_queued(&state).await {
             tracing::error!("couldn't queue sources after the download: {e:#}");
+        }
+        // Other documents that waited, and the move to the passage index if it did.
+        if let Err(e) = ingest::enqueue_waiting(&state).await {
+            tracing::error!("couldn't queue documents after the download: {e:#}");
         }
     }
 }

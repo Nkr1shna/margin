@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use chrono::Utc;
 use common::*;
+use margin_service::db::PassageRow;
 use margin_service::db::{self, Store};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore};
 use margin_service::sources::ChunkRow;
@@ -82,15 +83,16 @@ fn is_ready(s: &SourceStatus) -> bool {
     matches!(s, SourceStatus::Ready { .. })
 }
 
-async fn chunks(h: &Harness, source_id: &str) -> Vec<ChunkRow> {
-    let mut rows: Vec<ChunkRow> = h
-        .state
+/// A source's text passages, in order.
+async fn chunks(h: &Harness, source_id: &str) -> Vec<PassageRow> {
+    h.state
         .store
-        .list_where(db::CHUNK, "source_id", source_id)
+        .passages_of(source_id)
         .await
-        .unwrap();
-    rows.sort_by_key(|c| c.ord);
-    rows
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.modality == "text")
+        .collect()
 }
 
 async fn embedding(h: &Harness, token: &str) -> EmbeddingModel {
@@ -172,7 +174,10 @@ async fn uploads_are_read_embedded_and_listed() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[1].ord, 1);
     assert!(rows[1].text.starts_with("The coefficient a_n"));
-    assert_eq!(rows[1].topic_id, None);
+    assert!(rows[1].scope_ids.is_empty());
+    assert_eq!(rows[1].document_id, s.id);
+    assert_eq!(rows[1].embedder, margin_service::ingest::EMBEDDER_VERSION);
+    assert_eq!(rows[1].access, ["company"]);
     assert_eq!(rows[1].vector.len(), margin_embed::DIM);
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 
@@ -206,7 +211,7 @@ async fn uploads_are_read_embedded_and_listed() {
     );
     let rows = chunks(&h, &pdf.id).await;
     assert_eq!(rows[2].page, Some(2));
-    assert_eq!(rows[2].topic_id.as_deref(), Some(topic.id.as_str()));
+    assert_eq!(rows[2].scope_ids, std::slice::from_ref(&topic.id));
     // The model was loaded once and kept.
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 
@@ -573,7 +578,7 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
         chunks(&h, &fourier.id)
             .await
             .iter()
-            .all(|c| c.topic_id.as_deref() == Some(topic.id.as_str()))
+            .all(|c| c.scope_ids.contains(&topic.id))
     );
 
     // Each lesson is written with passages from the topic's sources.
@@ -928,4 +933,604 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     assert!(!lib.sources.iter().any(|s| s.id == "s-old"));
     assert!(!h.data_dir.join("sources").join("s-old").exists());
     assert!(chunks(&h, "s-old").await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// R1: the passage index (ingest, documents, migration)
+// ---------------------------------------------------------------------------
+
+use margin_embed::Embedder as _;
+use margin_shared::Note;
+use margin_shared::context::{
+    ContextIngest, Document, DocumentStatus, LibraryKind, Origin, Project,
+};
+
+const SECTIONS: &str = "# Fourier\n\nFourier series write a periodic signal as a sum of sines.\n\n\
+The coefficient a_n is the projection onto cos(n x).\n\n\
+# Gibbs\n\nPartial sums overshoot near jumps by about nine percent.";
+
+async fn document(h: &Harness, id: &str) -> Document {
+    margin_service::ingest::document(&h.state, id)
+        .await
+        .unwrap()
+        .expect("the document exists")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sources_become_documents_with_located_passages_in_the_default_project() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let topic = new_topic(&h, &t, None, "Signals").await;
+    let mut socket = h.socket(&t).await;
+    let s = upload_ok(&h, &t, "waves.md", Some(&topic.id), SECTIONS).await;
+    let events = socket
+        .until(|e| matches!(e, Event::DocumentChanged { document } if document.id == s.id))
+        .await;
+    let Some(Event::DocumentChanged { document: doc }) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(doc.status, DocumentStatus::Ready { passages: 3 });
+    assert_eq!(
+        doc.origin,
+        Origin::Source {
+            source_id: s.id.clone()
+        }
+    );
+    assert_eq!(doc.actor, "owner");
+    assert_eq!(doc.access, ["company"]);
+    assert!(doc.generation > 0);
+    // One project, "My library", holds it.
+    let projects: Vec<Project> = h.state.store.list(db::PROJECT).await.unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].name, "My library");
+    assert_eq!(doc.project_id, projects[0].id);
+    // The source is Ready like before; the pipeline's chunker was asked for by name.
+    wait_source(&h, &t, &s.id, is_ready).await;
+    assert!(
+        h.source_tools
+            .chunkers
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c == "sections-v2")
+    );
+
+    let rows = h.state.store.passages_of(&s.id).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].section_path, "Fourier");
+    assert_eq!((rows[0].start_line, rows[0].end_line), (Some(3), Some(3)));
+    assert_eq!(rows[2].section_path, "Gibbs");
+    assert_eq!(rows[2].start_line, Some(9));
+    assert!(rows.iter().all(|r| r.project_id == projects[0].id
+        && r.scope_ids == [topic.id.clone()]
+        && r.access == ["company"]
+        && r.origin == "source"
+        && r.chunk_hash.len() == 64
+        && r.id == format!("{}:{}", s.id, r.chunk_hash)
+        && r.unit_id.starts_with(&format!("{}:text:", s.id))));
+    assert_eq!(rows.iter().map(|r| r.ord).collect::<Vec<_>>(), [0, 1, 2]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_again_embeds_only_what_changed_and_moves_the_generation() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
+    wait_source(&h, &t, &s.id, is_ready).await;
+    let before = h.state.store.passages_of(&s.id).await.unwrap();
+    let gen_before = document(&h, &s.id).await.generation;
+    let since = margin_service::ingest::changes_since(&h.state, 0)
+        .await
+        .unwrap()
+        .generation;
+
+    // Unchanged: nothing embedded, nothing moved, the generation stays.
+    let report = margin_service::ingest::ingest(&h.state, &s.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.chunks_new, report.chunks_kept, report.chunks_deleted),
+        (0, 3, 0)
+    );
+    assert_eq!(document(&h, &s.id).await.generation, gen_before);
+
+    // One section edited in place, a line longer, above the last section.
+    let edited = SECTIONS.replace(
+        "The coefficient a_n is the projection onto cos(n x).",
+        "The coefficient b_n is the projection onto sin(n x),\nfound over one period.",
+    );
+    std::fs::write(h.data_dir.join("sources").join(&s.id).join("file"), &edited).unwrap();
+    let mut socket = h.socket(&t).await;
+    let report = margin_service::ingest::ingest(&h.state, &s.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.chunks_new, report.chunks_kept, report.chunks_deleted),
+        (1, 2, 1)
+    );
+    let after = h.state.store.passages_of(&s.id).await.unwrap();
+    assert_eq!(after.len(), 3);
+    // Kept passages keep their ids and vectors; the moved one has its new lines.
+    assert_eq!(after[0], before[0]);
+    assert_eq!(after[2].id, before[2].id);
+    assert_eq!(after[2].vector, before[2].vector);
+    assert_eq!(after[2].start_line, Some(10));
+    assert!(after[1].text.starts_with("The coefficient b_n"));
+    assert_ne!(after[1].id, before[1].id);
+    let doc = document(&h, &s.id).await;
+    assert!(doc.generation > gen_before);
+    assert_eq!(doc.status, DocumentStatus::Ready { passages: 3 });
+    // DocumentChanged once, and the change feed lists it.
+    let events = socket
+        .until(|e| matches!(e, Event::DocumentChanged { .. }))
+        .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::DocumentChanged { .. }))
+            .count(),
+        1
+    );
+    let changes = margin_service::ingest::changes_since(&h.state, since)
+        .await
+        .unwrap();
+    assert_eq!(
+        changes
+            .changed
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect::<Vec<_>>(),
+        [s.id.as_str()]
+    );
+    assert_eq!(changes.generation, doc.generation);
+    assert!(changes.deleted.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_documents_access_is_copied_onto_its_passages() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
+    wait_source(&h, &t, &s.id, is_ready).await;
+    let mut doc = document(&h, &s.id).await;
+    doc.access = vec!["company/engineering".into(), "company/research".into()];
+    h.state.store.put(db::DOCUMENT, &s.id, &doc).await.unwrap();
+    let report = margin_service::ingest::ingest(&h.state, &s.id)
+        .await
+        .unwrap();
+    // Nothing is embedded again; every passage carries the new paths.
+    assert_eq!(report.chunks_new, 0);
+    let rows = h.state.store.passages_of(&s.id).await.unwrap();
+    assert!(rows.iter().all(|r| r.access == doc.access));
+    // A query filtered by access finds them through the index.
+    let hits: Vec<serde_json::Value> = h
+        .state
+        .store
+        .query_rows(
+            "SELECT id FROM passage WHERE access CONTAINSANY $paths",
+            vec![("paths", json!(["company/research"]))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_and_attaching_sources_follow_through_to_documents() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s = upload_ok(&h, &t, "fourier.md", None, FOURIER).await;
+    wait_source(&h, &t, &s.id, is_ready).await;
+    let since = margin_service::ingest::changes_since(&h.state, 0)
+        .await
+        .unwrap()
+        .generation;
+    // Filed under a topic: its passages are searchable from the topic.
+    let topic = new_topic(&h, &t, None, "Signals").await;
+    let events = {
+        let _w = h.state.write_lock.lock().await;
+        margin_service::sources::attach_locked(&h.state, std::slice::from_ref(&s.id), &topic.id)
+            .await
+            .unwrap()
+    };
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::DocumentChanged { document } if document.id == s.id))
+    );
+    assert!(
+        chunks(&h, &s.id)
+            .await
+            .iter()
+            .all(|c| c.scope_ids == [topic.id.clone()])
+    );
+    assert!(document(&h, &s.id).await.generation > since);
+
+    let r = h
+        .delete(&t, &format!("/api/sources/{}", s.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(
+        margin_service::ingest::document(&h.state, &s.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(h.state.store.passages_of(&s.id).await.unwrap().is_empty());
+    let changes = margin_service::ingest::changes_since(&h.state, since)
+        .await
+        .unwrap();
+    assert_eq!(changes.deleted, std::slice::from_ref(&s.id));
+    assert!(changes.changed.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pictures_and_pages_share_units_and_pages_render_when_needed() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let pdf = upload_ok(
+        &h,
+        &t,
+        "dsp.pdf",
+        None,
+        "Aliasing folds high frequencies.\x0cNyquist rate is twice the bandwidth.",
+    )
+    .await;
+    wait_source(&h, &t, &pdf.id, is_ready).await;
+    let rows = h.state.store.passages_of(&pdf.id).await.unwrap();
+    let page2: Vec<&PassageRow> = rows.iter().filter(|r| r.page == Some(2)).collect();
+    assert_eq!(page2.len(), 2);
+    assert!(
+        page2
+            .iter()
+            .all(|r| r.unit_id == format!("{}:page:2", pdf.id))
+    );
+    let picture = page2.iter().find(|r| r.modality == "picture").unwrap();
+    // The page picture carries the page's text.
+    assert_eq!(picture.text, "Nyquist rate is twice the bandwidth.");
+    assert_eq!(picture.file.as_deref(), Some("page-2.png"));
+
+    // A page picture that isn't on disk is rendered when retrieval needs it.
+    let page = h
+        .data_dir
+        .join("sources")
+        .join(&pdf.id)
+        .join("media")
+        .join("page-2.png");
+    std::fs::remove_file(&page).unwrap();
+    let found = margin_service::sources::passages(
+        &h.state,
+        std::slice::from_ref(&pdf.id),
+        "Nyquist bandwidth",
+    )
+    .await;
+    assert!(!found.is_empty());
+    assert!(page.is_file());
+    assert!(h.source_tools.page_renders.load(Ordering::SeqCst) > 0);
+    assert!(
+        found
+            .iter()
+            .all(|p| p.citation.document_id.as_deref() == Some(pdf.id.as_str()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_documents_and_library_items_are_indexed_too() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    // An agent's text document.
+    let req = ContextIngest {
+        name: "runbook.md".into(),
+        origin: Origin::Agent {
+            name: "test".into(),
+        },
+        kind: SourceKind::Text,
+        text: "Restart the queue worker.\n\nThen drain the dead letters.".into(),
+    };
+    let doc = margin_service::ingest::ingest_text(&h.state, &req)
+        .await
+        .unwrap();
+    assert_eq!(doc.actor, "agent:test");
+    let ready = eventually(|| async {
+        let d = document(&h, &doc.id).await;
+        matches!(d.status, DocumentStatus::Ready { .. }).then_some(d)
+    })
+    .await;
+    assert_eq!(ready.status, DocumentStatus::Ready { passages: 2 });
+    let rows = h.state.store.passages_of(&doc.id).await.unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.origin == "agent" && r.scope_ids.is_empty())
+    );
+    // The same agent and name updates that document rather than adding one.
+    let again = margin_service::ingest::ingest_text(
+        &h.state,
+        &ContextIngest {
+            text: "Restart the queue worker.".into(),
+            ..req.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.id, doc.id);
+    eventually(|| async {
+        let d = document(&h, &doc.id).await;
+        (d.status == DocumentStatus::Ready { passages: 1 }).then_some(())
+    })
+    .await;
+    // Only agents add text.
+    assert!(
+        margin_service::ingest::ingest_text(
+            &h.state,
+            &ContextIngest {
+                origin: Origin::Source {
+                    source_id: "x".into()
+                },
+                ..req.clone()
+            }
+        )
+        .await
+        .is_err()
+    );
+
+    // A note, searchable from its topic, and gone with it.
+    let topic = new_topic(&h, &t, None, "Ops").await;
+    let note: Note = h
+        .post(&t, "/api/notes")
+        .json(
+            &json!({"topic_id": topic.id, "lesson_id": null, "title": "Pager",
+            "body_md": "Escalate after fifteen minutes.", "quote": null}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ndoc = margin_service::ingest::index_library(&h.state, LibraryKind::Note, &note.id)
+        .await
+        .unwrap();
+    eventually(|| async {
+        let d = document(&h, &ndoc.id).await;
+        matches!(d.status, DocumentStatus::Ready { .. }).then_some(())
+    })
+    .await;
+    let rows = h.state.store.passages_of(&ndoc.id).await.unwrap();
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|r| r.origin == "library" && r.scope_ids == [topic.id.clone()])
+    );
+    let r = h
+        .delete(&t, &format!("/api/notes/{}", note.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(
+        margin_service::ingest::document(&h.state, &ndoc.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.state
+            .store
+            .passages_of(&ndoc.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_files_are_folder_documents_searchable_from_their_folder() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let now = Utc::now();
+    let folder_file = Source {
+        media_url: None,
+        id: "f1".into(),
+        topic_id: None,
+        name: "notes/waves.md".into(),
+        folder: Some("Notes".into()),
+        kind: SourceKind::Text,
+        bytes: SECTIONS.len() as u64,
+        status: SourceStatus::Queued,
+        created_at: now,
+        workspace_id: Some("w1".into()),
+        modified: Some(now),
+    };
+    let dir = h.data_dir.join("sources").join("f1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("file"), SECTIONS).unwrap();
+    h.state
+        .store
+        .put(db::SOURCE, "f1", &folder_file)
+        .await
+        .unwrap();
+    margin_service::ingest::queue_source(&h.state, "f1")
+        .await
+        .unwrap();
+    wait_source(&h, &t, "f1", is_ready).await;
+    let doc = document(&h, "f1").await;
+    assert_eq!(
+        doc.origin,
+        Origin::FolderFile {
+            workspace_id: "w1".into(),
+            path: "notes/waves.md".into()
+        }
+    );
+    let rows = h.state.store.passages_of("f1").await.unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.origin == "folder" && r.scope_ids == ["w1"])
+    );
+}
+
+/// A store as the service left it before the passage index: Ready sources with `chunk`
+/// and `media` rows, attached to a chat (so the unattached clean-up keeps them).
+async fn old_store(ids: &[&str]) -> Store {
+    let store = Store::memory().await.unwrap();
+    let now = Utc::now();
+    for (i, id) in ids.iter().enumerate() {
+        let s = Source {
+            media_url: None,
+            id: id.to_string(),
+            topic_id: None,
+            name: format!("{id}.md"),
+            folder: None,
+            kind: SourceKind::Text,
+            bytes: FOURIER.len() as u64,
+            status: SourceStatus::Ready {
+                chunks: 2,
+                pages: None,
+                warning: None,
+            },
+            created_at: now - chrono::Duration::minutes(10 - i as i64),
+            workspace_id: None,
+            modified: None,
+        };
+        store.put(db::SOURCE, id, &s).await.unwrap();
+        let text = format!("old passage of {id} about Gibbs ringing");
+        let old = ChunkRow {
+            source_id: id.to_string(),
+            topic_id: None,
+            ord: 0,
+            page: None,
+            start_ms: None,
+            end_ms: None,
+            vector: margin_embed::fake::FakeEmbedder
+                .embed(std::slice::from_ref(&text), margin_embed::Purpose::DOCUMENT)
+                .unwrap()
+                .remove(0),
+            text,
+        };
+        store
+            .put(db::CHUNK, &format!("{id}-0"), &old)
+            .await
+            .unwrap();
+        let media = margin_service::sources::MediaRow {
+            source_id: id.to_string(),
+            topic_id: None,
+            ord: 0,
+            kind: margin_service::sources::MediaKind::Audio,
+            file: None,
+            page: None,
+            start_ms: Some(0),
+            end_ms: Some(10_000),
+            text: String::new(),
+            vector: vec![0.0; margin_embed::DIM],
+        };
+        store
+            .put(db::MEDIA, &format!("{id}-m0"), &media)
+            .await
+            .unwrap();
+    }
+    let chat: margin_shared::Chat = serde_json::from_value(json!({
+        "id": "c1", "title": "Old", "state": {"state": "idle"},
+        "source_ids": ids,
+        "created_at": now, "updated_at": now
+    }))
+    .unwrap();
+    store.put(db::CHAT, "c1", &chat).await.unwrap();
+    store
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_start_moves_old_sources_to_the_passage_index_in_one_pass() {
+    let store = old_store(&["s-a", "s-gone"]).await;
+    let h = start_with(Setup {
+        store: Some(store),
+        // Only s-a's file is still there.
+        files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
+        ..Setup::default()
+    })
+    .await;
+    let t = h.sign_in("Mac").await;
+    // The library is served meanwhile.
+    let r = h.get(&t, "/api/library").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+
+    eventually(|| async {
+        let row = h.state.settings_row().await.unwrap();
+        row.migrations
+            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
+            .then_some(())
+    })
+    .await;
+    let a = wait_source(&h, &t, "s-a", is_ready).await;
+    assert_eq!(
+        a.status,
+        SourceStatus::Ready {
+            chunks: 3,
+            pages: None,
+            warning: None,
+        }
+    );
+    let rows = chunks(&h, "s-a").await;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.scope_ids == ["c1"]));
+    // A source whose file is gone is Failed, to be read again.
+    let gone = wait_source(&h, &t, "s-gone", |s| {
+        matches!(s, SourceStatus::Failed { .. })
+    })
+    .await;
+    assert_eq!(
+        gone.status,
+        SourceStatus::Failed {
+            error: margin_service::ingest::FILE_GONE.into()
+        }
+    );
+    // The old tables are gone.
+    assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
+    assert!(!h.state.store.table_exists(db::MEDIA).await.unwrap());
+    // Retrieval reads the passages.
+    let found = margin_service::sources::passages(&h.state, &["s-a".into()], "Gibbs").await;
+    assert!(!found.is_empty());
+    assert!(
+        found
+            .iter()
+            .all(|p| !p.passage.text.starts_with("old passage"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows() {
+    let store = old_store(&["s-a"]).await;
+    let h = start_with(Setup {
+        store: Some(store),
+        model_downloaded: false,
+        files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
+        ..Setup::default()
+    })
+    .await;
+    let t = h.sign_in("Mac").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(h.state.settings_row().await.unwrap().migrations.is_empty());
+    assert!(h.state.store.table_exists(db::CHUNK).await.unwrap());
+    assert!(h.state.store.passages_of("s-a").await.unwrap().is_empty());
+    // The old rows still answer, as passages without a document.
+    let old = margin_service::sources::candidates(&h.state, "s-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        old.iter().map(|p| p.modality.as_str()).collect::<Vec<_>>(),
+        ["text", "sound"]
+    );
+
+    // Once the model is there, the pass runs.
+    let r = h.post(&t, "/api/embedding/download").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    eventually(|| async {
+        let row = h.state.settings_row().await.unwrap();
+        row.migrations
+            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
+            .then_some(())
+    })
+    .await;
+    assert_eq!(chunks(&h, "s-a").await.len(), 3);
+    assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
 }

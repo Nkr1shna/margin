@@ -26,6 +26,7 @@ use margin_embed::{
 use margin_service::config::Config;
 use margin_service::db::Store;
 use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools};
+use margin_service::pipeline::{Chunker, ChunkerCfg};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::server::{Options, Service};
 use margin_service::state::AppState;
@@ -406,6 +407,10 @@ pub struct FakeSourceTools {
     pub extracts: AtomicU32,
     pub transcribes: AtomicU32,
     pub no_transcriber: AtomicBool,
+    /// The chunker each `chunk` call was asked for, by name.
+    pub chunkers: Mutex<Vec<String>>,
+    /// Pages asked for through `pdf_page_picture`.
+    pub page_renders: AtomicU32,
     /// What each fake sound says, by `sound_key`.
     spoken: Mutex<std::collections::HashMap<u64, String>>,
 }
@@ -614,31 +619,70 @@ impl SourceTools for FakeSourceTools {
 
     fn chunk(
         &self,
+        chunker: &dyn Chunker,
         doc: &Extracted,
         _kind: SourceKind,
         count_tokens: &dyn Fn(&str) -> usize,
-        max_tokens: usize,
+        cfg: &ChunkerCfg,
     ) -> Vec<Chunk> {
+        self.chunkers
+            .lock()
+            .unwrap()
+            .push(chunker.name().to_string());
         let mut chunks = Vec::new();
         for page in &doc.pages {
-            for para in page.text.split("\n\n").map(str::trim) {
+            // Lines are counted from the page's first line, paragraphs being separated by
+            // one blank line; a "# " line names the section of what follows.
+            let mut line = 1u32;
+            let mut section = String::new();
+            for raw in page.text.split("\n\n") {
+                let lines = raw.lines().count().max(1) as u32;
+                let (start, end) = (line, line + lines - 1);
+                line += lines + 1;
+                let para = raw.trim();
                 if para.is_empty() {
                     continue;
                 }
+                if let Some(heading) = para.strip_prefix("# ") {
+                    section = heading.trim().to_string();
+                    continue;
+                }
                 assert!(
-                    count_tokens(para) <= max_tokens,
+                    count_tokens(para) <= cfg.max_tokens,
                     "test paragraphs are short"
                 );
                 chunks.push(Chunk {
                     text: para.to_string(),
                     page: page.number,
-                    start_ms: None,
-                    end_ms: None,
+                    section_path: section.clone(),
+                    start_line: page.number.is_none().then_some(start),
+                    end_line: page.number.is_none().then_some(end),
                     ..Default::default()
                 });
             }
         }
         chunks
+    }
+
+    fn pdf_page_picture(
+        &self,
+        pdf: &Path,
+        page: u32,
+        media_dir: &Path,
+    ) -> Result<PathBuf, EmbedError> {
+        self.page_renders.fetch_add(1, Ordering::SeqCst);
+        let target = media_dir.join(margin_embed::page_file(page));
+        if target.is_file() {
+            return Ok(target);
+        }
+        let text = String::from_utf8_lossy(&std::fs::read(pdf)?).into_owned();
+        let t = text
+            .split('\x0c')
+            .nth(page as usize - 1)
+            .ok_or_else(|| EmbedError::Extract(format!("the PDF has no page {page}")))?;
+        std::fs::create_dir_all(media_dir)?;
+        std::fs::write(&target, format!("{FAKE_PICTURE}{t}"))?;
+        Ok(target)
     }
 
     fn score(
