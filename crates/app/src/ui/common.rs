@@ -83,6 +83,7 @@ const ICONS: &[(&str, &str)] = &[
         r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5.5M12 16.5v.01"/>"#,
     ),
     ("back", r#"<path d="M14.5 6l-6 6 6 6"/>"#),
+    ("forward", r#"<path d="M9.5 6l6 6-6 6"/>"#),
     (
         "refresh",
         r#"<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4h-4"/>"#,
@@ -240,6 +241,36 @@ pub fn DragRegion() -> Element {
     }
 }
 
+/// Back and forward through the screens visited. They sit in the sidebar's header row,
+/// and in the top bar while the sidebar is hidden (CSS picks which shows).
+#[component]
+pub fn HistoryButtons() -> Element {
+    let nav = navigator();
+    // Re-render on navigation so the enabled state stays current.
+    let _ = use_route::<crate::routes::Route>();
+    let (can_back, can_forward) = (nav.can_go_back(), nav.can_go_forward());
+    rsx! {
+        div { class: "history",
+            button {
+                class: "icon-btn",
+                "aria-label": "Back",
+                title: "Back (⌘[)",
+                disabled: !can_back,
+                onclick: move |_| nav.go_back(),
+                Icon { name: "back" }
+            }
+            button {
+                class: "icon-btn",
+                "aria-label": "Forward",
+                title: "Forward (⌘])",
+                disabled: !can_forward,
+                onclick: move |_| nav.go_forward(),
+                Icon { name: "forward" }
+            }
+        }
+    }
+}
+
 /// The top bar of every screen: the drawer button (narrow screens), breadcrumbs, and
 /// screen controls on the right.
 #[component]
@@ -250,16 +281,23 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
         div { class: "topbar",
             DragRegion {}
             button {
-                class: "icon-btn menu-btn",
+                // Wide windows: shown while the sidebar is collapsed, un-collapses it.
+                class: "icon-btn menu-btn menu-wide",
                 "aria-label": "Show sidebar",
                 title: "Show sidebar (⌘\\)",
-                // Wide windows un-collapse the sidebar; narrow ones open the drawer.
                 onclick: move |_| {
                     let _ = app.set_config(|c| c.sidebar_hidden = false);
-                    app.drawer_open.set(true);
                 },
                 Icon { name: "panel" }
             }
+            button {
+                // Narrow windows: the sidebar is a drawer; this opens it.
+                class: "icon-btn menu-btn menu-narrow",
+                "aria-label": "Open sidebar",
+                onclick: move |_| app.drawer_open.set(true),
+                Icon { name: "panel" }
+            }
+            HistoryButtons {}
             nav { class: "crumbs", "aria-label": "Breadcrumbs",
                 for (i, c) in crumbs.iter().enumerate() {
                     if i == last {

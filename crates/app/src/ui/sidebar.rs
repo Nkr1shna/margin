@@ -7,7 +7,9 @@ use crate::config::Appearance;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::store::VideoDot;
-use crate::ui::common::{BrandMark, ConfirmDialog, DragRegion, Icon};
+use crate::ui::common::{
+    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
+};
 
 /// Which inline topic editor is open in the tree.
 #[derive(Clone, PartialEq, Debug)]
@@ -85,8 +87,12 @@ pub fn Sidebar() -> Element {
             div { class: "sb-top",
                 div { class: "ws",
                     DragRegion {}
-                    BrandMark {}
-                    span { class: "grow", "Margin" }
+                    // On macOS the app's name is in the menu bar; this row holds the
+                    // window controls instead.
+                    if !UNIFIED_TITLE_BAR {
+                        BrandMark {}
+                        span { class: "grow", "Margin" }
+                    }
                     button {
                         class: "icon-btn sb-toggle",
                         "aria-label": "Hide sidebar",
@@ -99,6 +105,9 @@ pub fn Sidebar() -> Element {
                             }
                         },
                         Icon { name: "panel" }
+                    }
+                    if UNIFIED_TITLE_BAR {
+                        HistoryButtons {}
                     }
                 }
                 button {

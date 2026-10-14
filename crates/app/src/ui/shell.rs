@@ -15,7 +15,7 @@ pub fn Shell() -> Element {
     let route = use_route::<Route>();
 
     // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+\ toggles the sidebar,
-    // from anywhere in the window.
+    // Cmd/Ctrl+[ and ] go back and forward, from anywhere in the window.
     use_future(move || async move {
         let mut eval = js(
             "MarginApp.watchShortcuts(function (m) { dioxus.send(m); });\nawait new Promise(function () {});",
@@ -23,10 +23,12 @@ pub fn Shell() -> Element {
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
                 "search" => app.search_open.set(true),
+                "back" => nav.go_back(),
+                "forward" => nav.go_forward(),
                 "sidebar" => {
                     let hidden = app.config.peek().sidebar_hidden;
                     let _ = app.set_config(|c| c.sidebar_hidden = !hidden);
-                    app.drawer_open.set(hidden);
+                    app.drawer_open.set(false);
                 }
                 "ask" => {
                     app.search_open.set(false);
