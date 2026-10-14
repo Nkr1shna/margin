@@ -5202,6 +5202,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "futures-util",
+ "httpdate",
  "margin-shared",
  "reqwest 0.13.5",
  "serde",

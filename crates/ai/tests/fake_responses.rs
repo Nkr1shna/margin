@@ -13,10 +13,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use margin_ai::{
-    AiError, FailedScene, Image, LessonContext, Passage, ResponsesClient, SceneRequest,
-    propose_outline, write_lesson, write_scene,
+    AiError, Backoff, FailedScene, Image, LessonContext, Passage, ReasoningConfig,
+    ReasoningSummary, ResponseRequest, ResponseStream, ResponsesClient, SceneRequest, StreamEvent,
+    ToolChoice, propose_outline, write_lesson, write_scene,
 };
-use margin_shared::{AskRequest, Level, OutlineLesson};
+use margin_shared::{AskRequest, Level, OutlineLesson, ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -27,8 +28,12 @@ enum Reply {
     /// An SSE body sent as these exact byte chunks, a few milliseconds apart so they
     /// reach the client as separate reads.
     Sse(Vec<Vec<u8>>),
+    /// An SSE body sent as these chunks, then the connection is cut (the body errors).
+    SseThenDrop(Vec<Vec<u8>>),
     Json(StatusCode, Value),
     Text(StatusCode, String),
+    /// A status with these headers and a JSON body (e.g. 429 with `Retry-After`).
+    WithHeaders(StatusCode, Vec<(&'static str, String)>, Value),
 }
 
 #[derive(Default)]
@@ -61,7 +66,26 @@ async fn responses(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: Byte
                 .body(Body::from_stream(stream))
                 .unwrap()
         }
+        Reply::SseThenDrop(chunks) => {
+            let stream = futures_util::stream::iter(chunks.into_iter().map(Some).chain([None]))
+                .then(|c| async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    c.map(Bytes::from)
+                        .ok_or_else(|| std::io::Error::other("connection cut"))
+                });
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
         Reply::Json(status, v) => (status, axum::Json(v)).into_response(),
+        Reply::WithHeaders(status, headers, v) => {
+            let mut resp = (status, axum::Json(v)).into_response();
+            for (name, value) in headers {
+                resp.headers_mut().insert(name, value.parse().unwrap());
+            }
+            resp
+        }
         Reply::Text(status, t) => (status, t).into_response(),
     }
 }
@@ -750,4 +774,663 @@ async fn write_scene_without_lesson_scene_is_parse() {
         write_scene(&client, &req).await,
         Err(AiError::Parse(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The agent's streaming call (`stream_response`)
+// ---------------------------------------------------------------------------
+
+/// Every event of `stream`, in order (an `Err` ends it).
+async fn drain(stream: ResponseStream) -> Vec<Result<StreamEvent, String>> {
+    stream
+        .map(|r| r.map_err(|e| format!("{e:?}")))
+        .collect()
+        .await
+}
+
+fn agent_request() -> ResponseRequest {
+    ResponseRequest {
+        model: Some("agent-model".into()),
+        input: vec![
+            json!({"role": "developer", "content": "You are Margin."}),
+            json!({"role": "user", "content": "Hi"}),
+        ],
+        tools: vec![json!({
+            "type": "function", "name": "search_library", "description": "Search.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                           "required": ["query"], "additionalProperties": false},
+            "strict": true
+        })],
+        tool_choice: Some(ToolChoice::Auto),
+        reasoning: Some(ReasoningConfig {
+            effort: ReasoningEffort::Medium,
+            summary: Some(ReasoningSummary::Auto),
+        }),
+        include_encrypted_reasoning: true,
+        prompt_cache_key: Some("chat-1".into()),
+        parallel_tool_calls: Some(true),
+        ..Default::default()
+    }
+}
+
+fn completed_with_usage(id: &str) -> String {
+    event(
+        json!({"type": "response.completed", "sequence_number": 99, "response": {
+            "id": id, "status": "completed", "output": [],
+            "usage": {
+                "input_tokens": 1200, "input_tokens_details": {"cached_tokens": 1024},
+                "output_tokens": 300, "output_tokens_details": {"reasoning_tokens": 200},
+                "total_tokens": 1500
+            }
+        }}),
+    )
+}
+
+fn usage_1200() -> Usage {
+    Usage {
+        input_tokens: 1200,
+        cached_input_tokens: 1024,
+        output_tokens: 300,
+        reasoning_tokens: 200,
+        model_calls: 1,
+    }
+}
+
+fn message_item(status: &str, text: &str) -> Value {
+    let content = if status == "in_progress" {
+        json!([])
+    } else {
+        json!([{"type": "output_text", "text": text, "annotations": []}])
+    };
+    json!({"id": "msg_1", "type": "message", "role": "assistant", "status": status, "content": content})
+}
+
+/// A text answer with every event the API sends around it, including those the stream
+/// doesn't yield (`created`, `in_progress`, `content_part.*`, `output_text.done`).
+fn agent_text_body(pieces: &[&str]) -> String {
+    let text = pieces.concat();
+    let mut s = created();
+    s.push_str(&event(
+        json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}),
+    ));
+    s.push_str(&event(
+        json!({"type": "response.output_item.added", "output_index": 0, "item": message_item("in_progress", "")}),
+    ));
+    s.push_str(&event(
+        json!({"type": "response.content_part.added", "item_id": "msg_1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}}),
+    ));
+    for p in pieces {
+        s.push_str(&delta(p));
+    }
+    s.push_str(&event(
+        json!({"type": "response.output_text.done", "item_id": "msg_1", "output_index": 0, "content_index": 0, "text": text}),
+    ));
+    s.push_str(&event(
+        json!({"type": "response.content_part.done", "item_id": "msg_1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text}}),
+    ));
+    s.push_str(&event(
+        json!({"type": "response.output_item.done", "output_index": 0, "item": message_item("completed", &text)}),
+    ));
+    s.push_str(&completed_with_usage("resp_1"));
+    s
+}
+
+fn text_delta_event(text: &str) -> StreamEvent {
+    StreamEvent::OutputTextDelta {
+        output_index: 0,
+        item_id: "msg_1".into(),
+        content_index: 0,
+        delta: text.into(),
+    }
+}
+
+#[tokio::test]
+async fn stream_response_yields_a_text_answer_split_anywhere() {
+    let pieces = ["Héllo", ", wörld", " — ∫ x dx", "!"];
+    let body = agent_text_body(&pieces);
+    let mut expected = vec![Ok(StreamEvent::OutputItemAdded {
+        output_index: 0,
+        item: message_item("in_progress", ""),
+    })];
+    expected.extend(pieces.iter().map(|p| Ok(text_delta_event(p))));
+    expected.push(Ok(StreamEvent::OutputItemDone {
+        output_index: 0,
+        item: message_item("completed", &pieces.concat()),
+    }));
+    expected.push(Ok(StreamEvent::Completed {
+        response_id: "resp_1".into(),
+        usage: usage_1200(),
+    }));
+    for size in [3, 13, 4096] {
+        let (client, fake) = spawn(vec![chunked(&body, size)]).await;
+        let req = agent_request();
+        let events = drain(client.stream_response(&req).await.unwrap()).await;
+        assert_eq!(events, expected, "chunk size {size}");
+
+        // What was sent is exactly `response_body`.
+        let (auth, sent) = last_request(&fake);
+        assert_eq!(auth.as_deref(), Some("Bearer test-key"));
+        assert_eq!(sent, client.response_body(&req));
+        assert_eq!(sent["model"], "agent-model");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            sent["reasoning"],
+            json!({"effort": "medium", "summary": "auto"})
+        );
+        assert_eq!(sent["tool_choice"], "auto");
+        assert_eq!(sent["prompt_cache_key"], "chat-1");
+        assert_eq!(sent["parallel_tool_calls"], true);
+        assert_eq!(sent["tools"][0]["strict"], true);
+        assert_eq!(sent["input"][0]["role"], "developer");
+    }
+}
+
+fn function_call_item(id: &str, call_id: &str, name: &str, args: &str, status: &str) -> Value {
+    json!({"id": id, "type": "function_call", "status": status, "call_id": call_id, "name": name, "arguments": args})
+}
+
+#[tokio::test]
+async fn stream_response_yields_parallel_function_calls() {
+    let calls = [
+        (
+            "fc_1",
+            "call_a",
+            "search_library",
+            ["{\"query\":", "\"Fourier\"}"],
+        ),
+        ("fc_2", "call_b", "list_topics", ["{", "}"]),
+    ];
+    let mut body = created();
+    let mut expected = Vec::new();
+    for (i, (id, call_id, name, parts)) in calls.iter().enumerate() {
+        let args = parts.concat();
+        let added = function_call_item(id, call_id, name, "", "in_progress");
+        let done = function_call_item(id, call_id, name, &args, "completed");
+        body.push_str(&event(
+            json!({"type": "response.output_item.added", "output_index": i, "item": added}),
+        ));
+        expected.push(Ok(StreamEvent::OutputItemAdded {
+            output_index: i as u32,
+            item: added,
+        }));
+        for p in parts {
+            body.push_str(&event(
+                json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": i, "delta": p}),
+            ));
+            expected.push(Ok(StreamEvent::FunctionCallArgumentsDelta {
+                output_index: i as u32,
+                item_id: (*id).into(),
+                delta: (*p).into(),
+            }));
+        }
+        body.push_str(&event(
+            json!({"type": "response.function_call_arguments.done", "item_id": id, "output_index": i, "arguments": args}),
+        ));
+        expected.push(Ok(StreamEvent::FunctionCallArgumentsDone {
+            output_index: i as u32,
+            item_id: (*id).into(),
+            arguments: args.clone(),
+        }));
+        body.push_str(&event(
+            json!({"type": "response.output_item.done", "output_index": i, "item": done}),
+        ));
+        expected.push(Ok(StreamEvent::OutputItemDone {
+            output_index: i as u32,
+            item: done,
+        }));
+    }
+    body.push_str(&completed_with_usage("resp_tools"));
+    expected.push(Ok(StreamEvent::Completed {
+        response_id: "resp_tools".into(),
+        usage: usage_1200(),
+    }));
+    let (client, _) = spawn(vec![chunked(&body, 7)]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    assert_eq!(events, expected);
+}
+
+#[tokio::test]
+async fn stream_response_yields_reasoning_summaries_and_keeps_encrypted_content() {
+    let added = json!({"id": "rs_1", "type": "reasoning", "summary": []});
+    let done = json!({
+        "id": "rs_1", "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "**Plan** Look it up."}],
+        "encrypted_content": "gAAAAABo-ëñçrÿptëd+/=="
+    });
+    let body = [
+        created(),
+        event(json!({"type": "response.output_item.added", "output_index": 0, "item": added})),
+        event(
+            json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1", "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}),
+        ),
+        event(
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "**Plan** "}),
+        ),
+        event(
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "output_index": 0, "summary_index": 0, "delta": "Look it up."}),
+        ),
+        event(
+            json!({"type": "response.reasoning_summary_text.done", "item_id": "rs_1", "output_index": 0, "summary_index": 0, "text": "**Plan** Look it up."}),
+        ),
+        event(
+            json!({"type": "response.reasoning_summary_part.done", "item_id": "rs_1", "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": "**Plan** Look it up."}}),
+        ),
+        event(json!({"type": "response.output_item.done", "output_index": 0, "item": done})),
+        completed_with_usage("resp_1"),
+    ]
+    .concat();
+    let (client, fake) = spawn(vec![chunked(&body, 5), whole(agent_text_body(&["ok"]))]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    let summary = |d: &str| {
+        Ok(StreamEvent::ReasoningSummaryTextDelta {
+            output_index: 0,
+            item_id: "rs_1".into(),
+            summary_index: 0,
+            delta: d.into(),
+        })
+    };
+    assert_eq!(
+        events,
+        vec![
+            Ok(StreamEvent::OutputItemAdded {
+                output_index: 0,
+                item: added
+            }),
+            summary("**Plan** "),
+            summary("Look it up."),
+            Ok(StreamEvent::OutputItemDone {
+                output_index: 0,
+                item: done.clone()
+            }),
+            Ok(StreamEvent::Completed {
+                response_id: "resp_1".into(),
+                usage: usage_1200()
+            }),
+        ]
+    );
+
+    // The done item, replayed as input, reaches the API unchanged.
+    let mut next = agent_request();
+    next.input.push(done.clone());
+    drain(client.stream_response(&next).await.unwrap()).await;
+    let (_, sent) = last_request(&fake);
+    assert_eq!(sent["input"][2], done);
+}
+
+#[tokio::test]
+async fn stream_response_streams_a_refusal_as_text() {
+    let refused = json!({"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "refusal", "refusal": "I can't help with that."}]});
+    let body = [
+        created(),
+        event(
+            json!({"type": "response.output_item.added", "output_index": 0, "item": message_item("in_progress", "")}),
+        ),
+        event(
+            json!({"type": "response.refusal.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "I can't "}),
+        ),
+        event(
+            json!({"type": "response.refusal.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "help with that."}),
+        ),
+        event(
+            json!({"type": "response.refusal.done", "item_id": "msg_1", "output_index": 0, "content_index": 0, "refusal": "I can't help with that."}),
+        ),
+        event(json!({"type": "response.output_item.done", "output_index": 0, "item": refused})),
+        completed_with_usage("resp_1"),
+    ]
+    .concat();
+    let (client, _) = spawn(vec![whole(body)]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    assert_eq!(events[1], Ok(text_delta_event("I can't ")));
+    assert_eq!(events[2], Ok(text_delta_event("help with that.")));
+    assert_eq!(
+        events[3],
+        Ok(StreamEvent::OutputItemDone {
+            output_index: 0,
+            item: refused
+        })
+    );
+    assert!(matches!(events[4], Ok(StreamEvent::Completed { .. })));
+    assert_eq!(events.len(), 5);
+}
+
+#[tokio::test]
+async fn stream_response_passes_other_items_through() {
+    let compaction = json!({"id": "cmp_1", "type": "compaction", "encrypted_content": "opaque"});
+    let body = [
+        created(),
+        event(json!({"type": "response.output_item.added", "output_index": 0, "item": compaction})),
+        event(json!({"type": "response.output_item.done", "output_index": 0, "item": compaction})),
+        completed_with_usage("resp_1"),
+    ]
+    .concat();
+    let (client, _) = spawn(vec![whole(body)]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    assert_eq!(
+        events[1],
+        Ok(StreamEvent::OutputItemDone {
+            output_index: 0,
+            item: compaction
+        })
+    );
+}
+
+#[tokio::test]
+async fn stream_response_incomplete_keeps_usage_and_ends() {
+    let body = [
+        agent_text_body(&["partial"]).replace(&completed_with_usage("resp_1"), ""),
+        event(json!({"type": "response.incomplete", "response": {
+            "id": "resp_1", "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}, "output": [],
+            "usage": {"input_tokens": 1200, "input_tokens_details": {"cached_tokens": 1024},
+                      "output_tokens": 300, "output_tokens_details": {"reasoning_tokens": 200}}
+        }})),
+        // Nothing after a terminal event is read.
+        delta("never"),
+    ]
+    .concat();
+    let (client, _) = spawn(vec![chunked(&body, 11)]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    assert_eq!(
+        events.last(),
+        Some(&Ok(StreamEvent::Incomplete {
+            reason: "max_output_tokens".into(),
+            usage: usage_1200(),
+        }))
+    );
+    assert!(matches!(
+        events[events.len() - 2],
+        Ok(StreamEvent::OutputItemDone { .. })
+    ));
+    assert!(!events.contains(&Ok(text_delta_event("never"))));
+}
+
+#[tokio::test]
+async fn stream_response_failed_and_error_events_are_terminal() {
+    let failed = [
+        created(),
+        event(json!({"type": "response.failed", "response": {
+            "id": "resp_1", "status": "failed",
+            "error": {"code": "server_error", "message": "The model crashed."}, "output": []
+        }})),
+        completed_with_usage("resp_1"),
+    ]
+    .concat();
+    let error = [
+        created(),
+        delta("half"),
+        event(
+            json!({"type": "error", "code": "rate_limit_exceeded", "message": "Slow down.", "param": null, "sequence_number": 2}),
+        ),
+    ]
+    .concat();
+    let nested = event(
+        json!({"type": "error", "error": {"type": "server_error", "code": "overloaded", "message": "Busy."}}),
+    );
+    let bare_failed =
+        event(json!({"type": "response.failed", "response": {"id": "r", "status": "failed"}}));
+    let (client, _) = spawn(vec![
+        whole(failed),
+        whole(error),
+        whole(nested),
+        whole(bare_failed),
+    ])
+    .await;
+    let req = agent_request();
+
+    let events = drain(client.stream_response(&req).await.unwrap()).await;
+    assert_eq!(
+        events,
+        vec![Ok(StreamEvent::Failed {
+            code: Some("server_error".into()),
+            message: "The model crashed.".into(),
+        })]
+    );
+    let events = drain(client.stream_response(&req).await.unwrap()).await;
+    assert_eq!(
+        events,
+        vec![
+            Ok(text_delta_event("half")),
+            Ok(StreamEvent::Error {
+                code: Some("rate_limit_exceeded".into()),
+                message: "Slow down.".into(),
+            })
+        ]
+    );
+    let events = drain(client.stream_response(&req).await.unwrap()).await;
+    assert_eq!(
+        events,
+        vec![Ok(StreamEvent::Error {
+            code: Some("overloaded".into()),
+            message: "Busy.".into()
+        })]
+    );
+    let events = drain(client.stream_response(&req).await.unwrap()).await;
+    assert_eq!(
+        events,
+        vec![Ok(StreamEvent::Failed {
+            code: None,
+            message: "the response failed".into()
+        })]
+    );
+}
+
+#[tokio::test]
+async fn stream_response_closed_or_cut_connection_is_a_network_error() {
+    let half = format!("{}{}", created(), delta("half"));
+    let (client, _) = spawn(vec![
+        whole(half.clone()),
+        Reply::SseThenDrop(vec![half.clone().into_bytes()]),
+        // Cut mid-event: the partial line is never dispatched.
+        Reply::SseThenDrop(vec![
+            format!("{half}data: {{\"type\":\"response.out").into_bytes(),
+        ]),
+    ])
+    .await;
+    for case in ["clean close", "cut", "cut mid-event"] {
+        let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+        assert_eq!(events.len(), 2, "{case}: {events:?}");
+        assert_eq!(events[0], Ok(text_delta_event("half")), "{case}");
+        assert!(
+            events[1].as_ref().unwrap_err().starts_with("Network("),
+            "{case}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_response_unreadable_event_is_parse_and_ends() {
+    let body = [
+        created(),
+        "data: {not json\n\n".to_string(),
+        delta("after"),
+        completed_with_usage("resp_1"),
+    ]
+    .concat();
+    let no_item = event(json!({"type": "response.output_item.added", "output_index": 0}));
+    let (client, _) = spawn(vec![whole(body), whole(no_item)]).await;
+    for _ in 0..2 {
+        let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].as_ref().unwrap_err().starts_with("Parse("),
+            "{events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stream_response_ignores_done_markers_and_unknown_events() {
+    let body = [
+        created(),
+        event(json!({"type": "response.output_text.annotation.added", "item_id": "msg_1"})),
+        event(json!({"type": "response.some_future_event"})),
+        delta("x"),
+        completed_with_usage("resp_1"),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let (client, _) = spawn(vec![whole(body)]).await;
+    let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
+    assert_eq!(
+        events,
+        vec![
+            Ok(text_delta_event("x")),
+            Ok(StreamEvent::Completed {
+                response_id: "resp_1".into(),
+                usage: usage_1200()
+            })
+        ]
+    );
+}
+
+fn rate_limited(retry_after: &str) -> Reply {
+    Reply::WithHeaders(
+        StatusCode::TOO_MANY_REQUESTS,
+        vec![("retry-after", retry_after.into())],
+        json!({"error": {"message": "Rate limit reached.", "type": "requests", "code": "rate_limit_exceeded"}}),
+    )
+}
+
+#[tokio::test]
+async fn stream_response_http_errors_carry_retry_after() {
+    let (client, _) = spawn(vec![
+        rate_limited("7"),
+        Reply::WithHeaders(
+            StatusCode::SERVICE_UNAVAILABLE,
+            vec![
+                ("retry-after", "2".into()),
+                ("retry-after-ms", "1500".into()),
+            ],
+            json!({"error": {"message": "Overloaded."}}),
+        ),
+        Reply::Json(
+            StatusCode::BAD_REQUEST,
+            json!({"error": {"message": "Unknown parameter: 'context_management'."}}),
+        ),
+    ])
+    .await;
+    let req = agent_request();
+    let err = client.stream_response(&req).await.err().unwrap();
+    assert!(
+        matches!(&err, AiError::Http { status: 429, message, .. } if message == "Rate limit reached.")
+    );
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+    assert!(err.is_retryable());
+    let err = client.stream_response(&req).await.err().unwrap();
+    assert_eq!(err.retry_after(), Some(Duration::from_millis(1500)));
+    assert!(err.is_retryable());
+    let err = client.stream_response(&req).await.err().unwrap();
+    assert!(
+        matches!(&err, AiError::Http { status: 400, message, retry_after: None } if message.contains("context_management"))
+    );
+    assert!(!err.is_retryable());
+}
+
+fn quick() -> Backoff {
+    Backoff {
+        retries: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    }
+}
+
+#[tokio::test]
+async fn stream_response_with_retries_retries_429_and_5xx_then_streams() {
+    let (client, fake) = spawn(vec![
+        rate_limited("0.05"),
+        Reply::Text(StatusCode::BAD_GATEWAY, "upstream down".into()),
+        Reply::Json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": {"message": "oops"}}),
+        ),
+        whole(agent_text_body(&["ok"])),
+    ])
+    .await;
+    let started = std::time::Instant::now();
+    let stream = client
+        .stream_response_with_retries(&agent_request(), &quick())
+        .await
+        .unwrap();
+    // The 429's Retry-After (50 ms) was honoured although it is past `max_delay`.
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    let events = drain(stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(Ok(StreamEvent::Completed { .. }))
+    ));
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    // Every attempt sends the same request.
+    assert!(requests.iter().all(|(_, body)| body == &requests[0].1));
+}
+
+#[tokio::test]
+async fn stream_response_with_retries_gives_up_after_three_retries() {
+    let busy = || Reply::Text(StatusCode::SERVICE_UNAVAILABLE, "busy".into());
+    let (client, fake) = spawn(vec![busy(), busy(), busy(), busy(), busy()]).await;
+    let err = client
+        .stream_response_with_retries(&agent_request(), &quick())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, AiError::Http { status: 503, .. }));
+    assert_eq!(fake.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn stream_response_with_retries_doesnt_retry_client_errors() {
+    let (client, fake) = spawn(vec![Reply::Json(
+        StatusCode::UNAUTHORIZED,
+        json!({"error": {"message": "Incorrect API key provided."}}),
+    )])
+    .await;
+    let err = client
+        .stream_response_with_retries(&agent_request(), &quick())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, AiError::Http { status: 401, .. }));
+    assert_eq!(fake.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stream_response_with_retries_doesnt_retry_inside_the_stream() {
+    let (client, fake) = spawn(vec![Reply::SseThenDrop(vec![
+        format!("{}{}", created(), delta("half")).into_bytes(),
+    ])])
+    .await;
+    let events = drain(
+        client
+            .stream_response_with_retries(&agent_request(), &quick())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        events
+            .last()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .starts_with("Network(")
+    );
+    assert_eq!(fake.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stream_response_unreachable_server_is_a_network_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let client = ResponsesClient::new(format!("http://{addr}/v1"), "k", "m");
+    let err = client
+        .stream_response(&agent_request())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, AiError::Network(_)));
+    assert!(err.is_retryable());
 }

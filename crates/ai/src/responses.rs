@@ -6,13 +6,16 @@
 //! as `serde_json::Value` exactly as the API sends them, so encrypted reasoning,
 //! compaction items and function calls round-trip byte for byte.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::time::Duration;
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use margin_shared::{ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
-use crate::{AiError, ResponsesClient};
+use crate::sse::{SseEvent, SseParser};
+use crate::{AiError, ResponsesClient, check_status, error_chain, error_message, network};
 
 /// One `POST /responses` of the agent loop.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -148,7 +151,8 @@ pub enum StreamEvent {
         item_id: String,
         arguments: String,
     },
-    /// `response.output_text.delta`.
+    /// `response.output_text.delta`, and `response.refusal.delta` (a refusal is shown as
+    /// the message's text).
     OutputTextDelta {
         output_index: u32,
         item_id: String,
@@ -243,10 +247,272 @@ impl ResponsesClient {
 
     /// Sends `req` and returns its events as they stream in. A non-2xx answer is
     /// `Err(AiError::Http { status, message, retry_after })` before any event; retrying
-    /// is the caller's decision (`AiError::is_retryable`).
+    /// is the caller's decision (`AiError::is_retryable`, [`Backoff`]).
     pub async fn stream_response(&self, req: &ResponseRequest) -> Result<ResponseStream, AiError> {
-        let _ = req;
-        unimplemented!("margin-ai: general streaming Responses call (phase 1, ai owner)")
+        let body = self.response_body(req);
+        let resp = self.request(&body)?.send().await.map_err(network)?;
+        let resp = check_status(resp).await?;
+        let pump = Pump {
+            bytes: Box::pin(resp.bytes_stream()),
+            parser: SseParser::new(),
+            queue: VecDeque::new(),
+            eof: false,
+            done: false,
+        };
+        Ok(Box::pin(futures_util::stream::unfold(pump, Pump::next)))
+    }
+
+    /// `stream_response`, retrying a call that fails before its stream starts (429, 5xx,
+    /// network) as `backoff` says. Errors inside the stream are not retried here: by
+    /// then the caller may have shown output, so starting over is its decision. The
+    /// agent loop retries itself (it also retries a stream that fails before any output)
+    /// and calls `stream_response`, so retries don't multiply.
+    pub async fn stream_response_with_retries(
+        &self,
+        req: &ResponseRequest,
+        backoff: &Backoff,
+    ) -> Result<ResponseStream, AiError> {
+        let mut attempt = 0;
+        loop {
+            match self.stream_response(req).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => match backoff.delay(attempt, &e) {
+                    Some(pause) => {
+                        tracing::debug!(attempt, ?pause, error = %e, "retrying the model call");
+                        tokio::time::sleep(pause).await;
+                        attempt += 1;
+                    }
+                    None => return Err(e),
+                },
+            }
+        }
+    }
+}
+
+/// How a failed model call is retried: `retries` more attempts after the first, each
+/// after the pause the API asked for (`Retry-After`) or else `base_delay · 2^n`, capped
+/// at `max_delay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    pub retries: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for Backoff {
+    /// 3 retries, 2 s doubling up to 60 s.
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+impl Backoff {
+    /// The pause before the next attempt after `err`, where `attempt` counts the retries
+    /// already made; `None` when `err` isn't worth retrying or the retries are used up.
+    /// A `Retry-After` from the API is honoured as given, even past `max_delay`:
+    /// retrying sooner would only be refused again.
+    pub fn delay(&self, attempt: u32, err: &AiError) -> Option<Duration> {
+        if attempt >= self.retries || !err.is_retryable() {
+            return None;
+        }
+        if let Some(after) = err.retry_after() {
+            return Some(after);
+        }
+        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        Some(
+            self.base_delay
+                .checked_mul(factor)
+                .unwrap_or(self.max_delay)
+                .min(self.max_delay),
+        )
+    }
+}
+
+/// Reads the body of one streamed response and turns its SSE events into
+/// `StreamEvent`s.
+struct Pump<S> {
+    bytes: S,
+    parser: SseParser,
+    /// Events parsed from the last chunk and not yet yielded.
+    queue: VecDeque<Result<StreamEvent, AiError>>,
+    /// The body ended.
+    eof: bool,
+    /// A terminal event or an error was yielded; nothing follows.
+    done: bool,
+}
+
+impl<S, B> Pump<S>
+where
+    S: Stream<Item = reqwest::Result<B>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    async fn next(mut self) -> Option<(Result<StreamEvent, AiError>, Self)> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if let Some(item) = self.queue.pop_front() {
+                if !matches!(&item, Ok(e) if !e.is_terminal()) {
+                    self.done = true;
+                    self.queue.clear();
+                }
+                return Some((item, self));
+            }
+            if self.eof {
+                return None;
+            }
+            match self.bytes.next().await {
+                Some(Ok(chunk)) => {
+                    for event in self.parser.push(chunk.as_ref()) {
+                        self.accept(&event);
+                    }
+                }
+                // reqwest reports a body cut mid-chunk as a decode error; it is the
+                // connection that failed, not the content.
+                Some(Err(e)) if e.is_decode() || e.is_body() => self.queue.push_back(Err(
+                    AiError::Network(format!("the connection broke: {}", error_chain(&e))),
+                )),
+                Some(Err(e)) => self.queue.push_back(Err(network(e))),
+                None => {
+                    self.eof = true;
+                    if let Some(event) = self.parser.finish() {
+                        self.accept(&event);
+                    }
+                    // Only reached when no terminal event came first.
+                    self.queue.push_back(Err(AiError::Network(
+                        "the connection closed before the response finished".into(),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn accept(&mut self, event: &SseEvent) {
+        match parse_event(event) {
+            Ok(Some(e)) => self.queue.push_back(Ok(e)),
+            Ok(None) => {}
+            Err(e) => self.queue.push_back(Err(e)),
+        }
+    }
+}
+
+/// One SSE event of a Responses stream as a `StreamEvent`; `None` for the events the
+/// loop doesn't need.
+fn parse_event(event: &SseEvent) -> Result<Option<StreamEvent>, AiError> {
+    let data = event.data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    let v: Value = serde_json::from_str(data)
+        .map_err(|e| AiError::Parse(format!("a stream event isn't JSON: {e}")))?;
+    let kind = v
+        .get("type")
+        .and_then(Value::as_str)
+        .or(event.event.as_deref())
+        .unwrap_or("");
+    let index = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
+    let text = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let item = || {
+        v.get("item")
+            .filter(|i| i.is_object())
+            .cloned()
+            .ok_or_else(|| AiError::Parse(format!("a {kind} event has no item")))
+    };
+    let response = v.get("response").unwrap_or(&Value::Null);
+    Ok(Some(match kind {
+        "response.output_item.added" => StreamEvent::OutputItemAdded {
+            output_index: index("output_index"),
+            item: item()?,
+        },
+        "response.output_item.done" => StreamEvent::OutputItemDone {
+            output_index: index("output_index"),
+            item: item()?,
+        },
+        "response.function_call_arguments.delta" => StreamEvent::FunctionCallArgumentsDelta {
+            output_index: index("output_index"),
+            item_id: text("item_id"),
+            delta: text("delta"),
+        },
+        "response.function_call_arguments.done" => StreamEvent::FunctionCallArgumentsDone {
+            output_index: index("output_index"),
+            item_id: text("item_id"),
+            arguments: text("arguments"),
+        },
+        // A refusal streams like text: the message's refusal is what the chat shows.
+        "response.output_text.delta" | "response.refusal.delta" => StreamEvent::OutputTextDelta {
+            output_index: index("output_index"),
+            item_id: text("item_id"),
+            content_index: index("content_index"),
+            delta: text("delta"),
+        },
+        "response.reasoning_summary_text.delta" => StreamEvent::ReasoningSummaryTextDelta {
+            output_index: index("output_index"),
+            item_id: text("item_id"),
+            summary_index: index("summary_index"),
+            delta: text("delta"),
+        },
+        "response.completed" => StreamEvent::Completed {
+            response_id: response
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            usage: usage(response),
+        },
+        "response.incomplete" => StreamEvent::Incomplete {
+            reason: response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            usage: usage(response),
+        },
+        "response.failed" => {
+            let err = response.get("error").filter(|e| !e.is_null());
+            StreamEvent::Failed {
+                code: err
+                    .and_then(|e| e.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                message: err
+                    .and_then(error_message)
+                    .unwrap_or_else(|| "the response failed".into()),
+            }
+        }
+        "error" => {
+            // `{type: "error", code, message}`, or the same nested under `error`.
+            let err = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
+            StreamEvent::Error {
+                code: err.get("code").and_then(Value::as_str).map(str::to_string),
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            }
+        }
+        _ => return Ok(None), // created, in_progress, content_part.*, text .done, …
+    }))
+}
+
+/// `response.usage` of a finished response, as one model call.
+fn usage(response: &Value) -> Usage {
+    let n = |path: &str| {
+        response
+            .pointer(&format!("/usage/{path}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    Usage {
+        input_tokens: n("input_tokens"),
+        cached_input_tokens: n("input_tokens_details/cached_tokens"),
+        output_tokens: n("output_tokens"),
+        reasoning_tokens: n("output_tokens_details/reasoning_tokens"),
+        model_calls: 1,
     }
 }
 
