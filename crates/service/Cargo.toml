@@ -20,6 +20,7 @@ margin-video.workspace = true
 margin-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

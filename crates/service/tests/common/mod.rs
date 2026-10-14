@@ -29,8 +29,8 @@ use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY,
 use margin_service::server::{Options, Service};
 use margin_service::state::AppState;
 use margin_shared::{
-    AskRequest, Event, Level, LoginState, Outline, OutlineLesson, SourceKind, StartLogin,
-    ToolStatus,
+    AskRequest, DeviceFrame, DirectedFrame, Event, Level, LoginState, Outline, OutlineLesson,
+    ServerFrame, SourceKind, StartLogin, ToolStatus,
 };
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 use serde_json::json;
@@ -914,7 +914,11 @@ impl Harness {
         req.headers_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
         let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        let mut s = Socket { ws };
+        let mut s = Socket {
+            ws,
+            events: Default::default(),
+            directed: Default::default(),
+        };
         match s.next_event().await {
             Some(Event::Hello { server_version }) => assert!(!server_version.is_empty()),
             other => panic!("expected Hello, got {other:?}"),
@@ -939,6 +943,11 @@ pub struct Socket {
     pub ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    /// Events read while looking for a directed frame, returned first by `next_frame`.
+    events: std::collections::VecDeque<Event>,
+    /// Directed frames read while looking for an event, returned first by
+    /// `next_directed`.
+    directed: std::collections::VecDeque<DirectedFrame>,
 }
 
 #[allow(clippy::large_enum_variant)] // test helper; size is irrelevant
@@ -947,24 +956,75 @@ pub enum Frame {
     Closed(Option<u16>),
 }
 
+#[allow(clippy::large_enum_variant)] // test helper; size is irrelevant
+enum Raw {
+    Server(ServerFrame),
+    Closed(Option<u16>),
+}
+
 impl Socket {
-    /// Next frame (event or close), skipping pings; panics after 10 s.
-    pub async fn next_frame(&mut self) -> Frame {
+    /// Next text frame (or close), skipping pings; panics after 10 s.
+    async fn next_raw(&mut self) -> Raw {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), self.ws.next())
                 .await
                 .expect("socket timed out");
             match msg {
                 Some(Ok(WsMessage::Text(t))) => {
-                    return Frame::Event(serde_json::from_str(t.as_str()).unwrap());
+                    return Raw::Server(serde_json::from_str(t.as_str()).unwrap());
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
-                    return Frame::Closed(frame.map(|f| u16::from(f.code)));
+                    return Raw::Closed(frame.map(|f| u16::from(f.code)));
                 }
-                None | Some(Err(_)) => return Frame::Closed(None),
+                None | Some(Err(_)) => return Raw::Closed(None),
                 Some(Ok(_)) => {}
             }
         }
+    }
+
+    /// Next frame (event or close), skipping pings and keeping directed frames for
+    /// `next_directed`; panics after 10 s.
+    pub async fn next_frame(&mut self) -> Frame {
+        if let Some(e) = self.events.pop_front() {
+            return Frame::Event(e);
+        }
+        loop {
+            match self.next_raw().await {
+                Raw::Server(ServerFrame::Event(e)) => return Frame::Event(e),
+                Raw::Server(ServerFrame::Directed(d)) => self.directed.push_back(d),
+                Raw::Closed(code) => return Frame::Closed(code),
+            }
+        }
+    }
+
+    /// Next frame addressed to this device, keeping events for `next_frame`; panics
+    /// after 10 s or when the socket closes.
+    pub async fn next_directed(&mut self) -> DirectedFrame {
+        if let Some(d) = self.directed.pop_front() {
+            return d;
+        }
+        loop {
+            match self.next_raw().await {
+                Raw::Server(ServerFrame::Directed(d)) => return d,
+                Raw::Server(ServerFrame::Event(e)) => self.events.push_back(e),
+                Raw::Closed(code) => panic!("socket closed ({code:?})"),
+            }
+        }
+    }
+
+    /// Skips events until the socket closes; returns the close code.
+    pub async fn closed(&mut self) -> Option<u16> {
+        loop {
+            if let Frame::Closed(code) = self.next_frame().await {
+                return code;
+            }
+        }
+    }
+
+    /// Sends a device frame (a tool result).
+    pub async fn send_frame(&mut self, frame: &DeviceFrame) {
+        let text = serde_json::to_string(frame).unwrap();
+        self.ws.send(WsMessage::Text(text.into())).await.unwrap();
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
