@@ -148,4 +148,6 @@ These answer the review's questions and are binding for the build.
 | Q4 Folder knowledge in lessons | **Folder-file citations now.** Lessons can cite files from attached folders like sources; opening such a citation reads the file from the device holding the folder (shows that device offline otherwise). |
 | Q5 Writes / commands | **Neither.** Attached folders are read-only; no shell commands. |
 | Q6 macOS distribution | **Direct distribution, not sandboxed.** Plain paths + bookmarks now; the handle abstraction keeps a sandboxed (security-scoped bookmark) variant possible. |
+| Appearance tool | **Left out.** The agent can't change theme/appearance; app control is navigate, open_citation, show_passage, toggle_sidebar. |
+| iOS continued processing | **Build it.** Long folder scans on iOS/iPadOS continue in the background with `BGContinuedProcessingTask` (iOS 26) and the system progress UI. |
 | Already decided | Chats stored on the service and synced; Ask = chat with inline cards; Chats section in the sidebar; course options inferred/asked with chips on the outline card; agent acts freely, confirms deletes; 500 MB per audio/video file, 50 MB others; no folder upload, single-file sources stay. |
