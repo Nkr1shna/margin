@@ -59,6 +59,8 @@ mod sources;
 mod state;
 #[path = "../src/store.rs"]
 mod store;
+#[path = "../src/tools/mod.rs"]
+mod tools;
 #[path = "../src/ui/mod.rs"]
 mod ui;
 #[path = "../src/zoom.rs"]
@@ -206,6 +208,10 @@ fn Harness(props: HarnessProps) -> Element {
                     .map(|id| (id.to_string(), fake::sample_transcript(id)))
                     .collect(),
             ),
+            shown_passage: Signal::new(None),
+            device_frames: Signal::new(None),
+            agent_commands: Signal::new(Default::default()),
+            foreground: Signal::new(true),
         }
     });
     let sources_topic = std::env::var("RENDER_SOURCES").ok();

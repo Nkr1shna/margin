@@ -63,6 +63,34 @@ pub fn page_title(route: &Route, lib: &crate::store::LibraryState) -> String {
     }
 }
 
+/// The screen the agent's `navigate` asks for. `None` for Settings, which is a dialog
+/// over the current screen rather than a route. A topic opens its notes list, the one
+/// screen of a topic's own.
+pub fn nav_route(to: &margin_shared::NavTarget) -> Option<Route> {
+    use margin_shared::{LessonView, NavTarget};
+    Some(match to {
+        NavTarget::Lesson { lesson_id, view } => {
+            let id = lesson_id.clone();
+            match view {
+                None | Some(LessonView::Read) => Route::LessonRead { id },
+                Some(LessonView::Notes) => Route::LessonNotes { id },
+                Some(LessonView::Video) => Route::LessonVideo { id },
+            }
+        }
+        NavTarget::Topic { topic_id } => Route::TopicNotes {
+            topic_id: topic_id.clone(),
+        },
+        NavTarget::Note { note_id } => Route::NoteOpen {
+            id: note_id.clone(),
+        },
+        NavTarget::AllNotes => Route::AllNotes {},
+        NavTarget::Chat { chat_id } => Route::Chat {
+            id: chat_id.clone(),
+        },
+        NavTarget::Settings => return None,
+    })
+}
+
 /// A chat's title as screens show it ("New chat" until its first message names it).
 pub fn chat_title(title: &str) -> String {
     if title.trim().is_empty() {

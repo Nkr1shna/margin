@@ -66,6 +66,10 @@ fn Harness(props: HarnessProps) -> Element {
         settings_open: Signal::new(settings),
         source_viewer: Signal::new(None),
         transcripts: Signal::new(Default::default()),
+        shown_passage: Signal::new(None),
+        device_frames: Signal::new(None),
+        agent_commands: Signal::new(Default::default()),
+        foreground: Signal::new(true),
     });
     rsx! { Router::<Route> {} }
 }

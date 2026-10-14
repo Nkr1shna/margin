@@ -1,9 +1,13 @@
 //! App-wide reactive state, shared through Dioxus context.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 use dioxus::prelude::*;
-use margin_shared::{Id, Me, TranscriptSegment};
+use margin_shared::{
+    Citation, DeviceFrame, DeviceToolCall, DeviceToolResult, Id, Me, TranscriptSegment,
+};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api::{Api, ApiFailure};
 use crate::config::{self, LocalConfig};
@@ -29,7 +33,13 @@ pub enum LoadStatus {
 pub enum LiveStatus {
     Connecting,
     Live,
-    Reconnecting { error: String, retry_secs: u64 },
+    Reconnecting {
+        error: String,
+        retry_secs: u64,
+    },
+    /// iOS, iPadOS, Android: the app is in the background, and the socket stays closed
+    /// until it comes back (`AppCtx::foreground`).
+    Background,
 }
 
 /// Everything the screens share. All fields are signals, so the struct is `Copy`.
@@ -60,6 +70,50 @@ pub struct AppCtx {
     pub source_viewer: Signal<Option<SourceViewer>>,
     /// Audio and video sources' whole transcripts, as last fetched for the viewer.
     pub transcripts: Signal<HashMap<Id, Vec<TranscriptSegment>>>,
+    /// The source viewer, open on a passage the agent showed (`show_passage`), which
+    /// belongs to no lesson.
+    pub shown_passage: Signal<Option<Citation>>,
+    /// Sends a frame on the events socket. Set by the live loop once the service said
+    /// hello on a connection, `None` while disconnected (a frame sent then is dropped;
+    /// the service's deadline covers it).
+    pub device_frames: Signal<Option<mpsc::UnboundedSender<DeviceFrame>>>,
+    /// App-control calls from the agent, waiting for the shell to run them on the main
+    /// thread (`ui::shell::Shell` drains it).
+    pub agent_commands: Signal<VecDeque<AgentCommand>>,
+    /// Whether the app is in the foreground. iOS, iPadOS and Android close the events
+    /// socket while it isn't (the system suspends the app soon after); computers are
+    /// always in the foreground here.
+    pub foreground: Signal<bool>,
+}
+
+/// An app-control tool call for the shell to run, and where its answer goes.
+#[derive(Debug)]
+pub struct AgentCommand {
+    /// One of the app-control calls (`navigate`, `open_citation`, `show_passage`,
+    /// `toggle_sidebar`).
+    pub call: DeviceToolCall,
+    /// The chat whose turn asked, for passages it found.
+    pub chat_id: Id,
+    pub reply: oneshot::Sender<DeviceToolResult>,
+}
+
+/// Where the platform's lifecycle (the iOS scene, Android's activity) reports going to
+/// the background and back. It runs outside the Dioxus runtime, so it goes through this
+/// channel; the root component copies it into `AppCtx::foreground`.
+fn foreground_channel() -> &'static watch::Sender<bool> {
+    static CHANNEL: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    CHANNEL.get_or_init(|| watch::Sender::new(true))
+}
+
+/// Report the app going to the background (`false`) or coming back (`true`). Any thread.
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+pub fn set_foreground(foreground: bool) {
+    foreground_channel().send_replace(foreground);
+}
+
+/// Follows `set_foreground`, starting from the current state.
+pub fn foreground_changes() -> watch::Receiver<bool> {
+    foreground_channel().subscribe()
 }
 
 /// Which citation the source viewer shows.
@@ -111,7 +165,10 @@ impl AppCtx {
         this.outline_drafts.set(HashMap::new());
         this.uploads.set(Vec::new());
         this.source_viewer.set(None);
+        this.shown_passage.set(None);
         this.transcripts.set(HashMap::new());
+        this.agent_commands.set(VecDeque::new());
+        this.device_frames.set(None);
     }
 
     /// Sign out: revoke this device on the service (best effort), then forget the token.
