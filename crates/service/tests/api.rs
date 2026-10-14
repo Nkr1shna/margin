@@ -175,6 +175,28 @@ async fn auth_start_is_rate_limited() {
     assert_eq!((status, e.code.as_str()), (429, "rate_limited"));
 }
 
+/// `GET /api/version` answers without a token, like `/health`, so `deploy.sh` can check a
+/// build (docs/plan-deploy.md §8).
+#[tokio::test(flavor = "multi_thread")]
+async fn version_reports_the_build_and_environment_without_a_token() {
+    let h = start().await;
+    let r = h
+        .http
+        .get(h.u(margin_shared::routes::VERSION))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: margin_service::version::VersionInfo = r.json().await.unwrap();
+    assert_eq!(v.environment, "dev");
+    assert_eq!(v.sha, margin_service::version::BUILD_SHA);
+    assert_eq!(v.version, env!("CARGO_PKG_VERSION"));
+    assert!(v.started_at <= chrono::Utc::now());
+    if cfg!(target_os = "macos") {
+        assert!(v.rss_bytes.is_some_and(|b| b > 0));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn api_requires_a_valid_token() {
     let h = start().await;

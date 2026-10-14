@@ -62,7 +62,7 @@ No file collides with R1 (`crates/{embed,service,ai,evals}`) or phase 4 (`crates
 
 ## 5. Safety: the live instance is real data
 
-- **Backup before the first R1 install**: stop the service, copy `data_dir` (`docs/service-setup.md` §3; today `~/Library/Application Support/Margin/data`) to `…/Margin/backups/<date>/`, start. R1-store's one-pass `passages-v1` migration runs at start; a backup is the only undo. Add `scripts/backup-margin.sh` (D) that does exactly this and refuses to run while the service is up.
+- **Backup before the first R1 install**: stop the service, copy `data_dir` (`docs/service-setup.md` §3; today `~/Library/Application Support/Margin/data`) to `…/Margin/backups/<date>/`, start. R1-store's one-pass `passages-v1` migration runs at start; a backup is the only undo. Add `scripts/backup-margin.sh` (D) that does exactly this and refuses to run while the service is up. (Now `deploy/scripts/backup-margin.sh`, the one backup script, also used by every deploy: `docs/plan-deploy.md` §5.)
 - **Agent writes are bounded**: everything D writes has `actor: agent:claude-code|repo` and `Origin::Agent`, so `margin-mcp purge --actor agent:repo` can delete it all (via the ordinary delete route) without touching the owner's own documents. The ingest CLI has `--dry-run` and prints what it would replace.
 - **Tests never see the live service**: the client requires an explicit URL; the test fake is in-process; CI has no Keychain and `login` is not exercised there. `margin-eval` keeps its own `data_dir/evals/` (RAG §3.4).
 - **Size**: `docs/` is ~0.3 MB of Markdown; a hook run is a handful of documents; embedding on the Mac is seconds. No rate concern.

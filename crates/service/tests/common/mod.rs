@@ -840,6 +840,7 @@ pub async fn start_with(setup: Setup) -> Harness {
         allowed_github_login: "Nkr1shna".into(),
         github_api_url: github.clone(),
         github_oauth_url: github,
+        environment: "dev".into(),
     };
     let store = match setup.store {
         Some(s) => s,

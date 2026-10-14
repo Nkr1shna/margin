@@ -6,7 +6,28 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_SERVICE_URL: &str = "https://margin.krishnanelloore.com";
+/// The prod service (`docs/plan-deploy.md` §2).
+pub const PROD_SERVICE_URL: &str = "https://margin.krishnanelloore.com";
+/// The dev service, where agents and evals run.
+pub const DEV_SERVICE_URL: &str = "https://devmargin.krishnanelloore.com";
+
+/// The address a fresh install starts with: `MARGIN_DEFAULT_SERVICE_URL` when the app
+/// was built (`apps.yml` builds one per environment), else prod.
+pub const DEFAULT_SERVICE_URL: &str = match option_env!("MARGIN_DEFAULT_SERVICE_URL") {
+    Some(url) => url,
+    None => PROD_SERVICE_URL,
+};
+
+/// The sign-in screen's named services; anything else is "Custom".
+pub const PRESETS: [(&str, &str); 2] = [("Prod", PROD_SERVICE_URL), ("Dev", DEV_SERVICE_URL)];
+
+/// The preset whose address `url` is (after normalizing), if any.
+pub fn preset_for(url: &str) -> Option<usize> {
+    let url = normalize_service_url(url).ok()?;
+    PRESETS
+        .iter()
+        .position(|(_, preset)| preset.eq_ignore_ascii_case(&url))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +214,23 @@ mod tests {
         assert!(normalize_service_url("").is_err());
         assert!(normalize_service_url("ftp://x").is_err());
         assert!(normalize_service_url("https://").is_err());
+    }
+
+    #[test]
+    fn presets_match_their_addresses() {
+        assert_eq!(preset_for("https://margin.krishnanelloore.com"), Some(0));
+        assert_eq!(preset_for("margin.krishnanelloore.com/"), Some(0));
+        assert_eq!(preset_for("https://DevMargin.krishnanelloore.com"), Some(1));
+        assert_eq!(preset_for("http://127.0.0.1:8787"), None);
+        assert_eq!(preset_for(""), None);
+        // Every preset is already a normalized address, and the default is one of
+        // them unless a build named another.
+        for (_, url) in PRESETS {
+            assert_eq!(normalize_service_url(url).unwrap(), url);
+        }
+        if option_env!("MARGIN_DEFAULT_SERVICE_URL").is_none() {
+            assert_eq!(preset_for(DEFAULT_SERVICE_URL), Some(0));
+        }
     }
 
     #[test]

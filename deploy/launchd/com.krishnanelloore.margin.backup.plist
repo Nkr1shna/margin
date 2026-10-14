@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly backup in a dev or prod VM (docs/plan-deploy.md §5, runbook step 13).
+  A template: provision-guest.sh fills __PERSIST__ and __HOME__ and installs it as
+  ~/Library/LaunchAgents/com.krishnanelloore.margin.backup.plist.
+  At 03:30 it stops the service, copies data/ to backups/<date>-nightly/ on the
+  persistent share (the Mac mini's disk), starts the service and keeps the newest 10.
+  Skipped when the share isn't mounted.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.krishnanelloore.margin.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>[ -f "$MARGIN_PERSIST/.margin-persistent" ] || { echo "margin backup: the persistent share isn't mounted; skipped" >&amp;2; exit 1; }; exec /bin/sh "$MARGIN_PERSIST/bin/backup-margin.sh" --stop-service --label nightly --keep 10</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MARGIN_PERSIST</key>
+    <string>__PERSIST__</string>
+    <key>MARGIN_CONFIG</key>
+    <string>__PERSIST__/service.toml</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Margin/backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Margin/backup.log</string>
+</dict>
+</plist>

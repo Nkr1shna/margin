@@ -35,7 +35,7 @@ use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
     ask, chats, context_api, embedding, events, ingest, library, media, retrieval, search,
-    settings, sources, trace, turns, uploads, video, workspaces,
+    settings, sources, trace, turns, uploads, version, video, workspaces,
 };
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -294,6 +294,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route(routes::HEALTH, get(|| async { "ok" }))
+        .route(routes::VERSION, get(version::get_version))
         .route(routes::AUTH_START, post(auth::start))
         .route(routes::AUTH_POLL, post(auth::poll))
         .route(routes::AUTH_GITHUB_CALLBACK, get(auth::github_callback))

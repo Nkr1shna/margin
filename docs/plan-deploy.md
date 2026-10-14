@@ -1,101 +1,151 @@
 # Deploy plan: dev and prod on the Mac mini
 
-Written 2026-10-14 on `claude/agent-build` (`af8cbe6`). Read: `docs/service-setup.md`, `PLAN.md`, `docs/plan-dogfood.md` §5, `docs/plan-live-context.md` §5.2 and Q10/Q16, `crates/service/src/{config,secrets,main,db,trace}.rs`, `crates/embed/Cargo.toml`, `crates/app/src/{config,secrets,state}.rs`, `evals/README.md`. Owner: dev and prod on the Mac mini, subdomains of a domain he owns, set up through **Cluster Bar** and GitHub Actions, with him at the machine for logins and approvals. Nothing here changes the owner's live instance on his own Mac; that stays as `docs/service-setup.md` describes until Q9 is answered.
+Written 2026-10-14 on `claude/agent-build` (`af8cbe6`), updated the same day with the facts of the Mac mini setup and built as area E-deploy (`agent/e-deploy`). Read: `docs/service-setup.md`, `PLAN.md`, `docs/plan-dogfood.md` §5, `docs/plan-live-context.md` §5.2 and Q10/Q16, `crates/service/src/{config,version,restore,main}.rs`, `deploy/`, `.github/workflows/`, `evals/README.md`. Linux service guests are planned separately (`docs/plan-linux-service.md`); the scripts here detect the guest's OS and stop on anything but macOS (launchd) rather than guessing at systemd.
 
-**Cluster Bar.** It is on the Mac mini and I have not read it. The closest thing on this machine is `~/Developer/tart-ui` ("Tart Desk"): a local GUI over `tart` and Orchard that runs only allow-listed subcommands (`server/allow.mjs`: `clone set run ip stop suspend export import …`, `orchard create vm / worker …`), keeps per-VM run profiles in `~/.tart-desk/state.json`, and documents every `tart run` option in `web/help.js` (`--no-graphics`, `--net-bridged`, `--net-softnet-expose`, `--dir=name:path:ro`, `--suspendable`). It has no GitHub-runner feature. The plan assumes Cluster Bar does what the owner said: creates Tart VMs and GitHub Actions runners. Step 0 of the runbook checks that and falls back to the plain `tart` commands written beside each step. `tart` 2.32.1 and `orchard` are installed here; `cloudflared` is not.
+**Cluster Bar / Orchard.** The VMs are macOS 26 Tart guests that Orchard schedules on the Mac mini, driven from Cluster Bar. Orchard's worker names each guest's disk `orchard-<name>-<uid>-<restart count>` and runs `tart clone <image>` for every new name (`internal/worker/vmmanager/tart/tart.go`, `cloneAndConfigure`; `internal/worker/ondiskname`). So **every restart under "restart on failure", every reschedule and every recreate starts from a fresh clone of the base image: the guest's own disk is thrown away.** §5 is built around that.
 
 ## 1. Environments
 
 | | dev | prod |
 |---|---|---|
-| Guest | macOS VM `margin-dev` (Tart, `ghcr.io/cirruslabs/macos-tahoe-base` or the newest base image Cluster Bar offers) | macOS VM `margin-prod`, same image |
+| Host | Mac mini, M1, 16 GB | same |
+| Guest | macOS 26 Tart VM `margin-dev` (Orchard, Cluster Bar) | macOS 26 Tart VM `margin-prod` |
+| Size | 4 CPU, **4 GB**, 60 GB disk | 4 CPU, 8 GB, 100 GB disk |
+| Reached as | `admin@margin-dev.local` (DHCP address changes; the mDNS name doesn't), key `~/.ssh/margin_deploy` on the host | `admin@margin-prod.local`, same key |
+| Public URL | `https://devmargin.krishnanelloore.com`, tunnel `margin-dev` | `https://margin.krishnanelloore.com`, tunnel `margin-prod` |
 | Runs | `margin-service serve` (LaunchAgent), `cloudflared` (LaunchAgent), `manimgx`, `fluidaudiocli` | same |
-| Data | `~/Library/Application Support/Margin/{service.toml,data/{db,videos,sources,uploads,models}}` inside the guest | same, plus `…/Margin/backups/` |
-| Size | 4 CPU, 8 GB, 80 GB disk | 4 CPU, 12 GB, 160 GB disk (sources up to 2 GB per add, videos, 1.4 GB of models) |
-| Later | LiveKit beside the service (Q10 of the live-context plan still prefers a Linux VM for media) | same |
+| Persistent | host `~/MarginVMs/margin-dev` → guest `/Volumes/My Shared Files/margin` | host `~/MarginVMs/margin-prod` → same guest path |
+| Later | LiveKit at `livedevmargin.krishnanelloore.com` | `livemargin.krishnanelloore.com` |
 
-**Why macOS guests.** `crates/embed` is macOS-only (`objc2-core-ml`, `objc2-pdf-kit`, `objc2-vision`, `objc2-av-foundation`), secrets are the login Keychain through `keyring`, scene code renders under `sandbox-exec`, and the service is a LaunchAgent that needs a logged-in GUI session. A Linux guest would need the Linux build the live-context plan defers (Q16). Tart's base images auto-login `admin` with SSH on, which is exactly the session the LaunchAgent needs.
+**Why macOS guests.** `crates/embed` is macOS-only (`objc2-core-ml`, `objc2-pdf-kit`, `objc2-vision`, `objc2-av-foundation`), secrets are the login Keychain through `keyring`, scene code renders under `sandbox-exec`, and the service is a LaunchAgent that needs a logged-in GUI session. Tart's base images auto-login `admin` with SSH on.
 
-**Two-VM limit.** Apple's Virtualization framework runs at most **two macOS guests per host**. dev and prod take both, so the CI runner lives on the host (§4), not in a third VM. The alternative (prod directly on the Mac mini as today, dev in a VM, the second slot free for throwaway CI VMs) is Q4.
+**Two-VM limit.** Apple's Virtualization framework runs at most two macOS guests per host; dev and prod take both, so the CI runner lives on the host (§4).
 
-**No Neural Engine in a VM.** Core ML inside a guest has GPU and CPU only; `Embedder` loads with all compute units and will silently fall back. Measure before trusting dev numbers: ingest the eval corpus (`evals/corpus`, ~5 MB) on the host Mac and in each VM, then compare the `embed` trace rows (`GET /api/traces`, `latency_ms` per chunk, or `margin-eval export`). Record host and VM medians in `evals/reports/`. If the VM is more than ~3× slower, prod embedding stays acceptable (sources are ingested once) but the eval runner (§6) should run on the host with the VM only as the trace source.
+**Memory.** The M1 has 16 GB: 4 for dev, 8 for prod, 4 for macOS, the runner and builds. Dev's 4 GB must hold the embedding model (EmbeddingGemma, ~1.4 GB loaded), SurrealDB's caches, the service and macOS itself. To make that visible: `GET /api/version` reports `rss_bytes` (the service's resident memory) and `physical_memory_bytes` (the VM's), `deploy.sh` prints the RSS after each deploy, and the service logs a warning at start when the machine has less than 6 GB (`version::LOW_MEMORY_BYTES`), which dev always does. If dev swaps under an ingest (watch `rss_bytes` and Activity Monitor in the VM window), the fixes are: dev to 6 GB (prod to 6 GB too, leaving 4 for the host), or not loading the embedder in dev until first use.
+
+**No Neural Engine in a VM.** Core ML inside a guest has GPU and CPU only. Measure before trusting dev numbers: ingest the eval corpus (`evals/corpus`, ~5 MB) on the host Mac and in each VM, then compare the `embed` trace rows (`margin-eval export --service-url …`). Record host and VM medians in `evals/reports/`. If the VM is more than ~3× slower, prod embedding stays acceptable (sources are ingested once) but the eval runner (§6) should run on the host with the VM only as the trace source.
 
 ## 2. Networking
 
-- One Cloudflare Tunnel **per VM**, `cloudflared` running as a LaunchAgent in the guest, forwarding to `127.0.0.1:8787`. No ports open on the Mac mini; the VMs use the default NAT network. TLS terminates at Cloudflare as today.
-- Hostnames on the owner's domain `<domain>` (Q1): prod `margin.<domain>` (web, API and apps are one origin), dev `dev.margin.<domain>`; reserved for later `live.margin.<domain>` and `live.dev.margin.<domain>` (LiveKit signalling). `public_url` in each guest's `service.toml` is its hostname.
-- Put **Cloudflare Access** (GitHub identity, the owner's login only) in front of dev so the dev service is never reachable by strangers; prod stays as the service's own OAuth allow-list.
-- **GitHub OAuth apps**: one per environment ("Margin" and "Margin dev"), because an OAuth app has exactly one callback URL (`https://<host>/auth/github/callback`). Each VM's `service.toml` holds its own `github_client_id`; the secret goes in that VM's Keychain.
+- One Cloudflare Tunnel per VM, `cloudflared` as a LaunchAgent in the guest, forwarding to `127.0.0.1:8787`. No ports open on the Mac mini; the VMs use Orchard's default NAT network. TLS terminates at Cloudflare.
+- **Single-level subdomains** (`devmargin.`, `margin.`, later `livemargin.`, `livedevmargin.`) so Cloudflare's free universal certificate covers them; `dev.margin.` would need an Advanced Certificate. `public_url` in each guest's `service.toml` is its hostname. The prod hostname used to route to the tunnel on the owner's Mac (`docs/service-setup.md`); `cloudflared tunnel route dns -f margin-prod margin.krishnanelloore.com` moves it, and the Mac's own tunnel then serves nothing until Q9.
+- Put **Cloudflare Access** (GitHub identity, the owner's login only) in front of dev so the dev service is never reachable by strangers; prod stays as the service's own OAuth allow-list. With Access on, `/api/version` on the dev hostname needs the Access cookie; `deploy.sh` checks it inside the guest instead.
+- **GitHub OAuth apps**: one per environment ("Margin" and "Margin dev"), because an OAuth app has one callback URL (`https://<host>/auth/github/callback`).
 - Cloudflare refuses bodies over 100 MB; multipart uploads already handle it (PLAN.md Upload limits).
 
 ## 3. Secrets
 
-Each VM has its own login Keychain and the service name stays `com.krishnanelloore.margin` (`secrets.rs`); nothing collides because the Keychains are separate. Items per VM: `github-client-secret`, `openai-api-key` (and the providers brief's Claude key), `media-signing-key` (generated). The owner enters them **in the VM's own window** (`tart run` window or Screen Sharing), never over an SSH session (the login Keychain is locked there) and never in the repo, in GitHub Actions secrets, in Cluster Bar or on a device: `margin-service setup` for the GitHub secret, Settings → AI provider in the app for model keys. Keychain "Always Allow" prompts appear in that window too. To stop the prompt returning on every deploy, CI signs the binary with a **stable identity** (§4); the Keychain ACL matches the signing requirement, so only the first install asks.
+Each VM has its own login Keychain; the service name stays `com.krishnanelloore.margin`. Items per VM: `github-client-secret`, `openai-api-key` (and the providers brief's Claude key), `media-signing-key` (generated). The owner enters them **in the VM's own window** (Screen Sharing or the Cluster Bar window), never over SSH (the login Keychain is locked there) and never in the repo, GitHub Actions secrets, Cluster Bar or a device: `margin-service setup` for the GitHub secret, Settings → AI provider in the app for model keys. CI signs the binary with a stable identity (§4) so the Keychain ACL keeps matching across deploys.
 
-## 4. CI/CD: GitHub Actions on a self-hosted runner from Cluster Bar
+**The Keychain is on the guest's disk, so a recreated VM has an empty one** (§5). After a recreation the owner runs `margin-service setup` again in the VM's window (Return keeps every value in `service.toml`; it asks only for the secret), enters the model keys in Settings again, and clicks Always Allow once. `media-signing-key` is made again at start, so media links handed out before die; nothing else is lost. `provision-guest.sh` says when the secret is missing. Moving secrets to a Keychain file on the share would survive recreation but put them on the host's disk in a file the runner user can read; not done (owner question 12).
 
-**Runner.** One runner on the Mac mini host, labels `self-hosted, macOS, arm64, margin`, created and registered by Cluster Bar (registration needs the owner's GitHub session). It has Rust, `dx`, Xcode CLT, and an SSH key for `admin@<vm-ip>` in both VMs (`tart ip margin-dev`). No GitHub Actions secrets are needed: deploys go runner → VM over the host's NAT network.
+GitHub Actions holds **no secrets**: deploys go runner → VM over the host's NAT network with the host's key, and every workflow uses only `github.token` (read-only, `actions: read` for artifacts). No workflow prints a secret.
 
-Workflows (files in §8):
+## 4. CI/CD: GitHub Actions on the host's runner
+
+**Runner.** `~/actions-runners/margin` on the Mac mini, name `mac-mini-host`, labels `self-hosted, macOS, ARM64, margin`; Rust 1.99, `dx` 0.7.10, Xcode 27, `gh`. A second runner on the host serves another repository with the label `clusterbar`, so **every job targets `[self-hosted, macOS, ARM64, margin]`**. The runner user holds `~/.ssh/margin_deploy`, the one deploy key for both VMs, and the self-signed code-signing identity "Margin Service Signing" (owner, runbook step 8).
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| `test.yml` | every push and PR | `cargo test --workspace` (fakes only: in-memory SurrealDB, fake GitHub and Responses servers), `cargo clippy -D warnings`, `cargo check` for `aarch64-apple-ios-sim`. Never reaches a VM, the Keychain or a model API. |
-| `build-service.yml` | push to the deploy branch, `workflow_dispatch` | `cargo build --release -p margin-service` with `MARGIN_BUILD_SHA`, `codesign --sign "Margin Service Signing"` (a self-signed identity in the runner's Keychain, made once by the owner), upload the artifact `margin-service-<sha>` |
-| `deploy-dev.yml` | after `build-service` on the deploy branch (Q2: `claude/agent-build`) | `deploy.sh dev <artifact>`: backup (§5), copy the binary, `launchctl kickstart -k`, wait for `/health`, check `/api/version` reports `<sha>` and `environment = dev`, smoke-sign-in is left to the owner |
-| `promote-prod.yml` | `workflow_dispatch` with the dev run id; GitHub Environment `prod` requires the owner's review | same `deploy.sh prod` with the **same artifact** that ran on dev |
-| `apps.yml` | tag or `workflow_dispatch` | desktop: `dx bundle … --package-types macos --release` → signed `.dmg` artifact; Android: `dx build --platform android` → APK artifact; iOS TestFlight later (Apple Developer account, Q7). Builds are per environment through `MARGIN_DEFAULT_SERVICE_URL` (§8). |
+| `test.yml` | push (not the deploy branch), same-repo PRs, called by `build-service` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` with `CI=true` and `MARGIN_EMBED_MODEL_DIR` pointing nowhere (fakes only: in-memory SurrealDB, fake GitHub and model servers), `cargo check` for `aarch64-apple-ios-sim`. Never reaches a VM, a secret or a model API. |
+| `build-service.yml` | push to the deploy branch, `workflow_dispatch` | `test.yml`, then `cargo build --release --locked -p margin-service` with `MARGIN_BUILD_SHA`, `codesign --sign "Margin Service Signing"`, check `margin-service version` shows the sha, upload `margin-service-<sha>` (binary + `BUILD_SHA`, 90 days) |
+| `deploy-dev.yml` | after a successful `build-service` on the deploy branch (push or dispatch, this repository), or `workflow_dispatch` with a build run id | `MARGIN_DEPLOY_ONLY=dev`; `deploy.sh dev`: preflight, copy the binary, stop, backup (§5), swap, start, wait for `/health`, check `/api/version` reports `<sha>` and `dev`, roll back to the previous binary if not. Uploads the installed bytes again as `deployed-dev-<sha>`. GitHub Environment `dev` (no reviewer; a deployment record) |
+| `promote-prod.yml` | `workflow_dispatch` with a deploy-dev run id | Environment **`prod`** (required reviewer: the owner); `MARGIN_DEPLOY_ONLY=prod`; checks the run is a successful `deploy-dev` and installs its `deployed-dev-<sha>` artifact with `deploy.sh prod`: the same bytes that ran on dev, never a build from source |
+| `apps.yml` | tag `v*` or `workflow_dispatch` (prod, dev or both) | per environment, `MARGIN_DEFAULT_SERVICE_URL` set: `dx bundle -p margin-app --platform desktop --package-types macos --release` → ad hoc signed `.dmg`; `dx build -p margin-app --platform android --release` → APK. iOS TestFlight waits on the Apple Developer account (Q7). |
 
-The apps pick the environment with the service URL screen they already have (`ui/signin.rs`); the device token is stored per URL (`app/secrets.rs`), so one desktop app can switch between dev and prod without mixing tokens. §8 adds named presets so the owner does not type hostnames.
+**Keeping the deploy key and prod safe.** `deploy.sh` and `provision-guest.sh` refuse any environment but `MARGIN_DEPLOY_ONLY` when it is set, so a deploy-dev job never opens a connection to margin-prod. Prod is reachable only from the `prod` Environment's job, which waits for the owner's approval. What protects the scripts themselves is that only the owner's commits reach the deploy branch; the owner applies these settings **[owner, GitHub]**:
 
-## 5. Data
+1. Settings → Actions → General → "Fork pull request workflows from outside collaborators": **Require approval for all outside collaborators**; and keep the repository private. `test.yml` also skips pull requests whose head is a fork, so fork code never runs on the self-hosted runner.
+2. Settings → Branches → rule for `claude/agent-build` (and `main` when it becomes the deploy branch): require a pull request before merging, require the `test` check, restrict who can push to the owner, block force pushes and deletions, include administrators off (so the owner can merge).
+3. Settings → Environments → `prod`: required reviewers = the owner, "Prevent self-review" off (he is the only reviewer), deployment branches = **Selected branches: `claude/agent-build`** (later `main`), so a `promote-prod` run from another branch's edited workflow never gets the environment.
+4. Settings → Environments → `dev`: deployment branches = `claude/agent-build`.
+5. Settings → Actions → General → Workflow permissions: **Read repository contents** (the default token stays read-only).
+6. Settings → Actions → Runners: the `mac-mini-host` runner in the default group, used only by this repository.
 
-- **Backup before every deploy**: `deploy.sh` runs `backup-margin.sh` in the guest first: `launchctl bootout` the service, copy `data_dir` to `backups/<date>-<old sha>/`, start. It refuses while the service runs, keeps the last 10, and is the same script `docs/plan-dogfood.md` §5 asks for (one file, owned here, D calls it).
-- **Migrations** run at service start (`db.rs`: `DEFINE … IF NOT EXISTS`, the one-pass `passages-v1` re-embed). A deploy is: backup → new binary → start → `/health` → `/api/version`. Rollback is: stop, copy the backup back, start the previous artifact (kept in the runner's artifact store for 90 days).
-- **Prod → dev restore** (`restore-into-dev.sh`, by hand only): copy the newest prod backup into the dev VM's `data_dir`, then delete the `device` rows (prod devices must not authenticate to dev) and the trace rows (dev evals must not read prod usage). Secrets are not copied; dev has its own `media-signing-key`, so old media links die, which is fine. Sources and chats are the owner's own data (single user); still, dev is where agents run, so the restore prints what it copied and the owner confirms.
-- **Tests and evals never see prod**: `test.yml` runs on fakes; `margin-eval` takes `--service-url` and refuses `margin.<domain>`; the Orchard/Cluster Bar runner has no SSH key for prod outside `deploy.sh prod`, which only the `prod` environment's approved job can run.
+The apps pick the environment on the sign-in screen: **Prod / Dev / Custom** (`config::PRESETS`, `ui/signin.rs`). The device token is stored per URL (`app/secrets.rs`), so one desktop app switches between dev and prod without mixing tokens.
+
+## 5. Data: what persists, what is wiped
+
+**Deploys never wipe the database.** A deploy replaces one file, `bin/margin-service`; `data/`, `backups/` and `service.toml` are never written by it except for the backup copy it takes first.
+
+**Orchard recreation would wipe it**, if it were on the guest's disk (see the top). So everything that must survive lives in one host folder per VM, shared into the guest with Orchard `hostDirs` (Tart `--dir`):
+
+```
+orchard create vm margin-dev  --image <macOS 26 base> --cpu 4 --memory 4096 --disk-size 60 \
+  --restart-policy OnFailure --host-dirs margin:/Users/<owner>/MarginVMs/margin-dev \
+  --startup-script @<(deploy/scripts/provision-guest.sh --startup-script dev)
+orchard create vm margin-prod --image <macOS 26 base> --cpu 4 --memory 8192 --disk-size 100 \
+  --restart-policy OnFailure --host-dirs margin:/Users/<owner>/MarginVMs/margin-prod \
+  --startup-script @<(deploy/scripts/provision-guest.sh --startup-script prod)
+```
+
+(or the same fields in Cluster Bar). macOS guests automount the share at `/Volumes/My Shared Files/margin`.
+
+| Where | What | Survives a deploy | Survives Orchard recreating the VM |
+|---|---|---|---|
+| Share (`~/MarginVMs/margin-<env>` on the Mac mini) | `.margin-persistent` (marker), `service.toml`, `data/` (`db/`, `sources/`, `uploads/`, `videos/`, `models/`), `backups/`, `bin/` (the installed binary, the previous one, the scripts), `cloudflared/` (`cert.pem`, tunnel credentials, `config.yml`; `~/.cloudflared` links here) | yes (only `bin/margin-service` changes) | yes |
+| Guest disk | macOS, Homebrew, `cloudflared`, `manimgx`, `fluidaudiocli`, the LaunchAgent plists, the login Keychain (secrets), `~/Library/Logs/Margin`, the guest's SSH host key | yes | **no**: `provision-guest.sh <env> --rekey` puts back everything but the Keychain secrets and the tools' installs (runbook 4); the owner re-enters secrets (§3) |
+| Orchard startup script | hostname `margin-<env>` (so `.local` resolves), the deploy public key in `authorized_keys` | — | re-applied at every start |
+
+**Guards.** `deploy.sh` refuses to deploy unless, inside the guest: the share is mounted at `/Volumes/My Shared Files/margin`, it is another file system than the guest's root disk, its marker names this VM, `service.toml` on it says this environment, and `data_dir` is on the share. The service's LaunchAgent waits for the marker before it starts the binary (which itself lives on the share), so a guest that boots before the share mounts never creates a fresh database on its own disk.
+
+**Backups** live on the share, which is the Mac mini's disk, so they survive the VM too:
+- `deploy.sh` runs `backup-margin.sh --label before-<new sha>-from-<old sha>` after stopping the service and before swapping the binary. It refuses while the service runs, writes `backups/<date-time>-<label>/data`, and keeps the newest 10.
+- The `com.krishnanelloore.margin.backup` LaunchAgent runs `backup-margin.sh --stop-service --label nightly` at 03:30.
+- `deploy/scripts/backup-margin.sh` is the one backup script: the same file `docs/plan-dogfood.md` §5 asks for (it moved from `scripts/`), and on the owner's Mac it runs as before with no arguments.
+- Off the Mac mini: `~/MarginVMs/margin-prod/backups` copied weekly to an external disk **[owner: which disk]** (runbook 13).
+
+**Migrations** run at service start (`db.rs`: `DEFINE … IF NOT EXISTS`, the one-pass `passages-v1` re-embed). A deploy is: backup → new binary → start → `/health` → `/api/version`. A build that doesn't come up is rolled back to `bin/margin-service.prev` automatically; data is restored by hand from the printed backup when the failed build had migrated it.
+
+**SurrealKV on a shared folder.** The database now sits on virtio-fs, not the guest's APFS disk. The restore drill (runbook 12) and a hard stop (`orchard` restart of dev under an ingest, then `/health` and a search) must pass before prod holds the owner's library; if SurrealKV misbehaves on virtio-fs, the alternative is the database on the guest disk with `backup-margin.sh` every hour to the share, accepting up to an hour's loss on recreation.
+
+**Prod → dev restore** (`restore-into-dev.sh`, by hand only, refuses CI and needs a terminal): copies the newest prod backup on the host from `~/MarginVMs/margin-prod/backups` (no SSH to prod at all), asks the owner to type `restore`, stops dev, backs dev up (`pre-restore`), puts the copy in dev's `data/` (dev's old `data/` kept beside it as `data.before-restore-<time>`), runs `margin-service scrub-restored` (deletes every `device` row so prod devices can't sign in to dev, and every trace row and kept rollup so dev evals don't read prod usage; refuses a config whose environment isn't dev), and starts dev. Secrets aren't copied.
+
+**Tests and evals never see prod**: `test.yml` runs on fakes; `margin-eval` requires `--service-url` for `run`, `export` and `report --service`, refuses the host `margin.krishnanelloore.com` when parsing, and refuses any service whose `/api/version` says anything but `dev` (which also catches the owner's own Mac, whose config predates `environment` and so is `prod`); the runner reaches prod only from the approved `prod` job.
 
 ## 6. Traces and evals
 
-The eval runner (`margin-eval run … --service-url https://dev.margin.<domain>`) reads cost, latency and cache numbers from **dev** traces over `GET /api/traces` with the owner's device token from the runner Mac's Keychain, and keeps its own `data_dir/evals/`. Dogfood harvesting (`margin-eval harvest`, dogfood plan §6) also points at dev. The opt-in eval job is `workflow_dispatch` only and runs on the host runner so embedding uses the Neural Engine; §1's measurement says whether the VM numbers are comparable.
+The eval runner (`margin-eval run … --service-url https://devmargin.krishnanelloore.com`) reads cost, latency and cache numbers from **dev** traces over `GET /api/traces` with the owner's device token, and keeps its own `data_dir/evals/`. Dogfood harvesting (`margin-eval harvest`, dogfood plan §6) also points at dev and must take `--service-url` the same way (`Command::needs_service_url`, `cli::check_service`). With Cloudflare Access on dev, the runner uses the service in the VM directly (`http://margin-dev.local:8787` is not reachable: the service binds 127.0.0.1) or an Access service token; owner question 6 decides. The opt-in eval job is `workflow_dispatch` only and runs on the host runner so embedding uses the Neural Engine.
 
 ## 7. Runbook for a Claude Code agent on the Mac mini
 
-Steps marked **[owner]** need the owner; **[Cluster Bar]** is what it does. Everything else is the agent at a shell.
+Steps marked **[owner]** need the owner. Everything else is the agent at the host's shell, in a checkout of the deploy branch.
 
-0. Read Cluster Bar's README and confirm it can: clone and size Tart VMs, run them headless, create a GitHub Actions runner on the host. Note what it cannot do; those steps use the `tart` commands below.
-1. **[owner]** Choose `<domain>` (Q1) and add it to Cloudflare if it is not there.
-2. **[Cluster Bar]** Create `margin-dev` and `margin-prod` from the macOS base image, sized per §1, headless, default NAT. Fallback: `tart clone <image> margin-dev && tart set margin-dev --cpu 4 --memory 8192 --disk-size 80 && tart run margin-dev --no-graphics`.
-3. **[owner]** Tart's licence: confirm it covers this use (free for personal use; check the current terms).
-4. In each guest over SSH (`admin@$(tart ip margin-dev)`): `brew install cloudflared`, install `manimgx` and `fluidaudiocli` the way Settings → Tools shows, `mkdir -p ~/.local/bin ~/Library/Logs/Margin`, install `deploy/launchd/*.plist` with the hostname filled in. Change the guest's `admin` password **[owner]**.
-5. **[owner, Cloudflare]** In each guest's window: `cloudflared tunnel login` (browser), then the agent runs `cloudflared tunnel create margin-dev`, `route dns margin-dev dev.margin.<domain>`, writes `~/.cloudflared/config.yml` from `deploy/cloudflared/config.yml`, `cloudflared service install`. Same for prod. **[owner]** Cloudflare Access policy on `dev.margin.<domain>`.
-6. **[owner, GitHub]** Create the two OAuth apps (callback `https://<host>/auth/github/callback`); keep the client ids and secrets at hand.
-7. **[owner]** In each guest's window: `margin-service setup` (public URL, client id, secret → Keychain, login `Nkr1shna`). The binary for this first run comes from step 9's first artifact or a local `cargo build`.
-8. **[Cluster Bar]** Create the host runner with labels `margin`; **[owner, GitHub]** approve its registration. The agent puts Rust, `dx`, Xcode CLT on the runner, makes the SSH key, adds it to both guests' `authorized_keys`. **[owner]** Create the self-signed identity "Margin Service Signing" in the runner's login Keychain (Keychain Access → Certificate Assistant) and allow `codesign` to use it.
-9. Push the §8 branch; `test.yml` and `build-service.yml` run; `deploy-dev.yml` installs the binary in dev. **[owner]** In the dev window, click "Always Allow" on the first Keychain prompt. Check `curl https://dev.margin.<domain>/api/version`.
-10. **[owner]** Open the desktop app, pick **Dev**, sign in with GitHub, enter the model keys in Settings, download the embedding model. Run the §1 embedding measurement.
-11. **[owner, GitHub]** Create Environment `prod` with "Required reviewers: owner". Run `promote-prod` for the dev run; approve it; repeat steps 9–10's checks on prod.
-12. Decide Q9 (prod data): if prod takes the owner's library, stop the service on his Mac, `backup-margin.sh`, copy the backup into the prod guest, start, and point the app at **Prod**.
-13. Schedule `backup-margin.sh` nightly in each guest (`launchd` StartCalendarInterval) and `tart export` of the prod VM weekly to an external disk **[owner: which disk]**.
+0. Done by the owner already: Cloudflare zone `krishnanelloore.com`; tunnels `margin-dev` and `margin-prod`; VMs `margin-dev` (4/4 GB/60 GB) and `margin-prod` (4/8 GB/100 GB) from the macOS 26 base image under Orchard with restart on failure; the runner `mac-mini-host`; `~/.ssh/margin_deploy`.
+1. `deploy/scripts/provision-guest.sh dev` once on the host: it creates `~/MarginVMs/margin-dev` with its marker and stops, saying the share isn't mounted. **[owner, Cluster Bar]** Add the shared folder `margin:/Users/<owner>/MarginVMs/margin-dev` (Orchard `hostDirs`) and the startup script from `provision-guest.sh --startup-script dev` to `margin-dev`; Orchard restarts it (a fresh clone). Same for prod.
+2. If a VM already holds something on its own disk (a tunnel login, a `service.toml`, a database), copy it out **before** the owner adds the share in step 1, because that restart is a fresh clone: stop the service in the guest, then from the host `scp -r -i ~/.ssh/margin_deploy 'admin@margin-dev.local:.cloudflared/*' ~/MarginVMs/margin-dev/cloudflared/` and `scp -r … 'admin@margin-dev.local:Library/Application Support/Margin/{service.toml,data}' ~/MarginVMs/margin-dev/`, then set `data_dir` in the copied `service.toml` to `/Volumes/My Shared Files/margin/data` and add `environment = "dev"`.
+3. `provision-guest.sh dev --rekey` (the restarted VM has a new host key): installs `cloudflared`, links `~/.cloudflared` to the share, writes a starter `service.toml` (environment, public URL, `data_dir` on the share), installs both LaunchAgents and starts the backup one. It prints what is left.
+4. In the guest over SSH: install `manimgx` and `fluidaudiocli` the way Settings → Tools shows (they live on the guest disk; repeat after a recreation). **[owner]** Change the guest's `admin` password from the image default and update it in Orchard's VM spec.
+5. **[owner, in the VM's window]** `cloudflared tunnel login` if the share's `cloudflared/` has no `cert.pem`; the agent then runs the tunnel's `create` (or reuses the existing tunnel's credentials JSON copied into `cloudflared/`), `route dns -f margin-dev devmargin.krishnanelloore.com`, and `provision-guest.sh dev --tunnel-uuid <UUID>`, which writes `cloudflared/config.yml` from `deploy/cloudflared/config.yml` and installs the cloudflared LaunchAgent. **[owner]** Cloudflare Access policy on `devmargin.krishnanelloore.com`.
+6. **[owner, GitHub]** The two OAuth apps (callbacks `https://devmargin.krishnanelloore.com/auth/github/callback`, `https://margin.krishnanelloore.com/auth/github/callback`).
+7. **[owner, GitHub]** The settings in §4 (fork approval, branch rule, Environments `dev` and `prod`, read-only token). **[owner]** Create "Margin Service Signing" (Keychain Access → Certificate Assistant → Create a Certificate, type Code Signing) in the runner user's login Keychain and allow `codesign` to use it.
+8. Push the deploy branch; `build-service` runs `test` then builds; `deploy-dev` installs the binary on the share and starts it. The first start fails `validate_for_serving` (no client id yet): **[owner, in the dev window]** `MARGIN_CONFIG="/Volumes/My Shared Files/margin/service.toml" "/Volumes/My Shared Files/margin/bin/margin-service" setup` (environment `dev`, the "Margin dev" app), click Always Allow on the first Keychain prompt, then re-run the deploy-dev job. Check `margin-service` answers inside the guest: `curl http://127.0.0.1:8787/api/version`.
+9. **[owner]** Open the desktop app, pick **Dev**, sign in with GitHub, enter the model keys in Settings, download the embedding model. Run the §1 embedding measurement and watch `rss_bytes`.
+10. **[owner, GitHub]** Run `promote-prod` with the deploy-dev run id; approve it; repeat steps 8–9 on prod (environment `prod`, the "Margin" app).
+11. **Recreation drill**: restart `margin-dev` from Orchard (a fresh clone). Then `provision-guest.sh dev --rekey`, the step-4 tools, **[owner]** `margin-service setup` (secret only) and the model keys; the library, devices and backups are all still there.
+12. Decide Q9 (prod data): if prod takes the owner's library, stop the service on his Mac, `deploy/scripts/backup-margin.sh`, copy the backup's `data/` to `~/MarginVMs/margin-prod/data` with prod stopped, start, point the app at **Prod**. Then a restore drill: `restore-into-dev.sh`.
+13. Weekly copy of `~/MarginVMs/margin-prod/backups` to an external disk **[owner: which disk]** (a host LaunchAgent; `tart export` is no longer needed for data, since the VM holds none).
 
-## 8. What changes in the repo (area E-deploy, one worktree, exclusive files)
+## 8. What changes in the repo (area E-deploy)
 
-- `deploy/scripts/{provision-guest.sh,deploy.sh,backup-margin.sh,restore-into-dev.sh}`, `deploy/launchd/{com.krishnanelloore.margin.service,com.krishnanelloore.margin.backup}.plist`, `deploy/cloudflared/config.yml` (templates with `<HOST>`, `<UUID>`), `.github/workflows/{test,build-service,deploy-dev,promote-prod,apps}.yml`.
-- `crates/service/src/config.rs`: `environment: String` (`"dev" | "prod"`, default `"prod"`), asked by `setup`. `crates/service/src/version.rs` (new): `GET /api/version` → `{ version, sha (from MARGIN_BUILD_SHA), environment, started_at }`; one route line in `server.rs` and `routes.rs` (coordinate: both shared files, two lines each, added in the first commit). `/health` stays `ok` for the tunnel.
-- `crates/app/src/config.rs`: `DEFAULT_SERVICE_URL` from `option_env!("MARGIN_DEFAULT_SERVICE_URL")`, plus `pub const PRESETS: [(name, url)]` for the sign-in screen's Prod / Dev / Custom choice (`ui/signin.rs`, one new row). Nothing else in the app changes; tokens are already per URL.
-- `crates/evals/src/bin/margin-eval.rs`: `--service-url` required for `run`/`harvest`/`export`, refusing the prod hostname. `docs/service-setup.md`: a note that a VM follows the same steps, pointing here. `docs/HANDOFF.md`: an E row.
-- No change to data layout, Keychain names, auth, or the wire contract beyond the one route.
+- `deploy/scripts/{common.sh,provision-guest.sh,deploy.sh,backup-margin.sh,restore-into-dev.sh}` (`backup-margin.sh` moved from `scripts/`; `common.sh` holds the hosts, the share's path and the persistence checks), `deploy/launchd/{com.krishnanelloore.margin.service,com.krishnanelloore.margin.backup}.plist` (templates with `__PERSIST__`, `__HOME__`), `deploy/cloudflared/config.yml` (template with `<HOST>`, `<UUID>`, `<CREDS_DIR>`), `.github/workflows/{test,build-service,deploy-dev,promote-prod,apps}.yml`.
+- `crates/service/src/config.rs`: `environment` (`"dev" | "prod"`, default `"prod"`), validated, asked first by `setup`. `crates/service/src/version.rs`: `GET /api/version` → `{ version, sha (MARGIN_BUILD_SHA at build time), environment, started_at, rss_bytes, physical_memory_bytes }`, public like `/health`; the low-memory start-up warning. One route line each in `margin_shared::routes` (`VERSION`) and `server.rs`. `crates/service/src/restore.rs` and `margin-service scrub-restored`; `margin-service version`.
+- `crates/app/src/config.rs`: `DEFAULT_SERVICE_URL` from `option_env!("MARGIN_DEFAULT_SERVICE_URL")` (prod otherwise), `PRESETS` (Prod, Dev) and `preset_for`; `ui/signin.rs`: the Prod / Dev / Custom radio group above the address (the field shows for Custom, remembering what was typed).
+- `crates/evals`: `--service-url` required for `run`, `export` and `report --service`, refusing the prod host and any non-dev `/api/version`; `service_url` left `evals/runner.toml`.
+- `docs/service-setup.md`: a note that the VMs follow this plan. `docs/HANDOFF.md`: an E row.
+- No change to data layout inside `data_dir`, Keychain names, auth, or the wire contract beyond the one route.
 
 ## 9. Owner questions, with recommendations
 
-1. **Domain.** Which domain, and is it on Cloudflare? Recommend `margin.<domain>` for prod, `dev.margin.<domain>` for dev, LiveKit under `live.`.
-2. **Which branch deploys to dev?** Recommend `claude/agent-build` now (it is where every phase merges); switch to `main` once `main` is caught up (it is still at `dbd08ff`).
-3. **What promotes to prod?** Recommend the exact artifact that ran on dev, by run id, with the owner's approval in the `prod` GitHub Environment; no prod builds from source.
-4. **Two VMs, or prod on the host?** Recommend two VMs as asked (clean, restorable with `tart export`); the host-prod layout only if CI needs throwaway macOS VMs later.
-5. **VM sizes.** What are the Mac mini's cores, memory and disk? Recommend dev 4/8 GB/80 GB, prod 4/12 GB/160 GB, leaving at least 4 GB and 2 cores for the host and runner.
-6. **Cloudflare Access on dev** (GitHub identity, owner only)? Recommend yes; prod stays on the service's own allow-list.
-7. **App builds.** Desktop `.dmg` and Android APK from CI now; iOS TestFlight needs the Apple Developer account and a distribution certificate on the runner: now or after phase 5? Recommend after phase 5.
-8. **Signing identity.** Self-signed "Margin Service Signing" (free, one Keychain prompt per VM) or a Developer ID (needed anyway for TestFlight)? Recommend self-signed now.
-9. **Does prod hold the owner's real library now?** Recommend not yet: keep the live instance on his Mac until dev has run for two weeks and the §1 embedding measurement and one restore drill have passed; then move it (runbook step 12) and retire the Mac's service.
-10. **Prod → dev restores**: on demand only (recommended), or nightly?
-11. **Who else may build?** The runner trusts pushes to the repo; recommend branch protection so only the owner's merges reach the deploy branch, and `pull_request` from forks never runs on the self-hosted runner.
+Answered by the setup: 1 (domain: `krishnanelloore.com`, single-level subdomains), 4 (two VMs), 5 (sizes, §1).
+
+2. **Which branch deploys to dev?** Recommend `claude/agent-build` now (every phase merges there); switch to `main` once `main` is caught up (still at `dbd08ff`). The workflows name the branch in `build-service.yml`, `deploy-dev.yml` and `test.yml`'s `branches-ignore`.
+3. **What promotes to prod?** Built: the exact `deployed-dev-<sha>` artifact, by deploy-dev run id, approved in the `prod` Environment.
+6. **Cloudflare Access on dev** (GitHub identity, owner only)? Recommend yes; the eval runner then needs an Access service token (stored in the runner user's Keychain, read by `margin-eval`, not built) or runs inside the dev VM.
+7. **App builds.** Desktop `.dmg` and Android APK from CI now; iOS TestFlight needs the Apple Developer account: now or after phase 5? Recommend after phase 5.
+8. **Signing identity.** Self-signed "Margin Service Signing" now (built); Developer ID later with TestFlight.
+9. **Does prod hold the owner's real library now?** Recommend not yet: after two weeks of dev, the §1 measurement, the recreation drill (runbook 11) and the restore drill pass, move it (runbook 12) and retire the Mac's service.
+10. **Prod → dev restores**: on demand only (built that way), or nightly?
+11. **Who else may build?** Built for: only the owner pushes the deploy branch; forks never run on the runner (§4 settings).
+12. **Secrets across recreation**: re-enter them after a recreation (now), or a Keychain file on the share (survives, but readable by the runner user on the host)? Recommend re-entering; recreations should be rare.
+13. **Dev memory**: keep 4 GB and watch `rss_bytes`, or move dev to 6 GB (prod to 6 GB)? Recommend measuring during the first real ingest before changing.
