@@ -265,6 +265,71 @@
     }
   }
 
+  // Tooltips. The macOS webview never shows native `title` tooltips, so elements with a
+  // title get this one instead: after a short hover (or keyboard focus), below the
+  // element (above it near the bottom edge), gone on click, key press or scroll. The
+  // title moves to data-tip so the native one can't double up.
+  (function tooltips() {
+    var tip = null, timer = null, current = null;
+    function el() {
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.className = "tooltip";
+        tip.setAttribute("role", "tooltip");
+        document.body.appendChild(tip);
+      }
+      return tip;
+    }
+    function target(node) {
+      var t = node && node.closest ? node.closest("[title], [data-tip]") : null;
+      if (!t) return null;
+      if (t.hasAttribute("title")) {
+        var text = t.getAttribute("title");
+        t.removeAttribute("title");
+        if (text) t.setAttribute("data-tip", text); else t.removeAttribute("data-tip");
+      }
+      return t.getAttribute("data-tip") ? t : null;
+    }
+    function hide() {
+      clearTimeout(timer);
+      timer = null;
+      current = null;
+      if (tip) tip.classList.remove("show");
+    }
+    function show(t) {
+      if (!document.body.contains(t)) return;
+      var box = el();
+      box.textContent = t.getAttribute("data-tip");
+      box.classList.add("show");
+      var r = t.getBoundingClientRect(), b = box.getBoundingClientRect();
+      var top = r.bottom + 6;
+      if (top + b.height > window.innerHeight - 4) top = r.top - b.height - 6;
+      var left = r.left + r.width / 2 - b.width / 2;
+      left = Math.max(6, Math.min(left, window.innerWidth - b.width - 6));
+      box.style.top = Math.round(top) + "px";
+      box.style.left = Math.round(left) + "px";
+    }
+    function arm(t, delay) {
+      if (t === current) return;
+      hide();
+      if (!t) return;
+      current = t;
+      timer = setTimeout(function () { show(t); }, delay);
+    }
+    document.addEventListener("mouseover", function (e) { arm(target(e.target), 500); }, true);
+    document.addEventListener("mouseout", function (e) {
+      if (current && !(e.relatedTarget && current.contains(e.relatedTarget))) hide();
+    }, true);
+    document.addEventListener("focusin", function (e) {
+      if (e.target.matches && e.target.matches(":focus-visible")) arm(target(e.target), 300);
+    }, true);
+    document.addEventListener("focusout", hide, true);
+    ["mousedown", "keydown", "scroll", "wheel"].forEach(function (type) {
+      document.addEventListener(type, hide, true);
+    });
+    window.addEventListener("blur", hide);
+  })();
+
   function fallbackCopy(text) {
     var ta = document.createElement("textarea");
     ta.value = text;

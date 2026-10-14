@@ -153,7 +153,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .row { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; border-radius: 6px; color: var(--fg-2); background: transparent; border: 0; width: 100%; text-align: left; font-size: 14px; text-decoration: none; }
 .row:hover { background: var(--hover); color: var(--fg); }
 .row[aria-current="true"] { background: var(--select); color: var(--fg); font-weight: 500; }
-.row .k { font-size: 11.5px; color: var(--fg-3); font-family: var(--font-mono); }
+.row .k { font-size: 12px; color: var(--fg-3); font-family: -apple-system, system-ui, sans-serif; letter-spacing: 0.5px; }  /* system font: SF Mono draws a squat ⇧ */
 .row .count { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 .sb-label { padding: 14px 10px 4px 16px; font-size: 13px; color: var(--fg-3); font-weight: 500; display: flex; align-items: center; justify-content: space-between; }
 .sb-scroll { flex: 1; overflow: hidden auto; padding: 0 10px 10px; }
@@ -204,6 +204,10 @@ body.resizing-sb * { user-select: none !important; }
 }
 .scroll { flex: 1; overflow: auto; min-height: 0; }
 .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-3); }
+
+/* tooltip (margin.js): the webview shows no native title tooltips */
+.tooltip { position: fixed; z-index: 100; max-width: 280px; padding: 4px 8px; border-radius: 6px; background: var(--invert-bg); color: var(--invert-fg); font-size: 12px; line-height: 16px; font-weight: 500; pointer-events: none; opacity: 0; transition: opacity .12s; white-space: normal; }
+.tooltip.show { opacity: 1; }
 
 /* popover menu */
 .pop-scrim { position: fixed; inset: 0; z-index: 40; }
