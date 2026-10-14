@@ -1,6 +1,15 @@
-//! Courses: outline proposals (written by the agent's `propose_course`), accepting them
-//! (Create lessons on the outline card, or the agent's `accept_proposal`), and lesson
-//! generation jobs.
+//! Courses: outline proposals (written by the agent's `propose_course`, optionally
+//! planned by the service's outline planner), accepting them (Create lessons on the
+//! outline card, or the agent's `accept_proposal`), and lesson generation jobs.
+//!
+//! R1 (`docs/agent-rag-architecture.md` §2.5): when a course draws on sources or
+//! folders, `propose_course` surveys them (one query per document plus the learner's
+//! request, packed to the pipeline's budget for the writing model's window, and every
+//! document's section paths) and the planner call returns the outline with 2–3
+//! retrieval questions and the sections to cite per lesson (`CoursePlan`, kept on the
+//! stored proposal). Lesson jobs retrieve with those questions (`retrieval::QueryPlan`)
+//! through `retrieval::retrieve`, packed to `PipelineConfig.budget` against the writing
+//! model's window: no fixed number of passages.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -10,15 +19,23 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use margin_ai::LessonContext;
+use futures_util::StreamExt;
+use margin_ai::{LessonContext, ReasoningConfig, ResponseRequest, StreamEvent};
+use margin_shared::context::{Scope, TraceKind, TraceRow, TraceUsage};
+use margin_shared::pipeline::Route;
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
-    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
+    Level, Outline, OutlineLesson, Proposal, ProposalStatus, ReasoningEffort, Source, Topic,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::chats::{self, StoredChatItem};
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
+use crate::pipeline::{Packed, PlanInput};
+use crate::retrieval::{self, QueryPlan};
 use crate::state::{AppState, Author, StoredLesson, new_id};
 use crate::{db, sources, video};
 
@@ -66,8 +83,22 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
 pub async fn propose(
     state: &AppState,
     chat_id: &str,
+    request: AskRequest,
+    outline: Outline,
+) -> AppResult<Proposal> {
+    propose_planned(state, chat_id, request, outline, None).await
+}
+
+/// `propose`, surveying the sources and running the outline planner first when
+/// `survey` is true, or when it is `None` and the course draws on sources or the chat's
+/// folders (§2.5). A planner that fails or isn't available leaves the agent's outline
+/// as it is.
+pub async fn propose_planned(
+    state: &AppState,
+    chat_id: &str,
     mut request: AskRequest,
     outline: Outline,
+    survey: Option<bool>,
 ) -> AppResult<Proposal> {
     request.prompt = request.prompt.trim().to_string();
     if request.prompt.is_empty() {
@@ -84,6 +115,26 @@ pub async fn propose(
         None => {}
     }
     check_sources(state, &mut request).await?;
+    let mut outline = outline;
+    let workspaces = match state.store.get::<Chat>(db::CHAT, chat_id).await? {
+        Some(chat) => chat.workspace_ids,
+        None => Vec::new(),
+    };
+    let wanted = survey.unwrap_or(!request.source_ids.is_empty() || !workspaces.is_empty());
+    let mut plan = None;
+    if wanted {
+        match plan_course(state, &request, &outline, &workspaces, chat_id).await {
+            Ok(Some(p)) => match validate_outline(&p.outline()) {
+                Ok(planned) => {
+                    outline = planned;
+                    plan = Some(p);
+                }
+                Err(e) => tracing::warn!("the planned outline isn't usable: {}", e.message),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!("the outline planner failed: {e:#}"),
+        }
+    }
     request.lesson_count = outline.lessons.len() as u32;
     let proposal = Proposal {
         id: new_id(),
@@ -93,24 +144,26 @@ pub async fn propose(
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
     };
+    let stored = StoredProposal {
+        proposal: proposal.clone(),
+        plan,
+        pipeline_hash: Some(state.pipeline.load_full().hash.clone()),
+    };
     let superseded = {
         let _w = state.write_lock.lock().await;
-        let mut earlier: Vec<Proposal> = state
+        let mut earlier: Vec<StoredProposal> = state
             .store
             .list_where(db::PROPOSAL, "chat_id", chat_id)
             .await?;
-        earlier.retain(|p| p.status == ProposalStatus::Ready);
+        earlier.retain(|p| p.proposal.status == ProposalStatus::Ready);
         for p in &mut earlier {
-            p.status = ProposalStatus::Superseded {
+            p.proposal.status = ProposalStatus::Superseded {
                 by: proposal.id.clone(),
             };
-            state.store.put(db::PROPOSAL, &p.id, &*p).await?;
+            state.store.put(db::PROPOSAL, &p.proposal.id, &*p).await?;
         }
-        state
-            .store
-            .put(db::PROPOSAL, &proposal.id, &proposal)
-            .await?;
-        earlier
+        state.store.put(db::PROPOSAL, &proposal.id, &stored).await?;
+        earlier.into_iter().map(|p| p.proposal).collect::<Vec<_>>()
     };
     for p in &superseded {
         state.emit_proposal(p);
@@ -237,11 +290,12 @@ pub async fn accept_proposal(
 
     let (topic, events, lesson_ids, proposal) = {
         let _w = state.write_lock.lock().await;
-        let mut proposal: Proposal = state
+        let mut stored: StoredProposal = state
             .store
             .get(db::PROPOSAL, id)
             .await?
             .ok_or_else(|| AppError::not_found("proposal"))?;
+        let proposal = &mut stored.proposal;
         match &proposal.status {
             ProposalStatus::Ready => {}
             ProposalStatus::Drafting => {
@@ -364,10 +418,8 @@ pub async fn accept_proposal(
         proposal.status = ProposalStatus::Accepted {
             topic_id: topic.id.clone(),
         };
-        state
-            .store
-            .put(db::PROPOSAL, &proposal.id, &proposal)
-            .await?;
+        let proposal = proposal.clone();
+        state.store.put(db::PROPOSAL, &proposal.id, &stored).await?;
         events.push(Event::ProposalChanged {
             proposal: proposal.clone(),
         });
@@ -518,7 +570,7 @@ async fn run_lesson_job(state: AppState, lesson_id: Id, first_write: bool) {
 async fn lesson_context(
     state: &AppState,
     row: &StoredLesson,
-) -> anyhow::Result<(LessonContext, Option<Proposal>, Vec<sources::Retrieved>)> {
+) -> anyhow::Result<(LessonContext, Option<Proposal>, Vec<Packed>)> {
     let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
     let topic = topics.iter().find(|t| t.id == row.lesson.topic_id);
     let topic_title = topic.map(|t| t.title.clone()).unwrap_or_default();
@@ -534,10 +586,12 @@ async fn lesson_context(
         .map(|t| t.title.clone())
         .unwrap_or_else(|| topic_title.clone());
 
-    let proposal: Option<Proposal> = match &row.proposal_id {
+    let stored: Option<StoredProposal> = match &row.proposal_id {
         Some(pid) => state.store.get(db::PROPOSAL, pid).await?,
         None => None,
     };
+    let plan = stored.as_ref().and_then(|p| p.plan.clone());
+    let proposal: Option<Proposal> = stored.map(|p| p.proposal);
     let siblings = topic_lessons(state, &row.lesson.topic_id).await?;
     let outline: Vec<OutlineLesson> = siblings
         .iter()
@@ -557,20 +611,25 @@ async fn lesson_context(
         .or_else(|| row.prompt.clone())
         .unwrap_or_else(|| row.lesson.title.clone());
 
-    // The passages most relevant to this lesson, from its topic's sources.
+    // The passages most relevant to this lesson, from its topic's sources and the ones
+    // its course was asked with, retrieved with the planner's questions when there are.
     let asked = proposal
         .as_ref()
         .map(|p| p.request.source_ids.clone())
         .unwrap_or_default();
-    let source_ids = sources::for_lesson(state, &row.lesson.topic_id, &asked).await?;
-    let query = format!(
-        "{}\n{}\n{}",
-        row.lesson.title,
-        row.lesson.summary,
-        prompt.trim()
+    let planned = plan
+        .as_ref()
+        .and_then(|p| p.lessons.iter().find(|l| l.title == row.lesson.title))
+        .map(|l| l.queries.clone())
+        .unwrap_or_default();
+    let query = QueryPlan::lesson(
+        &row.lesson.title,
+        &row.lesson.summary,
+        &planned,
+        (index == 0).then_some(prompt.trim()),
     );
-    let retrieved = sources::passages(state, &source_ids, &query).await;
-    let passages = retrieved.iter().map(|r| r.passage.clone()).collect();
+    let retrieved = lesson_passages(state, &row.lesson, &asked, query).await;
+    let passages = retrieval::for_writer(state, &retrieved).await;
 
     let ctx = LessonContext {
         subject_title,
@@ -585,6 +644,376 @@ async fn lesson_context(
         passages,
     };
     Ok((ctx, proposal, retrieved))
+}
+
+/// A lesson's passages: retrieved from its topic and the sources its course was asked
+/// with (waiting for those still being read, up to `sources::SOURCE_WAIT`), packed to
+/// the pipeline's budget against the writing model's window. When retrieval fails the
+/// lesson is written without passages (logged).
+async fn lesson_passages(
+    state: &AppState,
+    lesson: &Lesson,
+    asked: &[Id],
+    plan: QueryPlan,
+) -> Vec<Packed> {
+    let result = async {
+        let mut existing = Vec::new();
+        for id in asked {
+            if state.store.get::<Source>(db::SOURCE, id).await?.is_some() {
+                existing.push(id.clone());
+            }
+        }
+        let mut scopes = vec![Scope::Topic {
+            id: lesson.topic_id.clone(),
+        }];
+        if !existing.is_empty() {
+            scopes.push(Scope::Sources { ids: existing });
+        }
+        let scope = Scope::Union { scopes };
+        retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
+        let pipeline = state.pipeline.load_full();
+        let req = retrieval::Request {
+            plan,
+            scope,
+            access: None,
+            modalities: Vec::new(),
+            k: retrieval::fused_k(&pipeline.config),
+            budget: pipeline.config.budget,
+            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            trace_id: lesson.id.clone(),
+        };
+        retrieval::retrieve(state, &req).await
+    };
+    match result.await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("couldn't retrieve passages for lesson {}: {e:#}", lesson.id);
+            Vec::new()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The outline planner (§2.5)
+// ---------------------------------------------------------------------------
+
+/// What a proposal is stored as: the wire `Proposal` plus the planner's plan and the
+/// pipeline it was made with. Reading a row as a plain `Proposal` ignores the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredProposal {
+    #[serde(flatten)]
+    pub proposal: Proposal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<CoursePlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_hash: Option<String>,
+}
+
+/// The planner's answer, the shape of `margin_ai::prompts::CoursePlan` (`plan-v1`): the
+/// outline plus, per lesson, its retrieval questions and the sections it must cite.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CoursePlan {
+    /// The new topic's title.
+    pub topic_title: String,
+    /// The subject to file it under.
+    pub subject_title: String,
+    /// The lessons in reading order.
+    pub lessons: Vec<PlannedLesson>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PlannedLesson {
+    pub title: String,
+    /// One line on what it covers.
+    pub summary: String,
+    /// Estimated reading time in minutes.
+    pub minutes: u32,
+    /// 2 or 3 questions that find this lesson's material in the sources.
+    pub queries: Vec<String>,
+    /// Sections of the sources the lesson must draw on, as listed in the contents.
+    pub must_cite: Vec<SectionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SectionRef {
+    pub document: String,
+    pub section: String,
+}
+
+/// Most retrieval questions kept per planned lesson.
+pub const PLAN_QUERIES_MAX: usize = 3;
+/// How long the survey waits for sources still being read.
+pub const PLAN_WAIT: Duration = Duration::from_secs(15);
+/// The function the planner answers through (a strict schema of `CoursePlan`).
+pub const PLAN_TOOL: &str = "record_course_plan";
+/// Characters of a document's first passage used as its survey query.
+const SURVEY_QUERY_CHARS: usize = 500;
+
+impl CoursePlan {
+    /// The outline part.
+    pub fn outline(&self) -> Outline {
+        Outline {
+            topic_title: self.topic_title.clone(),
+            subject_title: self.subject_title.clone(),
+            lessons: self
+                .lessons
+                .iter()
+                .map(|l| OutlineLesson {
+                    title: l.title.clone(),
+                    summary: l.summary.clone(),
+                    minutes: l.minutes,
+                })
+                .collect(),
+        }
+    }
+
+    /// Usable for a draft of `lessons` lessons: the same count, every lesson titled;
+    /// questions trimmed, deduplicated and cut to `PLAN_QUERIES_MAX` (a lesson with
+    /// none gets "title: summary").
+    pub fn checked(mut self, lessons: usize) -> Option<Self> {
+        if self.lessons.len() != lessons || self.topic_title.trim().is_empty() {
+            return None;
+        }
+        for l in &mut self.lessons {
+            l.title = l.title.trim().to_string();
+            l.summary = l.summary.trim().to_string();
+            if l.title.is_empty() {
+                return None;
+            }
+            let mut queries: Vec<String> = Vec::new();
+            for q in &l.queries {
+                let q = q.trim();
+                if !q.is_empty() && !queries.iter().any(|k| k.eq_ignore_ascii_case(q)) {
+                    queries.push(q.to_string());
+                }
+            }
+            queries.truncate(PLAN_QUERIES_MAX);
+            if queries.is_empty() {
+                queries.push(format!("{}: {}", l.title, l.summary));
+            }
+            l.queries = queries;
+        }
+        Some(self)
+    }
+}
+
+/// The planner's input: the request (with the agent's draft outline and the course's
+/// options), each document's table of contents, and the survey passages.
+pub async fn survey(
+    state: &AppState,
+    request: &AskRequest,
+    draft: &Outline,
+    workspaces: &[Id],
+    trace_id: &str,
+) -> anyhow::Result<Option<PlanInput>> {
+    let mut scopes = Vec::new();
+    if !request.source_ids.is_empty() {
+        scopes.push(Scope::Sources {
+            ids: request.source_ids.clone(),
+        });
+    }
+    for w in workspaces {
+        scopes.push(Scope::Workspace { id: w.clone() });
+    }
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let scope = Scope::Union { scopes };
+    retrieval::wait_until_read(state, &scope, PLAN_WAIT).await?;
+    let resolved = retrieval::resolve(&state.store, &scope).await?;
+
+    // One query per document (its first passage), plus the learner's request; each
+    // document's section paths as the table of contents.
+    let mut queries = vec![request.prompt.clone()];
+    let mut contents = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for key in &resolved.keys {
+        let Some(info) = retrieval::doc_info(&state.store, key).await? else {
+            continue;
+        };
+        if !seen.insert(info.document_id.clone()) {
+            continue;
+        }
+        let first = retrieval::read_passages(
+            &state.store,
+            &info.document_id,
+            retrieval::Selector::Ords { from: 0, to: 0 },
+            1,
+        )
+        .await?;
+        let Some(first) = first.first() else {
+            continue;
+        };
+        queries.push(first.text.chars().take(SURVEY_QUERY_CHARS).collect());
+        let sections: Vec<String> = retrieval::document_outline(&state.store, &info.document_id)
+            .await?
+            .into_iter()
+            .map(|s| s.section_path)
+            .filter(|s| !s.is_empty())
+            .collect();
+        contents.push(if sections.is_empty() {
+            info.name.clone()
+        } else {
+            format!("{}: {}", info.name, sections.join("; "))
+        });
+    }
+    let pipeline = state.pipeline.load_full();
+    let survey = retrieval::retrieve(
+        state,
+        &retrieval::Request {
+            plan: QueryPlan::from_strings(queries),
+            scope,
+            access: None,
+            modalities: Vec::new(),
+            k: retrieval::fused_k(&pipeline.config),
+            budget: pipeline.config.budget,
+            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            trace_id: trace_id.to_string(),
+        },
+    )
+    .await?;
+    let level = match request.level {
+        Level::Intro => "intro",
+        Level::Intermediate => "intermediate",
+        Level::Advanced => "advanced",
+    };
+    let mut text = format!(
+        "{}\n\nLessons: exactly {}. Level: {level}. Quiz: {}.\n\nDraft outline: \"{}\" (filed under \"{}\")\n",
+        request.prompt.trim(),
+        draft.lessons.len(),
+        if request.with_quiz { "yes" } else { "no" },
+        draft.topic_title,
+        draft.subject_title,
+    );
+    for (i, l) in draft.lessons.iter().enumerate() {
+        text.push_str(&format!(
+            "{}. {} ({} min): {}\n",
+            i + 1,
+            l.title,
+            l.minutes,
+            l.summary
+        ));
+    }
+    Ok(Some(PlanInput {
+        request: text,
+        contents,
+        survey,
+    }))
+}
+
+/// Surveys the course's sources and folders and asks the planner (the writing route)
+/// for the outline with per-lesson questions and sections. `Ok(None)` when there is
+/// nothing to survey, no planner prompt in this build, or the answer doesn't fit the
+/// draft.
+pub async fn plan_course(
+    state: &AppState,
+    request: &AskRequest,
+    draft: &Outline,
+    workspaces: &[Id],
+    chat_id: &str,
+) -> anyhow::Result<Option<CoursePlan>> {
+    let trace_id = new_id();
+    let Some(input) = survey(state, request, draft, workspaces, &trace_id).await? else {
+        return Ok(None);
+    };
+    let pipeline = state.pipeline.load_full();
+    let prompts = pipeline.prompts.clone();
+    // The prompt set is R1-ai's, wired into the pipeline's `LessonV2` when that area
+    // merges; a build without it plans nothing rather than failing the proposal.
+    let prompt =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prompts.plan(&input))) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!("no planner prompt in this build; the agent's outline stays");
+                return Ok(None);
+            }
+        };
+    let ai = state
+        .ai_config()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let model = state.generator.agent_model(&ai);
+    let routed = retrieval::route_model(state, Route::Write).await?;
+    let survey_text: String = retrieval::for_writer(state, &input.survey)
+        .await
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("[{}] {}: {}\n", i + 1, p.source, p.text))
+        .collect();
+    let tool = json!({
+        "type": "function",
+        "name": PLAN_TOOL,
+        "description": "Record the course plan.",
+        "parameters": margin_agent::strict_schema::<CoursePlan>(),
+        "strict": true,
+    });
+    let req = ResponseRequest {
+        model: Some(routed.clone()).filter(|m| !m.is_empty()),
+        input: vec![
+            json!({"role": "developer", "content": [{"type": "input_text", "text": prompt.constant}]}),
+            json!({"role": "user", "content": [{"type": "input_text", "text": format!("{}\n\n{survey_text}", prompt.variable)}]}),
+        ],
+        tools: vec![tool],
+        tool_choice: Some(margin_ai::ToolChoice::Function(PLAN_TOOL.into())),
+        reasoning: Some(ReasoningConfig {
+            effort: ReasoningEffort::Medium,
+            summary: None,
+        }),
+        prompt_cache_key: Some(prompt.cache_key.clone()),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let mut row = TraceRow::new(TraceKind::ModelCall, new_id(), Utc::now());
+    row.trace_id = trace_id;
+    row.chat_id = Some(chat_id.to_string());
+    row.route = Some(Route::Write);
+    row.model = Some(routed);
+    row.prompt_version = Some(prompt.version.clone());
+    row.pipeline_hash = Some(pipeline.hash.clone());
+    let answer = async {
+        let mut stream = model.stream(req).await?;
+        let mut arguments = None;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::OutputItemDone { item, .. }
+                    if item["type"] == "function_call" && item["name"] == PLAN_TOOL =>
+                {
+                    arguments = item["arguments"].as_str().map(str::to_string);
+                }
+                StreamEvent::Completed { usage, .. } => return Ok((arguments, Some(usage))),
+                StreamEvent::Incomplete { usage, .. } => return Ok((None, Some(usage))),
+                StreamEvent::Failed { message, .. } | StreamEvent::Error { message, .. } => {
+                    anyhow::bail!("the planner call failed: {message}")
+                }
+                _ => {}
+            }
+        }
+        anyhow::bail!("the planner call ended without finishing")
+    }
+    .await;
+    row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    row.ok = answer.is_ok();
+    if let Ok((_, Some(u))) = &answer {
+        row.usage = Some(TraceUsage {
+            input: u.input_tokens,
+            cached: u.cached_input_tokens,
+            output: u.output_tokens,
+            reasoning: u.reasoning_tokens,
+            ..Default::default()
+        });
+    }
+    retrieval::record_trace(state, row);
+    let (arguments, _) = answer?;
+    let Some(arguments) = arguments else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<CoursePlan>(&arguments) {
+        Ok(plan) => Ok(plan.checked(draft.lessons.len())),
+        Err(e) => {
+            tracing::warn!("the planner's answer isn't a plan: {e}");
+            Ok(None)
+        }
+    }
 }
 
 async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> anyhow::Result<()> {
@@ -659,7 +1088,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         match &result {
             Ok(body) => {
                 // Footnotes renumbered in reading order, with what they point at.
-                (row.lesson.body_md, row.lesson.citations) = sources::cite(body, &retrieved);
+                (row.lesson.body_md, row.lesson.citations) = retrieval::cite(body, &retrieved);
                 row.lesson.status = LessonStatus::Ready;
                 // The body is the model's writing now (owner decision Q2).
                 row.author = Author::Agent;
@@ -673,7 +1102,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
                     (None, _) => {
                         let streamed = partial.lock().unwrap().clone();
                         (row.lesson.body_md, row.lesson.citations) =
-                            sources::cite(&streamed, &retrieved);
+                            retrieval::cite(&streamed, &retrieved);
                     }
                 }
                 row.lesson.status = LessonStatus::Failed {

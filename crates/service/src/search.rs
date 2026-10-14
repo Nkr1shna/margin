@@ -1,4 +1,10 @@
-//! ⌘K search: case-insensitive substring match over topics, lessons and notes.
+//! ⌘K search (and the agent's `search_library`) over topics, lessons and notes.
+//!
+//! Lessons and notes are found through FULLTEXT indexes on their title, body and quote
+//! (`LIBRARY_INDEXES`; analyzer `library`, which indexes every word's beginnings so a
+//! word being typed already matches), not by reading every body. What the index finds
+//! is then checked and ranked as before: a case-insensitive match of the whole query in
+//! one field, topics first, then lessons, then notes, title matches first.
 
 use std::collections::HashMap;
 
@@ -7,13 +13,24 @@ use axum::extract::{Query, State};
 use margin_shared::{Note, SearchHit, SearchKind, Topic};
 use serde::Deserialize;
 
-use crate::db;
+use crate::db::{self, Store};
 use crate::error::AppResult;
 use crate::state::{AppState, StoredLesson};
 
 pub const MAX_HITS: usize = 30;
 const SNIPPET_BEFORE: usize = 60;
 const SNIPPET_LEN: usize = 160;
+
+/// The analyzer and the FULLTEXT indexes library search runs on. Idempotent; applied
+/// before each search (a catalog lookup once they exist).
+pub const LIBRARY_INDEXES: &str = r#"
+DEFINE ANALYZER IF NOT EXISTS library TOKENIZERS blank, class FILTERS lowercase, ascii, edgengram(1, 12);
+DEFINE INDEX IF NOT EXISTS lesson_title ON lesson FIELDS doc.title FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS lesson_body  ON lesson FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_title   ON note FIELDS doc.title FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_body    ON note FIELDS doc.body_md FULLTEXT ANALYZER library BM25;
+DEFINE INDEX IF NOT EXISTS note_quote   ON note FIELDS doc.quote FULLTEXT ANALYZER library BM25;
+"#;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -25,16 +42,39 @@ pub async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> AppResult<Json<Vec<SearchHit>>> {
-    let needle = q.q.trim();
-    if needle.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
-    let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
-    let lessons: Vec<StoredLesson> = state.store.list(db::LESSON).await?;
-    let notes: Vec<Note> = state.store.list(db::NOTE).await?;
-    Ok(Json(run(needle, &topics, &lessons, &notes)))
+    Ok(Json(find(&state.store, &q.q).await?))
 }
 
+/// The library's hits for `query` (`run`'s order), with lessons and notes found through
+/// the FULLTEXT indexes.
+pub async fn find(store: &Store, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    store
+        .query_rows::<serde_json::Value>(LIBRARY_INDEXES, vec![])
+        .await?;
+    let topics: Vec<Topic> = store.list(db::TOPIC).await?;
+    let q = serde_json::json!(needle);
+    let lessons: Vec<StoredLesson> = store
+        .query_rows(
+            "SELECT VALUE doc FROM lesson WHERE doc.title @0@ $q OR doc.body_md @1@ $q",
+            vec![("q", q.clone())],
+        )
+        .await?;
+    let notes: Vec<Note> = store
+        .query_rows(
+            "SELECT VALUE doc FROM note \
+             WHERE doc.title @0@ $q OR doc.body_md @1@ $q OR doc.quote @2@ $q",
+            vec![("q", q)],
+        )
+        .await?;
+    Ok(run(needle, &topics, &lessons, &notes))
+}
+
+/// Ranks and cuts hits among `topics`, `lessons` and `notes` (every topic is needed for
+/// the breadcrumbs; lessons and notes may be just the index's candidates).
 pub fn run(
     needle: &str,
     topics: &[Topic],
@@ -238,5 +278,50 @@ mod tests {
     #[test]
     fn plain_strips_markdown() {
         assert_eq!(plain("## Title\n\n**bold** `code`"), "Title bold code");
+    }
+
+    async fn lesson(store: &Store, id: &str, title: &str, body: &str) {
+        let now = chrono::Utc::now();
+        let row = serde_json::json!({
+            "id": id, "topic_id": "t", "title": title, "summary": "", "position": 0,
+            "level": "intro", "minutes": 5, "body_md": body,
+            "status": {"state": "ready"}, "created_at": now, "updated_at": now, "citations": [],
+        });
+        store.put(db::LESSON, id, &row).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_index_finds_words_and_their_beginnings() {
+        let s = Store::memory().await.unwrap();
+        lesson(&s, "a", "Fourier series", "Sines **and** cosines.").await;
+        lesson(
+            &s,
+            "b",
+            "Laplace",
+            "The FOURIER transform turns signals into frequencies.",
+        )
+        .await;
+        lesson(&s, "c", "Bread", "Flour, water, salt.").await;
+        let ids = |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        // Title matches first, then the body's; "four" doesn't find "Flour".
+        assert_eq!(ids(find(&s, "fourier").await.unwrap()), ["a", "b"]);
+        assert_eq!(ids(find(&s, "Fou").await.unwrap()), ["a", "b"]);
+        // The whole query must match within one field.
+        assert_eq!(ids(find(&s, "fourier transform").await.unwrap()), ["b"]);
+        assert!(find(&s, "fourier water").await.unwrap().is_empty());
+        assert!(find(&s, "  ").await.unwrap().is_empty());
+        // The lessons were found through the index, not a scan.
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                "SELECT VALUE doc FROM lesson WHERE doc.title @0@ $q OR doc.body_md @1@ $q EXPLAIN",
+                vec![("q", serde_json::json!("fourier"))],
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(
+            plan.contains("lesson_title") && plan.contains("lesson_body"),
+            "{plan}"
+        );
     }
 }

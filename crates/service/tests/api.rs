@@ -1767,3 +1767,470 @@ async fn shutdown_closes_sockets() {
     h.stop.take().unwrap().send(()).unwrap();
     assert!(matches!(sock.next_frame().await, Frame::Closed(Some(1001))));
 }
+
+// ---------------------------------------------------------------------------
+// R1 retrieval: the context API and the agent's search tools (passages seeded
+// directly through the store; ingest is R1-store's)
+// ---------------------------------------------------------------------------
+
+mod retrieval_api {
+    use super::*;
+    use margin_agent::{NoDevices, ToolContext};
+    use margin_embed::{Embedder, Purpose, fake::FakeEmbedder};
+    use margin_service::db::PassageRow;
+    use margin_shared::context::{
+        ContextChanges, Document, DocumentOutline, DocumentStatus, Hit, Origin, Project,
+    };
+    use margin_shared::{Card, Chat, DeviceRef, SourceKind};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    fn vector(text: &str) -> Vec<f32> {
+        FakeEmbedder
+            .embed(&[text.to_string()], Purpose::DOCUMENT)
+            .unwrap()
+            .remove(0)
+    }
+
+    fn passage(
+        id: &str,
+        doc: &str,
+        scope: &[&str],
+        ord: i64,
+        section: &str,
+        text: &str,
+    ) -> PassageRow {
+        PassageRow {
+            id: id.into(),
+            project_id: "my-library".into(),
+            document_id: doc.into(),
+            origin: "agent".into(),
+            scope_ids: scope.iter().map(|s| s.to_string()).collect(),
+            access: vec!["company".into()],
+            unit_id: format!("{doc}:{id}"),
+            modality: "text".into(),
+            ord,
+            page: None,
+            start_line: Some(ord * 10 + 1),
+            end_line: Some(ord * 10 + 8),
+            start_ms: None,
+            end_ms: None,
+            section_path: section.into(),
+            text: text.into(),
+            file: None,
+            chunk_hash: format!("h-{id}"),
+            embedder: "fake".into(),
+            vector: vector(text),
+        }
+    }
+
+    fn document(id: &str, name: &str, generation: u64, status: DocumentStatus) -> Document {
+        Document {
+            id: id.into(),
+            project_id: "my-library".into(),
+            origin: Origin::Agent {
+                name: "test".into(),
+            },
+            name: name.into(),
+            kind: SourceKind::Text,
+            status,
+            generation,
+            bytes: 10,
+            actor: "agent:test".into(),
+            access: vec!["company".into()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// A topic with two documents in it and one outside it.
+    async fn seeded(h: &Harness, t: &str) -> Topic {
+        let topic = new_topic(h, t, None, "Thermodynamics").await;
+        let store = &h.state.store;
+        for (id, name, generation) in [("carnot", "carnot.md", 1), ("bio", "bio.md", 2)] {
+            let d = document(id, name, generation, DocumentStatus::Ready { passages: 3 });
+            store.put(db::DOCUMENT, id, &d).await.unwrap();
+        }
+        store
+            .insert_many(
+                db::PASSAGE,
+                &[
+                    passage(
+                        "c0",
+                        "carnot",
+                        &[&topic.id],
+                        0,
+                        "Engines",
+                        "The Carnot engine bounds thermal efficiency between two reservoirs.",
+                    ),
+                    passage(
+                        "c1",
+                        "carnot",
+                        &[&topic.id],
+                        1,
+                        "Engines",
+                        "Efficiency equals one minus the cold over the hot temperature.",
+                    ),
+                    passage(
+                        "c2",
+                        "carnot",
+                        &[&topic.id],
+                        2,
+                        "Entropy",
+                        "Entropy never decreases in an isolated system.",
+                    ),
+                    passage(
+                        "b0",
+                        "bio",
+                        &[],
+                        0,
+                        "Plants",
+                        "Photosynthesis stores light energy as sugar in leaves.",
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        topic
+    }
+
+    async fn context_search(h: &Harness, t: &str, body: Value) -> reqwest::Response {
+        h.post(t, "/api/context/search")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_search_retrieves_inside_the_scope() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        h.configure_ai(&t).await;
+        let topic = seeded(&h, &t).await;
+
+        let r = context_search(
+            &h,
+            &t,
+            json!({
+                "text": "Carnot engine efficiency",
+                "scope": {"scope": "topic", "id": topic.id}, "k": 5
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let hits: Vec<Hit> = r.json().await.unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].document_id, "carnot");
+        assert!(hits.iter().all(|h| h.document_id == "carnot"), "{hits:?}");
+        // Adjacent chunks of one document come back merged, with the first's locator.
+        assert!(hits[0].text.contains("Carnot engine") && hits[0].start_line == Some(1));
+        assert!(hits.iter().any(|h| h.highlight.is_some()));
+
+        // The whole library reaches the other document.
+        let hits: Vec<Hit> = context_search(
+            &h,
+            &t,
+            json!({
+                "text": "photosynthesis leaves", "scope": {"scope": "library"}, "k": 3
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(hits[0].document_id, "bio");
+
+        // A tiny budget packs fewer passages: no literal cap, a share of the window.
+        let hits: Vec<Hit> = context_search(&h, &t, json!({
+            "text": "Carnot engine efficiency entropy",
+            "scope": {"scope": "topic", "id": topic.id}, "k": 5,
+            "budget": {"share_of_window": 0.0001, "min_score_pct": 0, "images_max": 0, "passages_min": 0}
+        }))
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert!(hits.len() <= 1, "{hits:?}");
+
+        // Access pre-filter: a reader who may only see finance finds nothing here.
+        let hits: Vec<Hit> = context_search(
+            &h,
+            &t,
+            json!({
+                "text": "Carnot", "scope": {"scope": "library"}, "k": 5,
+                "access": ["company/finance"]
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert!(hits.is_empty());
+
+        let (status, e) = api_error(
+            context_search(
+                &h,
+                &t,
+                json!({"text": "x", "scope": {"scope": "topic", "id": "nope"}, "k": 5}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!((status, e.code.as_str()), (400, "bad_scope"));
+        let (status, _) = api_error(
+            context_search(
+                &h,
+                &t,
+                json!({"text": " ", "scope": {"scope": "library"}, "k": 5}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_documents_projects_changes_and_ingest() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        seeded(&h, &t).await;
+
+        let projects: Vec<Project> = h
+            .get(&t, "/api/projects")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "My library");
+
+        let outline: DocumentOutline = h
+            .get(&t, "/api/context/documents/carnot/outline")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sections: Vec<(&str, u32, u32)> = outline
+            .sections
+            .iter()
+            .map(|s| (s.section_path.as_str(), s.from_ord, s.to_ord))
+            .collect();
+        assert_eq!(sections, [("Engines", 0, 1), ("Entropy", 2, 2)]);
+
+        let rows: Vec<Hit> = h
+            .get(&t, "/api/context/documents/carnot/passages")
+            .query(&[("from", "1"), ("to", "50")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section_path, "Engines");
+
+        let (status, _) = api_error(
+            h.get(&t, "/api/context/documents/nope/outline")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 404);
+        let d = document(
+            "busy",
+            "busy.md",
+            3,
+            DocumentStatus::Indexing { done: 0, total: 4 },
+        );
+        h.state.store.put(db::DOCUMENT, "busy", &d).await.unwrap();
+        let (status, e) = api_error(
+            h.get(&t, "/api/context/documents/busy/passages")
+                .query(&[("from", "0"), ("to", "1")])
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((status, e.code.as_str()), (409, "not_ready"));
+
+        let changes: ContextChanges = h
+            .get(&t, "/api/context/changes")
+            .query(&[("since", "1")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(changes.generation, 3);
+        let ids: Vec<&str> = changes.changed.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["bio", "busy"]);
+
+        let (status, e) = api_error(
+            h.post(&t, "/api/context/ingest")
+                .json(&json!({"name": "x.md", "origin": {"origin": "source", "source_id": "s"}, "text": "hi"}))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((status, e.code.as_str()), (400, "bad_origin"));
+
+        // Deleting an agent's document: its passages go and the feed says so.
+        use axum::extract::{Path, State};
+        use margin_service::context_api::delete_document;
+        let deleted = delete_document(State(h.state.clone()), Path("carnot".into()))
+            .await
+            .unwrap();
+        assert_eq!(deleted, axum::http::StatusCode::NO_CONTENT);
+        let left: Vec<serde_json::Value> = h
+            .state
+            .store
+            .query_rows(
+                "SELECT id FROM passage WHERE document_id = 'carnot'",
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(left.is_empty());
+        let changes: ContextChanges = h
+            .get(&t, "/api/context/changes")
+            .query(&[("since", "3")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(changes.deleted, ["carnot"]);
+        assert_eq!(changes.generation, 4);
+        assert!(changes.changed.is_empty());
+        let err = delete_document(State(h.state.clone()), Path("carnot".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "not_found");
+        let mut owned = document("mine", "mine.md", 5, DocumentStatus::Ready { passages: 0 });
+        owned.origin = Origin::Source {
+            source_id: "s".into(),
+        };
+        h.state
+            .store
+            .put(db::DOCUMENT, "mine", &owned)
+            .await
+            .unwrap();
+        let err = delete_document(State(h.state.clone()), Path("mine".into()))
+            .await
+            .unwrap_err();
+        assert_eq!((err.status.as_u16(), err.code), (403, "forbidden"));
+    }
+
+    fn ctx(chat_id: &str) -> ToolContext {
+        ToolContext {
+            chat_id: chat_id.into(),
+            turn_id: "turn".into(),
+            call_id: "call".into(),
+            origin_device: DeviceRef {
+                device_id: "d".into(),
+                name: "Mac".into(),
+            },
+            workspaces: Vec::new(),
+            devices: Arc::new(NoDevices),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_tool_family_reads_retrieval() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        h.configure_ai(&t).await;
+        let topic = seeded(&h, &t).await;
+        let chat: Chat = serde_json::from_value(json!({
+            "id": "chat1", "title": "c", "state": {"state": "idle"},
+            "created_at": Utc::now(), "updated_at": Utc::now(),
+        }))
+        .unwrap();
+        h.state.store.put(db::CHAT, "chat1", &chat).await.unwrap();
+        let registry = margin_service::agent_tools::registry(&h.state);
+        assert!(
+            registry.get("search_sources").is_none(),
+            "replaced by search"
+        );
+        let ctx = ctx("chat1");
+        let run = |name: &'static str, args: Value| {
+            let tool = registry.get(name).unwrap().clone();
+            let ctx = ctx.clone();
+            async move {
+                let out = tool.run(&ctx, args).await;
+                let v: Value = if out.ok {
+                    serde_json::from_str(&out.output).unwrap()
+                } else {
+                    json!({"error": out.summary})
+                };
+                (out, v)
+            }
+        };
+
+        // A chat with nothing attached and no topic has nothing to search by default.
+        let (out, _) = run(
+            "search",
+            json!({"query": "carnot", "scope": null, "k": null, "modalities": null}),
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.summary.starts_with("There are no sources to search"));
+
+        let (out, v) = run(
+            "search",
+            json!({"query": "Carnot engine efficiency", "scope": {"topic_id": topic.id, "source_ids": null, "workspace_ids": null, "chat_files": null, "library": true}, "k": 4, "modalities": null}),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.len() <= margin_service::agent_tools::RETRIEVAL_OUTPUT_MAX_BYTES);
+        assert_eq!(v["passages"][0]["n"], 1);
+        assert_eq!(v["passages"][0]["document_id"], "carnot");
+        assert_eq!(v["passages"][0]["source"], "carnot.md");
+        assert_eq!(v["passages"][0]["section"], "Engines");
+        assert!(v.get("library").is_none() || v["library"].is_array());
+        match out.cards.as_slice() {
+            [Card::Passages(card)] => {
+                assert_eq!(card.passages.len(), v["passages"].as_array().unwrap().len());
+                assert_eq!(card.passages[0].document_id.as_deref(), Some("carnot"));
+                assert_eq!(card.passages[0].start_line, Some(1));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let (out, v) = run(
+            "read_passage",
+            json!({"document_id": "carnot", "page": null, "from_ord": 1, "to_ord": null}),
+        )
+        .await;
+        assert!(out.ok);
+        assert_eq!(v["passages"].as_array().unwrap().len(), 2);
+        assert_eq!(v["passages"][0]["ord"], 1);
+
+        let (out, v) = run("document_outline", json!({"document_id": "carnot"})).await;
+        assert_eq!(out.summary, "2 sections");
+        assert_eq!(v["sections"][1]["section"], "Entropy");
+
+        let (out, _) = run(
+            "view_picture",
+            json!({"document_id": "carnot", "page": null}),
+        )
+        .await;
+        assert!(!out.ok);
+        assert_eq!(out.summary, "That document has no picture.");
+        let (out, _) = run(
+            "read_passage",
+            json!({"document_id": "nope", "page": null, "from_ord": null, "to_ord": null}),
+        )
+        .await;
+        assert!(!out.ok);
+    }
+}
