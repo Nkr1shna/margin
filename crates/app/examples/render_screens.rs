@@ -63,7 +63,8 @@ use chrono::Utc;
 use dioxus::history::{History, MemoryHistory};
 use dioxus::prelude::*;
 use margin_shared::{
-    Device, EmbeddingModel, EmbeddingModelState, Me, Settings, SourceKind, SourceStatus,
+    Device, EmbeddingModel, EmbeddingModelState, Me, ReasoningEffort, Settings, SourceKind,
+    SourceStatus,
 };
 
 use crate::api::Api;
@@ -105,6 +106,8 @@ fn Harness(props: HarnessProps) -> Element {
             render_width: 1920,
             render_height: 1080,
             render_fps: 30,
+            reasoning_effort: ReasoningEffort::Medium,
+            agent_model: None,
         });
         lib.embedding = std::env::var("RENDER_EMBEDDING")
             .ok()
@@ -146,6 +149,7 @@ fn Harness(props: HarnessProps) -> Element {
                     created_at: Utc::now(),
                     last_seen_at: Some(Utc::now()),
                     current: true,
+                    online: true,
                 },
             }),
         });

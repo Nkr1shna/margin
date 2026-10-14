@@ -17,14 +17,24 @@ use serde_json::{Value, json};
 mod citations;
 mod clean;
 mod prompts;
+mod responses;
 mod sse;
+
+pub use responses::{
+    ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
+    StreamEvent, ToolChoice,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
     /// The API answered with a non-2xx status. `message` is the API's error message
-    /// when it sent one.
+    /// when it sent one; `retry_after` is the `Retry-After` header (seconds) when sent.
     #[error("the model API returned {status}: {message}")]
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[error("couldn't reach the model API: {0}")]
     Network(String),
     /// The response could not be parsed, or structured output didn't match the schema.
@@ -33,6 +43,26 @@ pub enum AiError {
     /// The model refused or the response ended as `incomplete`/`failed`.
     #[error("the model didn't finish: {0}")]
     Incomplete(String),
+}
+
+impl AiError {
+    /// Worth retrying after a pause: rate limits (429), server errors (5xx) and network
+    /// failures. Everything else (bad key, bad request, refusals) fails the same way again.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            AiError::Http { status, .. } => *status == 429 || *status >= 500,
+            AiError::Network(_) => true,
+            AiError::Parse(_) | AiError::Incomplete(_) => false,
+        }
+    }
+
+    /// The pause the API asked for, if it did.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            AiError::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// How long to wait for a TCP + TLS connection.
@@ -324,6 +354,13 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
     if status.is_success() {
         return Ok(resp);
     }
+    // Retry-After in seconds; the HTTP-date form isn't used by the Responses API.
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     let body = resp.text().await.unwrap_or_default();
     let message = serde_json::from_str::<Value>(&body)
         .ok()
@@ -342,6 +379,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
     Err(AiError::Http {
         status: status.as_u16(),
         message,
+        retry_after,
     })
 }
 

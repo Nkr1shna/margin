@@ -20,12 +20,17 @@ use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use crate::auth::{self, RateLimiter};
 use crate::config::Config;
 use crate::db::{self, Store};
+use crate::devices::DeviceHub;
 use crate::embedding::ModelJob;
 use crate::engines::{Generator, Renderer, SourceTools};
 use crate::error::AppError;
 use crate::secrets::{SecretStore, media_signing_key};
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
-use crate::{ask, embedding, events, library, media, search, settings, sources, uploads, video};
+use crate::turns::Turns;
+use crate::{
+    ask, chats, embedding, events, library, media, search, settings, sources, uploads, video,
+    workspaces,
+};
 
 pub struct Options {
     pub config: Config,
@@ -100,6 +105,8 @@ impl Service {
             model_download_bytes: Mutex::new(None),
             source_queue: source_tx,
             uploads_busy: Mutex::new(Default::default()),
+            turns: Turns::new(),
+            devices: Arc::new(DeviceHub::new()),
         });
 
         let resume = recover(&state).await?;
@@ -205,6 +212,30 @@ pub fn router(state: AppState) -> Router {
             get(embedding::get_model).delete(embedding::delete_model),
         )
         .route(routes::EMBEDDING_DOWNLOAD, post(embedding::start_download))
+        .route(
+            routes::CHATS,
+            get(chats::list_chats).post(chats::create_chat),
+        )
+        .route(
+            "/api/chats/{id}",
+            get(chats::get_chat)
+                .patch(chats::patch_chat)
+                .delete(chats::delete_chat),
+        )
+        .route("/api/chats/{id}/messages", post(chats::post_message))
+        .route("/api/chats/{id}/pending", delete(chats::cancel_pending))
+        .route("/api/chats/{id}/stop", post(chats::stop))
+        .route("/api/chats/{id}/continue", post(chats::continue_turn))
+        .route("/api/chats/{id}/confirm", post(chats::confirm))
+        .route(
+            "/api/chats/{id}/items/{item_id}/output",
+            get(chats::item_output),
+        )
+        .route(
+            routes::WORKSPACES,
+            get(workspaces::list_workspaces).post(workspaces::create_workspace),
+        )
+        .route("/api/workspaces/{id}", delete(workspaces::delete_workspace))
         .route(routes::EVENTS, get(events::events))
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(

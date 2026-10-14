@@ -7,7 +7,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod chat;
+pub mod device;
 pub mod routes;
+
+pub use chat::*;
+pub use device::*;
 
 /// Serde for `Option<Option<T>>` patch fields: a missing field is `None` (unchanged),
 /// `null` is `Some(None)` (clear), and a value is `Some(Some(v))`. Use with
@@ -223,12 +228,18 @@ pub struct Proposal {
     pub status: ProposalStatus,
     pub outline: Option<Outline>,
     pub created_at: DateTime<Utc>,
+    /// The chat whose `propose_course` call made it; accepting it records an
+    /// `ChatItemKind::Action` there so the agent knows the course exists.
+    #[serde(default)]
+    pub chat_id: Option<Id>,
 }
 
-/// Accept a proposal, optionally with an edited outline.
+/// Accept a proposal, optionally with an edited outline and the outline card's chips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcceptProposal {
     pub outline: Outline,
+    #[serde(default)]
+    pub chips: OutlineChips,
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +549,43 @@ pub struct Settings {
     pub render_width: u32,
     pub render_height: u32,
     pub render_fps: u32,
+    /// How hard the agent thinks before answering (Responses API `reasoning.effort`).
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+    /// The model chats use; `None` uses `openai_model` (which lessons, outlines and
+    /// scenes always use).
+    #[serde(default)]
+    pub agent_model: Option<String>,
+}
+
+/// Responses API `reasoning.effort` for the agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub const ALL: [ReasoningEffort; 4] = [
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+
+    /// The value sent as `reasoning.effort`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -555,6 +603,15 @@ pub struct SettingsPatch {
     pub render_width: Option<u32>,
     pub render_height: Option<u32>,
     pub render_fps: Option<u32>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// `Some(None)` (or an empty name) goes back to using `openai_model`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub agent_model: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -574,8 +631,13 @@ pub struct Device {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// True for the device making the request.
+    /// True for the device making the request. Always false in `Event::DeviceChanged`
+    /// (each app knows its own id from `Me`).
     pub current: bool,
+    /// Whether the device has an events socket open right now, i.e. the app is running
+    /// and can answer device tools.
+    #[serde(default)]
+    pub online: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +748,44 @@ pub enum Event {
     EmbeddingModelChanged {
         model: EmbeddingModel,
     },
+    /// A chat was created or its title, state, attachments, pending message or usage
+    /// changed. Carries the whole chat.
+    ChatChanged {
+        chat: Chat,
+    },
+    ChatDeleted {
+        id: Id,
+    },
+    /// An item was added, or finished, or changed (status, label, card decision). The
+    /// item is authoritative: it replaces whatever deltas built.
+    ChatItemChanged {
+        item: ChatItem,
+    },
+    /// Text appended to an `InProgress` item: `AssistantText.text`,
+    /// `Reasoning.summary` or `ToolCall.arguments`. `offset` is the length in bytes of
+    /// that text before this delta, so a device that loaded the chat mid-stream can tell
+    /// a delta it already has from one it missed (`ChatItemKind::apply_delta`). The
+    /// following `ChatItemChanged` carries the full value.
+    ChatItemDelta {
+        chat_id: Id,
+        item_id: Id,
+        offset: u64,
+        text: String,
+    },
+    WorkspaceChanged {
+        workspace: Workspace,
+    },
+    WorkspaceDeleted {
+        id: Id,
+    },
+    /// A device came online or went offline, or was renamed.
+    DeviceChanged {
+        device: Device,
+    },
+    /// A device was revoked.
+    DeviceDeleted {
+        id: Id,
+    },
 }
 
 /// Error body for every non-2xx API response.
@@ -740,6 +840,43 @@ mod tests {
         assert!(warned.can_read_again());
         assert!(SourceStatus::Failed { error: "x".into() }.can_read_again());
         assert!(!SourceStatus::Queued.can_read_again());
+    }
+
+    #[test]
+    fn agent_settings_default_and_patch() {
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "openai_base_url": "https://api.openai.com/v1", "openai_model": "m",
+            "has_api_key": false, "voice": null,
+            "render_width": 1920, "render_height": 1080, "render_fps": 30
+        }))
+        .unwrap();
+        assert_eq!(old.reasoning_effort, ReasoningEffort::Medium);
+        assert_eq!(old.agent_model, None);
+        let json = serde_json::to_string(&ReasoningEffort::Minimal).unwrap();
+        assert_eq!(json, r#""minimal""#);
+        assert_eq!(ReasoningEffort::High.as_str(), "high");
+
+        let back: SettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.agent_model, None);
+        assert_eq!(back.reasoning_effort, None);
+        let clear = SettingsPatch {
+            agent_model: Some(None),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&clear).unwrap();
+        assert_eq!(serde_json::from_str::<SettingsPatch>(&json).unwrap(), clear);
+        let old_device: Device = serde_json::from_value(serde_json::json!({
+            "id": "d", "name": "n", "created_at": "2025-10-09T08:53:20Z",
+            "last_seen_at": null, "current": true
+        }))
+        .unwrap();
+        assert!(!old_device.online);
+        let old_accept: AcceptProposal = serde_json::from_value(serde_json::json!({
+            "outline": {"topic_title": "t", "subject_title": "s", "lessons": []}
+        }))
+        .unwrap();
+        assert_eq!(old_accept.chips, OutlineChips::default());
     }
 
     #[test]

@@ -1,0 +1,81 @@
+//! Margin's agent: the loop that answers a chat message by calling the model, running
+//! tools and calling the model again until it answers, on the Responses API with
+//! `store: false` and full replay.
+//!
+//! This crate knows nothing about storage, HTTP or the library. The service plugs in:
+//! - a [`ModelClient`] (`margin_ai::ResponsesClient` in production, [`ScriptedModel`] in
+//!   tests);
+//! - a [`ToolRegistry`] of [`Tool`]s (the library, course and source tools live in the
+//!   service, which owns the data; the device tools live here and forward through a
+//!   [`DeviceBridge`]);
+//! - a [`TurnSink`] that stores each item and broadcasts it.
+//!
+//! The lifecycle of a turn (which items and events, in which order) is specified in
+//! `docs/agent-contract.md`; [`run_turn`] implements it.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+mod device;
+mod model;
+mod prompt;
+mod registry;
+mod replay;
+pub mod scripted;
+mod sink;
+mod tool;
+mod turn;
+
+pub use device::{
+    DeviceBridge, DeviceCall, DeviceError, NoDevices, device_output_text, device_tools,
+};
+pub use model::ModelClient;
+pub use prompt::{MessageContext, system_prompt, user_message_input};
+pub use registry::ToolRegistry;
+pub use replay::{
+    ReplayItem, action_input, cancelled_call_output, function_call_output, replay_input,
+    unanswered_calls,
+};
+pub use scripted::{Scripted, ScriptedModel};
+pub use sink::{ItemRecord, SinkError, TurnSink};
+pub use tool::{
+    ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool, error_output,
+    strict_schema, truncate_output,
+};
+pub use turn::{RetryPolicy, TurnDeps, TurnInput, TurnOutcome, run_turn};
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/// Most model calls in one run of [`run_turn`] (a turn, or one Continue of it). The last
+/// allowed call is made with `tool_choice: "none"` so the model answers instead of
+/// calling more tools.
+pub const MAX_STEPS: u32 = 40;
+/// Most bytes of one tool output the model sees; longer outputs are cut (see
+/// [`truncate_output`]).
+pub const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+/// Most bytes of tool output in one turn. Once used up, further calls get an error
+/// output saying so and the next model call is made with `tool_choice: "none"`.
+pub const TURN_OUTPUT_MAX_BYTES: usize = 512 * 1024;
+/// Model calls retried after a retryable error (429, 5xx, network) before the turn
+/// fails.
+pub const MODEL_RETRIES: u32 = 3;
+/// First pause before a retry; doubles each time, unless the API sent `Retry-After`.
+pub const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Longest pause before a retry, whatever `Retry-After` says.
+pub const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Turns running at once across all chats; a further turn waits (its chat shows
+/// Running) until one ends.
+pub const MAX_CONCURRENT_TURNS: usize = 2;
+/// How long a device has to answer `list_files`, `find_files` and `read_file`.
+pub const FOLDER_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a device has to answer `search_text`.
+pub const SEARCH_TEXT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a device has to answer an app-control tool.
+pub const APP_CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Server-side compaction threshold, in input tokens (phase 5).
+pub const COMPACT_THRESHOLD_TOKENS: u32 = 200_000;

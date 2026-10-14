@@ -530,20 +530,25 @@ async fn device_for_token(state: &AppState, token: &str) -> AppResult<Option<Dev
     Ok(Some(device))
 }
 
-fn to_device(row: &DeviceRow, current_id: &str) -> Device {
+/// The wire `Device`; `current_id` is the requesting device ("" for broadcasts).
+pub fn to_device(row: &DeviceRow, current_id: &str, online: bool) -> Device {
     Device {
         id: row.id.clone(),
         name: row.name.clone(),
         created_at: row.created_at,
         last_seen_at: row.last_seen_at,
         current: row.id == current_id,
+        online,
     }
 }
 
-pub async fn me(Extension(CurrentDevice(device)): Extension<CurrentDevice>) -> Json<Me> {
+pub async fn me(
+    State(state): State<AppState>,
+    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+) -> Json<Me> {
     Json(Me {
         github_login: device.github_login.clone(),
-        device: to_device(&device, &device.id),
+        device: to_device(&device, &device.id, state.devices.is_online(&device.id)),
     })
 }
 
@@ -557,7 +562,11 @@ pub async fn list_devices(
             .cmp(&b.created_at)
             .then_with(|| a.id.cmp(&b.id))
     });
-    Ok(Json(rows.iter().map(|r| to_device(r, &me.id)).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| to_device(r, &me.id, state.devices.is_online(&r.id)))
+            .collect(),
+    ))
 }
 
 pub async fn revoke_device(

@@ -43,7 +43,21 @@
 //! | GET    | /api/embedding                         |                    | EmbeddingModel      |
 //! | POST   | /api/embedding/download                |                    | EmbeddingModel      |
 //! | DELETE | /api/embedding                         |                    | EmbeddingModel      |
-//! | GET    | /api/events  (WebSocket upgrade)       |                    | Event frames        |
+//! | GET    | /api/chats                             |                    | Vec<Chat> (newest first) |
+//! | POST   | /api/chats                             | NewChat            | ChatDetail          |
+//! | GET    | /api/chats/{id}                        |                    | ChatDetail          |
+//! | PATCH  | /api/chats/{id}                        | ChatPatch          | Chat                |
+//! | DELETE | /api/chats/{id}                        |                    | 204 (stops its turn; items, excerpts and chat-only sources too) |
+//! | POST   | /api/chats/{id}/messages               | NewMessage         | MessageSent         |
+//! | DELETE | /api/chats/{id}/pending                |                    | Chat                |
+//! | POST   | /api/chats/{id}/stop                   |                    | Chat                |
+//! | POST   | /api/chats/{id}/continue               |                    | Chat                |
+//! | POST   | /api/chats/{id}/confirm                | ConfirmRequest     | Chat                |
+//! | GET    | /api/chats/{id}/items/{item}/output    |                    | ToolOutputText      |
+//! | GET    | /api/workspaces                        |                    | Vec<Workspace>      |
+//! | POST   | /api/workspaces                        | NewWorkspace       | Workspace (of the calling device) |
+//! | DELETE | /api/workspaces/{id}                   |                    | 204                 |
+//! | GET    | /api/events  (WebSocket upgrade)       | DeviceFrame frames | ServerFrame frames  |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
@@ -61,6 +75,12 @@ pub const SETTINGS: &str = "/api/settings";
 pub const TOOLS: &str = "/api/tools";
 pub const DEVICES: &str = "/api/devices";
 pub const EVENTS: &str = "/api/events";
+/// Chats with the agent. `POST` with `NewChat.message` creates the chat and starts its
+/// first turn; the answer streams in as events.
+pub const CHATS: &str = "/api/chats";
+/// Attached folders. `POST` registers a folder the calling device holds; only that
+/// device may delete it (or a revoke of the device deletes its workspaces).
+pub const WORKSPACES: &str = "/api/workspaces";
 /// Upload: the body is the file's bytes (`application/octet-stream`, at most
 /// `max_source_bytes` for its kind); `name` (required), `folder` and `topic_id` are query
 /// parameters. Without `topic_id` the source waits to be named in an
@@ -170,6 +190,40 @@ pub fn source_upload_finish(id: &str) -> String {
 }
 pub fn device(id: &str) -> String {
     format!("/api/devices/{id}")
+}
+pub fn chat(id: &str) -> String {
+    format!("/api/chats/{id}")
+}
+/// Send a message. Starts a turn when the chat is idle, interrupted or failed; while a
+/// turn is busy (running or waiting on a confirmation) the message becomes
+/// `Chat.pending` (409 "already_pending" if there already is one).
+pub fn chat_messages(id: &str) -> String {
+    format!("/api/chats/{id}/messages")
+}
+/// Drop the pending message.
+pub fn chat_pending(id: &str) -> String {
+    format!("/api/chats/{id}/pending")
+}
+/// Stop the running turn (a parked confirmation counts as denied). 409 "not_running"
+/// when no turn is busy.
+pub fn chat_stop(id: &str) -> String {
+    format!("/api/chats/{id}/stop")
+}
+/// Resume an interrupted or failed turn. 409 "cannot_continue" otherwise.
+pub fn chat_continue(id: &str) -> String {
+    format!("/api/chats/{id}/continue")
+}
+/// Answer the confirmation card the turn is waiting on. 409 "not_waiting" when that
+/// card is no longer pending.
+pub fn chat_confirm(id: &str) -> String {
+    format!("/api/chats/{id}/confirm")
+}
+/// The full output of a `ToolResult` item.
+pub fn chat_item_output(chat_id: &str, item_id: &str) -> String {
+    format!("/api/chats/{chat_id}/items/{item_id}/output")
+}
+pub fn workspace(id: &str) -> String {
+    format!("/api/workspaces/{id}")
 }
 
 #[cfg(test)]

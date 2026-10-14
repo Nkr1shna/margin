@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
+use margin_agent::{ModelClient, ScriptedModel};
 use margin_ai::{AiError, LessonContext, Passage, SceneRequest};
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
@@ -120,6 +121,8 @@ pub struct FakeGenerator {
     /// When set, every lesson is this body (streamed in two halves) instead of the
     /// default text.
     pub lesson_body: Mutex<Option<String>>,
+    /// The model chat turns call: queue replies with `agent.push(..)`.
+    pub agent: Arc<ScriptedModel>,
 }
 
 pub fn outline_for(req: &AskRequest) -> Outline {
@@ -159,6 +162,7 @@ impl Generator for FakeGenerator {
                 return Err(AiError::Http {
                     status: 500,
                     message: "boom".into(),
+                    retry_after: None,
                 });
             }
             Ok(outline_for(req))
@@ -221,6 +225,11 @@ impl Generator for FakeGenerator {
                 "import manimgx as m\n\nclass LessonScene(m.Scene):\n    # attempt {n}\n    pass\n"
             ))
         })
+    }
+
+    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
+        assert_eq!(ai.api_key, API_KEY);
+        self.agent.clone()
     }
 }
 

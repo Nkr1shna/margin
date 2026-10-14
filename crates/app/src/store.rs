@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use margin_shared::{
-    EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note, Proposal, ProposalStatus,
-    Settings, Source, Topic, Video, VideoStatus,
+    Chat, ChatItem, Device, EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note,
+    Proposal, ProposalStatus, Settings, Source, Topic, Video, VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -23,6 +23,16 @@ pub struct LibraryState {
     /// The service's embedding model, once fetched (`GET /api/embedding`) or announced.
     pub embedding: Option<EmbeddingModel>,
     pub server_version: Option<String>,
+    /// Chats for the sidebar (`GET /api/chats`), kept current by `ChatChanged` /
+    /// `ChatDeleted`.
+    pub chats: BTreeMap<Id, Chat>,
+    /// Transcripts of the chats opened this session (`GET /api/chats/{id}`), each ordered
+    /// by `seq`. Item events update only transcripts that are loaded.
+    pub chat_items: BTreeMap<Id, Vec<ChatItem>>,
+    /// Attached folders of every device (`GET /api/workspaces`).
+    pub workspaces: BTreeMap<Id, Workspace>,
+    /// Devices once fetched (`GET /api/devices`), with presence from `DeviceChanged`.
+    pub devices: BTreeMap<Id, Device>,
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -112,6 +122,56 @@ impl LibraryState {
                 self.sources.remove(&id);
             }
             Event::EmbeddingModelChanged { model } => self.embedding = Some(model),
+            Event::ChatChanged { chat } => {
+                self.chats.insert(chat.id.clone(), chat);
+            }
+            Event::ChatDeleted { id } => {
+                self.chats.remove(&id);
+                self.chat_items.remove(&id);
+            }
+            Event::ChatItemChanged { item } => {
+                if let Some(items) = self.chat_items.get_mut(&item.chat_id) {
+                    match items.iter_mut().find(|i| i.id == item.id) {
+                        Some(existing) => *existing = item,
+                        None => {
+                            let at = items.partition_point(|i| i.seq < item.seq);
+                            items.insert(at, item);
+                        }
+                    }
+                }
+            }
+            Event::ChatItemDelta {
+                chat_id,
+                item_id,
+                offset,
+                text,
+            } => {
+                if let Some(item) = self
+                    .chat_items
+                    .get_mut(&chat_id)
+                    .and_then(|items| items.iter_mut().find(|i| i.id == item_id))
+                {
+                    // A gap fills in with the item's next ChatItemChanged.
+                    item.kind.apply_delta(offset, &text);
+                }
+            }
+            Event::WorkspaceChanged { workspace } => {
+                self.workspaces.insert(workspace.id.clone(), workspace);
+            }
+            Event::WorkspaceDeleted { id } => {
+                self.workspaces.remove(&id);
+            }
+            Event::DeviceChanged { mut device } => {
+                // `current` is per device; broadcasts always say false.
+                if let Some(known) = self.devices.get(&device.id) {
+                    device.current = known.current;
+                }
+                self.devices.insert(device.id.clone(), device);
+            }
+            Event::DeviceDeleted { id } => {
+                self.devices.remove(&id);
+                self.workspaces.retain(|_, w| w.device_id != id);
+            }
         }
     }
 
@@ -386,7 +446,8 @@ pub(crate) mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use margin_shared::{
-        AskRequest, EmbeddingModelState, Level, SourceKind, SourceStatus, VideoMedia,
+        AskRequest, ChatItemKind, ChatState, EmbeddingModelState, ItemStatus, Level,
+        ReasoningEffort, SourceKind, SourceStatus, VideoMedia,
     };
 
     fn ts(n: i64) -> chrono::DateTime<Utc> {
@@ -751,6 +812,7 @@ pub(crate) mod tests {
             status: ProposalStatus::Drafting,
             outline: None,
             created_at: ts(0),
+            chat_id: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -785,6 +847,7 @@ pub(crate) mod tests {
             status: ProposalStatus::Drafting,
             outline: None,
             created_at: ts(0),
+            chat_id: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -837,6 +900,127 @@ pub(crate) mod tests {
         assert!(s.announcements(&after).is_empty());
     }
 
+    fn chat_item(id: &str, seq: u64, kind: ChatItemKind) -> ChatItem {
+        ChatItem {
+            id: id.into(),
+            chat_id: "c1".into(),
+            turn_id: "t1".into(),
+            seq,
+            status: ItemStatus::InProgress,
+            created_at: ts(seq as i64),
+            updated_at: ts(seq as i64),
+            kind,
+        }
+    }
+
+    #[test]
+    fn chat_events_update_loaded_transcripts() {
+        let mut s = sample();
+        let chat = Chat {
+            id: "c1".into(),
+            title: "Fourier".into(),
+            state: ChatState::Idle,
+            workspace_ids: vec![],
+            source_ids: vec![],
+            pending: None,
+            usage: Default::default(),
+            created_at: ts(0),
+            updated_at: ts(0),
+        };
+        s.apply(Event::ChatChanged { chat: chat.clone() });
+        assert_eq!(s.chats["c1"], chat);
+
+        // Not loaded: item events are ignored (the transcript is fetched on open).
+        let text = chat_item("i2", 2, ChatItemKind::AssistantText { text: "Hi".into() });
+        s.apply(Event::ChatItemChanged { item: text.clone() });
+        assert!(!s.chat_items.contains_key("c1"));
+
+        s.chat_items.insert("c1".into(), vec![]);
+        s.apply(Event::ChatItemChanged { item: text.clone() });
+        let user = chat_item(
+            "i1",
+            1,
+            ChatItemKind::UserMessage {
+                text: "Teach me".into(),
+                source_ids: vec![],
+                device_id: "d1".into(),
+                device_name: "Mac".into(),
+            },
+        );
+        s.apply(Event::ChatItemChanged { item: user });
+        s.apply(Event::ChatItemDelta {
+            chat_id: "c1".into(),
+            item_id: "i2".into(),
+            offset: 2,
+            text: " there".into(),
+        });
+        // A repeat of a delta the transcript already has changes nothing.
+        s.apply(Event::ChatItemDelta {
+            chat_id: "c1".into(),
+            item_id: "i2".into(),
+            offset: 2,
+            text: " there".into(),
+        });
+        let items = &s.chat_items["c1"];
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["i1", "i2"]
+        );
+        assert_eq!(
+            items[1].kind,
+            ChatItemKind::AssistantText {
+                text: "Hi there".into()
+            }
+        );
+        let mut done = text;
+        done.status = ItemStatus::Done;
+        done.kind = ChatItemKind::AssistantText {
+            text: "Hi there!".into(),
+        };
+        s.apply(Event::ChatItemChanged { item: done.clone() });
+        assert_eq!(s.chat_items["c1"][1], done);
+
+        s.apply(Event::ChatDeleted { id: "c1".into() });
+        assert!(s.chats.is_empty() && s.chat_items.is_empty());
+    }
+
+    #[test]
+    fn device_presence_keeps_current() {
+        let mut s = sample();
+        let me = Device {
+            id: "d1".into(),
+            name: "Mac".into(),
+            created_at: ts(0),
+            last_seen_at: None,
+            current: true,
+            online: true,
+        };
+        s.devices.insert("d1".into(), me.clone());
+        s.apply(Event::DeviceChanged {
+            device: Device {
+                current: false,
+                online: false,
+                ..me
+            },
+        });
+        assert!(s.devices["d1"].current);
+        assert!(!s.devices["d1"].online);
+        s.workspaces.insert(
+            "w1".into(),
+            Workspace {
+                id: "w1".into(),
+                name: "margin".into(),
+                device_id: "d1".into(),
+                device_name: "Mac".into(),
+                platform: margin_shared::Platform::Macos,
+                location: "~/margin".into(),
+                created_at: ts(0),
+            },
+        );
+        s.apply(Event::DeviceDeleted { id: "d1".into() });
+        assert!(s.devices.is_empty() && s.workspaces.is_empty());
+    }
+
     #[test]
     fn settings_changed_is_stored() {
         let mut s = sample();
@@ -848,6 +1032,8 @@ pub(crate) mod tests {
             render_width: 1920,
             render_height: 1080,
             render_fps: 30,
+            reasoning_effort: ReasoningEffort::Medium,
+            agent_model: None,
         };
         s.apply(Event::SettingsChanged {
             settings: settings.clone(),

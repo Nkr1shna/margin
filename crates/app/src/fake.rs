@@ -442,6 +442,8 @@ fn default_settings() -> Settings {
         render_width: 1920,
         render_height: 1080,
         render_fps: 30,
+        reasoning_effort: ReasoningEffort::Medium,
+        agent_model: None,
     }
 }
 
@@ -465,6 +467,7 @@ impl FakeState {
                     created_at: ts(0),
                     last_seen_at: Some(ts(100)),
                     current: true,
+                    online: true,
                 },
                 Device {
                     id: "d2".into(),
@@ -472,6 +475,7 @@ impl FakeState {
                     created_at: ts(5),
                     last_seen_at: None,
                     current: false,
+                    online: false,
                 },
             ],
             next_id: 1,
@@ -1207,6 +1211,7 @@ async fn ask(
             status: ProposalStatus::Drafting,
             outline: None,
             created_at: Utc::now(),
+            chat_id: None,
         };
         s.proposals.insert(proposal.id.clone(), proposal.clone());
         (proposal, s.simulate)

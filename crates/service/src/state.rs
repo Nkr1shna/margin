@@ -9,7 +9,8 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use margin_embed::{Embedder, ModelFiles};
 use margin_shared::{
-    Citation, Event, Id, Lesson, Proposal, Settings, Source, Topic, Video, VideoMedia, VideoStatus,
+    Citation, Event, Id, Lesson, Proposal, ReasoningEffort, Settings, Source, Topic, Video,
+    VideoMedia, VideoStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -19,10 +20,12 @@ use tokio::task::AbortHandle;
 use crate::auth::{Login, RateLimiter};
 use crate::config::Config;
 use crate::db::{self, Store};
+use crate::devices::DeviceHub;
 use crate::embedding::ModelJob;
 use crate::engines::{AiConfig, Generator, Renderer, SourceTools};
 use crate::error::{AppError, AppResult};
 use crate::secrets::{OPENAI_API_KEY, SecretStore};
+use crate::turns::Turns;
 
 pub type AppState = Arc<App>;
 
@@ -100,6 +103,11 @@ pub struct SettingsRow {
     pub render_width: u32,
     pub render_height: u32,
     pub render_fps: u32,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+    /// The model chats use; `None` uses `openai_model`.
+    #[serde(default)]
+    pub agent_model: Option<String>,
 }
 
 impl Default for SettingsRow {
@@ -111,6 +119,8 @@ impl Default for SettingsRow {
             render_width: DEFAULT_RENDER_WIDTH,
             render_height: DEFAULT_RENDER_HEIGHT,
             render_fps: DEFAULT_RENDER_FPS,
+            reasoning_effort: ReasoningEffort::default(),
+            agent_model: None,
         }
     }
 }
@@ -159,6 +169,10 @@ pub struct App {
     pub source_queue: mpsc::UnboundedSender<Id>,
     /// Uploads in parts a request is working on (`uploads`), one request at a time each.
     pub uploads_busy: Mutex<HashSet<Id>>,
+    /// Chat turns in progress.
+    pub turns: Turns,
+    /// Which devices are online, and tool requests sent to them.
+    pub devices: Arc<DeviceHub>,
 }
 
 impl App {
@@ -368,6 +382,8 @@ impl App {
             render_width: row.render_width,
             render_height: row.render_height,
             render_fps: row.render_fps,
+            reasoning_effort: row.reasoning_effort,
+            agent_model: row.agent_model,
         })
     }
 

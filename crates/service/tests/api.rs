@@ -1616,6 +1616,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         status: ProposalStatus::Drafting,
         outline: None,
         created_at: now,
+        chat_id: None,
     };
     store.put(db::PROPOSAL, "p1", &proposal).await.unwrap();
     store

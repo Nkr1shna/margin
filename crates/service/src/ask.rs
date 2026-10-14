@@ -80,6 +80,7 @@ pub async fn ask(
         status: ProposalStatus::Drafting,
         outline: None,
         created_at: Utc::now(),
+        chat_id: None,
     };
     state
         .store

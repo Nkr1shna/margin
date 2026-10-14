@@ -388,7 +388,10 @@ pub fn AskScreen() -> Element {
                                 let Some(api) = app.api() else { return };
                                 accepting.set(true);
                                 accept_error.set(None);
-                                match api.accept_proposal(&id, &AcceptProposal { outline }).await {
+                                match api.accept_proposal(&id, &AcceptProposal {
+                outline,
+                chips: Default::default(),
+            }).await {
                                     Ok(topic) => {
                                         // Make sure the new lessons are here before opening the first one.
                                         if let Ok(library) = api.library().await {

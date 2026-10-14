@@ -6,6 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use margin_agent::ModelClient;
 use margin_ai::{AiError, LessonContext, Passage, ResponsesClient, SceneRequest};
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{AskRequest, Outline, SourceKind, ToolStatus};
@@ -57,6 +58,10 @@ pub trait Generator: Send + Sync + 'static {
         ai: &'a AiConfig,
         req: &'a SceneRequest,
     ) -> BoxFuture<'a, Result<String, AiError>>;
+
+    /// The model the agent loop calls for a chat turn. The turn picks the agent model
+    /// (Settings' `agent_model`, else `ai.model`) per request.
+    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient>;
 }
 
 pub trait Renderer: Send + Sync + 'static {
@@ -105,6 +110,10 @@ impl Generator for AiGenerator {
         req: &'a SceneRequest,
     ) -> BoxFuture<'a, Result<String, AiError>> {
         Box::pin(async move { margin_ai::write_scene(&client(ai), req).await })
+    }
+
+    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
+        Arc::new(client(ai))
     }
 }
 

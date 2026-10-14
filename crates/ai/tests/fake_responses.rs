@@ -307,7 +307,9 @@ async fn error_status_with_json_body_is_http() {
     )])
     .await;
     match collect(&client).await.0 {
-        Err(AiError::Http { status, message }) => {
+        Err(AiError::Http {
+            status, message, ..
+        }) => {
             assert_eq!(status, 401);
             assert_eq!(message, "Incorrect API key provided.");
         }
@@ -323,7 +325,9 @@ async fn error_status_with_text_body_is_http() {
     )])
     .await;
     match collect(&client).await.0 {
-        Err(AiError::Http { status, message }) => {
+        Err(AiError::Http {
+            status, message, ..
+        }) => {
             assert_eq!(status, 502);
             assert_eq!(message, "upstream down");
         }
@@ -522,6 +526,7 @@ async fn structured_error_status_is_http() {
         Err(AiError::Http {
             status: 400,
             message,
+            ..
         }) => assert!(message.contains("Invalid schema")),
         other => panic!("expected Http, got {other:?}"),
     }

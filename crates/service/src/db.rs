@@ -26,9 +26,16 @@ pub const SOURCE: &str = "source";
 pub const CHUNK: &str = "chunk";
 /// Embedded pictures and sound of sources (`sources::MediaRow`).
 pub const MEDIA: &str = "media";
+/// Chats with the agent (`margin_shared::Chat`).
+pub const CHAT: &str = "chat";
+/// Chat transcripts (`chats::StoredChatItem`), with `chat_id`.
+pub const CHAT_ITEM: &str = "chat_item";
+/// Attached folders (`margin_shared::Workspace`).
+pub const WORKSPACE: &str = "workspace";
 
-const TABLES: [&str; 10] = [
-    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK, MEDIA,
+const TABLES: [&str; 13] = [
+    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK, MEDIA, CHAT, CHAT_ITEM,
+    WORKSPACE,
 ];
 
 #[derive(Clone)]

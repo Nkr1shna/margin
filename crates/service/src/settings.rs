@@ -43,6 +43,15 @@ pub async fn patch_settings(
         if let Some(model) = &patch.openai_model {
             row.openai_model = model.trim().to_string();
         }
+        if let Some(model) = &patch.agent_model {
+            row.agent_model = model
+                .as_ref()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
+        }
+        if let Some(effort) = patch.reasoning_effort {
+            row.reasoning_effort = effort;
+        }
         if let Some(voice) = &patch.voice {
             row.voice = voice
                 .as_ref()

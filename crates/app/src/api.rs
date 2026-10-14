@@ -679,6 +679,7 @@ mod tests {
                 &proposal.id,
                 &AcceptProposal {
                     outline: fetched.outline.unwrap(),
+                    chips: Default::default(),
                 },
             )
             .await
@@ -822,7 +823,13 @@ mod tests {
         let proposal = api.ask(&req).await.unwrap();
         let outline = api.proposal(&proposal.id).await.unwrap().outline.unwrap();
         let topic = api
-            .accept_proposal(&proposal.id, &AcceptProposal { outline })
+            .accept_proposal(
+                &proposal.id,
+                &AcceptProposal {
+                    outline,
+                    chips: Default::default(),
+                },
+            )
             .await
             .unwrap();
         let lib = api.library().await.unwrap();

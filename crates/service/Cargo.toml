@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 margin-shared.workspace = true
 margin-ai.workspace = true
+margin-agent.workspace = true
 margin-video.workspace = true
 margin-embed.workspace = true
 serde.workspace = true
