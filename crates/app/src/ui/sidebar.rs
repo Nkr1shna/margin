@@ -11,6 +11,7 @@ use crate::ui::common::{
     BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
 };
 use crate::ui::settings::SettingsPane;
+use crate::ui::sources::TopicSourcesDialog;
 
 /// Which inline topic editor is open in the tree.
 #[derive(Clone, PartialEq, Debug)]
@@ -30,6 +31,8 @@ struct TreeCtx {
     menu: Signal<Option<Id>>,
     delete: Signal<Option<Id>>,
     delete_lesson: Signal<Option<Id>>,
+    /// The topic whose Sources dialog is open.
+    sources: Signal<Option<Id>>,
     error: Signal<Option<String>>,
 }
 
@@ -43,6 +46,7 @@ pub fn Sidebar() -> Element {
         menu: Signal::new(None),
         delete: Signal::new(None),
         delete_lesson: Signal::new(None),
+        sources: Signal::new(None),
         error: Signal::new(None),
     });
     let mut edit = tree.edit;
@@ -85,6 +89,12 @@ pub fn Sidebar() -> Element {
         .as_ref()
         .and_then(|id| app.lib.read().lessons.get(id).map(|l| l.title.clone()));
     let route_now_lesson = route.clone();
+    let mut sources_topic = tree.sources;
+    // Open only while the topic exists (it may be deleted elsewhere meanwhile).
+    let sources_open = sources_topic
+        .read()
+        .clone()
+        .filter(|id| app.lib.read().topics.contains_key(id));
     let mut delete_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
 
@@ -255,6 +265,9 @@ pub fn Sidebar() -> Element {
                     }
                 },
             }
+        }
+        if let Some(id) = sources_open {
+            TopicSourcesDialog { key: "{id}", topic_id: id.clone(), on_close: move |_| sources_topic.set(None) }
         }
         if let (Some(id), Some(title)) = (deleting_lesson.clone(), deleting_lesson_title) {
             ConfirmDialog {
@@ -516,6 +529,7 @@ fn TopicNode(id: Id) -> Element {
     let mut edit = tree.edit;
     let mut menu = tree.menu;
     let mut delete = tree.delete;
+    let mut sources = tree.sources;
     let mut error = tree.error;
 
     let lib = app.lib.read();
@@ -674,6 +688,18 @@ fn TopicNode(id: Id) -> Element {
                         },
                         Icon { name: "note" }
                         "Notes in this topic"
+                    }
+                    button {
+                        role: "menuitem",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                sources.set(Some(id.clone()));
+                            }
+                        },
+                        Icon { name: "clip" }
+                        "Sources…"
                     }
                     button {
                         role: "menuitem",

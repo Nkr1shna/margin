@@ -104,6 +104,19 @@ const ICONS: &[(&str, &str)] = &[
         "folder",
         r#"<path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4.5l2 2.5H19a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z"/>"#,
     ),
+    // Sources: a paperclip, and the code and PDF file kinds ("note" stands for text).
+    (
+        "clip",
+        r#"<path d="M19.5 11.5l-7.6 7.6a4.6 4.6 0 0 1-6.5-6.5l8-8a3.1 3.1 0 0 1 4.4 4.4l-7.9 7.9a1.55 1.55 0 0 1-2.2-2.2l7.3-7.3"/>"#,
+    ),
+    (
+        "code",
+        r#"<path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5M13.5 5l-3 14"/>"#,
+    ),
+    (
+        "pdf",
+        r#"<path d="M6 3.5h8l4 4V20a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 6 20z"/><path d="M14 3.5V8h4"/><rect x="8.5" y="12" width="7" height="5" rx="1"/>"#,
+    ),
 ];
 
 fn icon_svg(name: &str) -> String {

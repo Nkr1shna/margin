@@ -10,6 +10,7 @@ mod fake;
 mod markdown;
 mod routes;
 mod secrets;
+mod sources;
 mod state;
 mod store;
 mod ui;
@@ -140,6 +141,7 @@ fn App() -> Element {
             collapsed: Signal::new(HashSet::new()),
             ask_proposal: Signal::new(None),
             ask_prompt: Signal::new(String::new()),
+            uploads: Signal::new(Vec::new()),
             settings_open: Signal::new(None),
         }
     });

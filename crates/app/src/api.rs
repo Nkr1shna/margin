@@ -5,9 +5,10 @@ use std::fmt;
 use std::time::Duration;
 
 use margin_shared::{
-    AcceptProposal, ApiError, AskRequest, Device, Id, Lesson, LessonPatch, Library, LoginState, Me,
-    NewNote, NewTopic, Note, NotePatch, PollLoginRequest, Proposal, SearchHit, Settings,
-    SettingsPatch, StartLogin, StartLoginRequest, ToolStatus, Topic, TopicPatch, Video, routes,
+    AcceptProposal, ApiError, AskRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library,
+    LoginState, Me, NewNote, NewTopic, Note, NotePatch, PollLoginRequest, Proposal, SearchHit,
+    Settings, SettingsPatch, Source, StartLogin, StartLoginRequest, ToolStatus, Topic, TopicPatch,
+    Video, routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -299,6 +300,58 @@ impl Api {
         self.delete(&routes::device(id)).await
     }
 
+    /// Upload one file as a source. `name` is the file name, or its path inside the folder
+    /// it was added with; without `topic_id` it waits to be named in an `AskRequest`.
+    pub async fn upload_source(
+        &self,
+        bytes: Vec<u8>,
+        name: &str,
+        folder: Option<&str>,
+        topic_id: Option<&str>,
+    ) -> ApiResult<Source> {
+        if bytes.len() as u64 > routes::MAX_SOURCE_BYTES {
+            return Err(ApiFailure::local(format!(
+                "{name} is larger than {} MB, the most a source can be.",
+                routes::MAX_SOURCE_BYTES / (1024 * 1024)
+            )));
+        }
+        let mut query = vec![("name", name)];
+        if let Some(folder) = folder {
+            query.push(("folder", folder));
+        }
+        if let Some(topic_id) = topic_id {
+            query.push(("topic_id", topic_id));
+        }
+        let builder = self
+            .request(Method::POST, routes::SOURCES)
+            .query(&query)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            // Large files over a slow link take longer than the default 60 s.
+            .timeout(Duration::from_secs(600))
+            .body(bytes);
+        self.json(builder).await
+    }
+
+    pub async fn delete_source(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::source(id)).await
+    }
+
+    pub async fn embedding(&self) -> ApiResult<EmbeddingModel> {
+        self.get(routes::EMBEDDING).await
+    }
+
+    /// Start downloading the embedding model on the service Mac; progress arrives as
+    /// `EmbeddingModelChanged` events.
+    pub async fn download_embedding(&self) -> ApiResult<EmbeddingModel> {
+        self.post_empty(routes::EMBEDDING_DOWNLOAD).await
+    }
+
+    /// Delete the downloaded model files.
+    pub async fn delete_embedding(&self) -> ApiResult<EmbeddingModel> {
+        self.json(self.request(Method::DELETE, routes::EMBEDDING))
+            .await
+    }
+
     /// Fetch a text file from an absolute (signed media) URL, without the bearer token.
     pub async fn fetch_text(&self, url: &str) -> ApiResult<String> {
         let response = self.send(self.http.get(url)).await?;
@@ -530,6 +583,95 @@ mod tests {
         assert_eq!(api.video(&video.id).await.unwrap().id, video.id);
         let lesson = api.regenerate_lesson("l1").await.unwrap();
         assert_eq!(lesson.status, margin_shared::LessonStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn sources_upload_with_query_and_attach_on_accept() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let source = api
+            .upload_source(
+                b"# Gibbs & friends\n".to_vec(),
+                "notes/ch 1.md",
+                Some("Fourier notes"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.name, "notes/ch 1.md");
+        assert_eq!(source.folder.as_deref(), Some("Fourier notes"));
+        assert_eq!(source.topic_id, None);
+        assert_eq!(source.kind, margin_shared::SourceKind::Text);
+        assert_eq!(source.bytes, 18);
+        assert_eq!(source.status, margin_shared::SourceStatus::Queued);
+
+        let in_topic = api
+            .upload_source(b"fn main() {}".to_vec(), "main.rs", None, Some("fourier"))
+            .await
+            .unwrap();
+        assert_eq!(in_topic.topic_id.as_deref(), Some("fourier"));
+        assert!(api.library().await.unwrap().sources.contains(&in_topic));
+        let err = api
+            .upload_source(b"x".to_vec(), "photo.png", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+
+        // Accepting a proposal that names the source attaches it to the new topic.
+        let req = AskRequest {
+            prompt: "Fourier series".into(),
+            lesson_count: 1,
+            level: Level::Intro,
+            with_videos: false,
+            with_quiz: false,
+            parent_topic_id: None,
+            source_ids: vec![source.id.clone()],
+        };
+        let proposal = api.ask(&req).await.unwrap();
+        let outline = api.proposal(&proposal.id).await.unwrap().outline.unwrap();
+        let topic = api
+            .accept_proposal(&proposal.id, &AcceptProposal { outline })
+            .await
+            .unwrap();
+        let lib = api.library().await.unwrap();
+        let attached = lib.sources.iter().find(|s| s.id == source.id).unwrap();
+        assert_eq!(attached.topic_id.as_deref(), Some(topic.id.as_str()));
+
+        api.delete_source(&source.id).await.unwrap();
+        assert_eq!(api.delete_source(&source.id).await.unwrap_err().status, Some(404));
+    }
+
+    #[tokio::test]
+    async fn upload_refuses_files_over_the_limit_locally() {
+        let api = Api::with_token("http://127.0.0.1:9", "x");
+        let big = vec![0u8; routes::MAX_SOURCE_BYTES as usize + 1];
+        let err = api.upload_source(big, "big.txt", None, None).await.unwrap_err();
+        assert_eq!(err.code, "local");
+        assert!(err.message.starts_with("big.txt is larger than 50 MB"));
+    }
+
+    #[tokio::test]
+    async fn embedding_model_download_and_delete() {
+        use margin_shared::EmbeddingModelState;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let model = api.embedding().await.unwrap();
+        assert_eq!(model.repo, "FluidInference/embeddinggemma-2-coreml");
+        assert!(matches!(
+            model.state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
+        let downloading = api.download_embedding().await.unwrap();
+        assert!(matches!(
+            downloading.state,
+            EmbeddingModelState::Downloading { received: 0, .. }
+        ));
+        assert_eq!(api.embedding().await.unwrap(), downloading);
+        let removed = api.delete_embedding().await.unwrap();
+        assert!(matches!(
+            removed.state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
     }
 
     #[tokio::test]

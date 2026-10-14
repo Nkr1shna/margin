@@ -1,12 +1,14 @@
-//! Settings: service, account and devices, AI provider and key, voice, render size,
-//! tools on the service Mac, and appearance.
+//! Settings: service, account and devices, AI provider and key, the embedding model for
+//! sources, voice, render size, tools on the service Mac, and appearance.
 
 use dioxus::prelude::*;
-use margin_shared::{Device, Event, Settings, SettingsPatch, ToolStatus};
+use margin_shared::{Device, EmbeddingModelState, Event, Settings, SettingsPatch, ToolStatus};
 
 use crate::config::{Appearance, normalize_service_url};
 use crate::state::use_app;
+use crate::sources::human_bytes;
 use crate::ui::common::{ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, js};
+use crate::ui::sources::{Progress, download_embedding, refresh_embedding};
 
 /// The panes of the Settings dialog, in sidebar order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -15,16 +17,18 @@ pub enum SettingsPane {
     Account,
     Service,
     Ai,
+    Sources,
     Video,
     Tools,
 }
 
 impl SettingsPane {
-    pub const ALL: [SettingsPane; 6] = [
+    pub const ALL: [SettingsPane; 7] = [
         SettingsPane::General,
         SettingsPane::Account,
         SettingsPane::Service,
         SettingsPane::Ai,
+        SettingsPane::Sources,
         SettingsPane::Video,
         SettingsPane::Tools,
     ];
@@ -35,6 +39,7 @@ impl SettingsPane {
             SettingsPane::Account => "Account",
             SettingsPane::Service => "Service",
             SettingsPane::Ai => "AI",
+            SettingsPane::Sources => "Sources",
             SettingsPane::Video => "Voice & video",
             SettingsPane::Tools => "Tools",
         }
@@ -46,6 +51,7 @@ impl SettingsPane {
             SettingsPane::Account => "user",
             SettingsPane::Service => "server",
             SettingsPane::Ai => "spark",
+            SettingsPane::Sources => "clip",
             SettingsPane::Video => "video",
             SettingsPane::Tools => "wrench",
         }
@@ -137,6 +143,7 @@ pub fn SettingsDialog() -> Element {
                             SettingsPane::Account => rsx! { AccountSection {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
                             SettingsPane::Ai => service_settings(|s| rsx! { AiSection { settings: s } }),
+                            SettingsPane::Sources => rsx! { SourcesSection {} },
                             SettingsPane::Video => service_settings(|s| rsx! {
                                 VoiceSection { settings: s.clone() }
                                 RenderSection { settings: s }
@@ -503,6 +510,106 @@ fn AiSection(settings: Settings) -> Element {
                 on_confirm: move |_| async move {
                     let patch = SettingsPatch { openai_api_key: Some(String::new()), ..Default::default() };
                     save_settings(app, patch, key_error, key_busy).await;
+                    confirm_remove.set(false);
+                },
+            }
+        }
+    }
+}
+
+/// The embedding model sources are read with: its state, download progress, and removal.
+#[component]
+fn SourcesSection() -> Element {
+    let app = use_app();
+    let mut load = use_resource(move || async move { refresh_embedding(app).await });
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let mut confirm_remove = use_signal(|| false);
+    let model = app.lib.read().embedding.clone();
+    let download = move || async move {
+        busy.set(true);
+        error.set(download_embedding(app).await.err());
+        busy.set(false);
+    };
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Embedding model" }
+            p { class: "help", "Runs on the service Mac to find the passages of your sources that outlines and lessons draw on." }
+            match (model, load.read().clone()) {
+                (Some(model), _) => rsx! {
+                    div { class: "kv",
+                        span { "Model" }
+                        span { class: "mono", "{model.repo}" }
+                        span { "Status" }
+                        span {
+                            match &model.state {
+                                EmbeddingModelState::NotDownloaded { .. } => "Not downloaded".to_string(),
+                                EmbeddingModelState::Downloading { .. } => "Downloading…".to_string(),
+                                EmbeddingModelState::Ready { bytes } => format!("Ready · {} on disk", human_bytes(*bytes)),
+                                EmbeddingModelState::Failed { .. } => "Download failed".to_string(),
+                            }
+                        }
+                    }
+                    match model.state {
+                        EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                            div { class: "row-actions",
+                                button {
+                                    class: "btn btn-primary btn-sm",
+                                    disabled: *busy.read(),
+                                    onclick: move |_| download(),
+                                    if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
+                                    "Download · {human_bytes(download_bytes)}"
+                                }
+                                span { class: "faint", style: "font-size: 13px", "Downloaded once from Hugging Face. Until then, sources wait in the queue." }
+                            }
+                        },
+                        EmbeddingModelState::Downloading { received, total } => rsx! {
+                            Progress { received, total }
+                        },
+                        EmbeddingModelState::Ready { .. } => rsx! {
+                            div { class: "row-actions",
+                                button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
+                            }
+                        },
+                        EmbeddingModelState::Failed { error: message } => rsx! {
+                            ErrorNotice {
+                                message: "The download failed. {message}",
+                                on_retry: move |_| { spawn(download()); },
+                            }
+                        },
+                    }
+                },
+                (None, Some(Err(err))) => rsx! {
+                    ErrorNotice { message: err, on_retry: move |_| load.restart() }
+                },
+                (None, _) => rsx! {
+                    div { class: "skel", style: "width: 50%" }
+                },
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", "{err}" }
+            }
+        }
+        if *confirm_remove.read() {
+            ConfirmDialog {
+                title: "Remove the embedding model?",
+                message: "Its files are deleted from the service Mac. New sources wait in the queue until you download it again.",
+                confirm_label: "Remove model",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_remove.set(false),
+                on_confirm: move |_| async move {
+                    let Some(api) = app.api() else { return };
+                    busy.set(true);
+                    match api.delete_embedding().await {
+                        Ok(model) => {
+                            let mut lib = app.lib;
+                            lib.write().apply(Event::EmbeddingModelChanged { model });
+                            error.set(None);
+                        }
+                        Err(e) => error.set(Some(app.failure(&e))),
+                    }
+                    busy.set(false);
                     confirm_remove.set(false);
                 },
             }

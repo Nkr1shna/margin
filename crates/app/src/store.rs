@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use margin_shared::{
-    Event, Id, Lesson, LessonStatus, Library, Note, Proposal, Settings, Topic, Video, VideoStatus,
+    EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note, Proposal, Settings, Source,
+    Topic, Video, VideoStatus,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -14,9 +15,13 @@ pub struct LibraryState {
     pub lessons: BTreeMap<Id, Lesson>,
     pub notes: BTreeMap<Id, Note>,
     pub videos: BTreeMap<Id, Video>,
+    /// Files added as sources: a topic's, and those waiting on an Ask in progress.
+    pub sources: BTreeMap<Id, Source>,
     /// Outline proposals seen in this session (they are not part of the library).
     pub proposals: BTreeMap<Id, Proposal>,
     pub settings: Option<Settings>,
+    /// The service's embedding model, once fetched (`GET /api/embedding`) or announced.
+    pub embedding: Option<EmbeddingModel>,
     pub server_version: Option<String>,
 }
 
@@ -36,8 +41,8 @@ impl LibraryState {
         state
     }
 
-    /// Replace topics, lessons, notes and videos with a fresh library, keeping proposals,
-    /// settings and the server version.
+    /// Replace topics, lessons, notes, videos and sources with a fresh library, keeping
+    /// proposals, settings, the embedding model and the server version.
     pub fn replace_library(&mut self, library: Library) {
         self.topics = library
             .topics
@@ -58,6 +63,11 @@ impl LibraryState {
         for video in library.videos {
             self.upsert_video(video);
         }
+        self.sources = library
+            .sources
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
     }
 
     pub fn apply(&mut self, event: Event) {
@@ -93,10 +103,13 @@ impl LibraryState {
                 self.proposals.insert(proposal.id.clone(), proposal);
             }
             Event::SettingsChanged { settings } => self.settings = Some(settings),
-            // Sources and the embedding model aren't shown yet.
-            Event::SourceChanged { .. }
-            | Event::SourceDeleted { .. }
-            | Event::EmbeddingModelChanged { .. } => {}
+            Event::SourceChanged { source } => {
+                self.sources.insert(source.id.clone(), source);
+            }
+            Event::SourceDeleted { id } => {
+                self.sources.remove(&id);
+            }
+            Event::EmbeddingModelChanged { model } => self.embedding = Some(model),
         }
     }
 
@@ -135,6 +148,8 @@ impl LibraryState {
             self.remove_lesson(&lesson);
         }
         self.notes.retain(|_, n| !doomed.contains(&n.topic_id));
+        self.sources
+            .retain(|_, s| s.topic_id.as_ref().is_none_or(|t| !doomed.contains(t)));
     }
 
     fn remove_lesson(&mut self, id: &str) {
@@ -254,6 +269,21 @@ impl LibraryState {
         self.lessons_in(topic_id).into_iter().next()
     }
 
+    /// A topic's sources: loose files first, then each folder's, by name.
+    pub fn sources_in_topic(&self, topic_id: &str) -> Vec<&Source> {
+        let mut out: Vec<&Source> = self
+            .sources
+            .values()
+            .filter(|s| s.topic_id.as_deref() == Some(topic_id))
+            .collect();
+        out.sort_by(|a, b| {
+            a.folder
+                .cmp(&b.folder)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        out
+    }
+
     /// All notes, newest edit first.
     pub fn all_notes(&self) -> Vec<&Note> {
         let mut out: Vec<&Note> = self.notes.values().collect();
@@ -266,7 +296,10 @@ impl LibraryState {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use margin_shared::{AskRequest, Level, ProposalStatus, VideoMedia};
+    use margin_shared::{
+        AskRequest, EmbeddingModelState, Level, ProposalStatus, SourceKind, SourceStatus,
+        VideoMedia,
+    };
 
     fn ts(n: i64) -> chrono::DateTime<Utc> {
         Utc.timestamp_opt(1_760_000_000 + n, 0).unwrap()
@@ -326,6 +359,19 @@ mod tests {
         }
     }
 
+    pub fn source(id: &str, topic_id: Option<&str>, name: &str, folder: Option<&str>) -> Source {
+        Source {
+            id: id.into(),
+            topic_id: topic_id.map(Into::into),
+            name: name.into(),
+            folder: folder.map(Into::into),
+            kind: SourceKind::for_name(name).unwrap_or(SourceKind::Text),
+            bytes: 100,
+            status: SourceStatus::Queued,
+            created_at: ts(0),
+        }
+    }
+
     fn sample() -> LibraryState {
         LibraryState::from_library(Library {
             topics: vec![
@@ -341,7 +387,12 @@ mod tests {
             ],
             notes: vec![note("n1", "f", Some("l1")), note("n2", "f", None)],
             videos: vec![video("v1", "l1", VideoStatus::Ready)],
-            sources: vec![],
+            sources: vec![
+                source("src1", Some("f"), "paper.pdf", None),
+                source("src2", Some("deep"), "main.rs", Some("code")),
+                source("src3", Some("c"), "euler.md", None),
+                source("src4", None, "draft.txt", None),
+            ],
         })
     }
 
@@ -384,6 +435,77 @@ mod tests {
         assert!(s.lessons.is_empty());
         assert!(s.notes.is_empty());
         assert!(s.videos.is_empty());
+        // Sources of the deleted topics go too; others, and unattached ones, stay.
+        let left: Vec<_> = s.sources.keys().cloned().collect();
+        assert_eq!(left, vec!["src3", "src4"]);
+    }
+
+    #[test]
+    fn source_changed_and_deleted() {
+        let mut s = sample();
+        assert_eq!(s.sources.len(), 4);
+        let mut src = source("src4", None, "draft.txt", None);
+        src.status = SourceStatus::Processing { done: 1, total: 3 };
+        s.apply(Event::SourceChanged { source: src });
+        assert_eq!(
+            s.sources["src4"].status,
+            SourceStatus::Processing { done: 1, total: 3 }
+        );
+        // Attached to a topic by accepting a proposal.
+        s.apply(Event::SourceChanged {
+            source: source("src4", Some("c"), "draft.txt", None),
+        });
+        assert_eq!(s.sources["src4"].topic_id.as_deref(), Some("c"));
+        s.apply(Event::SourceDeleted { id: "src4".into() });
+        assert!(!s.sources.contains_key("src4"));
+        // Unknown id: ignored.
+        s.apply(Event::SourceDeleted { id: "missing".into() });
+        assert_eq!(s.sources.len(), 3);
+    }
+
+    #[test]
+    fn sources_in_topic_put_loose_files_before_folders() {
+        let mut s = sample();
+        for src in [
+            source("a", Some("f"), "b/zeta.md", Some("notes")),
+            source("b", Some("f"), "Alpha.txt", None),
+            source("c", Some("f"), "a.md", Some("notes")),
+        ] {
+            s.apply(Event::SourceChanged { source: src });
+        }
+        let names: Vec<_> = s
+            .sources_in_topic("f")
+            .iter()
+            .map(|src| src.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Alpha.txt", "paper.pdf", "a.md", "b/zeta.md"]);
+    }
+
+    #[test]
+    fn embedding_model_changed_is_stored() {
+        let mut s = sample();
+        assert_eq!(s.embedding, None);
+        let model = EmbeddingModel {
+            repo: "FluidInference/embeddinggemma-2-coreml".into(),
+            state: EmbeddingModelState::Downloading {
+                received: 10,
+                total: 100,
+            },
+        };
+        s.apply(Event::EmbeddingModelChanged {
+            model: model.clone(),
+        });
+        assert_eq!(s.embedding, Some(model));
+        // A library reload keeps it.
+        s.replace_library(Library {
+            topics: vec![],
+            lessons: vec![],
+            notes: vec![],
+            videos: vec![],
+            sources: vec![],
+        });
+        assert!(s.embedding.is_some());
+        assert!(s.sources.is_empty());
     }
 
     #[test]

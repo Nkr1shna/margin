@@ -267,6 +267,35 @@ body.resizing-sb * { user-select: none !important; }
 .ol-view p { margin: 2px 0 0; font-size: 14px; font-weight: 500; color: var(--fg-2); }
 .outline-f { display: flex; gap: 8px; justify-content: flex-end; padding: 16px 0 0; flex-wrap: wrap; }
 
+/* ---------- sources ---------- */
+/* A chip or button with a menu that opens below it. */
+.pop-anchor { position: relative; display: inline-flex; }
+.menu.below { top: calc(100% + 4px); left: 0; }
+.attachments { display: grid; gap: 2px; margin-top: -12px; }
+.src-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 4px 4px 4px 10px; border-radius: var(--r-ctl); }
+.src-row:hover { background: var(--hover); }
+.src-ic { color: var(--fg-3); }
+.src-main { flex: 1; min-width: 0; display: grid; }
+.src-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-meta { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 500; color: var(--fg-3); min-width: 0; }
+.src-meta > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-meta.bad { color: var(--danger); }
+.src-meta.bad > span:last-child { white-space: normal; }
+.src-toggle { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; padding: 0; color: var(--fg-3); }
+.src-toggle:hover { color: var(--fg); }
+.src-nested { margin-left: 17px; padding-left: 10px; border-left: 1px solid var(--line); }
+.src-folder { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 4px 0 10px; margin-top: 6px; font-size: 13px; font-weight: 500; color: var(--fg-2); }
+.src-folder .count { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.notice-title { font-weight: 500; }
+.progress { display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.bar.wide { width: 100%; max-width: 320px; height: 4px; }
+.sources-modal { width: min(600px, 100%); max-height: calc(100vh - 96px); display: flex; flex-direction: column; outline: none; }
+.src-head { display: flex; align-items: flex-start; gap: 8px; }
+.src-head small { display: block; color: var(--fg-3); font-size: 13px; font-weight: 500; }
+.src-list { flex: 1 1 auto; overflow: auto; min-height: 0; margin: 0 -8px; padding: 0 8px; }
+.src-list > p { margin: 8px 0; }
+.src-foot { justify-content: flex-start !important; }
+
 /* ---------- lesson ---------- */
 .doc { max-width: 700px; margin: 0 auto; padding: 32px 48px 96px; }
 .doc h1 { font-size: 44px; line-height: 1.12; font-weight: 500; letter-spacing: -0.03em; margin: 12px 0 16px; text-wrap: balance; }

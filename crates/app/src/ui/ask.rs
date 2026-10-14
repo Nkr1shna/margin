@@ -1,5 +1,5 @@
-//! Ask: the composer (prompt, lesson count, level, videos, quiz, subject), the drafted
-//! outline with inline editing, and "Create lessons".
+//! Ask: the composer (prompt, lesson count, level, videos, quiz, subject, sources), the
+//! drafted outline with inline editing, and "Create lessons".
 
 use std::time::Duration;
 
@@ -10,8 +10,10 @@ use margin_shared::{
 
 use crate::api::ApiFailure;
 use crate::routes::Route;
+use crate::sources::UploadState;
 use crate::state::use_app;
 use crate::ui::common::{ErrorNotice, Icon, TopBar};
+use crate::ui::sources::{AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding};
 
 pub fn level_label(level: Level) -> &'static str {
     match level {
@@ -55,6 +57,13 @@ pub fn AskScreen() -> Element {
     let mut prompt_rev = use_signal(|| 0u64);
     let mut accepting = use_signal(|| false);
     let mut accept_error = use_signal(|| None::<ApiFailure>);
+    // What the last add of sources left out.
+    let mut sources_note = use_signal(|| None::<String>);
+
+    // Whether the service can read sources yet (events keep it current).
+    use_future(move || async move {
+        let _ = refresh_embedding(app).await;
+    });
 
     // When the shown proposal is (re)loaded, restore its request into the composer.
     let proposal: Option<Proposal> = proposal_id
@@ -106,11 +115,25 @@ pub fn AskScreen() -> Element {
         with_videos: *with_videos.peek(),
         with_quiz: *with_quiz.peek(),
         parent_topic_id: subject.peek().clone(),
-        source_ids: vec![],
+        source_ids: app
+            .uploads
+            .peek()
+            .iter()
+            .filter(|u| u.topic_id.is_none())
+            .filter_map(|u| match &u.state {
+                UploadState::Done(source) => Some(source.id.clone()),
+                _ => None,
+            })
+            .collect(),
     };
 
     let submit = move |req: AskRequest| {
-        if req.prompt.is_empty() || *submitting.peek() {
+        let uploading = app
+            .uploads
+            .peek()
+            .iter()
+            .any(|u| u.topic_id.is_none() && u.pending());
+        if req.prompt.is_empty() || *submitting.peek() || uploading {
             return;
         }
         spawn(async move {
@@ -147,7 +170,13 @@ pub fn AskScreen() -> Element {
         .and_then(|id| lib.topics.get(id).map(|t| t.title.clone()));
     drop(lib);
 
-    let can_send = !prompt.read().trim().is_empty() && !*submitting.read();
+    let (has_sources, uploading) = {
+        let uploads = app.uploads.read();
+        let mut ask = uploads.iter().filter(|u| u.topic_id.is_none());
+        let has = ask.clone().next().is_some();
+        (has, ask.any(|u| u.pending()))
+    };
+    let can_send = !prompt.read().trim().is_empty() && !*submitting.read() && !uploading;
     let count = *lesson_count.read();
 
     rsx! {
@@ -223,10 +252,13 @@ pub fn AskScreen() -> Element {
                                 option { key: "{id}", value: "{id}", selected: subject.read().as_deref() == Some(id.as_str()), "{title}" }
                             }
                         }
+                        if CAN_ADD {
+                            AddSourcesMenu { on_note: move |note| sources_note.set(note) }
+                        }
                         button {
                             class: "send",
                             "aria-label": "Draft an outline",
-                            title: "Draft an outline (Enter)",
+                            title: if uploading { "Waiting for the sources to upload" } else { "Draft an outline (Enter)" },
                             disabled: !can_send,
                             onclick: move |_| submit(request()),
                             if *submitting.read() {
@@ -236,6 +268,17 @@ pub fn AskScreen() -> Element {
                             }
                         }
                     }
+                }
+                AskAttachments {}
+                if let Some(note) = sources_note.read().clone() {
+                    div { class: "notice", role: "status",
+                        Icon { name: "alert" }
+                        div { class: "body", "{note}" }
+                        button { class: "icon-btn sm", "aria-label": "Dismiss", onclick: move |_| sources_note.set(None), Icon { name: "x" } }
+                    }
+                }
+                if has_sources {
+                    EmbeddingNotice {}
                 }
                 if let Some(err) = error.read().clone() {
                     ErrorNotice { message: err.message.clone(), settings_pane: err.is_no_api_key().then_some(crate::ui::settings::SettingsPane::Ai) }
@@ -275,6 +318,9 @@ pub fn AskScreen() -> Element {
                                         draft.set(None);
                                         prompt.set(String::new());
                                         prompt_rev += 1;
+                                        // The sources now belong to the new topic.
+                                        app.uploads.write().retain(|u| u.topic_id.is_some());
+                                        sources_note.set(None);
                                         app.collapsed.write().remove(&topic.id);
                                         match first {
                                             Some(lesson) => nav.push(Route::LessonRead { id: lesson }),

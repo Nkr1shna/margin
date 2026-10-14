@@ -8,6 +8,7 @@ use margin_shared::{Id, Me};
 use crate::api::{Api, ApiFailure};
 use crate::config::{self, LocalConfig};
 use crate::secrets;
+use crate::sources::Upload;
 use crate::store::LibraryState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,9 @@ pub struct AppCtx {
     /// The proposal shown on the Ask screen, kept while navigating elsewhere.
     pub ask_proposal: Signal<Option<Id>>,
     pub ask_prompt: Signal<String>,
+    /// Files being added as sources, in the order added: the Ask composer's (kept, like
+    /// the prompt, until its lessons are created) and those still uploading to a topic.
+    pub uploads: Signal<Vec<Upload>>,
     /// The Settings dialog, open at this pane.
     pub settings_open: Signal<Option<crate::ui::settings::SettingsPane>>,
 }
@@ -92,6 +96,7 @@ impl AppCtx {
         this.lib.set(LibraryState::default());
         this.lib_status.set(LoadStatus::Loading);
         this.ask_proposal.set(None);
+        this.uploads.set(Vec::new());
     }
 
     /// Sign out: revoke this device on the service (best effort), then forget the token.
