@@ -471,6 +471,49 @@
         });
       })();
     },
+    // Keep a chat's transcript (#id, its own scroll box) at its end as the answer streams
+    // in, unless the reader has scrolled up to read; it starts at the end. Tries for a
+    // few frames, since Rust renders asynchronously.
+    followChat: function (id) {
+      var tries = 0;
+      (function attempt() {
+        var box = document.getElementById(id);
+        if (!box) {
+          if (tries++ < 10) requestAnimationFrame(attempt);
+          return;
+        }
+        if (box.__follow) box.__follow.disconnect();
+        box.__stick = true;
+        box.scrollTop = box.scrollHeight;
+        if (!box.__watched) {
+          box.__watched = true;
+          box.addEventListener("scroll", function () {
+            box.__stick = window.MarginApp.nearEnd({
+              scrollTop: box.scrollTop,
+              scrollHeight: box.scrollHeight,
+              clientHeight: box.clientHeight,
+            });
+          }, { passive: true });
+        }
+        var follow = new MutationObserver(function () {
+          if (box.__stick) box.scrollTop = box.scrollHeight;
+        });
+        follow.observe(box, { childList: true, subtree: true, characterData: true });
+        box.__follow = follow;
+      })();
+    },
+    // Back to the end of the transcript #id and following it (after sending a message).
+    chatToEnd: function (id) {
+      var box = document.getElementById(id);
+      if (!box) return;
+      box.__stick = true;
+      requestAnimationFrame(function () { box.scrollTop = box.scrollHeight; });
+    },
+    // Whether a scroll box is at (or within a line or two of) its end. Plain numbers, so
+    // it can be tested without layout.
+    nearEnd: function (m) {
+      return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+    },
     // Where revealIn scrolls to: the item a quarter of the box's height below its top.
     // Plain numbers, so it can be tested without layout.
     revealTop: function (m) {

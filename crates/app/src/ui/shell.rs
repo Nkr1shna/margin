@@ -74,12 +74,12 @@ pub fn Shell() -> Element {
                     let _ = app.set_config(|c| c.sidebar_hidden = !hidden);
                     app.drawer_open.set(false);
                 }
-                Command::Ask => {
+                Command::NewChat => {
                     nav.push(Route::Ask {});
-                    // Ready to type straight away, also when Ask is already open.
+                    // Ready to type straight away, also when a new chat is already open.
                     let _ = js(&format!(
                         "MarginApp.focus('#{}');",
-                        crate::ui::ask::PROMPT_ID
+                        crate::ui::chat::PROMPT_ID
                     ));
                 }
             }
@@ -117,11 +117,12 @@ pub fn Shell() -> Element {
 
     // On every route change: close the drawer (narrow screens) and start the new page at
     // the top. Pages reuse the same scroll element, so its offset would otherwise carry over.
+    // A chat starts at its end instead (`MarginApp.followChat`).
     use_effect(use_reactive!(|route| {
         let _ = route;
         app.drawer_open.set(false);
         document::eval(
-            "requestAnimationFrame(function () { document.querySelectorAll('.main .scroll').forEach(function (e) { e.scrollTop = 0; }); });",
+            "requestAnimationFrame(function () { document.querySelectorAll('.main .scroll:not(.chat-scroll)').forEach(function (e) { e.scrollTop = 0; }); });",
         );
     }));
 

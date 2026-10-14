@@ -3,7 +3,7 @@
 
 use dioxus::prelude::*;
 
-use crate::ui::ask::AskScreen;
+use crate::ui::chat::ChatScreen;
 use crate::ui::common::TopBar;
 use crate::ui::lesson::{LessonScreen, LessonView};
 use crate::ui::notes::NotesScreen;
@@ -13,8 +13,11 @@ use crate::ui::shell::Shell;
 #[rustfmt::skip]
 pub enum Route {
     #[layout(Shell)]
+        /// Ask: a new chat. Its first message creates the chat and moves to it.
         #[route("/")]
         Ask {},
+        #[route("/chat/:id")]
+        Chat { id: String },
         #[route("/lesson/:id")]
         LessonRead { id: String },
         #[route("/lesson/:id/notes")]
@@ -39,7 +42,8 @@ pub enum Route {
 pub fn page_title(route: &Route, lib: &crate::store::LibraryState) -> String {
     let lesson = |id: &str| lib.lessons.get(id).map(|l| l.title.clone());
     let screen = match route {
-        Route::Ask {} => Some("Ask".to_string()),
+        Route::Ask {} => Some("New chat".to_string()),
+        Route::Chat { id } => lib.chats.get(id).map(|c| chat_title(&c.title)),
         Route::LessonRead { id } => lesson(id),
         Route::LessonNotes { id } => lesson(id).map(|t| format!("{t}: Notes")),
         Route::LessonVideo { id } => lesson(id).map(|t| format!("{t}: Video")),
@@ -59,9 +63,27 @@ pub fn page_title(route: &Route, lib: &crate::store::LibraryState) -> String {
     }
 }
 
+/// A chat's title as screens show it ("New chat" until its first message names it).
+pub fn chat_title(title: &str) -> String {
+    if title.trim().is_empty() {
+        "New chat".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
 #[component]
 fn Ask() -> Element {
-    rsx! { AskScreen {} }
+    rsx! { ChatScreen { id: None } }
+}
+
+#[component]
+fn Chat(id: String) -> Element {
+    rsx! {
+        for id in std::iter::once(id) {
+            ChatScreen { key: "{id}", id: Some(id.clone()) }
+        }
+    }
 }
 
 // Keyed single-item lists remount the screen when the id changes, so per-screen state
@@ -202,8 +224,26 @@ mod tests {
             .insert("f".into(), topic("f", None, "Fourier", 0));
         lib.lessons
             .insert("l1".into(), lesson("l1", "f", 0, LessonStatus::Ready));
+        let chat = |title: &str| margin_shared::Chat {
+            id: "c1".into(),
+            title: title.into(),
+            state: margin_shared::ChatState::Idle,
+            workspace_ids: vec![],
+            source_ids: vec![],
+            pending: None,
+            usage: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // A chat is named by its first message; until then it's a new chat.
+        lib.chats.insert("c1".into(), chat(""));
+        let in_chat = Route::Chat { id: "c1".into() };
+        assert_eq!(page_title(&in_chat, &lib), "New chat — Margin");
+        lib.chats.insert("c1".into(), chat("Fourier"));
+        assert_eq!(page_title(&in_chat, &lib), "Fourier — Margin");
+        assert_eq!(Route::from_str("/chat/c1").ok(), Some(in_chat));
         let title = |r: Route| page_title(&r, &lib);
-        assert_eq!(title(Route::Ask {}), "Ask — Margin");
+        assert_eq!(title(Route::Ask {}), "New chat — Margin");
         assert_eq!(
             title(Route::LessonRead { id: "l1".into() }),
             "Lesson l1 — Margin"

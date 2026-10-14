@@ -3,7 +3,8 @@
 
 use dioxus::prelude::*;
 use margin_shared::{
-    Device, EmbeddingModelState, Event, SOURCE_KINDS, Settings, SettingsPatch, ToolStatus,
+    Device, EmbeddingModelState, Event, ReasoningEffort, SOURCE_KINDS, Settings, SettingsPatch,
+    ToolStatus,
 };
 
 use crate::config::{Appearance, normalize_service_url};
@@ -206,7 +207,10 @@ pub fn SettingsDialog() -> Element {
                             },
                             SettingsPane::Account => rsx! { AccountSection {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
-                            SettingsPane::Ai => service_settings(|s| rsx! { AiSection { settings: s } }),
+                            SettingsPane::Ai => service_settings(|s| rsx! {
+                                AiSection { settings: s.clone() }
+                                AgentSection { settings: s }
+                            }),
                             SettingsPane::Sources => rsx! { SourcesSection {} },
                             SettingsPane::Video => service_settings(|s| rsx! {
                                 VoiceSection { settings: s.clone() }
@@ -487,7 +491,7 @@ fn AiSection(settings: Settings) -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "AI provider" }
-            p { class: "help", "Margin uses an OpenAI-compatible Responses API for outlines, lessons and video scenes." }
+            p { class: "help", "Margin uses an OpenAI-compatible Responses API for chats, outlines, lessons and video scenes." }
             form {
                 style: "display: grid; gap: 14px",
                 onsubmit: {
@@ -641,6 +645,103 @@ fn AiSection(settings: Settings) -> Element {
                     save_settings(app, patch, key_error, key_busy).await;
                     confirm_remove.set(false);
                 },
+            }
+        }
+    }
+}
+
+/// How hard the agent thinks, in words.
+pub fn effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Minimal => "Minimal",
+        ReasoningEffort::Low => "Low",
+        ReasoningEffort::Medium => "Medium",
+        ReasoningEffort::High => "High",
+    }
+}
+
+/// The model chats use (when not the one above) and how hard it thinks before answering.
+#[component]
+fn AgentSection(settings: Settings) -> Element {
+    let app = use_app();
+    let current = settings.agent_model.clone().unwrap_or_default();
+    let mut model = use_signal(|| current.clone());
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let effort_error = use_signal(|| None::<String>);
+    let effort_busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
+    let dirty = model.read().trim() != current;
+    let effort = settings.reasoning_effort;
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Chats" }
+            p { class: "help", "The model that answers in chats, and how much it reasons first. More reasoning answers harder questions better but takes longer and costs more." }
+            form {
+                class: "field",
+                onsubmit: move |e: FormEvent| async move {
+                    e.prevent_default();
+                    if *busy.peek() {
+                        return;
+                    }
+                    let m = model.peek().trim().to_string();
+                    let patch = SettingsPatch {
+                        agent_model: Some((!m.is_empty()).then_some(m)),
+                        ..Default::default()
+                    };
+                    if save_settings(app, patch, error, busy).await {
+                        saved_note.set(true);
+                    }
+                },
+                label { r#for: "ai-agent-model", "Model for chats" }
+                div { class: "row-actions",
+                    input {
+                        id: "ai-agent-model",
+                        class: "input",
+                        style: "flex: 1; min-width: 220px",
+                        placeholder: "Same as above ({settings.openai_model})",
+                        initial_value: "{model}",
+                        oninput: move |e| { saved_note.set(false); model.set(e.value()) },
+                    }
+                    button {
+                        r#type: "submit",
+                        class: "btn btn-primary btn-sm",
+                        disabled: !dirty || *busy.read(),
+                        SaveLabel { busy: *busy.read() }
+                    }
+                    if *saved_note.read() && !dirty {
+                        span { class: "save-state", role: "status", "Saved" }
+                    }
+                }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+            }
+            div { class: "field",
+                span { class: "label", id: "ai-effort-label", "Reasoning" }
+                div { class: "seg", role: "radiogroup", "aria-labelledby": "ai-effort-label", "aria-busy": effort_busy.read().to_string(),
+                    for e in ReasoningEffort::ALL {
+                        button {
+                            key: "{e.as_str()}",
+                            role: "radio",
+                            "aria-checked": (e == effort).to_string(),
+                            // One tab stop; the arrow keys move between options (margin.js).
+                            tabindex: if e == effort { "0" } else { "-1" },
+                            onclick: move |_| async move {
+                                if e == effort || *effort_busy.peek() {
+                                    return;
+                                }
+                                let patch = SettingsPatch { reasoning_effort: Some(e), ..Default::default() };
+                                save_settings(app, patch, effort_error, effort_busy).await;
+                            },
+                            {effort_label(e)}
+                        }
+                    }
+                }
+                if let Some(err) = effort_error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
             }
         }
     }
@@ -1096,6 +1197,21 @@ fn AppearanceSection() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_pane_sets_the_chat_model_and_reasoning() {
+        use crate::store::LibraryState;
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.reasoning_effort = ReasoningEffort::High;
+        lib.settings = Some(settings);
+        let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
+        assert!(html.contains("Model for chats"), "{html}");
+        assert!(html.contains("Same as above (gpt-5)"));
+        for e in ReasoningEffort::ALL {
+            assert!(html.contains(effort_label(e)));
+        }
+    }
 
     #[test]
     fn base_url_problem_checks_the_address() {

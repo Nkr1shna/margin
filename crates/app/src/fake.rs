@@ -51,6 +51,17 @@ pub struct FakeState {
     pub parts_received: u32,
     /// Fail the next this many parts with a 503, for tests of the retries.
     pub fail_parts: u32,
+    pub chats: Vec<Chat>,
+    /// Each chat's transcript, in `seq` order.
+    pub chat_items: HashMap<Id, Vec<ChatItem>>,
+    /// Full outputs of tool results, by item id.
+    pub chat_outputs: HashMap<Id, String>,
+    /// The last `ChatItem.seq` given out.
+    pub chat_seq: u64,
+    /// Turns stop part-way through their answer and stay running (to test Stop and the
+    /// pending message).
+    pub chat_hang: bool,
+    pub workspaces: Vec<Workspace>,
 }
 
 /// An upload in parts the fake is receiving.
@@ -72,12 +83,15 @@ pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 1_480_000_000;
 pub struct Fake {
     pub state: Arc<Mutex<FakeState>>,
     pub events: broadcast::Sender<Event>,
+    /// Frames for the device on the socket (every connected socket gets them here).
+    pub directed: broadcast::Sender<DirectedFrame>,
 }
 
 pub struct FakeService {
     pub url: String,
     pub state: Arc<Mutex<FakeState>>,
     pub events: broadcast::Sender<Event>,
+    pub directed: broadcast::Sender<DirectedFrame>,
 }
 
 fn ts(n: i64) -> DateTime<Utc> {
@@ -449,7 +463,7 @@ fn default_settings() -> Settings {
 
 impl FakeState {
     pub fn new() -> Self {
-        Self {
+        let mut state = Self {
             device_name: String::new(),
             approve: false,
             auto_approve_after: None,
@@ -489,7 +503,25 @@ impl FakeState {
             part_uploads: HashMap::new(),
             parts_received: 0,
             fail_parts: 0,
+            chats: Vec::new(),
+            chat_items: HashMap::new(),
+            chat_outputs: HashMap::new(),
+            chat_seq: 100,
+            chat_hang: false,
+            workspaces: Vec::new(),
+        };
+        for (chat, items) in sample_chats() {
+            for item in &items {
+                if let ChatItemKind::ToolResult { call_id, .. } = &item.kind {
+                    state
+                        .chat_outputs
+                        .insert(item.id.clone(), sample_tool_output(call_id));
+                }
+            }
+            state.chat_items.insert(chat.id.clone(), items);
+            state.chats.push(chat);
         }
+        state
     }
 
     fn embedding_model(&self) -> EmbeddingModel {
@@ -521,10 +553,15 @@ impl FakeService {
         let url = format!("http://{}", listener.local_addr().unwrap());
         state.public_url = url.clone();
         rebase_media(&mut state.library, |path| format!("{url}{path}"));
+        for items in state.chat_items.values_mut() {
+            rebase_chat_media(items, |path| format!("{url}{path}"));
+        }
         let (events, _) = broadcast::channel(1024);
+        let (directed, _) = broadcast::channel(64);
         let fake = Fake {
             state: Arc::new(Mutex::new(state)),
             events: events.clone(),
+            directed: directed.clone(),
         };
         let app = router(fake.clone());
         tokio::spawn(async move {
@@ -534,7 +571,13 @@ impl FakeService {
             url,
             state: fake.state,
             events,
+            directed,
         }
+    }
+
+    /// Send a frame to the connected devices, as the service sends a device-tool request.
+    pub fn direct(&self, frame: DirectedFrame) {
+        let _ = self.directed.send(frame);
     }
 }
 
@@ -599,6 +642,28 @@ pub fn router(fake: Fake) -> Router {
             get(get_embedding).delete(delete_embedding),
         )
         .route("/api/embedding/download", post(download_embedding))
+        .route("/api/chats", get(list_chats).post(create_chat))
+        .route(
+            "/api/chats/{id}",
+            get(get_chat).patch(patch_chat).delete(delete_chat),
+        )
+        .route("/api/chats/{id}/messages", post(send_message))
+        .route(
+            "/api/chats/{id}/pending",
+            axum::routing::delete(drop_pending),
+        )
+        .route("/api/chats/{id}/stop", post(stop_chat))
+        .route("/api/chats/{id}/continue", post(continue_chat))
+        .route("/api/chats/{id}/confirm", post(confirm))
+        .route("/api/chats/{id}/items/{item}/output", get(chat_item_output))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
+        .route(
+            "/api/workspaces/{id}",
+            axum::routing::delete(delete_workspace),
+        )
         .route("/api/events", get(events))
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
@@ -1504,6 +1569,12 @@ async fn patch_settings(
         if let Some(v) = req.render_fps {
             s.settings.render_fps = v;
         }
+        if let Some(v) = req.reasoning_effort {
+            s.settings.reasoning_effort = v;
+        }
+        if let Some(v) = req.agent_model {
+            s.settings.agent_model = v.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        }
         s.settings.has_api_key = s.has_api_key;
         s.settings.clone()
     };
@@ -2075,10 +2146,15 @@ async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgra
         return r;
     }
     let rx = fake.events.subscribe();
-    ws.on_upgrade(move |socket| socket_loop(socket, rx))
+    let directed = fake.directed.subscribe();
+    ws.on_upgrade(move |socket| socket_loop(socket, rx, directed))
 }
 
-async fn socket_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<Event>) {
+async fn socket_loop(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Event>,
+    mut directed: broadcast::Receiver<DirectedFrame>,
+) {
     let hello = Event::Hello {
         server_version: "fake-0.1".into(),
     };
@@ -2092,6 +2168,18 @@ async fn socket_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<Event>) 
                 match event {
                     Ok(event) => {
                         let json = serde_json::to_string(&event).unwrap();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return,
+                }
+            }
+            frame = directed.recv() => {
+                match frame {
+                    Ok(frame) => {
+                        let json = serde_json::to_string(&frame).unwrap();
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             return;
                         }
@@ -2263,6 +2351,1497 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chats: a scripted stand-in for the agent. A message is answered with a reasoning
+// summary, a `search_library` call over the fake library and a short Markdown answer;
+// "source" adds a `search_sources` call with a Passages card, "delete" asks to delete a
+// note (a confirmation card), "fail" ends the turn on a retryable error. With
+// `simulate` the answer streams in over a few seconds; otherwise it is written before
+// the request is answered, or, with `chat_hang`, stops part-way and stays running.
+// ---------------------------------------------------------------------------
+
+/// A sample conversation (`c1`) and an interrupted one (`c2`), for manual runs and
+/// screenshots. Media URLs are relative until `rebase_chat_media`.
+pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
+    let chat = |id: &str, title: &str, state, at| Chat {
+        id: id.into(),
+        title: title.into(),
+        state,
+        workspace_ids: vec![],
+        source_ids: vec![],
+        pending: None,
+        usage: Usage {
+            input_tokens: 18_400,
+            cached_input_tokens: 12_000,
+            output_tokens: 1_250,
+            reasoning_tokens: 640,
+            model_calls: 4,
+        },
+        created_at: ts(at),
+        updated_at: ts(at + 30),
+    };
+    let item = |chat: &str, seq: u64, turn: &str, kind| ChatItem {
+        id: format!("{chat}-i{seq}"),
+        chat_id: chat.into(),
+        turn_id: turn.into(),
+        seq,
+        status: ItemStatus::Done,
+        created_at: ts(40 + seq as i64),
+        updated_at: ts(40 + seq as i64),
+        kind,
+    };
+    let user = |text: &str| ChatItemKind::UserMessage {
+        text: text.into(),
+        source_ids: vec![],
+        device_id: "d1".into(),
+        device_name: "test-mac".into(),
+    };
+    let call = |id: &str, name: &str, args: &str, label: &str| ChatItemKind::ToolCall {
+        call_id: id.into(),
+        name: name.into(),
+        arguments: args.into(),
+        label: label.into(),
+        device: None,
+    };
+    let result = |id: &str, summary: &str| ChatItemKind::ToolResult {
+        call_id: id.into(),
+        ok: true,
+        summary: summary.into(),
+        output_bytes: sample_tool_output(id).len() as u64,
+    };
+    let passages = sample_citations().into_iter().take(3).collect();
+    let c1 = vec![
+        item("c1", 1, "t1", user("How do Fourier series converge?")),
+        item(
+            "c1",
+            2,
+            "t1",
+            ChatItemKind::Reasoning {
+                summary: "**Checking the library first**\n\nThe Fourier series topic has a lesson on why sums of sines work; convergence is covered there and in a note.".into(),
+            },
+        ),
+        item(
+            "c1",
+            3,
+            "t1",
+            call(
+                "call_1",
+                "search_library",
+                r#"{"query":"fourier convergence"}"#,
+                "Searching the library for “fourier convergence”",
+            ),
+        ),
+        item("c1", 4, "t1", result("call_1", "2 matches: 1 lesson, 1 note")),
+        item(
+            "c1",
+            5,
+            "t1",
+            ChatItemKind::AssistantText {
+                text: "For a reasonably well-behaved periodic signal the partial sums\n\n$$S_N(t) = \\sum_{n=-N}^{N} c_n e^{i n \\omega_0 t}$$\n\nconverge to the signal wherever it is continuous, and to the **midpoint of the jump** where it isn't.\n\n- Your lesson *Why sums of sines?* walks through the square wave.\n- Your note *Whole-number multiples* has the key fact about frequencies.\n\nNear a jump the partial sums overshoot by about 9% however many terms you add (the Gibbs phenomenon).".into(),
+            },
+        ),
+        item("c1", 6, "t2", user("Show me where my sources say that.")),
+        item(
+            "c1",
+            7,
+            "t2",
+            call(
+                "call_2",
+                "search_sources",
+                r#"{"query":"partial sums overshoot","topic_id":"fourier","source_ids":null}"#,
+                "Searching the sources for “partial sums overshoot”",
+            ),
+        ),
+        item("c1", 8, "t2", result("call_2", "3 passages in 3 files")),
+        item(
+            "c1",
+            9,
+            "t2",
+            ChatItemKind::Card {
+                call_id: "call_2".into(),
+                card: Card::Passages(PassagesCard {
+                    query: "partial sums overshoot".into(),
+                    passages,
+                }),
+            },
+        ),
+        item(
+            "c1",
+            10,
+            "t2",
+            ChatItemKind::AssistantText {
+                text: "Three of the topic's sources cover it: the textbook's chapter 3 [page 3], the script that plots the partial sums, and the square-wave figure.".into(),
+            },
+        ),
+    ];
+    let mut cancelled = item(
+        "c2",
+        2,
+        "t3",
+        ChatItemKind::AssistantText {
+            text: "Eigenvectors are the directions a matrix only stretches".into(),
+        },
+    );
+    cancelled.status = ItemStatus::Cancelled;
+    let c2 = vec![
+        item("c2", 1, "t3", user("Explain eigenvectors with a picture")),
+        cancelled,
+        item(
+            "c2",
+            3,
+            "t3",
+            ChatItemKind::Action {
+                text: "The service stopped while answering.".into(),
+            },
+        ),
+    ];
+    vec![
+        (
+            chat("c1", "How do Fourier series converge?", ChatState::Idle, 40),
+            c1,
+        ),
+        (
+            chat(
+                "c2",
+                "Explain eigenvectors with a picture",
+                ChatState::Interrupted {
+                    turn_id: "t3".into(),
+                },
+                10,
+            ),
+            c2,
+        ),
+    ]
+}
+
+/// What the sample chat's tool calls returned (`call_1`, `call_2`).
+pub fn sample_tool_output(call_id: &str) -> String {
+    match call_id {
+        "call_1" => serde_json::json!([
+            {"kind": "lesson", "id": "l1", "title": "Why sums of sines?", "context": "Signals & Systems / Fourier series", "snippet": "Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves."},
+            {"kind": "note", "id": "n1", "title": "Whole-number multiples", "context": "Signals & Systems / Fourier series", "snippet": "Every frequency is a whole-number multiple of the base frequency."}
+        ])
+        .to_string(),
+        "call_2" => serde_json::to_string(&sample_citations().into_iter().take(3).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Make the passages' relative media URLs absolute under `base`.
+pub fn rebase_chat_media(items: &mut [ChatItem], base: impl Fn(&str) -> String) {
+    for item in items {
+        if let ChatItemKind::Card {
+            card: Card::Passages(card),
+            ..
+        } = &mut item.kind
+        {
+            for c in &mut card.passages {
+                if let Some(u) = c.image_url.as_mut()
+                    && u.starts_with("/media/")
+                {
+                    *u = base(u);
+                }
+            }
+        }
+    }
+}
+
+impl FakeState {
+    fn chat_mut(&mut self, id: &str) -> Option<&mut Chat> {
+        self.chats.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Adds an item to the end of a chat's transcript.
+    fn add_item(
+        &mut self,
+        chat_id: &str,
+        turn_id: &str,
+        status: ItemStatus,
+        kind: ChatItemKind,
+    ) -> ChatItem {
+        self.chat_seq += 1;
+        let now = Utc::now();
+        let item = ChatItem {
+            id: self.id("item"),
+            chat_id: chat_id.into(),
+            turn_id: turn_id.into(),
+            seq: self.chat_seq,
+            status,
+            created_at: now,
+            updated_at: now,
+            kind,
+        };
+        self.chat_items
+            .entry(chat_id.into())
+            .or_default()
+            .push(item.clone());
+        item
+    }
+
+    fn update_item(
+        &mut self,
+        chat_id: &str,
+        item_id: &str,
+        change: impl FnOnce(&mut ChatItem),
+    ) -> Option<ChatItem> {
+        let item = self
+            .chat_items
+            .get_mut(chat_id)?
+            .iter_mut()
+            .find(|i| i.id == item_id)?;
+        change(item);
+        item.updated_at = Utc::now();
+        Some(item.clone())
+    }
+
+    /// Sets a chat's state; returns the changed chat.
+    fn set_chat_state(&mut self, chat_id: &str, state: ChatState) -> Option<Chat> {
+        let chat = self.chat_mut(chat_id)?;
+        chat.state = state;
+        chat.updated_at = Utc::now();
+        Some(chat.clone())
+    }
+
+    /// Whether `turn_id` is still the chat's running turn (Stop or a delete ends it).
+    fn turn_running(&self, chat_id: &str, turn_id: &str) -> bool {
+        self.chats.iter().any(|c| {
+            c.id == chat_id
+                && matches!(&c.state, ChatState::Running { turn_id: t, .. } if t == turn_id)
+        })
+    }
+
+    fn current_device(&self) -> (Id, String) {
+        self.devices
+            .iter()
+            .find(|d| d.current)
+            .map(|d| (d.id.clone(), d.name.clone()))
+            .unwrap_or_else(|| ("d1".into(), "test-mac".into()))
+    }
+
+    /// Stores the user message and starts its turn: the chat is Running. Returns the
+    /// events to publish and the item.
+    fn start_turn(&mut self, chat_id: &str, message: NewMessage) -> (Vec<Event>, ChatItem) {
+        let turn_id = self.id("turn");
+        let (device_id, device_name) = self.current_device();
+        let first = self.chat_items.get(chat_id).is_none_or(|i| i.is_empty());
+        let item = self.add_item(
+            chat_id,
+            &turn_id,
+            ItemStatus::Done,
+            ChatItemKind::UserMessage {
+                text: message.text.clone(),
+                source_ids: message.source_ids.clone(),
+                device_id: device_id.clone(),
+                device_name,
+            },
+        );
+        let chat = self.chat_mut(chat_id).expect("the chat exists");
+        if first && chat.title.is_empty() {
+            chat.title = chat_title(&message.text);
+        }
+        for id in message.source_ids {
+            if !chat.source_ids.contains(&id) {
+                chat.source_ids.push(id);
+            }
+        }
+        chat.pending = None;
+        chat.state = ChatState::Running {
+            turn_id,
+            device_id,
+            started_at: Utc::now(),
+        };
+        chat.updated_at = Utc::now();
+        let chat = chat.clone();
+        (
+            vec![
+                Event::ChatItemChanged { item: item.clone() },
+                Event::ChatChanged { chat },
+            ],
+            item,
+        )
+    }
+
+    /// What Stop and a restart do to the turn's unfinished work: in-progress items are
+    /// cancelled, calls without a result get one, a pending confirmation is denied.
+    fn cancel_turn(&mut self, chat_id: &str, turn_id: &str, summary: &str) -> Vec<Event> {
+        let (device_id, _) = self.current_device();
+        let mut events = Vec::new();
+        let items = self.chat_items.get(chat_id).cloned().unwrap_or_default();
+        for item in items.iter().filter(|i| i.turn_id == turn_id) {
+            if item.status == ItemStatus::InProgress
+                && let Some(changed) = self.update_item(chat_id, &item.id, |i| {
+                    i.status = ItemStatus::Cancelled;
+                })
+            {
+                events.push(Event::ChatItemChanged { item: changed });
+            }
+            if let ChatItemKind::Card {
+                card:
+                    Card::Confirmation(ConfirmationCard {
+                        decision: Decision::Pending,
+                        ..
+                    }),
+                ..
+            } = &item.kind
+                && let Some(changed) = self.update_item(chat_id, &item.id, |i| {
+                    if let ChatItemKind::Card {
+                        card: Card::Confirmation(c),
+                        ..
+                    } = &mut i.kind
+                    {
+                        c.decision = Decision::Denied {
+                            device_id: device_id.clone(),
+                            by_stop: true,
+                        };
+                    }
+                })
+            {
+                events.push(Event::ChatItemChanged { item: changed });
+            }
+        }
+        for call_id in unanswered(&items, turn_id) {
+            let result = self.add_item(
+                chat_id,
+                turn_id,
+                ItemStatus::Done,
+                ChatItemKind::ToolResult {
+                    call_id,
+                    ok: false,
+                    summary: summary.into(),
+                    output_bytes: 0,
+                },
+            );
+            events.push(Event::ChatItemChanged { item: result });
+        }
+        events
+    }
+}
+
+/// The calls of `turn_id` that have no result yet.
+fn unanswered(items: &[ChatItem], turn_id: &str) -> Vec<String> {
+    let answered: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ChatItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    items
+        .iter()
+        .filter(|i| i.turn_id == turn_id)
+        .filter_map(|i| match &i.kind {
+            ChatItemKind::ToolCall { call_id, .. } if !answered.contains(&call_id.as_str()) => {
+                Some(call_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A chat's title from its first message: the first line, cut to `CHAT_TITLE_MAX`.
+fn chat_title(text: &str) -> String {
+    let line = text.trim().lines().next().unwrap_or("").trim();
+    if line.chars().count() <= CHAT_TITLE_MAX {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(CHAT_TITLE_MAX - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+fn publish_all(fake: &Fake, events: Vec<Event>) {
+    for event in events {
+        publish(fake, event);
+    }
+}
+
+/// Pause between steps of a streamed answer (manual runs only).
+async fn pace(fake: &Fake, ms: u64) {
+    let simulate = fake.state.lock().unwrap().simulate;
+    if simulate {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+/// Runs one step of a turn under the lock, if the turn is still running; publishes what
+/// it returns. `None` when the turn was stopped or the chat deleted meanwhile.
+fn step<T>(
+    fake: &Fake,
+    chat_id: &str,
+    turn_id: &str,
+    f: impl FnOnce(&mut FakeState) -> (Vec<Event>, T),
+) -> Option<T> {
+    let (events, out) = {
+        let mut s = fake.state.lock().unwrap();
+        if !s.turn_running(chat_id, turn_id) {
+            return None;
+        }
+        f(&mut s)
+    };
+    publish_all(fake, events);
+    Some(out)
+}
+
+/// Streams `text` into an in-progress item, a few words at a time.
+async fn stream_into(
+    fake: &Fake,
+    chat_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    text: &str,
+) -> Option<()> {
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    for (n, word) in text.split_inclusive(' ').enumerate() {
+        piece.push_str(word);
+        if n % 3 == 2 {
+            pieces.push(std::mem::take(&mut piece));
+        }
+    }
+    if !piece.is_empty() {
+        pieces.push(piece);
+    }
+    for piece in pieces {
+        step(fake, chat_id, turn_id, |s| {
+            let mut offset = 0;
+            let item = s.update_item(chat_id, item_id, |i| {
+                offset = i.kind.streaming_text().map_or(0, str::len) as u64;
+                i.kind.apply_delta(offset, &piece);
+            });
+            let events = item
+                .map(|_| {
+                    vec![Event::ChatItemDelta {
+                        chat_id: chat_id.into(),
+                        item_id: item_id.into(),
+                        offset,
+                        text: piece.clone(),
+                    }]
+                })
+                .unwrap_or_default();
+            (events, ())
+        })?;
+        pace(fake, 60).await;
+    }
+    Some(())
+}
+
+/// Adds an in-progress item, streams `text` into it, and marks it done.
+async fn streamed_item(
+    fake: &Fake,
+    chat_id: &str,
+    turn_id: &str,
+    empty: ChatItemKind,
+    text: &str,
+) -> Option<ChatItem> {
+    let item = step(fake, chat_id, turn_id, |s| {
+        let item = s.add_item(chat_id, turn_id, ItemStatus::InProgress, empty);
+        (vec![Event::ChatItemChanged { item: item.clone() }], item)
+    })?;
+    stream_into(fake, chat_id, turn_id, &item.id, text).await?;
+    step(fake, chat_id, turn_id, |s| {
+        let done = s.update_item(chat_id, &item.id, |i| i.status = ItemStatus::Done);
+        let events = done
+            .clone()
+            .map(|item| vec![Event::ChatItemChanged { item }])
+            .unwrap_or_default();
+        (events, done)
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+/// A tool call whose arguments stream in, then its result (with the full output kept
+/// for `chat_item_output`) and the call marked done.
+async fn tool_call(
+    fake: &Fake,
+    chat_id: &str,
+    turn_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+    label: String,
+    summary: String,
+    output: String,
+) -> Option<String> {
+    let call_id = step(fake, chat_id, turn_id, |s| {
+        let call_id = s.id("call");
+        (vec![], call_id)
+    })?;
+    let call = streamed_item(
+        fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::ToolCall {
+            call_id: call_id.clone(),
+            name: name.into(),
+            arguments: String::new(),
+            label: String::new(),
+            device: None,
+        },
+        &arguments.to_string(),
+    )
+    .await?;
+    // `streamed_item` marked it done; a call stays in progress until its result.
+    step(fake, chat_id, turn_id, |s| {
+        let item = s.update_item(chat_id, &call.id, |i| {
+            i.status = ItemStatus::InProgress;
+            if let ChatItemKind::ToolCall { label: l, .. } = &mut i.kind {
+                *l = label.clone();
+            }
+        });
+        (
+            item.map(|item| vec![Event::ChatItemChanged { item }])
+                .unwrap_or_default(),
+            (),
+        )
+    })?;
+    pace(fake, 500).await;
+    step(fake, chat_id, turn_id, |s| {
+        let result = s.add_item(
+            chat_id,
+            turn_id,
+            ItemStatus::Done,
+            ChatItemKind::ToolResult {
+                call_id: call_id.clone(),
+                ok: true,
+                summary,
+                output_bytes: output.len() as u64,
+            },
+        );
+        s.chat_outputs.insert(result.id.clone(), output);
+        let mut events = vec![Event::ChatItemChanged { item: result }];
+        if let Some(item) = s.update_item(chat_id, &call.id, |i| i.status = ItemStatus::Done) {
+            events.push(Event::ChatItemChanged { item });
+        }
+        (events, ())
+    })?;
+    Some(call_id)
+}
+
+/// The library's lessons and notes that mention any word of `prompt`.
+fn library_matches(s: &FakeState, prompt: &str) -> Vec<SearchHit> {
+    let words: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3)
+        .map(str::to_lowercase)
+        .collect();
+    let mentions = |text: &str| {
+        let text = text.to_lowercase();
+        words.iter().any(|w| text.contains(w.as_str()))
+    };
+    let topic = |id: &str| {
+        s.library
+            .topics
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default()
+    };
+    let mut hits = Vec::new();
+    for l in &s.library.lessons {
+        if mentions(&l.title) || mentions(&l.body_md) {
+            hits.push(SearchHit {
+                kind: SearchKind::Lesson,
+                id: l.id.clone(),
+                title: l.title.clone(),
+                context: topic(&l.topic_id),
+                snippet: l.summary.clone(),
+            });
+        }
+    }
+    for n in &s.library.notes {
+        if mentions(&n.title) || mentions(&n.body_md) {
+            hits.push(SearchHit {
+                kind: SearchKind::Note,
+                id: n.id.clone(),
+                title: n.title.clone(),
+                context: topic(&n.topic_id),
+                snippet: n.body_md.chars().take(120).collect(),
+            });
+        }
+    }
+    hits
+}
+
+/// The scripted answer to `prompt` (see the section comment). `retry` is a Continue or
+/// Retry, which never fails again.
+async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry: bool) {
+    let (chat_id, turn_id) = (chat_id.as_str(), turn_id.as_str());
+    let lower = prompt.to_lowercase();
+    let no_key = !fake.state.lock().unwrap().has_api_key;
+    if no_key || (lower.contains("fail") && !retry) {
+        let message = if no_key {
+            "Add an OpenAI API key in Settings first."
+        } else {
+            "The model API answered 500 three times."
+        };
+        step(&fake, chat_id, turn_id, |s| {
+            let error = s.add_item(
+                chat_id,
+                turn_id,
+                ItemStatus::Done,
+                ChatItemKind::Error {
+                    message: message.into(),
+                    retryable: true,
+                },
+            );
+            let chat = s.set_chat_state(
+                chat_id,
+                ChatState::Failed {
+                    turn_id: turn_id.into(),
+                    error: message.into(),
+                },
+            );
+            let mut events = vec![Event::ChatItemChanged { item: error }];
+            events.extend(chat.map(|chat| Event::ChatChanged { chat }));
+            (events, ())
+        });
+        start_pending(&fake, chat_id).await;
+        return;
+    }
+    pace(&fake, 300).await;
+    let Some(_) = streamed_item(
+        &fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::Reasoning {
+            summary: String::new(),
+        },
+        "**Checking the library first**\n\nLooking for lessons and notes that already cover this.",
+    )
+    .await
+    else {
+        return;
+    };
+
+    if lower.contains("delete") {
+        let note = fake.state.lock().unwrap().library.notes.first().cloned();
+        if let Some(note) = note {
+            let args = serde_json::json!({ "note_id": note.id });
+            let Some(call_id) = step(&fake, chat_id, turn_id, |s| (vec![], s.id("call"))) else {
+                return;
+            };
+            step(&fake, chat_id, turn_id, |s| {
+                let call = s.add_item(
+                    chat_id,
+                    turn_id,
+                    ItemStatus::InProgress,
+                    ChatItemKind::ToolCall {
+                        call_id: call_id.clone(),
+                        name: "delete_note".into(),
+                        arguments: args.to_string(),
+                        label: format!("Deleting the note “{}”", note.title),
+                        device: None,
+                    },
+                );
+                let card = s.add_item(
+                    chat_id,
+                    turn_id,
+                    ItemStatus::Done,
+                    ChatItemKind::Card {
+                        call_id: call_id.clone(),
+                        card: Card::Confirmation(ConfirmationCard {
+                            tool: "delete_note".into(),
+                            title: format!("Delete the note “{}”?", note.title),
+                            detail: "The note is deleted. This can't be undone.".into(),
+                            approve_label: "Delete".into(),
+                            decision: Decision::Pending,
+                        }),
+                    },
+                );
+                let (device_id, _) = s.current_device();
+                let chat = s.set_chat_state(
+                    chat_id,
+                    ChatState::WaitingForUser {
+                        turn_id: turn_id.into(),
+                        device_id,
+                        item_id: card.id.clone(),
+                    },
+                );
+                let mut events = vec![
+                    Event::ChatItemChanged { item: call },
+                    Event::ChatItemChanged { item: card },
+                ];
+                events.extend(chat.map(|chat| Event::ChatChanged { chat }));
+                (events, ())
+            });
+            return;
+        }
+    }
+
+    let (hits, query) = {
+        let s = fake.state.lock().unwrap();
+        (library_matches(&s, &prompt), prompt.trim().to_string())
+    };
+    let summary = match hits.len() {
+        0 => "No matches".to_string(),
+        1 => "1 match".to_string(),
+        n => format!("{n} matches"),
+    };
+    if tool_call(
+        &fake,
+        chat_id,
+        turn_id,
+        "search_library",
+        serde_json::json!({ "query": query }),
+        format!("Searching the library for “{query}”"),
+        summary,
+        serde_json::to_string(&hits).unwrap_or_default(),
+    )
+    .await
+    .is_none()
+    {
+        return;
+    }
+
+    if lower.contains("source") {
+        let passages: Vec<Citation> = {
+            let s = fake.state.lock().unwrap();
+            s.library
+                .lessons
+                .iter()
+                .flat_map(|l| l.citations.iter().cloned())
+                .take(3)
+                .collect()
+        };
+        let output = serde_json::to_string(&passages).unwrap_or_default();
+        let Some(call_id) = tool_call(
+            &fake,
+            chat_id,
+            turn_id,
+            "search_sources",
+            serde_json::json!({ "query": query, "topic_id": null, "source_ids": null }),
+            format!("Searching the sources for “{query}”"),
+            format!("{} passages", passages.len()),
+            output,
+        )
+        .await
+        else {
+            return;
+        };
+        if step(&fake, chat_id, turn_id, |s| {
+            let card = s.add_item(
+                chat_id,
+                turn_id,
+                ItemStatus::Done,
+                ChatItemKind::Card {
+                    call_id,
+                    card: Card::Passages(PassagesCard {
+                        query: query.clone(),
+                        passages,
+                    }),
+                },
+            );
+            (vec![Event::ChatItemChanged { item: card }], ())
+        })
+        .is_none()
+        {
+            return;
+        }
+    }
+
+    let answer = if hits.is_empty() {
+        format!(
+            "Nothing in your library mentions **{query}** yet. Ask me to outline a course on it, or add sources to a topic first."
+        )
+    } else {
+        let mut text = format!("Here's what your library has on **{query}**:\n\n");
+        for hit in &hits {
+            let kind = if hit.kind == SearchKind::Lesson {
+                "lesson"
+            } else {
+                "note"
+            };
+            text.push_str(&format!(
+                "- The {kind} *{}* in {}\n",
+                hit.title, hit.context
+            ));
+        }
+        text.push_str("\nAsk me to go deeper into any of them.");
+        text
+    };
+    pace(&fake, 300).await;
+    let hang = fake.state.lock().unwrap().chat_hang;
+    if hang {
+        // Part of the answer, then nothing until Stop.
+        step(&fake, chat_id, turn_id, |s| {
+            let item = s.add_item(
+                chat_id,
+                turn_id,
+                ItemStatus::InProgress,
+                ChatItemKind::AssistantText {
+                    text: "Here's what".into(),
+                },
+            );
+            (vec![Event::ChatItemChanged { item }], ())
+        });
+        return;
+    }
+    if streamed_item(
+        &fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::AssistantText {
+            text: String::new(),
+        },
+        &answer,
+    )
+    .await
+    .is_none()
+    {
+        return;
+    }
+    finish_turn(&fake, chat_id, turn_id).await;
+}
+
+/// The turn ended: usage added, the chat idle, then the pending message, if any.
+async fn finish_turn(fake: &Fake, chat_id: &str, turn_id: &str) {
+    let done = step(fake, chat_id, turn_id, |s| {
+        let chat = s.chat_mut(chat_id).map(|chat| {
+            chat.usage.add(&Usage {
+                input_tokens: 4_200,
+                cached_input_tokens: 3_100,
+                output_tokens: 310,
+                reasoning_tokens: 120,
+                model_calls: 2,
+            });
+            chat.state = ChatState::Idle;
+            chat.updated_at = Utc::now();
+            chat.clone()
+        });
+        (
+            chat.map(|chat| vec![Event::ChatChanged { chat }])
+                .unwrap_or_default(),
+            (),
+        )
+    });
+    if done.is_some() {
+        start_pending(fake, chat_id).await;
+    }
+}
+
+/// Sends the chat's pending message as the next turn, if it has one and isn't busy.
+async fn start_pending(fake: &Fake, chat_id: &str) {
+    let started = {
+        let mut s = fake.state.lock().unwrap();
+        let pending = s
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id && !c.state.is_busy())
+            .and_then(|c| c.pending.clone());
+        pending.map(|p| {
+            let (events, item) = s.start_turn(
+                chat_id,
+                NewMessage {
+                    text: p.text.clone(),
+                    source_ids: p.source_ids,
+                },
+            );
+            (events, item.turn_id, p.text)
+        })
+    };
+    if let Some((events, turn_id, text)) = started {
+        publish_all(fake, events);
+        run_turn_task(fake.clone(), chat_id.into(), turn_id, text, false).await;
+    }
+}
+
+/// Runs the answer: in the background while simulating, else before returning. Boxed:
+/// an answer ends by starting the pending message's turn.
+fn run_turn_task(
+    fake: Fake,
+    chat_id: Id,
+    turn_id: Id,
+    text: String,
+    retry: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let simulate = fake.state.lock().unwrap().simulate;
+        let task = run_answer(fake, chat_id, turn_id, text, retry);
+        if simulate {
+            tokio::spawn(task);
+        } else {
+            task.await;
+        }
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn check_message(message: &NewMessage) -> Result<(), Response> {
+    if message.text.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_message",
+            "Write a message first.",
+        ));
+    }
+    Ok(())
+}
+
+fn chat_detail(s: &FakeState, id: &str) -> Option<ChatDetail> {
+    let chat = s.chats.iter().find(|c| c.id == id)?.clone();
+    let items = s.chat_items.get(id).cloned().unwrap_or_default();
+    Some(ChatDetail { chat, items })
+}
+
+async fn list_chats(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let mut chats = fake.state.lock().unwrap().chats.clone();
+    chats.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+    Json(chats).into_response()
+}
+
+async fn create_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(req): Json<NewChat>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    if let Some(message) = &req.message
+        && let Err(r) = check_message(message)
+    {
+        return r;
+    }
+    let (events, detail, turn) = {
+        let mut s = fake.state.lock().unwrap();
+        let now = Utc::now();
+        let chat = Chat {
+            id: s.id("chat"),
+            title: String::new(),
+            state: ChatState::Idle,
+            workspace_ids: req.workspace_ids,
+            source_ids: vec![],
+            pending: None,
+            usage: Usage::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let id = chat.id.clone();
+        s.chats.push(chat.clone());
+        s.chat_items.insert(id.clone(), vec![]);
+        match req.message {
+            Some(message) => {
+                let text = message.text.clone();
+                let (events, item) = s.start_turn(&id, message);
+                let detail = chat_detail(&s, &id).unwrap();
+                (events, detail, Some((id, item.turn_id, text)))
+            }
+            None => (
+                vec![Event::ChatChanged { chat: chat.clone() }],
+                ChatDetail {
+                    chat,
+                    items: vec![],
+                },
+                None,
+            ),
+        }
+    };
+    publish_all(&fake, events);
+    if let Some((id, turn_id, text)) = turn {
+        run_turn_task(fake.clone(), id, turn_id, text, false).await;
+    }
+    Json(detail).into_response()
+}
+
+async fn get_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    match chat_detail(&fake.state.lock().unwrap(), &id) {
+        Some(detail) => Json(detail).into_response(),
+        None => not_found(),
+    }
+}
+
+async fn patch_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ChatPatch>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let chat = {
+        let mut s = fake.state.lock().unwrap();
+        let Some(chat) = s.chat_mut(&id) else {
+            return not_found();
+        };
+        if let Some(title) = req.title {
+            let title = title.trim();
+            if title.is_empty() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "empty_title",
+                    "A chat needs a title.",
+                );
+            }
+            chat.title = title.chars().take(200).collect();
+        }
+        if let Some(ids) = req.workspace_ids {
+            chat.workspace_ids = ids;
+        }
+        if let Some(ids) = req.source_ids {
+            chat.source_ids = ids;
+        }
+        chat.updated_at = Utc::now();
+        chat.clone()
+    };
+    publish(&fake, Event::ChatChanged { chat: chat.clone() });
+    Json(chat).into_response()
+}
+
+async fn delete_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    {
+        let mut s = fake.state.lock().unwrap();
+        let before = s.chats.len();
+        s.chats.retain(|c| c.id != id);
+        if s.chats.len() == before {
+            return not_found();
+        }
+        if let Some(items) = s.chat_items.remove(&id) {
+            for item in items {
+                s.chat_outputs.remove(&item.id);
+            }
+        }
+    }
+    publish(&fake, Event::ChatDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn send_message(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<NewMessage>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    if let Err(r) = check_message(&req) {
+        return r;
+    }
+    let (events, sent, turn) = {
+        let mut s = fake.state.lock().unwrap();
+        let (device_id, _) = s.current_device();
+        let Some(chat) = s.chat_mut(&id) else {
+            return not_found();
+        };
+        if chat.pending.is_some() {
+            return api_error(
+                StatusCode::CONFLICT,
+                "already_pending",
+                "A message is already waiting to be sent.",
+            );
+        }
+        if chat.state.is_busy() {
+            chat.pending = Some(PendingMessage {
+                text: req.text,
+                source_ids: req.source_ids,
+                device_id,
+                created_at: Utc::now(),
+            });
+            chat.updated_at = Utc::now();
+            let chat = chat.clone();
+            (
+                vec![Event::ChatChanged { chat: chat.clone() }],
+                MessageSent { chat, item: None },
+                None,
+            )
+        } else {
+            let text = req.text.clone();
+            let (events, item) = s.start_turn(&id, req);
+            let chat = s.chats.iter().find(|c| c.id == id).unwrap().clone();
+            let turn = Some((item.turn_id.clone(), text));
+            (
+                events,
+                MessageSent {
+                    chat,
+                    item: Some(item),
+                },
+                turn,
+            )
+        }
+    };
+    publish_all(&fake, events);
+    if let Some((turn_id, text)) = turn {
+        run_turn_task(fake.clone(), id, turn_id, text, false).await;
+    }
+    Json(sent).into_response()
+}
+
+async fn drop_pending(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let chat = {
+        let mut s = fake.state.lock().unwrap();
+        let Some(chat) = s.chat_mut(&id) else {
+            return not_found();
+        };
+        chat.pending = None;
+        chat.updated_at = Utc::now();
+        chat.clone()
+    };
+    publish(&fake, Event::ChatChanged { chat: chat.clone() });
+    Json(chat).into_response()
+}
+
+async fn stop_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (events, chat) = {
+        let mut s = fake.state.lock().unwrap();
+        let Some(chat) = s.chats.iter().find(|c| c.id == id).cloned() else {
+            return not_found();
+        };
+        let (true, Some(turn_id)) = (chat.state.is_busy(), chat.state.turn_id()) else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "not_running",
+                "Nothing is being answered.",
+            );
+        };
+        let turn_id = turn_id.to_string();
+        let mut events = s.cancel_turn(&id, &turn_id, "Cancelled");
+        let action = s.add_item(
+            &id,
+            &turn_id,
+            ItemStatus::Done,
+            ChatItemKind::Action {
+                text: "Stopped by the owner.".into(),
+            },
+        );
+        events.push(Event::ChatItemChanged { item: action });
+        let chat = s.set_chat_state(&id, ChatState::Idle).unwrap();
+        events.push(Event::ChatChanged { chat: chat.clone() });
+        (events, chat)
+    };
+    publish_all(&fake, events);
+    start_pending(&fake, &id).await;
+    let chat = fake
+        .state
+        .lock()
+        .unwrap()
+        .chats
+        .iter()
+        .find(|c| c.id == id)
+        .cloned()
+        .unwrap_or(chat);
+    Json(chat).into_response()
+}
+
+async fn continue_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (chat, turn_id, text) = {
+        let mut s = fake.state.lock().unwrap();
+        let Some(chat) = s.chats.iter().find(|c| c.id == id).cloned() else {
+            return not_found();
+        };
+        let (true, Some(turn_id)) = (chat.state.can_continue(), chat.state.turn_id()) else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "cannot_continue",
+                "There's nothing to continue.",
+            );
+        };
+        let turn_id = turn_id.to_string();
+        let text = s
+            .chat_items
+            .get(&id)
+            .and_then(|items| {
+                items.iter().find_map(|i| match &i.kind {
+                    ChatItemKind::UserMessage { text, .. } if i.turn_id == turn_id => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let (device_id, _) = s.current_device();
+        let chat = s
+            .set_chat_state(
+                &id,
+                ChatState::Running {
+                    turn_id: turn_id.clone(),
+                    device_id,
+                    started_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        (chat, turn_id, text)
+    };
+    publish(&fake, Event::ChatChanged { chat: chat.clone() });
+    run_turn_task(fake.clone(), id, turn_id, text, true).await;
+    Json(chat).into_response()
+}
+
+async fn confirm(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmRequest>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (events, chat, turn_id) = {
+        let mut s = fake.state.lock().unwrap();
+        let Some(chat) = s.chats.iter().find(|c| c.id == id).cloned() else {
+            return not_found();
+        };
+        let ChatState::WaitingForUser {
+            turn_id, item_id, ..
+        } = &chat.state
+        else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "not_waiting",
+                "That question was already answered.",
+            );
+        };
+        if *item_id != req.item_id {
+            return api_error(
+                StatusCode::CONFLICT,
+                "not_waiting",
+                "That question was already answered.",
+            );
+        }
+        let turn_id = turn_id.clone();
+        let (device_id, _) = s.current_device();
+        let mut call_id = String::new();
+        let card = s
+            .update_item(&id, &req.item_id, |i| {
+                if let ChatItemKind::Card {
+                    call_id: c,
+                    card: Card::Confirmation(card),
+                } = &mut i.kind
+                {
+                    call_id = c.clone();
+                    card.decision = if req.approve {
+                        Decision::Approved {
+                            device_id: device_id.clone(),
+                        }
+                    } else {
+                        Decision::Denied {
+                            device_id: device_id.clone(),
+                            by_stop: false,
+                        }
+                    };
+                }
+            })
+            .unwrap();
+        let mut events = vec![Event::ChatItemChanged { item: card }];
+        // The note the call names goes, if approved.
+        let note_id = s.chat_items.get(&id).and_then(|items| {
+            items.iter().find_map(|i| match &i.kind {
+                ChatItemKind::ToolCall {
+                    call_id: c,
+                    arguments,
+                    ..
+                } if *c == call_id => serde_json::from_str::<serde_json::Value>(arguments)
+                    .ok()
+                    .and_then(|v| v["note_id"].as_str().map(str::to_string)),
+                _ => None,
+            })
+        });
+        if req.approve
+            && let Some(note_id) = &note_id
+        {
+            s.library.notes.retain(|n| &n.id != note_id);
+            events.push(Event::NoteDeleted {
+                id: note_id.clone(),
+            });
+        }
+        let (summary, output) = if req.approve {
+            ("Deleted", r#"{"deleted":true}"#.to_string())
+        } else {
+            (
+                "Declined",
+                r#"{"error":"The owner declined: delete the note"}"#.to_string(),
+            )
+        };
+        let result = s.add_item(
+            &id,
+            &turn_id,
+            ItemStatus::Done,
+            ChatItemKind::ToolResult {
+                call_id: call_id.clone(),
+                ok: req.approve,
+                summary: summary.into(),
+                output_bytes: output.len() as u64,
+            },
+        );
+        s.chat_outputs.insert(result.id.clone(), output);
+        events.push(Event::ChatItemChanged { item: result });
+        let call = s.chat_items.get(&id).and_then(|items| {
+            items
+                .iter()
+                .find(|i| matches!(&i.kind, ChatItemKind::ToolCall { call_id: c, .. } if *c == call_id))
+                .map(|i| i.id.clone())
+        });
+        if let Some(call) = call
+            && let Some(item) = s.update_item(&id, &call, |i| i.status = ItemStatus::Done)
+        {
+            events.push(Event::ChatItemChanged { item });
+        }
+        let chat = s
+            .set_chat_state(
+                &id,
+                ChatState::Running {
+                    turn_id: turn_id.clone(),
+                    device_id,
+                    started_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        events.push(Event::ChatChanged { chat: chat.clone() });
+        (events, chat, turn_id)
+    };
+    publish_all(&fake, events);
+    let text = if req.approve {
+        "Done: the note is deleted."
+    } else {
+        "All right, I left the note as it is."
+    };
+    let task = {
+        let fake = fake.clone();
+        let id = id.clone();
+        async move {
+            if streamed_item(
+                &fake,
+                &id,
+                &turn_id,
+                ChatItemKind::AssistantText {
+                    text: String::new(),
+                },
+                text,
+            )
+            .await
+            .is_some()
+            {
+                finish_turn(&fake, &id, &turn_id).await;
+            }
+        }
+    };
+    let simulate = fake.state.lock().unwrap().simulate;
+    if simulate {
+        tokio::spawn(task);
+    } else {
+        task.await;
+    }
+    Json(chat).into_response()
+}
+
+async fn chat_item_output(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    let is_result = s.chat_items.get(&id).is_some_and(|items| {
+        items
+            .iter()
+            .any(|i| i.id == item && matches!(i.kind, ChatItemKind::ToolResult { .. }))
+    });
+    if !is_result {
+        return not_found();
+    }
+    let text = s.chat_outputs.get(&item).cloned().unwrap_or_default();
+    Json(ToolOutputText { text }).into_response()
+}
+
+async fn list_workspaces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    Json(fake.state.lock().unwrap().workspaces.clone()).into_response()
+}
+
+async fn create_workspace(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(req): Json<NewWorkspace>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let workspace = {
+        let mut s = fake.state.lock().unwrap();
+        let (device_id, device_name) = s.current_device();
+        let workspace = Workspace {
+            id: s.id("workspace"),
+            name: req.name,
+            device_id,
+            device_name,
+            platform: req.platform,
+            location: req.location,
+            created_at: Utc::now(),
+        };
+        s.workspaces.push(workspace.clone());
+        workspace
+    };
+    publish(
+        &fake,
+        Event::WorkspaceChanged {
+            workspace: workspace.clone(),
+        },
+    );
+    Json(workspace).into_response()
+}
+
+async fn delete_workspace(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    {
+        let mut s = fake.state.lock().unwrap();
+        let before = s.workspaces.len();
+        s.workspaces.retain(|w| w.id != id);
+        if s.workspaces.len() == before {
+            return not_found();
+        }
+    }
+    publish(&fake, Event::WorkspaceDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]

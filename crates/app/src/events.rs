@@ -1,11 +1,12 @@
 //! The `/api/events` WebSocket: connect with the device token as a Bearer header, read
-//! JSON `Event` frames, and back off between reconnect attempts.
+//! JSON `ServerFrame`s (broadcast `Event`s, and `DirectedFrame`s for this device), and
+//! back off between reconnect attempts.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use margin_shared::Event;
+use margin_shared::ServerFrame;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header::AUTHORIZATION};
@@ -65,14 +66,15 @@ pub async fn connect(events_url: &str, token: &str) -> Result<Socket, ConnectErr
     }
 }
 
-/// Next event from the socket. `None` when the socket closed or failed; frames that do
-/// not parse as an `Event` (from a newer service) are skipped. Pings are answered by
-/// tungstenite itself. Cancel-safe: it only awaits the stream's `next()`.
-pub async fn next_event(socket: &mut Socket) -> Option<Event> {
+/// Next frame from the socket: an event for every device, or a frame addressed to this
+/// one (a device-tool request or its cancellation). `None` when the socket closed or
+/// failed; frames that parse as neither (from a newer service) are skipped. Pings are
+/// answered by tungstenite itself. Cancel-safe: it only awaits the stream's `next()`.
+pub async fn next_frame(socket: &mut Socket) -> Option<ServerFrame> {
     loop {
         match socket.next().await? {
-            Ok(Message::Text(text)) => match serde_json::from_str::<Event>(text.as_str()) {
-                Ok(event) => return Some(event),
+            Ok(Message::Text(text)) => match serde_json::from_str::<ServerFrame>(text.as_str()) {
+                Ok(frame) => return Some(frame),
                 Err(_) => continue,
             },
             Ok(Message::Close(_)) => return None,
@@ -93,7 +95,17 @@ mod tests {
     use super::*;
     use crate::api::Api;
     use crate::fake::{FakeService, TOKEN};
-    use margin_shared::NewNote;
+    use margin_shared::{DeviceToolCall, DirectedFrame, Event, NewNote, ServerFrame, ToolRequest};
+
+    /// The next broadcast event, skipping frames addressed to this device.
+    async fn next_event(socket: &mut Socket) -> Option<Event> {
+        loop {
+            match next_frame(socket).await? {
+                ServerFrame::Event(event) => return Some(event),
+                ServerFrame::Directed(_) => continue,
+            }
+        }
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
@@ -133,6 +145,45 @@ mod tests {
         assert_eq!(
             next_event(&mut socket).await,
             Some(Event::NoteChanged { note })
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_for_this_device_arrive_between_events() {
+        let fake = FakeService::start().await;
+        let mut socket = connect(&Api::with_token(&fake.url, TOKEN).events_url(), TOKEN)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut socket).await,
+            Some(ServerFrame::Event(Event::Hello { .. }))
+        ));
+        let request = DirectedFrame::ToolRequest {
+            request: ToolRequest {
+                request_id: "r1".into(),
+                chat_id: "c1".into(),
+                call_id: "call_1".into(),
+                deadline: chrono::Utc::now(),
+                call: DeviceToolCall::ToggleSidebar { visible: None },
+            },
+        };
+        fake.direct(request.clone());
+        fake.direct(DirectedFrame::ToolCancel {
+            request_id: "r1".into(),
+        });
+        assert_eq!(
+            next_frame(&mut socket).await,
+            Some(ServerFrame::Directed(request))
+        );
+        assert!(matches!(
+            next_frame(&mut socket).await,
+            Some(ServerFrame::Directed(DirectedFrame::ToolCancel { .. }))
+        ));
+        // The socket goes on with events after them.
+        let _ = fake.events.send(Event::ChatDeleted { id: "c1".into() });
+        assert_eq!(
+            next_frame(&mut socket).await,
+            Some(ServerFrame::Event(Event::ChatDeleted { id: "c1".into() }))
         );
     }
 

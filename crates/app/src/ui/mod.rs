@@ -1,8 +1,10 @@
 pub mod ask;
+pub mod chat;
 pub mod citations;
 pub mod common;
 pub mod lesson;
 pub mod notes;
+pub mod outline;
 pub mod search;
 pub mod settings;
 pub mod shell;
@@ -12,3 +14,5 @@ pub mod sources;
 
 #[cfg(test)]
 mod style_tests;
+#[cfg(test)]
+mod test_render;

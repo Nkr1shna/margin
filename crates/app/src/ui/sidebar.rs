@@ -1,11 +1,12 @@
-//! Sidebar: workspace header, Ask, Search, All notes, the topic tree, and the footer.
+//! Sidebar: workspace header, New chat, Search, All notes, the chats, the topic tree,
+//! and the footer.
 
 use dioxus::prelude::*;
-use margin_shared::{Event, Id, LessonPatch, NewTopic, TopicPatch};
+use margin_shared::{ChatPatch, ChatState, Event, Id, LessonPatch, NewTopic, TopicPatch};
 
 use crate::commands::Command;
 use crate::config::Appearance;
-use crate::routes::Route;
+use crate::routes::{Route, chat_title};
 use crate::state::{LoadStatus, use_app};
 use crate::store::{LibraryState, VideoDot};
 use crate::ui::common::{
@@ -26,7 +27,11 @@ enum TreeEdit {
     AddChild(Id),
     Rename(Id),
     RenameLesson(Id),
+    RenameChat(Id),
 }
+
+/// Chats listed before "Show all".
+const RECENT_CHATS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct TreeCtx {
@@ -34,6 +39,7 @@ struct TreeCtx {
     menu: Signal<Option<Id>>,
     delete: Signal<Option<Id>>,
     delete_lesson: Signal<Option<Id>>,
+    delete_chat: Signal<Option<Id>>,
     /// The topic whose Sources dialog is open.
     sources: Signal<Option<Id>>,
     /// The written lesson waiting for "Regenerate" to be confirmed.
@@ -78,6 +84,7 @@ pub fn Sidebar() -> Element {
         menu: Signal::new(None),
         delete: Signal::new(None),
         delete_lesson: Signal::new(None),
+        delete_chat: Signal::new(None),
         sources: Signal::new(None),
         regenerate: Signal::new(None),
         regenerating: Signal::new(None),
@@ -93,6 +100,16 @@ pub fn Sidebar() -> Element {
         .map(|t| t.id.clone())
         .collect();
     let loaded = *app.lib_status.read() == LoadStatus::Loaded;
+    let chats_loaded = lib.chats_loaded;
+    let current_chat = match &route {
+        Route::Chat { id } => Some(id.clone()),
+        _ => None,
+    };
+    let all_chats: Vec<Id> = lib
+        .chats_by_recency()
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
     let login = app
         .session
         .read()
@@ -135,6 +152,24 @@ pub fn Sidebar() -> Element {
         .filter(|id| app.lib.read().topics.contains_key(id));
     let mut delete_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
+    let mut all_shown = use_signal(|| false);
+    let chat_count = all_chats.len();
+    // The most recent few, and the open one wherever it is in the list.
+    let chats: Vec<Id> = if *all_shown.read() {
+        all_chats
+    } else {
+        all_chats
+            .into_iter()
+            .enumerate()
+            .filter(|(i, id)| *i < RECENT_CHATS || current_chat.as_ref() == Some(id))
+            .map(|(_, id)| id)
+            .collect()
+    };
+    let deleting_chat = tree.delete_chat.read().clone();
+    let deleting_chat_title = deleting_chat
+        .as_ref()
+        .and_then(|id| app.lib.read().chats.get(id).map(|c| chat_title(&c.title)));
+    let route_now_chat = route.clone();
 
     rsx! {
         aside {
@@ -187,8 +222,8 @@ pub fn Sidebar() -> Element {
                         nav.push(Route::Ask {});
                     },
                     Icon { name: "spark" }
-                    span { class: "grow", "Ask" }
-                    span { class: "k", {Command::Ask.shortcut()} }
+                    span { class: "grow", "New chat" }
+                    span { class: "k", {Command::NewChat.shortcut()} }
                 }
                 button {
                     class: "row",
@@ -209,6 +244,32 @@ pub fn Sidebar() -> Element {
                     span { class: "k", {Command::AllNotes.shortcut()} }
                 }
             }
+            div { class: "sb-scroll",
+            if chat_count > 0 || !chats_loaded {
+                div { class: "sb-label",
+                    span { id: "chats-label", "Chats" }
+                }
+                if !chats_loaded {
+                    div { class: "skel", style: "margin: 10px 8px; width: 60%" }
+                }
+                ul { class: "tree chat-list", role: "list", "aria-labelledby": "chats-label",
+                    for id in chats {
+                        ChatNode { key: "{id}", id: id.clone() }
+                    }
+                }
+                if chat_count > RECENT_CHATS {
+                    button {
+                        class: "row more-row",
+                        "aria-expanded": all_shown.read().to_string(),
+                        onclick: move |_| all_shown.toggle(),
+                        if *all_shown.read() {
+                            "Show fewer"
+                        } else {
+                            "Show all {chat_count} chats"
+                        }
+                    }
+                }
+            }
             div { class: "sb-label",
                 span { "Topics" }
                 button {
@@ -222,7 +283,6 @@ pub fn Sidebar() -> Element {
                     Icon { name: "plus" }
                 }
             }
-            div { class: "sb-scroll",
                 if let Some(err) = error.read().clone() {
                     div { class: "notice error", role: "alert", style: "margin: 4px 0 8px; font-size: 13px;",
                         span { class: "grow", style: "white-space: normal", "{err}" }
@@ -344,6 +404,42 @@ pub fn Sidebar() -> Element {
         }
         if let Some(id) = sources_open {
             TopicSourcesDialog { key: "{id}", topic_id: id.clone(), on_close: move |_| sources_topic.set(None) }
+        }
+        if let (Some(id), Some(title)) = (deleting_chat.clone(), deleting_chat_title) {
+            ConfirmDialog {
+                title: "Delete “{title}”?",
+                message: "This deletes the chat with its messages, and the files attached only to it. An answer still running stops. This can't be undone.",
+                confirm_label: "Delete chat",
+                busy: *delete_busy.read(),
+                error: delete_error.read().clone(),
+                on_cancel: move |_| {
+                    let mut d = tree.delete_chat;
+                    d.set(None);
+                    delete_error.set(None);
+                },
+                on_confirm: move |_| {
+                    let id = id.clone();
+                    let route = route_now_chat.clone();
+                    async move {
+                        let Some(api) = app.api() else { return };
+                        delete_busy.set(true);
+                        delete_error.set(None);
+                        match api.delete_chat(&id).await {
+                            Ok(()) => {
+                                let open = matches!(&route, Route::Chat { id: open } if *open == id);
+                                app.lib.write().apply(Event::ChatDeleted { id });
+                                let mut d = tree.delete_chat;
+                                d.set(None);
+                                if open {
+                                    nav.replace(Route::Ask {});
+                                }
+                            }
+                            Err(e) => delete_error.set(Some(app.failure(&e))),
+                        }
+                        delete_busy.set(false);
+                    }
+                },
+            }
         }
         if let (Some(id), Some(title)) = (deleting_lesson.clone(), deleting_lesson_title) {
             ConfirmDialog {
@@ -535,6 +631,234 @@ fn LessonNode(
                     }
                 }
             }
+        }
+    }
+}
+
+/// A chat in the sidebar: opens on click; its ⋯ button, a right-click or a long press
+/// offers Rename and Delete. A mark shows a chat that is answering, waiting for the
+/// owner, or stopped on an error or a restart.
+#[component]
+fn ChatNode(id: Id) -> Element {
+    let app = use_app();
+    let nav = navigator();
+    let route = use_route::<Route>();
+    let tree = use_context::<TreeCtx>();
+    let mut edit = tree.edit;
+    let mut menu = tree.menu;
+    let mut delete_chat = tree.delete_chat;
+    let mut error = tree.error;
+    let Some(chat) = app.lib.read().chats.get(&id).cloned() else {
+        return rsx! {};
+    };
+    let title = chat_title(&chat.title);
+    // Menus of chats and topics share one slot; chat ids can't clash with topic ids.
+    let menu_key = format!("chat:{id}");
+    let menu_open = menu.read().as_deref() == Some(menu_key.as_str());
+    let renaming = *edit.read() == TreeEdit::RenameChat(id.clone());
+    let current = matches!(&route, Route::Chat { id: open } if *open == id);
+    let open_menu = {
+        let key = menu_key.clone();
+        move || menu.set(Some(key.clone()))
+    };
+
+    rsx! {
+        li {
+            if renaming {
+                ChatInput { id: id.clone(), initial: chat.title.clone() }
+            } else {
+                div {
+                    class: if current { "tree-row current" } else { "tree-row" },
+                    "data-long-press": "true",
+                    oncontextmenu: {
+                        let mut open_menu = open_menu.clone();
+                        move |e: MouseEvent| {
+                            e.prevent_default();
+                            open_menu();
+                        }
+                    },
+                    button {
+                        class: "row",
+                        "aria-current": current.to_string(),
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                nav.push(Route::Chat { id: id.clone() });
+                            }
+                        },
+                        Icon { name: "chat", class: "leaf-ic" }
+                        span { class: "grow", "{title}" }
+                        span { class: "sr-only", {chat_state_text(&chat.state)} }
+                        match &chat.state {
+                            ChatState::Running { .. } => rsx! { span { class: "spinner xs", title: "Answering", "aria-hidden": "true" } },
+                            ChatState::WaitingForUser { .. } => rsx! { span { class: "dot warn", title: "Waiting for your answer", "aria-hidden": "true" } },
+                            ChatState::Failed { .. } => rsx! {
+                                span { class: "row-flag bad", title: "Stopped on an error", "aria-hidden": "true",
+                                    Icon { name: "alert" }
+                                }
+                            },
+                            ChatState::Interrupted { .. } => rsx! { span { class: "dot warn", title: "Interrupted", "aria-hidden": "true" } },
+                            ChatState::Idle => rsx! {},
+                        }
+                    }
+                    button {
+                        class: "icon-btn sm more",
+                        "aria-label": "Actions for {title}",
+                        "aria-haspopup": "menu",
+                        "aria-expanded": menu_open.to_string(),
+                        onclick: {
+                            let mut open_menu = open_menu.clone();
+                            move |_| if menu_open { menu.set(None) } else { open_menu() }
+                        },
+                        Icon { name: "more" }
+                    }
+                }
+            }
+            if menu_open {
+                div { class: "pop-scrim", onclick: move |_| menu.set(None) }
+                div {
+                    class: "menu right",
+                    role: "menu",
+                    onkeydown: move |e: KeyboardEvent| {
+                        if e.key() == Key::Escape {
+                            e.stop_propagation();
+                            menu.set(None);
+                        }
+                    },
+                    // The full name, cut off in the row: shown when a long press opened the menu.
+                    div { class: "menu-title", "aria-hidden": "true", "{title}" }
+                    button {
+                        role: "menuitem",
+                        onmounted: focus_on_mount,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                error.set(None);
+                                edit.set(TreeEdit::RenameChat(id.clone()));
+                            }
+                        },
+                        Icon { name: "edit" }
+                        "Rename"
+                    }
+                    div { class: "sep", role: "separator" }
+                    button {
+                        role: "menuitem",
+                        class: "danger",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                delete_chat.set(Some(id.clone()));
+                            }
+                        },
+                        Icon { name: "trash" }
+                        "Delete…"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A chat row's state in words (the row shows it as a mark).
+fn chat_state_text(state: &ChatState) -> &'static str {
+    match state {
+        ChatState::Idle => "",
+        ChatState::Running { .. } => ", answering",
+        ChatState::WaitingForUser { .. } => ", waiting for your answer",
+        ChatState::Interrupted { .. } => ", interrupted",
+        ChatState::Failed { .. } => ", stopped on an error",
+    }
+}
+
+/// Inline field renaming a chat. Enter or leaving the field saves; Escape cancels.
+#[component]
+fn ChatInput(id: Id, initial: String) -> Element {
+    let app = use_app();
+    let tree = use_context::<TreeCtx>();
+    let mut value = use_signal(|| initial.clone());
+    let mut busy = use_signal(|| false);
+    // A failed save: shown under the field, which stays open to fix or retry.
+    let mut field_error = use_signal(|| None::<String>);
+    let commit = {
+        let id = id.clone();
+        let initial = initial.clone();
+        move || {
+            let id = id.clone();
+            let initial = initial.clone();
+            async move {
+                if *busy.peek() {
+                    return;
+                }
+                let mut edit = tree.edit;
+                let title = value.peek().trim().to_string();
+                if title.is_empty() || title == initial {
+                    edit.set(TreeEdit::None);
+                    return;
+                }
+                let Some(api) = app.api() else { return };
+                let patch = ChatPatch {
+                    title: Some(title),
+                    ..Default::default()
+                };
+                busy.set(true);
+                let result = api.patch_chat(&id, &patch).await;
+                busy.set(false);
+                match result {
+                    Ok(chat) => {
+                        let mut lib = app.lib;
+                        lib.write().upsert_chat(chat);
+                        edit.set(TreeEdit::None);
+                    }
+                    Err(e) => {
+                        field_error.set(Some(app.failure(&e)));
+                        focus_first("#tree-edit");
+                    }
+                }
+            }
+        }
+    };
+    let on_blur = commit.clone();
+    let invalid = field_error.read().is_some();
+    rsx! {
+        input {
+            id: "tree-edit",
+            class: "input tree-input",
+            "aria-label": "Chat title",
+            "aria-invalid": invalid.to_string(),
+            "aria-describedby": invalid.then_some("tree-edit-err"),
+            "aria-busy": busy.read().to_string(),
+            readonly: *busy.read(),
+            onmounted: focus_on_mount,
+            initial_value: "{initial}",
+            oninput: move |e| {
+                field_error.set(None);
+                value.set(e.value());
+            },
+            onkeydown: move |e: KeyboardEvent| {
+                match e.key() {
+                    Key::Enter => {
+                        spawn(commit());
+                    }
+                    Key::Escape => {
+                        e.stop_propagation();
+                        let mut edit = tree.edit;
+                        edit.set(TreeEdit::None);
+                    }
+                    _ => {}
+                }
+            },
+            onblur: move |_| {
+                // Not again while the last try's error is showing (Enter retries).
+                if *tree.edit.peek() == TreeEdit::None || field_error.peek().is_some() {
+                    return;
+                }
+                spawn(on_blur());
+            },
+        }
+        if let Some(err) = field_error.read().clone() {
+            span { id: "tree-edit-err", class: "field-error tree-error", role: "alert", "{err}" }
         }
     }
 }
@@ -1108,6 +1432,54 @@ mod tests {
             "fourier"
         ));
         assert!(!route_in_topic(&lib, &scoped, "linalg"));
+    }
+
+    #[test]
+    fn chat_state_reads_as_words() {
+        assert_eq!(chat_state_text(&ChatState::Idle), "");
+        assert_eq!(
+            chat_state_text(&ChatState::Interrupted {
+                turn_id: "t".into()
+            }),
+            ", interrupted"
+        );
+    }
+
+    #[test]
+    fn sidebar_lists_recent_chats_with_their_state() {
+        use crate::ui::test_render::render_route;
+        let mut lib = lib();
+        let chats = crate::fake::sample_chats();
+        lib.replace_chats(chats.into_iter().map(|(c, _)| c).collect());
+        let html = render_route("/notes", lib.clone());
+        assert!(html.contains(r#"id="chats-label""#));
+        assert!(html.contains("How do Fourier series converge?"));
+        // An interrupted chat says so (to screen readers in words).
+        assert!(html.contains(", interrupted"));
+        // Every row has its ⋯ menu button and opens its menu on a long press too.
+        assert!(html.contains(r#"aria-label="Actions for Explain eigenvectors with a picture""#));
+        assert!(html.contains(r#"data-long-press="true""#));
+        // Touch can always start one: the New chat row with its shortcut.
+        assert!(html.contains("New chat"));
+        assert!(!html.contains("Show all"));
+
+        // Many chats: the recent ones, then Show all.
+        let template = lib.chats["c1"].clone();
+        let mut many = Vec::new();
+        for n in 0..12 {
+            let mut chat = template.clone();
+            chat.id = format!("m{n}");
+            chat.title = format!("Chat number {n}");
+            chat.updated_at = template.updated_at + chrono::Duration::seconds(n);
+            many.push(chat);
+        }
+        lib.replace_chats(many);
+        let html = render_route("/chat/m0", lib);
+        assert!(html.contains("Show all 12 chats"), "{html}");
+        assert!(html.contains("Chat number 11"));
+        assert!(!html.contains("Chat number 3<"));
+        // The open chat is listed though it's the oldest.
+        assert!(html.contains("Chat number 0"));
     }
 
     #[test]

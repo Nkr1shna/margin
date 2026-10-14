@@ -2,11 +2,12 @@
 //! applying every [`Event`] from the `/api/events` socket. Pure data: no Dioxus here,
 //! so the reducer is unit-tested directly.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use margin_shared::{
-    Chat, ChatItem, Device, EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note,
-    Proposal, ProposalStatus, Settings, Source, Topic, Video, VideoStatus, Workspace,
+    Chat, ChatDetail, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id, ItemStatus,
+    Lesson, LessonStatus, Library, Note, Proposal, ProposalStatus, Settings, Source, Topic, Video,
+    VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -26,9 +27,15 @@ pub struct LibraryState {
     /// Chats for the sidebar (`GET /api/chats`), kept current by `ChatChanged` /
     /// `ChatDeleted`.
     pub chats: BTreeMap<Id, Chat>,
+    /// Whether `chats` holds the service's list yet (the sidebar says "No chats yet" only
+    /// then).
+    pub chats_loaded: bool,
     /// Transcripts of the chats opened this session (`GET /api/chats/{id}`), each ordered
     /// by `seq`. Item events update only transcripts that are loaded.
     pub chat_items: BTreeMap<Id, Vec<ChatItem>>,
+    /// Loaded transcripts that missed something (a delta past the text they have, or for
+    /// an item they don't have): the chat screen fetches them again.
+    pub stale_chats: BTreeSet<Id>,
     /// Attached folders of every device (`GET /api/workspaces`).
     pub workspaces: BTreeMap<Id, Workspace>,
     /// Devices once fetched (`GET /api/devices`), with presence from `DeviceChanged`.
@@ -82,6 +89,52 @@ impl LibraryState {
             .collect();
     }
 
+    /// The service's chat list (`GET /api/chats`). Transcripts already loaded stay,
+    /// unless their chat is gone.
+    pub fn replace_chats(&mut self, chats: Vec<Chat>) {
+        self.chats = chats.into_iter().map(|c| (c.id.clone(), c)).collect();
+        self.chats_loaded = true;
+        let chats = &self.chats;
+        self.chat_items.retain(|id, _| chats.contains_key(id));
+    }
+
+    /// A chat as the answer to a request brought it. Events may have brought a newer copy
+    /// while the request was out, so the newer `updated_at` wins.
+    pub fn upsert_chat(&mut self, chat: Chat) {
+        match self.chats.get(&chat.id) {
+            Some(known) if known.updated_at > chat.updated_at => {}
+            _ => {
+                self.chats.insert(chat.id.clone(), chat);
+            }
+        }
+    }
+
+    /// An item as the answer to a request brought it (the message just sent), merged like
+    /// a fetched transcript's. Ignored while the chat's transcript isn't loaded.
+    pub fn upsert_chat_item(&mut self, item: ChatItem) {
+        if let Some(items) = self.chat_items.get_mut(&item.chat_id) {
+            merge_items(items, vec![item]);
+        }
+    }
+
+    /// A chat and its transcript from `GET /api/chats/{id}` (or `POST /api/chats`).
+    /// Items that events changed while the request was out keep their newer state, and
+    /// items only events brought stay.
+    pub fn load_chat(&mut self, detail: ChatDetail) {
+        let id = detail.chat.id.clone();
+        self.upsert_chat(detail.chat);
+        let items = self.chat_items.entry(id.clone()).or_default();
+        merge_items(items, detail.items);
+        self.stale_chats.remove(&id);
+    }
+
+    /// Chats for the sidebar, the most recently active first.
+    pub fn chats_by_recency(&self) -> Vec<&Chat> {
+        let mut chats: Vec<&Chat> = self.chats.values().collect();
+        chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+        chats
+    }
+
     pub fn apply(&mut self, event: Event) {
         match event {
             Event::Hello { server_version } => self.server_version = Some(server_version),
@@ -128,6 +181,7 @@ impl LibraryState {
             Event::ChatDeleted { id } => {
                 self.chats.remove(&id);
                 self.chat_items.remove(&id);
+                self.stale_chats.remove(&id);
             }
             Event::ChatItemChanged { item } => {
                 if let Some(items) = self.chat_items.get_mut(&item.chat_id) {
@@ -146,13 +200,18 @@ impl LibraryState {
                 offset,
                 text,
             } => {
-                if let Some(item) = self
-                    .chat_items
-                    .get_mut(&chat_id)
-                    .and_then(|items| items.iter_mut().find(|i| i.id == item_id))
-                {
-                    // A gap fills in with the item's next ChatItemChanged.
-                    item.kind.apply_delta(offset, &text);
+                let Some(items) = self.chat_items.get_mut(&chat_id) else {
+                    return;
+                };
+                let outcome = items
+                    .iter_mut()
+                    .find(|i| i.id == item_id)
+                    .map(|item| item.kind.apply_delta(offset, &text));
+                // Missed text, or an item this copy never heard of: the item's next
+                // ChatItemChanged fills it in, and the open chat is fetched again so
+                // the answer doesn't stall until then.
+                if matches!(outcome, None | Some(DeltaOutcome::Gap)) {
+                    self.stale_chats.insert(chat_id);
                 }
             }
             Event::WorkspaceChanged { workspace } => {
@@ -440,6 +499,29 @@ pub enum Stage {
 }
 
 pub type Milestones = BTreeMap<Work, Stage>;
+
+/// Merges fetched `items` into a loaded transcript by id, kept in `seq` order. The copy
+/// already there wins when it is newer, or when it is the same item still streaming with
+/// more text than the fetched one (deltas that arrived after the fetch was answered).
+fn merge_items(items: &mut Vec<ChatItem>, fetched: Vec<ChatItem>) {
+    let streamed = |i: &ChatItem| i.kind.streaming_text().map_or(0, str::len);
+    for item in fetched {
+        match items.iter_mut().find(|i| i.id == item.id) {
+            Some(existing) => {
+                let further = existing.status == ItemStatus::InProgress
+                    && item.status == ItemStatus::InProgress
+                    && streamed(existing) > streamed(&item);
+                if existing.updated_at <= item.updated_at && !further {
+                    *existing = item;
+                }
+            }
+            None => {
+                let at = items.partition_point(|i| i.seq < item.seq);
+                items.insert(at, item);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -982,6 +1064,142 @@ pub(crate) mod tests {
 
         s.apply(Event::ChatDeleted { id: "c1".into() });
         assert!(s.chats.is_empty() && s.chat_items.is_empty());
+    }
+
+    fn chat_at(id: &str, updated: i64) -> Chat {
+        Chat {
+            id: id.into(),
+            title: id.into(),
+            state: ChatState::Idle,
+            workspace_ids: vec![],
+            source_ids: vec![],
+            pending: None,
+            usage: Default::default(),
+            created_at: ts(0),
+            updated_at: ts(updated),
+        }
+    }
+
+    fn text(id: &str, seq: u64, status: ItemStatus, text: &str, updated: i64) -> ChatItem {
+        let mut item = chat_item(id, seq, ChatItemKind::AssistantText { text: text.into() });
+        item.status = status;
+        item.updated_at = ts(updated);
+        item
+    }
+
+    #[test]
+    fn chat_list_replaces_and_orders_by_recency() {
+        let mut s = sample();
+        assert!(!s.chats_loaded);
+        s.chat_items.insert("gone".into(), vec![]);
+        s.chat_items.insert("b".into(), vec![]);
+        s.replace_chats(vec![chat_at("a", 5), chat_at("b", 9), chat_at("c", 1)]);
+        assert!(s.chats_loaded);
+        let order: Vec<&str> = s.chats_by_recency().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(order, ["b", "a", "c"]);
+        // A transcript whose chat is gone goes too; the others stay loaded.
+        assert!(!s.chat_items.contains_key("gone"));
+        assert!(s.chat_items.contains_key("b"));
+        // An older copy from a slow request doesn't undo a newer event.
+        s.upsert_chat(chat_at("b", 3));
+        assert_eq!(s.chats["b"].updated_at, ts(9));
+        s.upsert_chat(chat_at("b", 12));
+        assert_eq!(s.chats["b"].updated_at, ts(12));
+    }
+
+    #[test]
+    fn a_fetched_transcript_merges_with_what_events_brought() {
+        let mut s = sample();
+        // Opened: events apply while the request is out.
+        s.chat_items.insert("c1".into(), vec![]);
+        s.stale_chats.insert("c1".into());
+        s.apply(Event::ChatItemChanged {
+            item: text("i2", 2, ItemStatus::InProgress, "Hel", 5),
+        });
+        s.apply(Event::ChatItemDelta {
+            chat_id: "c1".into(),
+            item_id: "i2".into(),
+            offset: 3,
+            text: "lo th".into(),
+        });
+        s.apply(Event::ChatItemChanged {
+            item: text("i3", 3, ItemStatus::Done, "later", 9),
+        });
+        let user = chat_item(
+            "i1",
+            1,
+            ChatItemKind::UserMessage {
+                text: "hi".into(),
+                source_ids: vec![],
+                device_id: "d1".into(),
+                device_name: "Mac".into(),
+            },
+        );
+        // The service's copy was taken before the last delta and before i3 existed.
+        s.load_chat(ChatDetail {
+            chat: chat_at("c1", 4),
+            items: vec![user, text("i2", 2, ItemStatus::InProgress, "Hello", 5)],
+        });
+        let items = &s.chat_items["c1"];
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["i1", "i2", "i3"]
+        );
+        assert_eq!(items[1].kind.streaming_text(), Some("Hello th"));
+        assert!(s.stale_chats.is_empty());
+        // A fetched copy that finished replaces the streaming one.
+        s.load_chat(ChatDetail {
+            chat: chat_at("c1", 10),
+            items: vec![text("i2", 2, ItemStatus::Done, "Hello there.", 8)],
+        });
+        assert_eq!(
+            s.chat_items["c1"][1].kind.streaming_text(),
+            Some("Hello there.")
+        );
+        assert_eq!(s.chat_items["c1"][1].status, ItemStatus::Done);
+        // The message just sent joins the transcript in place.
+        let mut sent = chat_item(
+            "i4",
+            4,
+            ChatItemKind::UserMessage {
+                text: "more".into(),
+                source_ids: vec![],
+                device_id: "d1".into(),
+                device_name: "Mac".into(),
+            },
+        );
+        sent.status = ItemStatus::Done;
+        s.upsert_chat_item(sent);
+        assert_eq!(s.chat_items["c1"].len(), 4);
+    }
+
+    #[test]
+    fn missed_deltas_mark_the_transcript_for_a_fetch() {
+        let mut s = sample();
+        let delta = |item: &str, offset| Event::ChatItemDelta {
+            chat_id: "c1".into(),
+            item_id: item.into(),
+            offset,
+            text: "x".into(),
+        };
+        // Not open: nothing to fetch.
+        s.apply(delta("i1", 0));
+        assert!(s.stale_chats.is_empty());
+        s.chat_items.insert(
+            "c1".into(),
+            vec![text("i1", 1, ItemStatus::InProgress, "ab", 1)],
+        );
+        s.apply(delta("i1", 2));
+        assert!(s.stale_chats.is_empty());
+        // Past the text it has.
+        s.apply(delta("i1", 9));
+        assert!(s.stale_chats.contains("c1"));
+        s.stale_chats.clear();
+        // For an item it never heard of.
+        s.apply(delta("i7", 0));
+        assert!(s.stale_chats.contains("c1"));
+        s.apply(Event::ChatDeleted { id: "c1".into() });
+        assert!(s.stale_chats.is_empty());
     }
 
     #[test]

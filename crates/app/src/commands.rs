@@ -8,8 +8,8 @@
 pub enum Command {
     /// Cmd+K (Ctrl+K off Apple platforms).
     Search,
-    /// Cmd+N.
-    Ask,
+    /// Cmd+N: a new chat.
+    NewChat,
     /// Shift+Cmd+N.
     AllNotes,
     /// Cmd+,
@@ -25,7 +25,7 @@ pub enum Command {
 impl Command {
     pub const ALL: [Command; 7] = [
         Command::Search,
-        Command::Ask,
+        Command::NewChat,
         Command::AllNotes,
         Command::Settings,
         Command::Back,
@@ -36,7 +36,7 @@ impl Command {
     pub fn slug(self) -> &'static str {
         match self {
             Command::Search => "search",
-            Command::Ask => "ask",
+            Command::NewChat => "ask",
             Command::AllNotes => "notes",
             Command::Settings => "settings",
             Command::Back => "back",
@@ -53,7 +53,7 @@ impl Command {
     pub fn key(self) -> &'static str {
         match self {
             Command::Search => "K",
-            Command::Ask | Command::AllNotes => "N",
+            Command::NewChat | Command::AllNotes => "N",
             Command::Settings => ",",
             Command::Back => "[",
             Command::Forward => "]",
