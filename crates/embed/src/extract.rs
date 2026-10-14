@@ -1,18 +1,23 @@
-//! Text from source files. Text and code are decoded as UTF-8 (lossy) with newlines
+//! Reading source files. Text and code are decoded as UTF-8 (lossy) with newlines
 //! normalized; Jupyter notebooks become their cells' sources and HTML loses its markup.
 //! Notebooks and HTML are recognized by extension or, for files stored without one, by
-//! their first bytes. PDFs are read in `pdf.rs`.
+//! their first bytes. PDFs are read in `pdf.rs`, images with ImageIO (`image.rs`), audio
+//! and video with AVFoundation (`av.rs`).
 
 use std::path::Path;
 
 use crate::{EmbedError, Extracted, Page, SourceKind};
 
-pub(crate) fn extract(path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
+pub(crate) fn extract(
+    path: &Path,
+    kind: SourceKind,
+    media_dir: &Path,
+) -> Result<Extracted, EmbedError> {
     match kind {
-        SourceKind::Pdf => pdf(path),
-        SourceKind::Image | SourceKind::Audio | SourceKind::Video => Err(EmbedError::Extract(
-            "Images, audio and video aren't read yet.".into(),
-        )),
+        SourceKind::Pdf => pdf(path, media_dir),
+        SourceKind::Image => image(path),
+        SourceKind::Audio => audio(path),
+        SourceKind::Video => video(path, media_dir),
         SourceKind::Text | SourceKind::Code => {
             let bytes = std::fs::read(path).map_err(|e| EmbedError::Extract(e.to_string()))?;
             let text = normalize_newlines(&String::from_utf8_lossy(&bytes));
@@ -31,19 +36,106 @@ pub(crate) fn extract(path: &Path, kind: SourceKind) -> Result<Extracted, EmbedE
             };
             Ok(Extracted {
                 pages: vec![Page { number: None, text }],
+                ..Default::default()
             })
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn pdf(path: &Path) -> Result<Extracted, EmbedError> {
-    crate::pdf::extract(path)
+fn pdf(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
+    crate::pdf::extract(path, Some(media_dir))
+}
+
+/// The image itself is the picture; decoding it now finds a broken file early.
+#[cfg(target_os = "macos")]
+fn image(path: &Path) -> Result<Extracted, EmbedError> {
+    let image = crate::image::load(path, Some(64))?;
+    let (width, height) = crate::image::size(&image);
+    if width == 0 || height == 0 {
+        return Err(EmbedError::Extract("the image is empty".into()));
+    }
+    Ok(Extracted {
+        pictures: vec![crate::Picture {
+            path: path.to_path_buf(),
+            page: None,
+            at_ms: None,
+            tokens: crate::ImageTokens::High,
+        }],
+        ..Default::default()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio(path: &Path) -> Result<Extracted, EmbedError> {
+    let Some(samples) = crate::av::sound(path)? else {
+        return Err(EmbedError::Extract("there's no sound in this file".into()));
+    };
+    if samples.is_empty() {
+        return Err(EmbedError::Extract("there's no sound in this file".into()));
+    }
+    Ok(Extracted {
+        duration_ms: Some(crate::sample_ms(samples.len())),
+        sound: Some(samples),
+        ..Default::default()
+    })
+}
+
+/// Frames at `frame_times` as JPEGs in `media_dir`, plus the soundtrack if there is one.
+#[cfg(target_os = "macos")]
+fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
+    if !crate::av::has_video(path)? {
+        return Err(EmbedError::Extract(
+            "there's no picture in this video".into(),
+        ));
+    }
+    let duration = crate::av::duration_ms(path)?;
+    let (_, times) = crate::frame_times(duration);
+    std::fs::create_dir_all(media_dir)?;
+    let mut pictures = Vec::new();
+    crate::av::frames(path, &times, &mut |ms, image| {
+        let file = media_dir.join(crate::frame_file(ms));
+        crate::image::write(image, &file, crate::image::Format::Jpeg(0.8))?;
+        pictures.push(crate::Picture {
+            path: file,
+            page: None,
+            at_ms: Some(ms),
+            tokens: crate::ImageTokens::Medium,
+        });
+        Ok(())
+    })?;
+    if pictures.is_empty() {
+        return Err(EmbedError::Extract(
+            "couldn't take any pictures from this video".into(),
+        ));
+    }
+    let sound = crate::av::sound(path)?.filter(|s| !s.is_empty());
+    Ok(Extracted {
+        pictures,
+        sound,
+        duration_ms: Some(duration),
+        ..Default::default()
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pdf(_path: &Path) -> Result<Extracted, EmbedError> {
+fn pdf(_path: &Path, _media_dir: &Path) -> Result<Extracted, EmbedError> {
     Err(EmbedError::Extract("reading PDFs needs macOS".into()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn image(_path: &Path) -> Result<Extracted, EmbedError> {
+    Err(EmbedError::Extract("reading images needs macOS".into()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio(_path: &Path) -> Result<Extracted, EmbedError> {
+    Err(EmbedError::Extract("reading audio needs macOS".into()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn video(_path: &Path, _media_dir: &Path) -> Result<Extracted, EmbedError> {
+    Err(EmbedError::Extract("reading video needs macOS".into()))
 }
 
 fn normalize_newlines(text: &str) -> String {
@@ -227,7 +319,7 @@ mod tests {
     }
 
     fn text_of(path: &Path, kind: SourceKind) -> String {
-        let doc = extract(path, kind).unwrap();
+        let doc = extract(path, kind, Path::new("/nonexistent")).unwrap();
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].number, None);
         doc.pages[0].text.clone()
@@ -288,7 +380,12 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_an_extract_error() {
-        let err = extract(Path::new("/nonexistent/margin.txt"), SourceKind::Text).unwrap_err();
+        let err = extract(
+            Path::new("/nonexistent/margin.txt"),
+            SourceKind::Text,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
         assert!(matches!(err, EmbedError::Extract(_)));
     }
 }

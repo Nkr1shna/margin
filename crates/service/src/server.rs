@@ -203,6 +203,7 @@ pub fn router(state: AppState) -> Router {
         .route(routes::AUTH_POLL, post(auth::poll))
         .route(routes::AUTH_GITHUB_CALLBACK, get(auth::github_callback))
         .route("/media/videos/{id}/{file}", get(media::serve))
+        .route("/media/sources/{id}/{file}", get(media::serve_source))
         .merge(api)
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(state.clone(), log_requests))
@@ -277,6 +278,9 @@ pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
             LessonStatus::Generating => {
                 if let Some(prev) = row.previous_body.take() {
                     row.lesson.body_md = prev;
+                }
+                if let Some(prev) = row.previous_citations.take() {
+                    row.lesson.citations = prev;
                 }
                 row.lesson.status = LessonStatus::Failed {
                     error: INTERRUPTED.into(),

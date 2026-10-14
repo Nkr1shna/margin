@@ -7,11 +7,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use margin_ai::{AiError, LessonContext, Passage, ResponsesClient, SceneRequest};
-use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles};
+use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{AskRequest, Outline, SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Longer side of a picture sent to the lesson writer: enough for the Responses API's
+/// high detail (which scales to 2048 px, then 768 px on the shorter side) without
+/// sending more than it reads.
+pub const WRITER_IMAGE_SIDE: usize = 1536;
 
 /// Where and how to call the Responses API. Built per job from Settings + Keychain.
 #[derive(Clone)]
@@ -147,8 +152,24 @@ pub trait SourceTools: Send + Sync + 'static {
     fn remove(&self, files: &ModelFiles) -> Result<(), EmbedError>;
     /// Loads the downloaded model. Blocking.
     fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError>;
-    /// A source file's text. Blocking.
-    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError>;
+    /// Reads a source file: its text, its pictures (rendered pages and video frames are
+    /// written into `media_dir` as `page_file`/`frame_file`) and its sound. Blocking.
+    fn extract(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError>;
+    /// What is said in 16 kHz mono `samples`, word by word, using `work_dir` for
+    /// temporary files. `Ok(None)` when no speech recognizer is installed. Blocking.
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        work_dir: &Path,
+    ) -> Result<Option<Transcript>, EmbedError>;
+    /// An image file as the lesson writer is shown it: (media type, bytes), at most
+    /// `WRITER_IMAGE_SIDE` px. Blocking.
+    fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError>;
     /// Cuts extracted text into chunks of at most `max_tokens`.
     fn chunk(
         &self,
@@ -213,8 +234,30 @@ impl SourceTools for EmbedTools {
         ))
     }
 
-    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
-        margin_embed::extract(path, kind)
+    fn extract(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError> {
+        margin_embed::extract(path, kind, media_dir)
+    }
+
+    /// With `fluidaudiocli` (Parakeet), found like the video pipeline finds it.
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        work_dir: &Path,
+    ) -> Result<Option<Transcript>, EmbedError> {
+        let Some(cli) = margin_embed::find_fluidaudiocli() else {
+            return Ok(None);
+        };
+        margin_embed::transcribe(&cli, samples, work_dir).map(Some)
+    }
+
+    fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {
+        let jpeg = margin_embed::jpeg_for_model(path, WRITER_IMAGE_SIDE)?;
+        Ok(("image/jpeg".to_string(), jpeg))
     }
 
     fn chunk(

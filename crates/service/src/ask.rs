@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use margin_ai::LessonContext;
+use margin_ai::{LessonContext, Passage};
 use margin_shared::{
     AcceptProposal, AskRequest, Event, Id, Lesson, LessonStatus, Outline, OutlineLesson, Proposal,
     ProposalStatus, Source, Topic,
@@ -125,12 +125,16 @@ async fn draft_outline(state: &AppState, id: &str) -> Result<Outline, String> {
     };
     let ai = state.ai_config().await.map_err(|e| e.message)?;
     let subjects = root_subjects(state).await.map_err(|e| e.to_string())?;
-    let passages = sources::passages(
+    // Outlines see the passages (pictures included) but don't cite them.
+    let passages: Vec<Passage> = sources::passages(
         state,
         &proposal.request.source_ids,
         &proposal.request.prompt,
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|r| r.passage)
+    .collect();
     let outline = state
         .generator
         .propose_outline(&ai, &proposal.request, &subjects, &passages)
@@ -284,10 +288,13 @@ pub async fn accept(
                 },
                 proposal_id: Some(proposal.id.clone()),
                 previous_body: None,
+                previous_citations: None,
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
-            events.push(Event::LessonChanged { lesson: row.lesson });
+            events.push(Event::LessonChanged {
+                lesson: state.public_lesson(&row.lesson),
+            });
         }
 
         // The Ask's sources now belong to the new topic.
@@ -336,7 +343,7 @@ pub async fn regenerate(
     };
     state.emit_lesson(&lesson);
     spawn_lesson_job(&state, id, false);
-    Ok(Json(lesson))
+    Ok(Json(state.public_lesson(&lesson)))
 }
 
 /// Starts writing a Queued lesson in the background (at most three at once).
@@ -372,7 +379,7 @@ async fn run_lesson_job(state: AppState, lesson_id: Id, first_write: bool) {
 async fn lesson_context(
     state: &AppState,
     row: &StoredLesson,
-) -> anyhow::Result<(LessonContext, Option<Proposal>)> {
+) -> anyhow::Result<(LessonContext, Option<Proposal>, Vec<sources::Retrieved>)> {
     let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
     let topic = topics.iter().find(|t| t.id == row.lesson.topic_id);
     let topic_title = topic.map(|t| t.title.clone()).unwrap_or_default();
@@ -422,7 +429,8 @@ async fn lesson_context(
         row.lesson.summary,
         prompt.trim()
     );
-    let passages = sources::passages(state, &source_ids, &query).await;
+    let retrieved = sources::passages(state, &source_ids, &query).await;
+    let passages = retrieved.iter().map(|r| r.passage.clone()).collect();
 
     let ctx = LessonContext {
         subject_title,
@@ -434,7 +442,7 @@ async fn lesson_context(
         index,
         passages,
     };
-    Ok((ctx, proposal))
+    Ok((ctx, proposal, retrieved))
 }
 
 async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> anyhow::Result<()> {
@@ -460,7 +468,9 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         };
         if !row.lesson.body_md.is_empty() {
             row.previous_body = Some(std::mem::take(&mut row.lesson.body_md));
+            row.previous_citations = Some(std::mem::take(&mut row.lesson.citations));
         }
+        row.lesson.citations.clear();
         row.lesson.status = LessonStatus::Generating;
         row.lesson.updated_at = Utc::now();
         state.store.put(db::LESSON, lesson_id, &row).await?;
@@ -468,7 +478,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         (row, ai)
     };
     let (row, ai) = row;
-    let (ctx, proposal) = lesson_context(state, &row).await?;
+    let (ctx, proposal, retrieved) = lesson_context(state, &row).await?;
 
     let partial = Arc::new(Mutex::new(String::new()));
     let saver = tokio::spawn(save_partial_bodies(
@@ -506,18 +516,29 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         };
         match &result {
             Ok(body) => {
-                row.lesson.body_md = body.clone();
+                // Footnotes renumbered in reading order, with what they point at.
+                (row.lesson.body_md, row.lesson.citations) = sources::cite(body, &retrieved);
                 row.lesson.status = LessonStatus::Ready;
             }
             Err(e) => {
-                let streamed = partial.lock().unwrap().clone();
-                row.lesson.body_md = row.previous_body.clone().unwrap_or(streamed);
+                match (row.previous_body.clone(), row.previous_citations.clone()) {
+                    (Some(body), citations) => {
+                        row.lesson.body_md = body;
+                        row.lesson.citations = citations.unwrap_or_default();
+                    }
+                    (None, _) => {
+                        let streamed = partial.lock().unwrap().clone();
+                        (row.lesson.body_md, row.lesson.citations) =
+                            sources::cite(&streamed, &retrieved);
+                    }
+                }
                 row.lesson.status = LessonStatus::Failed {
                     error: e.to_string(),
                 };
             }
         }
         row.previous_body = None;
+        row.previous_citations = None;
         row.lesson.updated_at = Utc::now();
         state.store.put(db::LESSON, lesson_id, &row).await?;
         row.lesson

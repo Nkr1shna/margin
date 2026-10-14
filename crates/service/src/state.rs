@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use margin_embed::{Embedder, ModelFiles};
 use margin_shared::{
-    Event, Id, Lesson, Proposal, Settings, Source, Topic, Video, VideoMedia, VideoStatus,
+    Citation, Event, Id, Lesson, Proposal, Settings, Source, Topic, Video, VideoMedia, VideoStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -41,6 +41,10 @@ pub const MP4_FILE: &str = "video.mp4";
 pub const STORYBOARD_FILE: &str = "storyboard.png";
 pub const CAPTIONS_FILE: &str = "captions.srt";
 pub const POSTER_FILE: &str = margin_video::POSTER_FILE;
+/// A source's uploaded file, by the name the source media route serves it under.
+pub const SOURCE_ORIGINAL: &str = "original";
+/// The folder inside a source's folder for its rendered pages and video frames.
+pub const SOURCE_MEDIA_DIR: &str = "media";
 
 // ---------------------------------------------------------------------------
 // Stored rows (wire types plus service-only fields)
@@ -56,7 +60,13 @@ pub struct StoredLesson {
     /// The body before a regeneration started, restored if it fails or is interrupted.
     #[serde(default)]
     pub previous_body: Option<String>,
+    /// The citations that went with `previous_body`.
+    #[serde(default)]
+    pub previous_citations: Option<Vec<Citation>>,
 }
+
+// Stored lessons keep each citation's `image_url` as the bare name of the source's media
+// file ("page-3.png"); `App::public_lesson` turns it into a signed URL on the way out.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredVideo {
@@ -163,7 +173,7 @@ impl App {
 
     pub fn emit_lesson(&self, lesson: &Lesson) {
         self.emit(Event::LessonChanged {
-            lesson: lesson.clone(),
+            lesson: self.public_lesson(lesson),
         });
     }
 
@@ -181,7 +191,7 @@ impl App {
 
     pub fn emit_source(&self, source: &Source) {
         self.emit(Event::SourceChanged {
-            source: source.clone(),
+            source: self.public_source(source),
         });
     }
 
@@ -192,6 +202,11 @@ impl App {
     /// The folder holding an uploaded source's `file`.
     pub fn source_dir(&self, source_id: &str) -> PathBuf {
         self.config.sources_dir().join(source_id)
+    }
+
+    /// Where a source's rendered pages and video frames are kept.
+    pub fn source_media_dir(&self, source_id: &str) -> PathBuf {
+        self.source_dir(source_id).join(SOURCE_MEDIA_DIR)
     }
 
     // -- media signing -----------------------------------------------------
@@ -226,6 +241,66 @@ impl App {
             "{}/media/videos/{video_id}/{file}?exp={exp}&sig={sig}",
             self.config.public_url
         )
+    }
+
+    /// What a source media URL signs: `source/{id}/{file}/{exp}`, kept apart from video
+    /// signatures by the prefix.
+    fn source_mac(&self, source_id: &str, file: &str, exp: i64) -> Hmac<Sha256> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.media_key)
+            .expect("HMAC accepts any key length");
+        mac.update(format!("source/{source_id}/{file}/{exp}").as_bytes());
+        mac
+    }
+
+    pub fn source_media_signature(&self, source_id: &str, file: &str, exp: i64) -> String {
+        hex::encode(
+            self.source_mac(source_id, file, exp)
+                .finalize()
+                .into_bytes(),
+        )
+    }
+
+    /// Checks a source media signature in constant time and that `exp` hasn't passed.
+    pub fn verify_source_media(&self, source_id: &str, file: &str, exp: i64, sig: &str) -> bool {
+        if exp < Utc::now().timestamp() {
+            return false;
+        }
+        let Ok(sig) = hex::decode(sig) else {
+            return false;
+        };
+        self.source_mac(source_id, file, exp)
+            .verify_slice(&sig)
+            .is_ok()
+    }
+
+    /// `/media/sources/{id}/{file}?exp&sig`, valid for `MEDIA_URL_TTL_SECONDS`.
+    pub fn source_media_url(&self, source_id: &str, file: &str) -> String {
+        let exp = (Utc::now() + Duration::seconds(MEDIA_URL_TTL_SECONDS)).timestamp();
+        let sig = self.source_media_signature(source_id, file, exp);
+        format!(
+            "{}/media/sources/{source_id}/{file}?exp={exp}&sig={sig}",
+            self.config.public_url
+        )
+    }
+
+    /// The wire `Source`, with a signed URL of the original file.
+    pub fn public_source(&self, source: &Source) -> Source {
+        let mut source = source.clone();
+        source.media_url = Some(self.source_media_url(&source.id, SOURCE_ORIGINAL));
+        source
+    }
+
+    /// The wire `Lesson`: citation pictures (stored as media file names) become signed
+    /// URLs.
+    pub fn public_lesson(&self, lesson: &Lesson) -> Lesson {
+        let mut lesson = lesson.clone();
+        for c in &mut lesson.citations {
+            c.image_url = c
+                .image_url
+                .take()
+                .map(|file| self.source_media_url(&c.source_id, &file));
+        }
+        lesson
     }
 
     /// The wire `Video`, with signed media URLs when it is Ready.

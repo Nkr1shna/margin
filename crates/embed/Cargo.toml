@@ -20,8 +20,11 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 objc2-core-ml = { version = "=0.3.2", default-features = false, features = ["std", "block2", "MLDictionaryFeatureProvider", "MLFeatureProvider", "MLFeatureValue", "MLModel", "MLModelConfiguration", "MLModel_MLModelCompilation", "MLMultiArray"] }
 objc2-pdf-kit = { version = "=0.3.2", default-features = false, features = ["std", "PDFDocument", "PDFPage", "objc2-core-graphics"] }
 objc2-vision = { version = "=0.3.2", default-features = false, features = ["std", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes", "objc2-core-graphics"] }
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "CGPDFPage"] }
-objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage", "CGPDFPage", "CGAffineTransform"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFDictionary", "CFNumber", "CFString", "CFURL", "CFData", "CFArray"] }
+objc2-image-io = { version = "=0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageDestination", "CGImageProperties", "objc2-core-graphics"] }
+objc2-av-foundation = { version = "=0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media", "AVAsset", "AVAssetImageGenerator", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat"] }
+objc2-core-media = { version = "=0.3.2", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMSampleBuffer", "CMTime"] }
 block2 = "=0.6.2"
 memmap2 = "=0.9.11"
 half = "=2.7.1"

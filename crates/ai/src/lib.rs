@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use margin_shared::{AskRequest, Level, Outline, OutlineLesson};
 use serde_json::{Value, json};
 
+mod citations;
 mod clean;
 mod prompts;
 mod sse;
@@ -96,11 +97,11 @@ impl ResponsesClient {
             .json(body))
     }
 
-    fn body(&self, instructions: &str, input: &str, stream: bool) -> Value {
+    fn body(&self, instructions: &str, input: &[InputPart], stream: bool) -> Value {
         json!({
             "model": self.model,
             "instructions": instructions,
-            "input": input,
+            "input": input_json(input),
             "stream": stream,
             "store": false,
         })
@@ -112,6 +113,21 @@ impl ResponsesClient {
         &self,
         instructions: &str,
         input: &str,
+        on_delta: impl FnMut(&str) + Send,
+    ) -> Result<String, AiError> {
+        self.stream_parts(
+            instructions,
+            &[InputPart::Text(input.to_string())],
+            on_delta,
+        )
+        .await
+    }
+
+    /// `stream_text` with an input of text and images, in order.
+    pub async fn stream_parts(
+        &self,
+        instructions: &str,
+        input: &[InputPart],
         mut on_delta: impl FnMut(&str) + Send,
     ) -> Result<String, AiError> {
         let body = self.body(instructions, input, true);
@@ -148,6 +164,23 @@ impl ResponsesClient {
         schema_name: &str,
         schema: serde_json::Value,
     ) -> Result<T, AiError> {
+        self.structured_parts(
+            instructions,
+            &[InputPart::Text(input.to_string())],
+            schema_name,
+            schema,
+        )
+        .await
+    }
+
+    /// `structured` with an input of text and images, in order.
+    pub async fn structured_parts<T: serde::de::DeserializeOwned>(
+        &self,
+        instructions: &str,
+        input: &[InputPart],
+        schema_name: &str,
+        schema: serde_json::Value,
+    ) -> Result<T, AiError> {
         let mut body = self.body(instructions, input, false);
         body["text"] = json!({
             "format": {
@@ -174,6 +207,84 @@ impl ResponsesClient {
             ))
         })
     }
+}
+
+/// A piece of a request's input.
+#[derive(Clone, PartialEq)]
+pub enum InputPart {
+    Text(String),
+    Image(Image),
+}
+
+/// A picture sent to the model as an `input_image` part (a base64 data URL).
+#[derive(Clone, PartialEq)]
+pub struct Image {
+    /// "image/jpeg", "image/png", "image/webp" or "image/gif".
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+impl Image {
+    /// `data:{media_type};base64,{data}`.
+    pub fn data_url(&self) -> String {
+        use base64::Engine;
+        format!(
+            "data:{};base64,{}",
+            self.media_type,
+            base64::engine::general_purpose::STANDARD.encode(&self.data)
+        )
+    }
+}
+
+impl std::fmt::Debug for Image {
+    // Not the bytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Image")
+            .field("media_type", &self.media_type)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InputPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputPart::Text(t) => f.debug_tuple("Text").field(t).finish(),
+            InputPart::Image(i) => i.fmt(f),
+        }
+    }
+}
+
+/// The Responses API `input`: a plain string when it's all text, otherwise one user
+/// message whose content is `input_text` and `input_image` parts in order (adjacent
+/// texts joined).
+fn input_json(parts: &[InputPart]) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    let mut text = String::new();
+    let mut has_image = false;
+    for part in parts {
+        match part {
+            InputPart::Text(t) => text.push_str(t),
+            InputPart::Image(image) => {
+                has_image = true;
+                if !text.is_empty() {
+                    content.push(json!({"type": "input_text", "text": std::mem::take(&mut text)}));
+                }
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": image.data_url(),
+                    "detail": "auto",
+                }));
+            }
+        }
+    }
+    if !has_image {
+        return Value::String(text);
+    }
+    if !text.is_empty() {
+        content.push(json!({"type": "input_text", "text": text}));
+    }
+    json!([{"role": "user", "content": content}])
 }
 
 // ---------------------------------------------------------------------------
@@ -427,14 +538,25 @@ impl StreamState {
 
 /// An excerpt of one of the learner's sources, retrieved because it is relevant to what
 /// is being written. Outlines and lessons are based on these where they cover the topic.
-#[derive(Debug, Clone, PartialEq)]
+/// Passages are numbered from 1 in the order given, and lessons cite them as `[^n]`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Passage {
     /// The source's name, e.g. "notes/ch1.md".
     pub source: String,
     /// PDF page the passage is on.
     pub page: Option<u32>,
+    /// The passage's text: a chunk, or the transcript of a stretch of a recording (with
+    /// `start_ms`/`end_ms`), or what was said around a video frame. May be empty for a
+    /// picture.
     pub text: String,
+    /// Where in an audio or video source it is.
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    /// A picture the model is shown with it: an image file, a PDF page, a video frame.
+    pub image: Option<Image>,
 }
+
+pub use citations::{Renumbered, renumber_citations};
 
 /// Proposes a course outline. `existing_subjects` are the titles of root topics, so the
 /// model can file the topic under one of them (it may also invent a new subject).
@@ -447,7 +569,7 @@ pub async fn propose_outline(
     passages: &[Passage],
 ) -> Result<Outline, AiError> {
     let outline: Outline = client
-        .structured(
+        .structured_parts(
             &prompts::outline_instructions(req.lesson_count, req.level, !passages.is_empty()),
             &prompts::outline_input(req, existing_subjects, passages),
             prompts::OUTLINE_SCHEMA_NAME,
@@ -541,7 +663,7 @@ pub async fn write_lesson(
         )));
     }
     let text = client
-        .stream_text(
+        .stream_parts(
             &prompts::lesson_instructions(ctx),
             &prompts::lesson_input(ctx),
             on_delta,
