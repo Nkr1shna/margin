@@ -10,7 +10,15 @@ use std::path::{Path, PathBuf};
 /// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
 
+mod chunk;
+#[cfg(target_os = "macos")]
+mod coreml;
+mod download;
+mod extract;
 pub mod fake;
+#[cfg(target_os = "macos")]
+mod pdf;
+mod rank;
 
 /// Hugging Face repo the model is downloaded from.
 pub const REPO: &str = "FluidInference/embeddinggemma-2-coreml";
@@ -71,19 +79,19 @@ impl ModelFiles {
 
     /// Whether every file the text model needs is present (a finished download).
     pub fn is_complete(&self) -> bool {
-        todo!("margin-embed: ModelFiles::is_complete")
+        download::is_complete(&self.dir)
     }
 
     /// Bytes on disk for the downloaded files.
     pub fn size_on_disk(&self) -> u64 {
-        todo!("margin-embed: ModelFiles::size_on_disk")
+        download::size_on_disk(&self.dir)
     }
 
     /// Total bytes a download fetches (from the Hugging Face API), for showing before
     /// the user starts it.
     pub async fn remote_size(client: &reqwest::Client, hf_base: &str) -> Result<u64, EmbedError> {
-        let _ = (client, hf_base);
-        todo!("margin-embed: ModelFiles::remote_size")
+        let files = download::remote_files(client, hf_base).await?;
+        Ok(files.iter().map(|f| f.size).sum())
     }
 
     /// Downloads the text model's files from `hf_base`/`REPO` (resolve/main) into `dir`,
@@ -95,41 +103,35 @@ impl ModelFiles {
         hf_base: &str,
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), EmbedError> {
-        let _ = (client, hf_base, progress);
-        todo!("margin-embed: ModelFiles::download")
+        download::download(&self.dir, client, hf_base, progress).await
     }
 
     /// Deletes the downloaded files (and the compiled model cache).
     pub fn remove(&self) -> Result<(), EmbedError> {
-        todo!("margin-embed: ModelFiles::remove")
+        download::remove(&self.dir)
     }
 }
 
 /// EmbeddingGemma 2 on Core ML (Neural Engine where possible). macOS only.
 #[cfg(target_os = "macos")]
-pub struct CoreMlEmbedder {
-    _private: (),
-}
+pub struct CoreMlEmbedder(coreml::Model);
 
 #[cfg(target_os = "macos")]
 impl CoreMlEmbedder {
     /// Loads the tokenizer and token table and the Core ML text model, compiling the
     /// `.mlpackage` on first use (cached next to it). Blocking.
     pub fn load(files: &ModelFiles) -> Result<Self, EmbedError> {
-        let _ = files;
-        todo!("margin-embed: CoreMlEmbedder::load")
+        coreml::Model::load(files).map(CoreMlEmbedder)
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Embedder for CoreMlEmbedder {
     fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let _ = (texts, purpose);
-        todo!("margin-embed: CoreMlEmbedder::embed")
+        self.0.embed(texts, purpose)
     }
     fn count_tokens(&self, text: &str) -> usize {
-        let _ = text;
-        todo!("margin-embed: CoreMlEmbedder::count_tokens")
+        self.0.count_tokens(text)
     }
 }
 
@@ -150,8 +152,7 @@ pub struct Page {
 /// Extracts text: UTF-8 (lossy) for text and code; PDFKit for PDFs, with Vision OCR for
 /// pages that have no text layer. Blocking.
 pub fn extract(path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
-    let _ = (path, kind);
-    todo!("margin-embed: extract")
+    extract::extract(path, kind)
 }
 
 /// A piece of a source small enough to embed.
@@ -171,8 +172,7 @@ pub fn chunk(
     count_tokens: &dyn Fn(&str) -> usize,
     max_tokens: usize,
 ) -> Vec<Chunk> {
-    let _ = (doc, kind, count_tokens, max_tokens);
-    todo!("margin-embed: chunk")
+    chunk::chunk(doc, kind, count_tokens, max_tokens)
 }
 
 /// Cosine similarity of two L2-normalized vectors (their dot product).
@@ -184,6 +184,5 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// words (and numbers/identifiers) that appear in the chunk, since no embedding holds an
 /// invoice number exactly.
 pub fn score(query_vec: &[f32], query_text: &str, chunk_vec: &[f32], chunk_text: &str) -> f32 {
-    let _ = (query_vec, query_text, chunk_vec, chunk_text);
-    todo!("margin-embed: score")
+    cosine(query_vec, chunk_vec) + rank::term_boost(query_text, chunk_text)
 }
