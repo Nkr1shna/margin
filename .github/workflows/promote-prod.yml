@@ -1,7 +1,7 @@
 # Installs in prod exactly the binary a deploy-dev run installed in dev
-# (docs/plan-deploy.md §4). Runs only in the GitHub Environment `prod`, whose required
-# reviewer is the owner and whose deployment branches are the deploy branch only, so
-# nothing reaches prod without his approval. MARGIN_DEPLOY_ONLY=prod.
+# (docs/plan-deploy.md §4). Runs only when the owner dispatches it by hand from main
+# (the free plan has no environment reviewers); the first step refuses any other ref.
+# MARGIN_DEPLOY_ONLY=prod.
 name: promote-prod
 
 on:
@@ -32,6 +32,11 @@ jobs:
       DEV_RUN_ID: ${{ inputs.dev_run_id }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Only from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::run this workflow from main, not $GITHUB_REF"; exit 1
+          fi
       - name: Check the dev run
         id: dev
         run: |

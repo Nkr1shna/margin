@@ -26,6 +26,11 @@ jobs:
     outputs:
       environments: ${{ steps.pick.outputs.environments }}
     steps:
+      - name: Only from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::run this workflow from main, not $GITHUB_REF"; exit 1
+          fi
       - id: pick
         env:
           CHOICE: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'both' }}
@@ -50,6 +55,11 @@ jobs:
       CARGO_TERM_COLOR: always
       MARGIN_DEFAULT_SERVICE_URL: ${{ matrix.environment == 'dev' && 'https://devmargin.krishnanelloore.com' || 'https://margin.krishnanelloore.com' }}
     steps:
+      - name: Only from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::run this workflow from main, not $GITHUB_REF"; exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
