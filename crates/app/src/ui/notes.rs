@@ -173,7 +173,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                         r#type: "search",
                         placeholder: "Filter notes",
                         "aria-label": "Filter notes",
-                        value: "{query}",
+                        initial_value: "{query}",
                         oninput: move |e| query.set(e.value()),
                     }
                     if loading {
@@ -260,6 +260,8 @@ fn NoteEditor(id: Id) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut generation = use_signal(|| 0u64);
     let mut preview = use_signal(|| false);
+    // Bumped when another device's edit replaces the text, to remount the fields.
+    let mut remote_rev = use_signal(|| 0u64);
     let mut confirm = use_signal(|| false);
     let mut deleting = use_signal(|| false);
 
@@ -278,6 +280,7 @@ fn NoteEditor(id: Id) -> Element {
             title.set(remote.0.clone());
             body.set(remote.1.clone());
             saved.set(remote);
+            remote_rev += 1;
         }
     });
 
@@ -330,9 +333,9 @@ fn NoteEditor(id: Id) -> Element {
             });
         }
     };
-    let mut schedule_title = schedule.clone();
+    let schedule_title = schedule.clone();
     let mut schedule_retry = schedule.clone();
-    let mut schedule_body = schedule;
+    let schedule_body = schedule;
 
     let note = app.lib.read().notes.get(&id).cloned().unwrap_or(initial);
     let lesson = note.lesson_id.as_ref().and_then(|l| {
@@ -392,15 +395,21 @@ fn NoteEditor(id: Id) -> Element {
                     Icon { name: "trash" }
                 }
             }
+            for rev in std::iter::once(remote_rev()) {
             input {
+                key: "t{rev}",
                 class: "title-input",
                 "aria-label": "Title",
                 placeholder: "Untitled note",
-                value: "{title}",
-                oninput: move |e| {
-                    title.set(e.value());
-                    schedule_title();
+                initial_value: "{title}",
+                oninput: {
+                    let mut schedule_title = schedule_title.clone();
+                    move |e: FormEvent| {
+                        title.set(e.value());
+                        schedule_title();
+                    }
                 },
+            }
             }
             if let Some(q) = &note.quote {
                 blockquote { class: "md", style: "margin: 0; padding: 0 0 0 12px; border-left: 2px solid var(--line-2); background: none; color: var(--fg-2); font-style: italic; font-size: 15px",
@@ -410,15 +419,21 @@ fn NoteEditor(id: Id) -> Element {
             if showing_preview {
                 div { id: "note-preview", class: "md", dangerous_inner_html: "{html}" }
             } else {
+                for rev in std::iter::once(remote_rev()) {
                 textarea {
+                    key: "b{rev}",
                     class: "body-input",
                     "aria-label": "Note body (Markdown)",
                     placeholder: "Write in Markdown…",
-                    value: "{body}",
-                    oninput: move |e| {
-                        body.set(e.value());
-                        schedule_body();
+                    initial_value: "{body}",
+                    oninput: {
+                        let mut schedule_body = schedule_body.clone();
+                        move |e: FormEvent| {
+                            body.set(e.value());
+                            schedule_body();
+                        }
                     },
+                }
                 }
             }
         }

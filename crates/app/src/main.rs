@@ -37,11 +37,63 @@ fn main() {
             .with_inner_size(LogicalSize::new(1240.0, 800.0))
             .with_min_inner_size(LogicalSize::new(360.0, 480.0));
         dioxus::LaunchBuilder::new()
-            .with_cfg(Config::new().with_window(window).with_menu(None))
+            .with_cfg(Config::new().with_window(window).with_menu(menu_bar()))
             .launch(App);
     }
     #[cfg(not(feature = "desktop"))]
     dioxus::launch(App);
+}
+
+/// The native menu bar. Besides the usual app and window commands it carries the Edit
+/// menu, which is what makes Cmd+Z/X/C/V/A work in text fields: the webview handles those
+/// shortcuts only through the menu's standard items.
+#[cfg(feature = "desktop")]
+fn menu_bar() -> dioxus::desktop::muda::Menu {
+    use dioxus::desktop::muda::{Menu, PredefinedMenuItem, Submenu};
+
+    let app = Submenu::new("Margin", true);
+    let edit = Submenu::new("Edit", true);
+    let window = Submenu::new("Window", true);
+    let menu = Menu::new();
+    let built = app
+        .append_items(&[
+            &PredefinedMenuItem::about(Some("About Margin"), None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::services(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(Some("Hide Margin")),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(Some("Quit Margin")),
+        ])
+        .and_then(|_| {
+            edit.append_items(&[
+                &PredefinedMenuItem::undo(None),
+                &PredefinedMenuItem::redo(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::cut(None),
+                &PredefinedMenuItem::copy(None),
+                &PredefinedMenuItem::paste(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::select_all(None),
+            ])
+        })
+        .and_then(|_| {
+            window.append_items(&[
+                &PredefinedMenuItem::minimize(None),
+                &PredefinedMenuItem::maximize(Some("Zoom")),
+                &PredefinedMenuItem::fullscreen(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::bring_all_to_front(None),
+                &PredefinedMenuItem::close_window(None),
+            ])
+        })
+        .and_then(|_| menu.append_items(&[&app, &edit, &window]));
+    if let Err(error) = built {
+        eprintln!("couldn't build the menu bar: {error}");
+    }
+    menu
 }
 
 #[component]

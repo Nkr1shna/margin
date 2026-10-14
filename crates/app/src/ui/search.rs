@@ -115,7 +115,7 @@ pub fn SearchPalette() -> Element {
                         "aria-expanded": (count > 0).to_string(),
                         "aria-controls": "search-results",
                         "aria-activedescendant": if count > 0 { format!("hit-{sel}") } else { String::new() },
-                        value: "{query}",
+                        initial_value: "{query}",
                         onmounted: move |e| async move { let _ = e.set_focus(true).await; },
                         oninput: move |e| {
                             let v = e.value();

@@ -548,7 +548,7 @@ fn TopicInput(
             r#type: "text",
             placeholder,
             "aria-label": placeholder,
-            value: "{value}",
+            initial_value: "{value}",
             disabled: *busy.read(),
             onmounted: move |e| async move {
                 let _ = e.set_focus(true).await;

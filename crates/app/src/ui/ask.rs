@@ -51,6 +51,8 @@ pub fn AskScreen() -> Element {
     let mut error = use_signal(|| None::<ApiFailure>);
     let mut proposal_id = app.ask_proposal;
     let mut draft = use_signal(|| None::<Outline>);
+    // Bumped when code replaces the composer text, to remount the (uncontrolled) textarea.
+    let mut prompt_rev = use_signal(|| 0u64);
     let mut accepting = use_signal(|| false);
     let mut accept_error = use_signal(|| None::<ApiFailure>);
 
@@ -153,11 +155,13 @@ pub fn AskScreen() -> Element {
             div { class: "gen",
                 h1 { "What do you want to learn?" }
                 div { class: "composer",
+                    for rev in std::iter::once(prompt_rev()) {
                     textarea {
+                        key: "{rev}",
                         rows: 2,
                         "aria-label": "What do you want to learn?",
                         placeholder: "A topic, a question, or what you already know…",
-                        value: "{prompt}",
+                        initial_value: "{prompt}",
                         oninput: move |e| prompt.set(e.value()),
                         onkeydown: move |e: KeyboardEvent| {
                             if e.key() == Key::Enter && !e.modifiers().shift() && !e.is_composing() {
@@ -165,6 +169,7 @@ pub fn AskScreen() -> Element {
                                 submit(request());
                             }
                         },
+                    }
                     }
                     div { class: "composer-row",
                         select {
@@ -268,6 +273,7 @@ pub fn AskScreen() -> Element {
                                         proposal_id.set(None);
                                         draft.set(None);
                                         prompt.set(String::new());
+                                        prompt_rev += 1;
                                         app.collapsed.write().remove(&topic.id);
                                         match first {
                                             Some(lesson) => nav.push(Route::LessonRead { id: lesson }),
@@ -375,6 +381,8 @@ fn OutlineEditor(
     on_accept: EventHandler<Outline>,
 ) -> Element {
     let mut editing = use_signal(|| false);
+    // Bumped when lessons move, are removed or added, so their (uncontrolled) fields remount.
+    let mut rows_rev = use_signal(|| 0u64);
     let mut edit = move |f: &dyn Fn(&mut Outline)| {
         let mut d = draft.write();
         if let Some(o) = d.as_mut() {
@@ -403,7 +411,7 @@ fn OutlineEditor(
                         input {
                             id: "ol-topic",
                             class: "input",
-                            value: "{outline.topic_title}",
+                            initial_value: "{outline.topic_title}",
                             oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.topic_title = v.clone()) },
                         }
                     }
@@ -413,7 +421,7 @@ fn OutlineEditor(
                             input {
                                 id: "ol-subject",
                                 class: "input",
-                                value: "{outline.subject_title}",
+                                initial_value: "{outline.subject_title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.subject_title = v.clone()) },
                             }
                         }
@@ -423,21 +431,21 @@ fn OutlineEditor(
                 p { class: "muted", style: "margin: 0 0 12px", "New topic: ", b { style: "font-weight: 500; color: var(--fg)", "{outline.topic_title}" } }
             }
             for (i, lesson) in outline.lessons.iter().cloned().enumerate() {
-                div { key: "{i}", class: "ol-item",
+                div { key: "{rows_rev}-{i}", class: "ol-item",
                     span { class: "n", "{i + 1}" }
                     if *editing.read() {
                         div { class: "ol-main",
                             input {
                                 class: "input ol-title",
                                 "aria-label": "Lesson {i + 1} title",
-                                value: "{lesson.title}",
+                                initial_value: "{lesson.title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].title = v.clone()) },
                             }
                             input {
                                 class: "input",
                                 "aria-label": "Lesson {i + 1} summary",
                                 placeholder: "One-line summary",
-                                value: "{lesson.summary}",
+                                initial_value: "{lesson.summary}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].summary = v.clone()) },
                             }
                         }
@@ -448,7 +456,7 @@ fn OutlineEditor(
                                 min: "1",
                                 max: "180",
                                 "aria-label": "Lesson {i + 1} minutes",
-                                value: "{lesson.minutes}",
+                                initial_value: "{lesson.minutes}",
                                 oninput: move |e| {
                                     if let Ok(m) = e.value().parse::<u32>() {
                                         edit(&move |o: &mut Outline| o.lessons[i].minutes = m.clamp(1, 180));
@@ -459,21 +467,21 @@ fn OutlineEditor(
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} up",
                                 disabled: i == 0,
-                                onclick: move |_| edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1)),
+                                onclick: move |_| { edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1)); rows_rev += 1; },
                                 Icon { name: "up" }
                             }
                             button {
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} down",
                                 disabled: i + 1 == n,
-                                onclick: move |_| edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1)),
+                                onclick: move |_| { edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1)); rows_rev += 1; },
                                 Icon { name: "down" }
                             }
                             button {
                                 class: "icon-btn",
                                 "aria-label": "Remove lesson {i + 1}",
                                 disabled: n == 1,
-                                onclick: move |_| edit(&move |o: &mut Outline| { o.lessons.remove(i); }),
+                                onclick: move |_| { edit(&move |o: &mut Outline| { o.lessons.remove(i); }); rows_rev += 1; },
                                 Icon { name: "trash" }
                             }
                         }
@@ -490,7 +498,7 @@ fn OutlineEditor(
                 div { style: "padding-top: 10px",
                     button {
                         class: "btn btn-ghost btn-sm",
-                        onclick: move |_| edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 })),
+                        onclick: move |_| { edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 })); rows_rev += 1; },
                         Icon { name: "plus" }
                         "Add lesson"
                     }

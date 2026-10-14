@@ -166,7 +166,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                     class: "input",
                     style: "max-width: 420px",
                     "aria-label": "Lesson title",
-                    value: "{rename_value}",
+                    initial_value: "{rename_value}",
                     onmounted: move |e| async move { let _ = e.set_focus(true).await; },
                     oninput: move |e| rename_value.set(e.value()),
                     onkeydown: {
@@ -570,7 +570,7 @@ pub fn NoteCard(note: Note, compact: bool) -> Element {
                 textarea {
                     class: "textarea",
                     "aria-label": "Note",
-                    value: "{body}",
+                    initial_value: "{body}",
                     onmounted: move |e| async move { let _ = e.set_focus(true).await; },
                     oninput: move |e| body.set(e.value()),
                     onkeydown: move |e: KeyboardEvent| {
@@ -718,7 +718,7 @@ pub fn NewNoteEditor(
             class: "textarea",
             "aria-label": "New note",
             placeholder: if quote.is_some() { "Your note on this passage…" } else { "Write a note… (Markdown)" },
-            value: "{body}",
+            initial_value: "{body}",
             onmounted: move |e| async move { let _ = e.set_focus(true).await; },
             oninput: move |e| body.set(e.value()),
             onkeydown: move |e: KeyboardEvent| {

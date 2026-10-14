@@ -81,7 +81,7 @@ fn ServiceSection() -> Element {
                         id: "svc-url",
                         class: "input",
                         r#type: "url",
-                        value: "{value}",
+                        initial_value: "{value}",
                         oninput: move |e| value.set(e.value()),
                     }
                 }
@@ -296,6 +296,8 @@ fn AiSection(settings: Settings) -> Element {
     let mut base = use_signal(|| settings.openai_base_url.clone());
     let mut model = use_signal(|| settings.openai_model.clone());
     let mut key = use_signal(String::new);
+    // Bumped when the key field is cleared by code, to remount it empty.
+    let mut key_rev = use_signal(|| 0u64);
     let mut replacing = use_signal(|| false);
     let mut confirm_remove = use_signal(|| false);
     let error = use_signal(|| None::<String>);
@@ -314,11 +316,11 @@ fn AiSection(settings: Settings) -> Element {
             div { class: "grid2",
                 div { class: "field",
                     label { r#for: "ai-base", "Base URL" }
-                    input { id: "ai-base", class: "input", r#type: "url", value: "{base}", oninput: move |e| { saved_note.set(false); base.set(e.value()) } }
+                    input { id: "ai-base", class: "input", r#type: "url", initial_value: "{base}", oninput: move |e| { saved_note.set(false); base.set(e.value()) } }
                 }
                 div { class: "field",
                     label { r#for: "ai-model", "Model" }
-                    input { id: "ai-model", class: "input", value: "{model}", oninput: move |e| { saved_note.set(false); model.set(e.value()) } }
+                    input { id: "ai-model", class: "input", initial_value: "{model}", oninput: move |e| { saved_note.set(false); model.set(e.value()) } }
                 }
             }
             if let Some(err) = error.read().clone() {
@@ -356,15 +358,18 @@ fn AiSection(settings: Settings) -> Element {
                 span { class: "label", "API key" }
                 if show_key_input {
                     div { class: "row-actions",
+                        for rev in std::iter::once(key_rev()) {
                         input {
+                            key: "{rev}",
                             class: "input",
                             style: "flex: 1; min-width: 220px",
                             r#type: "password",
                             autocomplete: "off",
                             placeholder: "sk-…",
                             "aria-label": "API key",
-                            value: "{key}",
+                            initial_value: "{key}",
                             oninput: move |e| key.set(e.value()),
+                        }
                         }
                         button {
                             class: "btn btn-primary btn-sm",
@@ -374,13 +379,14 @@ fn AiSection(settings: Settings) -> Element {
                                 let patch = SettingsPatch { openai_api_key: Some(k), ..Default::default() };
                                 if save_settings(app, patch, key_error, key_busy).await {
                                     key.set(String::new());
+                                    key_rev += 1;
                                     replacing.set(false);
                                 }
                             },
                             "Save key"
                         }
                         if settings.has_api_key {
-                            button { class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); replacing.set(false) }, "Cancel" }
+                            button { class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                         }
                     }
                     p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the Mac's Keychain. It is never shown again." }
@@ -433,7 +439,7 @@ fn VoiceSection(settings: Settings) -> Element {
                     style: "flex: 1; min-width: 220px",
                     "aria-label": "Voice name",
                     placeholder: "Default voice",
-                    value: "{voice}",
+                    initial_value: "{voice}",
                     oninput: move |e| voice.set(e.value()),
                 }
                 button {

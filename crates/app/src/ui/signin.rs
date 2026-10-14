@@ -52,6 +52,8 @@ fn device_name() -> String {
 pub fn ConnectScreen() -> Element {
     let mut app = use_app();
     let mut url = use_signal(|| app.service_url());
+    // Bumped when the address is rewritten by code (normalized), to remount the field.
+    let mut url_rev = use_signal(|| 0u64);
     let mut phase = use_signal(|| Phase::Idle);
     let mut task = use_signal(|| None::<Task>);
 
@@ -68,7 +70,10 @@ pub fn ConnectScreen() -> Element {
                     return;
                 }
             };
-            url.set(base.clone());
+            if *url.peek() != base {
+                url.set(base.clone());
+                url_rev += 1;
+            }
             phase.set(Phase::Starting);
             let api = Api::anonymous(&base);
             let login = match api.start_login(&device_name()).await {
@@ -146,7 +151,9 @@ pub fn ConnectScreen() -> Element {
                         }
                     },
                     label { r#for: "service-url", "Service address" }
+                    for rev in std::iter::once(url_rev()) {
                     input {
+                        key: "{rev}",
                         id: "service-url",
                         class: "input",
                         r#type: "url",
@@ -154,9 +161,10 @@ pub fn ConnectScreen() -> Element {
                         autocomplete: "url",
                         spellcheck: false,
                         disabled: busy,
-                        value: "{url}",
+                        initial_value: "{url}",
                         placeholder: config::DEFAULT_SERVICE_URL,
                         oninput: move |e| url.set(e.value()),
+                    }
                     }
                 }
                 match current {
