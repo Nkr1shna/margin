@@ -2,7 +2,9 @@
 //! and the footer.
 
 use dioxus::prelude::*;
-use margin_shared::{ChatPatch, ChatState, Event, Id, LessonPatch, NewTopic, TopicPatch};
+use margin_shared::{
+    ChatPatch, ChatState, Event, Id, LessonPatch, NewTopic, TitleSource, TopicPatch,
+};
 
 use crate::commands::Command;
 use crate::config::Appearance;
@@ -687,7 +689,11 @@ fn ChatNode(id: Id) -> Element {
                             }
                         },
                         Icon { name: "chat", class: "leaf-ic" }
-                        span { class: "grow", "{title}" }
+                        // Faint until the model or the owner names the chat.
+                        span {
+                            class: if chat.title_by == TitleSource::FirstLine { "grow provisional" } else { "grow" },
+                            "{title}"
+                        }
                         span { class: "sr-only", {chat_state_text(&chat.state)} }
                         match &chat.state {
                             ChatState::Running { .. } => rsx! { span { class: "spinner xs", title: "Answering", "aria-hidden": "true" } },

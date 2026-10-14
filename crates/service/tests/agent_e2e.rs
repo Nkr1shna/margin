@@ -7,7 +7,10 @@
 //! the chat's record of it on the next turn, a delete parked on its confirmation card and
 //! approved from another device, and owner decision Q2 for overwriting notes. A third
 //! (phase 3) adds a lesson, files the chat's attached file under its topic and makes the
-//! lesson's video, with their result cards.
+//! lesson's video, with their result cards. The phase-3 integration tests add a turn
+//! that waits on a 429's `Retry-After`, the model-written title and a rename, an
+//! app-control call answered by the device over the events socket, and Stop pressed
+//! while a Write tool's change runs.
 
 mod common;
 
@@ -22,6 +25,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use chrono::Utc;
 use common::*;
 use futures_util::StreamExt as _;
 use margin_agent::RetryPolicy;
@@ -30,9 +34,9 @@ use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY}
 use margin_service::state::{Author, StoredNote};
 use margin_service::turns::{CALL_INTERRUPTED, STOPPED, STOPPED_BY_RESTART};
 use margin_shared::{
-    Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, Event, ItemStatus, Lesson,
-    LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, Source, ToolOutputText,
-    Topic,
+    Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, DeviceFrame, DeviceToolCall,
+    DeviceToolOutput, DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus,
+    Level, Library, Me, Note, Proposal, ProposalStatus, Source, TitleSource, ToolOutputText, Topic,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -46,6 +50,8 @@ enum Reply {
     Stream(String),
     /// These SSE events, then the connection stays open without another byte.
     Hang(String),
+    /// 429 Too Many Requests with `retry-after-ms`.
+    SlowDown { retry_after_ms: u64 },
 }
 
 #[derive(Default)]
@@ -80,6 +86,14 @@ async fn responses(
         return (StatusCode::INTERNAL_SERVER_ERROR, "no reply scripted").into_response();
     };
     let body = match reply {
+        Reply::SlowDown { retry_after_ms } => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after-ms", retry_after_ms.to_string())],
+                Json(json!({"error": {"message": "Rate limit reached", "type": "requests"}})),
+            )
+                .into_response();
+        }
         Reply::Stream(sse) => Body::from(sse),
         Reply::Hang(sse) => Body::from_stream(
             futures_util::stream::once(async move { Ok::<_, Infallible>(Bytes::from(sse)) })
@@ -554,10 +568,10 @@ async fn a_chat_runs_through_the_real_client_tools_replay_stop_and_restart() {
         added[0],
         message_done("msg_2", "You have a topic on photosynthesis.")
     );
-    // The new message: its developer context, then the user's words.
-    assert_eq!(added[1]["role"], "developer");
+    // The new message: its context part, then the user's words.
+    assert_eq!(added.len(), 2);
     assert_eq!(added.last().unwrap()["role"], "user");
-    assert_eq!(added.last().unwrap()["content"][0]["text"], "Any notes?");
+    assert_eq!(added.last().unwrap()["content"][1]["text"], "Any notes?");
 
     // --- Turn 3: Stop while the answer streams. ---
     fake.push(Reply::Hang(
@@ -1234,6 +1248,8 @@ async fn lessons_videos_and_files_run_through_the_real_client() {
     let r = h.upload(&t, "lenses.md", None, "Thin lenses.").await;
     assert_eq!(r.status(), 200);
     let file: Source = r.json().await.unwrap();
+    // The jobs' events, which the app's result cards follow.
+    let mut sock = h.socket(&t).await;
 
     // --- Turn 1, with a file attached: one step adds a lesson and files the file. ---
     fake.push(calls_reply(
@@ -1324,6 +1340,29 @@ async fn lessons_videos_and_files_run_through_the_real_client() {
     })
     .await;
     assert_eq!(lesson.title, "Lenses");
+    let events = sock
+        .until(|e| matches!(e, Event::LessonChanged { lesson } if lesson.id == lesson_id && lesson.status == LessonStatus::Ready))
+        .await;
+    let statuses: Vec<LessonStatus> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::LessonChanged { lesson } if lesson.id == lesson_id => {
+                Some(lesson.status.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses.first(),
+        Some(&LessonStatus::Queued),
+        "{statuses:?}"
+    );
+    assert!(statuses.contains(&LessonStatus::Generating), "{statuses:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::LessonDelta { lesson_id: id, .. } if *id == lesson_id))
+    );
 
     // --- Turn 2: a video of the written lesson. ---
     fake.push(calls_reply(
@@ -1370,6 +1409,14 @@ async fn lessons_videos_and_files_run_through_the_real_client() {
             .then_some(())
     })
     .await;
+    let events = sock
+        .until(|e| matches!(e, Event::VideoChanged { video } if video.lesson_id == lesson_id && video.status == margin_shared::VideoStatus::Ready))
+        .await;
+    let stages = events
+        .iter()
+        .filter(|e| matches!(e, Event::VideoChanged { video } if video.lesson_id == lesson_id))
+        .count();
+    assert!(stages >= 2, "the video's stages go out as it is made");
     // The file stays with the topic when the chat goes.
     let r = h
         .delete(&t, &format!("/api/chats/{chat_id}"))
@@ -1385,4 +1432,344 @@ async fn lessons_videos_and_files_run_through_the_real_client() {
             .unwrap()
             .is_some()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 integration: waiting, titles, app control over the socket, Stop during a
+// running write
+// ---------------------------------------------------------------------------
+
+/// The chat as each `ChatChanged` for it on the socket had it.
+fn chat_changes(events: &[Event], chat_id: &str) -> Vec<margin_shared::Chat> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ChatChanged { chat } if chat.id == chat_id => Some(chat.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_turn_waits_then_the_model_titles_the_chat() {
+    let (openai, fake) = start_fake_openai().await;
+    let h = start_service(None).await;
+    // The title goes through the real client to the fake API, like the turn.
+    *h.state.turns.title_model.lock().unwrap() = None;
+    let t = h.sign_in("Mac").await;
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let mut sock = h.socket(&t).await;
+
+    // The API asks Margin to slow down once; the turn waits, then answers.
+    fake.push(Reply::SlowDown {
+        retry_after_ms: 300,
+    });
+    fake.push(text_reply("resp_1", "Light becomes sugar in the leaves."));
+    fake.push(text_reply("resp_title", "\"Photosynthesis basics.\""));
+    let asked = Utc::now();
+    let r = h
+        .post(&t, "/api/chats")
+        .json(&json!({"message": {"text": "How do plants make food?\nKeep it short."}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let created: ChatDetail = r.json().await.unwrap();
+    let chat_id = created.chat.id.clone();
+    assert_eq!(created.chat.title, "How do plants make food?");
+    assert_eq!(created.chat.title_by, TitleSource::FirstLine);
+
+    let events = sock
+        .until(|e| matches!(e, Event::ChatChanged { chat } if chat.id == chat_id && chat.title_by == TitleSource::Model))
+        .await;
+    let changes = chat_changes(&events, &chat_id);
+    let waited = changes
+        .iter()
+        .position(|c| c.waiting.is_some())
+        .expect("the chat said it was waiting");
+    let waiting = changes[waited].waiting.clone().unwrap();
+    assert_eq!(waiting.reason, "The model API asked Margin to slow down.");
+    // As asked (300 ms), plus up to a second of jitter.
+    let ms = (waiting.until - asked).num_milliseconds();
+    assert!((300..=1_300 + 5_000).contains(&ms), "waits {ms} ms");
+    assert!(matches!(changes[waited].state, ChatState::Running { .. }));
+    // Cleared when the retry starts, before the turn ends.
+    let cleared = changes[waited..]
+        .iter()
+        .position(|c| c.waiting.is_none())
+        .map(|i| i + waited)
+        .expect("the wait was cleared");
+    let idle = changes[waited..]
+        .iter()
+        .position(|c| c.state == ChatState::Idle)
+        .map(|i| i + waited)
+        .unwrap();
+    assert!(cleared <= idle);
+    assert!(changes[idle..].iter().all(|c| c.waiting.is_none()));
+
+    // The model's title, cleaned, after the first answer.
+    let titled = changes.last().unwrap();
+    assert_eq!(titled.title, "Photosynthesis basics");
+    let d = detail(&h, &t, &chat_id).await;
+    assert_eq!(d.chat.title_by, TitleSource::Model);
+    assert!(d.chat.waiting.is_none());
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: How do plants make food?\nKeep it short.".to_string(),
+            "assistant: Light becomes sugar in the leaves.".into(),
+        ]
+    );
+    let bodies = fake.bodies();
+    assert_eq!(bodies.len(), 3, "the 429, the retry and the title");
+    assert_eq!(bodies[0]["input"], bodies[1]["input"]);
+    let title = &bodies[2];
+    assert!(
+        title
+            .get("tools")
+            .is_none_or(|t| t.as_array().is_some_and(Vec::is_empty))
+    );
+    assert_eq!(title["reasoning"]["effort"], "low");
+    assert_eq!(title["max_output_tokens"], 30);
+    let data = title["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["role"] == "user")
+        .unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let data: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        data["owner_message"],
+        "How do plants make food?\nKeep it short."
+    );
+    assert_eq!(data["answer"], "Light becomes sugar in the leaves.");
+
+    // A rename is the owner's, and later answers don't retitle the chat.
+    let r = h
+        .patch(&t, &format!("/api/chats/{chat_id}"))
+        .json(&json!({"title": "Plants"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let renamed: margin_shared::Chat = r.json().await.unwrap();
+    assert_eq!(
+        (renamed.title.as_str(), renamed.title_by),
+        ("Plants", TitleSource::Owner)
+    );
+    sock.until(|e| matches!(e, Event::ChatChanged { chat } if chat.id == chat_id && chat.title_by == TitleSource::Owner))
+        .await;
+    fake.push(text_reply("resp_2", "Mostly in the leaves."));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Where?"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = wait_chat(&h, &t, &chat_id, |d| {
+        d.chat.state == ChatState::Idle && d.items.len() == 4
+    })
+    .await;
+    assert_eq!(d.chat.title, "Plants");
+    assert_eq!(d.chat.title_by, TitleSource::Owner);
+    assert_eq!(fake.bodies().len(), 4, "no second title call");
+}
+
+/// The device's next tool request.
+async fn next_request(device: &mut Socket) -> margin_shared::ToolRequest {
+    match device.next_directed().await {
+        DirectedFrame::ToolRequest { request } => request,
+        other => panic!("expected a tool request, got {other:?}"),
+    }
+}
+
+async fn answer(device: &mut Socket, request_id: &str, message: &str) {
+    device
+        .send_frame(&DeviceFrame::ToolResult {
+            request_id: request_id.to_string(),
+            result: DeviceToolResult::Ok {
+                output: DeviceToolOutput::Done {
+                    message: message.to_string(),
+                },
+            },
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_control_goes_to_the_device_and_stop_keeps_a_running_writes_result() {
+    let (openai, fake) = start_fake_openai().await;
+    let h = start_service(None).await;
+    let t = h.sign_in("Mac").await;
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = h
+        .post(&t, "/api/topics")
+        .json(&json!({"parent_id": null, "title": "Optics"}))
+        .send()
+        .await
+        .unwrap();
+    let topic: Topic = r.json().await.unwrap();
+    // The app on this device, answering its tool requests over the events socket.
+    let mut device = h.socket(&t).await;
+
+    // --- Turn 1: app control, answered by the device. ---
+    fake.push(calls_reply(
+        "resp_1",
+        &[("call_side", "toggle_sidebar", json!({"visible": false}))],
+    ));
+    fake.push(text_reply("resp_2", "The sidebar is hidden."));
+    let r = h
+        .post(&t, "/api/chats")
+        .json(&json!({"message": {"text": "Hide the sidebar"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let chat_id = r.json::<ChatDetail>().await.unwrap().chat.id;
+    let request = next_request(&mut device).await;
+    assert_eq!(request.chat_id, chat_id);
+    assert_eq!(request.call_id, "call_side");
+    assert_eq!(
+        request.call,
+        DeviceToolCall::ToggleSidebar {
+            visible: Some(false)
+        }
+    );
+    assert!(request.deadline > Utc::now());
+    answer(&mut device, &request.request_id, "Sidebar hidden.").await;
+    let d = wait_chat(&h, &t, &chat_id, |d| d.chat.state == ChatState::Idle).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: Hide the sidebar".to_string(),
+            "call toggle_sidebar: Hiding the sidebar".into(),
+            "result ok: Sidebar hidden.".into(),
+            "assistant: The sidebar is hidden.".into(),
+        ]
+    );
+    let (_, out) = function_call_outputs(&input_of(&fake.bodies()[1]))
+        .into_iter()
+        .find(|(id, _)| id == "call_side")
+        .unwrap();
+    assert!(out.contains("Sidebar hidden."), "{out}");
+
+    // --- Turn 2: a lesson is being added when the owner presses Stop. ---
+    fake.push(calls_reply(
+        "resp_3",
+        &[
+            (
+                "call_write",
+                "write_lesson",
+                json!({"topic_id": topic.id, "title": "Lenses", "summary": "Thin lenses.",
+                    "minutes": 6, "level": "intro", "with_quiz": false}),
+            ),
+            (
+                "call_nav",
+                "navigate",
+                json!({"to": {"screen": "topic", "topic_id": topic.id}}),
+            ),
+        ],
+    ));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Add a lesson on lenses and show me the topic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // The Device call runs first; while the device has it, hold the library so the
+    // write, which comes next, starts and then waits for it.
+    let request = next_request(&mut device).await;
+    assert_eq!(request.call_id, "call_nav");
+    let library_lock = h.state.write_lock.lock().await;
+    answer(&mut device, &request.request_id, "Opened “Optics”.").await;
+    eventually(|| async {
+        h.state
+            .turns
+            .writes
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .is_some_and(|w| !w.is_empty())
+            .then_some(())
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Stop queues behind the write; the turn, recording the write's result, behind Stop.
+    let stop = {
+        let req = h.post(&t, &format!("/api/chats/{chat_id}/stop"));
+        tokio::spawn(async move { req.send().await.unwrap().status() })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(library_lock);
+    assert_eq!(stop.await.unwrap(), 200);
+    let d = wait_chat(&h, &t, &chat_id, |d| d.chat.state == ChatState::Idle).await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Add a lesson on lenses and show me the topic".to_string(),
+            "call write_lesson: Adding the lesson “Lenses”".into(),
+            "call navigate: Opening the topic (cancelled)".into(),
+            "result ok: Added “Lenses”".into(),
+            "card".into(),
+            "result failed: Cancelled".into(),
+            format!("action: {STOPPED}"),
+        ]
+    );
+    let lesson = library(&h, &t)
+        .await
+        .lessons
+        .into_iter()
+        .find(|l| l.title == "Lenses")
+        .expect("the lesson was added");
+    assert_eq!(
+        result_card_of(&d, "call_write").target,
+        margin_shared::ResultTarget::Lesson {
+            lesson_id: lesson.id.clone()
+        }
+    );
+
+    // --- Turn 3: the model sees the write's real result. ---
+    fake.push(text_reply(
+        "resp_4",
+        "The lesson was added before you stopped.",
+    ));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Did it go through?"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    wait_chat(&h, &t, &chat_id, |d| {
+        d.chat.state == ChatState::Idle
+            && d.items
+                .last()
+                .is_some_and(|i| line(i) == "assistant: The lesson was added before you stopped.")
+    })
+    .await;
+    let bodies = fake.bodies();
+    let last = bodies.last().unwrap();
+    assert_eq!(output_in(last, "call_write")["id"], lesson.id);
+    let (_, nav) = function_call_outputs(&input_of(last))
+        .into_iter()
+        .find(|(id, _)| id == "call_nav")
+        .unwrap();
+    assert!(!nav.contains("Opened"), "{nav}");
 }

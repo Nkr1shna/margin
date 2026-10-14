@@ -348,14 +348,10 @@ pub fn AddSourcesMenu(
             on_note.call(note);
         });
     };
-    // Placed against the chip (the menu's own CSS is shared with the sidebar's menus).
-    let placement = if above {
-        "bottom: calc(100% + 4px); left: 0"
-    } else {
-        "top: calc(100% + 4px); left: 0"
-    };
+    // Placed against the chip, above it when the composer sits at the bottom.
+    let placement = if above { "menu above" } else { "menu below" };
     rsx! {
-        div { style: "position: relative; display: inline-flex",
+        div { class: "pop-anchor",
             button {
                 class: "chip",
                 "aria-haspopup": "menu",
@@ -373,8 +369,7 @@ pub fn AddSourcesMenu(
             if *open.read() {
                 div { class: "pop-scrim", onclick: move |_| open.set(false) }
                 div {
-                    class: "menu",
-                    style: placement,
+                    class: placement,
                     role: "menu",
                     onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); open.set(false) },
                     button { role: "menuitem", onmounted: crate::ui::common::focus_on_mount, onclick: add,
@@ -446,7 +441,7 @@ pub fn ChatAttachments(chat_id: Option<Id>) -> Element {
     };
 
     rsx! {
-        div { style: "display: grid; gap: 2px",
+        div { class: "attachments",
             if !attached.is_empty() {
                 details { class: "collapse",
                     summary {

@@ -42,7 +42,9 @@ Between the phase 1 and phase 2 merges courses can't be created (the old compose
 unrouted until phase 2 reuses its outline editor); no release happens in between.
 
 Web search is not built (owner decision Q1). Nothing in the registry assumes a fixed set
-of tools, so a search tool can be added later.
+of tools, so a search tool can be added later. The service registers the app-control
+device tools from phase 3 and the folder tools from phase 4 (the `tools` array changes,
+and the prompt cache prefix with it, once at each of those releases).
 
 ## 3. Data
 
@@ -86,7 +88,10 @@ low, at most 30 output tokens, given the first user message and the final answer
 ("at most 6 words, no quotes"); the reply, trimmed and cut to `CHAT_TITLE_MAX`, is
 stored with `title_by: Model` → `ChatChanged`. It is not a tool and is not stored as an
 item. If the call fails (or a `ScriptedModel` has no reply left), it logs and the
-first-line title stays. `PATCH /api/chats/{id}` with a title sets `title_by: Owner`; the
+first-line title stays; it is tried at most once per chat per service start. The call
+goes to `Turns.title_model` when set (tests point it at a scripted model of its own, so
+the title doesn't take a reply queued for a later turn), else the agent's model; its
+usage counts in the chat's usage footer. `PATCH /api/chats/{id}` with a title sets `title_by: Owner`; the
 model never replaces an `Owner` title. The sidebar's new-chat row stays "New chat".
 
 ## 4. Lifecycle of a turn
@@ -231,7 +236,10 @@ gives `msg`.
 ### 4.6 Stop
 
 `POST /api/chats/{id}/stop` (any device) on a busy chat; 409 `not_running` otherwise.
-`turns::stop` under `write_lock`:
+`turns::stop` runs step 1 under `write_lock`, waits for step 2's writes without it (the
+library changes take `write_lock` themselves), then does steps 3–6 under it again. A
+second Stop during the wait answers with the chat as it is (`Turns.stopping`); the chat
+stays `Running` until the wait ends:
 
 1. Abort the task (`run_turn` is cancel-safe; pending `DeviceBridge` calls send
    `ToolCancel`). Jobs started by tools (lessons, videos) carry on, and so do library
@@ -402,6 +410,12 @@ failed at startup.
 Result cards render live state from the library (a lesson generating, a video
 rendering) through the existing events.
 
+`write_lesson` stores `StoredLesson.prompt` (the request of the course the topic came
+from, if any) and `with_quiz` (both service-only, serde default) so the lesson writer
+has them without a proposal; the lesson is written without a video (`first_write`
+false). `attach_sources` takes only files attached to this chat and not yet in a topic;
+they stay in `Chat.source_ids` and, now in a topic, survive the chat's deletion.
+
 ### Phase 4, folders (device, read-only)
 
 `list_files {workspace_id, path}`, `find_files {workspace_id, path, pattern}`,
@@ -429,6 +443,14 @@ offline.
 - The app parses incoming frames as `ServerFrame`; `Directed` frames go to the device-tool
   runner, which answers with `DeviceFrame::ToolResult` before the deadline and abandons
   work on `ToolCancel`. Folder tools check that the workspace is this device's.
+  One task owns both halves of the app's socket; the runner sends through
+  `AppCtx.device_frames` (an unbounded channel per connection, `None` while
+  disconnected). Each request is its own task keyed by `request_id`, waiting until the
+  deadline but at least 5 s (the device's clock may run ahead). App-control calls are
+  queued on `AppCtx.agent_commands` (`AgentCommand { call, chat_id, reply }`) and run by
+  the shell on the main thread; an unknown id answers `Err`. `show_passage` outside a
+  lesson uses `AppCtx.shown_passage`. On iOS and Android the app closes the socket when
+  it goes to the background (`LiveStatus::Background`) and reconnects on return.
 - Revoking a device: `DeviceHub::forget_device`, its workspaces deleted (detached from
   chats → `ChatChanged`, `WorkspaceDeleted`), `DeviceDeleted`.
 

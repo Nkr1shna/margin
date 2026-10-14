@@ -10,8 +10,8 @@ use dioxus::prelude::*;
 use margin_shared::{
     AcceptProposal, Card, Chat, ChatItem, ChatItemKind, ChatState, ConfirmRequest,
     ConfirmationCard, Decision, Event, Id, ItemStatus, LessonStatus, NewChat, NewMessage,
-    PassagesCard, ProposalStatus, ResultCard, ResultTarget, Usage, VideoStatus, Waiting,
-    error_code,
+    PassagesCard, ProposalStatus, ResultCard, ResultTarget, TitleSource, Usage, VideoStatus,
+    Waiting, error_code,
 };
 
 use crate::api::ApiFailure;
@@ -698,7 +698,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let usage = usage_text(&chat.usage);
 
     rsx! {
-        TopBar { crumbs: vec![title] }
+        TopBar { crumbs: vec![title], provisional: chat.title_by == TitleSource::FirstLine }
         div { id: "{LOG_ID}", class: "scroll chat-scroll",
             div { class: "chat-col chat-log", role: "log", "aria-label": "Conversation",
                 if first_load {
@@ -2617,6 +2617,78 @@ mod tests {
             lesson_result_state(&LessonStatus::Queued),
             "Waiting to be written"
         );
+    }
+
+    /// The cards change with the jobs' events as the store applies them, as they do when
+    /// `write_lesson` and `make_video` run: written, then voiced, rendered and ready.
+    #[test]
+    fn result_cards_follow_job_events() {
+        let mut lib = sample();
+        lib.lessons.get_mut("l1").unwrap().status = LessonStatus::Queued;
+        let items = lib.chat_items.get_mut("c1").unwrap();
+        for (id, seq, target) in [
+            (
+                "k-lesson",
+                80,
+                ResultTarget::Lesson {
+                    lesson_id: "l1".into(),
+                },
+            ),
+            (
+                "k-video",
+                81,
+                ResultTarget::Video {
+                    lesson_id: "l1".into(),
+                },
+            ),
+        ] {
+            items.push(item(
+                id,
+                seq,
+                ItemStatus::Done,
+                ChatItemKind::Card {
+                    call_id: format!("call_{id}"),
+                    card: Card::Result(ResultCard {
+                        target,
+                        title: "Why sums of sines?".into(),
+                    }),
+                },
+            ));
+        }
+        let html = render_route("/chat/c1", lib.clone());
+        assert!(html.contains("Lesson · Waiting to be written"), "{html}");
+        assert!(html.contains("Video · No video yet"), "{html}");
+
+        let mut lesson = lib.lessons["l1"].clone();
+        lesson.status = LessonStatus::Generating;
+        lib.apply(Event::LessonChanged {
+            lesson: lesson.clone(),
+        });
+        assert!(render_route("/chat/c1", lib.clone()).contains("Lesson · Writing…"));
+        lesson.status = LessonStatus::Ready;
+        lib.apply(Event::LessonChanged { lesson });
+        let mut video = margin_shared::Video {
+            id: "v9".into(),
+            lesson_id: "l1".into(),
+            status: VideoStatus::Rendering {
+                progress: Some(0.5),
+            },
+            scene_code: None,
+            log: String::new(),
+            duration_seconds: None,
+            media: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        lib.apply(Event::VideoChanged {
+            video: video.clone(),
+        });
+        let html = render_route("/chat/c1", lib.clone());
+        assert!(html.contains("Lesson · Ready"), "{html}");
+        assert!(html.contains("Video · Rendering 50%…"), "{html}");
+        video.status = VideoStatus::Ready;
+        lib.apply(Event::VideoChanged { video });
+        assert!(render_route("/chat/c1", lib).contains("Video · Ready"));
     }
 
     #[test]

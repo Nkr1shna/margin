@@ -255,6 +255,8 @@ body.resizing-sb * { user-select: none !important; }
 /* Without room, the ancestors give way first (each ellipsized); the current page keeps ~6ch.
    Ancestors that lead somewhere are buttons (the topic shows it in the sidebar). */
 .crumbs b { font-weight: 500; color: var(--fg); min-width: min(6ch, 100%); flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+/* A chat's first-line title, until the model or the owner names the chat. */
+.crumbs b.provisional, .tree-row .row .provisional { color: var(--fg-3); }
 .crumbs .crumb-anc { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1000 auto; }
 .crumbs .crumb-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .crumbs .sep { flex: none; color: var(--fg-4); }
@@ -292,6 +294,12 @@ body.resizing-sb * { user-select: none !important; }
 :root[data-input="touch"] .menu .menu-title { display: block; }
 .menu .menu-note { margin: 4px 0 2px; padding: 6px 10px 4px; max-width: 260px; border-top: 1px solid var(--line); font-size: 12px; line-height: 17px; color: var(--fg-3); }
 .menu.right { right: 0; }
+/* A menu opening from a chip (the chat composer's Attach). */
+.pop-anchor { position: relative; display: inline-flex; }
+.menu.below { top: calc(100% + 4px); left: 0; }
+.menu.above { bottom: calc(100% + 4px); left: 0; }
+/* The chat's files under the composer. */
+.attachments { display: grid; gap: 2px; }
 
 /* modal */
 .modal-scrim { position: fixed; inset: 0; background: var(--scrim); z-index: 60; display: grid; place-items: start center; padding: max(12vh, env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom) + var(--kb)) calc(16px + env(safe-area-inset-left)); }

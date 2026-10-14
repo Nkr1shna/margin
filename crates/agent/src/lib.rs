@@ -67,7 +67,8 @@ pub const TURN_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 pub const MODEL_RETRIES: u32 = 3;
 /// First pause before a retry; doubles each time, unless the API sent `Retry-After`.
 pub const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
-/// Longest pause before a retry, whatever `Retry-After` says.
+/// Longest computed backoff before a retry. A `Retry-After` from the API is honoured as
+/// asked, however long (owner decision); the chat shows it is waiting.
 pub const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// Turns running at once across all chats; a further turn waits (its chat shows
 /// Running) until one ends.

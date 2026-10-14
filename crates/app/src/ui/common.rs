@@ -425,11 +425,13 @@ pub fn reveal_topic(app: crate::state::AppCtx, topic_id: &str) {
 
 /// The top bar of every screen: the drawer button (narrow screens), breadcrumbs, and
 /// screen controls on the right. A crumb with a link (`links`, by position) is a button;
-/// the last crumb is the current screen and never is.
+/// the last crumb is the current screen and never is. `provisional` shows the last crumb
+/// faint: a chat's first-line title, until the model or the owner names the chat.
 #[component]
 pub fn TopBar(
     crumbs: Vec<String>,
     #[props(default)] links: Vec<Option<CrumbLink>>,
+    #[props(default)] provisional: bool,
     children: Element,
 ) -> Element {
     let mut app = use_app();
@@ -463,7 +465,7 @@ pub fn TopBar(
             nav { class: "crumbs", "aria-label": "Breadcrumbs",
                 for (i, c) in crumbs.iter().enumerate() {
                     if i == last {
-                        b { key: "{i}", title: "{path}", "aria-current": "page", "{c}" }
+                        b { key: "{i}", class: if provisional { "provisional" }, title: "{path}", "aria-current": "page", "{c}" }
                     } else if let Some(link) = links.get(i).cloned().flatten() {
                         span { key: "{i}", class: "crumb-anc", title: "{path}",
                             button {

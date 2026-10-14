@@ -51,8 +51,10 @@ use crate::{ask, db, embedding, search, sources, video};
 /// is ready.
 pub const SOURCE_SEARCH_WAIT: Duration = Duration::from_secs(15);
 
-/// Every tool, service tools first then `margin_agent::device_tools()` (from phase 3),
-/// in a fixed order so the `tools` array is identical on every call.
+/// Every tool, service tools first then `margin_agent::device_tools()`, in a fixed order
+/// so the `tools` array is identical on every call. Phase 3 registers the app-control
+/// tools (the turn offers them while the origin device is connected); the folder tools
+/// join in phase 4.
 pub fn registry(state: &AppState) -> ToolRegistry {
     let mut r = ToolRegistry::new();
     r.register(Arc::new(Typed(SearchLibrary(state.clone()))));
@@ -79,6 +81,11 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(DeleteTopic(state.clone()))));
     r.register(Arc::new(Typed(DeleteLesson(state.clone()))));
     r.register(Arc::new(Typed(DeleteNote(state.clone()))));
+    for tool in margin_agent::device_tools() {
+        if margin_agent::APP_CONTROL_TOOLS.contains(&tool.name()) {
+            r.register(tool);
+        }
+    }
     r
 }
 
