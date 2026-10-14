@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use margin_shared::{AskRequest, Level, Outline, OutlineLesson};
+use margin_shared::{Level, OutlineLesson};
 use serde_json::{Value, json};
 
 mod citations;
@@ -598,7 +598,7 @@ impl StreamState {
 // ---------------------------------------------------------------------------
 
 /// An excerpt of one of the learner's sources, retrieved because it is relevant to what
-/// is being written. Outlines and lessons are based on these where they cover the topic.
+/// is being written. Lessons are based on these where they cover the topic.
 /// Passages are numbered from 1 in the order given, and lessons cite them as `[^n]`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Passage {
@@ -618,74 +618,6 @@ pub struct Passage {
 }
 
 pub use citations::{Renumbered, renumber_citations};
-
-/// Proposes a course outline. `existing_subjects` are the titles of root topics, so the
-/// model can file the topic under one of them (it may also invent a new subject).
-/// `passages` are the excerpts of the learner's sources most relevant to the request
-/// (empty without sources). The result has exactly `req.lesson_count` lessons.
-pub async fn propose_outline(
-    client: &ResponsesClient,
-    req: &AskRequest,
-    existing_subjects: &[String],
-    passages: &[Passage],
-) -> Result<Outline, AiError> {
-    let outline: Outline = client
-        .structured_parts(
-            &prompts::outline_instructions(req.lesson_count, req.level, !passages.is_empty()),
-            &prompts::outline_input(req, existing_subjects, passages),
-            prompts::OUTLINE_SCHEMA_NAME,
-            prompts::outline_schema(),
-        )
-        .await?;
-    validate_outline(outline, req.lesson_count)
-}
-
-/// Checks the model's outline: the requested number of lessons, no empty text, a
-/// positive reading time. Whitespace around fields is trimmed and summaries are kept
-/// to one line.
-fn validate_outline(outline: Outline, lesson_count: u32) -> Result<Outline, AiError> {
-    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let outline = Outline {
-        topic_title: one_line(&outline.topic_title),
-        subject_title: one_line(&outline.subject_title),
-        lessons: outline
-            .lessons
-            .into_iter()
-            .map(|l| OutlineLesson {
-                title: one_line(&l.title),
-                summary: one_line(&l.summary),
-                minutes: l.minutes,
-            })
-            .collect(),
-    };
-    if outline.lessons.len() != lesson_count as usize {
-        return Err(AiError::Parse(format!(
-            "asked for {lesson_count} lessons but the outline has {}",
-            outline.lessons.len()
-        )));
-    }
-    if outline.topic_title.is_empty() {
-        return Err(AiError::Parse("the outline has no topic title".into()));
-    }
-    if outline.subject_title.is_empty() {
-        return Err(AiError::Parse("the outline has no subject title".into()));
-    }
-    for (i, l) in outline.lessons.iter().enumerate() {
-        if l.title.is_empty() {
-            return Err(AiError::Parse(format!("lesson {} has no title", i + 1)));
-        }
-        if l.summary.is_empty() {
-            return Err(AiError::Parse(format!("lesson {} has no summary", i + 1)));
-        }
-        if l.minutes == 0 {
-            return Err(AiError::Parse(format!(
-                "lesson {} has a reading time of 0 minutes",
-                i + 1
-            )));
-        }
-    }
-    Ok(outline)
-}
 
 /// Everything needed to write one lesson of an accepted outline.
 #[derive(Debug, Clone)]
@@ -789,43 +721,6 @@ pub async fn write_scene(client: &ResponsesClient, req: &SceneRequest) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn outline(n: usize) -> Outline {
-        Outline {
-            topic_title: " Fourier series ".into(),
-            subject_title: "Signals & Systems".into(),
-            lessons: (0..n)
-                .map(|i| OutlineLesson {
-                    title: format!("Lesson {i}"),
-                    summary: "One\nline".into(),
-                    minutes: 10,
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn outline_validation() {
-        let ok = validate_outline(outline(3), 3).unwrap();
-        assert_eq!(ok.topic_title, "Fourier series");
-        assert_eq!(ok.lessons[0].summary, "One line");
-        assert!(matches!(
-            validate_outline(outline(2), 3),
-            Err(AiError::Parse(_))
-        ));
-        let mut empty = outline(1);
-        empty.lessons[0].summary = "  ".into();
-        assert!(matches!(validate_outline(empty, 1), Err(AiError::Parse(_))));
-        let mut zero = outline(1);
-        zero.lessons[0].minutes = 0;
-        assert!(matches!(validate_outline(zero, 1), Err(AiError::Parse(_))));
-        let mut no_subject = outline(1);
-        no_subject.subject_title = String::new();
-        assert!(matches!(
-            validate_outline(no_subject, 1),
-            Err(AiError::Parse(_))
-        ));
-    }
 
     #[test]
     fn error_messages() {

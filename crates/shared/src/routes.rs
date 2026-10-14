@@ -21,7 +21,6 @@
 //! | POST   | /api/notes                             | NewNote            | Note                |
 //! | PATCH  | /api/notes/{id}                        | NotePatch          | Note                |
 //! | DELETE | /api/notes/{id}                        |                    | 204                 |
-//! | POST   | /api/ask                               | AskRequest         | Proposal (Drafting) |
 //! | GET    | /api/proposals/{id}                    |                    | Proposal            |
 //! | POST   | /api/proposals/{id}/accept             | AcceptProposal     | Topic               |
 //! | POST   | /api/lessons/{id}/video                |                    | Video (Queued)      |
@@ -69,7 +68,6 @@ pub const ME: &str = "/api/me";
 pub const LIBRARY: &str = "/api/library";
 pub const TOPICS: &str = "/api/topics";
 pub const NOTES: &str = "/api/notes";
-pub const ASK: &str = "/api/ask";
 pub const SEARCH: &str = "/api/search";
 pub const SETTINGS: &str = "/api/settings";
 pub const TOOLS: &str = "/api/tools";

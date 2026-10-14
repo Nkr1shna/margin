@@ -23,7 +23,9 @@ pub const CONDENSED_HISTORY_PREFIX: &str =
 /// `output_item.done` arrived, function call outputs, `Action`s as developer messages
 /// from [`action_input`]). Cards, errors and model output that never completed have no
 /// model items. A `function_call` with no `function_call_output` anywhere gets
-/// [`cancelled_call_output`] right after it, so the input is always valid.
+/// [`cancelled_call_output`] right after it, so the input is always valid. Anything
+/// stored between a step's calls and their outputs (an `Action` recorded while the turn
+/// waited on a confirmation) is replayed after those outputs.
 ///
 /// Condensed history: the input starts at the latest `compaction` item (server-side
 /// compaction carries everything before it) or the latest condensed-history `Action`
@@ -41,6 +43,11 @@ pub fn replay_input(items: &[ReplayItem<'_>]) -> Vec<Value> {
         .collect();
     let mut seen_calls = HashSet::new();
     let mut out = Vec::with_capacity(flat.len());
+    // Calls replayed whose output is still to come, and what was stored meanwhile (an
+    // `Action` recorded while the turn waited on a confirmation): it goes after the
+    // outputs, so nothing comes between a step's calls and their outputs.
+    let mut open: HashSet<&str> = HashSet::new();
+    let mut deferred: Vec<Value> = Vec::new();
     for (i, value) in flat.iter().enumerate() {
         match item_type(value) {
             Some("reasoning") if !leads_to_output(&flat[i + 1..]) => continue,
@@ -50,13 +57,24 @@ pub fn replay_input(items: &[ReplayItem<'_>]) -> Vec<Value> {
                     continue;
                 }
                 out.push((*value).clone());
-                if !answered.contains(call_id) {
+                if answered.contains(call_id) {
+                    open.insert(call_id);
+                } else {
                     out.push(cancelled_call_output(call_id));
                 }
             }
+            Some("function_call_output") => {
+                out.push((*value).clone());
+                open.remove(value["call_id"].as_str().unwrap_or_default());
+                if open.is_empty() {
+                    out.append(&mut deferred);
+                }
+            }
+            _ if !open.is_empty() => deferred.push((*value).clone()),
             _ => out.push((*value).clone()),
         }
     }
+    out.append(&mut deferred);
     out
 }
 
@@ -241,6 +259,42 @@ mod tests {
         assert_eq!(unanswered.len(), 1);
         assert_eq!(unanswered[0].0, "call_1");
         assert_eq!(unanswered[0].1.id, "i2");
+    }
+
+    #[test]
+    fn an_action_between_calls_and_outputs_follows_the_outputs() {
+        let items: Vec<ChatItem> = (1..=7).map(item).collect();
+        let created = action_input("Created the course “Optics” with 3 lessons.");
+        let stored = [
+            vec![user("tidy up")],
+            vec![function_call_item("fc_1", "call_1", "delete_note", "{}")],
+            vec![function_call_item("fc_2", "call_2", "list_topics", "{}")],
+            vec![created.clone()],
+            vec![function_call_output("call_1", "ok")],
+            vec![function_call_output("call_2", "[]")],
+            vec![message_item("msg_1", "Done.")],
+        ];
+        let replay: Vec<ReplayItem> = items
+            .iter()
+            .zip(&stored)
+            .map(|(item, m)| ReplayItem {
+                item,
+                model_items: m,
+            })
+            .collect();
+        let input = replay_input(&replay);
+        assert_eq!(
+            input,
+            vec![
+                user("tidy up"),
+                function_call_item("fc_1", "call_1", "delete_note", "{}"),
+                function_call_item("fc_2", "call_2", "list_topics", "{}"),
+                function_call_output("call_1", "ok"),
+                function_call_output("call_2", "[]"),
+                created,
+                message_item("msg_1", "Done."),
+            ]
+        );
     }
 
     #[test]

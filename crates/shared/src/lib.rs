@@ -170,9 +170,12 @@ pub struct VideoMedia {
 }
 
 // ---------------------------------------------------------------------------
-// Ask: outline proposals
+// Course proposals
 // ---------------------------------------------------------------------------
 
+/// What a course was proposed with: the agent's `propose_course` call (the learner's
+/// request and the options it inferred), kept as `Proposal.request`. The outline card's
+/// chips start from these and `AcceptProposal.chips` overrides them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskRequest {
     /// What the learner wants to learn, in their own words.
@@ -182,7 +185,7 @@ pub struct AskRequest {
     pub level: Level,
     pub with_videos: bool,
     pub with_quiz: bool,
-    /// Subject to file the new topic under; `None` lets the model pick or create one.
+    /// Subject to file the new topic under; `None` files it under `Outline.subject_title`.
     pub parent_topic_id: Option<Id>,
     /// Uploaded sources (`Source.id`, not yet attached to a topic) the outline and the
     /// lessons draw on. Accepting the proposal attaches them to the new topic.

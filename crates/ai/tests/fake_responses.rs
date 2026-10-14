@@ -15,9 +15,9 @@ use futures_util::StreamExt;
 use margin_ai::{
     AiError, Backoff, FailedScene, Image, LessonContext, Passage, ReasoningConfig,
     ReasoningSummary, ResponseRequest, ResponseStream, ResponsesClient, SceneRequest, StreamEvent,
-    ToolChoice, propose_outline, write_lesson, write_scene,
+    ToolChoice, write_lesson, write_scene,
 };
-use margin_shared::{AskRequest, Level, OutlineLesson, ReasoningEffort, Usage};
+use margin_shared::{Level, Outline, OutlineLesson, ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -369,19 +369,44 @@ async fn unreachable_server_is_a_network_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Structured output and the outline
+// Structured output
 // ---------------------------------------------------------------------------
 
-fn ask(lesson_count: u32) -> AskRequest {
-    AskRequest {
-        prompt: "I want to understand Fourier series".into(),
-        lesson_count,
-        level: Level::Intermediate,
-        with_videos: false,
-        with_quiz: true,
-        parent_topic_id: None,
-        source_ids: vec![],
-    }
+/// A strict schema for `Outline`, the shape the tests ask for.
+fn outline_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic_title", "subject_title", "lessons"],
+        "properties": {
+            "topic_title": { "type": "string" },
+            "subject_title": { "type": "string" },
+            "lessons": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["title", "summary", "minutes"],
+                    "properties": {
+                        "title": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "minutes": { "type": "integer" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn outline(client: &ResponsesClient) -> Result<Outline, AiError> {
+    client
+        .structured(
+            "Propose an outline.",
+            "I want to understand Fourier series",
+            "course_outline",
+            outline_schema(),
+        )
+        .await
 }
 
 fn outline_json(n: usize) -> String {
@@ -398,19 +423,13 @@ fn outline_json(n: usize) -> String {
 }
 
 #[tokio::test]
-async fn propose_outline_parses_structured_output() {
+async fn structured_output_parses_and_sends_a_strict_schema() {
     let (client, fake) = spawn(vec![Reply::Json(
         StatusCode::OK,
         message_response(&outline_json(3)),
     )])
     .await;
-    let subjects = vec![
-        "Signals & Systems".to_string(),
-        "Linear Algebra".to_string(),
-    ];
-    let outline = propose_outline(&client, &ask(3), &subjects, &[])
-        .await
-        .unwrap();
+    let outline = outline(&client).await.unwrap();
     assert_eq!(outline.topic_title, "Fourier series");
     assert_eq!(outline.subject_title, "Signals & Systems");
     assert_eq!(outline.lessons.len(), 3);
@@ -425,20 +444,8 @@ async fn propose_outline_parses_structured_output() {
     assert_eq!(format["strict"], true);
     assert_eq!(format["name"], "course_outline");
     assert_eq!(format["schema"]["additionalProperties"], false);
-    assert_eq!(
-        format["schema"]["properties"]["lessons"]["items"]["required"],
-        json!(["title", "summary", "minutes"])
-    );
-    let input = req["input"].as_str().unwrap();
-    assert!(input.contains("Fourier series"));
-    assert!(input.contains("- Linear Algebra"));
-    assert!(
-        req["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("exactly 3 lessons")
-    );
-    assert!(!input.contains("SOURCE PASSAGES"));
+    assert_eq!(req["input"], "I want to understand Fourier series");
+    assert_eq!(req["instructions"], "Propose an outline.");
 }
 
 fn passages() -> Vec<Passage> {
@@ -448,53 +455,6 @@ fn passages() -> Vec<Passage> {
         text: "The coefficient a_n is the projection onto cos(n x).".into(),
         ..Default::default()
     }]
-}
-
-#[tokio::test]
-async fn propose_outline_sends_source_passages() {
-    let (client, fake) = spawn(vec![Reply::Json(
-        StatusCode::OK,
-        message_response(&outline_json(2)),
-    )])
-    .await;
-    propose_outline(&client, &ask(2), &[], &passages())
-        .await
-        .unwrap();
-    let (_, req) = last_request(&fake);
-    let input = req["input"].as_str().unwrap();
-    assert!(input.contains("=== BEGIN SOURCE PASSAGES ==="));
-    assert!(
-        input.contains("[1] dsp.pdf, p. 12:\nThe coefficient a_n is the projection onto cos(n x).")
-    );
-    let ins = req["instructions"].as_str().unwrap();
-    assert!(ins.contains("Base the outline on the sources"));
-}
-
-#[tokio::test]
-async fn propose_outline_rejects_the_wrong_lesson_count() {
-    let (client, _) = spawn(vec![Reply::Json(
-        StatusCode::OK,
-        message_response(&outline_json(4)),
-    )])
-    .await;
-    match propose_outline(&client, &ask(3), &[], &[]).await {
-        Err(AiError::Parse(m)) => assert!(m.contains("asked for 3 lessons"), "{m}"),
-        other => panic!("expected Parse, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn propose_outline_rejects_empty_fields() {
-    let bad = json!({"topic_title": "", "subject_title": "S", "lessons": [{"title": "t", "summary": "s", "minutes": 5}]});
-    let (client, _) = spawn(vec![Reply::Json(
-        StatusCode::OK,
-        message_response(&bad.to_string()),
-    )])
-    .await;
-    assert!(matches!(
-        propose_outline(&client, &ask(1), &[], &[]).await,
-        Err(AiError::Parse(_))
-    ));
 }
 
 #[tokio::test]
@@ -513,7 +473,7 @@ async fn structured_output_that_violates_the_schema_is_parse() {
     ])
     .await;
     for _ in 0..4 {
-        match propose_outline(&client, &ask(1), &[], &[]).await {
+        match outline(&client).await {
             Err(AiError::Parse(_)) => {}
             other => panic!("expected Parse, got {other:?}"),
         }
@@ -532,7 +492,7 @@ async fn structured_refusal_and_incomplete_are_incomplete() {
     ])
     .await;
     for expected in ["I won't.", "token limit", "Boom."] {
-        match propose_outline(&client, &ask(1), &[], &[]).await {
+        match outline(&client).await {
             Err(AiError::Incomplete(m)) => assert!(m.contains(expected), "{m}"),
             other => panic!("expected Incomplete, got {other:?}"),
         }
@@ -546,7 +506,7 @@ async fn structured_error_status_is_http() {
         json!({"error": {"message": "Invalid schema for response_format 'course_outline'.", "type": "invalid_request_error", "code": null}}),
     )])
     .await;
-    match propose_outline(&client, &ask(1), &[], &[]).await {
+    match outline(&client).await {
         Err(AiError::Http {
             status: 400,
             message,
@@ -662,38 +622,6 @@ async fn write_lesson_sends_pictures_as_image_inputs() {
             .unwrap()
             .contains("=== END SOURCE PASSAGES ===")
     );
-}
-
-#[tokio::test]
-async fn propose_outline_sends_pictures_too() {
-    let (client, fake) = spawn(vec![Reply::Json(
-        StatusCode::OK,
-        message_response(&outline_json(2)),
-    )])
-    .await;
-    let picture = Passage {
-        source: "slides.pdf".into(),
-        page: Some(2),
-        text: "Slide two.".into(),
-        image: Some(Image {
-            media_type: "image/png".into(),
-            data: vec![1, 2, 3],
-        }),
-        ..Default::default()
-    };
-    propose_outline(&client, &ask(2), &[], &[picture])
-        .await
-        .unwrap();
-    let (_, req) = last_request(&fake);
-    let content = req["input"][0]["content"].as_array().unwrap();
-    assert_eq!(content[1]["image_url"], "data:image/png;base64,AQID");
-    assert!(
-        content[2]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("Slide two.")
-    );
-    assert_eq!(req["text"]["format"]["type"], "json_schema");
 }
 
 #[tokio::test]

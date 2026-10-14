@@ -2,7 +2,10 @@
 //! runner → the agent loop → the real `ResponsesClient` against a fake Responses API that
 //! streams real SSE → a read-only library tool → the final answer, with the stored items,
 //! the socket's events, replay on the next turn, Stop, and Continue after a simulated
-//! restart of the service on the same store.
+//! restart of the service on the same store. A second test takes a course through the
+//! same path (phase 2): `propose_course` and its outline card, Create lessons with chips,
+//! the chat's record of it on the next turn, a delete parked on its confirmation card and
+//! approved from another device, and owner decision Q2 for overwriting notes.
 
 mod common;
 
@@ -20,10 +23,13 @@ use axum::{Json, Router};
 use common::*;
 use futures_util::StreamExt as _;
 use margin_agent::RetryPolicy;
+use margin_service::db;
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY};
+use margin_service::state::{Author, StoredNote};
 use margin_service::turns::{CALL_INTERRUPTED, STOPPED, STOPPED_BY_RESTART};
 use margin_shared::{
-    ChatDetail, ChatItem, ChatItemKind, ChatState, Event, ItemStatus, ToolOutputText, Topic,
+    Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, Event, ItemStatus, Lesson,
+    LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, ToolOutputText, Topic,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -696,4 +702,491 @@ async fn a_chat_runs_through_the_real_client_tools_replay_stop_and_restart() {
     );
     // Everything up to the stopped turn is still the same bytes as before.
     assert_eq!(&resumed[..third_input.len()], &third_input[..]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: a course, a delete and an overwrite through the real client
+// ---------------------------------------------------------------------------
+
+async fn library(h: &Harness, token: &str) -> Library {
+    let r = h.get(token, "/api/library").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
+
+async fn stored_note(h: &Harness, id: &str) -> StoredNote {
+    h.state.store.get(db::NOTE, id).await.unwrap().unwrap()
+}
+
+/// One model reply that makes the function calls `(call_id, name, arguments)`.
+fn calls_reply(id: &str, calls: &[(&str, &str, Value)]) -> Reply {
+    let mut sse = created(id);
+    for (i, (call_id, name, args)) in calls.iter().enumerate() {
+        let args = args.to_string();
+        sse.push_str(&call(
+            i as u32,
+            &format!("fc_{call_id}"),
+            call_id,
+            name,
+            &[&args],
+        ));
+    }
+    sse.push_str(&completed(id));
+    Reply::Stream(sse)
+}
+
+/// One model reply that answers `text`.
+fn text_reply(id: &str, text: &str) -> Reply {
+    Reply::Stream(
+        [
+            created(id),
+            message(0, &format!("msg_{id}"), &[text]),
+            completed(id),
+        ]
+        .concat(),
+    )
+}
+
+async fn confirm(h: &Harness, token: &str, chat_id: &str, item_id: &str, approve: bool) {
+    let r = h
+        .post(token, &format!("/api/chats/{chat_id}/confirm"))
+        .json(&json!({"item_id": item_id, "approve": approve}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+}
+
+/// The confirmation card the chat waits on, once it waits.
+async fn wait_for_card(h: &Harness, token: &str, chat_id: &str) -> (ChatDetail, ChatItem) {
+    let d = wait_chat(h, token, chat_id, |d| {
+        matches!(d.chat.state, ChatState::WaitingForUser { .. })
+    })
+    .await;
+    let ChatState::WaitingForUser { item_id, .. } = &d.chat.state else {
+        unreachable!()
+    };
+    let item = d.items.iter().find(|i| &i.id == item_id).unwrap().clone();
+    (d, item)
+}
+
+fn confirmation(item: &ChatItem) -> &margin_shared::ConfirmationCard {
+    match &item.kind {
+        ChatItemKind::Card {
+            card: Card::Confirmation(c),
+            ..
+        } => c,
+        other => panic!("not a confirmation card: {other:?}"),
+    }
+}
+
+/// The lines of the chat's last turn, from its user message on.
+fn last_turn(d: &ChatDetail) -> Vec<String> {
+    let start = d
+        .items
+        .iter()
+        .rposition(|i| matches!(i.kind, ChatItemKind::UserMessage { .. }))
+        .unwrap();
+    d.items[start..].iter().map(line).collect()
+}
+
+/// The text of the last request's `function_call_output` for `call_id`.
+fn output_in(body: &Value, call_id: &str) -> Value {
+    let (_, out) = function_call_outputs(&input_of(body))
+        .into_iter()
+        .find(|(id, _)| id == call_id)
+        .unwrap_or_else(|| panic!("no output for {call_id}"));
+    serde_json::from_str(&out).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_course_a_delete_and_an_overwrite_run_through_the_real_client() {
+    let (openai, fake) = start_fake_openai().await;
+    let h = start_service(None).await;
+    let t = h.sign_in("Mac").await;
+    let phone = h.sign_in("iPhone").await;
+    let me: Me = h
+        .get(&phone, "/api/me")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let phone_id = me.device.id;
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = h
+        .post(&t, "/api/topics")
+        .json(&json!({"parent_id": null, "title": "Old optics"}))
+        .send()
+        .await
+        .unwrap();
+    let old: Topic = r.json().await.unwrap();
+    let r = h
+        .post(&t, "/api/notes")
+        .json(
+            &json!({"topic_id": old.id, "lesson_id": null, "title": "Mirrors",
+            "body_md": "Angles of incidence.", "quote": null}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let mut sock = h.socket(&t).await;
+
+    // --- Turn 1: the model proposes a course; the outline card is stored and sent. ---
+    let lessons = json!([
+        {"title": "Why waves bend", "summary": "Refraction from wavefronts.", "minutes": 8},
+        {"title": "Snell's law", "summary": "Deriving and using it.", "minutes": 10},
+        {"title": "Lenses", "summary": "Thin lenses and focal length.", "minutes": 12},
+    ]);
+    fake.push(calls_reply(
+        "resp_1",
+        &[(
+            "call_propose",
+            "propose_course",
+            json!({
+                "prompt": "Teach me how light refracts",
+                "topic_title": "Refraction",
+                "subject_title": "Physics",
+                "lessons": lessons,
+                "level": "intermediate",
+                "with_videos": false,
+                "with_quiz": true,
+                "parent_topic_id": null,
+                "source_ids": [],
+            }),
+        )],
+    ));
+    fake.push(text_reply(
+        "resp_2",
+        "Here is an outline; change it on the card.",
+    ));
+    let r = h
+        .post(&t, "/api/chats")
+        .json(&json!({"message": {"text": "Teach me how light refracts"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let chat_id = r.json::<ChatDetail>().await.unwrap().chat.id;
+    let events = sock
+        .until(|e| matches!(e, Event::ChatChanged { chat } if chat.id == chat_id && chat.state == ChatState::Idle && chat.usage.model_calls == 2))
+        .await;
+    let d = detail(&h, &t, &chat_id).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: Teach me how light refracts".to_string(),
+            "call propose_course: Proposing the course “Refraction”".into(),
+            "result ok: Proposed “Refraction” · 3 lessons".into(),
+            "card".into(),
+            "assistant: Here is an outline; change it on the card.".into(),
+        ]
+    );
+    let proposal_id = match &d.items[3].kind {
+        ChatItemKind::Card {
+            call_id,
+            card: Card::Outline(c),
+        } => {
+            assert_eq!(call_id, "call_propose");
+            c.proposal_id.clone()
+        }
+        other => panic!("expected the outline card, got {other:?}"),
+    };
+    // Broadcast after it was stored, once.
+    let card_events = events
+        .iter()
+        .filter(|e| matches!(e, Event::ChatItemChanged { item } if item.id == d.items[3].id && item == &d.items[3]))
+        .count();
+    assert_eq!(card_events, 1);
+    let proposal: Proposal = h
+        .get(&t, &format!("/api/proposals/{proposal_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Ready);
+    assert_eq!(proposal.chat_id.as_deref(), Some(chat_id.as_str()));
+    assert_eq!(proposal.request.level, Level::Intermediate);
+    assert!(proposal.request.with_quiz && !proposal.request.with_videos);
+    let outline = proposal.outline.clone().unwrap();
+    assert_eq!(outline.topic_title, "Refraction");
+    assert_eq!(outline.lessons.len(), 3);
+    // The model was told what it proposed.
+    let bodies = fake.bodies();
+    assert_eq!(
+        output_in(&bodies[1], "call_propose")["proposal_id"],
+        proposal_id.as_str()
+    );
+    let propose = bodies[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "propose_course")
+        .expect("propose_course is offered");
+    assert_eq!(propose["strict"], true);
+    // Nothing exists until the owner accepts.
+    assert!(
+        library(&h, &t)
+            .await
+            .topics
+            .iter()
+            .all(|t| t.title != "Refraction")
+    );
+
+    // --- Create lessons on the card, the outline edited and the chips changed. ---
+    let mut edited = outline.clone();
+    edited.lessons.truncate(2);
+    edited.lessons[1].title = "Snell's law in practice".into();
+    let r = h
+        .post(&t, &format!("/api/proposals/{proposal_id}/accept"))
+        .json(&json!({
+            "outline": edited,
+            "chips": {"level": "advanced", "with_videos": null, "with_quiz": false},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let topic: Topic = r.json().await.unwrap();
+    assert_eq!(topic.title, "Refraction");
+    let action = "Created the course “Refraction” with 2 lessons.";
+    sock.until(|e| {
+        matches!(e, Event::ChatItemChanged { item } if item.chat_id == chat_id
+            && matches!(&item.kind, ChatItemKind::Action { text } if text == action))
+    })
+    .await;
+    // The lesson jobs run with the chips' options.
+    let written: Vec<Lesson> = eventually(|| async {
+        let lessons: Vec<Lesson> = library(&h, &t)
+            .await
+            .lessons
+            .into_iter()
+            .filter(|l| l.topic_id == topic.id)
+            .collect();
+        (lessons.len() == 2 && lessons.iter().all(|l| l.status == LessonStatus::Ready))
+            .then_some(lessons)
+    })
+    .await;
+    assert!(written.iter().all(|l| l.level == Level::Advanced));
+    let mut titles: Vec<String> = written.iter().map(|l| l.title.clone()).collect();
+    titles.sort();
+    assert_eq!(titles, ["Snell's law in practice", "Why waves bend"]);
+    {
+        let requests = h.generator.lesson_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|c| c.level == Level::Advanced && !c.with_quiz)
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|c| c.prompt == "Teach me how light refracts")
+        );
+    }
+    assert!(
+        library(&h, &t).await.videos.is_empty(),
+        "the proposal had no videos"
+    );
+
+    // --- Turn 2: the course is in the replay; a delete waits for the owner. ---
+    fake.push(calls_reply(
+        "resp_3",
+        &[("call_delete", "delete_topic", json!({"topic_id": old.id}))],
+    ));
+    fake.push(text_reply("resp_4", "Deleted the old topic."));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Now delete my old optics topic"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let (d, card_item) = wait_for_card(&h, &t, &chat_id).await;
+    let card = confirmation(&card_item);
+    assert_eq!(card.tool, "delete_topic");
+    assert_eq!(card.title, "Delete the topic “Old optics”?");
+    assert_eq!(card.detail, "1 note goes with it.");
+    assert_eq!(card.approve_label, "Delete");
+    assert_eq!(card.decision, Decision::Pending);
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Now delete my old optics topic".to_string(),
+            "call delete_topic: Deleting a topic…".into(),
+            "card".into(),
+        ]
+    );
+    assert!(
+        library(&h, &t).await.topics.iter().any(|t| t.id == old.id),
+        "nothing is deleted while it waits"
+    );
+    let bodies = fake.bodies();
+    assert_eq!(bodies.len(), 3);
+    // The replay carries the course: after the answer that proposed it, before the
+    // new message, told to the model as a developer message.
+    let input = input_of(&bodies[2]);
+    let at_action = input
+        .iter()
+        .position(|i| i["role"] == "developer" && i["content"][0]["text"] == action)
+        .expect("the course is in the replay");
+    let at_answer = input
+        .iter()
+        .position(|i| i["type"] == "message" && i["role"] == "assistant")
+        .unwrap();
+    let at_user = input.iter().rposition(|i| i["role"] == "user").unwrap();
+    assert!(at_answer < at_action && at_action < at_user);
+    // Everything before it replays the earlier turn byte for byte.
+    let earlier = input_of(&bodies[1]);
+    assert_eq!(&input[..earlier.len()], &earlier[..]);
+
+    // Approved from the phone, over HTTP.
+    confirm(&h, &phone, &chat_id, &card_item.id, true).await;
+    let d = wait_chat(&h, &t, &chat_id, |d| d.chat.state == ChatState::Idle).await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Now delete my old optics topic".to_string(),
+            "call delete_topic: Deleting a topic".into(),
+            "card".into(),
+            "result ok: Deleted “Old optics”".into(),
+            "assistant: Deleted the old topic.".into(),
+        ]
+    );
+    let answered = d.items.iter().find(|i| i.id == card_item.id).unwrap();
+    assert_eq!(
+        confirmation(answered).decision,
+        Decision::Approved {
+            device_id: phone_id.clone()
+        }
+    );
+    let lib = library(&h, &t).await;
+    assert!(lib.topics.iter().all(|t| t.id != old.id));
+    assert!(lib.notes.iter().all(|n| n.title != "Mirrors"));
+    let bodies = fake.bodies();
+    assert_eq!(output_in(&bodies[3], "call_delete")["with_it"]["notes"], 1);
+
+    // --- Turn 3: the agent writes two notes. ---
+    fake.push(calls_reply(
+        "resp_5",
+        &[
+            (
+                "call_note_a",
+                "create_note",
+                json!({"topic_id": topic.id, "lesson_id": null, "title": "Indices",
+                    "body_md": "Glass is about 1.5."}),
+            ),
+            (
+                "call_note_b",
+                "create_note",
+                json!({"topic_id": topic.id, "lesson_id": null, "title": "Formulas",
+                    "body_md": "n1 sin θ1 = n2 sin θ2"}),
+            ),
+        ],
+    ));
+    fake.push(text_reply("resp_6", "Two notes written."));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Write me two notes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    wait_chat(&h, &t, &chat_id, |d| {
+        d.chat.state == ChatState::Idle
+            && d.items
+                .last()
+                .is_some_and(|i| line(i) == "assistant: Two notes written.")
+    })
+    .await;
+    let notes: Vec<Note> = library(&h, &t)
+        .await
+        .notes
+        .into_iter()
+        .filter(|n| n.topic_id == topic.id)
+        .collect();
+    let note_id = |title: &str| notes.iter().find(|n| n.title == title).unwrap().id.clone();
+    let (agents, edited) = (note_id("Indices"), note_id("Formulas"));
+    assert_eq!(stored_note(&h, &agents).await.author, Author::Agent);
+    // The owner edits the second one's text: it is their writing now.
+    let r = h
+        .patch(&t, &format!("/api/notes/{edited}"))
+        .json(&json!({"body_md": "n₁ sin θ₁ = n₂ sin θ₂, my way."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(stored_note(&h, &edited).await.author, Author::Owner);
+
+    // --- Turn 4: replacing the agent's note just happens; the owner's asks. ---
+    fake.push(calls_reply(
+        "resp_7",
+        &[
+            (
+                "call_replace_a",
+                "replace_note_body",
+                json!({"note_id": agents, "body_md": "Glass: 1.5; water: 1.33."}),
+            ),
+            (
+                "call_replace_b",
+                "replace_note_body",
+                json!({"note_id": edited, "body_md": "Snell's law."}),
+            ),
+        ],
+    ));
+    fake.push(text_reply("resp_8", "Updated the first; left yours."));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "Tidy both notes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let (d, card_item) = wait_for_card(&h, &t, &chat_id).await;
+    let card = confirmation(&card_item);
+    assert_eq!(card.tool, "replace_note_body");
+    assert_eq!(card.title, "Replace the text of your note “Formulas”?");
+    assert_eq!(card.approve_label, "Replace");
+    // Only the owner's note asked; the agent's was already replaced.
+    assert_eq!(
+        last_turn(&d)
+            .iter()
+            .filter(|l| l.as_str() == "card")
+            .count(),
+        1
+    );
+    assert!(last_turn(&d).contains(&"result ok: Rewrote “Indices”".to_string()));
+    assert_eq!(
+        stored_note(&h, &agents).await.note.body_md,
+        "Glass: 1.5; water: 1.33."
+    );
+    // Denied over HTTP: the owner's text stays and the model is told.
+    confirm(&h, &t, &chat_id, &card_item.id, false).await;
+    let d = wait_chat(&h, &t, &chat_id, |d| d.chat.state == ChatState::Idle).await;
+    assert_eq!(
+        last_turn(&d).last().unwrap(),
+        "assistant: Updated the first; left yours."
+    );
+    assert!(last_turn(&d).contains(&"result failed: Declined".to_string()));
+    let row = stored_note(&h, &edited).await;
+    assert_eq!(row.note.body_md, "n₁ sin θ₁ = n₂ sin θ₂, my way.");
+    assert_eq!(row.author, Author::Owner);
+    let bodies = fake.bodies();
+    assert_eq!(bodies.len(), 8);
+    assert_eq!(
+        output_in(&bodies[7], "call_replace_b")["error"],
+        "The owner declined: Replace the text of your note “Formulas”?"
+    );
+    assert!(d.items.windows(2).all(|w| w[0].seq < w[1].seq));
 }

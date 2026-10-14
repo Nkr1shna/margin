@@ -253,7 +253,9 @@ pending message), delete items, delete sources whose only attachment is this cha
 ### 4.11 Replay
 
 `replay_input` = each stored item's `model_items` in `seq` order, plus the safety net for
-unanswered calls. What stores which model items:
+unanswered calls. Anything stored between a step's `function_call`s and their outputs (an
+`Action` recorded while the turn waited on a confirmation) is replayed right after those
+outputs, so nothing sits between a call and its output. What stores which model items:
 
 | Item | model_items |
 |---|---|
@@ -324,7 +326,15 @@ Create lessons on the outline card: `POST proposal_accept` with the edited outli
 `chips`; when the proposal has a `chat_id`, the service adds
 `Action "Created the course “<topic>” with N lessons."` (with `action_input`) to that chat
 → `ChatItemChanged`, so the next turn knows. Accepting while that chat's turn is busy is
-fine (the action lands between items; replay order is `seq`).
+fine: the action takes that turn's id and lands between items; replay moves it after the
+outputs of calls still open when it was stored (4.11). Accepting through the
+`accept_proposal` tool adds no `Action` (its result is the record).
+
+`POST /api/ask` (`routes::ASK`), the proposal job and `margin_ai::propose_outline` with its
+prompt are gone; the model writes the outline in `propose_course`. `AskRequest` stays as
+`Proposal.request` (what the course was proposed with; the chips start from it and
+`AcceptProposal.chips` overrides it). Proposals left `Drafting` by an older service are
+failed at startup.
 
 ### Phase 3 (service and device)
 
