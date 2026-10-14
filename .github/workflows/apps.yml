@@ -2,7 +2,7 @@
 # publishes them as GitHub releases, so every deployed service has a matching app:
 #
 #   after a successful deploy-dev    -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
-#   after a successful promote-prod  -> Margin-prod .dmg (+ .apk), release "prod-<sha>", marked latest
+#   after a successful deploy-prod   -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
 #   a v* tag                         -> both environments, release named after the tag
 #   workflow_dispatch                -> workflow artifacts only, no release
 #
@@ -13,12 +13,12 @@
 # entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer
 # account, owner question 7). Android: the APK, skipped while the runner has no Android SDK.
 #
-# workflow_run triggers only take effect once this file is on the default branch (main).
+# workflow_run triggers only take effect once this file is on the default branch (dev).
 name: apps
 
 on:
   workflow_run:
-    workflows: [deploy-dev, promote-prod]
+    workflows: [deploy-dev, deploy-prod]
     types: [completed]
   push:
     tags: ["v*"]
@@ -60,7 +60,7 @@ jobs:
             workflow_run)
               case "$RUN_NAME" in
                 deploy-dev) env=dev ;;
-                promote-prod) env=prod ;;
+                deploy-prod) env=prod ;;
                 *) echo "::error::unexpected workflow $RUN_NAME"; exit 1 ;;
               esac
               # The commit that was actually deployed, from the run's deployed-<env>-<sha> artifact.

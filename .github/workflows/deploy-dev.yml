@@ -1,14 +1,16 @@
 # Installs a build-service artifact in the dev VM (docs/plan-deploy.md §4).
-# Only ever reaches margin-dev: MARGIN_DEPLOY_ONLY=dev makes deploy.sh refuse anything
-# else. The binary it installed is uploaded again as `deployed-dev-<sha>`, which is what
-# promote-prod.yml installs in prod (the same bytes that ran on dev).
+# Runs after build-service succeeds on the `dev` branch (or by hand with a build run id of
+# that branch). Only ever reaches margin-dev: MARGIN_DEPLOY_ONLY=dev makes deploy.sh refuse
+# anything else. The binary it installed is uploaded again as `deployed-dev-<sha>`, which
+# apps.yml builds the matching "Margin Dev" app from. Prod deploys from `release`
+# (deploy-prod.yml).
 name: deploy-dev
 
 on:
   workflow_run:
     workflows: [build-service]
     types: [completed]
-    branches: [main]
+    branches: [dev]
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -39,6 +41,7 @@ jobs:
     timeout-minutes: 30
     env:
       MARGIN_DEPLOY_ONLY: dev
+      DEPLOY_BRANCH: dev
       BUILD_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.build_run_id || github.event.workflow_run.id }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -50,8 +53,13 @@ jobs:
           path="$(printf '%s' "$run" | jq -r .path)"
           conclusion="$(printf '%s' "$run" | jq -r .conclusion)"
           sha="$(printf '%s' "$run" | jq -r .head_sha)"
+          branch="$(printf '%s' "$run" | jq -r .head_branch)"
           if [ "$path" != ".github/workflows/build-service.yml" ] || [ "$conclusion" != success ]; then
             echo "::error::run $BUILD_RUN_ID is $path ($conclusion), not a successful build-service run"
+            exit 1
+          fi
+          if [ "$branch" != "$DEPLOY_BRANCH" ]; then
+            echo "::error::run $BUILD_RUN_ID built $branch; this environment deploys only $DEPLOY_BRANCH"
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
