@@ -9,10 +9,10 @@ use dioxus::prelude::*;
 use margin_shared::{LoginState, StartLogin};
 
 use crate::api::Api;
-use crate::config::{self, normalize_service_url};
+use crate::config::normalize_service_url;
 use crate::secrets;
 use crate::state::{Session, use_app};
-use crate::ui::common::{BrandMark, DragRegion, Icon, open_external};
+use crate::ui::common::{BrandMark, DragRegion, Icon, focus_first, open_external};
 
 #[derive(Clone, PartialEq, Debug)]
 enum Phase {
@@ -56,24 +56,29 @@ pub fn ConnectScreen() -> Element {
     let mut url_rev = use_signal(|| 0u64);
     let mut phase = use_signal(|| Phase::Idle);
     let mut task = use_signal(|| None::<Task>);
+    // A mistyped address: shown under the field (not as a failed connection).
+    let mut url_error = use_signal(|| None::<String>);
 
     let mut start = move || {
         if let Some(t) = task.take() {
             t.cancel();
         }
+        let base = match normalize_service_url(&url.peek()) {
+            Ok(base) => base,
+            Err(message) => {
+                url_error.set(Some(message));
+                phase.set(Phase::Idle);
+                focus_first("#service-url");
+                return;
+            }
+        };
+        url_error.set(None);
+        if *url.peek() != base {
+            url.set(base.clone());
+            url_rev += 1;
+        }
         app.signed_out_reason.set(None);
         let handle = spawn(async move {
-            let base = match normalize_service_url(&url.peek()) {
-                Ok(base) => base,
-                Err(message) => {
-                    phase.set(Phase::Failed(message));
-                    return;
-                }
-            };
-            if *url.peek() != base {
-                url.set(base.clone());
-                url_rev += 1;
-            }
             phase.set(Phase::Starting);
             let api = Api::anonymous(&base);
             let login = match api.start_login(&device_name()).await {
@@ -126,6 +131,7 @@ pub fn ConnectScreen() -> Element {
         Phase::Starting | Phase::Waiting { .. } | Phase::Finishing
     );
     let reason = app.signed_out_reason.read().clone();
+    let url_invalid = url_error.read().is_some();
 
     rsx! {
         div { class: "connect",
@@ -162,10 +168,19 @@ pub fn ConnectScreen() -> Element {
                         autocomplete: "url",
                         spellcheck: false,
                         disabled: busy,
+                        "aria-invalid": url_invalid.to_string(),
+                        "aria-describedby": url_invalid.then_some("service-url-err"),
                         initial_value: "{url}",
-                        placeholder: config::DEFAULT_SERVICE_URL,
-                        oninput: move |e| url.set(e.value()),
+                        // Clearly an example, not a value already filled in.
+                        placeholder: "e.g. margin.example.com",
+                        oninput: move |e| {
+                            url_error.set(None);
+                            url.set(e.value());
+                        },
                     }
+                    }
+                    if let Some(err) = url_error.read().clone() {
+                        span { id: "service-url-err", class: "field-error", role: "alert", "{err}" }
                     }
                 }
                 match current {

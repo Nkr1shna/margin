@@ -157,6 +157,13 @@ pub fn render_math(id: &str) {
     let _ = js(&format!("MarginApp.renderMath({id});"));
 }
 
+/// Focus the first element matching `selector` once the next DOM update lands (for a
+/// field that was just added, or the first one with an error).
+pub fn focus_first(selector: &str) {
+    let sel = serde_json::to_string(selector).unwrap_or_default();
+    let _ = js(&format!("MarginApp.focusFirst({sel});"));
+}
+
 pub fn render_math_in(selector: &str) {
     let sel = serde_json::to_string(selector).unwrap_or_default();
     let _ = js(&format!("MarginApp.renderMathIn({sel});"));
@@ -437,7 +444,12 @@ pub fn ConfirmDialog(
     use_hook(|| {
         let _ = js("MarginApp.saveFocus();");
     });
+    // While the action runs, the dialog can't be dismissed: it would look cancelled
+    // while the request carries on.
     let cancel = move || {
+        if busy {
+            return;
+        }
         let _ = js("MarginApp.restoreFocus();");
         on_cancel.call(());
     };
@@ -457,11 +469,12 @@ pub fn ConfirmDialog(
                 role: "alertdialog",
                 "aria-modal": "true",
                 "aria-label": "{title}",
+                "aria-busy": busy.to_string(),
                 onclick: move |e| e.stop_propagation(),
                 h2 { "{title}" }
                 p { "{message}" }
                 if let Some(err) = error {
-                    div { class: "notice error",
+                    div { class: "notice error", role: "alert",
                         Icon { name: "alert" }
                         div { class: "body", "{err}" }
                     }
@@ -469,6 +482,7 @@ pub fn ConfirmDialog(
                 div { class: "row-actions",
                     button {
                         class: "btn btn-secondary btn-sm",
+                        disabled: busy,
                         onclick: move |_| cancel(),
                         "Cancel"
                     }
@@ -482,7 +496,11 @@ pub fn ConfirmDialog(
                         onmounted: move |e| async move {
                             let _ = e.set_focus(true).await;
                         },
-                        onclick: move |_| on_confirm.call(()),
+                        onclick: move |_| {
+                            if !busy {
+                                on_confirm.call(());
+                            }
+                        },
                         if busy { span { class: "spinner" } }
                         "{confirm_label}"
                     }

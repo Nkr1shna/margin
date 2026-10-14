@@ -367,6 +367,20 @@
       if (m.ellipsis && m.scrollWidth > m.clientWidth) return true;
       return !!m.clamped && m.scrollHeight > m.clientHeight + 1;
     },
+    // Focus (and show) the first element matching the selector once the pending DOM
+    // update has landed; tries for a few frames, since Rust renders asynchronously.
+    focusFirst: function (selector) {
+      var tries = 0;
+      (function attempt() {
+        var el = document.querySelector(selector);
+        if (el) {
+          el.focus();
+          el.scrollIntoView({ block: "nearest" });
+        } else if (tries++ < 10) {
+          requestAnimationFrame(attempt);
+        }
+      })();
+    },
     copyText: function (text) {
       if (navigator.clipboard && window.isSecureContext) {
         return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fallbackCopy(text); });

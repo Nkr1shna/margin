@@ -9,7 +9,7 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::store::{LibraryState, VideoDot};
 use crate::ui::common::{
-    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
+    BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR, focus_first,
 };
 use crate::ui::settings::SettingsPane;
 use crate::ui::shell::close_drawer;
@@ -35,7 +35,36 @@ struct TreeCtx {
     delete_lesson: Signal<Option<Id>>,
     /// The topic whose Sources dialog is open.
     sources: Signal<Option<Id>>,
+    /// The written lesson waiting for "Regenerate" to be confirmed.
+    regenerate: Signal<Option<Id>>,
+    /// The lesson whose regenerate request is in flight.
+    regenerating: Signal<Option<Id>>,
     error: Signal<Option<String>>,
+}
+
+/// Ask the service to write the lesson again (the tree's Regenerate).
+async fn regenerate_lesson(app: crate::state::AppCtx, tree: TreeCtx, id: Id) -> bool {
+    let Some(api) = app.api() else { return false };
+    let mut regenerating = tree.regenerating;
+    let mut error = tree.error;
+    if regenerating.peek().is_some() {
+        return false;
+    }
+    regenerating.set(Some(id.clone()));
+    error.set(None);
+    let ok = match api.regenerate_lesson(&id).await {
+        Ok(lesson) => {
+            let mut lib = app.lib;
+            lib.write().apply(Event::LessonChanged { lesson });
+            true
+        }
+        Err(e) => {
+            error.set(Some(app.failure(&e)));
+            false
+        }
+    };
+    regenerating.set(None);
+    ok
 }
 
 #[component]
@@ -49,6 +78,8 @@ pub fn Sidebar() -> Element {
         delete: Signal::new(None),
         delete_lesson: Signal::new(None),
         sources: Signal::new(None),
+        regenerate: Signal::new(None),
+        regenerating: Signal::new(None),
         error: Signal::new(None),
     });
     let mut edit = tree.edit;
@@ -91,6 +122,10 @@ pub fn Sidebar() -> Element {
         .as_ref()
         .and_then(|id| app.lib.read().lessons.get(id).map(|l| l.title.clone()));
     let route_now_lesson = route.clone();
+    let regenerate_id = tree.regenerate.read().clone();
+    let regenerate_title = regenerate_id
+        .as_ref()
+        .and_then(|id| app.lib.read().lessons.get(id).map(|l| l.title.clone()));
     let mut sources_topic = tree.sources;
     // Open only while the topic exists (it may be deleted elsewhere meanwhile).
     let sources_open = sources_topic
@@ -206,7 +241,16 @@ pub fn Sidebar() -> Element {
                     div { class: "skel", style: "margin: 10px 8px; width: 55%" }
                 } else if roots.is_empty() && *edit.read() != TreeEdit::AddRoot {
                     p { class: "faint", style: "padding: 6px 8px; margin: 0; font-size: 13px;",
-                        "No topics yet. Ask for something to learn, or add a topic with +."
+                        "No topics yet. Ask for something to learn, or "
+                        button {
+                            class: "link-btn",
+                            onclick: move |_| {
+                                error.set(None);
+                                edit.set(TreeEdit::AddRoot);
+                            },
+                            "add a topic"
+                        }
+                        "."
                     }
                 }
                 ul { class: "tree", role: "tree",
@@ -276,6 +320,28 @@ pub fn Sidebar() -> Element {
                 },
             }
         }
+        if let (Some(id), Some(title)) = (regenerate_id.clone(), regenerate_title) {
+            ConfirmDialog {
+                title: "Regenerate “{title}”?",
+                message: "The lesson is written again from its outline and this text is replaced. Your notes stay, but a note anchored to a quote may no longer find it. This can't be undone.",
+                confirm_label: "Regenerate",
+                busy: tree.regenerating.read().is_some(),
+                error: error.read().clone(),
+                on_cancel: move |_| {
+                    let mut r = tree.regenerate;
+                    r.set(None);
+                },
+                on_confirm: move |_| {
+                    let id = id.clone();
+                    async move {
+                        if regenerate_lesson(app, tree, id).await {
+                            let mut r = tree.regenerate;
+                            r.set(None);
+                        }
+                    }
+                },
+            }
+        }
         if let Some(id) = sources_open {
             TopicSourcesDialog { key: "{id}", topic_id: id.clone(), on_close: move |_| sources_topic.set(None) }
         }
@@ -321,7 +387,7 @@ pub fn Sidebar() -> Element {
 /// A lesson in the tree: opens on click; its ⋯ button or a right-click offers Rename,
 /// Regenerate and Delete, like the lesson screen's menu.
 #[component]
-fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element {
+fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: bool) -> Element {
     let app = use_app();
     let nav = navigator();
     let route = use_route::<Route>();
@@ -333,6 +399,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
     let menu_open = menu.read().as_deref() == Some(id.as_str());
     let renaming = *edit.read() == TreeEdit::RenameLesson(id.clone());
     let current = route_is_lesson(&route, &id);
+    let regenerating = tree.regenerating.read().as_deref() == Some(id.as_str());
     let open_menu = {
         let id = id.clone();
         move || menu.set(Some(id.clone()))
@@ -365,8 +432,8 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                         },
                         Icon { name: "book", class: "leaf-ic" }
                         span { class: "grow", "{title}" }
-                        if generating {
-                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: "Writing" }
+                        if generating || regenerating {
+                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: if regenerating { "Starting over" } else { "Writing" } }
                         }
                         match dot {
                             VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready" } },
@@ -414,27 +481,26 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                     }
                     button {
                         role: "menuitem",
-                        disabled: generating,
+                        disabled: generating || regenerating,
                         onclick: {
                             let id = id.clone();
                             move |_| {
                                 menu.set(None);
                                 error.set(None);
-                                let id = id.clone();
-                                spawn(async move {
-                                    let Some(api) = app.api() else { return };
-                                    match api.regenerate_lesson(&id).await {
-                                        Ok(lesson) => {
-                                            let mut lib = app.lib;
-                                            lib.write().apply(Event::LessonChanged { lesson });
-                                        }
-                                        Err(e) => error.set(Some(app.failure(&e))),
-                                    }
-                                });
+                                if ready {
+                                    // A written lesson is replaced: ask first.
+                                    let mut r = tree.regenerate;
+                                    r.set(Some(id.clone()));
+                                } else {
+                                    let id = id.clone();
+                                    spawn(async move {
+                                        regenerate_lesson(app, tree, id).await;
+                                    });
+                                }
                             }
                         },
                         Icon { name: "refresh" }
-                        "Regenerate"
+                        if ready { "Regenerate…" } else { "Regenerate" }
                     }
                     button {
                         role: "menuitem",
@@ -461,6 +527,9 @@ fn LessonInput(id: Id, initial: String) -> Element {
     let app = use_app();
     let tree = use_context::<TreeCtx>();
     let mut value = use_signal(|| initial.clone());
+    let mut busy = use_signal(|| false);
+    // A failed save: shown under the field, which stays open to fix or retry.
+    let mut field_error = use_signal(|| None::<String>);
     let commit = {
         let id = id.clone();
         let initial = initial.clone();
@@ -468,11 +537,13 @@ fn LessonInput(id: Id, initial: String) -> Element {
             let id = id.clone();
             let initial = initial.clone();
             async move {
+                if *busy.peek() {
+                    return;
+                }
                 let mut edit = tree.edit;
-                let mut error = tree.error;
                 let title = value.peek().trim().to_string();
-                edit.set(TreeEdit::None);
                 if title.is_empty() || title == initial {
+                    edit.set(TreeEdit::None);
                     return;
                 }
                 let Some(api) = app.api() else { return };
@@ -480,24 +551,39 @@ fn LessonInput(id: Id, initial: String) -> Element {
                     title: Some(title),
                     ..Default::default()
                 };
-                match api.patch_lesson(&id, &patch).await {
+                busy.set(true);
+                let result = api.patch_lesson(&id, &patch).await;
+                busy.set(false);
+                match result {
                     Ok(lesson) => {
                         let mut lib = app.lib;
                         lib.write().apply(Event::LessonChanged { lesson });
+                        edit.set(TreeEdit::None);
                     }
-                    Err(e) => error.set(Some(app.failure(&e))),
+                    Err(e) => {
+                        field_error.set(Some(app.failure(&e)));
+                        focus_first("#tree-edit");
+                    }
                 }
             }
         }
     };
     let on_blur = commit.clone();
+    let invalid = field_error.read().is_some();
     rsx! {
         input {
+            id: "tree-edit",
             class: "input tree-input",
             "aria-label": "Lesson title",
+            "aria-invalid": invalid.to_string(),
+            "aria-describedby": invalid.then_some("tree-edit-err"),
+            "aria-busy": busy.read().to_string(),
             autofocus: true,
             initial_value: "{initial}",
-            oninput: move |e| value.set(e.value()),
+            oninput: move |e| {
+                field_error.set(None);
+                value.set(e.value());
+            },
             onkeydown: move |e: KeyboardEvent| {
                 match e.key() {
                     Key::Enter => {
@@ -512,11 +598,15 @@ fn LessonInput(id: Id, initial: String) -> Element {
                 }
             },
             onblur: move |_| {
-                if *tree.edit.peek() == TreeEdit::None {
+                // Not again while the last try's error is showing (Enter retries).
+                if *tree.edit.peek() == TreeEdit::None || field_error.peek().is_some() {
                     return;
                 }
                 spawn(on_blur());
             },
+        }
+        if let Some(err) = field_error.read().clone() {
+            span { id: "tree-edit-err", class: "field-error tree-error", role: "alert", "{err}" }
         }
     }
 }
@@ -572,7 +662,7 @@ fn TopicNode(id: Id) -> Element {
         .iter()
         .map(|t| t.id.clone())
         .collect();
-    let lessons: Vec<(Id, String, VideoDot, bool)> = lib
+    let lessons: Vec<(Id, String, VideoDot, bool, bool)> = lib
         .lessons_in(&id)
         .iter()
         .map(|l| {
@@ -585,6 +675,7 @@ fn TopicNode(id: Id) -> Element {
                 l.title.clone(),
                 lib.video_dot(&l.id),
                 generating,
+                l.status == margin_shared::LessonStatus::Ready,
             )
         })
         .collect();
@@ -760,8 +851,8 @@ fn TopicNode(id: Id) -> Element {
                     for child in children {
                         TopicNode { key: "{child}", id: child.clone() }
                     }
-                    for (lid, title, dot, generating) in lessons {
-                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating }
+                    for (lid, title, dot, generating, ready) in lessons {
+                        LessonNode { key: "{lid}", id: lid.clone(), title, dot, generating, ready }
                     }
                     if note_count > 0 {
                         li { key: "notes-{id}", role: "treeitem",
@@ -814,6 +905,8 @@ fn TopicInput(
     let tree = use_context::<TreeCtx>();
     let mut value = use_signal(|| initial.clone());
     let mut busy = use_signal(|| false);
+    // A failed save: shown under the field, which stays open to fix or retry.
+    let mut field_error = use_signal(|| None::<String>);
 
     let commit = {
         let parent = parent.clone();
@@ -828,7 +921,6 @@ fn TopicInput(
                     return;
                 }
                 let mut edit = tree.edit;
-                let mut error = tree.error;
                 let title = value.peek().trim().to_string();
                 if title.is_empty() || title == initial {
                     edit.set(TreeEdit::None);
@@ -863,25 +955,37 @@ fn TopicInput(
                             .apply(margin_shared::Event::TopicChanged { topic });
                         edit.set(TreeEdit::None);
                     }
-                    Err(e) => error.set(Some(app.failure(&e))),
+                    Err(e) => {
+                        field_error.set(Some(app.failure(&e)));
+                        focus_first("#tree-edit");
+                    }
                 }
             }
         }
     };
     let commit_blur = commit.clone();
+    let invalid = field_error.read().is_some();
 
     rsx! {
         input {
+            id: "tree-edit",
             class: "input tree-input",
             r#type: "text",
             placeholder,
             "aria-label": placeholder,
+            "aria-invalid": invalid.to_string(),
+            "aria-describedby": invalid.then_some("tree-edit-err"),
+            // Read-only rather than disabled while saving, so the field keeps focus.
+            readonly: *busy.read(),
+            "aria-busy": busy.read().to_string(),
             initial_value: "{value}",
-            disabled: *busy.read(),
             onmounted: move |e| async move {
                 let _ = e.set_focus(true).await;
             },
-            oninput: move |e| value.set(e.value()),
+            oninput: move |e| {
+                field_error.set(None);
+                value.set(e.value());
+            },
             onkeydown: move |e: KeyboardEvent| {
                 let commit = commit.clone();
                 if e.key() == Key::Escape {
@@ -904,8 +1008,16 @@ fn TopicInput(
             },
             onblur: move |_| {
                 let commit = commit_blur.clone();
-                async move { commit().await }
+                async move {
+                    // Not again while the last try's error is showing (Enter retries).
+                    if field_error.peek().is_none() {
+                        commit().await
+                    }
+                }
             },
+        }
+        if let Some(err) = field_error.read().clone() {
+            span { id: "tree-edit-err", class: "field-error tree-error", role: "alert", "{err}" }
         }
     }
 }

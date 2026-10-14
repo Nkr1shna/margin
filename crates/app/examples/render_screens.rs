@@ -23,6 +23,8 @@ mod api;
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/drafts.rs"]
+mod drafts;
 #[path = "../src/fake.rs"]
 mod fake;
 #[path = "../src/markdown.rs"]

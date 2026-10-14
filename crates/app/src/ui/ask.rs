@@ -12,13 +12,21 @@ use crate::api::ApiFailure;
 use crate::routes::Route;
 use crate::sources::UploadState;
 use crate::state::use_app;
-use crate::ui::common::{ErrorNotice, Icon, TopBar, js};
+use crate::ui::common::{ErrorNotice, Icon, TopBar, focus_first, js};
+use crate::ui::settings::SettingsPane;
 use crate::ui::sources::{
     AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding,
 };
 
 /// The composer's text field, focused by Cmd+N (`ui::shell`).
 pub const PROMPT_ID: &str = "ask-prompt";
+
+/// Prompts to start from while the library is empty; a click puts one in the composer.
+const EXAMPLE_PROMPTS: [&str; 3] = [
+    "How do Fourier series approximate a signal?",
+    "Linear algebra for machine learning",
+    "How does TCP avoid congestion?",
+];
 
 pub fn level_label(level: Level) -> &'static str {
     match level {
@@ -68,6 +76,19 @@ pub fn AskScreen() -> Element {
     // Whether the service can read sources yet (events keep it current).
     use_future(move || async move {
         let _ = refresh_embedding(app).await;
+    });
+    // Whether an API key is set, to say so before a prompt is sent rather than after
+    // (SettingsChanged events keep it current).
+    use_future(move || async move {
+        if app.lib.peek().settings.is_some() {
+            return;
+        }
+        let Some(api) = app.api() else { return };
+        if let Ok(settings) = api.settings().await {
+            app.lib
+                .write()
+                .apply(margin_shared::Event::SettingsChanged { settings });
+        }
     });
 
     // When the shown proposal is (re)loaded, restore its request into the composer.
@@ -138,7 +159,13 @@ pub fn AskScreen() -> Element {
             .peek()
             .iter()
             .any(|u| u.topic_id.is_none() && u.pending());
-        if req.prompt.is_empty() || *submitting.peek() || uploading {
+        let no_key = app
+            .lib
+            .peek()
+            .settings
+            .as_ref()
+            .is_some_and(|s| !s.has_api_key);
+        if req.prompt.is_empty() || *submitting.peek() || uploading || no_key {
             return;
         }
         spawn(async move {
@@ -173,6 +200,10 @@ pub fn AskScreen() -> Element {
         .read()
         .as_ref()
         .and_then(|id| lib.topics.get(id).map(|t| t.title.clone()));
+    let no_key = lib.settings.as_ref().is_some_and(|s| !s.has_api_key);
+    // A first run: offer a few prompts to start from.
+    let empty_library =
+        lib.topics.is_empty() && *app.lib_status.read() == crate::state::LoadStatus::Loaded;
     drop(lib);
 
     let (has_sources, uploading) = {
@@ -181,7 +212,15 @@ pub fn AskScreen() -> Element {
         let has = ask.clone().next().is_some();
         (has, ask.any(|u| u.pending()))
     };
-    let can_send = !prompt.read().trim().is_empty() && !*submitting.read() && !uploading;
+    let can_send = !prompt.read().trim().is_empty() && !*submitting.read() && !uploading && !no_key;
+    let send_title = if no_key {
+        "Add an API key in Settings to draft outlines"
+    } else if uploading {
+        "Waiting for the sources to upload"
+    } else {
+        "Draft an outline (Enter)"
+    };
+    let show_examples = empty_library && prompt.read().trim().is_empty() && proposal.is_none();
     let count = *lesson_count.read();
 
     rsx! {
@@ -272,13 +311,46 @@ pub fn AskScreen() -> Element {
                         button {
                             class: "send",
                             "aria-label": "Draft an outline",
-                            title: if uploading { "Waiting for the sources to upload" } else { "Draft an outline (Enter)" },
+                            title: send_title,
+                            "aria-describedby": no_key.then_some("ask-no-key"),
                             disabled: !can_send,
                             onclick: move |_| submit(request()),
                             if *submitting.read() {
                                 span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" }
                             } else {
                                 Icon { name: "up" }
+                            }
+                        }
+                    }
+                }
+                if no_key {
+                    div { id: "ask-no-key", class: "notice", role: "status",
+                        Icon { name: "alert" }
+                        div { class: "body",
+                            span { "Add an API key to draft outlines. Margin needs one for your AI provider before it can write lessons." }
+                            div { class: "row-actions",
+                                button {
+                                    class: "btn btn-secondary btn-sm",
+                                    onclick: move |_| app.settings_open.set(Some(SettingsPane::Ai)),
+                                    Icon { name: "gear" }
+                                    "Open Settings → AI"
+                                }
+                            }
+                        }
+                    }
+                }
+                if show_examples {
+                    div { class: "examples", role: "group", "aria-label": "Example prompts",
+                        for example in EXAMPLE_PROMPTS {
+                            button {
+                                key: "{example}",
+                                class: "chip",
+                                onclick: move |_| {
+                                    prompt.set(example.to_string());
+                                    prompt_rev += 1;
+                                    focus_first(".composer textarea");
+                                },
+                                "{example}"
                             }
                         }
                     }
@@ -468,9 +540,8 @@ fn OutlineEditor(
         keys.write().fit(n);
     }
     let row_keys = keys.peek().keys();
-    let valid = !outline.topic_title.trim().is_empty()
-        && !outline.lessons.is_empty()
-        && outline.lessons.iter().all(|l| !l.title.trim().is_empty());
+    let issue = first_issue(&outline);
+    let topic_missing = outline.topic_title.trim().is_empty();
     let subject_label = fixed_subject
         .clone()
         .unwrap_or_else(|| outline.subject_title.clone());
@@ -488,8 +559,14 @@ fn OutlineEditor(
                         input {
                             id: "ol-topic",
                             class: "input",
+                            placeholder: "Topic title",
+                            "aria-invalid": topic_missing.to_string(),
+                            "aria-describedby": topic_missing.then_some("ol-topic-err"),
                             initial_value: "{outline.topic_title}",
                             oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.topic_title = v.clone()) },
+                        }
+                        if topic_missing {
+                            span { id: "ol-topic-err", class: "field-error", "Needs a title" }
                         }
                     }
                     if fixed_subject.is_none() {
@@ -516,8 +593,14 @@ fn OutlineEditor(
                                 id: row_control(key, "title"),
                                 class: "input ol-title",
                                 "aria-label": "Lesson {i + 1} title",
+                                placeholder: "Lesson title",
+                                "aria-invalid": lesson.title.trim().is_empty().to_string(),
+                                "aria-describedby": lesson.title.trim().is_empty().then(|| format!("ol-title-{i}-err")),
                                 initial_value: "{lesson.title}",
                                 oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].title = v.clone()) },
+                            }
+                            if lesson.title.trim().is_empty() {
+                                span { id: "ol-title-{i}-err", class: "field-error", "Needs a title" }
                             }
                             input {
                                 class: "input",
@@ -593,6 +676,7 @@ fn OutlineEditor(
             if *editing.read() && n < 12 {
                 div { style: "padding-top: 10px",
                     button {
+                        id: "ol-add",
                         class: "btn btn-ghost btn-sm",
                         onclick: move |_| {
                             edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 }));
@@ -610,17 +694,31 @@ fn OutlineEditor(
                 }
             }
             div { class: "outline-f",
-                button { class: "btn btn-ghost", onclick: move |_| on_discard.call(()), "Discard" }
+                // Why "Create lessons" won't go yet (it also jumps to the field).
+                if let Some(issue) = &issue {
+                    span { class: "field-error", role: "status", style: "margin-right: auto; align-self: center", {issue.message()} }
+                }
+                button { class: "btn btn-ghost", disabled: accepting, onclick: move |_| on_discard.call(()), "Discard" }
                 button {
                     class: "btn btn-secondary",
+                    disabled: accepting,
                     "aria-pressed": editing.read().to_string(),
                     onclick: move |_| editing.toggle(),
                     if *editing.read() { "Done editing" } else { "Edit outline" }
                 }
                 button {
                     class: "btn btn-primary",
-                    disabled: !valid || accepting,
+                    disabled: accepting,
+                    "aria-busy": accepting.to_string(),
                     onclick: move |_| {
+                        if accepting {
+                            return;
+                        }
+                        if let Some(issue) = first_issue(&outline) {
+                            editing.set(true);
+                            focus_first(&issue.selector(&keys.peek()));
+                            return;
+                        }
                         let o = outline.clone();
                         let cleaned = Outline {
                             topic_title: o.topic_title.trim().to_string(),
@@ -629,8 +727,12 @@ fn OutlineEditor(
                         };
                         on_accept.call(cleaned)
                     },
-                    if accepting { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
-                    "Create lessons"
+                    if accepting {
+                        span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" }
+                        "Creating lessons…"
+                    } else {
+                        "Create lessons"
+                    }
                 }
             }
         }
@@ -686,6 +788,36 @@ impl RowKeys {
     }
 }
 
+/// What keeps an outline from being created, in the order the fields appear.
+#[derive(Debug, Clone, PartialEq)]
+enum OutlineIssue {
+    TopicTitle,
+    NoLessons,
+    LessonTitle(usize),
+}
+
+impl OutlineIssue {
+    fn message(&self) -> String {
+        match self {
+            OutlineIssue::TopicTitle => "The topic needs a title.".into(),
+            OutlineIssue::NoLessons => "Add at least one lesson.".into(),
+            OutlineIssue::LessonTitle(i) => format!("Lesson {} needs a title.", i + 1),
+        }
+    }
+
+    /// The field to fix (shown in edit mode); `keys` are the rows' keys, in order.
+    fn selector(&self, keys: &RowKeys) -> String {
+        match self {
+            OutlineIssue::TopicTitle => "#ol-topic".into(),
+            OutlineIssue::NoLessons => "#ol-add".into(),
+            OutlineIssue::LessonTitle(i) => match keys.at(*i) {
+                Some(key) => format!("#{}", row_control(key, "title")),
+                None => "#ol-add".into(),
+            },
+        }
+    }
+}
+
 /// The id of a row's control: "title", "up" or "down".
 fn row_control(key: u64, part: &str) -> String {
     format!("ol-{key}-{part}")
@@ -701,6 +833,20 @@ fn after_move(to: usize, n: usize, up: bool) -> &'static str {
         (false, _, false) => "down",
         (false, _, true) => "up",
     }
+}
+
+fn first_issue(outline: &Outline) -> Option<OutlineIssue> {
+    if outline.topic_title.trim().is_empty() {
+        return Some(OutlineIssue::TopicTitle);
+    }
+    if outline.lessons.is_empty() {
+        return Some(OutlineIssue::NoLessons);
+    }
+    outline
+        .lessons
+        .iter()
+        .position(|l| l.title.trim().is_empty())
+        .map(OutlineIssue::LessonTitle)
 }
 
 #[cfg(test)]
@@ -741,5 +887,39 @@ mod tests {
         // Two rows: every move ends at an edge.
         assert_eq!(after_move(0, 2, true), "down");
         assert_eq!(after_move(1, 2, false), "up");
+    }
+
+    fn lesson(title: &str) -> OutlineLesson {
+        OutlineLesson {
+            title: title.into(),
+            summary: String::new(),
+            minutes: 10,
+        }
+    }
+
+    #[test]
+    fn first_issue_points_at_the_first_empty_field() {
+        let mut o = Outline {
+            topic_title: "Fourier".into(),
+            subject_title: "Maths".into(),
+            lessons: vec![lesson("Series"), lesson("  "), lesson("")],
+        };
+        assert_eq!(first_issue(&o), Some(OutlineIssue::LessonTitle(1)));
+        let mut keys = RowKeys::default();
+        keys.fit(3);
+        keys.swap(0, 1);
+        assert_eq!(OutlineIssue::LessonTitle(1).selector(&keys), "#ol-0-title");
+        assert_eq!(OutlineIssue::LessonTitle(7).selector(&keys), "#ol-add");
+        assert_eq!(
+            OutlineIssue::LessonTitle(1).message(),
+            "Lesson 2 needs a title."
+        );
+        o.lessons.truncate(1);
+        assert_eq!(first_issue(&o), None);
+        o.topic_title = " ".into();
+        assert_eq!(first_issue(&o), Some(OutlineIssue::TopicTitle));
+        o.topic_title = "Fourier".into();
+        o.lessons.clear();
+        assert_eq!(first_issue(&o), Some(OutlineIssue::NoLessons));
     }
 }

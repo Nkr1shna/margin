@@ -4,8 +4,9 @@
 use std::time::Duration;
 
 use dioxus::prelude::*;
-use margin_shared::{Event, Id, NewNote, Note, NotePatch};
+use margin_shared::{Event, Id, NewNote, Note};
 
+use crate::drafts;
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
@@ -24,6 +25,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
     let mut creating = use_signal(|| false);
     let mut new_topic = use_signal(|| None::<Id>);
     let mut create_error = use_signal(|| None::<String>);
+    let mut create_busy = use_signal(|| false);
     let mut item_menu = use_signal(|| None::<Id>);
     let mut confirm_note = use_signal(|| None::<(Id, String)>);
     let mut del_busy = use_signal(|| false);
@@ -119,10 +121,14 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
     let default_topic = topic
         .clone()
         .or_else(|| topics.first().map(|(id, _)| id.clone()));
+    let default_topic_empty = default_topic.clone();
 
     let create = move |_| {
         let scopes = scopes.clone();
         async move {
+            if *create_busy.peek() {
+                return; // a double click: one note is already on its way
+            }
             let chosen = new_topic.peek().clone();
             let Some(topic_id) = chosen else {
                 create_error.set(Some("Choose a topic for the note.".into()));
@@ -130,6 +136,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
             };
             let Some(api) = app.api() else { return };
             create_error.set(None);
+            create_busy.set(true);
             let new = NewNote {
                 topic_id,
                 lesson_id: None,
@@ -151,6 +158,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                 }
                 Err(e) => create_error.set(Some(app.failure(&e))),
             }
+            create_busy.set(false);
         }
     };
 
@@ -193,7 +201,18 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                     span { class: "save-state error", "{err}" }
                                 }
                                 div { class: "row-actions",
-                                    button { class: "btn btn-primary btn-sm", onclick: create, "Create note" }
+                                    button {
+                                        class: "btn btn-primary btn-sm",
+                                        disabled: *create_busy.read(),
+                                        "aria-busy": create_busy.read().to_string(),
+                                        onclick: create,
+                                        if *create_busy.read() {
+                                            span { class: "spinner" }
+                                            "Creating…"
+                                        } else {
+                                            "Create note"
+                                        }
+                                    }
                                     button { class: "btn btn-ghost btn-sm", onclick: move |_| creating.set(false), "Cancel" }
                                 }
                             }
@@ -212,7 +231,19 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                     } else if total == 0 {
                         div { class: "empty", style: "padding: 32px 12px",
                             if q.is_empty() {
-                                p { "No notes yet. Select text in a lesson to add a margin note, or press + to write one." }
+                                p { "No notes yet. Select text in a lesson to add a margin note, or write one here." }
+                                if !*creating.read() && !topics.is_empty() {
+                                    button {
+                                        class: "btn btn-secondary btn-sm",
+                                        onclick: move |_| {
+                                            new_topic.set(default_topic_empty.clone());
+                                            create_error.set(None);
+                                            creating.set(true);
+                                        },
+                                        Icon { name: "plus" }
+                                        "New note"
+                                    }
+                                }
                             } else {
                                 p { "No notes match “{query}”." }
                             }
@@ -381,8 +412,21 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     let Some(initial) = initial else {
         return rsx! {};
     };
-    let mut title = use_signal(|| initial.title.clone());
-    let mut body = use_signal(|| initial.body_md.clone());
+    // An edit made earlier that the service doesn't have yet (the save after leaving
+    // the note failed): show it, and try again.
+    let restored = use_hook(|| drafts::get(&id));
+    let mut title = use_signal(|| {
+        restored
+            .as_ref()
+            .and_then(|p| p.title.clone())
+            .unwrap_or_else(|| initial.title.clone())
+    });
+    let mut body = use_signal(|| {
+        restored
+            .as_ref()
+            .and_then(|p| p.body_md.clone())
+            .unwrap_or_else(|| initial.body_md.clone())
+    });
     // What the service has, as far as we know (to detect unsaved edits).
     let mut saved = use_signal(|| (initial.title.clone(), initial.body_md.clone()));
     let mut state = use_signal(|| SaveState::Saved);
@@ -393,6 +437,12 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     let mut remote_rev = use_signal(|| 0u64);
     let mut confirm = use_signal(|| false);
     let mut deleting = use_signal(|| false);
+    let mut del_error = use_signal(|| None::<String>);
+
+    // Leaving the note (another note, Back, the lesson chip) unmounts the editor and
+    // cancels its debounced save: hand any unsaved edit to a task that outlives it.
+    let drop_id = id.clone();
+    use_drop(move || drafts::save_in_background(app, drop_id.clone()));
 
     // Follow edits from other devices while there are no local unsaved changes.
     let follow_id = id.clone();
@@ -413,41 +463,48 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
         }
     });
 
-    let schedule = {
+    // Keep the shared record of unsaved edits current (see `drafts`).
+    let record = {
         let id = id.clone();
         move || {
+            let (st, sb) = saved.peek().clone();
+            let patch = drafts::patch_for((&st, &sb), (&title.peek(), &body.peek()));
+            drafts::record(&id, app.api().as_ref(), patch);
+        }
+    };
+
+    // Save after `delay` unless another edit comes first.
+    let schedule = {
+        let id = id.clone();
+        move |delay: Duration| {
             let id = id.clone();
+            let record = record.clone();
             let next = *generation.peek() + 1;
             generation.set(next);
             state.set(SaveState::Pending);
+            record();
             spawn(async move {
-                tokio::time::sleep(AUTOSAVE_DELAY).await;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 if *generation.peek() != next {
                     return; // a newer edit is waiting
                 }
                 let t = title.peek().clone();
                 let b = body.peek().clone();
                 let (st, sb) = saved.peek().clone();
-                if (t.clone(), b.clone()) == (st.clone(), sb.clone()) {
+                let Some(patch) = drafts::patch_for((&st, &sb), (&t, &b)) else {
                     state.set(SaveState::Saved);
+                    error.set(None);
                     return;
-                }
+                };
                 let Some(api) = app.api() else { return };
                 state.set(SaveState::Saving);
-                let patch = NotePatch {
-                    title: (t != st).then(|| {
-                        if t.trim().is_empty() {
-                            "Untitled note".to_string()
-                        } else {
-                            t.clone()
-                        }
-                    }),
-                    body_md: (b != sb).then(|| b.clone()),
-                };
                 match api.patch_note(&id, &patch).await {
                     Ok(note) => {
                         saved.set((t, b));
                         error.set(None);
+                        record();
                         let mut lib = app.lib;
                         lib.write().apply(Event::NoteChanged { note });
                         if *generation.peek() == next {
@@ -462,9 +519,27 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
             });
         }
     };
+    {
+        let mut schedule = schedule.clone();
+        let restored = restored.is_some();
+        use_hook(move || {
+            if restored {
+                schedule(Duration::ZERO);
+            }
+        });
+    }
     let schedule_title = schedule.clone();
     let mut schedule_retry = schedule.clone();
-    let schedule_body = schedule;
+    let schedule_body = schedule.clone();
+    // Leaving a field (or the window losing focus) saves right away.
+    let flush = move || {
+        let mut schedule = schedule.clone();
+        move |_: FocusEvent| {
+            if *state.peek() == SaveState::Pending && error.peek().is_none() {
+                schedule(Duration::ZERO);
+            }
+        }
+    };
 
     let note = app.lib.read().notes.get(&id).cloned().unwrap_or(initial);
     let lesson = note.lesson_id.as_ref().and_then(|l| {
@@ -514,7 +589,7 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                 }
                 span { class: if error.read().is_some() { "save-state error" } else { "save-state" }, role: "status", "{state_text}" }
                 if error.read().is_some() {
-                    button { class: "btn btn-ghost btn-sm", onclick: move |_| schedule_retry(), "Retry" }
+                    button { class: "btn btn-ghost btn-sm", onclick: move |_| schedule_retry(Duration::ZERO), "Retry" }
                 }
                 div { class: "note-tools",
                     div { class: "seg", role: "tablist", "aria-label": "Editor mode",
@@ -525,7 +600,10 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                         class: "icon-btn",
                         "aria-label": "Delete note",
                         title: "Delete note",
-                        onclick: move |_| confirm.set(true),
+                        onclick: move |_| {
+                            del_error.set(None);
+                            confirm.set(true);
+                        },
                         Icon { name: "trash" }
                     }
                 }
@@ -541,9 +619,10 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                     let mut schedule_title = schedule_title.clone();
                     move |e: FormEvent| {
                         title.set(e.value());
-                        schedule_title();
+                        schedule_title(AUTOSAVE_DELAY);
                     }
                 },
+                onblur: flush(),
             }
             }
             if let Some(q) = &note.quote {
@@ -565,9 +644,10 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                         let mut schedule_body = schedule_body.clone();
                         move |e: FormEvent| {
                             body.set(e.value());
-                            schedule_body();
+                            schedule_body(AUTOSAVE_DELAY);
                         }
                     },
+                    onblur: flush(),
                 }
                 }
             }
@@ -578,6 +658,7 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                 message: "This note will be deleted. This can't be undone.",
                 confirm_label: "Delete note",
                 busy: *deleting.read(),
+                error: del_error.read().clone(),
                 on_cancel: move |_| confirm.set(false),
                 on_confirm: {
                     let id = id.clone();
@@ -586,22 +667,25 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                         let id = id.clone();
                         let list = list.clone();
                         async move {
+                            if *deleting.peek() {
+                                return;
+                            }
                             let Some(api) = app.api() else { return };
                             deleting.set(true);
+                            del_error.set(None);
                             match api.delete_note(&id).await {
                                 Ok(()) => {
-                                    // Stop any pending autosave.
+                                    // Stop any pending autosave, and don't save on the way out.
                                     let next = *generation.peek() + 1;
                                     generation.set(next);
+                                    drafts::take(&id);
                                     let mut lib = app.lib;
                                     lib.write().apply(Event::NoteDeleted { id });
                                     confirm.set(false);
                                     nav.replace(list);
                                 }
-                                Err(e) => {
-                                    error.set(Some(app.failure(&e)));
-                                    confirm.set(false);
-                                }
+                                // Shown in the dialog, which stays open to try again.
+                                Err(e) => del_error.set(Some(app.failure(&e))),
                             }
                             deleting.set(false);
                         }
