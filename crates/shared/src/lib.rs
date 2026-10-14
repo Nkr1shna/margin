@@ -154,6 +154,10 @@ pub struct VideoMedia {
     pub storyboard_url: String,
     /// Captions (.srt), when the scene speaks. Absolute URL.
     pub captions_url: Option<String>,
+    /// The video's thumbnail: the scene's closing poster shot as a PNG at full render
+    /// size. Absolute URL. `None` for videos rendered before posters existed.
+    #[serde(default)]
+    pub poster_url: Option<String>,
     pub expires_at: DateTime<Utc>,
 }
 

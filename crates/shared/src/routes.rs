@@ -33,7 +33,7 @@
 //! | GET    | /api/devices                           |                    | Vec<Device>         |
 //! | DELETE | /api/devices/{id}                      |                    | 204                 |
 //! | GET    | /api/events  (WebSocket upgrade)       |                    | Event frames        |
-//! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, storyboard.png, captions.srt (range requests) |
+//! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 
 pub const HEALTH: &str = "/health";
 pub const AUTH_START: &str = "/auth/start";

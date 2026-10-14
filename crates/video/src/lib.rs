@@ -98,6 +98,9 @@ pub enum RenderProgress {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderOutput {
     pub mp4: PathBuf,
+    /// The thumbnail (`poster.png`): the frame of the scene's closing poster shot, at the
+    /// render size. `None` if it couldn't be captured; the render still succeeds.
+    pub poster: Option<PathBuf>,
     pub storyboard: PathBuf,
     pub captions: Option<PathBuf>,
     pub duration_seconds: Option<f32>,
@@ -122,6 +125,7 @@ pub enum RenderError {
 /// File names of the outputs in `work_dir`.
 pub const VIDEO_FILE: &str = "video.mp4";
 pub const STORYBOARD_FILE: &str = "storyboard.png";
+pub const POSTER_FILE: &str = "poster.png";
 pub const CAPTIONS_FILE: &str = "captions.srt";
 
 /// The scene's file and class, the voice module, and the renderer's state folder.
@@ -267,6 +271,7 @@ pub async fn render(
     let duration_seconds =
         printed_duration(&pass2.stdout, VIDEO_FILE).or_else(|| mp4::duration_seconds(&video));
     Ok(RenderOutput {
+        poster: None,
         mp4: video,
         storyboard,
         captions,

@@ -428,6 +428,7 @@ fn with_media(s: &FakeState, mut video: Video) -> Video {
             mp4_url: format!("{base}/video.mp4?exp=1&sig=x"),
             storyboard_url: format!("{base}/storyboard.png?exp=1&sig=x"),
             captions_url: Some(format!("{base}/captions.srt?exp=1&sig=x")),
+            poster_url: None,
             expires_at: Utc::now() + chrono::Duration::hours(6),
         });
     }
@@ -740,6 +741,7 @@ async fn simulate_video(fake: Fake, id: Id) {
                 mp4_url: format!("{base}/video.mp4?exp=1&sig=x"),
                 storyboard_url: format!("{base}/storyboard.png?exp=1&sig=x"),
                 captions_url: Some(format!("{base}/captions.srt?exp=1&sig=x")),
+                poster_url: None,
                 expires_at: Utc::now() + chrono::Duration::hours(6),
             });
         }

@@ -207,6 +207,7 @@ impl App {
                 captions_url: stored
                     .has_captions
                     .then(|| self.media_url(&video.id, CAPTIONS_FILE, exp)),
+                poster_url: None,
                 expires_at: DateTime::from_timestamp(exp, 0).unwrap_or(expires_at),
             });
         }

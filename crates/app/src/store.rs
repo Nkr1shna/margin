@@ -454,6 +454,7 @@ mod tests {
             mp4_url: "https://x/video.mp4".into(),
             storyboard_url: "https://x/storyboard.png".into(),
             captions_url: None,
+            poster_url: None,
             expires_at: ts(100),
         });
         s.apply(Event::VideoChanged { video: ready });
