@@ -134,42 +134,70 @@ pub fn truncate(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Convert SubRip captions to WebVTT, which is what `<track>` accepts.
-pub fn srt_to_vtt(srt: &str) -> String {
-    let mut out = String::from("WEBVTT\n\n");
-    let text = srt.replace("\r\n", "\n");
-    for line in text.lines() {
-        if line.contains("-->") {
-            out.push_str(&line.replace(',', "."));
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    out
+/// One caption: start and end in seconds, and its text (lines joined with newlines).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Cue {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
-/// A `data:` URL for text content (percent-encoded), used for the captions track so
-/// the webview needs no cross-origin fetch.
-pub fn text_data_url(mime: &str, text: &str) -> String {
-    let mut out = format!("data:{mime};charset=utf-8,");
-    for b in text.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~ ".contains(&b) {
-            if b == b' ' {
-                out.push_str("%20");
-            } else {
-                out.push(b as char);
-            }
-        } else {
-            out.push_str(&format!("%{b:02X}"));
+/// Parses SubRip (`.srt`) captions into cues. Malformed blocks are skipped.
+pub fn parse_srt(srt: &str) -> Vec<Cue> {
+    fn seconds(t: &str) -> Option<f64> {
+        let t = t.trim().replace(',', ".");
+        let mut parts = t.split(':');
+        let (h, m, s) = (parts.next()?, parts.next()?, parts.next()?);
+        Some(
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + s.parse::<f64>().ok()?,
+        )
+    }
+    let text = srt.replace("\r\n", "\n");
+    let mut cues = Vec::new();
+    for block in text.split("\n\n") {
+        let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
+        let Some(timing) = lines.next() else { continue };
+        let Some((a, b)) = timing.split_once("-->") else {
+            continue;
+        };
+        let b = b.split_whitespace().next().unwrap_or("");
+        let (Some(start), Some(end)) = (seconds(a), seconds(b)) else {
+            continue;
+        };
+        let body: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+        if !body.is_empty() && end > start {
+            cues.push(Cue {
+                start,
+                end,
+                text: body.join("\n"),
+            });
         }
     }
-    out
+    cues
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_srt_cues() {
+        let cues = parse_srt(
+            "1\r\n00:00:00,500 --> 00:00:04,000\r\nEvery periodic signal\r\nhides waves.\r\n\r\n2\n00:01:04,500 --> 00:01:09,250\nLet's find them.\n\n3\nbroken\n",
+        );
+        assert_eq!(cues.len(), 2);
+        assert_eq!(
+            cues[0],
+            Cue {
+                start: 0.5,
+                end: 4.0,
+                text: "Every periodic signal\nhides waves.".into()
+            }
+        );
+        assert_eq!((cues[1].start, cues[1].end), (64.5, 69.25));
+    }
 
     #[test]
     fn renders_basic_markdown() {
@@ -248,18 +276,5 @@ mod tests {
         assert_eq!(derive_title("   ", Some("the  quote")), "the quote");
         assert_eq!(derive_title("", None), "Untitled note");
         assert_eq!(truncate("abcdef", 4), "abc…");
-    }
-
-    #[test]
-    fn converts_srt_to_vtt() {
-        let srt = "1\r\n00:00:01,000 --> 00:00:02,500\r\nHello, world\r\n\r\n";
-        let vtt = srt_to_vtt(srt);
-        assert!(vtt.starts_with("WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500\nHello, world\n"));
-    }
-
-    #[test]
-    fn data_url_is_percent_encoded() {
-        let url = text_data_url("text/vtt", "WEBVTT\n\na, b");
-        assert_eq!(url, "data:text/vtt;charset=utf-8,WEBVTT%0A%0Aa%2C%20b");
     }
 }

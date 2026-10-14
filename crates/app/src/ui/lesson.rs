@@ -941,12 +941,32 @@ fn VideoDetails(video: Video) -> Element {
         let url = captions_url?;
         let api = app.api()?;
         let srt = api.fetch_text(&url).await.ok()?;
-        Some(markdown::text_data_url(
-            "text/vtt",
-            &markdown::srt_to_vtt(&srt),
-        ))
+        Some(markdown::parse_srt(&srt))
     }));
-    let track = captions.read().clone().flatten();
+    let cues = captions.read().clone().flatten();
+    // The webview won't load a <track> from an inline URL, so the cues are added through
+    // the video element's text-track API once both the player and the captions exist.
+    let player_id = format!("player-{}", video.id);
+    let ready = matches!(video.status, VideoStatus::Ready) && video.media.is_some();
+    use_effect(use_reactive!(|cues, player_id, ready| {
+        let Some(cues) = cues.filter(|c| !c.is_empty() && ready) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(&cues) else {
+            return;
+        };
+        document::eval(&format!(
+            r#"(function() {{
+                const v = document.getElementById({id});
+                if (!v) return;
+                for (const t of v.textTracks) {{ if (t.label === "Captions") t.mode = "disabled"; }}
+                const track = v.addTextTrack("captions", "Captions", "en");
+                for (const c of {json}) track.addCue(new VTTCue(c.start, c.end, c.text));
+                track.mode = "showing";
+            }})()"#,
+            id = serde_json::to_string(&player_id).unwrap_or_default(),
+        ));
+    }));
 
     let pipeline = pipeline_steps(&video.status);
 
@@ -969,13 +989,11 @@ fn VideoDetails(video: Video) -> Element {
         }
         if let (VideoStatus::Ready, Some(media)) = (&video.status, &video.media) {
             video {
+                id: "{player_id}",
                 class: "player",
                 controls: true,
                 preload: "metadata",
                 src: "{media.mp4_url}",
-                if let Some(track) = track {
-                    track { kind: "captions", src: "{track}", srclang: "en", label: "Captions", default: true }
-                }
                 "Your system can't play this video."
             }
         }
