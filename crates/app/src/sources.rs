@@ -39,7 +39,7 @@ pub struct Candidate {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Selection {
     pub files: Vec<Candidate>,
-    /// Files Margin can't read (images, archives, binaries…).
+    /// Files Margin can't read (archives, binaries, lock files…).
     pub unsupported: usize,
     /// Files over `routes::MAX_SOURCE_BYTES`.
     pub too_large: usize,

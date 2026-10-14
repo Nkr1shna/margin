@@ -535,12 +535,16 @@ fn SourcesSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Embedding model" }
-            p { class: "help", "Runs on the service Mac to find the passages of your sources that outlines and lessons draw on." }
+            p { class: "help",
+                "EmbeddingGemma 2 runs on the service Mac. It reads your documents, PDFs, images, audio and video, and finds the passages, pages, pictures and clips that outlines and lessons draw on."
+            }
             match (model, load.read().clone()) {
                 (Some(model), _) => rsx! {
                     div { class: "kv",
                         span { "Model" }
                         span { class: "mono", "{model.repo}" }
+                        span { "Parts" }
+                        span { "Text, image and audio encoders" }
                         span { "Status" }
                         span {
                             match &model.state {
@@ -561,7 +565,7 @@ fn SourcesSection() -> Element {
                                     if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
                                     "Download · {human_bytes(download_bytes)}"
                                 }
-                                span { class: "faint", style: "font-size: 13px", "Downloaded once from Hugging Face. Until then, sources wait in the queue." }
+                                span { class: "faint", style: "font-size: 13px", "All three parts download together, once, from Hugging Face. Until then, sources wait in the queue." }
                             }
                         },
                         EmbeddingModelState::Downloading { received, total } => rsx! {

@@ -529,7 +529,7 @@ pub fn EmbeddingNotice() -> Element {
                     div { class: "body",
                         b { class: "notice-title", "Sources need the local embedding model" }
                         span { class: "muted",
-                            "It runs on the service Mac and is downloaded once. Until then, sources wait in the queue."
+                            "Its text, image and audio encoders run on the service Mac and download together, once. Until then, sources wait in the queue."
                         }
                         match &state {
                             EmbeddingModelState::Downloading { received, total } => rsx! {
@@ -700,7 +700,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                         Icon { name: "x" }
                     }
                 }
-                p { "Outlines and lessons in this topic draw on the passages of these files that matter most." }
+                p { "Outlines and lessons in this topic draw on the passages, pages, pictures and clips of these files that matter most." }
                 if !empty {
                     EmbeddingNotice {}
                 }
@@ -721,7 +721,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                     if empty {
                         p { class: "faint",
                             if CAN_ADD {
-                                "No sources yet. Add text, code or PDF files, or a whole folder."
+                                "No sources yet. Add documents, code, PDFs, images, audio or video, or a whole folder."
                             } else {
                                 "No sources yet."
                             }
