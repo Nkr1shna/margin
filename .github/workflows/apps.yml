@@ -48,11 +48,6 @@ jobs:
       sha: ${{ steps.pick.outputs.sha }}
       release: ${{ steps.pick.outputs.release }}
     steps:
-      - name: Only from main
-        run: |
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::run this workflow from main, not $GITHUB_REF"; exit 1
-          fi
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,11 +111,6 @@ jobs:
       MARGIN_APP_NAME: ${{ matrix.environment == 'dev' && 'Margin Dev' || 'Margin' }}
       MARGIN_APP_ID: ${{ matrix.environment == 'dev' && 'com.krishnanelloore.margin.app.dev' || 'com.krishnanelloore.margin.app' }}
     steps:
-      - name: Only from main
-        run: |
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::run this workflow from main, not $GITHUB_REF"; exit 1
-          fi
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.plan.outputs.sha }}
