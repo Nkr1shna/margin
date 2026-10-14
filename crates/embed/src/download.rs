@@ -1,6 +1,7 @@
-//! Fetching the text model's files from Hugging Face. The file list comes from the
-//! repo's tree API, so every file inside `EmbeddingGemma2Text.mlpackage` is fetched
-//! whatever the package holds; the audio and vision encoders are skipped.
+//! Fetching the model's files from Hugging Face: the text model, the vision and audio
+//! encoders and the tables they read, in one download with one progress total. The file
+//! list comes from the repo's tree API, so every file inside each `.mlpackage` is fetched
+//! whatever the package holds; anything else in the repo (README, …) is skipped.
 //!
 //! Each file streams into `{path}.part` and is renamed when its size checks out. The
 //! list of files (with sizes) is written to `files.json` last, so a folder without it
@@ -16,10 +17,34 @@ use crate::{EmbedError, REPO};
 
 /// The Core ML package the text functions live in.
 pub(crate) const TEXT_PACKAGE: &str = "EmbeddingGemma2Text.mlpackage";
-/// Where `CoreMlEmbedder::load` keeps the compiled package.
-pub(crate) const COMPILED: &str = "EmbeddingGemma2Text.mlmodelc";
-/// Top-level files the text path reads besides the package.
-const TOP_FILES: &[&str] = &["config.json", "tokenizer.json", "embeddings.bf16"];
+/// The image encoder (`vision_70` / `vision_140` / `vision_280`).
+pub(crate) const VISION_PACKAGE: &str = "EmbeddingGemma2Vision.mlpackage";
+/// The audio encoder.
+pub(crate) const AUDIO_PACKAGE: &str = "EmbeddingGemma2Audio.mlpackage";
+/// Every package a download fetches.
+pub(crate) const PACKAGES: &[&str] = &[TEXT_PACKAGE, VISION_PACKAGE, AUDIO_PACKAGE];
+/// The vision encoder's patch position tables.
+pub(crate) const POSITION_TABLE: &str = "position_embeddings.f16";
+/// Top-level files the model reads besides the packages.
+const TOP_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    "embeddings.bf16",
+    POSITION_TABLE,
+];
+
+/// Where a package is kept compiled: `X.mlpackage` → `X.mlmodelc`.
+pub(crate) fn compiled_name(package: &str) -> String {
+    format!("{}.mlmodelc", package.trim_end_matches(".mlpackage"))
+}
+
+/// The package a repo file belongs to.
+fn package_of(path: &str) -> Option<&'static str> {
+    PACKAGES.iter().copied().find(|p| {
+        path.strip_prefix(p)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
 /// Written after every file is in place.
 const MANIFEST: &str = "files.json";
 
@@ -38,7 +63,7 @@ struct TreeEntry {
     size: u64,
 }
 
-/// The files the text model needs, from `{hf_base}/api/models/{REPO}/tree/main`.
+/// The files the model needs, from `{hf_base}/api/models/{REPO}/tree/main`.
 pub(crate) async fn remote_files(
     client: &reqwest::Client,
     hf_base: &str,
@@ -57,11 +82,10 @@ pub(crate) async fn remote_files(
         .json()
         .await
         .map_err(|e| EmbedError::Download(format!("unexpected file list: {e}")))?;
-    let package = format!("{TEXT_PACKAGE}/");
     let files: Vec<RemoteFile> = tree
         .into_iter()
         .filter(|e| e.kind == "file")
-        .filter(|e| TOP_FILES.contains(&e.path.as_str()) || e.path.starts_with(&package))
+        .filter(|e| TOP_FILES.contains(&e.path.as_str()) || package_of(&e.path).is_some())
         .map(|e| RemoteFile {
             path: e.path,
             size: e.size,
@@ -72,10 +96,10 @@ pub(crate) async fn remote_files(
             return Err(EmbedError::Download(format!("{REPO} has no {needed}")));
         }
     }
-    if !files.iter().any(|f| f.path.starts_with(&package)) {
-        return Err(EmbedError::Download(format!(
-            "{REPO} has no {TEXT_PACKAGE}"
-        )));
+    for package in PACKAGES {
+        if !files.iter().any(|f| package_of(&f.path) == Some(package)) {
+            return Err(EmbedError::Download(format!("{REPO} has no {package}")));
+        }
     }
     Ok(files)
 }
@@ -93,7 +117,7 @@ pub(crate) async fn download(
     remove_if_exists(&dir.join(MANIFEST)).await?;
 
     let mut received = 0u64;
-    let mut fetched_any = false;
+    let mut fetched: Vec<&str> = Vec::new();
     progress(received, total);
     for file in &files {
         let target = file_path(dir, &file.path)?;
@@ -133,12 +157,16 @@ pub(crate) async fn download(
         }
         received = start + written;
         tokio::fs::rename(&partial, &target).await?;
-        fetched_any = true;
+        if let Some(package) = package_of(&file.path)
+            && !fetched.contains(&package)
+        {
+            fetched.push(package);
+        }
     }
 
     // New package files need a new compile.
-    if fetched_any {
-        remove_if_exists(&dir.join(COMPILED)).await?;
+    for package in fetched {
+        remove_if_exists(&dir.join(compiled_name(package))).await?;
     }
     let manifest = dir.join(MANIFEST);
     let partial = part_path(&manifest);
@@ -187,9 +215,9 @@ pub(crate) fn is_complete(dir: &Path) -> bool {
     };
     let listed = |name: &str| files.iter().any(|f| f.path == name);
     TOP_FILES.iter().all(|f| listed(f))
-        && files
+        && PACKAGES
             .iter()
-            .any(|f| f.path.starts_with(&format!("{TEXT_PACKAGE}/")))
+            .all(|p| files.iter().any(|f| package_of(&f.path) == Some(p)))
         && files.iter().all(|f| {
             file_path(dir, &f.path)
                 .ok()
@@ -269,8 +297,8 @@ mod tests {
 
     use super::*;
 
-    /// A fake Hugging Face repo: the tree listing plus small files, including the audio
-    /// package a text download must skip.
+    /// A fake Hugging Face repo: the tree listing plus small files: every model part, and
+    /// files a download must skip.
     struct Repo {
         files: Vec<(String, Vec<u8>)>,
         /// Paths the server answers with 404.
@@ -301,7 +329,21 @@ mod tests {
                 "EmbeddingGemma2Audio.mlpackage/Manifest.json",
                 b"{}".to_vec(),
             ),
+            (
+                "EmbeddingGemma2Audio.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+                vec![4u8; 40_000],
+            ),
+            (
+                "EmbeddingGemma2Vision.mlpackage/Manifest.json",
+                b"{}".to_vec(),
+            ),
+            (
+                "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+                vec![5u8; 30_000],
+            ),
             ("position_embeddings.f16", vec![3u8; 900]),
+            // Not part of the model: skipped, even though its name starts like a package's.
+            ("EmbeddingGemma2Text.mlpackage.zip", vec![9u8; 10]),
         ]
         .into_iter()
         .map(|(p, b)| (p.to_string(), b))
@@ -345,16 +387,36 @@ mod tests {
         dir
     }
 
-    fn text_bytes() -> u64 {
+    fn wanted(path: &str) -> bool {
+        TOP_FILES.contains(&path) || package_of(path).is_some()
+    }
+
+    /// Bytes of every model part: text, vision, audio and the tables.
+    fn model_bytes() -> u64 {
         fake_files()
             .iter()
-            .filter(|(p, _)| TOP_FILES.contains(&p.as_str()) || p.starts_with(TEXT_PACKAGE))
+            .filter(|(p, _)| wanted(p))
             .map(|(_, b)| b.len() as u64)
             .sum()
     }
 
+    #[test]
+    fn files_belong_to_packages_by_folder() {
+        assert_eq!(
+            package_of("EmbeddingGemma2Vision.mlpackage/Manifest.json"),
+            Some(VISION_PACKAGE)
+        );
+        assert_eq!(package_of("EmbeddingGemma2Text.mlpackage.zip"), None);
+        assert_eq!(package_of("README.md"), None);
+        assert_eq!(
+            compiled_name(AUDIO_PACKAGE),
+            "EmbeddingGemma2Audio.mlmodelc"
+        );
+        assert_eq!(compiled_name(TEXT_PACKAGE), "EmbeddingGemma2Text.mlmodelc");
+    }
+
     #[tokio::test]
-    async fn downloads_only_the_text_model_with_progress() {
+    async fn downloads_every_model_part_with_one_progress_total() {
         let repo = Arc::new(Repo {
             files: fake_files(),
             missing: vec![],
@@ -366,7 +428,7 @@ mod tests {
 
         assert_eq!(
             ModelFiles::remote_size(&client, &base).await.unwrap(),
-            text_bytes()
+            model_bytes()
         );
         assert!(!files.is_complete());
 
@@ -378,28 +440,45 @@ mod tests {
             .await
             .unwrap();
         let seen = seen.into_inner().unwrap();
-        assert_eq!(seen.first(), Some(&(0, text_bytes())));
-        assert_eq!(seen.last(), Some(&(text_bytes(), text_bytes())));
+        assert_eq!(seen.first(), Some(&(0, model_bytes())));
+        assert_eq!(seen.last(), Some(&(model_bytes(), model_bytes())));
         assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
 
         assert!(files.is_complete());
-        assert_eq!(repo.fetches.load(Ordering::SeqCst), 6);
+        let parts = fake_files().iter().filter(|(p, _)| wanted(p)).count();
+        assert_eq!(parts, 11);
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts);
         for (path, bytes) in fake_files() {
             let on_disk = std::fs::read(files.dir.join(&path)).ok();
-            if TOP_FILES.contains(&path.as_str()) || path.starts_with(TEXT_PACKAGE) {
+            if wanted(&path) {
                 assert_eq!(on_disk.as_ref(), Some(&bytes), "{path}");
             } else {
                 assert_eq!(on_disk, None, "{path} should be skipped");
             }
         }
-        assert!(files.size_on_disk() >= text_bytes());
+        assert!(files.size_on_disk() >= model_bytes());
 
-        // A missing file makes it incomplete; downloading again fetches only that file.
-        std::fs::remove_file(files.dir.join("embeddings.bf16")).unwrap();
+        // A missing file makes it incomplete; downloading again fetches only that file,
+        // and drops the compiled copy of the package it belongs to (only that one).
+        for package in PACKAGES {
+            std::fs::create_dir_all(files.dir.join(compiled_name(package))).unwrap();
+        }
+        let weights = "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin";
+        std::fs::remove_file(files.dir.join(weights)).unwrap();
         assert!(!files.is_complete());
         files.download(&client, &base, &|_, _| {}).await.unwrap();
         assert!(files.is_complete());
-        assert_eq!(repo.fetches.load(Ordering::SeqCst), 7);
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts + 1);
+        assert!(!files.dir.join(compiled_name(VISION_PACKAGE)).exists());
+        assert!(files.dir.join(compiled_name(TEXT_PACKAGE)).exists());
+        assert!(files.dir.join(compiled_name(AUDIO_PACKAGE)).exists());
+
+        // A text-only download from before the encoders were added isn't complete.
+        std::fs::remove_dir_all(files.dir.join(AUDIO_PACKAGE)).unwrap();
+        assert!(!files.is_complete());
+        files.download(&client, &base, &|_, _| {}).await.unwrap();
+        assert!(files.is_complete());
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts + 3);
 
         files.remove().unwrap();
         assert!(!files.dir.exists());
@@ -445,6 +524,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("tokenizer.json"), "{err}");
+
+        // Every encoder is required too.
+        let files: Vec<_> = fake_files()
+            .into_iter()
+            .filter(|(p, _)| package_of(p) != Some(AUDIO_PACKAGE))
+            .collect();
+        let repo = Arc::new(Repo {
+            files,
+            missing: vec![],
+            fetches: 0.into(),
+        });
+        let base = serve(repo).await;
+        let err = ModelFiles::remote_size(&reqwest::Client::new(), &base)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(AUDIO_PACKAGE), "{err}");
     }
 
     /// Downloads the real model from Hugging Face when `MARGIN_EMBED_DOWNLOAD_TO` names a

@@ -14,13 +14,22 @@
 //!    `attention_mask` [1, S] (1 for the text's tokens, 0 for padding).
 //! 5. Read `embedding` [1, 768] and L2-normalize it.
 //!
-//! The `.mlpackage` is compiled once into `EmbeddingGemma2Text.mlmodelc` beside it; each
-//! function is loaded from it with all compute units (`functionName`, macOS 15+).
+//! Images and audio (`vision.rs`, `audio.rs`) go through their encoder first, which
+//! turns them into rows in the same 512-wide space; those rows are wrapped in
+//! `<bos> <|image> … <image|> <eos>` (or `<|audio>` … `<audio|>`), the special tokens
+//! looked up as in step 3, and embedded by the same `embed_S` functions
+//! (FluidUse's `EmbeddingGemma2Manager.embed(media:count:start:end:)`).
+//!
+//! Each `.mlpackage` is compiled once into a `.mlmodelc` beside it; each function is
+//! loaded from it by name (`functionName`, macOS 15+). The text functions use all
+//! compute units; the encoders load on first use, on the CPU and GPU (as the model card
+//! and FluidUse recommend: faster than the Neural Engine for them).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use half::f16;
@@ -35,10 +44,10 @@ use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSNumber, NSSt
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::download::{COMPILED, TEXT_PACKAGE};
-use crate::{DIM, EmbedError, Embedder, MAX_TOKENS, ModelFiles, Purpose};
+use crate::download::{TEXT_PACKAGE, compiled_name};
+use crate::{DIM, EmbedError, Embedder, ImageTokens, MAX_TOKENS, ModelFiles, Purpose};
 
-/// The fields of `config.json` the text path uses.
+/// The fields of `config.json` the model uses.
 #[derive(Debug, Deserialize)]
 struct Config {
     hidden_size: usize,
@@ -49,6 +58,8 @@ struct Config {
     pad_token_id: u32,
     functions: BTreeMap<String, Function>,
     prompts: BTreeMap<String, String>,
+    vision: crate::vision::Config,
+    audio: crate::audio::Config,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,11 +82,12 @@ struct Functions(Vec<EmbedFunction>);
 unsafe impl Send for Functions {}
 
 pub(crate) struct Model {
+    files: ModelFiles,
     tokenizer: Tokenizer,
     /// `embeddings.bf16`, rows of `hidden` little-endian bf16 values.
     table: memmap2::Mmap,
     rows: usize,
-    hidden: usize,
+    pub(crate) hidden: usize,
     scale: f32,
     bos: u32,
     eos: u32,
@@ -83,6 +95,11 @@ pub(crate) struct Model {
     document_prompt: String,
     query_prompt: String,
     functions: Mutex<Functions>,
+    vision_config: crate::vision::Config,
+    audio_config: crate::audio::Config,
+    /// The encoders, loaded on first use.
+    vision: Mutex<Option<Arc<crate::vision::Vision>>>,
+    audio: Mutex<Option<Arc<crate::audio::Audio>>>,
 }
 
 impl Model {
@@ -141,22 +158,16 @@ impl Model {
                 "config.json has no embed_{MAX_TOKENS} function"
             )));
         }
-
-        let compiled = dir.join(COMPILED);
-        let functions = match load_functions(&compiled, &sizes) {
-            Ok(functions) => functions,
-            Err(first) => {
-                // A missing or stale compile (e.g. from another macOS version): compile again.
-                if compiled.exists() {
-                    tracing::info!("recompiling the embedding model: {first}");
-                    std::fs::remove_dir_all(&compiled)?;
-                }
-                compile(&dir.join(TEXT_PACKAGE), &compiled)?;
-                load_functions(&compiled, &sizes)?
-            }
-        };
+        let names: Vec<&str> = sizes.iter().map(|(_, name)| *name).collect();
+        let models = load_package(dir, TEXT_PACKAGE, &names, MLComputeUnits::All)?;
+        let functions = sizes
+            .iter()
+            .zip(models)
+            .map(|(&(tokens, _), model)| EmbedFunction { tokens, model })
+            .collect();
 
         Ok(Model {
+            files: files.clone(),
             tokenizer,
             table,
             rows,
@@ -168,6 +179,10 @@ impl Model {
             document_prompt,
             query_prompt,
             functions: Mutex::new(Functions(functions)),
+            vision_config: config.vision,
+            audio_config: config.audio,
+            vision: Mutex::new(None),
+            audio: Mutex::new(None),
         })
     }
 
@@ -199,54 +214,98 @@ impl Model {
         }
     }
 
+    /// The table rows of `ids`, one after another.
+    fn rows_of(&self, ids: &[u32]) -> Vec<f16> {
+        let mut rows = vec![f16::ZERO; ids.len() * self.hidden];
+        for (&id, row) in ids.iter().zip(rows.chunks_exact_mut(self.hidden)) {
+            self.write_row(id, row);
+        }
+        rows
+    }
+
     fn embed_one(&self, text: &str, purpose: Purpose) -> Result<Vec<f32>, EmbedError> {
         let ids = self.token_ids(text, purpose)?;
+        self.embed_rows(self.rows_of(&ids))
+    }
+
+    /// The embedding of a media item's encoder rows (`count` × `hidden`, fp16):
+    /// `<bos> start rows end <eos>` through the smallest `embed_S` that fits.
+    pub(crate) fn embed_media(
+        &self,
+        media: &[f16],
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<f32>, EmbedError> {
+        let mut rows = self.rows_of(&[self.bos, start]);
+        rows.extend_from_slice(media);
+        rows.extend(self.rows_of(&[end, self.eos]));
+        self.embed_rows(rows)
+    }
+
+    /// Runs the smallest `embed_S` that holds `rows` (input rows of `hidden` values, all
+    /// attended), padding with the `<pad>` row.
+    fn embed_rows(&self, mut rows: Vec<f16>) -> Result<Vec<f32>, EmbedError> {
+        let count = rows.len() / self.hidden;
         let functions = self.functions.lock().unwrap_or_else(|e| e.into_inner());
         let function = functions
             .0
             .iter()
-            .find(|f| f.tokens >= ids.len())
-            .ok_or_else(|| EmbedError::Embed(format!("{} tokens don't fit", ids.len())))?;
+            .find(|f| f.tokens >= count)
+            .ok_or_else(|| EmbedError::Embed(format!("{count} tokens don't fit")))?;
         let length = function.tokens;
-
-        let mut embeds = vec![f16::ZERO; length * self.hidden];
-        for (position, row) in embeds.chunks_exact_mut(self.hidden).enumerate() {
-            self.write_row(ids.get(position).copied().unwrap_or(self.pad), row);
+        let pad = self.rows_of(&[self.pad]);
+        for _ in count..length {
+            rows.extend_from_slice(&pad);
         }
         let mask: Vec<f16> = (0..length)
-            .map(|i| if i < ids.len() { f16::ONE } else { f16::ZERO })
+            .map(|i| if i < count { f16::ONE } else { f16::ZERO })
             .collect();
 
         autoreleasepool(|_| {
-            let inputs_embeds = multi_array(&[1, length, self.hidden], &embeds)?;
-            let attention_mask = multi_array(&[1, length], &mask)?;
-            let keys = [
-                &*NSString::from_str("inputs_embeds"),
-                &*NSString::from_str("attention_mask"),
-            ];
-            let values = [
-                unsafe { MLFeatureValue::featureValueWithMultiArray(&inputs_embeds) },
-                unsafe { MLFeatureValue::featureValueWithMultiArray(&attention_mask) },
-            ];
-            let values: [&AnyObject; 2] = [&values[0], &values[1]];
-            let dictionary = NSDictionary::from_slices(&keys, &values);
-            let input = unsafe {
-                MLDictionaryFeatureProvider::initWithDictionary_error(
-                    MLDictionaryFeatureProvider::alloc(),
-                    &dictionary,
-                )
-            }
-            .map_err(|e| EmbedError::Embed(describe(&e)))?;
-            let input = ProtocolObject::<dyn MLFeatureProvider>::from_ref(&*input);
-            let output = unsafe { function.model.predictionFromFeatures_error(input) }
-                .map_err(|e| EmbedError::Embed(describe(&e)))?;
-            let embedding = unsafe { output.featureValueForName(&NSString::from_str("embedding")) }
-                .and_then(|value| unsafe { value.multiArrayValue() })
-                .ok_or_else(|| EmbedError::Embed("the model returned no embedding".into()))?;
+            let inputs_embeds = multi_array(
+                &[1, length, self.hidden],
+                &rows,
+                MLMultiArrayDataType::Float16,
+            )?;
+            let attention_mask = multi_array(&[1, length], &mask, MLMultiArrayDataType::Float16)?;
+            let output = predict(
+                &function.model,
+                &[
+                    ("inputs_embeds", &inputs_embeds),
+                    ("attention_mask", &attention_mask),
+                ],
+            )?;
+            let embedding = output_array(&output, "embedding")?;
             let mut vector = read_vector(&embedding)?;
             normalize(&mut vector);
             Ok(vector)
         })
+    }
+
+    fn vision(&self) -> Result<Arc<crate::vision::Vision>, EmbedError> {
+        let mut slot = self.vision.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(vision) = slot.as_ref() {
+            return Ok(vision.clone());
+        }
+        let vision = Arc::new(crate::vision::Vision::load(
+            &self.files.dir,
+            &self.vision_config,
+        )?);
+        *slot = Some(vision.clone());
+        Ok(vision)
+    }
+
+    fn audio(&self) -> Result<Arc<crate::audio::Audio>, EmbedError> {
+        let mut slot = self.audio.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(audio) = slot.as_ref() {
+            return Ok(audio.clone());
+        }
+        let audio = Arc::new(crate::audio::Audio::load(
+            &self.files.dir,
+            &self.audio_config,
+        )?);
+        *slot = Some(audio.clone());
+        Ok(audio)
     }
 }
 
@@ -264,39 +323,108 @@ impl Embedder for Model {
             .map(|e| e.get_ids().len())
             .unwrap_or(0)
     }
+
+    fn embed_images(
+        &self,
+        images: &[std::path::PathBuf],
+        tokens: ImageTokens,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vision = self.vision()?;
+        images
+            .iter()
+            .map(|path| {
+                let rows = vision.encode(path, tokens)?;
+                self.embed_media(
+                    &rows,
+                    self.vision_config.boi_token_id,
+                    self.vision_config.eoi_token_id,
+                )
+            })
+            .collect()
+    }
+
+    fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let audio = self.audio()?;
+        windows
+            .iter()
+            .map(|window| {
+                let rows = audio.encode(window)?;
+                self.embed_media(
+                    &rows,
+                    self.audio_config.boa_token_id,
+                    self.audio_config.eoa_token_id,
+                )
+            })
+            .collect()
+    }
 }
 
-/// Loads every `embed_S` function from the compiled model.
+// ---------------------------------------------------------------------------
+// Core ML helpers, shared with the encoders
+// ---------------------------------------------------------------------------
+
+/// Loads `functions` (or the package's only function, for an empty list) from `package`
+/// in `dir`, compiling it first when there's no usable compiled copy.
+pub(crate) fn load_package(
+    dir: &Path,
+    package: &str,
+    functions: &[&str],
+    units: MLComputeUnits,
+) -> Result<Vec<Retained<MLModel>>, EmbedError> {
+    let compiled = dir.join(compiled_name(package));
+    match load_functions(&compiled, functions, units) {
+        Ok(models) => Ok(models),
+        Err(first) => {
+            // A missing or stale compile (e.g. from another macOS version): compile again.
+            if compiled.exists() {
+                tracing::info!("recompiling {package}: {first}");
+                std::fs::remove_dir_all(&compiled)?;
+            }
+            compile(&dir.join(package), &compiled)?;
+            load_functions(&compiled, functions, units)
+        }
+    }
+}
+
 fn load_functions(
-    compiled: &std::path::Path,
-    sizes: &[(usize, &str)],
-) -> Result<Vec<EmbedFunction>, EmbedError> {
+    compiled: &Path,
+    functions: &[&str],
+    units: MLComputeUnits,
+) -> Result<Vec<Retained<MLModel>>, EmbedError> {
     if !compiled.exists() {
         return Err(EmbedError::Load("not compiled yet".into()));
     }
     let url = NSURL::from_directory_path(compiled)
         .ok_or_else(|| EmbedError::Load(format!("bad path {}", compiled.display())))?;
-    sizes
-        .iter()
-        .map(|&(tokens, name)| {
-            autoreleasepool(|_| {
-                let configuration = unsafe { MLModelConfiguration::new() };
-                unsafe {
-                    configuration.setComputeUnits(MLComputeUnits::All);
+    let load = |name: Option<&str>| {
+        autoreleasepool(|_| {
+            let configuration = unsafe { MLModelConfiguration::new() };
+            unsafe {
+                configuration.setComputeUnits(units);
+                if let Some(name) = name {
                     configuration.setFunctionName(Some(&NSString::from_str(name)));
                 }
-                let model = unsafe {
-                    MLModel::modelWithContentsOfURL_configuration_error(&url, &configuration)
-                }
-                .map_err(|e| EmbedError::Load(format!("{name}: {}", describe(&e))))?;
-                Ok(EmbedFunction { tokens, model })
-            })
+            }
+            unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &configuration) }
+                .map_err(|e| {
+                    EmbedError::Load(format!("{}: {}", name.unwrap_or("model"), describe(&e)))
+                })
         })
-        .collect()
+    };
+    if functions.is_empty() {
+        return Ok(vec![load(None)?]);
+    }
+    functions.iter().map(|&name| load(Some(name))).collect()
 }
 
 /// Compiles `package` for this Mac and moves the result to `to`.
-fn compile(package: &std::path::Path, to: &std::path::Path) -> Result<(), EmbedError> {
+fn compile(package: &Path, to: &Path) -> Result<(), EmbedError> {
     let url = NSURL::from_directory_path(package)
         .ok_or_else(|| EmbedError::Load(format!("bad path {}", package.display())))?;
     let (send, receive) = mpsc::channel();
@@ -330,7 +458,7 @@ fn compile(package: &std::path::Path, to: &std::path::Path) -> Result<(), EmbedE
     Ok(())
 }
 
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -344,8 +472,52 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>
     Ok(())
 }
 
-/// An fp16 `MLMultiArray` of `shape` holding `values` in row-major order.
-fn multi_array(shape: &[usize], values: &[f16]) -> Result<Retained<MLMultiArray>, EmbedError> {
+/// One prediction with the named multi-array inputs.
+pub(crate) fn predict(
+    model: &MLModel,
+    inputs: &[(&str, &MLMultiArray)],
+) -> Result<Retained<ProtocolObject<dyn MLFeatureProvider>>, EmbedError> {
+    let keys: Vec<Retained<NSString>> = inputs.iter().map(|(k, _)| NSString::from_str(k)).collect();
+    let keys: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let values: Vec<Retained<MLFeatureValue>> = inputs
+        .iter()
+        .map(|(_, v)| unsafe { MLFeatureValue::featureValueWithMultiArray(v) })
+        .collect();
+    let values: Vec<&AnyObject> = values
+        .iter()
+        .map(|v| AsRef::<AnyObject>::as_ref(&**v))
+        .collect();
+    let dictionary = NSDictionary::from_slices(&keys, &values);
+    let input = unsafe {
+        MLDictionaryFeatureProvider::initWithDictionary_error(
+            MLDictionaryFeatureProvider::alloc(),
+            &dictionary,
+        )
+    }
+    .map_err(|e| EmbedError::Embed(describe(&e)))?;
+    let input = ProtocolObject::<dyn MLFeatureProvider>::from_ref(&*input);
+    unsafe { model.predictionFromFeatures_error(input) }
+        .map_err(|e| EmbedError::Embed(describe(&e)))
+}
+
+/// The multi-array output called `name`.
+pub(crate) fn output_array(
+    output: &ProtocolObject<dyn MLFeatureProvider>,
+    name: &str,
+) -> Result<Retained<MLMultiArray>, EmbedError> {
+    unsafe { output.featureValueForName(&NSString::from_str(name)) }
+        .and_then(|value| unsafe { value.multiArrayValue() })
+        .ok_or_else(|| EmbedError::Embed(format!("the model returned no {name}")))
+}
+
+/// An `MLMultiArray` of `shape` and `data_type` (Float16 for `f16` values, Float32 for
+/// `f32`) holding `values` in row-major order.
+pub(crate) fn multi_array<T: Copy>(
+    shape: &[usize],
+    values: &[T],
+    data_type: MLMultiArrayDataType,
+) -> Result<Retained<MLMultiArray>, EmbedError> {
+    debug_assert_eq!(values.len(), shape.iter().product::<usize>());
     let numbers: Vec<Retained<NSNumber>> = shape
         .iter()
         .map(|&n| NSNumber::new_isize(n as isize))
@@ -354,7 +526,7 @@ fn multi_array(shape: &[usize], values: &[f16]) -> Result<Retained<MLMultiArray>
         MLMultiArray::initWithShape_dataType_error(
             MLMultiArray::alloc(),
             &NSArray::from_retained_slice(&numbers),
-            MLMultiArrayDataType::Float16,
+            data_type,
         )
     }
     .map_err(|e| EmbedError::Embed(describe(&e)))?;
@@ -363,12 +535,19 @@ fn multi_array(shape: &[usize], values: &[f16]) -> Result<Retained<MLMultiArray>
          _size: NSInteger,
          strides: NonNull<NSArray<NSNumber>>| {
             // SAFETY: Core ML passes the array's buffer, of `shape` with these strides
-            // (in elements), valid for the call.
+            // (in elements of `data_type`, which matches `T`), valid for the call.
             let strides: Vec<usize> = unsafe { strides.as_ref() }
                 .iter()
                 .map(|n| n.as_isize() as usize)
                 .collect();
-            let base = bytes.as_ptr().cast::<f16>();
+            let base = bytes.as_ptr().cast::<T>();
+            let contiguous = strides.last() == Some(&1)
+                && (0..shape.len().saturating_sub(1))
+                    .all(|axis| strides[axis] == strides[axis + 1] * shape[axis + 1]);
+            if contiguous {
+                unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), base, values.len()) };
+                return;
+            }
             let mut index = vec![0usize; shape.len()];
             for &value in values {
                 let offset: usize = index.iter().zip(&strides).map(|(i, s)| i * s).sum();
@@ -395,24 +574,67 @@ fn read_vector(array: &MLMultiArray) -> Result<Vec<f32>, EmbedError> {
             "the embedding has {count} values, expected {DIM}"
         )));
     }
-    let strides = unsafe { array.strides() };
-    let stride = strides.lastObject().map_or(1, |n| n.as_isize() as usize);
+    let mut rows = read_rows(array, 1, DIM)?;
+    Ok(rows.pop().unwrap_or_default())
+}
+
+/// The first `rows` × `cols` values of an output whose last two axes are rows and
+/// columns (`[…, R, C]`, fp16 or fp32), as f32 rows.
+pub(crate) fn read_rows(
+    array: &MLMultiArray,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<Vec<f32>>, EmbedError> {
+    let shape: Vec<usize> = unsafe { array.shape() }
+        .iter()
+        .map(|n| n.as_isize() as usize)
+        .collect();
+    let strides: Vec<usize> = unsafe { array.strides() }
+        .iter()
+        .map(|n| n.as_isize() as usize)
+        .collect();
+    let (shape_rows, shape_cols) = match shape.as_slice() {
+        [.., r, c] => (*r, *c),
+        [c] => (1, *c),
+        _ => (0, 0),
+    };
+    if shape_rows < rows || shape_cols < cols {
+        return Err(EmbedError::Embed(format!(
+            "the model returned {shape:?}, expected at least {rows} x {cols}"
+        )));
+    }
+    let col_stride = strides.last().copied().unwrap_or(1);
+    let row_stride = if strides.len() >= 2 {
+        strides[strides.len() - 2]
+    } else {
+        0
+    };
     let data_type = unsafe { array.dataType() };
     let out = std::cell::RefCell::new(Err(EmbedError::Embed(format!(
-        "unexpected embedding type {data_type:?}"
+        "unexpected output type {data_type:?}"
     ))));
     let handler = RcBlock::new(|bytes: NonNull<std::ffi::c_void>, _size: NSInteger| {
-        // SAFETY: the buffer holds `DIM` values of `data_type` at `stride`, valid for the call.
-        let values: Option<Vec<f32>> = if data_type == MLMultiArrayDataType::Float16 {
+        // SAFETY: the buffer holds the array's values of `data_type` at these strides,
+        // valid for the call; `rows` and `cols` are within its shape.
+        let at = |r: usize, c: usize| r * row_stride + c * col_stride;
+        let values: Option<Vec<Vec<f32>>> = if data_type == MLMultiArrayDataType::Float16 {
             let base = bytes.as_ptr().cast::<f16>();
             Some(
-                (0..DIM)
-                    .map(|i| unsafe { *base.add(i * stride) }.to_f32())
+                (0..rows)
+                    .map(|r| {
+                        (0..cols)
+                            .map(|c| unsafe { *base.add(at(r, c)) }.to_f32())
+                            .collect()
+                    })
                     .collect(),
             )
         } else if data_type == MLMultiArrayDataType::Float32 {
             let base = bytes.as_ptr().cast::<f32>();
-            Some((0..DIM).map(|i| unsafe { *base.add(i * stride) }).collect())
+            Some(
+                (0..rows)
+                    .map(|r| (0..cols).map(|c| unsafe { *base.add(at(r, c)) }).collect())
+                    .collect(),
+            )
         } else {
             None
         };
@@ -425,6 +647,11 @@ fn read_vector(array: &MLMultiArray) -> Result<Vec<f32>, EmbedError> {
     out.into_inner()
 }
 
+/// Rows of f32 as one fp16 buffer.
+pub(crate) fn to_f16(rows: &[Vec<f32>]) -> Vec<f16> {
+    rows.iter().flatten().map(|&x| f16::from_f32(x)).collect()
+}
+
 fn normalize(vector: &mut [f32]) {
     let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -432,7 +659,7 @@ fn normalize(vector: &mut [f32]) {
     }
 }
 
-fn describe(error: &NSError) -> String {
+pub(crate) fn describe(error: &NSError) -> String {
     error.localizedDescription().to_string()
 }
 
@@ -689,5 +916,141 @@ mod tests {
             );
             assert!(similarity > 0.99, "{similarity} for {:?}", r.text);
         }
+    }
+
+    /// Test pictures and speech: `MARGIN_EMBED_MEDIA_DIR`, or
+    /// `~/Library/Caches/margin-embed-test/media` (made by its `make.sh`: `diagram.png`, a
+    /// red circle and a blue square with a caption; `diagram-wide.png`, a crop of it;
+    /// `coast.jpg`, a photo of a rocky coast; `speech.wav`, `say` reading a sentence about
+    /// mitochondria, 16 kHz mono).
+    fn media_dir() -> Option<PathBuf> {
+        let dir = match std::env::var_os("MARGIN_EMBED_MEDIA_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from(std::env::var_os("HOME")?)
+                .join("Library/Caches/margin-embed-test/media"),
+        };
+        if dir.join("diagram.png").exists() && dir.join("speech.wav").exists() {
+            Some(dir)
+        } else {
+            eprintln!("skipping: no test media in {}", dir.display());
+            None
+        }
+    }
+
+    fn unit(v: &[f32]) -> bool {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.len() == DIM && (norm - 1.0).abs() < 1e-3 && v.iter().all(|x| x.is_finite())
+    }
+
+    #[test]
+    fn real_model_embeds_images_into_the_text_space() {
+        let Some(model) = model() else { return };
+        let Some(media) = media_dir() else { return };
+        let images = [media.join("diagram.png"), media.join("coast.jpg")];
+        let vectors = model.embed_images(&images, ImageTokens::High).unwrap();
+        assert!(vectors.iter().all(|v| unit(v)));
+        assert_eq!(
+            vectors,
+            model.embed_images(&images, ImageTokens::High).unwrap()
+        );
+        let queries = embed(
+            model,
+            &[
+                "a red circle and a blue square",
+                "a rocky coastline by the sea",
+            ],
+            Purpose::Query,
+        );
+        let scores: Vec<Vec<f32>> = queries
+            .iter()
+            .map(|q| vectors.iter().map(|v| cosine(q, v)).collect())
+            .collect();
+        eprintln!("query x image cosines: {scores:?}");
+        assert!(scores[0][0] > scores[0][1], "{scores:?}");
+        assert!(scores[1][1] > scores[1][0], "{scores:?}");
+        // Every budget works; fewer tokens stay close to the default.
+        for tokens in [ImageTokens::Low, ImageTokens::Medium] {
+            let v = &model.embed_images(&images[..1], tokens).unwrap()[0];
+            assert!(unit(v));
+            let similarity = cosine(v, &vectors[0]);
+            eprintln!("{tokens:?} vs High: {similarity:.4}");
+            assert!(similarity > 0.8, "{tokens:?}: {similarity}");
+        }
+        assert!(matches!(
+            model.embed_images(&[media.join("speech.wav")], ImageTokens::High),
+            Err(EmbedError::Extract(_))
+        ));
+    }
+
+    #[test]
+    fn real_model_embeds_audio_into_the_text_space() {
+        let Some(model) = model() else { return };
+        let Some(media) = media_dir() else { return };
+        let samples = crate::av::sound(&media.join("speech.wav"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            (samples.len() as i64 - 81_927).abs() < 10,
+            "{}",
+            samples.len()
+        );
+        let vectors = model
+            .embed_audio(&[samples.clone(), samples[..16_000].to_vec()])
+            .unwrap();
+        assert!(vectors.iter().all(|v| unit(v)));
+        let queries = embed(
+            model,
+            &[
+                "the mitochondria is the powerhouse of the cell",
+                "the stock market fell on Tuesday",
+            ],
+            Purpose::Query,
+        );
+        let scores: Vec<f32> = queries.iter().map(|q| cosine(q, &vectors[0])).collect();
+        eprintln!("query x speech cosines: {scores:?}");
+        assert!(scores[0] > scores[1], "{scores:?}");
+        // Too short for a single token.
+        assert!(model.embed_audio(&[vec![0.0; 100]]).is_err());
+    }
+
+    /// Compares images and audio with `SentenceTransformer("google/embeddinggemma-2")`
+    /// when `MARGIN_EMBED_MEDIA_REFERENCE` names the JSON `reference_media.py` writes
+    /// (`[{"file", "kind", "vector"}]`, files in the media folder).
+    #[test]
+    fn real_model_matches_reference_media_vectors() {
+        let Some(model) = model() else { return };
+        let Some(media) = media_dir() else { return };
+        let Some(path) = std::env::var_os("MARGIN_EMBED_MEDIA_REFERENCE") else {
+            eprintln!("skipping: MARGIN_EMBED_MEDIA_REFERENCE is not set");
+            return;
+        };
+        #[derive(Deserialize)]
+        struct Reference {
+            file: String,
+            kind: String,
+            vector: Vec<f32>,
+        }
+        let references: Vec<Reference> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut compared = 0;
+        for r in references {
+            let ours = match r.kind.as_str() {
+                "image" => model
+                    .embed_images(&[media.join(&r.file)], ImageTokens::High)
+                    .unwrap()
+                    .remove(0),
+                "audio" => {
+                    let samples = crate::av::sound(&media.join(&r.file)).unwrap().unwrap();
+                    model.embed_audio(&[samples]).unwrap().remove(0)
+                }
+                "query" => embed(model, &[r.file.as_str()], Purpose::Query).remove(0),
+                _ => continue,
+            };
+            let similarity = cosine(&ours, &r.vector);
+            eprintln!("{similarity:.5}  {} {}", r.kind, r.file);
+            assert!(similarity > 0.99, "{similarity} for {}", r.file);
+            compared += 1;
+        }
+        assert!(compared >= 4);
     }
 }

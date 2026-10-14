@@ -1,6 +1,7 @@
 //! PDF text with PDFKit, page by page. A page whose text layer is empty or nearly so
 //! (a scan) is rendered to a grayscale bitmap with Core Graphics and read with Vision's
-//! text recognition (accurate, with language correction).
+//! text recognition (accurate, with language correction). Each page is also rendered in
+//! color as a PNG picture, which is embedded with the image encoder and served to the app.
 
 use std::path::Path;
 use std::ptr;
@@ -10,7 +11,7 @@ use objc2::rc::autoreleasepool;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGImage,
-    CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFPage,
+    CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFPage, kCGColorSpaceSRGB,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSURL};
 use objc2_pdf_kit::{PDFDocument, PDFPage};
@@ -27,7 +28,14 @@ const OCR_SCALE: f64 = 2.0;
 /// Longest side of an OCR render, in pixels.
 const OCR_MAX_SIDE: f64 = 4096.0;
 
-pub(crate) fn extract(path: &Path) -> Result<Extracted, EmbedError> {
+/// Each page as a picture: rendered in color at this scale (144 dpi)…
+const PICTURE_SCALE: f64 = 2.0;
+/// …with its longer side at most this many pixels.
+const PICTURE_MAX_SIDE: f64 = 2048.0;
+
+/// The text of every page; with `media_dir`, each page is also rendered there as
+/// `page_file(n)` and listed as a picture.
+pub(crate) fn extract(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
     let url = NSURL::from_file_path(path)
         .ok_or_else(|| EmbedError::Extract(format!("bad path {}", path.display())))?;
     let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }
@@ -37,11 +45,28 @@ pub(crate) fn extract(path: &Path) -> Result<Extracted, EmbedError> {
     }
     let count = unsafe { doc.pageCount() };
     let mut pages = Vec::with_capacity(count);
+    let mut pictures = Vec::new();
+    if let Some(dir) = media_dir {
+        std::fs::create_dir_all(dir)?;
+    }
     for index in 0..count {
+        let number = index as u32 + 1;
         let text = autoreleasepool(|_| -> Result<String, EmbedError> {
             let Some(page) = (unsafe { doc.pageAtIndex(index) }) else {
                 return Ok(String::new());
             };
+            if let Some(dir) = media_dir
+                && let Some(image) = render(&page, Color::Rgb, PICTURE_SCALE, PICTURE_MAX_SIDE)
+            {
+                let file = dir.join(crate::page_file(number));
+                crate::image::write(&image, &file, crate::image::Format::Png)?;
+                pictures.push(crate::Picture {
+                    path: file,
+                    page: Some(number),
+                    at_ms: None,
+                    tokens: crate::ImageTokens::High,
+                });
+            }
             let layer = unsafe { page.string() }
                 .map(|s| s.to_string())
                 .unwrap_or_default();
@@ -57,11 +82,15 @@ pub(crate) fn extract(path: &Path) -> Result<Extracted, EmbedError> {
             })
         })?;
         pages.push(Page {
-            number: Some(index as u32 + 1),
+            number: Some(number),
             text,
         });
     }
-    Ok(Extracted { pages })
+    Ok(Extracted {
+        pages,
+        pictures,
+        ..Default::default()
+    })
 }
 
 fn non_space_chars(text: &str) -> usize {
@@ -70,7 +99,7 @@ fn non_space_chars(text: &str) -> usize {
 
 /// Recognized lines of the rendered page, in Vision's reading order.
 fn ocr_page(page: &PDFPage) -> Result<String, EmbedError> {
-    let Some(image) = render(page) else {
+    let Some(image) = render(page, Color::Gray, OCR_SCALE, OCR_MAX_SIDE) else {
         return Ok(String::new());
     };
     let request = VNRecognizeTextRequest::new();
@@ -101,8 +130,22 @@ fn ocr_page(page: &PDFPage) -> Result<String, EmbedError> {
     Ok(lines.join("\n"))
 }
 
-/// The page's crop box drawn on white, grayscale, at `OCR_SCALE` (smaller for huge pages).
-fn render(page: &PDFPage) -> Option<objc2_core_foundation::CFRetained<CGImage>> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Color {
+    /// For OCR.
+    Gray,
+    /// For pictures of the page.
+    Rgb,
+}
+
+/// The page's crop box drawn on white at `scale` (smaller for huge pages, so the longer
+/// side is at most `max_side` pixels).
+fn render(
+    page: &PDFPage,
+    color: Color,
+    scale: f64,
+    max_side: f64,
+) -> Option<objc2_core_foundation::CFRetained<CGImage>> {
     let pdf_page = unsafe { page.pageRef() }?;
     let pdf_page: &CGPDFPage = &pdf_page;
     let rect = CGPDFPage::box_rect(Some(pdf_page), CGPDFBox::CropBox);
@@ -115,12 +158,18 @@ fn render(page: &PDFPage) -> Option<objc2_core_foundation::CFRetained<CGImage>> 
     if width < 1.0 || height < 1.0 {
         return None;
     }
-    let scale = OCR_SCALE.min(OCR_MAX_SIDE / width.max(height));
+    let scale = scale.min(max_side / width.max(height));
     let (pixels_w, pixels_h) = (
-        (width * scale).round() as usize,
-        (height * scale).round() as usize,
+        (width * scale).round().max(1.0) as usize,
+        (height * scale).round().max(1.0) as usize,
     );
-    let space = CGColorSpace::new_device_gray()?;
+    let (space, alpha) = match color {
+        Color::Gray => (CGColorSpace::new_device_gray()?, CGImageAlphaInfo::None),
+        Color::Rgb => (
+            CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))?,
+            CGImageAlphaInfo::NoneSkipLast,
+        ),
+    };
     let context = unsafe {
         CGBitmapContextCreate(
             ptr::null_mut(),
@@ -129,11 +178,14 @@ fn render(page: &PDFPage) -> Option<objc2_core_foundation::CFRetained<CGImage>> 
             8,
             0,
             Some(&space),
-            CGImageAlphaInfo::None.0,
+            alpha.0,
         )
     }?;
     let context: &CGContext = &context;
-    CGContext::set_gray_fill_color(Some(context), 1.0, 1.0);
+    match color {
+        Color::Gray => CGContext::set_gray_fill_color(Some(context), 1.0, 1.0),
+        Color::Rgb => CGContext::set_rgb_fill_color(Some(context), 1.0, 1.0, 1.0, 1.0),
+    }
     CGContext::fill_rect(
         Some(context),
         CGRect::new(
@@ -235,7 +287,7 @@ mod tests {
     #[test]
     fn reads_the_text_layer_page_by_page() {
         let pdf = text_pdf(&temp_dir());
-        let doc = crate::extract(&pdf, SourceKind::Pdf).unwrap();
+        let doc = crate::extract(&pdf, SourceKind::Pdf, &pdf.with_extension("media")).unwrap();
         assert!(doc.pages.len() >= 2, "{doc:?}");
         assert_eq!(doc.pages[0].number, Some(1));
         assert!(
@@ -257,7 +309,7 @@ mod tests {
         let layer = unsafe { doc.pageAtIndex(0).unwrap().string() }.map(|s| s.to_string());
         assert!(layer.unwrap_or_default().trim().is_empty());
 
-        let doc = crate::extract(&pdf, SourceKind::Pdf).unwrap();
+        let doc = crate::extract(&pdf, SourceKind::Pdf, &pdf.with_extension("media")).unwrap();
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].number, Some(1));
         let text = &doc.pages[0].text;
@@ -269,7 +321,8 @@ mod tests {
     fn a_file_that_is_not_a_pdf_is_an_error() {
         let path = temp_dir().join("fake.pdf");
         std::fs::write(&path, "not a pdf").unwrap();
-        let err = crate::extract(&path, SourceKind::Pdf).unwrap_err();
+        let err =
+            crate::extract(&path, SourceKind::Pdf, &path.with_extension("media")).unwrap_err();
         assert!(matches!(err, EmbedError::Extract(_)), "{err:?}");
     }
 }

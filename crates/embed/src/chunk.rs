@@ -53,6 +53,8 @@ pub(crate) fn chunk(
             chunks.push(Chunk {
                 text,
                 page: page.number,
+                start_ms: None,
+                end_ms: None,
             });
         }
     }
@@ -270,6 +272,7 @@ mod tests {
                     text: text.to_string(),
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -300,7 +303,9 @@ mod tests {
             chunks,
             vec![Chunk {
                 text: "Hello there.\n\nSecond paragraph.".into(),
-                page: None
+                page: None,
+                start_ms: None,
+                end_ms: None
             }]
         );
     }
@@ -421,7 +426,9 @@ mod tests {
             chunks[0],
             Chunk {
                 text: "Short first page.".into(),
-                page: Some(1)
+                page: Some(1),
+                start_ms: None,
+                end_ms: None
             }
         );
         assert!(chunks.len() > 2);
