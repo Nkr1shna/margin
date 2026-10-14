@@ -119,57 +119,94 @@ pub async fn tools(State(state): State<AppState>) -> Json<Vec<ToolStatus>> {
 /// The stage kinds a `PipelineConfig` names, in the order the pipeline runs them.
 pub use margin_shared::pipeline::{NamedVariant, PipelineVariants, STAGE_KINDS};
 
-/// Where the named variants are: `MARGIN_EVALS_DIR`, else the repository's `evals/`
-/// next to this crate (the service runs from its checkout).
-fn evals_dir() -> std::path::PathBuf {
-    match std::env::var_os("MARGIN_EVALS_DIR") {
-        Some(dir) => dir.into(),
-        None => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals"),
+/// The named variants built in (`evals/variants/*.toml`), so a deployed service, which
+/// has no checkout next to it, still offers them.
+pub const BUILTIN_VARIANTS: &[(&str, &str)] = &[
+    (
+        "baseline",
+        include_str!("../../../evals/variants/baseline.toml"),
+    ),
+    ("bm25", include_str!("../../../evals/variants/bm25.toml")),
+    ("dense", include_str!("../../../evals/variants/dense.toml")),
+    (
+        "hybrid",
+        include_str!("../../../evals/variants/hybrid.toml"),
+    ),
+];
+
+/// A folder of more variants: `MARGIN_EVALS_DIR`, when set (its `variants/*.toml` add to
+/// the built-in ones and replace those of the same name).
+fn evals_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("MARGIN_EVALS_DIR").map(Into::into)
+}
+
+/// One variant from its TOML; `None` (logged) when it doesn't parse.
+fn parse_variant(
+    name: String,
+    text: &str,
+    from: &str,
+    registry: &crate::pipeline::Registry,
+) -> Option<NamedVariant> {
+    match toml::from_str::<margin_shared::pipeline::PipelineConfig>(text) {
+        Ok(config) => {
+            let unavailable = Pipeline::build(&config, registry)
+                .err()
+                .map(|e| format!("{e:#}"));
+            Some(NamedVariant {
+                name,
+                config,
+                unavailable,
+            })
+        }
+        Err(e) => {
+            tracing::warn!("couldn't read the variant {from}: {e:#}");
+            None
+        }
     }
 }
 
-/// The variants in `dir/variants`, by name; a file that can't be read or parsed is
-/// skipped (logged), and a missing folder is no variants.
+/// The built-in variants and those in `dir/variants` (which replace a built-in one of
+/// the same name), by name. A file that can't be read or parsed is skipped (logged); a
+/// missing folder adds nothing.
 pub fn named_variants(
-    dir: &std::path::Path,
+    dir: Option<&std::path::Path>,
     registry: &crate::pipeline::Registry,
 ) -> Vec<NamedVariant> {
-    let Ok(entries) = std::fs::read_dir(dir.join("variants")) else {
-        return Vec::new();
-    };
-    let mut out: Vec<NamedVariant> = entries
+    let mut by_name: std::collections::BTreeMap<String, NamedVariant> = BUILTIN_VARIANTS
+        .iter()
+        .filter_map(|(name, text)| {
+            parse_variant(
+                name.to_string(),
+                text,
+                &format!("{name} (built in)"),
+                registry,
+            )
+        })
+        .map(|v| (v.name.clone(), v))
+        .collect();
+    let entries = dir.and_then(|d| std::fs::read_dir(d.join("variants")).ok());
+    for p in entries
+        .into_iter()
+        .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-        .filter_map(|p| {
-            let name = p.file_stem()?.to_string_lossy().into_owned();
-            let parsed = std::fs::read_to_string(&p)
-                .map_err(anyhow::Error::from)
-                .and_then(|t| {
-                    Ok(toml::from_str::<margin_shared::pipeline::PipelineConfig>(
-                        &t,
-                    )?)
-                });
-            match parsed {
-                Ok(config) => {
-                    let unavailable = Pipeline::build(&config, registry)
-                        .err()
-                        .map(|e| format!("{e:#}"));
-                    Some(NamedVariant {
-                        name,
-                        config,
-                        unavailable,
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!("couldn't read the variant {}: {e:#}", p.display());
-                    None
-                }
+    {
+        let Some(name) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let text = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("couldn't read the variant {}: {e}", p.display());
+                continue;
             }
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        };
+        if let Some(v) = parse_variant(name, &text, &p.display().to_string(), registry) {
+            by_name.insert(v.name.clone(), v);
+        }
+    }
+    by_name.into_values().collect()
 }
 
 /// `GET /api/pipeline/variants`.
@@ -181,7 +218,7 @@ pub async fn pipeline_variants(State(state): State<AppState>) -> Json<PipelineVa
     let dir = evals_dir();
     let variants = {
         let state = state.clone();
-        tokio::task::spawn_blocking(move || named_variants(&dir, &state.registry))
+        tokio::task::spawn_blocking(move || named_variants(dir.as_deref(), &state.registry))
             .await
             .unwrap_or_default()
     };
@@ -197,7 +234,8 @@ mod variant_tests {
     async fn the_repositorys_variants_are_listed_and_buildable() {
         let store = crate::db::Store::memory().await.unwrap();
         let reg = Registry::standard(StageDeps { store });
-        let variants = named_variants(&evals_dir(), &reg);
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let variants = named_variants(Some(&repo), &reg);
         let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
         for n in ["baseline", "bm25", "dense", "hybrid"] {
             assert!(names.contains(&n), "{n} missing from {names:?}");
@@ -205,7 +243,16 @@ mod variant_tests {
         for v in &variants {
             assert_eq!(v.unavailable, None, "{}", v.name);
         }
-        assert!(named_variants(std::path::Path::new("/nonexistent"), &reg).is_empty());
+        // A deployed service has no evals folder: the built-in variants are still there.
+        for dir in [None, Some(std::path::Path::new("/nonexistent"))] {
+            let built_in = named_variants(dir, &reg);
+            let names: Vec<&str> = built_in.iter().map(|v| v.name.as_str()).collect();
+            assert_eq!(names, ["baseline", "bm25", "dense", "hybrid"]);
+            assert!(built_in.iter().all(|v| v.unavailable.is_none()));
+        }
+        // Every variant file in the repository is built in.
+        let files = std::fs::read_dir(repo.join("variants")).unwrap().count();
+        assert_eq!(files, BUILTIN_VARIANTS.len());
         assert!(
             reg.names("retriever")
                 .contains(&"hybrid-linear".to_string())

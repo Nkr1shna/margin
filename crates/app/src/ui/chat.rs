@@ -178,6 +178,7 @@ fn tool_icon(name: &str) -> &'static str {
         n if n.contains("note") => "note",
         "list_sources" | "attach_sources" => "clip",
         "make_video" => "video",
+        "sync_folder" => "folder",
         n if n.contains("file") => "folder",
         _ => "wrench",
     }
@@ -2121,6 +2122,7 @@ mod tests {
         }
         assert_eq!(tool_icon("read_lesson"), "book");
         assert_eq!(tool_icon("list_files"), "folder");
+        assert_eq!(tool_icon("sync_folder"), "folder");
         assert_eq!(tool_icon("anything"), "wrench");
         assert_eq!(
             reasoning_title("**Checking the library**\n\nMore.").as_deref(),
