@@ -55,6 +55,16 @@ pub struct AppCtx {
     pub uploads: Signal<Vec<Upload>>,
     /// The Settings dialog, open at this pane.
     pub settings_open: Signal<Option<crate::ui::settings::SettingsPane>>,
+    /// The source viewer, open on this lesson's citation.
+    pub source_viewer: Signal<Option<SourceViewer>>,
+}
+
+/// Which citation the source viewer shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceViewer {
+    pub lesson_id: Id,
+    /// `Citation::n`.
+    pub n: u32,
 }
 
 pub fn use_app() -> AppCtx {
@@ -97,6 +107,7 @@ impl AppCtx {
         this.lib_status.set(LoadStatus::Loading);
         this.ask_proposal.set(None);
         this.uploads.set(Vec::new());
+        this.source_viewer.set(None);
     }
 
     /// Sign out: revoke this device on the service (best effort), then forget the token.

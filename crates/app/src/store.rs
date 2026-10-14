@@ -546,6 +546,41 @@ mod tests {
     }
 
     #[test]
+    fn citations_arrive_with_the_finished_lesson() {
+        let mut s = sample();
+        s.apply(Event::LessonChanged {
+            lesson: lesson("g", "f", 3, LessonStatus::Generating),
+        });
+        s.apply(Event::LessonDelta {
+            lesson_id: "g".into(),
+            text: "Sines[^1] add up.".into(),
+        });
+        assert!(s.lessons["g"].citations.is_empty());
+        // The final LessonChanged, as the socket sends it, carries the citations.
+        let json = r#"{"type":"lesson_changed","lesson":{"id":"g","topic_id":"f","title":"G",
+            "summary":"","position":3,"level":"intro","minutes":5,"body_md":"Sines[^1] add up.",
+            "status":{"state":"ready"},"created_at":"2026-10-01T00:00:00Z",
+            "updated_at":"2026-10-01T00:00:00Z","citations":[{"n":1,"source_id":"src1",
+            "source_name":"paper.pdf","kind":"pdf","page":2,"start_ms":null,"end_ms":null,
+            "excerpt":"Sines add up.","image_url":"https://m/media/sources/src1/page-2.png?exp=1&sig=a"}]}}"#;
+        s.apply(serde_json::from_str::<Event>(json).unwrap());
+        let cites = &s.lessons["g"].citations;
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0].kind, SourceKind::Pdf);
+        assert_eq!(cites[0].page, Some(2));
+        assert_eq!(
+            cites[0].image_url.as_deref(),
+            Some("https://m/media/sources/src1/page-2.png?exp=1&sig=a")
+        );
+        // Deltas after that (a regeneration) keep the list until the next full lesson.
+        s.apply(Event::LessonDelta {
+            lesson_id: "g".into(),
+            text: " More.".into(),
+        });
+        assert_eq!(s.lessons["g"].citations.len(), 1);
+    }
+
+    #[test]
     fn lesson_deleted_removes_its_notes_and_video() {
         let mut s = sample();
         s.apply(Event::LessonDeleted { id: "l1".into() });

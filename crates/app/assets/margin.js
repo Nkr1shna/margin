@@ -232,6 +232,74 @@
         }
       }, { once: true });
     },
+    // Clicks on the citation markers (button.cite[data-cite]) inside #`bodyId`: call
+    // send(n). The body's HTML is replaced as it changes, so the listener sits on the
+    // document. Only one watcher is active at a time.
+    watchCitations: function (bodyId, send) {
+      if (window.MarginApp._stopCitations) window.MarginApp._stopCitations();
+      function onClick(e) {
+        var b = e.target.closest && e.target.closest("button.cite[data-cite]");
+        var body = document.getElementById(bodyId);
+        if (!b || !body || !body.contains(b)) return;
+        e.preventDefault();
+        var n = parseInt(b.getAttribute("data-cite"), 10);
+        if (n > 0) send(n);
+      }
+      document.addEventListener("click", onClick);
+      window.MarginApp._stopCitations = function () {
+        document.removeEventListener("click", onClick);
+        window.MarginApp._stopCitations = null;
+      };
+    },
+    stopCitations: function () {
+      if (window.MarginApp._stopCitations) window.MarginApp._stopCitations();
+    },
+    // A modal dialog (#id) was opened or changed what it shows: remember what had focus
+    // before it opened (to give it back on close), keep Tab inside it, and move focus in
+    // if it isn't there yet.
+    dialogOpened: function (id) {
+      var d = document.getElementById(id);
+      if (!d) return;
+      var active = document.activeElement;
+      if (!active || active === document.body) active = lastPressed;
+      if (!d.__marginTrap) {
+        // A fresh dialog element: this is the open, not a change of what it shows.
+        d.__marginTrap = true;
+        dialogReturn[id] = active && !d.contains(active) ? active : null;
+        d.addEventListener("keydown", function (e) {
+          if (e.key !== "Tab") return;
+          var items = focusables(d);
+          if (!items.length) { e.preventDefault(); d.focus(); return; }
+          var first = items[0], last = items[items.length - 1], at = document.activeElement;
+          if (e.shiftKey && (at === first || at === d)) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && at === last) { e.preventDefault(); first.focus(); }
+        });
+      }
+      if (!d.contains(document.activeElement)) d.focus();
+    },
+    // The dialog closed: focus what opened it, or `fallback` (a selector) when that
+    // element is gone (e.g. re-rendered).
+    dialogClosed: function (id, fallback) {
+      var el = dialogReturn[id];
+      delete dialogReturn[id];
+      setTimeout(function () {
+        if (el && document.body.contains(el)) { el.focus(); return; }
+        var f = fallback && document.querySelector(fallback);
+        if (f) f.focus();
+      });
+    },
+    // Start the media element #id at `seconds` once it knows its duration; `play` starts
+    // it too.
+    seekMedia: function (id, seconds, play) {
+      var m = document.getElementById(id);
+      if (!m) return;
+      function go() {
+        var t = isFinite(m.duration) ? Math.min(seconds, Math.max(0, m.duration - 0.05)) : seconds;
+        if (Math.abs(m.currentTime - t) > 0.25) m.currentTime = t;
+        if (play) { var p = m.play(); if (p && p.catch) p.catch(function () {}); }
+      }
+      if (m.readyState >= 1) go(); else m.addEventListener("loadedmetadata", go, { once: true });
+    },
     scrollIntoView: function (selector) {
       var el = document.querySelector(selector);
       if (el) el.scrollIntoView({ block: "nearest" });
@@ -243,6 +311,23 @@
       return Promise.resolve(fallbackCopy(text));
     },
   };
+
+  // Dialogs give focus back to what opened them. WebKit doesn't focus a button that is
+  // clicked, so the last control pressed stands in for the focused element.
+  var dialogReturn = {};
+  var lastPressed = null;
+  document.addEventListener("mousedown", function (e) {
+    var t = e.target.closest && e.target.closest("button, a[href], [tabindex]");
+    if (t) lastPressed = t;
+  }, true);
+  function focusables(root) {
+    var all = root.querySelectorAll(
+      "button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), audio[controls], video[controls], [tabindex]:not([tabindex='-1'])"
+    );
+    return Array.prototype.filter.call(all, function (el) {
+      return el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0;
+    });
+  }
 
   // The player volume and mute, shared by every lesson video and kept across restarts.
   var VOLUME_KEY = "margin.player.volume";
