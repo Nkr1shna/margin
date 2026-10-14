@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 /// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
 
+mod chunk;
 pub mod fake;
+mod rank;
 
 /// Hugging Face repo the model is downloaded from.
 pub const REPO: &str = "FluidInference/embeddinggemma-2-coreml";
@@ -171,8 +173,7 @@ pub fn chunk(
     count_tokens: &dyn Fn(&str) -> usize,
     max_tokens: usize,
 ) -> Vec<Chunk> {
-    let _ = (doc, kind, count_tokens, max_tokens);
-    todo!("margin-embed: chunk")
+    chunk::chunk(doc, kind, count_tokens, max_tokens)
 }
 
 /// Cosine similarity of two L2-normalized vectors (their dot product).
@@ -184,6 +185,5 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// words (and numbers/identifiers) that appear in the chunk, since no embedding holds an
 /// invoice number exactly.
 pub fn score(query_vec: &[f32], query_text: &str, chunk_vec: &[f32], chunk_text: &str) -> f32 {
-    let _ = (query_vec, query_text, chunk_vec, chunk_text);
-    todo!("margin-embed: score")
+    cosine(query_vec, chunk_vec) + rank::term_boost(query_text, chunk_text)
 }
