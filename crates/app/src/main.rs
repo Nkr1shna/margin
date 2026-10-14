@@ -19,6 +19,7 @@ mod secrets;
 mod sources;
 mod state;
 mod store;
+mod tools;
 mod ui;
 mod zoom;
 
@@ -26,7 +27,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use dioxus::prelude::*;
-use margin_shared::ServerFrame;
+use futures_util::StreamExt;
+use margin_shared::{Event, ServerFrame};
 
 use crate::api::Api;
 use crate::events::ConnectError;
@@ -112,7 +114,9 @@ fn main() {
     }
     #[cfg(all(feature = "mobile", not(feature = "desktop")))]
     dioxus::LaunchBuilder::new()
-        .with_cfg(with_index(dioxus::mobile::Config::new()))
+        .with_cfg(with_index(
+            dioxus::mobile::Config::new().with_custom_event_handler(lifecycle),
+        ))
         .launch(App);
     #[cfg(not(any(feature = "desktop", feature = "mobile")))]
     dioxus::launch(App);
@@ -136,6 +140,27 @@ fn flush_on_exit<T>(
     ) {
         drafts::flush_blocking(Duration::from_secs(3));
     }
+}
+
+/// Android: the activity pausing and resuming arrive as tao's `Suspended` and `Resumed`;
+/// the app is in the background in between (`state::set_foreground`). On iOS these
+/// don't fire under scenes, so the scene delegate reports it (src/scene.rs).
+#[cfg(all(feature = "mobile", not(feature = "desktop")))]
+fn lifecycle<T>(
+    event: &dioxus::mobile::tao::event::Event<'_, T>,
+    _: &dioxus::mobile::tao::event_loop::EventLoopWindowTarget<T>,
+) {
+    #[cfg(target_os = "android")]
+    {
+        use dioxus::mobile::tao::event::Event;
+        match event {
+            Event::Suspended => state::set_foreground(false),
+            Event::Resumed => state::set_foreground(true),
+            _ => {}
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = event;
 }
 
 /// Release builds start from `INDEX_HTML`. Debug builds keep Dioxus's development page
@@ -327,6 +352,26 @@ fn App() -> Element {
             settings_open: Signal::new(None),
             source_viewer: Signal::new(None),
             transcripts: Signal::new(Default::default()),
+            shown_passage: Signal::new(None),
+            device_frames: Signal::new(None),
+            agent_commands: Signal::new(Default::default()),
+            foreground: Signal::new(*state::foreground_changes().borrow()),
+        }
+    });
+
+    // The platform's lifecycle (src/scene.rs on iOS, `lifecycle` on Android) into
+    // `AppCtx::foreground`, which the live loop follows.
+    use_future(move || async move {
+        let mut changes = state::foreground_changes();
+        let mut foreground = ctx.foreground;
+        loop {
+            let now = *changes.borrow_and_update();
+            if *foreground.peek() != now {
+                foreground.set(now);
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
         }
     });
 
@@ -468,6 +513,42 @@ async fn load_chats(ctx: AppCtx, api: &Api) -> bool {
     true
 }
 
+/// How often the live loop looks at the reload button, the chat list and the app's
+/// foreground state while connected or waiting.
+const LIVE_TICK: Duration = Duration::from_millis(250);
+
+/// This device's own presence, which the service never reports to the device itself:
+/// online exactly while its socket is live.
+fn set_self_online(ctx: AppCtx, online: bool) {
+    let mut lib = ctx.lib;
+    let me = ctx
+        .session
+        .peek()
+        .as_ref()
+        .and_then(|s| s.me.as_ref().map(|me| me.device.id.clone()));
+    let id = me.or_else(|| {
+        lib.peek()
+            .devices
+            .values()
+            .find(|d| d.current)
+            .map(|d| d.id.clone())
+    });
+    let Some(id) = id else { return };
+    let changed = lib
+        .peek()
+        .devices
+        .get(&id)
+        .is_some_and(|d| d.online != online);
+    if changed && let Some(device) = lib.write().devices.get_mut(&id) {
+        device.online = online;
+    }
+}
+
+/// Keeps the library live over the events socket and runs the device tools the service
+/// sends this device. The loop owns both halves of the socket: frames for the service
+/// (tool answers) come to it through `AppCtx::device_frames`. On iOS, iPadOS and Android
+/// the socket is closed while the app is in the background and opened again when it
+/// comes back.
 async fn live_loop(ctx: AppCtx) {
     let Some(api) = ctx.api() else { return };
     let Some(token) = api.token().map(str::to_string) else {
@@ -475,15 +556,25 @@ async fn live_loop(ctx: AppCtx) {
     };
     let mut live = ctx.live;
     let mut lib = ctx.lib;
+    let mut device_frames = ctx.device_frames;
     let mut reload_seen = *ctx.reload.peek();
+    let runner = tools::Runner::new();
+    let host = tools::AppHost(ctx);
     load_library(ctx, &api).await;
     let mut chats_retry_at = tokio::time::Instant::now() + CHATS_RETRY;
     let mut attempt: u32 = 0;
     let mut connected_before = false;
     loop {
+        if !*ctx.foreground.peek() {
+            live.set(LiveStatus::Background);
+            while !*ctx.foreground.peek() {
+                tokio::time::sleep(LIVE_TICK).await;
+            }
+            attempt = 0;
+        }
         live.set(LiveStatus::Connecting);
         let error = match events::connect(&api.events_url(), &token).await {
-            Ok(mut socket) => {
+            Ok(socket) => {
                 attempt = 0;
                 if connected_before || *ctx.lib_status.peek() != LoadStatus::Loaded {
                     // Events may have been missed while disconnected.
@@ -491,17 +582,44 @@ async fn live_loop(ctx: AppCtx) {
                 }
                 connected_before = true;
                 live.set(LiveStatus::Live);
-                loop {
+                set_self_online(ctx, true);
+                let (mut sender, mut frames) = socket.split();
+                // This connection's outgoing frames; device tools get the sender once
+                // the service said hello.
+                let (outgoing_tx, mut outgoing) = tokio::sync::mpsc::unbounded_channel();
+                let mut outgoing_tx = Some(outgoing_tx);
+                let mut tick = tokio::time::interval(LIVE_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let error = loop {
                     tokio::select! {
-                        frame = events::next_frame(&mut socket) => match frame {
-                            Some(ServerFrame::Event(event)) => lib.write().apply(event),
-                            // Device-tool requests for this device. This build runs no
-                            // device tools; the service times the request out and tells
-                            // the model the device couldn't answer.
-                            Some(ServerFrame::Directed(_)) => {}
-                            None => break,
+                        frame = events::next_frame(&mut frames) => match frame {
+                            Some(ServerFrame::Event(event)) => {
+                                if matches!(event, Event::Hello { .. })
+                                    && let Some(tx) = outgoing_tx.take()
+                                {
+                                    device_frames.set(Some(tx));
+                                }
+                                lib.write().apply(event);
+                            }
+                            // Device-tool requests for this device and their cancellations.
+                            Some(ServerFrame::Directed(frame)) => {
+                                runner.handle(frame, &host, |task| {
+                                    spawn(task);
+                                });
+                            }
+                            None => break "The live connection closed.".to_string(),
                         },
-                        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        Some(frame) = outgoing.recv() => {
+                            if let Err(e) = events::send_frame(&mut sender, &frame).await {
+                                break format!("Live updates are disconnected ({e}).");
+                            }
+                        }
+                        _ = tick.tick() => {
+                            if !*ctx.foreground.peek() {
+                                events::close(&mut sender).await;
+                                break String::new();
+                            }
+                            set_self_online(ctx, true);
                             let wanted = *ctx.reload.peek();
                             if wanted != reload_seen {
                                 reload_seen = wanted;
@@ -515,8 +633,12 @@ async fn live_loop(ctx: AppCtx) {
                             }
                         }
                     }
-                }
-                "The live connection closed.".to_string()
+                };
+                // The service gives up on this connection's requests; so does the app.
+                device_frames.set(None);
+                runner.cancel_all();
+                set_self_online(ctx, false);
+                error
             }
             Err(ConnectError::Unauthorized) => {
                 ctx.forget_session(Some(
@@ -526,6 +648,10 @@ async fn live_loop(ctx: AppCtx) {
             }
             Err(ConnectError::Other(message)) => message,
         };
+        // Gone to the background: wait for the app to come back, not for a retry.
+        if !*ctx.foreground.peek() {
+            continue;
+        }
         let delay = events::backoff(attempt);
         attempt = attempt.saturating_add(1);
         live.set(LiveStatus::Reconnecting {
@@ -534,8 +660,9 @@ async fn live_loop(ctx: AppCtx) {
         });
         // Wait, but honor a manual reload request (Retry) in the meantime.
         let deadline = tokio::time::Instant::now() + delay;
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        while tokio::time::Instant::now() < deadline && *ctx.foreground.peek() {
+            tokio::time::sleep(LIVE_TICK).await;
+            set_self_online(ctx, false);
             let wanted = *ctx.reload.peek();
             if wanted != reload_seen {
                 reload_seen = wanted;

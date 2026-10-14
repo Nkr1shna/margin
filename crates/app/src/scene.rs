@@ -17,7 +17,8 @@
 //! switches UIKit to scenes.
 //!
 //! tao's app-delegate callbacks for becoming active and resigning (its `Resumed` and
-//! `Suspended` events) don't fire under scenes; Dioxus doesn't use them.
+//! `Suspended` events) don't fire under scenes; Dioxus doesn't use them. Going to the
+//! background and back comes from the scene delegate instead (`state::set_foreground`).
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -76,6 +77,19 @@ define_class!(
         #[unsafe(method(sceneDidDisconnect:))]
         fn did_disconnect(&self, _scene: &UIScene) {
             STATE.with_borrow_mut(|state| state.scene = None);
+        }
+
+        // UIKit suspends the app a few seconds after it goes to the background; the live
+        // loop closes the events socket first, so the service knows this device is gone
+        // at once, and opens it again on the way back.
+        #[unsafe(method(sceneDidEnterBackground:))]
+        fn did_enter_background(&self, _scene: &UIScene) {
+            crate::state::set_foreground(false);
+        }
+
+        #[unsafe(method(sceneWillEnterForeground:))]
+        fn will_enter_foreground(&self, _scene: &UIScene) {
+            crate::state::set_foreground(true);
         }
     }
 

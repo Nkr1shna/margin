@@ -4,8 +4,10 @@ use dioxus::prelude::*;
 
 use crate::commands::Command;
 use crate::routes::{Route, page_title};
-use crate::state::{AppCtx, LiveStatus, LoadStatus, use_app};
+use crate::state::{AppCtx, LiveStatus, LoadStatus, SourceViewer, use_app};
 use crate::store::Milestones;
+use crate::tools::app_control;
+use crate::ui::citations::CitationViewer;
 use crate::ui::common::{Icon, announce, js, sentence};
 use crate::ui::search::SearchPalette;
 use crate::ui::settings::{SettingsDialog, SettingsPane};
@@ -126,6 +128,33 @@ pub fn Shell() -> Element {
         );
     }));
 
+    // App-control calls from the agent (`tools`), run here on the main thread where the
+    // router is. A citation in a lesson that isn't open waits in `parked` until the
+    // lesson is the screen (the screen being left closes its viewer as it goes).
+    let parked = use_signal(|| None::<SourceViewer>);
+    use_effect(move || {
+        if app.agent_commands.read().is_empty() {
+            return;
+        }
+        let commands: Vec<_> = app.agent_commands.write().drain(..).collect();
+        for command in commands {
+            spawn(app_control::perform(app, parked, command));
+        }
+    });
+    use_effect(use_reactive!(|route| {
+        let mut parked = parked;
+        let Some(viewer) = parked.take() else {
+            return;
+        };
+        if route
+            == (Route::LessonRead {
+                id: viewer.lesson_id.clone(),
+            })
+        {
+            app.source_viewer.set(Some(viewer));
+        }
+    }));
+
     // Tell screen readers when background work finishes: an outline drafted, a lesson
     // written, a video made (or any of them failing). Measured against the last state seen.
     let seen = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None::<Milestones>)));
@@ -177,6 +206,16 @@ pub fn Shell() -> Element {
         }
         if *app.search_open.read() {
             SearchPalette {}
+        }
+        if let Some(passage) = app.shown_passage.read().clone() {
+            // A passage the agent showed (`show_passage`): one passage, no Previous/Next.
+            CitationViewer {
+                citations: vec![passage.clone()],
+                n: passage.n,
+                fallback: "main.main".to_string(),
+                on_go: move |_| {},
+                on_close: move |_| app.shown_passage.set(None),
+            }
         }
     }
 }

@@ -1,12 +1,13 @@
 //! The `/api/events` WebSocket: connect with the device token as a Bearer header, read
-//! JSON `ServerFrame`s (broadcast `Event`s, and `DirectedFrame`s for this device), and
-//! back off between reconnect attempts.
+//! JSON `ServerFrame`s (broadcast `Event`s, and `DirectedFrame`s for this device), send
+//! `DeviceFrame`s (device-tool answers), and back off between reconnect attempts.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use margin_shared::ServerFrame;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use margin_shared::{DeviceFrame, ServerFrame};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header::AUTHORIZATION};
@@ -14,6 +15,11 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// The socket's read half. The live loop splits the socket once connected and owns both
+/// halves.
+pub type Frames = SplitStream<Socket>;
+/// The socket's write half.
+pub type Sender = SplitSink<Socket, Message>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectError {
@@ -69,10 +75,11 @@ pub async fn connect(events_url: &str, token: &str) -> Result<Socket, ConnectErr
 /// Next frame from the socket: an event for every device, or a frame addressed to this
 /// one (a device-tool request or its cancellation). `None` when the socket closed or
 /// failed; frames that parse as neither (from a newer service) are skipped. Pings are
-/// answered by tungstenite itself. Cancel-safe: it only awaits the stream's `next()`.
-pub async fn next_frame(socket: &mut Socket) -> Option<ServerFrame> {
+/// answered by tungstenite itself (queued, and flushed with the next frame read or
+/// sent). Cancel-safe: it only awaits the stream's `next()`.
+pub async fn next_frame(frames: &mut Frames) -> Option<ServerFrame> {
     loop {
-        match socket.next().await? {
+        match frames.next().await? {
             Ok(Message::Text(text)) => match serde_json::from_str::<ServerFrame>(text.as_str()) {
                 Ok(frame) => return Some(frame),
                 Err(_) => continue,
@@ -82,6 +89,19 @@ pub async fn next_frame(socket: &mut Socket) -> Option<ServerFrame> {
             Err(_) => return None,
         }
     }
+}
+
+/// Send one frame to the service as JSON text.
+pub async fn send_frame(sender: &mut Sender, frame: &DeviceFrame) -> Result<(), WsError> {
+    let json = serde_json::to_string(frame).expect("device frames serialize");
+    sender.send(Message::Text(json.into())).await
+}
+
+/// Close the socket with a Close frame, so the service drops this device's presence at
+/// once instead of when its pings go unanswered.
+pub async fn close(sender: &mut Sender) {
+    let _ = sender.send(Message::Close(None)).await;
+    let _ = sender.close().await;
 }
 
 /// Delay before reconnect attempt `attempt` (0-based): 1 s, 2 s, 4 s … capped at 30 s.
@@ -98,7 +118,7 @@ mod tests {
     use margin_shared::{DeviceToolCall, DirectedFrame, Event, NewNote, ServerFrame, ToolRequest};
 
     /// The next broadcast event, skipping frames addressed to this device.
-    async fn next_event(socket: &mut Socket) -> Option<Event> {
+    async fn next_event(socket: &mut Frames) -> Option<Event> {
         loop {
             match next_frame(socket).await? {
                 ServerFrame::Event(event) => return Some(event),
@@ -125,7 +145,7 @@ mod tests {
     async fn receives_hello_and_live_events() {
         let fake = FakeService::start().await;
         let api = Api::with_token(&fake.url, TOKEN);
-        let mut socket = connect(&api.events_url(), TOKEN).await.unwrap();
+        let (_sender, mut socket) = connect(&api.events_url(), TOKEN).await.unwrap().split();
         assert_eq!(
             next_event(&mut socket).await,
             Some(Event::Hello {
@@ -151,9 +171,10 @@ mod tests {
     #[tokio::test]
     async fn frames_for_this_device_arrive_between_events() {
         let fake = FakeService::start().await;
-        let mut socket = connect(&Api::with_token(&fake.url, TOKEN).events_url(), TOKEN)
+        let (_sender, mut socket) = connect(&Api::with_token(&fake.url, TOKEN).events_url(), TOKEN)
             .await
-            .unwrap();
+            .unwrap()
+            .split();
         assert!(matches!(
             next_frame(&mut socket).await,
             Some(ServerFrame::Event(Event::Hello { .. }))
@@ -185,6 +206,54 @@ mod tests {
             next_frame(&mut socket).await,
             Some(ServerFrame::Event(Event::ChatDeleted { id: "c1".into() }))
         );
+    }
+
+    /// A WebSocket server that reports what a device sends it: each text frame, then
+    /// `None` when the device closes.
+    async fn listening_server() -> (String, tokio::sync::mpsc::UnboundedReceiver<Option<String>>) {
+        use axum::extract::ws::{Message as AxumMessage, WebSocketUpgrade};
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/api/events",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            match message {
+                                AxumMessage::Text(text) => {
+                                    let _ = tx.send(Some(text.to_string()));
+                                }
+                                AxumMessage::Close(_) => break,
+                                _ => {}
+                            }
+                        }
+                        let _ = tx.send(None);
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/events", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, rx)
+    }
+
+    #[tokio::test]
+    async fn sends_device_frames_and_closes() {
+        let (url, mut received) = listening_server().await;
+        let (mut sender, _frames) = connect(&url, TOKEN).await.unwrap().split();
+        let frame = DeviceFrame::ToolResult {
+            request_id: "r1".into(),
+            result: margin_shared::DeviceToolResult::Err {
+                message: "nope".into(),
+            },
+        };
+        send_frame(&mut sender, &frame).await.unwrap();
+        let text = received.recv().await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<DeviceFrame>(&text).unwrap(), frame);
+        close(&mut sender).await;
+        assert_eq!(received.recv().await, Some(None));
     }
 
     #[tokio::test]
