@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub use margin_shared::SourceKind;
 
 mod chunk;
+mod download;
 pub mod fake;
 mod rank;
 
@@ -73,19 +74,19 @@ impl ModelFiles {
 
     /// Whether every file the text model needs is present (a finished download).
     pub fn is_complete(&self) -> bool {
-        todo!("margin-embed: ModelFiles::is_complete")
+        download::is_complete(&self.dir)
     }
 
     /// Bytes on disk for the downloaded files.
     pub fn size_on_disk(&self) -> u64 {
-        todo!("margin-embed: ModelFiles::size_on_disk")
+        download::size_on_disk(&self.dir)
     }
 
     /// Total bytes a download fetches (from the Hugging Face API), for showing before
     /// the user starts it.
     pub async fn remote_size(client: &reqwest::Client, hf_base: &str) -> Result<u64, EmbedError> {
-        let _ = (client, hf_base);
-        todo!("margin-embed: ModelFiles::remote_size")
+        let files = download::remote_files(client, hf_base).await?;
+        Ok(files.iter().map(|f| f.size).sum())
     }
 
     /// Downloads the text model's files from `hf_base`/`REPO` (resolve/main) into `dir`,
@@ -97,13 +98,12 @@ impl ModelFiles {
         hf_base: &str,
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), EmbedError> {
-        let _ = (client, hf_base, progress);
-        todo!("margin-embed: ModelFiles::download")
+        download::download(&self.dir, client, hf_base, progress).await
     }
 
     /// Deletes the downloaded files (and the compiled model cache).
     pub fn remove(&self) -> Result<(), EmbedError> {
-        todo!("margin-embed: ModelFiles::remove")
+        download::remove(&self.dir)
     }
 }
 

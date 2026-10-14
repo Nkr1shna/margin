@@ -5098,6 +5098,7 @@ dependencies = [
 name = "margin-embed"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "futures-util",
  "margin-shared",
  "reqwest 0.13.5",

@@ -16,3 +16,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+axum = "=0.8.9"
