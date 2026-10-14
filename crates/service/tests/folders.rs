@@ -1177,3 +1177,152 @@ async fn a_folders_passages_are_found_through_that_folder_only() {
     assert!(hits.iter().all(|hit| a_files.contains(&hit.document_id)), "{hits:?}");
     let _: Option<Chat> = None;
 }
+
+// ---------------------------------------------------------------------------
+// Needing 4-agent's margin_agent (`sync_folder`, `ToolOutput.images`): ignored until
+// agent/p4-agent is merged; the integrator removes the `ignore`s then.
+// ---------------------------------------------------------------------------
+
+/// A chat with `ws` attached whose model makes `calls` then answers; waits for it.
+async fn folder_turn(h: &Harness, t: &str, ws: &str, calls: &[(&str, &str, &str)]) -> ChatDetail {
+    h.generator.agent.push(Scripted::Events(tool_calls_reply(calls)));
+    h.generator.agent.push(Scripted::Events(text_reply(&["Done."])));
+    let r = h
+        .post(t, "/api/chats")
+        .json(&json!({"workspace_ids": [ws], "message": {"text": "Look at my folder"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let chat: ChatDetail = r.json().await.unwrap();
+    wait_idle(h, t, &chat.chat.id, 3).await
+}
+
+/// D13 test 3: `sync_folder` goes to the holding device; offline and unattached folders
+/// get their texts.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs agent/p4-agent"]
+async fn sync_folder_asks_the_holding_device() {
+    let h = start().await;
+    let t = h.sign_in("MacBook Pro").await;
+    h.configure_ai(&t).await;
+    let ws = new_folder(&h, &t, "notes").await;
+    let mut device = h.socket(&t).await;
+    let args = json!({"workspace_id": ws.id}).to_string();
+    let calls = [("call_sync", "sync_folder", args.as_str())];
+    let run = folder_turn(&h, &t, &ws.id, &calls);
+    let answer = async {
+        let request = match device.next_directed().await {
+            margin_shared::DirectedFrame::ToolRequest { request } => request,
+            other => panic!("expected a tool request, got {other:?}"),
+        };
+        assert_eq!(
+            request.call,
+            margin_shared::DeviceToolCall::SyncFolder {
+                workspace_id: ws.id.clone()
+            }
+        );
+        device
+            .send_frame(&margin_shared::DeviceFrame::ToolResult {
+                request_id: request.request_id,
+                result: margin_shared::DeviceToolResult::Ok {
+                    output: margin_shared::DeviceToolOutput::Done {
+                        message: "Synced “notes”: 3 files to send, 1 removed; sending now."
+                            .into(),
+                    },
+                },
+            })
+            .await;
+    };
+    let (d, ()) = tokio::join!(run, answer);
+    assert_eq!(
+        output_sent(&h, "call_sync"),
+        Value::String("Synced “notes”: 3 files to send, 1 removed; sending now.".into())
+    );
+    assert!(d.items.iter().any(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, ok: true, .. } if call_id == "call_sync")));
+    let offered_tools = offered(&h.generator.agent.requests()[0]);
+    for name in ["list_files", "find_files", "sync_folder"] {
+        assert!(offered_tools.iter().any(|n| n == name), "{name}: {offered_tools:?}");
+    }
+
+    // With the device gone: the offline text.
+    device.close().await;
+    folder_turn(&h, &t, &ws.id, &[("call_off", "sync_folder", &args)]).await;
+    let out = output_sent(&h, "call_off").to_string();
+    assert!(
+        out.contains("MacBook Pro isn't connected to Margin right now"),
+        "{out}"
+    );
+    // A folder that isn't attached: the check text.
+    folder_turn(
+        &h,
+        &t,
+        &ws.id,
+        &[("call_bad", "sync_folder", &json!({"workspace_id": "nope"}).to_string())],
+    )
+    .await;
+    let out = output_sent(&h, "call_bad").to_string();
+    assert!(
+        out.contains("No folder attached to this chat has the workspace_id “nope”"),
+        "{out}"
+    );
+}
+
+/// D13 test 1, the pixels: `view_picture` stores a user message with the picture right
+/// after its `function_call_output`, and the next request carries it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs agent/p4-agent"]
+async fn view_picture_sends_the_picture_to_the_model() {
+    let (h, t, ws) = synced_notes().await;
+    let pdf = by_name(&files(&h, &t, &ws.id).await, "paper.pdf").clone();
+    let d = folder_turn(
+        &h,
+        &t,
+        &ws.id,
+        &[(
+            "call_view",
+            "view_picture",
+            &json!({"document_id": pdf.id, "page": 3}).to_string(),
+        )],
+    )
+    .await;
+    let result = d
+        .items
+        .iter()
+        .find(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == "call_view"))
+        .unwrap();
+    let stored: margin_service::chats::StoredChatItem = h
+        .state
+        .store
+        .get(db::CHAT_ITEM, &result.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.model_items.len(), 2, "{:?}", stored.model_items);
+    assert_eq!(stored.model_items[0]["type"], "function_call_output");
+    let picture = &stored.model_items[1];
+    assert_eq!(picture["role"], "user");
+    let images: Vec<&Value> = picture["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["type"] == "input_image")
+        .collect();
+    assert_eq!(images.len(), 1);
+    assert!(
+        images[0]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,")
+    );
+    // The answer step was sent the picture.
+    let requests = h.generator.agent.requests();
+    let last = requests.last().unwrap();
+    assert!(
+        last.input.iter().any(|i| i["role"] == "user"
+            && i["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|p| p["type"] == "input_image"))),
+        "no picture in the next request"
+    );
+}
