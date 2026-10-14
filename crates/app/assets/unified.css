@@ -22,7 +22,7 @@
 .app.sb-hidden .topbar .history { margin-left: -6px; } /* topbar gap 8 -> 2 */
 /* With the sidebar showing, its header row has the history buttons; the top bar's
    copy is for a hidden sidebar or narrow windows. */
-@media (min-width: 720px) {
+@media (min-width: 1024px) {
   .app:not(.sb-hidden) .topbar .history { display: none; }
 }
 
@@ -30,9 +30,9 @@
 .connect { position: relative; }
 .connect-bar { position: absolute; top: 0; left: 0; right: 0; height: 46px; }
 
-/* Narrow windows hide the sidebar, so the top bar makes room for the lights; the
-   drawer's own first row already does. */
-@media (max-width: 719px) {
+/* Windows under 1024px make the sidebar a drawer, so the top bar makes room for the
+   lights; the drawer's own first row already does. */
+@media (max-width: 1023px) {
   .topbar { padding-left: 84px; }
   .topbar .menu-btn { width: 28px; height: 28px; }
   .topbar .history { margin-left: -6px; }

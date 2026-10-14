@@ -64,6 +64,9 @@ impl SettingsPane {
 pub fn SettingsDialog() -> Element {
     let mut app = use_app();
     let pane = app.settings_open.read().unwrap_or(SettingsPane::General);
+    // Phones show the pane list or the open pane (CSS, `.list`); it opens on the pane asked
+    // for, and its back button goes to the list.
+    let mut show_list = use_signal(|| false);
 
     // Load settings into the store (SettingsChanged events keep them current).
     let mut settings_error = use_signal(|| None::<String>);
@@ -98,11 +101,11 @@ pub fn SettingsDialog() -> Element {
 
     rsx! {
         div {
-            class: "modal-scrim center",
+            class: "modal-scrim center full",
             onclick: move |_| app.settings_open.set(None),
             div {
                 id: "settings-dialog",
-                class: "modal settings-modal",
+                class: if *show_list.read() { "modal settings-modal list" } else { "modal settings-modal" },
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-label": "Settings",
@@ -114,20 +117,38 @@ pub fn SettingsDialog() -> Element {
                     }
                 },
                 nav { class: "set-nav", "aria-label": "Settings",
-                    h2 { "Settings" }
+                    div { class: "set-nav-head",
+                        h2 { "Settings" }
+                        button {
+                            class: "icon-btn",
+                            "aria-label": "Close settings",
+                            onclick: move |_| app.settings_open.set(None),
+                            Icon { name: "x" }
+                        }
+                    }
                     for p in SettingsPane::ALL {
                         button {
                             key: "{p:?}",
                             class: "row",
                             "aria-current": (p == pane).to_string(),
-                            onclick: move |_| app.settings_open.set(Some(p)),
+                            onclick: move |_| {
+                                app.settings_open.set(Some(p));
+                                show_list.set(false);
+                            },
                             Icon { name: p.icon() }
                             span { class: "grow", {p.label()} }
+                            Icon { name: "forward", class: "set-chev" }
                         }
                     }
                 }
                 div { class: "set-body",
                     div { class: "set-head",
+                        button {
+                            class: "icon-btn back-btn",
+                            "aria-label": "All settings",
+                            onclick: move |_| show_list.set(true),
+                            Icon { name: "back" }
+                        }
                         h1 { {pane.label()} }
                         button {
                             class: "icon-btn",
