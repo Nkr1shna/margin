@@ -132,14 +132,48 @@ impl Client {
     }
 }
 
-/// `https://host/` → `https://host`; only http(s) URLs.
+/// `https://host/` → `https://host`; only https URLs, and plain http only to this
+/// machine (`localhost`, `127.0.0.0/8`, `::1`): the device token never crosses a
+/// network in the clear.
 pub fn normalize_url(url: &str) -> anyhow::Result<String> {
     let url = url.trim().trim_end_matches('/');
-    if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() <= "https://".len()
-    {
-        bail!("{url:?} isn't a Margin service URL (it must start with https:// or http://)");
+    if let Some(rest) = url.strip_prefix("https://") {
+        if rest.is_empty() {
+            bail!("{url:?} isn't a Margin service URL (it has no host)");
+        }
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        if !is_loopback(rest) {
+            bail!(
+                "{url:?} isn't allowed: plain http:// is only for a service on this machine \
+                 (localhost, 127.0.0.1, [::1]); use https://"
+            );
+        }
+    } else {
+        bail!("{url:?} isn't a Margin service URL (it must start with https://)");
     }
     Ok(url.to_string())
+}
+
+/// Whether the authority (and path) after `http://` names this machine.
+fn is_loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // No credentials in the URL.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A failed call: the service's `ApiError` when it sent one.
@@ -221,6 +255,15 @@ mod tests {
         );
         assert!(normalize_url("margin.example.com").is_err());
         assert!(normalize_url("https://").is_err());
+        // Plain http only to this machine.
+        assert!(normalize_url("http://localhost:8787/").is_ok());
+        assert!(normalize_url("http://[::1]:8787").is_ok());
+        assert!(normalize_url("http://127.0.0.2").is_ok());
+        assert!(normalize_url("http://margin.example.com").is_err());
+        assert!(normalize_url("http://192.168.1.5:8787").is_err());
+        assert!(normalize_url("http://localhost.evil.com").is_err());
+        assert!(normalize_url("http://127.0.0.1@evil.com").is_err());
+        assert!(normalize_url("http://").is_err());
         assert_eq!(context_document("d1"), "/api/context/documents/d1");
     }
 }
