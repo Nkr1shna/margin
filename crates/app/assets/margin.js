@@ -28,7 +28,40 @@
     }
   }
 
+  // Typesets the math in `node` itself and in its descendants.
+  function renderMathNode(node) {
+    if (node.nodeType !== 1) return;
+    if (node.classList.contains("math")) {
+      var wrap = document.createElement("div");
+      node.parentNode ? renderMath(node.parentNode) : (wrap.appendChild(node), renderMath(wrap), wrap.removeChild(node));
+    } else {
+      renderMath(node);
+    }
+  }
+
   window.MarginApp = {
+    // Updates #id's content to `html` without flicker: top-level blocks whose source is
+    // unchanged keep their existing (already typeset) DOM; changed blocks are typeset
+    // before they're inserted, so raw TeX never paints. Used while a lesson streams in.
+    setHtml: function (id, html) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var tpl = document.createElement("template");
+      tpl.innerHTML = html;
+      var fresh = Array.prototype.slice.call(tpl.content.childNodes);
+      var old = Array.prototype.slice.call(el.childNodes);
+      for (var i = 0; i < fresh.length; i++) {
+        var node = fresh[i];
+        var src = node.nodeType === 1 ? node.outerHTML : node.textContent;
+        var current = old[i];
+        if (current && current.__marginSrc === src) continue;
+        if (window.katex) renderMathNode(node);
+        node.__marginSrc = src;
+        if (current) el.replaceChild(node, current); else el.appendChild(node);
+      }
+      for (var j = old.length - 1; j >= fresh.length; j--) el.removeChild(old[j]);
+      if (!window.katex) setTimeout(function () { renderMath(el); }, 50);
+    },
     renderMath: function (id) {
       setTimeout(function () { renderMath(document.getElementById(id)); });
     },

@@ -16,7 +16,7 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
 use crate::ui::common::{
-    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math, render_math_in,
+    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -313,10 +313,12 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     let html = use_memo(move || markdown::render(&body.read()));
     let plain = use_memo(move || markdown::plain_text(&body.read()));
 
-    // Typeset math after every body render.
+    // Put the rendered body into the page. Only changed blocks are replaced (and typeset
+    // first), so streaming text doesn't flicker or re-typeset finished formulas.
     use_effect(move || {
-        let _ = html.read();
-        render_math("lesson-body");
+        let html = html.read().clone();
+        let html = serde_json::to_string(&html).unwrap_or_default();
+        let _ = js(&format!("MarginApp.setHtml('lesson-body', {html});"));
     });
 
     // Listen for text selections inside the lesson body.
@@ -362,7 +364,6 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     );
 
     let status = lesson.status.clone();
-    let html_now = html.read().clone();
     let sel = selection.read().clone();
     let quote_open = new_quote.read().clone();
     let topic_id = lesson.topic_id.clone();
@@ -410,7 +411,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                     },
                     _ => rsx! {},
                 }
-                div { id: "lesson-body", class: "md", dangerous_inner_html: "{html_now}" }
+                div { id: "lesson-body", class: "md" }
                 if status == LessonStatus::Generating {
                     div { class: "generating", role: "status", span { class: "dot run" } "Writing…" }
                 }
