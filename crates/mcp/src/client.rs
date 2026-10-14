@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use margin_shared::context::{
-    ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
+    AGENT_HEADER, CHANGES_PAGE_MAX, ContextChanges, ContextIngest, ContextQuery, Document,
+    DocumentOutline, Hit,
 };
 use margin_shared::{
     ApiError, LoginState, PollLoginRequest, StartLogin, StartLoginRequest, routes,
@@ -44,7 +45,12 @@ impl Client {
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        let req = self.http.request(method, format!("{}{path}", self.base));
+        // Names the agent, so the service's trace rows of its searches and reads say
+        // `actor: agent:claude-code`, `via: mcp` (the dogfood eval feed).
+        let req = self
+            .http
+            .request(method, format!("{}{path}", self.base))
+            .header(AGENT_HEADER, crate::ingest::CLAUDE_CODE);
         match &self.token {
             Some(token) => req.bearer_auth(token),
             None => req,
@@ -85,11 +91,32 @@ impl Client {
     }
 
     /// `GET routes::CONTEXT_CHANGES?since`.
-    pub async fn changes(&self, since: u64) -> anyhow::Result<ContextChanges> {
+    pub async fn changes_page(&self, since: u64, limit: usize) -> anyhow::Result<ContextChanges> {
         let req = self
             .request(Method::GET, routes::CONTEXT_CHANGES)
-            .query(&[("since", since)]);
+            .query(&[("since", since), ("limit", limit as u64)]);
         json(req.send().await).await
+    }
+
+    /// Every change after `since`, page by page (`CHANGES_PAGE_MAX` at a time), as one.
+    pub async fn changes(&self, since: u64) -> anyhow::Result<ContextChanges> {
+        let mut all = ContextChanges {
+            generation: since,
+            changed: Vec::new(),
+            deleted: Vec::new(),
+            more: false,
+        };
+        loop {
+            let page = self.changes_page(all.generation, CHANGES_PAGE_MAX).await?;
+            // A service that ignores `limit` (or a stuck cursor) can't loop forever.
+            let stuck = page.more && page.generation <= all.generation;
+            all.generation = all.generation.max(page.generation);
+            all.changed.extend(page.changed);
+            all.deleted.extend(page.deleted);
+            if !page.more || stuck {
+                return Ok(all);
+            }
+        }
     }
 
     /// Every document of the project (the change feed from the beginning).

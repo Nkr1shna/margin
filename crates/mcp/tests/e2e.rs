@@ -191,6 +191,8 @@ async fn login_ingest_search_changes() {
     assert!(hits[0]["text"].as_str().unwrap().contains("two weeks"));
     let q = fake.lock().searches[0].clone();
     assert_eq!(q.k, serve::DEFAULT_K);
+    // Every search names the agent, so the service traces it for the eval feed.
+    assert_eq!(fake.lock().agents, [Some("claude-code".to_string())]);
 
     let (_, text) = mcp.tool("recent_changes", json!({})).await;
     let changes: Value = serde_json::from_str(&text).unwrap();
@@ -493,4 +495,43 @@ fn the_binary_needs_a_url_before_it_touches_the_keychain() {
         .unwrap();
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown command"));
     std::fs::remove_dir_all(&home).unwrap();
+}
+
+/// A big library: the feed is read in pages of at most 500, and `recent_changes` lists
+/// the latest 50 (newest first) and counts the rest.
+#[tokio::test]
+async fn recent_changes_pages_the_feed_and_lists_the_latest_fifty() {
+    let (fake, base) = Fake::start().await;
+    for i in 0..1100 {
+        fake.add(
+            &format!("Note {i}"),
+            Origin::Agent {
+                name: "claude-code".into(),
+            },
+            "agent:claude-code",
+            "A short note.\n",
+        );
+    }
+    let client = signed_in(&base);
+    let all = client.changes(0).await.unwrap();
+    assert_eq!(all.changed.len(), 1100);
+    assert!(!all.more);
+    assert_eq!(
+        fake.lock().changes_pages,
+        [(0, Some(500)), (500, Some(500)), (1000, Some(500))]
+    );
+
+    let mut mcp = Mcp::start(client).await;
+    let (is_error, text) = mcp.tool("recent_changes", json!({})).await;
+    assert!(!is_error, "{text}");
+    let changes: Value = serde_json::from_str(&text).unwrap();
+    let listed = changes["changed"].as_array().unwrap();
+    assert_eq!(listed.len(), 50);
+    assert_eq!(listed[0]["name"], "Note 1099");
+    assert_eq!(listed[49]["name"], "Note 1050");
+    assert_eq!(changes["older_changes_not_shown"], 1050);
+    assert_eq!(changes["generation"], 1100);
+    let (_, text) = mcp.tool("recent_changes", json!({"limit": 5})).await;
+    let changes: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(changes["changed"].as_array().unwrap().len(), 5);
 }

@@ -9,9 +9,11 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use chrono::Utc;
 use margin_shared::context::{
-    ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit, Origin, Project,
+    AGENT_HEADER, ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
+    Origin, Project, TraceKind, TraceRow, VIA_MCP, is_agent_name,
 };
 use margin_shared::pipeline::Route;
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
@@ -53,9 +55,20 @@ pub async fn projects(State(state): State<AppState>) -> AppResult<Json<Vec<Proje
     Ok(Json(projects))
 }
 
+/// The agent `margin-mcp` names in `AGENT_HEADER`, as the trace rows' caller; `None`
+/// without the header (or with a name that isn't one).
+fn caller(headers: &HeaderMap) -> Option<retrieval::Caller> {
+    let name = headers.get(AGENT_HEADER)?.to_str().ok()?.trim();
+    is_agent_name(name).then(|| retrieval::Caller {
+        actor: format!("agent:{name}"),
+        via: VIA_MCP.to_string(),
+    })
+}
+
 /// `POST routes::CONTEXT_SEARCH`.
 pub async fn search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiJson(q): ApiJson<ContextQuery>,
 ) -> AppResult<Json<Vec<Hit>>> {
     if q.text.trim().is_empty() {
@@ -64,7 +77,7 @@ pub async fn search(
     if q.k == 0 {
         return Err(AppError::bad_request("k must be at least 1."));
     }
-    match retrieval::context_search(&state, &q, Route::Chat, &new_id()).await {
+    match retrieval::context_search(&state, &q, Route::Chat, &new_id(), caller(&headers)).await {
         Ok(packed) => Ok(Json(packed.iter().map(retrieval::packed_hit).collect())),
         Err(e) => match e.downcast_ref::<BadScope>() {
             Some(bad) => Err(bad_scope(bad.to_string())),
@@ -95,9 +108,11 @@ pub struct PassagesQuery {
 /// `GET routes::context_document_passages(id)?from&to`.
 pub async fn passages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<PassagesQuery>,
 ) -> AppResult<Json<Vec<Hit>>> {
+    let started = std::time::Instant::now();
     if q.to < q.from {
         return Err(AppError::bad_request("`to` comes before `from`."));
     }
@@ -112,6 +127,18 @@ pub async fn passages(
         TOOL_READ_PASSAGES_MAX,
     )
     .await?;
+    // An agent reading after a search: an implicit relevance mark for the eval feed.
+    if let Some(c) = caller(&headers) {
+        let mut row = TraceRow::new(TraceKind::ToolCall, new_id(), Utc::now());
+        row.trace_id = new_id();
+        c.stamp(&mut row);
+        row.tool = Some("read_passages".into());
+        row.document_id = Some(id.clone());
+        row.read_range = Some([q.from, q.to]);
+        row.hit_ids = rows.iter().map(|r| r.id.clone()).collect();
+        row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        retrieval::record_trace(&state, row);
+    }
     Ok(Json(
         rows.iter()
             .map(|r| retrieval::context_hit(r, 1.0, None))
@@ -153,6 +180,9 @@ pub async fn ingest(
 pub struct ChangesQuery {
     #[serde(default)]
     pub since: u64,
+    /// Changes per page: `CHANGES_PAGE_DEFAULT` when absent, at most `CHANGES_PAGE_MAX`.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// `GET routes::CONTEXT_CHANGES?since`: `ingest::changes_since`.
@@ -160,7 +190,16 @@ pub async fn changes(
     State(state): State<AppState>,
     Query(q): Query<ChangesQuery>,
 ) -> AppResult<Json<ContextChanges>> {
-    Ok(Json(crate::ingest::changes_since(&state, q.since).await?))
+    use margin_shared::context::{CHANGES_PAGE_DEFAULT, CHANGES_PAGE_MAX};
+    let limit = q.limit.unwrap_or(CHANGES_PAGE_DEFAULT);
+    if !(1..=CHANGES_PAGE_MAX).contains(&limit) {
+        return Err(AppError::bad_request(format!(
+            "limit is 1 to {CHANGES_PAGE_MAX}."
+        )));
+    }
+    Ok(Json(
+        crate::ingest::changes_page(&state, q.since, limit).await?,
+    ))
 }
 
 /// `DELETE routes::context_document(id)`: an agent's document and its passages go, and

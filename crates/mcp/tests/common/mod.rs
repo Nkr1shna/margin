@@ -44,6 +44,10 @@ pub struct Inner {
     pub logins: HashMap<String, (String, bool, bool)>,
     pub searches: Vec<ContextQuery>,
     pub passage_reads: Vec<(String, u32, u32)>,
+    /// The `x-margin-agent` header of every search and passage read.
+    pub agents: Vec<Option<String>>,
+    /// `(since, limit)` of every change-feed request.
+    pub changes_pages: Vec<(u64, Option<usize>)>,
     pub base: String,
 }
 
@@ -59,6 +63,13 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+fn agent_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(margin_shared::context::AGENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn authorized(headers: &HeaderMap) -> bool {
@@ -271,6 +282,7 @@ async fn search(
     }
     let mut s = fake.lock();
     s.searches.push(q.clone());
+    s.agents.push(agent_of(&headers));
     let words: Vec<String> = q
         .text
         .to_lowercase()
@@ -346,6 +358,7 @@ async fn passages(
     }
     let mut s = fake.lock();
     s.passage_reads.push((id.clone(), q.from, q.to));
+    s.agents.push(agent_of(&headers));
     let Some((doc, passages)) = s.docs.iter().find(|(d, _)| d.id == id) else {
         return error(StatusCode::NOT_FOUND, "not_found", "No such document.");
     };
@@ -408,27 +421,43 @@ async fn ingest(
 struct Since {
     #[serde(default)]
     since: u64,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn changes(State(fake): State<Fake>, headers: HeaderMap, Query(q): Query<Since>) -> Response {
     if !authorized(&headers) {
         return unauthorized();
     }
-    let s = fake.lock();
+    let mut s = fake.lock();
+    s.changes_pages.push((q.since, q.limit));
+    // By generation, documents and deletions together, paged as the service does.
+    let mut items: Vec<(u64, Option<Document>, Option<String>)> = s
+        .docs
+        .iter()
+        .filter(|(d, _)| d.generation > q.since)
+        .map(|(d, _)| (d.generation, Some(d.clone()), None))
+        .chain(
+            s.deleted
+                .iter()
+                .filter(|(g, _)| *g > q.since)
+                .map(|(g, id)| (*g, None, Some(id.clone()))),
+        )
+        .collect();
+    items.sort_by_key(|i| i.0);
+    let limit = q.limit.unwrap_or(100);
+    let more = items.len() > limit;
+    items.truncate(limit);
+    let generation = if more {
+        items.last().map_or(q.since, |i| i.0)
+    } else {
+        s.generation.max(q.since)
+    };
     Json(ContextChanges {
-        generation: s.generation,
-        changed: s
-            .docs
-            .iter()
-            .filter(|(d, _)| d.generation > q.since)
-            .map(|(d, _)| d.clone())
-            .collect(),
-        deleted: s
-            .deleted
-            .iter()
-            .filter(|(g, _)| *g > q.since)
-            .map(|(_, id)| id.clone())
-            .collect(),
+        generation,
+        changed: items.iter().filter_map(|i| i.1.clone()).collect(),
+        deleted: items.iter().filter_map(|i| i.2.clone()).collect(),
+        more,
     })
     .into_response()
 }

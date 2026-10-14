@@ -96,7 +96,14 @@ pub struct ChangesArgs {
     /// The generation returned by an earlier recent_changes (0 or absent: everything).
     #[serde(default)]
     pub since: Option<u64>,
+    /// How many of the latest changed documents to list (default 50, at most 500); the
+    /// rest are counted.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
+
+/// Changed documents `recent_changes` lists when `limit` isn't given.
+pub const RECENT_CHANGES_DEFAULT: usize = 50;
 
 /// A hit as the tools return it: the passage, where it is, and how to cite it.
 #[derive(Debug, Serialize)]
@@ -367,7 +374,7 @@ impl Margin {
     }
 
     #[tool(
-        description = "What changed in Margin since a generation: documents added or re-indexed and documents deleted. Pass the returned generation next time; omit `since` for everything."
+        description = "What changed in Margin since a generation: documents added or re-indexed (the latest 50, newest first, unless `limit` says otherwise; older ones are counted) and documents deleted. Pass the returned generation next time; omit `since` for everything."
     )]
     async fn recent_changes(
         &self,
@@ -382,9 +389,16 @@ impl Margin {
             let mut names = self.names.lock().await;
             Self::remember(&mut names, &changes.changed);
         }
-        let changed: Vec<_> = changes
-            .changed
-            .iter()
+        let limit = args
+            .limit
+            .map_or(RECENT_CHANGES_DEFAULT, |l| l.clamp(1, 500) as usize);
+        // The latest `limit`, newest first; older ones are only counted.
+        let mut latest: Vec<&Document> = changes.changed.iter().collect();
+        latest.sort_by_key(|d| std::cmp::Reverse(d.generation));
+        let not_shown = latest.len().saturating_sub(limit);
+        latest.truncate(limit);
+        let changed: Vec<_> = latest
+            .into_iter()
             .map(|d| {
                 json!({
                     "document_id": d.id,
@@ -397,11 +411,20 @@ impl Margin {
                 })
             })
             .collect();
-        pretty(&json!({
+        let mut out = json!({
             "generation": changes.generation,
             "changed": changed,
             "deleted": changes.deleted,
-        }))
+        });
+        if not_shown > 0 {
+            out["older_changes_not_shown"] = json!(not_shown);
+            out["note"] = json!(format!(
+                "{} documents changed; the latest {} are listed. Search for the others.",
+                changes.changed.len(),
+                changes.changed.len() - not_shown
+            ));
+        }
+        pretty(&out)
     }
 }
 

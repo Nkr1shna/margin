@@ -702,6 +702,7 @@ async fn lesson_passages(
             budget: pipeline.config.budget,
             window_tokens: retrieval::route_window(state, Route::Write).await?,
             trace_id: lesson.id.clone(),
+            caller: None,
         };
         retrieval::retrieve(state, &req).await
     };
@@ -815,6 +816,7 @@ pub async fn survey(
             budget: pipeline.config.budget,
             window_tokens: retrieval::route_window(state, Route::Write).await?,
             trace_id: trace_id.to_string(),
+            caller: None,
         },
     )
     .await?;

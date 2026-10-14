@@ -254,17 +254,27 @@ fn text_kind() -> SourceKind {
     SourceKind::Text
 }
 
-/// `GET routes::CONTEXT_CHANGES?since=<generation>`.
+/// `GET routes::CONTEXT_CHANGES?since=<generation>&limit=<n>`: one page of the
+/// changes after `since`, oldest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextChanges {
-    /// The highest generation now; pass it as `since` next time.
+    /// Pass it as `since` next time: the highest generation in this page when `more`,
+    /// else the highest generation now.
     pub generation: u64,
-    /// Documents whose generation is above `since`.
+    /// Documents whose generation is above `since`, by generation.
     pub changed: Vec<Document>,
     /// Documents deleted since then.
     #[serde(default)]
     pub deleted: Vec<Id>,
+    /// More changes follow this page: ask again from `generation`.
+    #[serde(default)]
+    pub more: bool,
 }
+
+/// Changes one page of `CONTEXT_CHANGES` lists when `limit` isn't given.
+pub const CHANGES_PAGE_DEFAULT: usize = 100;
+/// The most one page lists.
+pub const CHANGES_PAGE_MAX: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Traces (§2.11)
@@ -362,6 +372,10 @@ pub struct TraceRow {
     /// `owner` or `agent:<name>`.
     #[serde(default)]
     pub actor: Option<String>,
+    /// The way in when it isn't the app: `mcp` for the context API as `margin-mcp`
+    /// calls it (dogfood plan §6). `route` stays the model slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 
     // Configuration.
     #[serde(default)]
@@ -406,6 +420,14 @@ pub struct TraceRow {
     pub images: Option<u32>,
     #[serde(default)]
     pub cache_hit: Option<bool>,
+    /// The query as asked, kept only for an agent's context-API search (`via` set,
+    /// `actor` `agent:*`), at most `TRACE_QUERY_MAX` characters: what
+    /// `margin-eval harvest` turns into eval candidates. App retrievals keep the hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// The passages a `read_passages` call read (`[from, to]` ords, inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_range: Option<[u32; 2]>,
 
     // Tool calls.
     #[serde(default)]
@@ -448,6 +470,7 @@ impl TraceRow {
             job_id: None,
             document_id: None,
             actor: None,
+            via: None,
             pipeline_hash: None,
             prompt_version: None,
             route: None,
@@ -466,6 +489,8 @@ impl TraceRow {
             packed_tokens: None,
             images: None,
             cache_hit: None,
+            query: None,
+            read_range: None,
             tool: None,
             output_bytes: None,
             device_id: None,
@@ -475,6 +500,24 @@ impl TraceRow {
             embed_ms: None,
         }
     }
+}
+
+/// The longest query a trace row keeps (`TraceRow::query`).
+pub const TRACE_QUERY_MAX: usize = 500;
+
+/// `via` of the context API's rows when `margin-mcp` calls it.
+pub const VIA_MCP: &str = "mcp";
+
+/// The header `margin-mcp` names its agent with on context-API calls (`claude-code`),
+/// so the service's trace rows say `actor: agent:<name>`, `via: mcp`.
+pub const AGENT_HEADER: &str = "x-margin-agent";
+
+/// Whether `name` is a usable agent name: 1–40 of `[a-z0-9_-]`.
+pub fn is_agent_name(name: &str) -> bool {
+    (1..=40).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
 }
 
 /// The bucket of `GET routes::TRACES_ROLLUP`.

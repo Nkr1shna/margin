@@ -553,30 +553,77 @@ async fn rescope_locked(
     Ok(Some(Event::DocumentChanged { document: doc }))
 }
 
-/// The documents whose generation passed `since`, and those deleted since then
-/// (`routes::CONTEXT_CHANGES`).
+/// Every document whose generation passed `since`, and those deleted since then.
 pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<ContextChanges> {
+    changes_page(state, since, usize::MAX).await
+}
+
+/// One page of the change feed (`routes::CONTEXT_CHANGES`): the first `limit` changes
+/// (documents and deletions) after `since`, by generation; `more` when others follow,
+/// and then `generation` is the page's last, so the next page starts after it.
+pub async fn changes_page(
+    state: &AppState,
+    since: u64,
+    limit: usize,
+) -> anyhow::Result<ContextChanges> {
     // Writers bump the counter and then put the row in a separate statement, both under
     // the write lock. Reading under it too means no generation is handed out whose row
     // isn't written yet, so the cursor never passes a document the feed didn't list.
+    let limit = limit.max(1);
+    // One more than the page, to know whether more follow.
+    let fetch = limit.saturating_add(1).min(i64::MAX as usize);
     let _w = state.write_lock.lock().await;
     let generation = state.store.generation().await?;
-    let mut changed: Vec<Document> = state
+    let rows: Vec<serde_json::Value> = state
         .store
         .query_rows(
-            "SELECT VALUE doc FROM document WHERE doc.generation > $since",
-            vec![("since", serde_json::json!(since))],
+            "SELECT doc, doc.generation AS g FROM document WHERE doc.generation > $since \
+             ORDER BY g LIMIT $n",
+            vec![
+                ("since", serde_json::json!(since)),
+                ("n", serde_json::json!(fetch)),
+            ],
         )
         .await?;
+    let mut changed: Vec<Document> = rows
+        .into_iter()
+        .map(|mut r| serde_json::from_value(r["doc"].take()))
+        .collect::<Result<_, _>>()?;
     changed.sort_by_key(|d| d.generation);
-    let mut deleted: Vec<Tombstone> = state
+    let rows: Vec<serde_json::Value> = state
         .store
         .query_rows(
-            "SELECT VALUE doc FROM document_deleted WHERE doc.generation > $since",
-            vec![("since", serde_json::json!(since))],
+            "SELECT doc, doc.generation AS g FROM document_deleted WHERE doc.generation > $since \
+             ORDER BY g LIMIT $n",
+            vec![
+                ("since", serde_json::json!(since)),
+                ("n", serde_json::json!(fetch)),
+            ],
         )
         .await?;
+    let mut deleted: Vec<Tombstone> = rows
+        .into_iter()
+        .map(|mut r| serde_json::from_value(r["doc"].take()))
+        .collect::<Result<_, _>>()?;
     deleted.sort_by_key(|t| t.generation);
+    // Merged by generation, the page is the first `limit`.
+    let mut gens: Vec<u64> = changed
+        .iter()
+        .map(|d| d.generation)
+        .chain(deleted.iter().map(|t| t.generation))
+        .collect();
+    gens.sort_unstable();
+    if gens.len() > limit {
+        let last = gens[limit - 1];
+        changed.retain(|d| d.generation <= last);
+        deleted.retain(|t| t.generation <= last);
+        return Ok(ContextChanges {
+            generation: last,
+            changed,
+            deleted: deleted.into_iter().map(|t| t.id).collect(),
+            more: true,
+        });
+    }
     // Never behind what it lists, nor behind what the caller has seen.
     let generation = changed
         .iter()
@@ -587,6 +634,7 @@ pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<Conte
         generation,
         changed,
         deleted: deleted.into_iter().map(|t| t.id).collect(),
+        more: false,
     })
 }
 

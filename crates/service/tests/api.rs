@@ -1866,6 +1866,78 @@ mod retrieval_api {
         }
     }
 
+    /// The change feed in pages: `limit` changes (documents and deletions together, by
+    /// generation) per call, `more` while others follow, the cursor the page's last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_change_feed_comes_in_pages() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let store = &h.state.store;
+        for (id, generation) in [("d1", 1), ("d2", 2), ("d4", 4), ("d5", 5)] {
+            let d = document(
+                id,
+                &format!("{id}.md"),
+                generation,
+                DocumentStatus::Ready { passages: 1 },
+            );
+            store.put(db::DOCUMENT, id, &d).await.unwrap();
+        }
+        store
+            .put(
+                db::DOCUMENT_DELETED,
+                "gone",
+                &margin_service::ingest::Tombstone {
+                    id: "gone".into(),
+                    generation: 3,
+                    deleted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let page = |since: u64, limit: Option<u32>| {
+            let mut q = vec![("since", since.to_string())];
+            if let Some(l) = limit {
+                q.push(("limit", l.to_string()));
+            }
+            h.get(&t, "/api/context/changes").query(&q).send()
+        };
+        let ids = |c: &ContextChanges| c.changed.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+
+        let p1: ContextChanges = page(0, Some(2)).await.unwrap().json().await.unwrap();
+        assert_eq!(
+            (ids(&p1), p1.deleted.clone(), p1.generation, p1.more),
+            (vec!["d1".to_string(), "d2".into()], vec![], 2, true)
+        );
+        let p2: ContextChanges = page(p1.generation, Some(2))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&p2), p2.deleted.clone(), p2.generation, p2.more),
+            (vec!["d4".to_string()], vec!["gone".to_string()], 4, true)
+        );
+        let p3: ContextChanges = page(p2.generation, Some(2))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!((ids(&p3), p3.more), (vec!["d5".to_string()], false));
+        assert!(p3.generation >= 5);
+        // Without a limit, a page of up to 100: everything here.
+        let all: ContextChanges = page(0, None).await.unwrap().json().await.unwrap();
+        assert_eq!(
+            (all.changed.len(), all.deleted.len(), all.more),
+            (4, 1, false)
+        );
+        for bad in [0, 501] {
+            let (status, _) = api_error(page(0, Some(bad)).await.unwrap()).await;
+            assert_eq!(status, 400, "limit {bad}");
+        }
+    }
+
     /// A topic with two documents in it and one outside it.
     async fn seeded(h: &Harness, t: &str) -> Topic {
         let topic = new_topic(h, t, None, "Thermodynamics").await;
@@ -1923,6 +1995,100 @@ mod retrieval_api {
             .send()
             .await
             .unwrap()
+    }
+
+    /// An agent's searches and reads through the context API (`margin-mcp`, naming
+    /// itself in `x-margin-agent`) leave trace rows the eval harvest pairs up: the
+    /// search with its query, `via: mcp`, `actor: agent:<name>`; the read with its
+    /// document and range. The app's own retrievals keep only the query's hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agents_context_calls_feed_the_eval_harvest() {
+        use margin_shared::context::{AGENT_HEADER, TraceKind, TraceRow};
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        h.configure_ai(&t).await;
+        seeded(&h, &t).await;
+        let r = h
+            .post(&t, "/api/context/search")
+            .header(AGENT_HEADER, "claude-code")
+            .json(
+                &json!({"text": "Carnot engine efficiency", "scope": {"scope": "library"}, "k": 3}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let r = h
+            .get(&t, "/api/context/documents/carnot/passages")
+            .header(AGENT_HEADER, "claude-code")
+            .query(&[("from", 0), ("to", 1)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        // Without the header (or with a name that isn't one): no actor, no query kept.
+        for agent in [None, Some("Not An Agent!")] {
+            let mut req = h.post(&t, "/api/context/search").json(
+                &json!({"text": "photosynthesis leaves", "scope": {"scope": "library"}, "k": 3}),
+            );
+            if let Some(a) = agent {
+                req = req.header(AGENT_HEADER, a);
+            }
+            assert_eq!(req.send().await.unwrap().status(), 200);
+        }
+
+        let rows: Vec<TraceRow> = eventually(|| async {
+            let body = h
+                .get(&t, "/api/traces")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let rows: Vec<TraceRow> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let retrievals = rows
+                .iter()
+                .filter(|r| r.kind == TraceKind::Retrieval)
+                .count();
+            let reads = rows
+                .iter()
+                .filter(|r| r.tool.as_deref() == Some("read_passages"))
+                .count();
+            (retrievals >= 3 && reads >= 1).then_some(rows)
+        })
+        .await;
+        let search = rows
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval && r.via.is_some())
+            .unwrap();
+        assert_eq!(search.via.as_deref(), Some("mcp"));
+        assert_eq!(search.actor.as_deref(), Some("agent:claude-code"));
+        assert_eq!(search.query.as_deref(), Some("Carnot engine efficiency"));
+        assert!(!search.packed_ids.is_empty());
+        let read = rows
+            .iter()
+            .find(|r| r.tool.as_deref() == Some("read_passages"))
+            .unwrap();
+        assert_eq!(read.kind, TraceKind::ToolCall);
+        assert_eq!(read.actor.as_deref(), Some("agent:claude-code"));
+        assert_eq!(read.via.as_deref(), Some("mcp"));
+        assert_eq!(read.document_id.as_deref(), Some("carnot"));
+        assert_eq!(read.read_range, Some([0, 1]));
+        let others: Vec<&TraceRow> = rows
+            .iter()
+            .filter(|r| r.kind == TraceKind::Retrieval && r.via.is_none())
+            .collect();
+        assert_eq!(others.len(), 2);
+        assert!(
+            others
+                .iter()
+                .all(|r| r.query.is_none() && r.actor.is_none())
+        );
+        assert!(others.iter().all(|r| r.query_hash.is_some()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -776,7 +776,7 @@ impl TypedTool for Search {
             let packed = if resolved.is_empty() {
                 Vec::new()
             } else {
-                match retrieval::context_search(state, &q, Route::Chat, &ctx.turn_id).await {
+                match retrieval::context_search(state, &q, Route::Chat, &ctx.turn_id, None).await {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!("search failed: {e:#}");

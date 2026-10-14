@@ -158,6 +158,17 @@ impl Tracer {
         {
             row.cost_usd = cost_usd(&self.prices.load(), model, usage);
         }
+        // A query is kept only for an agent's context-API search, and only so long.
+        let agent = row.via.is_some()
+            && row
+                .actor
+                .as_deref()
+                .is_some_and(|a| a.starts_with("agent:"));
+        row.query = row.query.filter(|_| agent).map(|q| {
+            q.chars()
+                .take(margin_shared::context::TRACE_QUERY_MAX)
+                .collect()
+        });
         row.error_code = row.error_code.map(|c| sanitize_code(&c));
         row.stop_reason = row.stop_reason.map(|c| sanitize_code(&c));
         match self.tx.try_send(row) {

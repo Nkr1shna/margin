@@ -105,6 +105,26 @@ pub struct Request {
     pub window_tokens: usize,
     /// Correlates the retrieval's trace row with its turn or job.
     pub trace_id: String,
+    /// An agent calling the context API from outside (`margin-mcp`): its trace row says
+    /// who and keeps the query (dogfood plan §6). `None` for the app's own retrievals.
+    pub caller: Option<Caller>,
+}
+
+/// Who called the context API, for its trace rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// `agent:<name>`.
+    pub actor: String,
+    /// `margin_shared::context::VIA_MCP`.
+    pub via: String,
+}
+
+impl Caller {
+    /// Stamps a trace row with the caller.
+    pub fn stamp(&self, row: &mut TraceRow) {
+        row.actor = Some(self.actor.clone());
+        row.via = Some(self.via.clone());
+    }
 }
 
 /// A scope naming something that doesn't exist (the context API's 400 "bad_scope").
@@ -1529,6 +1549,10 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     row.pipeline_hash = Some(pipeline.hash.clone());
     row.scope = Some(req.scope.clone());
     row.query_hash = Some(hash_hex(&req.plan.queries.join("\n")));
+    if let Some(caller) = &req.caller {
+        caller.stamp(&mut row);
+        row.query = Some(req.plan.queries.join("\n"));
+    }
     if req.plan.queries.is_empty() || resolved.is_empty() || req.k == 0 {
         row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         record_trace(state, row);
@@ -2240,6 +2264,7 @@ pub async fn context_search(
     q: &margin_shared::context::ContextQuery,
     route: Route,
     trace_id: &str,
+    caller: Option<Caller>,
 ) -> anyhow::Result<Vec<Packed>> {
     let budget = q.budget.unwrap_or(state.pipeline.load_full().config.budget);
     let window_tokens = route_window(state, route).await?;
@@ -2254,6 +2279,7 @@ pub async fn context_search(
             budget,
             window_tokens,
             trace_id: trace_id.to_string(),
+            caller,
         },
     )
     .await
