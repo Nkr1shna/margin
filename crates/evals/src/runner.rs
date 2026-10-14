@@ -41,6 +41,10 @@ use crate::store::{EvalResult, EvalRun, EvalStore};
 pub struct Paths {
     pub evals: PathBuf,
     pub out: PathBuf,
+    /// The corpus when it isn't `evals/corpus` (the dogfood suite's `docs/`).
+    pub corpus_dir: Option<PathBuf>,
+    /// The retrieval questions when they aren't `golden/retrieval.jsonl`.
+    pub retrieval_file: Option<PathBuf>,
 }
 
 impl Paths {
@@ -48,12 +52,35 @@ impl Paths {
         Self {
             evals: evals.into(),
             out: evals.into(),
+            corpus_dir: None,
+            retrieval_file: None,
+        }
+    }
+    /// The dogfood suite (`docs/plan-dogfood.md` §6): the repository's `docs/` as the
+    /// corpus and the promoted `golden/dogfood.jsonl` as the questions.
+    pub fn dogfood(&self, docs: &Path) -> Self {
+        Self {
+            corpus_dir: Some(docs.into()),
+            retrieval_file: Some(self.evals.join(crate::harvest::DOGFOOD_FILE)),
+            ..self.clone()
         }
     }
     pub fn corpus(&self) -> PathBuf {
-        self.evals.join("corpus")
+        self.corpus_dir
+            .clone()
+            .unwrap_or_else(|| self.evals.join("corpus"))
     }
     pub fn retrieval_golden(&self) -> anyhow::Result<Vec<RetrievalQuery>> {
+        if let Some(file) = &self.retrieval_file {
+            anyhow::ensure!(
+                file.is_file(),
+                "no questions at {} yet: run `margin-eval harvest`, then promote the serious \
+                 candidates from {} into it",
+                file.display(),
+                crate::harvest::CANDIDATES_FILE
+            );
+            return read_jsonl(file);
+        }
         // Generated rows are appended under `out`; read them from there when present.
         let out = self.out.join("golden/retrieval.jsonl");
         let path = if out.is_file() {
@@ -255,16 +282,34 @@ pub async fn run_retrieval(
     store: &EvalStore,
     write_baseline: bool,
 ) -> anyhow::Result<(EvalRun, RetrievalReport)> {
+    run_retrieval_suite(env, "retrieval", variant, store, write_baseline).await
+}
+
+/// The dogfood suite (`docs/plan-dogfood.md` §6): the retrieval suite over `docs/` with
+/// the questions an agent really asked (`env.paths` from `Paths::dogfood`). It has no
+/// baseline of its own: CI never runs it.
+pub async fn run_dogfood(
+    env: &Env<'_>,
+    variant: &str,
+    store: &EvalStore,
+) -> anyhow::Result<(EvalRun, RetrievalReport)> {
+    anyhow::ensure!(
+        env.paths.retrieval_file.is_some(),
+        "the dogfood suite runs on Paths::dogfood"
+    );
+    run_retrieval_suite(env, "dogfood", variant, store, false).await
+}
+
+async fn run_retrieval_suite(
+    env: &Env<'_>,
+    suite: &str,
+    variant: &str,
+    store: &EvalStore,
+    write_baseline: bool,
+) -> anyhow::Result<(EvalRun, RetrievalReport)> {
     let (cfg, toml) = env.paths.variant(variant)?;
     let corpus = corpus_hash(&env.paths.corpus())?;
-    let run = new_run(
-        "retrieval",
-        variant,
-        &cfg,
-        &toml,
-        env.vectors.version(),
-        &corpus,
-    );
+    let run = new_run(suite, variant, &cfg, &toml, env.vectors.version(), &corpus);
     let index = env.index(&cfg).await?;
     let queries = env.paths.retrieval_golden()?;
     let report = crate::retrieval::run(&index, &queries).await?;
@@ -1009,8 +1054,8 @@ mod tests {
 
     fn env<'a>(out: &Path, vectors: &'a dyn Vectors) -> Env<'a> {
         let paths = Paths {
-            evals: evals_dir(),
             out: out.into(),
+            ..Paths::same(&evals_dir())
         };
         let docs = documents(&paths.corpus()).unwrap();
         Env {
@@ -1071,6 +1116,68 @@ mod tests {
             c.deltas
                 .iter()
                 .any(|d| d.metric == "recall_at_5" && d.interval.mean.abs() < 1e-9)
+        );
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
+    /// The dogfood suite: the retrieval suite over a `docs/` folder with the promoted
+    /// questions an agent asked, stored as its own suite.
+    #[tokio::test]
+    async fn the_dogfood_suite_runs_over_docs_with_the_promoted_questions() {
+        let out = temp("dogfood");
+        let docs = out.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("plan-deploy.md"),
+            "# Deploys\n\n## Prod\n\nProd is promoted by hand from main after dev passes.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("agent-contract.md"),
+            "# Agent contract\n\n## Tools\n\nThe folder tools list and find files.\n",
+        )
+        .unwrap();
+        let questions = out.join("dogfood.jsonl");
+        // Without promoted questions it says what to do.
+        let base = Paths {
+            out: out.clone(),
+            ..Paths::same(&evals_dir())
+        };
+        let missing = Paths {
+            retrieval_file: Some(out.join("none.jsonl")),
+            ..base.dogfood(&docs)
+        };
+        let err = missing.retrieval_golden().unwrap_err().to_string();
+        assert!(err.contains("margin-eval harvest"), "{err}");
+        std::fs::write(
+            &questions,
+            r#"{"id":"d1","query":"how does prod get deployed","scope":{"scope":"corpus"},"relevant":[{"document":"plan-deploy.md","anchor":"Prod is promoted by hand"}],"kind":"semantic","generated_by":"dogfood"}
+"#,
+        )
+        .unwrap();
+        let paths = Paths {
+            retrieval_file: Some(questions),
+            ..base.dogfood(&docs)
+        };
+        assert_eq!(paths.corpus(), docs);
+        let d = documents(&paths.corpus()).unwrap();
+        let e = Env {
+            extraction: Extraction::fixture(&paths.corpus(), &d).unwrap(),
+            paths,
+            vectors: &FAKE,
+            register: &register,
+            pack_budget: &budget,
+        };
+        let store = EvalStore::memory().await.unwrap();
+        let (run, report) = run_dogfood(&e, "baseline", &store).await.unwrap();
+        assert_eq!(run.suite, "dogfood");
+        assert_eq!(report.queries.len(), 1);
+        assert_eq!(report.queries[0].recall_at_5, Some(1.0));
+        // The ordinary suite won't take dogfood paths' place.
+        assert!(
+            run_dogfood(&env(&out, &FAKE), "baseline", &store)
+                .await
+                .is_err()
         );
         std::fs::remove_dir_all(&out).unwrap();
     }

@@ -177,8 +177,8 @@ mod tests {
         let out = std::env::temp_dir().join(format!("margin-evals-ci-{}", std::process::id()));
         std::fs::create_dir_all(&out).unwrap();
         let paths = Paths {
-            evals: evals_dir(),
             out: out.clone(),
+            ..Paths::same(&evals_dir())
         };
         let docs = documents(&paths.corpus()).unwrap();
         static V: FakeVectors = FakeVectors;

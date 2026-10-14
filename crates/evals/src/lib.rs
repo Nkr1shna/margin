@@ -17,6 +17,7 @@ pub mod corpus;
 pub mod courses;
 pub mod gates;
 pub mod golden;
+pub mod harvest;
 pub mod index;
 pub mod judge;
 pub mod live;

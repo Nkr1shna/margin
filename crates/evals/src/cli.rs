@@ -41,10 +41,16 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent --service-url URL [--variant NAME]
+  run --suite retrieval|courses|agent|dogfood --service-url URL [--variant NAME]
       [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
-                        beside the dev service at URL
+                        beside the dev service at URL; dogfood runs the retrieval suite
+                        over the repository's docs/ with evals/golden/dogfood.jsonl
+  harvest --service-url URL [--since T] [--out FILE]
+                        Turn agents' context-API searches and the passages they read
+                        after them (trace rows with via \"mcp\") into candidate questions,
+                        appended to evals/golden/candidates.jsonl (or FILE); promote the
+                        serious ones into evals/golden/dogfood.jsonl
   judge [--dir PATH] [--against PATH]
                         Judge recorded generations (default: the baseline's prompt
                         version), with canaries; --against compares pairwise
@@ -105,6 +111,11 @@ pub enum Command {
         filter: TraceFilter,
         out: PathBuf,
     },
+    /// `docs/plan-dogfood.md` §6. `out` defaults to `evals/golden/candidates.jsonl`.
+    Harvest {
+        since: Option<DateTime<Utc>>,
+        out: Option<PathBuf>,
+    },
     Runs,
     Help,
 }
@@ -114,6 +125,8 @@ pub enum Suite {
     Retrieval,
     Courses,
     Agent,
+    /// The retrieval suite over `docs/` with the questions agents really asked.
+    Dogfood,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,12 +140,15 @@ pub struct Cli {
 }
 
 impl Command {
-    /// Whether it reads the service, so `--service-url` is required: `run`, `export`
-    /// and `report --service` (and `harvest`, dogfood plan §6, when it lands).
+    /// Whether it reads the service, so `--service-url` is required: `run`, `export`,
+    /// `harvest` and `report --service`.
     pub fn needs_service_url(&self) -> bool {
         matches!(
             self,
-            Command::Run { .. } | Command::Export { .. } | Command::Report { service: true, .. }
+            Command::Run { .. }
+                | Command::Export { .. }
+                | Command::Harvest { .. }
+                | Command::Report { service: true, .. }
         )
     }
 
@@ -143,6 +159,7 @@ impl Command {
             Command::Compare { .. }
                 | Command::Report { .. }
                 | Command::Export { .. }
+                | Command::Harvest { .. }
                 | Command::Runs
                 | Command::Help
         )
@@ -220,8 +237,11 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 Some("retrieval") => Suite::Retrieval,
                 Some("courses") => Suite::Courses,
                 Some("agent") => Suite::Agent,
-                Some(other) => bail!("no suite \"{other}\" (retrieval, courses, agent)"),
-                None => bail!("run needs --suite retrieval|courses|agent"),
+                Some("dogfood") => Suite::Dogfood,
+                Some(other) => {
+                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood)")
+                }
+                None => bail!("run needs --suite retrieval|courses|agent|dogfood"),
             },
             variant,
             write_baseline: flag(take("write-baseline")),
@@ -261,6 +281,10 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
             out: take("out")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("traces.jsonl")),
+        },
+        Some("harvest") => Command::Harvest {
+            since: time(take("since"))?,
+            out: take("out").map(PathBuf::from),
         },
         Some("runs") => Command::Runs,
         Some(other) => bail!("no command \"{other}\""),
@@ -432,6 +456,40 @@ mod tests {
         );
         assert!(p("record-embeddings").unwrap().command.is_live());
         assert!(!p("runs").unwrap().command.is_live());
+        // The dogfood feed (plan-dogfood §6).
+        assert_eq!(
+            p("run --suite dogfood --service-url http://127.0.0.1:8787")
+                .unwrap()
+                .command,
+            Command::Run {
+                suite: Suite::Dogfood,
+                variant: "baseline".into(),
+                write_baseline: false,
+                judge: true
+            }
+        );
+        let h = p("harvest --since 2026-10-01T00:00:00Z --out c.jsonl --service-url http://127.0.0.1:8787").unwrap();
+        assert!(!h.command.is_live());
+        match h.command {
+            Command::Harvest { since, out } => {
+                assert!(since.is_some());
+                assert_eq!(out, Some(PathBuf::from("c.jsonl")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Harvesting reads the service, never prod.
+        assert!(
+            p("harvest")
+                .unwrap_err()
+                .to_string()
+                .contains("--service-url")
+        );
+        assert!(
+            p("harvest --service-url https://margin.krishnanelloore.com")
+                .unwrap_err()
+                .to_string()
+                .contains("prod")
+        );
     }
 
     #[test]

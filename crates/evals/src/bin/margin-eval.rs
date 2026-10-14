@@ -11,6 +11,7 @@ use margin_evals::cli::{Command, Suite, USAGE, check_service, parse};
 use margin_evals::corpus::{EXTRACTED_FILE, Extraction, documents};
 use margin_evals::gates::{BASELINE_FILE, Baseline};
 use margin_evals::golden::evals_dir;
+use margin_evals::harvest;
 use margin_evals::judge::Judge;
 use margin_evals::live;
 use margin_evals::recorded::{EMBEDDINGS_FILE, Recording, RecordingVectors, Vectors};
@@ -88,6 +89,33 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             traces::write_jsonl(out, &rows)?;
             println!("{} trace rows → {}", rows.len(), out.display());
         }
+        Command::Harvest { since, out } => {
+            let url = cli
+                .service_url
+                .as_deref()
+                .context("harvest needs --service-url")?;
+            let http = reqwest::Client::new();
+            let token = token()?;
+            let service = harvest::Service {
+                http: &http,
+                url,
+                token: &token,
+            };
+            let found = harvest::harvest(&service, *since).await?;
+            let out = out
+                .clone()
+                .unwrap_or_else(|| evals.join(harvest::CANDIDATES_FILE));
+            let added = harvest::append_candidates(&out, &found)?;
+            for (actor, n) in harvest::by_actor(&found) {
+                println!("{actor}: {n} searches with reads");
+            }
+            println!(
+                "{} candidates, {added} new → {} (promote the serious ones into {})",
+                found.len(),
+                out.display(),
+                evals.join(harvest::DOGFOOD_FILE).display()
+            );
+        }
         Command::Report {
             run,
             traces: file,
@@ -158,6 +186,22 @@ fn need_judges(js: &[Box<dyn Judge>]) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow::Result<()> {
     let cfg = live::RunnerConfig::load(&paths.evals.join("runner.toml"))?;
+    // The dogfood suite reads the repository's docs/ (next to evals/) as its corpus.
+    let dogfood;
+    let paths = if matches!(
+        cmd,
+        Command::Run {
+            suite: Suite::Dogfood,
+            ..
+        }
+    ) {
+        let docs = paths.evals.join("../docs");
+        anyhow::ensure!(docs.is_dir(), "no docs/ next to {}", paths.evals.display());
+        dogfood = paths.dogfood(&docs);
+        &dogfood
+    } else {
+        paths
+    };
     let data = default_data_dir();
     let media = media_dir(&data);
     let corpus = paths.corpus();
@@ -199,7 +243,7 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
         cmd,
         Command::RecordEmbeddings
             | Command::Run {
-                suite: Suite::Retrieval,
+                suite: Suite::Retrieval | Suite::Dogfood,
                 ..
             }
     );
@@ -299,6 +343,20 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                         b.variant, b.embedder_version
                     );
                 }
+            }
+            Suite::Dogfood => {
+                anyhow::ensure!(
+                    !*write_baseline,
+                    "the dogfood suite has no baseline (CI never runs it)"
+                );
+                let (run, r) = runner::run_dogfood(&env, variant, store).await?;
+                println!(
+                    "{}: dogfood recall@5 {:.1}, nDCG@10 {:.1} over {} questions",
+                    run.id,
+                    r.overall.recall_at_5,
+                    r.overall.ndcg_at_10,
+                    r.queries.len()
+                );
             }
             Suite::Courses => {
                 let m = models.as_ref().unwrap();
