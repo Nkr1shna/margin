@@ -12,11 +12,15 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
+use margin_ai::evals::{self, QuestionKind, Rubric, SynthRequest, Winner};
+use margin_ai::prompts::{LESSON_CONSTANT, SCENE_CONSTANT};
 use margin_ai::{
-    AiError, Backoff, FailedScene, Image, LessonContext, Passage, ReasoningConfig,
-    ReasoningSummary, ResponseRequest, ResponseStream, ResponsesClient, SceneRequest, StreamEvent,
-    ToolChoice, write_lesson, write_scene,
+    AiError, Backoff, CallOptions, DocumentContents, FailedScene, Image, LessonContext, Passage,
+    PlanRequest, Ranked, ReasoningConfig, ReasoningSummary, RerankCandidate, ResponseRequest,
+    ResponseStream, ResponsesClient, SceneRequest, StreamEvent, ToolChoice, plan_course, rerank,
+    write_lesson, write_lesson_with, write_scene, write_scene_with,
 };
+use margin_shared::pipeline::Route;
 use margin_shared::{Level, OutlineLesson, ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
@@ -164,7 +168,12 @@ fn whole(body: String) -> Reply {
 async fn collect(client: &ResponsesClient) -> (Result<String, AiError>, Vec<String>) {
     let mut deltas = Vec::new();
     let r = client
-        .stream_text("Be brief.", "Say hello.", |d| deltas.push(d.to_string()))
+        .stream_text(
+            "Be brief.",
+            "Say hello.",
+            &CallOptions::new(Route::Small),
+            |d| deltas.push(d.to_string()),
+        )
         .await;
     (r, deltas)
 }
@@ -552,6 +561,425 @@ async fn write_scene_without_lesson_scene_is_parse() {
         write_scene(&client, &req).await,
         Err(AiError::Parse(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Prompt caching (§2.6), call options, structured calls
+// ---------------------------------------------------------------------------
+
+/// `text_stream` whose `response.completed` carries usage.
+fn text_stream_with_usage(text: &str, input: u64, cached: u64, output: u64) -> String {
+    let mut s = created();
+    s.push_str(&delta(text));
+    s.push_str(&event(json!({"type": "response.completed", "response": {
+        "id": "resp_1", "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+        "usage": {"input_tokens": input, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": output, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": input + output}
+    }})));
+    s
+}
+
+fn json_reply(v: Value) -> Reply {
+    whole(text_stream(&[&v.to_string()]))
+}
+
+fn all_requests(fake: &Fake) -> Vec<Value> {
+    fake.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+/// The CI gate of §3.3: across varied lessons (level, quiz, passages, pictures, first,
+/// middle and last lesson) and scenes (first try and repair), every request's
+/// instructions start with its version's constant block, byte for byte, the variable
+/// part comes after it and nothing else does, and the prompt cache key is the one per
+/// prompt version.
+#[tokio::test]
+async fn lesson_and_scene_prefixes_are_byte_identical_across_calls() {
+    let mut contexts = Vec::new();
+    for index in 0..2 {
+        for with_quiz in [false, true] {
+            let mut ctx = lesson_ctx(index);
+            ctx.with_quiz = with_quiz;
+            ctx.level = if with_quiz {
+                Level::Advanced
+            } else {
+                Level::Intro
+            };
+            if index == 1 {
+                ctx.passages = passages();
+            }
+            contexts.push(ctx);
+        }
+    }
+    contexts[3].passages.push(Passage {
+        source: "board.jpg".into(),
+        image: Some(Image {
+            media_type: "image/jpeg".into(),
+            data: vec![1, 2, 3],
+        }),
+        ..Default::default()
+    });
+    let scenes = [
+        SceneRequest {
+            lesson_title: "Waves as sums".into(),
+            lesson_body_md: "## Idea\n\nSines add.\n\n## Check yourself\n\nQ".into(),
+            previous_attempt: None,
+        },
+        SceneRequest {
+            lesson_title: "Coefficients".into(),
+            lesson_body_md: "## Idea\n\nProject.".into(),
+            previous_attempt: Some(FailedScene {
+                code: SCENE.into(),
+                error: "NameError".into(),
+            }),
+        },
+    ];
+    let replies = contexts
+        .iter()
+        .map(|_| whole(text_stream(&["## Idea\n\nText.\n"])))
+        .chain(scenes.iter().map(|_| whole(text_stream(&[SCENE]))))
+        .collect();
+    let (client, fake) = spawn(replies).await;
+    for ctx in &contexts {
+        write_lesson(&client, ctx, |_| {}).await.unwrap();
+    }
+    for req in &scenes {
+        write_scene(&client, req).await.unwrap();
+    }
+    let sent = all_requests(&fake);
+    assert_eq!(sent.len(), 6);
+    for (i, body) in sent.iter().enumerate() {
+        let ins = body["instructions"].as_str().unwrap();
+        let (constant, key) = if i < 4 {
+            (LESSON_CONSTANT, "lesson:lesson-v2")
+        } else {
+            (SCENE_CONSTANT.as_str(), "scene:scene-v2")
+        };
+        assert!(ins.starts_with(constant), "request {i}");
+        assert_eq!(body["prompt_cache_key"], key, "request {i}");
+        let rest = &ins[constant.len()..];
+        if i < 4 {
+            assert!(
+                rest.starts_with("\n\nThis lesson:\n"),
+                "request {i}: {rest}"
+            );
+            assert!(
+                !rest.contains("Signals & Systems"),
+                "the request goes in the input"
+            );
+        } else {
+            assert_eq!(rest, "", "scenes have no variable instructions");
+        }
+        // Nothing but the instructions carries the constant block.
+        assert!(
+            !body["input"]
+                .to_string()
+                .contains("How the app renders your answer")
+        );
+    }
+    // The variable parts really differ, so the identity above isn't vacuous.
+    let variable =
+        |i: usize| sent[i]["instructions"].as_str().unwrap()[LESSON_CONSTANT.len()..].to_string();
+    assert_ne!(variable(0), variable(3));
+    assert!(variable(3).contains("2 source passages"));
+    // Both prefixes clear OpenAI's 1 024-token cache minimum (≈ 4 characters a token).
+    assert!(LESSON_CONSTANT.len() >= 4 * 1024);
+    assert!(SCENE_CONSTANT.len() >= 4 * 1024);
+    // The scene input leaves the lesson's quiz out.
+    assert!(
+        !sent[4]["input"]
+            .as_str()
+            .unwrap()
+            .contains("Check yourself")
+    );
+}
+
+#[tokio::test]
+async fn call_options_set_the_cache_key_and_output_cap_and_usage_comes_back() {
+    let (client, fake) = spawn(vec![
+        whole(text_stream_with_usage(
+            "## Idea\n\nText.\n",
+            1500,
+            1200,
+            300,
+        )),
+        whole(text_stream_with_usage(SCENE, 5000, 4096, 900)),
+        chunked(&text_stream(&["Hi."]), 7),
+    ])
+    .await;
+    let opts = CallOptions::new(Route::Write)
+        .with_cache_key("lesson:lesson-v2:topic-7")
+        .with_max_output_tokens(8000);
+    let out = write_lesson_with(&client, &lesson_ctx(0), &opts, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(out.value, "## Idea\n\nText.\n");
+    assert_eq!(
+        out.usage,
+        Usage {
+            input_tokens: 1500,
+            cached_input_tokens: 1200,
+            output_tokens: 300,
+            reasoning_tokens: 0,
+            model_calls: 1,
+        }
+    );
+    let (_, body) = last_request(&fake);
+    assert_eq!(body["prompt_cache_key"], "lesson:lesson-v2:topic-7");
+    assert_eq!(body["max_output_tokens"], 8000);
+    assert_eq!(body["store"], false);
+    assert!(body.get("text").is_none());
+
+    let req = SceneRequest {
+        lesson_title: "T".into(),
+        lesson_body_md: "B".into(),
+        previous_attempt: None,
+    };
+    let scene = write_scene_with(&client, &req, &CallOptions::new(Route::Write))
+        .await
+        .unwrap();
+    assert_eq!(scene.usage.cached_input_tokens, 4096);
+    assert_eq!(last_request(&fake).1["prompt_cache_key"], "scene:scene-v2");
+
+    // A plain call sends no key and no cap unless asked.
+    let (text, _) = collect(&client).await;
+    assert_eq!(text.unwrap(), "Hi.");
+    let (_, body) = last_request(&fake);
+    assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("max_output_tokens").is_none());
+}
+
+fn plan_request() -> PlanRequest {
+    PlanRequest {
+        prompt: "Fourier series, for signal processing".into(),
+        level: Level::Intermediate,
+        lesson_count: 2,
+        with_quiz: true,
+        draft: None,
+        contents: vec![DocumentContents {
+            document: "dsp.pdf".into(),
+            sections: vec![
+                "2 Fourier series > 2.1 Orthogonality".into(),
+                "2 Fourier series > 2.2 Coefficients".into(),
+            ],
+        }],
+        survey: passages(),
+    }
+}
+
+#[tokio::test]
+async fn plan_course_asks_for_strict_json_and_checks_the_answer() {
+    let answer = json!({
+        "topic_title": "Fourier series",
+        "subject_title": "Signals and systems",
+        "lessons": [
+            {
+                "title": "Orthogonality of sines and cosines",
+                "summary": "Why the trigonometric functions form an orthogonal basis on [-pi, pi].",
+                "minutes": 12,
+                "queries": [
+                    "integral of cos(n x) cos(m x) over [-pi, pi] for n != m",
+                    "orthogonality relations of the trigonometric system",
+                ],
+                "must_cite": [
+                    {"document": "dsp.pdf", "section": "2 Fourier series > 2.1 Orthogonality"},
+                    {"document": "dsp.pdf", "section": "9 Wavelets"},
+                ],
+            },
+            {
+                "title": "Computing the coefficients",
+                "summary": "Deriving a_n and b_n by projection.",
+                "minutes": 15,
+                "queries": ["coefficient a_n as projection onto cos(n x)", "b_n formula"],
+                "must_cite": [{"document": "DSP.pdf", "section": "2 fourier series > 2.2 coefficients"}],
+            },
+        ],
+    });
+    // A server that wraps JSON in a fence is tolerated.
+    let fenced = format!("```json\n{answer}\n```");
+    let (client, fake) = spawn(vec![
+        json_reply(answer.clone()),
+        whole(text_stream(&[&fenced])),
+        json_reply(json!({"topic_title": "x", "subject_title": "y", "lessons": []})),
+        whole(text_stream(&["not json"])),
+    ])
+    .await;
+    let opts = CallOptions::new(Route::Write);
+    let plan = plan_course(&client, &plan_request(), &opts)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(plan.lessons.len(), 2);
+    assert_eq!(
+        plan.lessons[0].must_cite.len(),
+        1,
+        "an unlisted section is dropped"
+    );
+    assert_eq!(
+        plan.lessons[1].must_cite[0].section, "2 Fourier series > 2.2 Coefficients",
+        "spelled as in the contents"
+    );
+    assert_eq!(plan.outline().lessons[1].minutes, 15);
+    let (_, body) = last_request(&fake);
+    assert_eq!(body["prompt_cache_key"], "plan:plan-v1");
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert_eq!(body["text"]["format"]["strict"], true);
+    assert_eq!(body["text"]["format"]["name"], "course_plan");
+    let ins = body["instructions"].as_str().unwrap();
+    assert!(ins.contains("Lessons: exactly 2."));
+    let input = body["input"].as_str().unwrap();
+    assert!(input.contains("Contents:\n- dsp.pdf\n  - 2 Fourier series > 2.1 Orthogonality"));
+    assert!(input.contains("[1] dsp.pdf, p. 12:"));
+
+    assert_eq!(
+        plan_course(&client, &plan_request(), &opts)
+            .await
+            .unwrap()
+            .value,
+        plan
+    );
+    assert!(matches!(
+        plan_course(&client, &plan_request(), &opts).await,
+        Err(AiError::Parse(m)) if m.contains("0 lessons")
+    ));
+    assert!(matches!(
+        plan_course(&client, &plan_request(), &opts).await,
+        Err(AiError::Parse(m)) if m.contains("plan answer isn't the JSON")
+    ));
+}
+
+#[tokio::test]
+async fn rerank_returns_every_candidate_once() {
+    let (client, fake) = spawn(vec![json_reply(json!({"ranking": [
+        {"id": "p2", "grade": 3},
+        {"id": "invented", "grade": 3},
+        {"id": "p1", "grade": 1},
+    ]}))])
+    .await;
+    let candidates: Vec<RerankCandidate> = ["p1", "p2", "p3"]
+        .iter()
+        .map(|id| RerankCandidate {
+            id: id.to_string(),
+            label: "dsp.pdf".into(),
+            text: "text".into(),
+        })
+        .collect();
+    let opts = CallOptions::new(Route::Small);
+    let ranked = rerank(&client, "why does the window leak", &candidates, &opts)
+        .await
+        .unwrap()
+        .value;
+    let pairs: Vec<(&str, u8)> = ranked
+        .iter()
+        .map(|Ranked { id, grade }| (id.as_str(), *grade))
+        .collect();
+    assert_eq!(pairs, [("p2", 3), ("p1", 1), ("p3", 0)]);
+    assert_eq!(
+        last_request(&fake).1["prompt_cache_key"],
+        "rerank:rerank-v1"
+    );
+    // No candidates, no call.
+    assert!(
+        rerank(&client, "q", &[], &opts)
+            .await
+            .unwrap()
+            .value
+            .is_empty()
+    );
+    assert_eq!(all_requests(&fake).len(), 1);
+}
+
+#[tokio::test]
+async fn eval_calls_generate_grade_and_judge() {
+    let section = &evals::CANARY_SECTIONS[3];
+    let (client, fake) = spawn(vec![
+        json_reply(json!({"questions": [{
+            "question": "A test has sensitivity 0.99 and a false-positive rate of 0.02 for a condition with prevalence 1 in 1,000. What fraction of positives are true positives?",
+            "kind": "application",
+            "answer": "About 0.047, because false positives from the healthy majority dominate.",
+            "spans": [{"section": 1, "quote": "most positive results are false positives"}],
+            "self_grade": 3
+        }]})),
+        json_reply(json!({"grade": 3, "supported": true, "kind": "application", "reason": "Needs Bayes' rule on new numbers."})),
+        json_reply(json!({"grade": 0, "items": [{"quote": "P(+|not D)", "passages": [1], "grade": 0, "note": "Wrong denominator."}], "reason": "Wrong formula."})),
+        json_reply(json!({"preferred": "first", "first_grade": 3, "second_grade": 1, "reason": "A is faithful."})),
+        json_reply(json!({"preferred": "second", "first_grade": 1, "second_grade": 3, "reason": "A is faithful."})),
+    ])
+    .await;
+    let small = CallOptions::new(Route::Small);
+    let req = SynthRequest {
+        sections: vec![section.synth()],
+        count: 3,
+        kinds: vec![QuestionKind::Application, QuestionKind::Derivation],
+    };
+    let questions = evals::synth_questions(&client, &req, &CallOptions::new(Route::Write))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(questions.len(), 1);
+    assert!(questions[0].is_usable(), "{:?}", questions[0].problems);
+    assert_eq!(questions[0].spans[0].document, "probability.md");
+
+    let grade = evals::grade_question(&client, &(&questions[0]).into(), &small)
+        .await
+        .unwrap()
+        .value;
+    assert!(grade.keeps());
+
+    let canary = &evals::BAD_LESSONS[2];
+    let verdict =
+        evals::judge_candidate(&client, canary.rubric, &canary.input(), canary.body, &small)
+            .await
+            .unwrap()
+            .value;
+    assert!(canary.passes(&verdict));
+    assert_eq!(verdict.item_mean(), Some(0.0));
+
+    let pair = evals::judge_pair(
+        &client,
+        Rubric::Faithfulness,
+        &canary.input(),
+        "A",
+        "B",
+        &small,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pair.value.0.winner, Winner::A);
+    assert!(pair.value.0.consistent);
+    assert_eq!(pair.usage.model_calls, 2);
+
+    let sent = all_requests(&fake);
+    let keys: Vec<&str> = sent
+        .iter()
+        .map(|b| b["prompt_cache_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "synth:synth-v1",
+            "seriousness:seriousness-v1",
+            "judge_faithfulness:judge-v1",
+            "pair_faithfulness:pair-v1",
+            "pair_faithfulness:pair-v1",
+        ]
+    );
+    for body in &sent {
+        assert_eq!(body["text"]["format"]["strict"], true);
+    }
+    // The second pairwise call shows the candidates the other way round.
+    let order = |b: &Value| {
+        b["input"]
+            .as_str()
+            .unwrap()
+            .contains("=== BEGIN FIRST ===\nA\n")
+    };
+    assert!(order(&sent[3]));
+    assert!(!order(&sent[4]));
 }
 
 // ---------------------------------------------------------------------------
