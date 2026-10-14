@@ -1099,6 +1099,46 @@ async fn reading_again_embeds_only_what_changed_and_moves_the_generation() {
     assert!(changes.deleted.is_empty());
 }
 
+/// A writer bumps the generation counter and puts the document in a second statement.
+/// The change feed must not hand out a cursor past a generation whose row isn't written
+/// yet, or the reader skips that document for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_change_feed_never_passes_a_generation_still_being_written() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
+    wait_source(&h, &t, &s.id, is_ready).await;
+    let since = margin_service::ingest::changes_since(&h.state, 0)
+        .await
+        .unwrap()
+        .generation;
+
+    // A writer mid-way: the counter has moved, the document isn't put yet.
+    let w = h.state.write_lock.lock().await;
+    let mut doc = document(&h, &s.id).await;
+    doc.generation = h.state.store.next_generation().await.unwrap();
+    let state = h.state.clone();
+    let feed = tokio::spawn(async move {
+        margin_service::ingest::changes_since(&state, since)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h.state.store.put(db::DOCUMENT, &s.id, &doc).await.unwrap();
+    drop(w);
+
+    let changes = feed.await.unwrap();
+    assert_eq!(changes.generation, doc.generation);
+    assert_eq!(
+        changes
+            .changed
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect::<Vec<_>>(),
+        [s.id.as_str()]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_documents_access_is_copied_onto_its_passages() {
     let h = start().await;

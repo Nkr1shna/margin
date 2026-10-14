@@ -556,6 +556,10 @@ async fn rescope_locked(
 /// The documents whose generation passed `since`, and those deleted since then
 /// (`routes::CONTEXT_CHANGES`).
 pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<ContextChanges> {
+    // Writers bump the counter and then put the row in a separate statement, both under
+    // the write lock. Reading under it too means no generation is handed out whose row
+    // isn't written yet, so the cursor never passes a document the feed didn't list.
+    let _w = state.write_lock.lock().await;
     let generation = state.store.generation().await?;
     let mut changed: Vec<Document> = state
         .store
