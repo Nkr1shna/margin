@@ -795,7 +795,7 @@ fn ToolRow(tool: ToolStatus) -> Element {
             div { class: "tool-h",
                 span { class: if tool.found { "dot ok" } else { "dot bad" } }
                 b { "{tool.name}" }
-                span { class: "grow muted", style: "font-size: 13px",
+                span { class: "tool-detail muted",
                     if tool.found {
                         "Found"
                         if let Some(v) = &tool.version { " · {v}" }

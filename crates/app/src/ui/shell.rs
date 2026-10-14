@@ -115,7 +115,7 @@ pub fn Shell() -> Element {
                     if *app.lib_status.read() == LoadStatus::Loaded {
                         div { class: "banner", role: "status",
                             span { class: "dot" }
-                            span { class: "grow", "Offline: {error} Retrying in {retry_secs} s." }
+                            span { class: "grow", "Offline. Retrying in {retry_secs} s. {error}" }
                             button {
                                 class: "btn btn-ghost btn-sm",
                                 onclick: move |_| {

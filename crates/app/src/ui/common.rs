@@ -310,6 +310,9 @@ pub fn HistoryButtons() -> Element {
 pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
     let mut app = use_app();
     let last = crumbs.len().saturating_sub(1);
+    // Each crumb carries the whole path as its tooltip: crumbs ellipsize when the bar is
+    // narrow, and below 720px only the current page shows.
+    let path = crumbs.join(" / ");
     rsx! {
         div { class: "topbar",
             DragRegion {}
@@ -334,9 +337,12 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
             nav { class: "crumbs", "aria-label": "Breadcrumbs",
                 for (i, c) in crumbs.iter().enumerate() {
                     if i == last {
-                        b { key: "{i}", "{c}" }
+                        b { key: "{i}", title: "{path}", "{c}" }
                     } else {
-                        span { key: "{i}", "{c}" span { class: "sep", " /" } }
+                        span { key: "{i}", class: "crumb-anc", title: "{path}",
+                            span { class: "crumb-t", "{c}" }
+                            span { class: "sep", "aria-hidden": "true", "/" }
+                        }
                     }
                 }
             }
