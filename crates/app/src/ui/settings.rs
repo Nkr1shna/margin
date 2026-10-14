@@ -849,6 +849,8 @@ fn AppearanceSection() -> Element {
                         key: "{a.label()}",
                         role: "radio",
                         "aria-checked": (a == current).to_string(),
+                        // One tab stop; the arrow keys move between options (margin.js).
+                        tabindex: if a == current { "0" } else { "-1" },
                         onclick: move |_| {
                             if let Err(e) = app.set_config(|c| c.appearance = a) {
                                 error.set(Some(format!("Changed for now, but couldn't be saved: {e}")));

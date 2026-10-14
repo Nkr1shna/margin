@@ -3,6 +3,7 @@
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
 
+use crate::commands::Command;
 use crate::state::use_app;
 
 // Icons from the mockup's SVG sprite (24×24, stroked); "gear" is an eight-tooth cog
@@ -287,7 +288,7 @@ pub fn HistoryButtons() -> Element {
             button {
                 class: "icon-btn",
                 "aria-label": "Back",
-                title: "Back (⌘[)",
+                title: "Back ({Command::Back.shortcut()})",
                 disabled: !can_back,
                 onclick: move |_| nav.go_back(),
                 Icon { name: "back" }
@@ -295,7 +296,7 @@ pub fn HistoryButtons() -> Element {
             button {
                 class: "icon-btn",
                 "aria-label": "Forward",
-                title: "Forward (⌘])",
+                title: "Forward ({Command::Forward.shortcut()})",
                 disabled: !can_forward,
                 onclick: move |_| nav.go_forward(),
                 Icon { name: "forward" }
@@ -304,11 +305,61 @@ pub fn HistoryButtons() -> Element {
     }
 }
 
+/// Where a breadcrumb leads.
+#[derive(Clone, PartialEq, Debug)]
+pub enum CrumbLink {
+    Route(crate::routes::Route),
+    /// Shows the topic in the sidebar: expands it (and the topics above it), opens the
+    /// sidebar or drawer, and moves focus to it.
+    Topic(margin_shared::Id),
+}
+
+/// Expand `topic_id` and the topics above it in the sidebar tree, show the sidebar (the
+/// drawer on narrow screens), and focus the topic's row.
+pub fn reveal_topic(app: crate::state::AppCtx, topic_id: &str) {
+    let path: Vec<margin_shared::Id> = app
+        .lib
+        .peek()
+        .topic_path(topic_id)
+        .iter()
+        .map(|t| t.id.clone())
+        .collect();
+    let mut collapsed = app.collapsed;
+    {
+        let mut set = collapsed.write();
+        for id in &path {
+            set.remove(id);
+        }
+    }
+    if app.config.peek().sidebar_hidden {
+        let _ = app.set_config(|c| c.sidebar_hidden = false);
+    }
+    let selector = serde_json::to_string(&format!(".sb [data-topic=\"{topic_id}\"] > .row"))
+        .unwrap_or_default();
+    spawn(async move {
+        let narrow = document::eval("return window.matchMedia('(max-width: 719px)').matches;")
+            .join::<bool>()
+            .await
+            .unwrap_or(false);
+        if narrow {
+            let mut open = app.drawer_open;
+            open.set(true);
+        }
+        let _ = js(&format!("MarginApp.focus({selector});"));
+    });
+}
+
 /// The top bar of every screen: the drawer button (narrow screens), breadcrumbs, and
-/// screen controls on the right.
+/// screen controls on the right. A crumb with a link (`links`, by position) is a button;
+/// the last crumb is the current screen and never is.
 #[component]
-pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
+pub fn TopBar(
+    crumbs: Vec<String>,
+    #[props(default)] links: Vec<Option<CrumbLink>>,
+    children: Element,
+) -> Element {
     let mut app = use_app();
+    let nav = navigator();
     let last = crumbs.len().saturating_sub(1);
     rsx! {
         div { class: "topbar",
@@ -317,7 +368,7 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
                 // Wide windows: shown while the sidebar is collapsed, un-collapses it.
                 class: "icon-btn menu-btn menu-wide",
                 "aria-label": "Show sidebar",
-                title: "Show sidebar (⌘\\)",
+                title: "Show sidebar ({Command::ToggleSidebar.shortcut()})",
                 onclick: move |_| {
                     let _ = app.set_config(|c| c.sidebar_hidden = false);
                 },
@@ -327,6 +378,7 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
                 // Narrow windows: the sidebar is a drawer; this opens it.
                 class: "icon-btn menu-btn menu-narrow",
                 "aria-label": "Open sidebar",
+                "aria-expanded": app.drawer_open.read().to_string(),
                 onclick: move |_| app.drawer_open.set(true),
                 Icon { name: "panel" }
             }
@@ -334,7 +386,25 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
             nav { class: "crumbs", "aria-label": "Breadcrumbs",
                 for (i, c) in crumbs.iter().enumerate() {
                     if i == last {
-                        b { key: "{i}", "{c}" }
+                        b { key: "{i}", "aria-current": "page", "{c}" }
+                    } else if let Some(link) = links.get(i).cloned().flatten() {
+                        span { key: "{i}",
+                            button {
+                                class: "crumb",
+                                title: match &link {
+                                    CrumbLink::Topic(_) => "Show in sidebar",
+                                    CrumbLink::Route(_) => "",
+                                },
+                                onclick: move |_| match &link {
+                                    CrumbLink::Route(route) => {
+                                        nav.push(route.clone());
+                                    }
+                                    CrumbLink::Topic(id) => reveal_topic(app, id),
+                                },
+                                "{c}"
+                            }
+                            span { class: "sep", " /" }
+                        }
                     } else {
                         span { key: "{i}", "{c}" span { class: "sep", " /" } }
                     }
@@ -357,19 +427,30 @@ pub fn ConfirmDialog(
     on_confirm: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
+    // Remember where the focus was, to put it back when the dialog is cancelled.
+    use_hook(|| {
+        let _ = js("MarginApp.saveFocus();");
+    });
+    let cancel = move || {
+        let _ = js("MarginApp.restoreFocus();");
+        on_cancel.call(());
+    };
     rsx! {
         div {
             class: "modal-scrim",
-            onclick: move |_| on_cancel.call(()),
+            onclick: move |_| cancel(),
+            // Escape closes this dialog only, not a dialog it sits in (Settings).
             onkeydown: move |e: KeyboardEvent| {
                 if e.key() == Key::Escape {
-                    on_cancel.call(());
+                    e.stop_propagation();
+                    cancel();
                 }
             },
             div {
                 class: "modal",
                 role: "alertdialog",
                 "aria-modal": "true",
+                "aria-label": "{title}",
                 onclick: move |e| e.stop_propagation(),
                 h2 { "{title}" }
                 p { "{message}" }
@@ -382,13 +463,19 @@ pub fn ConfirmDialog(
                 div { class: "row-actions",
                     button {
                         class: "btn btn-secondary btn-sm",
-                        onclick: move |_| on_cancel.call(()),
+                        onclick: move |_| cancel(),
                         "Cancel"
                     }
                     button {
                         class: if danger { "btn btn-danger btn-sm" } else { "btn btn-primary btn-sm" },
                         disabled: busy,
                         autofocus: true,
+                        // `autofocus` doesn't take in a page that's already loaded: focus
+                        // starts here so Escape and Enter reach the dialog, not what's
+                        // behind it.
+                        onmounted: move |e| async move {
+                            let _ = e.set_focus(true).await;
+                        },
                         onclick: move |_| on_confirm.call(()),
                         if busy { span { class: "spinner" } }
                         "{confirm_label}"

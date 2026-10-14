@@ -3,14 +3,16 @@
 use dioxus::prelude::*;
 use margin_shared::{Event, Id, LessonPatch, NewTopic, TopicPatch};
 
+use crate::commands::Command;
 use crate::config::Appearance;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
-use crate::store::VideoDot;
+use crate::store::{LibraryState, VideoDot};
 use crate::ui::common::{
     BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
 };
 use crate::ui::settings::SettingsPane;
+use crate::ui::shell::close_drawer;
 use crate::ui::sources::TopicSourcesDialog;
 
 /// Which inline topic editor is open in the tree.
@@ -102,6 +104,13 @@ pub fn Sidebar() -> Element {
         aside {
             class: if drawer_open { "sb open" } else { "sb" },
             "aria-label": "Sidebar",
+            // Narrow screens: Escape closes the drawer (menus and fields inside handle
+            // their own Escape first).
+            onkeydown: move |e: KeyboardEvent| {
+                if drawer_open && e.key() == Key::Escape {
+                    close_drawer(app);
+                }
+            },
             div {
                 class: "sb-resize",
                 role: "separator",
@@ -121,10 +130,10 @@ pub fn Sidebar() -> Element {
                     button {
                         class: "icon-btn sb-toggle",
                         "aria-label": "Hide sidebar",
-                        title: "Hide sidebar (⌘\\)",
+                        title: "Hide sidebar ({Command::ToggleSidebar.shortcut()})",
                         onclick: move |_| {
                             if drawer_open {
-                                app.drawer_open.set(false);
+                                close_drawer(app);
                             } else {
                                 let _ = app.set_config(|c| c.sidebar_hidden = true);
                             }
@@ -143,24 +152,25 @@ pub fn Sidebar() -> Element {
                     },
                     Icon { name: "spark" }
                     span { class: "grow", "Ask" }
-                    span { class: "k", "⌘N" }
+                    span { class: "k", {Command::Ask.shortcut()} }
                 }
                 button {
                     class: "row",
                     onclick: move |_| app.search_open.set(true),
                     Icon { name: "search" }
                     span { class: "grow", "Search" }
-                    span { class: "k", "⌘K" }
+                    span { class: "k", {Command::Search.shortcut()} }
                 }
                 button {
                     class: "row",
-                    "aria-current": matches!(route, Route::AllNotes {}).to_string(),
+                    // Also while a note opened from All notes is showing.
+                    "aria-current": (route.notes_scope() == Some(None)).to_string(),
                     onclick: move |_| {
                         nav.push(Route::AllNotes {});
                     },
                     Icon { name: "note" }
                     span { class: "grow", "All notes" }
-                    span { class: "k", "⇧⌘N" }
+                    span { class: "k", {Command::AllNotes.shortcut()} }
                 }
             }
             div { class: "sb-label",
@@ -222,7 +232,7 @@ pub fn Sidebar() -> Element {
                 button {
                     class: "icon-btn",
                     "aria-label": "Settings",
-                    title: "Settings (⌘,)",
+                    title: "Settings ({Command::Settings.shortcut()})",
                     "aria-current": app.settings_open.read().is_some().to_string(),
                     onclick: move |_| app.settings_open.set(Some(SettingsPane::General)),
                     Icon { name: "gear" }
@@ -251,7 +261,7 @@ pub fn Sidebar() -> Element {
                         match api.delete_topic(&id).await {
                             Ok(()) => {
                                 // Leave screens that belonged to the deleted topic.
-                                let gone = route_in_topic(&app, &route, &id);
+                                let gone = route_in_topic(&app.lib.peek(), &route, &id);
                                 app.lib.write().apply(margin_shared::Event::TopicDeleted { id });
                                 let mut d = tree.delete;
                                 d.set(None);
@@ -322,6 +332,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
     let mut error = tree.error;
     let menu_open = menu.read().as_deref() == Some(id.as_str());
     let renaming = *edit.read() == TreeEdit::RenameLesson(id.clone());
+    let current = route_is_lesson(&route, &id);
     let open_menu = {
         let id = id.clone();
         move || menu.set(Some(id.clone()))
@@ -333,7 +344,8 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                 LessonInput { id: id.clone(), initial: title.clone() }
             } else {
                 div {
-                    class: "tree-row",
+                    // The selection spans the whole row, ⋯ slot included, like Notes rows.
+                    class: if current { "tree-row current" } else { "tree-row" },
                     oncontextmenu: {
                         let mut open_menu = open_menu.clone();
                         move |e: MouseEvent| {
@@ -343,7 +355,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                     },
                     button {
                         class: "row",
-                        "aria-current": route_is_lesson(&route, &id).to_string(),
+                        "aria-current": current.to_string(),
                         onclick: {
                             let id = id.clone();
                             move |_| {
@@ -381,6 +393,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
                     role: "menu",
                     onkeydown: move |e: KeyboardEvent| {
                         if e.key() == Key::Escape {
+                            e.stop_propagation();
                             menu.set(None);
                         }
                     },
@@ -490,6 +503,7 @@ fn LessonInput(id: Id, initial: String) -> Element {
                         spawn(commit());
                     }
                     Key::Escape => {
+                        e.stop_propagation();
                         let mut edit = tree.edit;
                         edit.set(TreeEdit::None);
                     }
@@ -507,17 +521,33 @@ fn LessonInput(id: Id, initial: String) -> Element {
 }
 
 /// Whether the current route shows something inside topic `topic_id` (or below it).
-fn route_in_topic(app: &crate::state::AppCtx, route: &Route, topic_id: &str) -> bool {
-    let lib = app.lib.peek();
+fn route_in_topic(lib: &LibraryState, route: &Route, topic_id: &str) -> bool {
     let topic_of = |t: &str| lib.topic_path(t).iter().any(|p| p.id == topic_id);
+    let note_in = |id: &str| lib.notes.get(id).is_some_and(|n| topic_of(&n.topic_id));
     match route {
         Route::LessonRead { id } | Route::LessonNotes { id } | Route::LessonVideo { id } => {
             lib.lessons.get(id).is_some_and(|l| topic_of(&l.topic_id))
         }
         Route::TopicNotes { topic_id: t } => topic_of(t),
-        Route::NoteOpen { id } => lib.notes.get(id).is_some_and(|n| topic_of(&n.topic_id)),
+        Route::TopicNoteOpen { topic_id: t, id } => topic_of(t) || note_in(id),
+        Route::NoteOpen { id } => note_in(id),
         _ => false,
     }
+}
+
+/// Whether the tree row of the current screen (a lesson, or a topic's Notes) is inside
+/// topic `topic_id`, so a collapsed `topic_id` hides it.
+fn current_row_in_topic(lib: &LibraryState, route: &Route, topic_id: &str) -> bool {
+    let row_topic = match route {
+        Route::LessonRead { id } | Route::LessonNotes { id } | Route::LessonVideo { id } => {
+            lib.lessons.get(id).map(|l| l.topic_id.as_str())
+        }
+        Route::TopicNotes { topic_id } | Route::TopicNoteOpen { topic_id, .. } => {
+            Some(topic_id.as_str())
+        }
+        _ => None,
+    };
+    row_topic.is_some_and(|t| lib.topic_path(t).iter().any(|p| p.id == topic_id))
 }
 
 #[component]
@@ -559,9 +589,11 @@ fn TopicNode(id: Id) -> Element {
         .collect();
     let note_count = lib.notes_in_topic(&id).len();
     let count = lib.lesson_count_deep(&id);
+    let collapsed = app.collapsed.read().contains(&id);
+    // Collapsed over the open screen's row: the topic stands in for it.
+    let holds_current = collapsed && current_row_in_topic(&lib, &route, &id);
     drop(lib);
 
-    let collapsed = app.collapsed.read().contains(&id);
     let menu_open = menu.read().as_deref() == Some(id.as_str());
     let renaming = *edit.read() == TreeEdit::Rename(id.clone());
     let adding_child = *edit.read() == TreeEdit::AddChild(id.clone());
@@ -575,6 +607,8 @@ fn TopicNode(id: Id) -> Element {
     };
     let toggle_label = if !has_children {
         topic.title.clone()
+    } else if holds_current {
+        format!("Expand {} (contains the open page)", topic.title)
     } else if collapsed {
         format!("Expand {}", topic.title)
     } else {
@@ -599,7 +633,9 @@ fn TopicNode(id: Id) -> Element {
                 TopicInput { parent: topic.parent_id.clone(), initial: topic.title.clone(), placeholder: "Topic name", rename: Some(id.clone()) }
             } else {
                 div {
-                    class: "tree-row",
+                    class: if holds_current { "tree-row holds-current" } else { "tree-row" },
+                    // Breadcrumbs find the topic here to show it (`reveal_topic`).
+                    "data-topic": "{id}",
                     // Right-click opens the same menu as the ⋯ button.
                     oncontextmenu: {
                         let id = id.clone();
@@ -646,6 +682,7 @@ fn TopicNode(id: Id) -> Element {
                     role: "menu",
                     onkeydown: move |e: KeyboardEvent| {
                         if e.key() == Key::Escape {
+                            e.stop_propagation();
                             menu.set(None);
                         }
                     },
@@ -728,7 +765,8 @@ fn TopicNode(id: Id) -> Element {
                         li { key: "notes-{id}", role: "treeitem",
                             button {
                                 class: "row",
-                                "aria-current": matches!(&route, Route::TopicNotes { topic_id } if *topic_id == id).to_string(),
+                                // Also while a note opened from this list is showing.
+                                "aria-current": (route.notes_scope() == Some(Some(id.as_str()))).to_string(),
                                 onclick: {
                                     let id = id.clone();
                                     move |_| {
@@ -844,6 +882,10 @@ fn TopicInput(
             oninput: move |e| value.set(e.value()),
             onkeydown: move |e: KeyboardEvent| {
                 let commit = commit.clone();
+                if e.key() == Key::Escape {
+                    // Cancels the edit only (an open drawer stays open).
+                    e.stop_propagation();
+                }
                 async move {
                     match e.key() {
                         Key::Enter => {
@@ -863,5 +905,54 @@ fn TopicInput(
                 async move { commit().await }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lib() -> LibraryState {
+        let mut lib = LibraryState::default();
+        lib.replace_library(crate::fake::sample_library());
+        lib
+    }
+
+    #[test]
+    fn collapsed_topics_know_the_current_row() {
+        let lib = lib();
+        // signals > fourier > l1; signals > complex > l4.
+        let lesson = Route::LessonRead { id: "l1".into() };
+        assert!(current_row_in_topic(&lib, &lesson, "fourier"));
+        assert!(current_row_in_topic(&lib, &lesson, "signals"));
+        assert!(!current_row_in_topic(&lib, &lesson, "complex"));
+        // A topic's notes (also with a note open) live in that topic's subtree.
+        let notes = Route::TopicNoteOpen {
+            topic_id: "fourier".into(),
+            id: "n1".into(),
+        };
+        assert!(current_row_in_topic(&lib, &notes, "signals"));
+        assert!(!current_row_in_topic(&lib, &notes, "linalg"));
+        // All notes is outside the tree.
+        let all = Route::NoteOpen { id: "n1".into() };
+        assert!(!current_row_in_topic(&lib, &all, "fourier"));
+    }
+
+    #[test]
+    fn deleting_a_topic_leaves_screens_inside_it() {
+        let lib = lib();
+        let scoped = Route::TopicNoteOpen {
+            topic_id: "signals".into(),
+            id: "n1".into(),
+        };
+        assert!(route_in_topic(&lib, &scoped, "signals"));
+        // The open note is in fourier, though the list is its parent's.
+        assert!(route_in_topic(&lib, &scoped, "fourier"));
+        assert!(route_in_topic(
+            &lib,
+            &Route::NoteOpen { id: "n1".into() },
+            "fourier"
+        ));
+        assert!(!route_in_topic(&lib, &scoped, "linalg"));
     }
 }

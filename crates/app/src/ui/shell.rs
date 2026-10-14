@@ -2,8 +2,9 @@
 
 use dioxus::prelude::*;
 
+use crate::commands::Command;
 use crate::routes::Route;
-use crate::state::{LiveStatus, LoadStatus, use_app};
+use crate::state::{AppCtx, LiveStatus, LoadStatus, use_app};
 use crate::ui::common::{Icon, js};
 use crate::ui::search::SearchPalette;
 use crate::ui::settings::{SettingsDialog, SettingsPane};
@@ -13,41 +14,83 @@ use crate::ui::sidebar::Sidebar;
 const SIDEBAR_MIN: u32 = 200;
 const SIDEBAR_MAX: u32 = 480;
 
+/// Close the narrow-layout drawer and put focus back on the button that opened it.
+pub fn close_drawer(app: AppCtx) {
+    let mut open = app.drawer_open;
+    if *open.peek() {
+        open.set(false);
+        let _ = js("MarginApp.focus('.menu-btn.menu-narrow');");
+    }
+}
+
 #[component]
 pub fn Shell() -> Element {
     let mut app = use_app();
     let nav = navigator();
     let route = use_route::<Route>();
 
-    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+Shift+N opens All notes, Cmd/Ctrl+\ toggles the sidebar,
-    // Cmd/Ctrl+[ and ] go back and forward, from anywhere in the window.
+    // The shortcuts in `Command`, from anywhere in the window. Key presses and the menu
+    // bar (`SignedIn` in main.rs) both arrive here through `MarginApp.command`, which
+    // drops them under a modal.
     use_future(move || async move {
         let mut eval = js(
             "MarginApp.watchShortcuts(function (m) { dioxus.send(m); });\nawait new Promise(function () {});",
         );
         while let Ok(message) = eval.recv::<String>().await {
-            match message.as_str() {
-                "search" => app.search_open.set(true),
-                "notes" => {
-                    app.search_open.set(false);
+            let Some(command) = Command::from_slug(&message) else {
+                continue;
+            };
+            // The search palette is the one modal commands pass through; they close it.
+            if command != Command::Search {
+                app.search_open.set(false);
+            }
+            match command {
+                Command::Search => app.search_open.set(true),
+                Command::AllNotes => {
                     nav.push(Route::AllNotes {});
                 }
-                "settings" => app.settings_open.set(Some(SettingsPane::General)),
-                "back" => nav.go_back(),
-                "forward" => nav.go_forward(),
-                "sidebar" => {
+                Command::Settings => {
+                    // Already open: stay on the pane the person is on.
+                    if app.settings_open.peek().is_none() {
+                        app.settings_open.set(Some(SettingsPane::General));
+                    }
+                }
+                Command::Back => nav.go_back(),
+                Command::Forward => nav.go_forward(),
+                Command::ToggleSidebar => {
                     let hidden = app.config.peek().sidebar_hidden;
                     let _ = app.set_config(|c| c.sidebar_hidden = !hidden);
                     app.drawer_open.set(false);
                 }
-                "ask" => {
-                    app.search_open.set(false);
+                Command::Ask => {
                     nav.push(Route::Ask {});
+                    // Ready to type straight away, also when Ask is already open.
+                    let _ = js(&format!(
+                        "MarginApp.focus('#{}');",
+                        crate::ui::ask::PROMPT_ID
+                    ));
                 }
-                _ => {}
             }
         }
     });
+
+    // The drawer closes when the window widens out of the narrow layout.
+    use_future(move || async move {
+        let mut eval = js(
+            "MarginApp.watchWide(function (w) { dioxus.send(w); });\nawait new Promise(function () {});",
+        );
+        while eval.recv::<bool>().await.is_ok() {
+            app.drawer_open.set(false);
+        }
+    });
+
+    // Opening the drawer moves focus into it.
+    let drawer_open = *app.drawer_open.read();
+    use_effect(use_reactive!(|drawer_open| {
+        if drawer_open {
+            let _ = js("MarginApp.focusDrawer('.sb.open .sb-toggle');");
+        }
+    }));
 
     // Dragging the sidebar's edge resizes it; the width is saved (0 = back to default).
     use_future(move || async move {
@@ -72,7 +115,6 @@ pub fn Shell() -> Element {
 
     let lib_status = app.lib_status.read().clone();
     let live = app.live.read().clone();
-    let drawer_open = *app.drawer_open.read();
     let sidebar_hidden = app.config.read().sidebar_hidden;
     let sidebar_style = app
         .config
@@ -88,11 +130,14 @@ pub fn Shell() -> Element {
             if drawer_open {
                 div {
                     class: "drawer-scrim",
-                    onclick: move |_| app.drawer_open.set(false),
+                    onclick: move |_| close_drawer(app),
                 }
             }
             Sidebar {}
-            main { class: "main",
+            main {
+                class: "main",
+                // Behind the open drawer the page is out of reach, for focus and screen readers.
+                "inert": drawer_open.then_some("true"),
                 match lib_status {
                     LoadStatus::Failed(message) => rsx! {
                         div { class: "banner error", role: "alert",

@@ -16,7 +16,7 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
 use crate::ui::common::{
-    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math_in,
+    ConfirmDialog, CrumbLink, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -56,12 +56,13 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
             }
         };
     };
-    let mut crumbs: Vec<String> = lib
+    let (mut crumbs, mut crumb_links): (Vec<String>, Vec<Option<CrumbLink>>) = lib
         .topic_path(&lesson.topic_id)
         .iter()
-        .map(|t| t.title.clone())
-        .collect();
+        .map(|t| (t.title.clone(), Some(CrumbLink::Topic(t.id.clone()))))
+        .unzip();
     crumbs.push(lesson.title.clone());
+    crumb_links.push(None);
     drop(lib);
 
     let go = {
@@ -98,11 +99,11 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
     let regenerate_menu = regenerate.clone();
 
     rsx! {
-        TopBar { crumbs,
+        TopBar { crumbs, links: crumb_links,
             div { class: "seg", role: "tablist", "aria-label": "Lesson view",
-                button { role: "tab", "aria-selected": (view == LessonView::Read).to_string(), onclick: move |_| go_read(LessonView::Read), "Read" }
-                button { role: "tab", "aria-selected": (view == LessonView::Notes).to_string(), onclick: move |_| go_notes(LessonView::Notes), "Notes" }
-                button { role: "tab", "aria-selected": (view == LessonView::Video).to_string(), onclick: move |_| go_video(LessonView::Video), "Video" }
+                button { role: "tab", "aria-selected": (view == LessonView::Read).to_string(), tabindex: if view == LessonView::Read { "0" } else { "-1" }, onclick: move |_| go_read(LessonView::Read), "Read" }
+                button { role: "tab", "aria-selected": (view == LessonView::Notes).to_string(), tabindex: if view == LessonView::Notes { "0" } else { "-1" }, onclick: move |_| go_notes(LessonView::Notes), "Notes" }
+                button { role: "tab", "aria-selected": (view == LessonView::Video).to_string(), tabindex: if view == LessonView::Video { "0" } else { "-1" }, onclick: move |_| go_video(LessonView::Video), "Video" }
             }
             div { style: "position: relative",
                 button {
@@ -119,7 +120,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                         class: "menu right",
                         role: "menu",
                         style: "top: 34px",
-                        onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { menu_open.set(false) },
+                        onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); menu_open.set(false) },
                         button {
                             role: "menuitem",
                             autofocus: true,

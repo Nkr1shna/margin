@@ -12,10 +12,13 @@ use crate::api::ApiFailure;
 use crate::routes::Route;
 use crate::sources::UploadState;
 use crate::state::use_app;
-use crate::ui::common::{ErrorNotice, Icon, TopBar};
+use crate::ui::common::{ErrorNotice, Icon, TopBar, js};
 use crate::ui::sources::{
     AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding,
 };
+
+/// The composer's text field, focused by Cmd+N (`ui::shell`).
+pub const PROMPT_ID: &str = "ask-prompt";
 
 pub fn level_label(level: Level) -> &'static str {
     match level {
@@ -190,7 +193,13 @@ pub fn AskScreen() -> Element {
                     for rev in std::iter::once(prompt_rev()) {
                     textarea {
                         key: "{rev}",
+                        id: PROMPT_ID,
                         rows: 2,
+                        // Ready to type on arrival, where there's a mouse or trackpad (on a
+                        // touch screen it would pop up the keyboard every visit).
+                        onmounted: move |_| {
+                            let _ = js(&format!("MarginApp.focus('#{PROMPT_ID}', true);"));
+                        },
                         "aria-label": "What do you want to learn?",
                         placeholder: "A topic, a question, or what you already know…",
                         initial_value: "{prompt}",
@@ -205,7 +214,7 @@ pub fn AskScreen() -> Element {
                     }
                     div { class: "composer-row",
                         select {
-                            class: "chip on",
+                            class: "chip",
                             "aria-label": "Number of lessons",
                             value: "{count}",
                             onchange: move |e| {
@@ -239,7 +248,10 @@ pub fn AskScreen() -> Element {
                             class: "chip",
                             "aria-pressed": with_quiz.read().to_string(),
                             onclick: move |_| with_quiz.toggle(),
-                            Icon { name: "check" }
+                            // The check marks the state, so it shows only when on.
+                            if *with_quiz.read() {
+                                Icon { name: "check" }
+                            }
                             "Quiz at the end"
                         }
                         select {
@@ -430,8 +442,20 @@ fn OutlineEditor(
     on_accept: EventHandler<Outline>,
 ) -> Element {
     let mut editing = use_signal(|| false);
-    // Bumped when lessons move, are removed or added, so their (uncontrolled) fields remount.
-    let mut rows_rev = use_signal(|| 0u64);
+    // A stable key per lesson row, moved and removed with it, so a row's (uncontrolled)
+    // fields and the focus stay with the lesson.
+    let mut keys = use_hook(|| CopyValue::new(RowKeys::default()));
+    // The control to focus once the rows have re-rendered after a move, remove or add.
+    let mut focus_next = use_signal(|| None::<String>);
+    use_effect(move || {
+        if focus_next.read().is_none() {
+            return;
+        }
+        if let Some(id) = focus_next.write().take() {
+            let id = serde_json::to_string(&format!("#{id}")).unwrap_or_default();
+            let _ = js(&format!("MarginApp.focus({id});"));
+        }
+    });
     let mut edit = move |f: &dyn Fn(&mut Outline)| {
         let mut d = draft.write();
         if let Some(o) = d.as_mut() {
@@ -440,6 +464,10 @@ fn OutlineEditor(
     };
     let total: u32 = outline.lessons.iter().map(|l| l.minutes).sum();
     let n = outline.lessons.len();
+    if keys.peek().len() != n {
+        keys.write().fit(n);
+    }
+    let row_keys = keys.peek().keys();
     let valid = !outline.topic_title.trim().is_empty()
         && !outline.lessons.is_empty()
         && outline.lessons.iter().all(|l| !l.title.trim().is_empty());
@@ -479,12 +507,13 @@ fn OutlineEditor(
             } else {
                 p { class: "muted", style: "margin: 0 0 12px", "New topic: ", b { style: "font-weight: 500; color: var(--fg)", "{outline.topic_title}" } }
             }
-            for (i, lesson) in outline.lessons.iter().cloned().enumerate() {
-                div { key: "{rows_rev}-{i}", class: "ol-item",
+            for (i, (lesson, key)) in outline.lessons.iter().cloned().zip(row_keys).enumerate() {
+                div { key: "{key}", class: "ol-item",
                     span { class: "n", "{i + 1}" }
                     if *editing.read() {
                         div { class: "ol-main",
                             input {
+                                id: row_control(key, "title"),
                                 class: "input ol-title",
                                 "aria-label": "Lesson {i + 1} title",
                                 initial_value: "{lesson.title}",
@@ -513,24 +542,42 @@ fn OutlineEditor(
                                 },
                             }
                             button {
+                                id: row_control(key, "up"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} up",
                                 disabled: i == 0,
-                                onclick: move |_| { edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1)); rows_rev += 1; },
+                                onclick: move |_| {
+                                    edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1));
+                                    keys.write().swap(i, i - 1);
+                                    focus_next.set(Some(row_control(key, after_move(i - 1, n, true))));
+                                },
                                 Icon { name: "up" }
                             }
                             button {
+                                id: row_control(key, "down"),
                                 class: "icon-btn",
                                 "aria-label": "Move lesson {i + 1} down",
                                 disabled: i + 1 == n,
-                                onclick: move |_| { edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1)); rows_rev += 1; },
+                                onclick: move |_| {
+                                    edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1));
+                                    keys.write().swap(i, i + 1);
+                                    focus_next.set(Some(row_control(key, after_move(i + 1, n, false))));
+                                },
                                 Icon { name: "down" }
                             }
                             button {
                                 class: "icon-btn",
                                 "aria-label": "Remove lesson {i + 1}",
                                 disabled: n == 1,
-                                onclick: move |_| { edit(&move |o: &mut Outline| { o.lessons.remove(i); }); rows_rev += 1; },
+                                onclick: move |_| {
+                                    edit(&move |o: &mut Outline| { o.lessons.remove(i); });
+                                    let next = {
+                                        let mut k = keys.write();
+                                        k.remove(i);
+                                        k.at(i.min(n - 2))
+                                    };
+                                    focus_next.set(next.map(|k| row_control(k, "title")));
+                                },
                                 Icon { name: "trash" }
                             }
                         }
@@ -547,7 +594,11 @@ fn OutlineEditor(
                 div { style: "padding-top: 10px",
                     button {
                         class: "btn btn-ghost btn-sm",
-                        onclick: move |_| { edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 })); rows_rev += 1; },
+                        onclick: move |_| {
+                            edit(&|o: &mut Outline| o.lessons.push(OutlineLesson { title: String::new(), summary: String::new(), minutes: 10 }));
+                            let key = keys.write().push();
+                            focus_next.set(Some(row_control(key, "title")));
+                        },
                         Icon { name: "plus" }
                         "Add lesson"
                     }
@@ -583,5 +634,112 @@ fn OutlineEditor(
                 }
             }
         }
+    }
+}
+
+/// Stable keys for the outline editor's lesson rows, kept in the rows' order.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RowKeys {
+    keys: Vec<u64>,
+    next: u64,
+}
+
+impl RowKeys {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn keys(&self) -> Vec<u64> {
+        self.keys.clone()
+    }
+
+    fn at(&self, i: usize) -> Option<u64> {
+        self.keys.get(i).copied()
+    }
+
+    /// A new row at the end; returns its key.
+    fn push(&mut self) -> u64 {
+        let key = self.next;
+        self.next += 1;
+        self.keys.push(key);
+        key
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        if a < self.keys.len() && b < self.keys.len() {
+            self.keys.swap(a, b);
+        }
+    }
+
+    fn remove(&mut self, i: usize) {
+        if i < self.keys.len() {
+            self.keys.remove(i);
+        }
+    }
+
+    /// Match `n` rows (a new draft): keep the keys there are, add or drop at the end.
+    fn fit(&mut self, n: usize) {
+        self.keys.truncate(n);
+        while self.keys.len() < n {
+            self.push();
+        }
+    }
+}
+
+/// The id of a row's control: "title", "up" or "down".
+fn row_control(key: u64, part: &str) -> String {
+    format!("ol-{key}-{part}")
+}
+
+/// After a lesson moves (`up` or down) to row `to` of `n`, which of its move buttons
+/// takes the focus: the one just used while it can go on, else the other (the first
+/// row can't go up, the last can't go down).
+fn after_move(to: usize, n: usize, up: bool) -> &'static str {
+    match (up, to == 0, to + 1 == n) {
+        (true, false, _) => "up",
+        (true, true, _) => "down",
+        (false, _, false) => "down",
+        (false, _, true) => "up",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_keys_follow_their_lessons() {
+        let mut keys = RowKeys::default();
+        keys.fit(3);
+        assert_eq!(keys.keys(), vec![0, 1, 2]);
+        keys.swap(0, 1);
+        assert_eq!(keys.keys(), vec![1, 0, 2]);
+        keys.remove(1);
+        assert_eq!(keys.keys(), vec![1, 2]);
+        // New rows never reuse a key, so a fresh field never inherits an old one.
+        assert_eq!(keys.push(), 3);
+        assert_eq!(keys.keys(), vec![1, 2, 3]);
+        keys.fit(2);
+        assert_eq!(keys.keys(), vec![1, 2]);
+        assert_eq!(keys.at(1), Some(2));
+        assert_eq!(keys.at(5), None);
+        // Out of range is ignored.
+        keys.swap(0, 9);
+        keys.remove(9);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(row_control(3, "title"), "ol-3-title");
+    }
+
+    #[test]
+    fn focus_stays_on_a_usable_move_button() {
+        // Up, still room to go up: keep "up"; reached the top: "down".
+        assert_eq!(after_move(1, 4, true), "up");
+        assert_eq!(after_move(0, 4, true), "down");
+        // Down, still room: "down"; reached the bottom: "up".
+        assert_eq!(after_move(2, 4, false), "down");
+        assert_eq!(after_move(3, 4, false), "up");
+        // Two rows: every move ends at an edge.
+        assert_eq!(after_move(0, 2, true), "down");
+        assert_eq!(after_move(1, 2, false), "up");
     }
 }
