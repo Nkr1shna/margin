@@ -14,6 +14,7 @@ use crate::ui::sources::kind_icon;
 const DIALOG_ID: &str = "source-viewer";
 const MEDIA_ID: &str = "viewer-media";
 const TRANSCRIPT_ID: &str = "viewer-transcript";
+const LINES_ID: &str = "viewer-lines";
 
 /// Open the source viewer on `n`.
 pub fn open_viewer(app: AppCtx, lesson_id: &Id, n: u32) {
@@ -441,6 +442,15 @@ fn ViewerContent(
         Viewer::Passage { excerpt, code } => rsx! {
             Passage { excerpt, code }
         },
+        Viewer::Lines {
+            excerpt,
+            code,
+            start_line,
+            end_line,
+            original,
+        } => rsx! {
+            Lines { excerpt, code, start_line, end_line, original }
+        },
         Viewer::Missing => rsx! {
             p { class: "faint", "There's no passage or picture to show for this citation." }
         },
@@ -482,6 +492,109 @@ fn Passage(excerpt: String, code: bool) -> Element {
         } else {
             blockquote { class: "viewer-excerpt", mark { "{excerpt}" } }
         }
+    }
+}
+
+/// Original files fetched for their lines, by signed URL (a new signature fetches it
+/// again, so a file read again isn't shown stale for long): Previous and Next through
+/// several passages of one file fetch it once.
+static ORIGINALS: std::sync::Mutex<Vec<(String, std::sync::Arc<str>)>> =
+    std::sync::Mutex::new(Vec::new());
+/// Files kept in `ORIGINALS`, the most recently fetched.
+const ORIGINALS_KEPT: usize = 6;
+
+/// Keep `text` as the original at `url` (also how `render_screens` gives the viewer a
+/// file without a service).
+pub fn remember_original(url: &str, text: &str) {
+    let mut kept = ORIGINALS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.retain(|(u, _)| u != url);
+    kept.push((url.to_string(), text.into()));
+    let excess = kept.len().saturating_sub(ORIGINALS_KEPT);
+    kept.drain(..excess);
+}
+
+fn known_original(url: &str) -> Option<std::sync::Arc<str>> {
+    let kept = ORIGINALS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.iter().find(|(u, _)| u == url).map(|(_, t)| t.clone())
+}
+
+/// A passage that knows its lines: the original file's lines around them with the cited
+/// ones marked and scrolled into view; the passage alone while the file loads, or when
+/// it can't be had or no longer holds the passage there.
+#[component]
+fn Lines(
+    excerpt: String,
+    code: bool,
+    start_line: u32,
+    end_line: u32,
+    original: Option<String>,
+) -> Element {
+    let app = use_app();
+    let wanted = original.clone();
+    let file = use_resource(move || {
+        let url = wanted.clone();
+        async move {
+            let url = url?;
+            if let Some(text) = known_original(&url) {
+                return Some(text);
+            }
+            let api = app.api()?;
+            match api.fetch_text(&url).await {
+                Ok(text) => {
+                    remember_original(&url, &text);
+                    Some(text.into())
+                }
+                Err(e) => {
+                    eprintln!("couldn't fetch the original for its lines: {e}");
+                    None
+                }
+            }
+        }
+    });
+    let text: Option<std::sync::Arc<str>> = file
+        .read()
+        .clone()
+        .flatten()
+        .or_else(|| original.as_deref().and_then(known_original));
+    let window =
+        text.and_then(|text| citations::line_window(&text, start_line, end_line, &excerpt));
+    let shown = window.is_some();
+    use_effect(use_reactive!(|shown| {
+        if shown {
+            let id = serde_json::to_string(LINES_ID).unwrap_or_default();
+            let _ = js(&format!("MarginApp.revealIn({id}, '.src-line.cited');"));
+        }
+    }));
+    let label = if end_line > start_line {
+        format!("Lines {start_line}–{end_line}")
+    } else {
+        format!("Line {start_line}")
+    };
+    match window {
+        Some(lines) => rsx! {
+            p { class: "viewer-label", "{label}" }
+            ol {
+                id: "{LINES_ID}",
+                class: if code { "src-lines code-lines" } else { "src-lines" },
+                "aria-label": "{label} in the file",
+                for l in lines {
+                    li {
+                        key: "{l.number}",
+                        class: if l.cited { "src-line cited" } else { "src-line" },
+                        span { class: "src-ln", "aria-hidden": "true", "{l.number}" }
+                        if l.cited {
+                            mark { class: "src-text", "{l.text}" }
+                        } else {
+                            span { class: "src-text", "{l.text}" }
+                        }
+                    }
+                }
+            }
+        },
+        None => rsx! {
+            p { class: "viewer-label", "{label}" }
+            Passage { excerpt, code }
+        },
     }
 }
 
@@ -552,6 +665,13 @@ mod tests {
         render_with("/", lib, None, extra)
     }
 
+    fn lessons_cite(source: &str) -> margin_shared::Citation {
+        fake::sample_citations()
+            .into_iter()
+            .find(|c| c.source_id == source)
+            .unwrap()
+    }
+
     fn lib() -> LibraryState {
         let mut lib = LibraryState::from_library(fake::sample_library());
         lib.replace_workspaces(fake::sample_workspaces());
@@ -576,6 +696,45 @@ mod tests {
         assert!(html.contains("In “notes” on test-mac · figure.png"));
         assert!(html.contains(r#"class="viewer-figure""#));
         assert!(!html.contains(crate::citations::FOLDER_FILE_GONE));
+    }
+
+    #[test]
+    fn a_passage_with_lines_says_which_until_the_file_loads() {
+        // Only s7 here: s2's original is remembered by the next test.
+        let extra = Extra {
+            shown_passage: Some(lessons_cite("s7")),
+            ..Default::default()
+        };
+        let html = render_with("/", lib(), None, extra);
+        assert!(html.contains("Code · lines 1–7"), "{html}");
+        assert!(html.contains(r#"<p class="viewer-label">Lines 1–7</p>"#));
+        // The passage stands in until the file's lines arrive.
+        assert!(html.contains("viewer-code"));
+        assert!(html.contains("def square_coefficients"));
+        assert!(!html.contains("src-lines"));
+    }
+
+    #[test]
+    fn a_passage_with_lines_opens_on_them_in_the_file() {
+        let c = lessons_cite("s2");
+        let url = lib().sources["s2"].media_url.clone().unwrap();
+        super::remember_original(&url, fake::sample_original("s2").unwrap());
+        let extra = Extra {
+            shown_passage: Some(c),
+            ..Default::default()
+        };
+        let html = render_with("/", lib(), None, extra);
+        assert!(html.contains("Text · line 3"), "{html}");
+        assert!(html.contains(r#"<p class="viewer-label">Line 3</p>"#));
+        // The file's lines, numbered, line 3 marked.
+        assert!(html.contains(r#"id="viewer-lines""#));
+        assert!(html.contains(r#"aria-label="Line 3 in the file""#));
+        assert!(html.contains("# Gibbs overshoot"));
+        assert!(html.contains(
+            r#"<li class="src-line cited"><span class="src-ln" aria-hidden="true">3</span><mark class="src-text">Near a jump"#
+        ));
+        assert_eq!(html.matches("src-line cited").count(), 1);
+        assert!(!html.contains("viewer-excerpt"));
     }
 
     #[test]

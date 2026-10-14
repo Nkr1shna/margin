@@ -152,6 +152,16 @@ const PARTIAL_SUMS_PY: &str = "import numpy as np\n\n\ndef square_coefficients(n
 \"\"\"b_n of a unit square wave: 4/(n*pi) for odd n, zero for even n.\"\"\"\n    \
 n = np.arange(1, n_max + 1)\n    return np.where(n % 2 == 1, 4 / (n * np.pi), 0.0)\n";
 
+/// The text of a sample text or code source's original file (`s2`, `s7`), as
+/// `/media/sources/{id}/original` serves it.
+pub fn sample_original(source_id: &str) -> Option<&'static str> {
+    match source_id {
+        "s2" => Some(GIBBS_MD),
+        "s7" => Some(PARTIAL_SUMS_PY),
+        _ => None,
+    }
+}
+
 /// Where the sample sources' media live (`examples/sample-media`, made by its
 /// `generate.swift`).
 pub fn sample_media_dir() -> std::path::PathBuf {
@@ -223,6 +233,9 @@ pub fn sample_citations() -> Vec<Citation> {
         },
         Citation {
             excerpt: PARTIAL_SUMS_PY.trim_end().into(),
+            document_id: Some("doc-s7".into()),
+            start_line: Some(1),
+            end_line: Some(7),
             ..cite(2, "s7", "partial_sums.py", SourceKind::Code)
         },
         Citation {
@@ -238,6 +251,9 @@ pub fn sample_citations() -> Vec<Citation> {
         },
         Citation {
             excerpt: "Near a jump the partial sums overshoot by about 9% of the jump, whatever the number of terms.".into(),
+            document_id: Some("doc-s2".into()),
+            start_line: Some(3),
+            end_line: Some(3),
             ..cite(5, "s2", "notes/gibbs.md", SourceKind::Text)
         },
         Citation {
@@ -706,6 +722,8 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/search", get(search))
         .route("/api/settings", get(get_settings).patch(patch_settings))
         .route("/api/tools", get(tools))
+        .route(routes::TRACES, get(traces))
+        .route(routes::TRACES_ROLLUP, get(traces_rollup))
         .route("/api/devices", get(devices))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
         .route(
@@ -1716,8 +1734,29 @@ async fn patch_settings(
     if let Err(r) = authorized(&headers) {
         return r;
     }
+    // Checked as the service checks them, before anything changes.
+    if let Some(days) = req.trace_retention_days
+        && !(1..=3650).contains(&days)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Traces can be kept from 1 to 3650 days.",
+        );
+    }
+    if let Some(cfg) = &req.pipeline
+        && let Some(problem) = unknown_stage(cfg)
+    {
+        return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
+    }
     let settings = {
         let mut s = fake.state.lock().unwrap();
+        if let Some(v) = req.trace_retention_days {
+            s.settings.trace_retention_days = v;
+        }
+        if let Some(v) = req.pipeline {
+            s.settings.pipeline = v;
+        }
         if let Some(v) = req.openai_base_url {
             s.settings.openai_base_url = v;
         }
@@ -1755,6 +1794,56 @@ async fn patch_settings(
         },
     );
     Json(settings).into_response()
+}
+
+/// The stage names the service's registry knows (`crates/service`: `pipeline.rs`,
+/// `ingest.rs`, `retrieval.rs`), by kind.
+pub const FAKE_STAGES: &[(&str, &[&str])] = &[
+    ("chunker", &["pages-v1", "sections-v2"]),
+    ("retriever", &["bm25", "dense", "hybrid-rrf"]),
+    ("fusion", &["first", "linear", "rrf"]),
+    ("reranker", &["none"]),
+    ("packer", &["mmr-v1", "take-k"]),
+];
+
+/// The service's 400 for a pipeline naming a stage it doesn't have.
+fn unknown_stage(cfg: &margin_shared::pipeline::PipelineConfig) -> Option<String> {
+    let named = [
+        ("chunker", &cfg.chunker.name),
+        ("retriever", &cfg.retriever.name),
+        ("fusion", &cfg.fusion.name),
+        ("reranker", &cfg.reranker.name),
+        ("packer", &cfg.packer.name),
+    ];
+    named.into_iter().find_map(|(kind, name)| {
+        let known = FAKE_STAGES.iter().find(|(k, _)| *k == kind)?.1;
+        (!known.contains(&name.as_str())).then(|| {
+            format!(
+                "There is no {kind} named \"{name}\" (known: {}).",
+                known.join(", ")
+            )
+        })
+    })
+}
+
+/// `GET /api/traces`: the fake records no traces, so none (JSON lines, oldest first).
+async fn traces(headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        "",
+    )
+        .into_response()
+}
+
+/// `GET /api/traces/rollup`: no traces, so no buckets.
+async fn traces_rollup(headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    Json(Vec::<margin_shared::context::TraceRollup>::new()).into_response()
 }
 
 async fn tools(headers: HeaderMap) -> Response {
@@ -2578,8 +2667,7 @@ async fn source_media(
         }
     } else if file == "original" {
         match (id.as_str(), uploaded) {
-            ("s2", _) => GIBBS_MD.as_bytes().to_vec(),
-            ("s7", _) => PARTIAL_SUMS_PY.as_bytes().to_vec(),
+            ("s2" | "s7", _) => sample_original(&id).unwrap_or_default().as_bytes().to_vec(),
             (_, Some(bytes)) => bytes,
             _ => return not_found(),
         }
@@ -2675,7 +2763,7 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
 // ---------------------------------------------------------------------------
 // Chats: a scripted stand-in for the agent. A message is answered with a reasoning
 // summary, a `search_library` call over the fake library and a short Markdown answer;
-// "source" adds a `search_sources` call with a Passages card, "delete" asks to delete a
+// "source" adds a `search` call with a Passages card, "delete" asks to delete a
 // note (a confirmation card), "fail" ends the turn on a retryable error. Asking for a
 // course ("course", "outline", "teach me", …) proposes one with `propose_course` (an
 // outline card); "go ahead" then accepts the chat's outline with `accept_proposal` (a
@@ -2773,12 +2861,12 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             "t2",
             call(
                 "call_2",
-                "search_sources",
-                r#"{"query":"partial sums overshoot","topic_id":"fourier","source_ids":null}"#,
-                "Searching the sources for “partial sums overshoot”",
+                "search",
+                r#"{"query":"partial sums overshoot","scope":null,"k":null,"modalities":null}"#,
+                "Searching for “partial sums overshoot”",
             ),
         ),
-        item("c1", 8, "t2", result("call_2", "3 passages in 3 files")),
+        item("c1", 8, "t2", result("call_2", "3 passages from 3 documents")),
         item(
             "c1",
             9,
@@ -2794,6 +2882,54 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
         item(
             "c1",
             10,
+            "t2",
+            call(
+                "call_3",
+                "document_outline",
+                r#"{"document_id":"doc-s1"}"#,
+                "Reading a document's outline",
+            ),
+        ),
+        item("c1", 11, "t2", result("call_3", "3 sections")),
+        item(
+            "c1",
+            12,
+            "t2",
+            call(
+                "call_4",
+                "read_passage",
+                r#"{"document_id":"doc-s1","page":3,"from_ord":null,"to_ord":null}"#,
+                "Reading page 3",
+            ),
+        ),
+        item("c1", 13, "t2", result("call_4", "2 passages")),
+        item(
+            "c1",
+            14,
+            "t2",
+            call(
+                "call_5",
+                "view_picture",
+                r#"{"document_id":"doc-s1","page":3}"#,
+                "Looking at page 3",
+            ),
+        ),
+        item("c1", 15, "t2", result("call_5", "Page 3 of Oppenheim ch3.pdf")),
+        item(
+            "c1",
+            16,
+            "t2",
+            ChatItemKind::Card {
+                call_id: "call_5".into(),
+                card: Card::Passages(PassagesCard {
+                    query: "Oppenheim ch3.pdf, page 3".into(),
+                    passages: sample_citations().into_iter().take(1).collect(),
+                }),
+            },
+        ),
+        item(
+            "c1",
+            17,
             "t2",
             ChatItemKind::AssistantText {
                 text: "Three of the topic's sources cover it: the textbook's chapter 3 [page 3], the script that plots the partial sums, and the square-wave figure.".into(),
@@ -2908,10 +3044,61 @@ pub fn sample_tool_output(call_id: &str) -> String {
             {"kind": "note", "id": "n1", "title": "Whole-number multiples", "context": "Signals & Systems / Fourier series", "snippet": "Every frequency is a whole-number multiple of the base frequency."}
         ])
         .to_string(),
-        "call_2" => serde_json::to_string(&sample_citations().into_iter().take(3).collect::<Vec<_>>())
-            .unwrap_or_default(),
+        "call_2" => search_output(
+            "partial sums overshoot",
+            &sample_citations().into_iter().take(3).collect::<Vec<_>>(),
+        ),
+        "call_3" => serde_json::json!({
+            "document_id": "doc-s1",
+            "source": "Oppenheim ch3.pdf",
+            "sections": [
+                {"section": "3.1 A historical perspective", "from_ord": 0, "to_ord": 1, "pages": [1, 2], "lines": null},
+                {"section": "3.2 The response of LTI systems to complex exponentials", "from_ord": 2, "to_ord": 3, "pages": [3, 3], "lines": null},
+                {"section": "3.3 Fourier series representation", "from_ord": 4, "to_ord": 6, "pages": [4, 6], "lines": null},
+            ],
+        })
+        .to_string(),
+        "call_4" => serde_json::json!({
+            "document_id": "doc-s1",
+            "source": "Oppenheim ch3.pdf",
+            "passages": [
+                {"ord": 2, "section": "3.2 The response of LTI systems to complex exponentials", "page": 3, "text": sample_citations()[0].excerpt},
+                {"ord": 3, "section": "3.2 The response of LTI systems to complex exponentials", "page": 3, "text": "Each coefficient is an inner product with one harmonic."},
+            ],
+        })
+        .to_string(),
+        "call_5" => serde_json::json!({
+            "document_id": "doc-s1",
+            "source": "Oppenheim ch3.pdf",
+            "page": 3,
+            "text_in_picture": "3.2 The response of LTI systems to complex exponentials",
+            "shown_to_owner": true,
+        })
+        .to_string(),
         _ => String::new(),
     }
+}
+
+/// `search`'s output as the service writes it: the passages numbered, each with its
+/// document, section and locator.
+fn search_output(query: &str, passages: &[Citation]) -> String {
+    serde_json::json!({
+        "query": query,
+        "passages": passages.iter().map(|c| serde_json::json!({
+            "n": c.n,
+            "document_id": c.document_id,
+            "source_id": c.source_id,
+            "source": c.source_name,
+            "section": "",
+            "page": c.page,
+            "start_line": c.start_line,
+            "end_line": c.end_line,
+            "start_ms": c.start_ms,
+            "end_ms": c.end_ms,
+            "text": c.excerpt,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 /// Make the passages' relative media URLs absolute under `base`.
@@ -4111,15 +4298,21 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
                 .take(3)
                 .collect()
         };
-        let output = serde_json::to_string(&passages).unwrap_or_default();
+        let output = search_output(&query, &passages);
+        let documents: std::collections::HashSet<&str> =
+            passages.iter().map(|c| c.source_id.as_str()).collect();
         let Some(call_id) = tool_call(
             &fake,
             chat_id,
             turn_id,
-            "search_sources",
-            serde_json::json!({ "query": query, "topic_id": null, "source_ids": null }),
-            format!("Searching the sources for “{query}”"),
-            format!("{} passages", passages.len()),
+            "search",
+            serde_json::json!({ "query": query, "scope": null, "k": null, "modalities": null }),
+            format!("Searching for “{query}”"),
+            format!(
+                "{} passages from {} documents",
+                passages.len(),
+                documents.len()
+            ),
             output,
         )
         .await

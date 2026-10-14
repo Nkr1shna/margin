@@ -1794,6 +1794,171 @@ mod tests {
         assert_eq!(cleared.reasoning_effort, ReasoningEffort::High);
     }
 
+    /// What Settings → AI (model slots, pipeline budget, Reset to default) and Settings →
+    /// Advanced (trace retention) send, through the fake service.
+    #[tokio::test]
+    async fn model_slots_pipeline_budget_and_trace_retention() {
+        use crate::ui::settings::{
+            budget_fields, parse_budget, reset_pipeline, slot_value, slots_patch,
+        };
+        use margin_shared::pipeline::{Budget, PipelineConfig, Route, StageCfg};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let settings = api.settings().await.unwrap();
+        assert_eq!(settings.pipeline, PipelineConfig::default());
+
+        // The three slots: chats on agent_model, writing and small tasks on the routes.
+        let wanted = [
+            "gpt-6.1-sol".to_string(),
+            " gpt-6 ".to_string(),
+            "gpt-6-luna".to_string(),
+        ];
+        let settings = api
+            .patch_settings(&slots_patch(&settings, &wanted))
+            .await
+            .unwrap();
+        assert_eq!(settings.agent_model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
+        assert_eq!(
+            settings.pipeline.routes.get(Route::Small),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(settings.pipeline.routes.get(Route::Chat), None);
+        assert_eq!(slot_value(&settings, Route::Write), "gpt-6");
+        // Nothing changed: nothing to send.
+        assert_eq!(slots_patch(&settings, &wanted), SettingsPatch::default());
+
+        // The budget's numbers, saved with the rest of the pipeline kept.
+        let mut fields = budget_fields(&settings.pipeline.budget);
+        assert_eq!(fields, ["50", "25", "8", "0"].map(String::from));
+        fields[0] = "75".into();
+        fields[2] = "24".into();
+        let budget = parse_budget(&fields).unwrap();
+        let settings = api
+            .patch_settings(&SettingsPatch {
+                pipeline: Some(PipelineConfig {
+                    budget,
+                    ..settings.pipeline.clone()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.budget.share_of_window, 0.75);
+        assert_eq!(settings.pipeline.budget.images_max, 24);
+        assert_eq!(
+            settings.pipeline.routes.get(Route::Small),
+            Some("gpt-6-luna")
+        );
+        assert_ne!(settings.pipeline.hash(), PipelineConfig::default().hash());
+
+        // A stage the service doesn't have is refused, naming it.
+        let mut bad = settings.pipeline.clone();
+        bad.retriever = StageCfg::named("telepathy");
+        let err = api
+            .patch_settings(&SettingsPatch {
+                pipeline: Some(bad),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((err.status, err.code.as_str()), (Some(400), "bad_pipeline"));
+        assert!(err.message.contains("telepathy"), "{}", err.message);
+
+        // Reset to default: stages and budget back, the slots kept.
+        let settings = api
+            .patch_settings(&SettingsPatch {
+                pipeline: Some(reset_pipeline(&settings.pipeline)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.budget, Budget::default());
+        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
+        assert_eq!(reset_pipeline(&settings.pipeline), settings.pipeline);
+
+        // Trace retention, in range or refused.
+        let settings = api
+            .patch_settings(&SettingsPatch {
+                trace_retention_days: Some(30),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.trace_retention_days, 30);
+        let err = api
+            .patch_settings(&SettingsPatch {
+                trace_retention_days: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert_eq!(api.settings().await.unwrap().trace_retention_days, 30);
+    }
+
+    /// The trace routes answer as the service's do when there are none.
+    #[tokio::test]
+    async fn trace_routes_are_empty() {
+        let fake = FakeService::start().await;
+        let http = reqwest::Client::new();
+        let get = |path: &str| {
+            http.get(format!("{}{path}", fake.url))
+                .bearer_auth(crate::fake::TOKEN)
+                .send()
+        };
+        let traces = get(routes::TRACES).await.unwrap();
+        assert_eq!(traces.status(), 200);
+        assert_eq!(
+            traces.headers()["content-type"].to_str().unwrap(),
+            "application/x-ndjson"
+        );
+        assert_eq!(traces.text().await.unwrap(), "");
+        let rollup = get(routes::TRACES_ROLLUP).await.unwrap();
+        assert_eq!(rollup.status(), 200);
+        assert_eq!(rollup.text().await.unwrap(), "[]");
+        let anonymous = http
+            .get(format!("{}{}", fake.url, routes::TRACES))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), 401);
+    }
+
+    /// A text citation with lines opens on the original file's lines, fetched from its
+    /// signed URL.
+    #[tokio::test]
+    async fn cited_lines_come_from_the_original_file() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let lib = api.library().await.unwrap();
+        let lesson = lib.lessons.iter().find(|l| l.id == "l1").unwrap();
+        let cited = lesson
+            .citations
+            .iter()
+            .find(|c| c.source_id == "s2")
+            .unwrap();
+        let source = lib.sources.iter().find(|s| s.id == "s2").unwrap();
+        let view =
+            crate::citations::viewer(cited, &lesson.citations, source.media_url.as_deref(), &[]);
+        let crate::citations::Viewer::Lines {
+            excerpt,
+            start_line,
+            end_line,
+            original: Some(url),
+            ..
+        } = view
+        else {
+            panic!("not lines: {view:?}");
+        };
+        let text = api.fetch_text(&url).await.unwrap();
+        let lines = crate::citations::line_window(&text, start_line, end_line, &excerpt).unwrap();
+        let marked: Vec<u32> = lines.iter().filter(|l| l.cited).map(|l| l.number).collect();
+        assert_eq!(marked, [3]);
+        assert_eq!(lines.first().unwrap().number, 1);
+        assert!(lines[2].text.starts_with("Near a jump"));
+    }
+
     #[tokio::test]
     async fn chats_take_files_with_a_message_and_let_them_go() {
         let fake = FakeService::start().await;

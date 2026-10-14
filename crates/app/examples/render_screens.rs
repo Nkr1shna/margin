@@ -20,9 +20,13 @@
 //! - `RENDER_CONFIRM=pending|approved|denied|stopped|expired` adds a confirmation card to
 //!   chat `c1` (`pending`: the answer waits on it).
 //! - `RENDER_EMBEDDING=missing|downloading|ready|failed` sets the embedding model's state.
-//! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n;
+//! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n (5: a
+//!   Markdown note and 2: a script open on their cited lines in the file);
 //!   `RENDER_VIEWER=folder` (or `folder-gone`) on a passage of a folder's PDF (or of a
 //!   file whose folder was removed).
+//! - `RENDER_PIPELINE=changed` sets the three model slots and a changed pipeline budget
+//!   (Settings → AI, `RENDER_SETTINGS=ai`; Reset to default is offered then).
+//! - `RENDER_SETTINGS=advanced` shows trace retention.
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
@@ -136,6 +140,23 @@ fn Harness(props: HarnessProps) -> Element {
             pipeline: Default::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
         });
+        if std::env::var("RENDER_PIPELINE").as_deref() == Ok("changed")
+            && let Some(settings) = lib.settings.as_mut()
+        {
+            settings.agent_model = Some("gpt-6.1-sol".into());
+            settings.pipeline.routes.write = Some("gpt-6".into());
+            settings.pipeline.routes.small = Some("gpt-6-luna".into());
+            settings.pipeline.budget.share_of_window = 0.75;
+            settings.pipeline.budget.images_max = 24;
+        }
+        // The text and code sources' originals, so the viewer shows their cited lines
+        // (the fetch it would make doesn't run here).
+        for source in lib.sources.values() {
+            if let (Some(url), Some(text)) = (&source.media_url, fake::sample_original(&source.id))
+            {
+                ui::citations::remember_original(url, text);
+            }
+        }
         lib.embedding = std::env::var("RENDER_EMBEDDING")
             .ok()
             .map(|state| EmbeddingModel {

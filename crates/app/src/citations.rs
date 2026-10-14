@@ -27,15 +27,31 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
-/// Where in its source a citation points: "p. 3", "1:05–1:20", "1:05"; for a file of an
-/// attached folder without a page, its path in the folder; `None` when the whole source
-/// is meant (an image, a text passage).
+/// The lines of a text document a citation spans: "lines 12–18", "line 12".
+pub fn lines_text(c: &Citation) -> Option<String> {
+    let start = c.start_line?;
+    Some(match c.end_line.filter(|&e| e > start) {
+        Some(end) => format!("lines {start}–{end}"),
+        None => format!("line {start}"),
+    })
+}
+
+/// Where in its source a citation points: "p. 3", "lines 12–18", "1:05–1:20", "1:05";
+/// for a file of an attached folder without a page, its path in the folder (and its
+/// lines); `None` when the whole source is meant (an image, a passage without lines).
 pub fn locator(c: &Citation) -> Option<String> {
     if let Some(page) = c.page {
         return Some(format!("p. {page}"));
     }
+    let lines = lines_text(c);
     if let Some(file) = &c.file {
-        return Some(file.path.clone());
+        return Some(match lines {
+            Some(lines) => format!("{} · {lines}", file.path),
+            None => file.path.clone(),
+        });
+    }
+    if lines.is_some() {
+        return lines;
     }
     match (c.start_ms, c.end_ms) {
         (Some(start), Some(end)) if end > start => Some(format!("{}–{}", clock(start), clock(end))),
@@ -177,6 +193,18 @@ pub enum Viewer {
     },
     /// A text or code passage.
     Passage { excerpt: String, code: bool },
+    /// A text or code passage that knows its lines: the original file's lines around
+    /// them (fetched from `original`), the cited ones marked; the passage alone until
+    /// then, or when the original can't be had or no longer matches.
+    Lines {
+        excerpt: String,
+        code: bool,
+        start_line: u32,
+        end_line: u32,
+        /// The original file's URL, when its lines are the ones the passage counts
+        /// (not for text read out of HTML).
+        original: Option<String>,
+    },
     /// Nothing to show: the source has no picture and the passage no text.
     Missing,
 }
@@ -220,11 +248,88 @@ pub fn viewer(
             transcript: whole_transcript(c, all, lines),
         },
         SourceKind::Text | SourceKind::Code if excerpt.is_empty() => Viewer::Missing,
-        SourceKind::Text | SourceKind::Code => Viewer::Passage {
-            excerpt,
-            code: c.kind == SourceKind::Code,
+        SourceKind::Text | SourceKind::Code => match c.start_line {
+            Some(start_line) => Viewer::Lines {
+                excerpt,
+                code: c.kind == SourceKind::Code,
+                start_line,
+                end_line: c.end_line.unwrap_or(start_line).max(start_line),
+                original: media_url
+                    .filter(|_| lines_are_the_files(&c.source_name))
+                    .map(str::to_string),
+            },
+            None => Viewer::Passage {
+                excerpt,
+                code: c.kind == SourceKind::Code,
+            },
         },
     }
+}
+
+/// Whether a text file's own lines are the ones its passages count: not for HTML, whose
+/// text is read out of the markup first.
+pub fn lines_are_the_files(name: &str) -> bool {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    !matches!(ext.as_str(), "html" | "htm" | "xhtml")
+}
+
+/// Lines shown before and after the cited ones.
+pub const CONTEXT_LINES: u32 = 12;
+
+/// A line of a text file as the viewer shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumberedLine {
+    /// 1-based.
+    pub number: u32,
+    pub text: String,
+    /// Within the cited lines.
+    pub cited: bool,
+}
+
+/// The lowercase words of `text` (letters and digits), for comparing a passage with the
+/// file's lines whatever the spacing or markup between them.
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The lines of `original` from `CONTEXT_LINES` before `start` to as many after `end`,
+/// the cited ones (`start..=end`) marked. `None` when the file doesn't hold the passage
+/// there (it changed since it was read): its first words must be among the cited lines.
+pub fn line_window(
+    original: &str,
+    start: u32,
+    end: u32,
+    excerpt: &str,
+) -> Option<Vec<NumberedLine>> {
+    let lines: Vec<&str> = original.lines().collect();
+    let total = lines.len() as u32;
+    let end = end.max(start);
+    if start == 0 || start > total {
+        return None;
+    }
+    let end = end.min(total);
+    let cited = words(&lines[(start - 1) as usize..end as usize].join("\n"));
+    let first: Vec<String> = words(excerpt).into_iter().take(6).collect();
+    if first.is_empty() || !cited.windows(first.len()).any(|w| w == first.as_slice()) {
+        return None;
+    }
+    let from = start.saturating_sub(CONTEXT_LINES).max(1);
+    let to = (end + CONTEXT_LINES).min(total);
+    Some(
+        (from..=to)
+            .map(|n| NumberedLine {
+                number: n,
+                text: lines[(n - 1) as usize].to_string(),
+                cited: (start..=end).contains(&n),
+            })
+            .collect(),
+    )
 }
 
 /// The stretch of the recording a citation points at: its span, or for a moment (a
@@ -389,6 +494,100 @@ mod tests {
         assert_eq!(locator(&frame).as_deref(), Some("0:04"));
         assert_eq!(locator(&cite(4, "d", SourceKind::Image)), None);
         assert_eq!(marker_label(2, "talk.m4a"), "Source 2: talk.m4a");
+    }
+
+    #[test]
+    fn locators_read_as_lines() {
+        let lines = Citation {
+            start_line: Some(12),
+            end_line: Some(18),
+            ..cite(1, "a", SourceKind::Text)
+        };
+        assert_eq!(locator(&lines).as_deref(), Some("lines 12–18"));
+        let one = Citation {
+            start_line: Some(4),
+            end_line: Some(4),
+            ..cite(2, "a", SourceKind::Code)
+        };
+        assert_eq!(locator(&one).as_deref(), Some("line 4"));
+        assert_eq!(lines_text(&cite(3, "a", SourceKind::Text)), None);
+        // A folder's file: its path, then its lines.
+        let mut file = lines.clone();
+        file.file = Some(margin_shared::WorkspaceFile {
+            workspace_id: "w1".into(),
+            path: "ch1/intro.md".into(),
+        });
+        assert_eq!(
+            locator(&file).as_deref(),
+            Some("ch1/intro.md · lines 12–18")
+        );
+        // A page wins over lines.
+        let page = Citation {
+            page: Some(2),
+            ..lines.clone()
+        };
+        assert_eq!(locator(&page).as_deref(), Some("p. 2"));
+    }
+
+    #[test]
+    fn cited_lines_open_in_the_file() {
+        let c = Citation {
+            excerpt: "Overshoot near the jump stays.".into(),
+            start_line: Some(14),
+            end_line: Some(15),
+            ..cite(1, "a", SourceKind::Text)
+        };
+        let all = std::slice::from_ref(&c);
+        assert_eq!(
+            viewer(&c, all, Some("orig"), &[]),
+            Viewer::Lines {
+                excerpt: "Overshoot near the jump stays.".into(),
+                code: false,
+                start_line: 14,
+                end_line: 15,
+                original: Some("orig".into()),
+            }
+        );
+        // HTML's lines are of the text read out of it, not of the file.
+        let html = Citation {
+            source_name: "page.html".into(),
+            ..c.clone()
+        };
+        assert!(matches!(
+            viewer(&html, all, Some("orig"), &[]),
+            Viewer::Lines { original: None, .. }
+        ));
+        assert!(lines_are_the_files("notes/a.MD"));
+        assert!(!lines_are_the_files("x/page.HTM"));
+
+        let file: String = (1..=40)
+            .map(|n| match n {
+                14 => "## Gibbs: overshoot".to_string(),
+                15 => "near the *jump* stays.".to_string(),
+                n => format!("line {n}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window = line_window(&file, 14, 15, &c.excerpt).unwrap();
+        assert_eq!(window.first().unwrap().number, 14 - CONTEXT_LINES);
+        assert_eq!(window.last().unwrap().number, 15 + CONTEXT_LINES);
+        let cited: Vec<u32> = window
+            .iter()
+            .filter(|l| l.cited)
+            .map(|l| l.number)
+            .collect();
+        assert_eq!(cited, [14, 15]);
+        assert_eq!(window[CONTEXT_LINES as usize].text, "## Gibbs: overshoot");
+        // Near the ends the window stops at the file's first and last lines.
+        let top = line_window(&file, 1, 1, "line 1").unwrap();
+        assert_eq!((top[0].number, top.len()), (1, 1 + CONTEXT_LINES as usize));
+        let bottom = line_window(&file, 40, 99, "line 40").unwrap();
+        assert_eq!(bottom.last().unwrap().number, 40);
+        // The file changed since it was read, or the lines are past its end: none.
+        assert_eq!(line_window(&file, 20, 21, &c.excerpt), None);
+        assert_eq!(line_window(&file, 41, 42, "line"), None);
+        assert_eq!(line_window(&file, 0, 2, "line 1"), None);
+        assert_eq!(line_window(&file, 14, 15, "  "), None);
     }
 
     #[test]
