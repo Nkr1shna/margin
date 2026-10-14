@@ -25,9 +25,12 @@ Every decision below was made explicitly by the owner. Do not change one without
 | Tool install | The app shows whether `manimgx` and `fluidaudiocli` are found on the service Mac, with **install commands to copy** — it never runs installers. |
 | Scene code | AI-written scene code renders **automatically, sandboxed** (macOS `sandbox-exec`: no network, writes only in the video's folder). Elsewhere rendering is refused unless the service runs with `--allow-unsandboxed-render` (tests only). |
 | Playback | In-app `<video>` element (the Dioxus webview), streaming from the service's signed media URLs. |
-| Sources | Files and folders added **in the Ask composer**, uploaded from the app to the service and **kept with the resulting topic** (the topic menu's "Sources…" adds/removes later). Types: **text, code, PDF**. Used through **retrieval**: chunks embedded locally, the most relevant passages go into outline and lesson prompts. |
-| Embeddings | **EmbeddingGemma 2, Core ML** (`FluidInference/embeddinggemma-2-coreml`) run **inside the service** from Rust (`objc2-core-ml`, `tokenizers`); no helper process. **Never bundled**: downloaded from Hugging Face by a button in Settings. Text only for now (≤ 512 tokens per call). |
+| Sources | Files and folders added **in the Ask composer**, uploaded from the app to the service and **kept with the resulting topic** (the topic menu's "Sources…" adds/removes later). Types: **text, code, PDF (text and page images), images, audio, video** (frames + soundtrack). Used through **retrieval**: chunks embedded locally, the most relevant passages go into outline and lesson prompts. |
+| Embeddings | **EmbeddingGemma 2, Core ML** (`FluidInference/embeddinggemma-2-coreml`) run **inside the service** from Rust (`objc2-core-ml`, `tokenizers`); no helper process. **Never bundled**: downloaded from Hugging Face by a button in Settings. Text, image and audio encoders, all downloaded by one button (~1.4 GB). |
 | PDF text | Apple **PDFKit** (`objc2-pdf-kit`); pages without a text layer are rendered and read with **Vision OCR** (`objc2-vision`). |
+| Media in lessons | Retrieved images (image files, PDF pages, video frames) go to the writer as **image inputs**; audio is **transcribed locally** (FluidAudio `transcribe`, Parakeet) and its transcript span goes in as text. |
+| Citations | Lessons cite with Markdown footnotes `[^n]`; no inline images. A **Sources** list follows the lesson and a **source viewer** opens the exact page / time / image / passage. |
+| Mobile pickers | Adding files **and folders** works on iOS/iPadOS (UIDocumentPicker) and Android (Storage Access Framework), not only desktop. |
 
 ## Layout
 
