@@ -90,9 +90,34 @@ EOF
     todo="$todo
   - cloudflared tunnel create $(vm_name "$env_name") (in the guest), then
     provision-guest.sh $env_name --tunnel-uuid <UUID>"
-  elif [ ! -f "$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist" ]; then
-    "$cloudflared" service install
-    echo "Installed the cloudflared LaunchAgent."
+  else
+    # Not `cloudflared service install`: its LaunchAgent runs bare `cloudflared`, which
+    # only prints "use cloudflared tunnel run" and exits, so the tunnel never connects.
+    plist="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+    cat > "$plist.part" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cloudflare.cloudflared</string>
+  <key>ProgramArguments</key><array>
+    <string>$cloudflared</string><string>tunnel</string>
+    <string>--config</string><string>$p/cloudflared/config.yml</string><string>run</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/com.cloudflare.cloudflared.out.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/com.cloudflare.cloudflared.err.log</string>
+</dict></plist>
+EOF
+    plutil -lint "$plist.part" >/dev/null
+    if ! cmp -s "$plist.part" "$plist"; then
+      mv -f "$plist.part" "$plist"
+      launchctl bootout "gui/$(id -u)/com.cloudflare.cloudflared" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      echo "Installed the cloudflared LaunchAgent."
+    else
+      rm -f "$plist.part"
+    fi
   fi
 
   # The LaunchAgents.

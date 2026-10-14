@@ -65,3 +65,10 @@ jobs:
           [ "$(cat dist/BUILD_SHA)" = "$SHA" ] || { echo "::error::the artifact is stamped $(cat dist/BUILD_SHA), not $SHA"; exit 1; }
           chmod +x dist/margin-service
           deploy/scripts/deploy.sh prod dist/margin-service "$SHA"
+      # Records which commit prod now runs; the apps workflow builds the matching app from it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployed-prod-${{ steps.dev.outputs.sha }}
+          path: dist/BUILD_SHA
+          retention-days: 90
+          if-no-files-found: error
