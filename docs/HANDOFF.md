@@ -15,6 +15,7 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 | `docs/agent-providers-brief.md` | **Switchable model providers brief (OpenAI key / ChatGPT sign-in / Claude API)**; see the status below |
 | `docs/agent-engine-review.md` | Fable's review of the ACP/CLI-engine idea. Background only, superseded by the providers decision |
 | `docs/service-setup.md` | How the service and Cloudflare Tunnel run |
+| `docs/plan-dogfood.md` | **D (dogfood)**: Margin as the knowledge base for building Margin. `crates/mcp` (`margin-mcp serve/login/ingest/ingest-dir/purge`), `.mcp.json`, `/margin-handoff`, `scripts/{backup-margin,ingest-docs}.sh`; live once R1-store and R1-retrieve merge |
 
 ## Status
 
