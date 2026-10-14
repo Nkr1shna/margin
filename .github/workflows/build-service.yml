@@ -6,7 +6,7 @@ name: build-service
 
 on:
   push:
-    branches: [claude/agent-build]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
