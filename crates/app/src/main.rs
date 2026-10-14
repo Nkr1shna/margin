@@ -8,6 +8,7 @@ mod events;
 #[cfg(test)]
 mod fake;
 mod markdown;
+mod picker;
 mod routes;
 mod secrets;
 mod sources;
@@ -34,6 +35,7 @@ const KATEX: Asset = asset!("/assets/katex", AssetOptions::folder());
 const FONTS: Asset = asset!("/assets/fonts", AssetOptions::folder());
 
 fn main() {
+    picker::clear_staging();
     #[cfg(feature = "desktop")]
     {
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};

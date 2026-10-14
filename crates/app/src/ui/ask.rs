@@ -14,7 +14,7 @@ use crate::sources::UploadState;
 use crate::state::use_app;
 use crate::ui::common::{ErrorNotice, Icon, TopBar};
 use crate::ui::sources::{
-    AddSourcesMenu, AskAttachments, CAN_ADD, EmbeddingNotice, refresh_embedding,
+    AddSourcesMenu, AskAttachments, EmbeddingNotice, refresh_embedding,
 };
 
 pub fn level_label(level: Level) -> &'static str {
@@ -254,9 +254,7 @@ pub fn AskScreen() -> Element {
                                 option { key: "{id}", value: "{id}", selected: subject.read().as_deref() == Some(id.as_str()), "{title}" }
                             }
                         }
-                        if CAN_ADD {
-                            AddSourcesMenu { on_note: move |note| sources_note.set(note) }
-                        }
+                        AddSourcesMenu { on_note: move |note| sources_note.set(note) }
                         button {
                             class: "send",
                             "aria-label": "Draft an outline",

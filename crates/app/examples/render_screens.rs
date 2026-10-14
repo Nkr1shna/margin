@@ -25,6 +25,8 @@ mod config;
 mod fake;
 #[path = "../src/markdown.rs"]
 mod markdown;
+#[path = "../src/picker/mod.rs"]
+mod picker;
 #[path = "../src/routes.rs"]
 mod routes;
 #[path = "../src/secrets.rs"]

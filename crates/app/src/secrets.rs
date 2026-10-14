@@ -35,7 +35,7 @@ mod platform {
             let name = "android";
             keyring::use_named_store(name).map_err(|e| e.to_string())
         });
-        result.clone().map_err(|e| Error::NotSupportedByStore(e))
+        result.clone().map_err(Error::NotSupportedByStore)
     }
 
     pub fn entry(service: &str, user: &str) -> Result<Entry, Error> {

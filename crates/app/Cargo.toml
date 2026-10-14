@@ -50,6 +50,15 @@ objc2 = "=0.6.5"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder", "objc2-core-foundation"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSGeometry"] }
 
+# Document picker for adding sources on iOS and iPadOS (src/picker/ios.rs). Same objc2
+# family as the macOS crates above and as tao/wry.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "=0.6.5"
+block2 = "=0.6.2"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSError", "NSFileCoordinator", "NSObject", "NSString", "NSURL"] }
+objc2-ui-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "UIDocumentPickerViewController", "UIResponder", "UIViewController", "objc2-uniform-type-identifiers"] }
+objc2-uniform-type-identifiers = { version = "=0.3.2", default-features = false, features = ["std", "UTCoreTypes", "UTType"] }
+
 [dev-dependencies]
 axum = { version = "=0.8.9", features = ["ws"] }
 dioxus-ssr = "=0.7.9"
