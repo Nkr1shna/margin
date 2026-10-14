@@ -1498,6 +1498,8 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
             previous_body: prev.map(Into::into),
             previous_citations: None,
             author: Default::default(),
+            prompt: None,
+            with_quiz: false,
         };
     store
         .put(

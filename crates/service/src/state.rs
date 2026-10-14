@@ -71,6 +71,13 @@ pub struct StoredLesson {
     /// written before this field existed read as the owner's.
     #[serde(default)]
     pub author: Author,
+    /// What the lesson writer is told the learner asked for, for a lesson with no
+    /// proposal (the agent's `write_lesson`); a lesson from a proposal reads its request.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Whether a lesson with no proposal ends with a "Check yourself" quiz.
+    #[serde(default)]
+    pub with_quiz: bool,
 }
 
 /// Who wrote a note's or a lesson's text, for owner decision Q2: the agent changes its
