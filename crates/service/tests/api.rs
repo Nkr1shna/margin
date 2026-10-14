@@ -1136,6 +1136,41 @@ async fn videos_render_through_the_queue_with_signed_media() {
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("Hello"));
 
+    // The poster: signed, served as PNG, range-capable.
+    let poster_url = media.poster_url.clone().expect("a poster url");
+    assert!(poster_url.starts_with(&format!("{}/media/videos/{}/poster.png?exp=", h.url, v.id)));
+    let q: std::collections::HashMap<String, String> = reqwest::Url::parse(&poster_url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect();
+    let exp: i64 = q["exp"].parse().unwrap();
+    assert_eq!(q["sig"], h.state.media_signature(&v.id, "poster.png", exp));
+    let r = h.http.get(&poster_url).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "image/png");
+    assert_eq!(r.bytes().await.unwrap().to_vec(), poster_content());
+    let r = h
+        .http
+        .get(&poster_url)
+        .header("range", "bytes=8-15")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.headers()["content-type"], "image/png");
+    assert_eq!(
+        r.headers()["content-range"],
+        format!("bytes 8-15/{POSTER_BYTES}")
+    );
+    assert_eq!(
+        r.bytes().await.unwrap().to_vec(),
+        poster_content()[8..16].to_vec()
+    );
+    let unsigned = poster_url.split('?').next().unwrap().to_string();
+    let (status, _) = api_error(h.http.get(&unsigned).send().await.unwrap()).await;
+    assert_eq!(status, 403);
+
     // Tampered and expired links fail.
     let tampered = media.mp4_url.replace("video.mp4", "storyboard.png");
     let (status, e) = api_error(h.http.get(&tampered).send().await.unwrap()).await;
@@ -1191,6 +1226,126 @@ async fn videos_render_through_the_queue_with_signed_media() {
     );
     assert!(again.media.is_none());
     sock.until(|e| matches!(e, Event::VideoChanged { video } if video.id == v.id && video.status == VideoStatus::Ready)).await;
+}
+
+async fn wait_video_ready(h: &Harness, token: &str, id: &str, renders: u32) -> Video {
+    eventually(|| async {
+        let v: Video = h
+            .get(token, &format!("/api/videos/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (v.status == VideoStatus::Ready && h.renderer.renders.load(Ordering::SeqCst) >= renders)
+            .then_some(v)
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rerender_clears_the_poster_and_a_render_without_one_has_no_poster_url() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    h.configure_ai(&t).await;
+    let (topic, _) = create_lessons(&h, &t, "posters", 1, false).await;
+    let lesson = wait_lessons_ready(&h, &t, &topic.id).await.remove(0);
+
+    let v: Video = h
+        .post(&t, &format!("/api/lessons/{}/video", lesson.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v = wait_video_ready(&h, &t, &v.id, 1).await;
+    let old_poster = v.media.unwrap().poster_url.expect("a poster url");
+    assert_eq!(h.http.get(&old_poster).send().await.unwrap().status(), 200);
+
+    // Re-render with a scene that has no poster: the flag drops as soon as it queues.
+    h.renderer.no_poster.store(true, Ordering::SeqCst);
+    let again: Video = h
+        .post(&t, &format!("/api/lessons/{}/video", lesson.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again.id, v.id);
+    let stored: StoredVideo = h.state.store.get(db::VIDEO, &v.id).await.unwrap().unwrap();
+    assert!(!stored.has_poster);
+    let again = wait_video_ready(&h, &t, &v.id, 2).await;
+    let media = again.media.unwrap();
+    assert!(media.captions_url.is_some());
+    assert_eq!(media.poster_url, None);
+    let (status, _) = api_error(h.http.get(&old_poster).send().await.unwrap()).await;
+    assert_eq!(status, 404);
+    let poster_path = h.data_dir.join("videos").join(&v.id).join("poster.png");
+    assert!(!poster_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn videos_stored_before_posters_existed_still_load() {
+    let store = Store::memory().await.unwrap();
+    let now = Utc::now();
+    let id = "00000000-0000-4000-8000-0000000000a1";
+    let mut row = serde_json::to_value(StoredVideo {
+        video: Video {
+            id: id.into(),
+            lesson_id: "l-gone".into(),
+            status: VideoStatus::Ready,
+            scene_code: None,
+            log: String::new(),
+            duration_seconds: Some(3.0),
+            media: None,
+            created_at: now,
+            updated_at: now,
+        },
+        has_captions: true,
+        has_poster: true,
+    })
+    .unwrap();
+    assert!(row.as_object_mut().unwrap().remove("has_poster").is_some());
+    store.put(db::VIDEO, id, &row).await.unwrap();
+    let loaded: StoredVideo = store.get(db::VIDEO, id).await.unwrap().unwrap();
+    assert!(loaded.has_captions);
+    assert!(!loaded.has_poster);
+
+    let h = start_with(Setup {
+        store: Some(store),
+        ..Setup::default()
+    })
+    .await;
+    let t = h.sign_in("Mac").await;
+    let v: Video = h
+        .get(&t, &format!("/api/videos/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let media = v.media.expect("a Ready video carries media");
+    assert!(media.captions_url.is_some());
+    assert_eq!(media.poster_url, None);
+    // Without the flag the poster isn't served, even with a valid signature.
+    let exp = Utc::now().timestamp() + 60;
+    let sig = h.state.media_signature(id, "poster.png", exp);
+    let (status, _) = api_error(
+        h.http
+            .get(format!(
+                "{}/media/videos/{id}/poster.png?exp={exp}&sig={sig}",
+                h.url
+            ))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1438,6 +1593,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
             updated_at: now,
         },
         has_captions: false,
+        has_poster: false,
     };
     store
         .put(

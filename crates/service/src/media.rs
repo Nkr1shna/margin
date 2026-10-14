@@ -11,7 +11,7 @@ use tower_http::services::ServeFile;
 
 use crate::db;
 use crate::error::AppError;
-use crate::state::{AppState, CAPTIONS_FILE, MP4_FILE, STORYBOARD_FILE, StoredVideo};
+use crate::state::{AppState, CAPTIONS_FILE, MP4_FILE, POSTER_FILE, STORYBOARD_FILE, StoredVideo};
 
 #[derive(Deserialize)]
 pub struct MediaQuery {
@@ -22,7 +22,7 @@ pub struct MediaQuery {
 fn content_type(file: &str) -> &'static str {
     match file {
         MP4_FILE => "video/mp4",
-        STORYBOARD_FILE => "image/png",
+        STORYBOARD_FILE | POSTER_FILE => "image/png",
         _ => "application/x-subrip; charset=utf-8",
     }
 }
@@ -48,7 +48,7 @@ async fn serve_inner(
 ) -> Result<Response, AppError> {
     let not_found = || AppError::not_found("file");
     if uuid::Uuid::parse_str(id).is_err()
-        || ![MP4_FILE, STORYBOARD_FILE, CAPTIONS_FILE].contains(&file)
+        || ![MP4_FILE, STORYBOARD_FILE, CAPTIONS_FILE, POSTER_FILE].contains(&file)
     {
         return Err(not_found());
     }
@@ -79,7 +79,10 @@ async fn serve_inner(
         .get(db::VIDEO, id)
         .await?
         .ok_or_else(not_found)?;
-    if video.video.status != VideoStatus::Ready || (file == CAPTIONS_FILE && !video.has_captions) {
+    if video.video.status != VideoStatus::Ready
+        || (file == CAPTIONS_FILE && !video.has_captions)
+        || (file == POSTER_FILE && !video.has_poster)
+    {
         return Err(not_found());
     }
     let path = state.video_dir(id).join(file);

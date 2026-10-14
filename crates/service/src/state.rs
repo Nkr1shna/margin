@@ -36,6 +36,7 @@ pub const INTERRUPTED: &str = "Interrupted when the service stopped.";
 pub const MP4_FILE: &str = "video.mp4";
 pub const STORYBOARD_FILE: &str = "storyboard.png";
 pub const CAPTIONS_FILE: &str = "captions.srt";
+pub const POSTER_FILE: &str = margin_video::POSTER_FILE;
 
 // ---------------------------------------------------------------------------
 // Stored rows (wire types plus service-only fields)
@@ -59,6 +60,10 @@ pub struct StoredVideo {
     pub video: Video,
     #[serde(default)]
     pub has_captions: bool,
+    /// Whether the last successful render left a `poster.png`. Absent (false) on rows
+    /// written before posters existed.
+    #[serde(default)]
+    pub has_poster: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +212,9 @@ impl App {
                 captions_url: stored
                     .has_captions
                     .then(|| self.media_url(&video.id, CAPTIONS_FILE, exp)),
-                poster_url: None,
+                poster_url: stored
+                    .has_poster
+                    .then(|| self.media_url(&video.id, POSTER_FILE, exp)),
                 expires_at: DateTime::from_timestamp(exp, 0).unwrap_or(expires_at),
             });
         }
