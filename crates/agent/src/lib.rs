@@ -28,20 +28,21 @@ mod tool;
 mod turn;
 
 pub use device::{
-    DeviceBridge, DeviceCall, DeviceError, NoDevices, device_output_text, device_tools,
+    APP_CONTROL_TOOLS, DeviceBridge, DeviceCall, DeviceError, FOLDER_TOOLS, NoDevices,
+    device_output_text, device_tools,
 };
 pub use model::ModelClient;
 pub use prompt::{MessageContext, system_prompt, user_message_input};
 pub use registry::ToolRegistry;
 pub use replay::{
-    ReplayItem, action_input, cancelled_call_output, function_call_output, replay_input,
-    unanswered_calls,
+    CONDENSED_HISTORY_PREFIX, ReplayItem, action_input, cancelled_call_output,
+    function_call_output, replay_input, unanswered_calls,
 };
 pub use scripted::{Scripted, ScriptedModel};
 pub use sink::{ItemRecord, SinkError, TurnSink};
 pub use tool::{
-    ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool, error_output,
-    strict_schema, truncate_output,
+    ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool,
+    check_strict_schema, error_output, strict_schema, truncate_output,
 };
 pub use turn::{RetryPolicy, TurnDeps, TurnInput, TurnOutcome, run_turn};
 
