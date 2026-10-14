@@ -13,8 +13,8 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use margin_shared::{
     CHAT_TITLE_MAX, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatPatch, ChatState,
-    ConfirmRequest, DeviceRef, Event, Id, MessageSent, NewChat, NewMessage, PendingMessage,
-    Source, ToolOutputText, Usage,
+    ConfirmRequest, DeviceRef, Event, Id, MessageSent, NewChat, NewMessage, PendingMessage, Source,
+    ToolOutputText, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -431,7 +431,17 @@ pub async fn delete_chat(
         let chat = chat(&state, &id).await?;
         // The items go too, so there is nothing to finish: just end the task.
         state.turns.abort(&id);
-        state.store.delete_where(db::CHAT_ITEM, "chat_id", &id).await?;
+        {
+            let rows = items(&state, &id).await?;
+            let mut live = state.turns.live_text.lock().unwrap();
+            for r in rows {
+                live.remove(&r.item.id);
+            }
+        }
+        state
+            .store
+            .delete_where(db::CHAT_ITEM, "chat_id", &id)
+            .await?;
         state.store.delete(db::CHAT, &id).await?;
         state.turns.forget_chat(&id);
         delete_chat_only_sources_locked(&state, &id, &chat.source_ids).await?
@@ -538,6 +548,9 @@ mod tests {
         let t = title_from(&long);
         assert_eq!(t.chars().count(), CHAT_TITLE_MAX);
         assert!(t.ends_with('…'));
-        assert_eq!(title_from(&"é".repeat(CHAT_TITLE_MAX)).chars().count(), CHAT_TITLE_MAX);
+        assert_eq!(
+            title_from(&"é".repeat(CHAT_TITLE_MAX)).chars().count(),
+            CHAT_TITLE_MAX
+        );
     }
 }

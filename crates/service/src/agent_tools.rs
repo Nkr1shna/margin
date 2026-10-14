@@ -843,7 +843,12 @@ mod tests {
 
     #[test]
     fn subtrees_and_paths() {
-        let all = vec![t("a", None), t("b", Some("a")), t("c", Some("b")), t("d", None)];
+        let all = vec![
+            t("a", None),
+            t("b", Some("a")),
+            t("c", Some("b")),
+            t("d", None),
+        ];
         let mut s: Vec<_> = subtree(&all, "a").into_iter().collect();
         s.sort();
         assert_eq!(s, vec!["a", "b", "c"]);

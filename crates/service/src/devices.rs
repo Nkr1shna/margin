@@ -274,7 +274,9 @@ mod tests {
         DeviceCall {
             chat_id: "c1".into(),
             call_id: "call_1".into(),
-            call: margin_shared::DeviceToolCall::ToggleSidebar { visible: Some(true) },
+            call: margin_shared::DeviceToolCall::ToggleSidebar {
+                visible: Some(true),
+            },
             timeout: std::time::Duration::from_millis(timeout_ms),
         }
     }
@@ -377,7 +379,9 @@ mod tests {
         let id = request_id(rx.recv().await.unwrap());
         assert_eq!(
             rx.recv().await.unwrap(),
-            DirectedFrame::ToolCancel { request_id: id.clone() }
+            DirectedFrame::ToolCancel {
+                request_id: id.clone()
+            }
         );
         // A late answer is ignored.
         hub.deliver("d1", &id, done("late"));

@@ -28,8 +28,8 @@ use margin_shared::{
     ApiError, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatState, Citation,
     ConfirmationCard, Decision, Device, DeviceFrame, DeviceRef, DeviceToolCall, DeviceToolOutput,
     DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus, Level, Me,
-    MessageSent, Note, PendingMessage, ReasoningEffort, Settings, Source, SourceKind,
-    SourceStatus, ToolOutputText, Topic, Usage, Workspace,
+    MessageSent, Note, PendingMessage, ReasoningEffort, Settings, Source, SourceKind, SourceStatus,
+    ToolOutputText, Topic, Usage, Workspace,
 };
 use serde_json::{Value, json};
 
@@ -61,7 +61,12 @@ async fn me(h: &Harness, token: &str) -> Me {
 }
 
 async fn create_chat(h: &Harness, token: &str, body: Value) -> ChatDetail {
-    let r = h.post(token, "/api/chats").json(&body).send().await.unwrap();
+    let r = h
+        .post(token, "/api/chats")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     r.json().await.unwrap()
 }
@@ -134,7 +139,10 @@ fn line(item: &ChatItem) -> String {
         },
         ChatItemKind::Action { text } => format!("action: {text}"),
         ChatItemKind::Error { message, retryable } => {
-            format!("error{}: {message}", if *retryable { " (retry)" } else { "" })
+            format!(
+                "error{}: {message}",
+                if *retryable { " (retry)" } else { "" }
+            )
         }
     };
     format!("{what}{status}")
@@ -203,7 +211,13 @@ async fn new_topic(h: &Harness, token: &str, parent: Option<&str>, title: &str) 
     r.json().await.unwrap()
 }
 
-async fn upload_ready(h: &Harness, token: &str, name: &str, topic: Option<&str>, text: &str) -> Source {
+async fn upload_ready(
+    h: &Harness,
+    token: &str,
+    name: &str,
+    topic: Option<&str>,
+    text: &str,
+) -> Source {
     let r = h.upload(token, name, topic, text.to_string()).await;
     assert_eq!(r.status(), 200);
     let source: Source = r.json().await.unwrap();
@@ -251,18 +265,29 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
         .filter(|e| {
             matches!(
                 e,
-                Event::ChatChanged { .. } | Event::ChatItemChanged { .. } | Event::ChatItemDelta { .. }
+                Event::ChatChanged { .. }
+                    | Event::ChatItemChanged { .. }
+                    | Event::ChatItemDelta { .. }
             )
         })
         .collect();
-    assert!(matches!(chat_events[0], Event::ChatChanged { chat } if chat.state == ChatState::Idle && chat.title.is_empty()));
-    assert!(matches!(chat_events[1], Event::ChatItemChanged { item } if matches!(item.kind, ChatItemKind::UserMessage { .. })));
-    assert!(matches!(chat_events[2], Event::ChatChanged { chat } if matches!(chat.state, ChatState::Running { .. })));
+    assert!(
+        matches!(chat_events[0], Event::ChatChanged { chat } if chat.state == ChatState::Idle && chat.title.is_empty())
+    );
+    assert!(
+        matches!(chat_events[1], Event::ChatItemChanged { item } if matches!(item.kind, ChatItemKind::UserMessage { .. }))
+    );
+    assert!(
+        matches!(chat_events[2], Event::ChatChanged { chat } if matches!(chat.state, ChatState::Running { .. }))
+    );
     let deltas: Vec<(u64, &str)> = events
         .iter()
         .filter_map(|e| match e {
             Event::ChatItemDelta {
-                offset, text, chat_id: c, ..
+                offset,
+                text,
+                chat_id: c,
+                ..
             } if *c == chat_id => Some((*offset, text.as_str())),
             _ => None,
         })
@@ -286,8 +311,14 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     let req = &reqs[0];
     assert_eq!(req.prompt_cache_key.as_deref(), Some(chat_id.as_str()));
     assert_eq!(req.model, None, "no agent model: the client's model");
-    assert_eq!(req.input[0]["role"], "developer", "the system prompt comes first");
-    assert!(has_user_text(&req.input, "Teach me Fourier series\nwith examples"));
+    assert_eq!(
+        req.input[0]["role"], "developer",
+        "the system prompt comes first"
+    );
+    assert!(has_user_text(
+        &req.input,
+        "Teach me Fourier series\nwith examples"
+    ));
     let names: Vec<&str> = req
         .tools
         .iter()
@@ -329,7 +360,10 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     let d = wait_chat(&h, &t, &chat_id, |d| idle(d) && d.items.len() == 4).await;
     assert_eq!(lines(&d)[3], "assistant: Sure.");
     let second = &h.generator.agent.requests()[1];
-    assert!(has_user_text(&second.input, "Teach me Fourier series\nwith examples"));
+    assert!(has_user_text(
+        &second.input,
+        "Teach me Fourier series\nwith examples"
+    ));
     assert!(has_user_text(&second.input, "Shorter please"));
     assert!(
         second
@@ -356,15 +390,14 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
     assert_eq!(s.reasoning_effort, ReasoningEffort::High);
     assert_eq!(s.openai_model, "test-model", "lessons keep their model");
 
-    h.generator.agent.push(Scripted::Events(text_reply(&["ok"])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["ok"])));
     let chat = ask(&h, &t, "hi").await.chat;
     wait_chat(&h, &t, &chat.id, idle).await;
     let req = &h.generator.agent.requests()[0];
     assert_eq!(req.model.as_deref(), Some("gpt-6-luna"));
-    assert_eq!(
-        req.reasoning.map(|r| r.effort),
-        Some(ReasoningEffort::High)
-    );
+    assert_eq!(req.reasoning.map(|r| r.effort), Some(ReasoningEffort::High));
 
     // Null and blank both go back to the main model.
     for clear in [json!(null), json!("  ")] {
@@ -380,7 +413,9 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         assert_eq!(s.agent_model, None);
         assert_eq!(s.reasoning_effort, ReasoningEffort::High, "unchanged");
     }
-    h.generator.agent.push(Scripted::Events(text_reply(&["ok"])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["ok"])));
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 4).await;
     assert_eq!(h.generator.agent.requests()[1].model, None);
@@ -453,10 +488,14 @@ async fn tool_calls_run_and_their_outputs_load_on_demand() {
     let call = d
         .items
         .iter()
-        .find(|i| matches!(&i.kind, ChatItemKind::ToolCall { name, .. } if name == "search_library"))
+        .find(
+            |i| matches!(&i.kind, ChatItemKind::ToolCall { name, .. } if name == "search_library"),
+        )
         .unwrap();
     match &call.kind {
-        ChatItemKind::ToolCall { label, arguments, .. } => {
+        ChatItemKind::ToolCall {
+            label, arguments, ..
+        } => {
             assert_eq!(label, "Searching the library for “fourier”");
             assert_eq!(arguments, r#"{"query":"fourier"}"#);
         }
@@ -468,10 +507,15 @@ async fn tool_calls_run_and_their_outputs_load_on_demand() {
     let result = d
         .items
         .iter()
-        .find(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == "call_1"))
+        .find(
+            |i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == "call_1"),
+        )
         .unwrap();
     let out: ToolOutputText = h
-        .get(&t, &format!("/api/chats/{}/items/{}/output", chat.id, result.id))
+        .get(
+            &t,
+            &format!("/api/chats/{}/items/{}/output", chat.id, result.id),
+        )
         .send()
         .await
         .unwrap()
@@ -489,7 +533,10 @@ async fn tool_calls_run_and_their_outputs_load_on_demand() {
     // Only tool results of this chat.
     let user = &d.items[0];
     let r = h
-        .get(&t, &format!("/api/chats/{}/items/{}/output", chat.id, user.id))
+        .get(
+            &t,
+            &format!("/api/chats/{}/items/{}/output", chat.id, user.id),
+        )
         .send()
         .await
         .unwrap();
@@ -625,7 +672,10 @@ async fn read_tools_answer_from_the_library() {
     assert_eq!(v["body_md"], "Overshoot of 9%");
 
     let (out, v) = run("list_notes", json!({"topic_id": subject.id})).await;
-    assert_eq!(out.summary, "1 note", "a subject includes its topics' notes");
+    assert_eq!(
+        out.summary, "1 note",
+        "a subject includes its topics' notes"
+    );
     assert_eq!(v["notes"][0]["lesson"], "Coefficients");
     let (out, _) = run("list_notes", json!({"topic_id": null})).await;
     assert_eq!(out.summary, "1 note");
@@ -709,10 +759,15 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
         .unwrap();
     let c: Chat = r.json().await.unwrap();
     assert_eq!(c.pending, None);
-    assert_eq!(send(&h, &phone, &chat.id, "second, again").await.status(), 200);
+    assert_eq!(
+        send(&h, &phone, &chat.id, "second, again").await.status(),
+        200
+    );
 
     // Stopping the first answer sends the pending one.
-    h.generator.agent.push(Scripted::Events(text_reply(&["Done."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Done."])));
     let r = h
         .post(&t, &format!("/api/chats/{}/stop", chat.id))
         .send()
@@ -720,7 +775,9 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
         .unwrap();
     assert_eq!(r.status(), 200);
     let after_stop: Chat = r.json().await.unwrap();
-    assert!(matches!(after_stop.state, ChatState::Running { ref device_id, .. } if *device_id == pending.device_id));
+    assert!(
+        matches!(after_stop.state, ChatState::Running { ref device_id, .. } if *device_id == pending.device_id)
+    );
     assert_eq!(after_stop.pending, None);
     let d = wait_chat(&h, &t, &chat.id, idle).await;
     assert_eq!(
@@ -747,7 +804,9 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
         Duration::from_millis(300),
         Box::new(Scripted::Events(text_reply(&["One."]))),
     ));
-    h.generator.agent.push(Scripted::Events(text_reply(&["Two."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Two."])));
     assert_eq!(send(&h, &t, &chat.id, "one").await.status(), 200);
     let r = send(&h, &t, &chat.id, "two").await;
     let sent: MessageSent = r.json().await.unwrap();
@@ -755,7 +814,12 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
     let d = wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 9).await;
     assert_eq!(
         lines(&d)[5..],
-        ["user: one", "assistant: One.", "user: two", "assistant: Two."]
+        [
+            "user: one",
+            "assistant: One.",
+            "user: two",
+            "assistant: Two."
+        ]
     );
 }
 
@@ -764,10 +828,7 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
 async fn stop_keeps_streamed_text_and_answers_open_calls() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let (status, err) = api_error(
-        h.post(&t, "/api/chats/nope/stop").send().await.unwrap(),
-    )
-    .await;
+    let (status, err) = api_error(h.post(&t, "/api/chats/nope/stop").send().await.unwrap()).await;
     assert_eq!((status, err.code.as_str()), (404, "not_found"));
 
     h.generator.agent.push(hanging_text("Half an ans"));
@@ -791,7 +852,9 @@ async fn stop_keeps_streamed_text_and_answers_open_calls() {
     let events = sock
         .until(|e| matches!(e, Event::ChatChanged { chat } if chat.state == ChatState::Idle))
         .await;
-    assert!(events.iter().any(|e| matches!(e, Event::ChatItemChanged { item } if item.status == ItemStatus::Cancelled)));
+    assert!(events.iter().any(
+        |e| matches!(e, Event::ChatItemChanged { item } if item.status == ItemStatus::Cancelled)
+    ));
     let d = detail(&h, &t, &chat.id).await;
     assert_eq!(
         lines(&d),
@@ -839,7 +902,9 @@ async fn stop_keeps_streamed_text_and_answers_open_calls() {
             format!("action: {STOPPED}"),
         ]
     );
-    h.generator.agent.push(Scripted::Events(text_reply(&["ok"])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["ok"])));
     assert_eq!(send(&h, &t, &chat.id, "go on").await.status(), 200);
     wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 9).await;
     let reqs = h.generator.agent.requests();
@@ -876,7 +941,9 @@ async fn a_failed_turn_can_be_continued() {
     let turn = d.chat.state.turn_id().unwrap().to_string();
 
     h.configure_ai(&t).await;
-    h.generator.agent.push(Scripted::Events(text_reply(&["Hi!"])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Hi!"])));
     let r = h
         .post(&t, &format!("/api/chats/{}/continue", chat.id))
         .send()
@@ -915,7 +982,9 @@ async fn a_failed_turn_can_be_continued() {
         lines(&d)
     );
     // A new message on a failed chat starts a new turn.
-    h.generator.agent.push(Scripted::Events(text_reply(&["Fine."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Fine."])));
     assert_eq!(send(&h, &t, &chat.id, "try this").await.status(), 200);
     let d = wait_chat(&h, &t, &chat.id, idle).await;
     assert_eq!(lines(&d).last().unwrap(), "assistant: Fine.");
@@ -1088,9 +1157,7 @@ async fn any_device_answers_a_confirmation() {
             device_id: phone_id.clone()
         })
     );
-    let events = sock
-        .until(|e| matches!(e, Event::ChatChanged { .. }))
-        .await;
+    let events = sock.until(|e| matches!(e, Event::ChatChanged { .. })).await;
     assert!(events.iter().any(|e| matches!(
         e,
         Event::ChatItemChanged { item } if item.id == card.id
@@ -1224,7 +1291,8 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         updated_at: now,
     };
     store.put(db::CHAT, "c1", &chat).await.unwrap();
-    let user_input = json!({"role": "user", "content": [{"type": "input_text", "text": "teach me"}]});
+    let user_input =
+        json!({"role": "user", "content": [{"type": "input_text", "text": "teach me"}]});
     put_item(
         &store,
         item(
@@ -1254,7 +1322,10 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         vec![],
     )
     .await;
-    for (id, seq, call_id, name) in [("i3", 3, "call_1", "list_topics"), ("i4", 4, "call_2", "delete_topic")] {
+    for (id, seq, call_id, name) in [
+        ("i3", 3, "call_1", "list_topics"),
+        ("i4", 4, "call_2", "delete_topic"),
+    ] {
         put_item(
             &store,
             item(
@@ -1269,7 +1340,12 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
                     device: None,
                 },
             ),
-            vec![function_call_item(&format!("fc_{call_id}"), call_id, name, "{}")],
+            vec![function_call_item(
+                &format!("fc_{call_id}"),
+                call_id,
+                name,
+                "{}",
+            )],
         )
         .await;
     }
@@ -1341,12 +1417,17 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         let r = d
             .items
             .iter()
-            .find(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == call))
+            .find(
+                |i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == call),
+            )
             .unwrap();
         r.id.clone()
     };
     let text: ToolOutputText = h
-        .get(&t, &format!("/api/chats/c1/items/{}/output", output("call_1")))
+        .get(
+            &t,
+            &format!("/api/chats/c1/items/{}/output", output("call_1")),
+        )
         .send()
         .await
         .unwrap()
@@ -1355,14 +1436,20 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         .unwrap();
     assert_eq!(text.text, json!({"error": CALL_INTERRUPTED}).to_string());
     let text: ToolOutputText = h
-        .get(&t, &format!("/api/chats/c1/items/{}/output", output("call_2")))
+        .get(
+            &t,
+            &format!("/api/chats/c1/items/{}/output", output("call_2")),
+        )
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(text.text, json!({"error": CONFIRMATION_EXPIRED}).to_string());
+    assert_eq!(
+        text.text,
+        json!({"error": CONFIRMATION_EXPIRED}).to_string()
+    );
 
     // A new message waits behind the kept one.
     let (status, err) = api_error(send(&h, &t, "c1", "new").await).await;
@@ -1370,12 +1457,18 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
 
     // Continue resumes the turn for the device that started it; then the pending
     // message goes.
-    h.generator.agent.push(Scripted::Events(text_reply(&["Resumed."])));
-    h.generator.agent.push(Scripted::Events(text_reply(&["Then this."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Resumed."])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Then this."])));
     let r = h.post(&t, "/api/chats/c1/continue").send().await.unwrap();
     assert_eq!(r.status(), 200);
     let c: Chat = r.json().await.unwrap();
-    assert!(matches!(&c.state, ChatState::Running { turn_id, device_id, .. } if turn_id == "t1" && device_id == "old-mac"));
+    assert!(
+        matches!(&c.state, ChatState::Running { turn_id, device_id, .. } if turn_id == "t1" && device_id == "old-mac")
+    );
     let d = wait_chat(&h, &t, "c1", |d| idle(d) && d.items.len() == 11).await;
     assert_eq!(
         lines(&d)[8..],
@@ -1386,7 +1479,9 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         ]
     );
     match &d.items[9].kind {
-        ChatItemKind::UserMessage { device_name, .. } => assert_eq!(device_name, "A removed device"),
+        ChatItemKind::UserMessage { device_name, .. } => {
+            assert_eq!(device_name, "A removed device")
+        }
         other => panic!("{other:?}"),
     }
     let reqs = h.generator.agent.requests();
@@ -1469,7 +1564,8 @@ async fn chats_are_renamed_listed_and_checked() {
         ),
         (json!({"workspace_ids": ["gone"]}), "unknown_workspace"),
     ] {
-        let (status, err) = api_error(h.post(&t, "/api/chats").json(&body).send().await.unwrap()).await;
+        let (status, err) =
+            api_error(h.post(&t, "/api/chats").json(&body).send().await.unwrap()).await;
         assert_eq!((status, err.code.as_str()), (400, code));
     }
     let (status, _) = api_error(send(&h, &t, &a.id, "").await).await;
@@ -1511,9 +1607,7 @@ async fn chats_are_renamed_listed_and_checked() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    let events = sock
-        .until(|e| matches!(e, Event::ChatDeleted { .. }))
-        .await;
+    let events = sock.until(|e| matches!(e, Event::ChatDeleted { .. })).await;
     assert!(matches!(events.last(), Some(Event::ChatDeleted { id }) if *id == b.id));
     let r = h
         .delete(&t, &format!("/api/chats/{}", b.id))
@@ -1532,7 +1626,9 @@ async fn deleting_a_chat_stops_it_and_takes_its_own_files() {
     let shared = upload_ready(&h, &t, "shared.md", None, "also in another chat").await;
     let in_topic = upload_ready(&h, &t, "topic.md", Some(&topic.id), "in a topic").await;
 
-    h.generator.agent.push(Scripted::Events(text_reply(&["ok"])));
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["ok"])));
     let other = create_chat(
         &h,
         &t,
@@ -1557,10 +1653,8 @@ async fn deleting_a_chat_stops_it_and_takes_its_own_files() {
         ChatItemKind::UserMessage { source_ids, .. } => assert_eq!(source_ids.len(), 3),
         other => panic!("{other:?}"),
     }
-    let req_input = eventually(|| async {
-        h.generator.agent.requests().get(1).map(|r| r.input.clone())
-    })
-    .await;
+    let req_input =
+        eventually(|| async { h.generator.agent.requests().get(1).map(|r| r.input.clone()) }).await;
     // The message's context names the attached files.
     assert!(req_input.iter().any(|i| i.to_string().contains("mine.md")));
 
@@ -1571,10 +1665,12 @@ async fn deleting_a_chat_stops_it_and_takes_its_own_files() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    let events = sock
-        .until(|e| matches!(e, Event::ChatDeleted { .. }))
-        .await;
-    assert!(events.iter().any(|e| matches!(e, Event::SourceDeleted { id } if *id == mine.id)));
+    let events = sock.until(|e| matches!(e, Event::ChatDeleted { .. })).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::SourceDeleted { id } if *id == mine.id))
+    );
     let gone: Vec<chats::StoredChatItem> = h
         .state
         .store
@@ -1636,13 +1732,19 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
     let phone = h.sign_in("iPhone").await;
     let phone_id = me(&h, &phone).await.device.id;
     let mut watcher = h.socket(&mac).await;
-    assert!(!devices(&h, &mac).await.iter().any(|d| d.id == phone_id && d.online));
     assert!(
-        matches!(
-            h.state.devices.call(&phone_id, sidebar_call(Duration::from_secs(1))).await,
-            Err(DeviceError::Offline)
-        )
+        !devices(&h, &mac)
+            .await
+            .iter()
+            .any(|d| d.id == phone_id && d.online)
     );
+    assert!(matches!(
+        h.state
+            .devices
+            .call(&phone_id, sidebar_call(Duration::from_secs(1)))
+            .await,
+        Err(DeviceError::Offline)
+    ));
 
     let mut device = h.socket(&phone).await;
     let events = watcher
@@ -1656,7 +1758,12 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
         }
         other => panic!("{other:?}"),
     }
-    assert!(devices(&h, &mac).await.iter().any(|d| d.id == phone_id && d.online));
+    assert!(
+        devices(&h, &mac)
+            .await
+            .iter()
+            .any(|d| d.id == phone_id && d.online)
+    );
     assert!(me(&h, &phone).await.device.online);
 
     // A request reaches only that device; its answer completes the call.
@@ -1669,12 +1776,17 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
         DirectedFrame::ToolRequest { request } => request,
         other => panic!("{other:?}"),
     };
-    assert_eq!(request.call, DeviceToolCall::ToggleSidebar { visible: None });
+    assert_eq!(
+        request.call,
+        DeviceToolCall::ToggleSidebar { visible: None }
+    );
     assert_eq!(request.call_id, "call_1");
     // Something a device shouldn't send is ignored.
     device
         .ws
-        .send(tokio_tungstenite::tungstenite::Message::Text("{\"type\":\"nonsense\"}".into()))
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "{\"type\":\"nonsense\"}".into(),
+        ))
         .await
         .unwrap();
     device
@@ -1718,7 +1830,12 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
         .until(|e| matches!(e, Event::DeviceChanged { device } if device.id == phone_id && !device.online))
         .await;
     assert!(!events.is_empty());
-    assert!(!devices(&h, &mac).await.iter().any(|d| d.id == phone_id && d.online));
+    assert!(
+        !devices(&h, &mac)
+            .await
+            .iter()
+            .any(|d| d.id == phone_id && d.online)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1756,7 +1873,9 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
         .unwrap();
     assert_eq!(all, vec![ws.clone()]);
 
-    let chat = create_chat(&h, &mac, json!({"workspace_ids": [ws.id]})).await.chat;
+    let chat = create_chat(&h, &mac, json!({"workspace_ids": [ws.id]}))
+        .await
+        .chat;
     assert_eq!(chat.workspace_ids, vec![ws.id.clone()]);
 
     let (status, err) = api_error(
@@ -1779,7 +1898,13 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
         .until(|e| matches!(e, Event::WorkspaceDeleted { .. }))
         .await;
     assert!(events.iter().any(|e| matches!(e, Event::ChatChanged { chat: c } if c.id == chat.id && c.workspace_ids.is_empty())));
-    assert!(detail(&h, &mac, &chat.id).await.chat.workspace_ids.is_empty());
+    assert!(
+        detail(&h, &mac, &chat.id)
+            .await
+            .chat
+            .workspace_ids
+            .is_empty()
+    );
 
     // Revoking a device removes its folders.
     let r = h
@@ -1805,8 +1930,18 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
     let events = sock
         .until(|e| matches!(e, Event::DeviceDeleted { .. }))
         .await;
-    assert!(events.iter().any(|e| matches!(e, Event::WorkspaceDeleted { id } if *id == ws2.id)));
-    assert!(detail(&h, &mac, &chat.id).await.chat.workspace_ids.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::WorkspaceDeleted { id } if *id == ws2.id))
+    );
+    assert!(
+        detail(&h, &mac, &chat.id)
+            .await
+            .chat
+            .workspace_ids
+            .is_empty()
+    );
     let all: Vec<Workspace> = h
         .get(&mac, "/api/workspaces")
         .send()
@@ -1853,7 +1988,9 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     let item = sink
         .add_item(
             ItemStatus::InProgress,
-            ChatItemKind::AssistantText { text: String::new() },
+            ChatItemKind::AssistantText {
+                text: String::new(),
+            },
             ItemRecord::default(),
         )
         .await

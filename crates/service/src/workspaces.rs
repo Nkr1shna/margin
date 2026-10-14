@@ -27,7 +27,9 @@ pub async fn list_workspaces(State(state): State<AppState>) -> AppResult<Json<Ve
 fn clean(value: &str, what: &str) -> AppResult<String> {
     let v = value.trim();
     if v.is_empty() {
-        return Err(AppError::bad_request(format!("The folder's {what} is missing.")));
+        return Err(AppError::bad_request(format!(
+            "The folder's {what} is missing."
+        )));
     }
     Ok(v.chars().take(MAX_FIELD_CHARS).collect())
 }

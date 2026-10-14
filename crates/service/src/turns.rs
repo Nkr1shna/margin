@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use margin_agent::{
-    BoxFuture, ItemRecord, MessageContext, ReplayItem, RetryPolicy, SinkError, TurnDeps,
-    TurnInput, TurnOutcome, TurnSink,
+    BoxFuture, ItemRecord, MessageContext, ReplayItem, RetryPolicy, SinkError, TurnDeps, TurnInput,
+    TurnOutcome, TurnSink,
 };
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
@@ -729,10 +729,7 @@ async fn wind_up_locked(
                     CALL_INTERRUPTED
                 };
                 (
-                    margin_agent::function_call_output(
-                        &call_id,
-                        &margin_agent::error_output(why),
-                    ),
+                    margin_agent::function_call_output(&call_id, &margin_agent::error_output(why)),
                     "Interrupted",
                 )
             }
