@@ -366,7 +366,12 @@ body.resizing-sb * { user-select: none !important; }
 /* ---------- chat ---------- */
 /* One column for the transcript and the composer docked under it. */
 .chat-col { width: 100%; max-width: 760px; margin: 0 auto; padding: 0 var(--gutter); }
-.chat-log { display: grid; gap: 16px; align-content: start; padding-top: 24px; padding-bottom: 24px; }
+/* One track exactly as wide as the column: an auto track grows to its widest item's
+   min-content (a long reasoning headline, a code block, a table), which would push the
+   whole transcript past the pane and scroll it sideways. Long text wraps instead, and
+   code blocks and tables scroll inside themselves. */
+.chat-log { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-content: start; padding-top: 24px; padding-bottom: 24px; }
+.chat-log > * { min-width: 0; max-width: 100%; }
 .msg-user { justify-self: end; max-width: min(80%, 560px); display: grid; justify-items: end; gap: 2px; }
 .msg-user small { color: var(--fg-3); font-size: 12px; font-weight: 500; }
 .msg-user .bubble { background: var(--surface); border-radius: 18px; padding: 10px 16px; font-size: 16px; line-height: 24px; white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
@@ -378,9 +383,9 @@ body.resizing-sb * { user-select: none !important; }
 .chat-action { margin: 0; text-align: center; font-size: 13px; font-weight: 500; color: var(--fg-3); }
 .chat-working { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 500; color: var(--fg-3); }
 /* Reasoning summaries fold away under their first line. */
-.reasoning > summary .faint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.reasoning > summary { max-width: 100%; }
-.reasoning-md { font-size: 14px; line-height: 22px; letter-spacing: 0; color: var(--fg-2); padding: 4px 0 0 18px; }
+.reasoning > summary .faint { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.reasoning > summary { max-width: 100%; min-width: 0; }
+.reasoning-md { font-size: 14px; line-height: 22px; letter-spacing: 0; color: var(--fg-2); padding: 4px 0 0 18px; min-width: 0; overflow-wrap: anywhere; }
 .reasoning-md p { margin: 0 0 8px; }
 .reasoning-md > :last-child { margin-bottom: 0; }
 /* A tool call: one line that opens to its arguments and output. */
@@ -486,9 +491,9 @@ body.resizing-sb * { user-select: none !important; }
 .md blockquote { margin: 16px 0; padding: 14px 16px; border-radius: 6px; background: var(--surface); font-size: 16px; line-height: 26px; }
 .md blockquote p:last-child { margin: 0; }
 .md code { font-family: var(--font-mono); font-size: .86em; background: var(--surface); padding: 1px 5px; border-radius: 4px; }
-.md pre { background: var(--surface); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.6; }
+.md pre { background: var(--surface); border-radius: 6px; padding: 12px 14px; overflow-x: auto; max-width: 100%; font-size: 13px; line-height: 1.6; }
 .md pre code { background: none; padding: 0; }
-.md table { border-collapse: collapse; margin: 0 0 16px; font-size: 15px; display: block; overflow-x: auto; }
+.md table { border-collapse: collapse; margin: 0 0 16px; font-size: 15px; display: block; overflow-x: auto; max-width: 100%; }
 .md th, .md td { border-bottom: 1px solid var(--line); padding: 6px 12px 6px 0; text-align: left; }
 .md img { max-width: 100%; border-radius: 6px; }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 28px 0; }
