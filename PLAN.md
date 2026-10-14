@@ -30,6 +30,10 @@ Every decision below was made explicitly by the owner. Do not change one without
 | PDF text | Apple **PDFKit** (`objc2-pdf-kit`); pages without a text layer are rendered and read with **Vision OCR** (`objc2-vision`). |
 | Media in lessons | Retrieved images (image files, PDF pages, video frames) go to the writer as **image inputs**; audio is **transcribed locally** (FluidAudio `transcribe`, Parakeet) and its transcript span goes in as text. |
 | Citations | Lessons cite with Markdown footnotes `[^n]`; no inline images. A **Sources** list follows the lesson and a **source viewer** opens the exact page / time / image / passage. |
+| Upload limits | **500 MB** per audio or video file, **50 MB** for every other kind (`routes::max_source_bytes`). Uploads stream to disk; files over 32 MB go up in parts (Cloudflare refuses bodies over 100 MB). One add (files or a folder) takes at most 300 files and 2 GB. |
+| Transcripts | The source viewer shows an audio/video source's **whole transcript**, the cited span marked and scrolled into view; any line seeks. A recording that couldn't be transcribed is **Ready with a warning** and offers **Read again**. |
+| Note drafts | Unconfirmed note edits are kept in `drafts.json` in the app's data folder and sent again on the next launch or when the note reopens; cleared once saved. |
+| Touch reveal | On touch, a long press on cut-off text shows it in full above the finger; rows whose long press opens a menu head it with the full name. |
 | Mobile pickers | Adding files **and folders** works on iOS/iPadOS (UIDocumentPicker) and Android (Storage Access Framework), not only desktop. |
 
 ## Layout
