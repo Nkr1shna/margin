@@ -242,6 +242,12 @@ impl LibraryState {
         }
     }
 
+    /// Devices exactly as `GET /api/devices` lists them: one revoked since the last look
+    /// goes (Settings → Devices shows this list, with who is online).
+    pub fn replace_devices(&mut self, devices: Vec<Device>) {
+        self.devices = devices.into_iter().map(|d| (d.id.clone(), d)).collect();
+    }
+
     /// One video per lesson: a video for a lesson replaces any other video of that lesson.
     pub fn upsert_video(&mut self, video: Video) {
         self.videos
@@ -1251,6 +1257,31 @@ pub(crate) mod tests {
         );
         s.apply(Event::DeviceDeleted { id: "d1".into() });
         assert!(s.devices.is_empty() && s.workspaces.is_empty());
+
+        // The service's list replaces what was known: a device revoked meanwhile goes.
+        let phone = Device {
+            id: "d2".into(),
+            name: "iPhone".into(),
+            created_at: ts(0),
+            last_seen_at: None,
+            current: false,
+            online: true,
+        };
+        s.merge_devices(vec![Device {
+            id: "d3".into(),
+            ..phone.clone()
+        }]);
+        s.replace_devices(vec![phone.clone()]);
+        assert_eq!(s.devices.len(), 1);
+        assert!(s.devices["d2"].online);
+        // It comes online and goes again as its socket opens and closes.
+        s.apply(Event::DeviceChanged {
+            device: Device {
+                online: false,
+                ..phone
+            },
+        });
+        assert!(!s.devices["d2"].online);
     }
 
     #[test]

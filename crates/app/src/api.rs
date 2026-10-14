@@ -38,7 +38,7 @@ impl ApiFailure {
     pub fn settings_pane(&self) -> Option<crate::ui::settings::SettingsPane> {
         use crate::ui::settings::SettingsPane;
         match self.code.as_str() {
-            "no_api_key" => Some(SettingsPane::Ai),
+            "no_api_key" | "no_model" => Some(SettingsPane::Ai),
             "no_embedding_model" => Some(SettingsPane::Sources),
             c if c.contains("tool") => Some(SettingsPane::Tools),
             _ => None,
@@ -1577,6 +1577,338 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.agent_model, None);
         assert_eq!(cleared.reasoning_effort, ReasoningEffort::High);
+    }
+
+    #[tokio::test]
+    async fn chats_take_files_with_a_message_and_let_them_go() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        // Uploaded from the composer: no topic.
+        let file = TempFile::new("chat-file", b"# Gibbs\n");
+        let source = api
+            .upload_source(&file.0, "gibbs.md", None, None, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(source.topic_id, None);
+        let unknown = api
+            .create_chat(&NewChat {
+                message: Some(NewMessage {
+                    text: "Read this".into(),
+                    source_ids: vec!["nope".into()],
+                }),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (unknown.status, unknown.code.as_str()),
+            (Some(400), "unknown_source")
+        );
+        let created = api
+            .create_chat(&NewChat {
+                message: Some(NewMessage {
+                    text: "Read this".into(),
+                    source_ids: vec![source.id.clone()],
+                }),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap();
+        let id = created.chat.id.clone();
+        assert_eq!(created.chat.source_ids, vec![source.id.clone()]);
+        assert!(matches!(
+            &created.items[0].kind,
+            margin_shared::ChatItemKind::UserMessage { source_ids, .. } if *source_ids == vec![source.id.clone()]
+        ));
+        // Taken off the chat, a file no topic has is deleted.
+        let detached = api
+            .patch_chat(
+                &id,
+                &ChatPatch {
+                    source_ids: Some(vec![]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(detached.source_ids.is_empty());
+        let library = api.library().await.unwrap();
+        assert!(!library.sources.iter().any(|s| s.id == source.id));
+        // One a topic also has stays.
+        let in_topic = api
+            .upload_source(&file.0, "kept.md", None, Some("fourier"), |_| {})
+            .await
+            .unwrap();
+        api.send_message(
+            &id,
+            &NewMessage {
+                text: "And this".into(),
+                source_ids: vec![in_topic.id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        let chat = api.chat(&id).await.unwrap().chat;
+        assert_eq!(chat.source_ids, vec![in_topic.id.clone()]);
+        api.patch_chat(
+            &id,
+            &ChatPatch {
+                source_ids: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            api.library()
+                .await
+                .unwrap()
+                .sources
+                .iter()
+                .any(|s| s.id == in_topic.id)
+        );
+        // Deleting the chat deletes the files only it had.
+        let only_here = api
+            .upload_source(&file.0, "gone.md", None, None, |_| {})
+            .await
+            .unwrap();
+        api.send_message(
+            &id,
+            &NewMessage {
+                text: "One more".into(),
+                source_ids: vec![only_here.id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        api.delete_chat(&id).await.unwrap();
+        let library = api.library().await.unwrap();
+        assert!(!library.sources.iter().any(|s| s.id == only_here.id));
+        assert!(library.sources.iter().any(|s| s.id == in_topic.id));
+    }
+
+    #[tokio::test]
+    async fn chats_are_named_by_the_model_until_the_owner_renames_them() {
+        use margin_shared::TitleSource;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let created = api
+            .create_chat(&NewChat {
+                message: Some(message("How do Fourier series converge?\nIn detail")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap();
+        // Until the first answer: the first line, as a stand-in.
+        assert_eq!(created.chat.title, "How do Fourier series converge?");
+        assert_eq!(created.chat.title_by, TitleSource::FirstLine);
+        let id = created.chat.id;
+        let named = api.chat(&id).await.unwrap().chat;
+        assert_eq!(named.title_by, TitleSource::Model);
+        assert_eq!(named.title, "Fourier series converge");
+        let renamed = api
+            .patch_chat(
+                &id,
+                &ChatPatch {
+                    title: Some("Convergence".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.title_by, TitleSource::Owner);
+        // Later answers keep the owner's name.
+        api.send_message(&id, &message("And Gibbs?")).await.unwrap();
+        let chat = api.chat(&id).await.unwrap().chat;
+        assert_eq!(
+            (chat.title.as_str(), chat.title_by),
+            ("Convergence", TitleSource::Owner)
+        );
+    }
+
+    #[tokio::test]
+    async fn chats_wait_when_the_model_api_asks_and_stop_ends_the_wait() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        fake.state.lock().unwrap().chat_hang = true;
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Please slow down")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let chat = api.chat(&id).await.unwrap().chat;
+        assert!(chat.state.is_busy());
+        let waiting = chat.waiting.expect("waiting before the retry");
+        assert!(waiting.until > chrono::Utc::now());
+        assert_eq!(waiting.reason, "The model API asked Margin to slow down.");
+        let stopped = api.stop_chat(&id).await.unwrap();
+        assert_eq!(stopped.waiting, None);
+        assert!(!stopped.state.is_busy());
+    }
+
+    #[tokio::test]
+    async fn chat_errors_say_what_kind_they_are() {
+        use margin_shared::{ChatItemKind, error_code};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        fake.state.lock().unwrap().has_api_key = false;
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Hello")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let detail = api.chat(&id).await.unwrap();
+        assert!(matches!(
+            &detail.items.last().unwrap().kind,
+            ChatItemKind::Error { code: Some(c), retryable: true, .. } if c == error_code::NO_API_KEY
+        ));
+        {
+            let mut s = fake.state.lock().unwrap();
+            s.has_api_key = true;
+            s.settings.openai_model = String::new();
+        }
+        let resumed = api.continue_chat(&id).await;
+        assert!(resumed.is_ok());
+        let detail = api.chat(&id).await.unwrap();
+        assert!(matches!(
+            &detail.items.last().unwrap().kind,
+            ChatItemKind::Error { code: Some(c), .. } if c == error_code::NO_MODEL
+        ));
+        let failure = ApiFailure {
+            status: Some(400),
+            code: "no_model".into(),
+            message: "Choose a model.".into(),
+        };
+        assert_eq!(
+            failure.settings_pane(),
+            Some(crate::ui::settings::SettingsPane::Ai)
+        );
+    }
+
+    #[tokio::test]
+    async fn chats_write_lessons_and_make_videos_with_result_cards() {
+        use margin_shared::{Card, ChatItemKind, LessonStatus, ResultTarget, VideoStatus};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("Write a lesson on the Gibbs phenomenon in Fourier")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        let detail = api.chat(&id).await.unwrap();
+        assert_eq!(
+            kinds(&detail),
+            ["user", "reasoning", "call", "result", "card", "text"]
+        );
+        let lesson_id = detail
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Card {
+                    card: Card::Result(c),
+                    ..
+                } => match &c.target {
+                    ResultTarget::Lesson { lesson_id } => Some(lesson_id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a lesson card");
+        let library = api.library().await.unwrap();
+        let lesson = library.lessons.iter().find(|l| l.id == lesson_id).unwrap();
+        assert_eq!(lesson.title, "The Gibbs phenomenon in Fourier");
+        assert_eq!(lesson.status, LessonStatus::Queued);
+
+        api.send_message(&id, &message("Make a video of Why sums of sines"))
+            .await
+            .unwrap();
+        let detail = api.chat(&id).await.unwrap();
+        let video_lesson = detail
+            .items
+            .iter()
+            .rev()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Card {
+                    card: Card::Result(c),
+                    ..
+                } => match &c.target {
+                    ResultTarget::Video { lesson_id } => Some(lesson_id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a video card");
+        let library = api.library().await.unwrap();
+        let video = library
+            .videos
+            .iter()
+            .find(|v| v.lesson_id == video_lesson)
+            .unwrap();
+        assert_eq!(video.status, VideoStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn a_newer_outline_supersedes_the_chats_earlier_one() {
+        use margin_shared::{Card, ChatItemKind};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let outlines = |detail: &ChatDetail| -> Vec<Id> {
+            detail
+                .items
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    ChatItemKind::Card {
+                        card: Card::Outline(c),
+                        ..
+                    } => Some(c.proposal_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let id = api
+            .create_chat(&NewChat {
+                message: Some(message("A course on control theory")),
+                workspace_ids: vec![],
+            })
+            .await
+            .unwrap()
+            .chat
+            .id;
+        api.send_message(&id, &message("Make it a course on robotics instead"))
+            .await
+            .unwrap();
+        let ids = outlines(&api.chat(&id).await.unwrap());
+        assert_eq!(ids.len(), 2);
+        let first = api.proposal(&ids[0]).await.unwrap();
+        assert_eq!(
+            first.status,
+            ProposalStatus::Superseded { by: ids[1].clone() }
+        );
+        assert_eq!(
+            api.proposal(&ids[1]).await.unwrap().status,
+            ProposalStatus::Ready
+        );
+        let body = AcceptProposal {
+            outline: first.outline.clone().unwrap(),
+            chips: Default::default(),
+        };
+        let refused = api.accept_proposal(&ids[0], &body).await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.code.as_str()),
+            (Some(409), "superseded")
+        );
     }
 
     #[tokio::test]

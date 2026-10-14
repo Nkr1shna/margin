@@ -331,12 +331,39 @@ fn ServiceSection() -> Element {
     }
 }
 
+/// The devices as Settings lists them: this one first, then the others, newest first.
+pub fn devices_in_order(devices: &[Device]) -> Vec<Device> {
+    let mut list = devices.to_vec();
+    list.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then(b.created_at.cmp(&a.created_at))
+            .then(a.id.cmp(&b.id))
+    });
+    list
+}
+
+/// Whether a device is connected now, in words for its row: "Online", or "Offline ·
+/// last seen 2 h ago".
+pub fn presence_text(device: &Device) -> String {
+    match (device.online, device.last_seen_at) {
+        (true, _) => "Online".to_string(),
+        (false, Some(seen)) => format!("Offline · last seen {}", ago(&seen)),
+        (false, None) => "Offline".to_string(),
+    }
+}
+
 #[component]
 fn AccountSection() -> Element {
     let app = use_app();
+    // The list comes from the service once; DeviceChanged / DeviceDeleted keep it (and
+    // who is online) current from then on.
     let mut devices = use_resource(move || async move {
         let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
-        api.devices().await.map_err(|e| app.failure(&e))
+        let list = api.devices().await.map_err(|e| app.failure(&e))?;
+        let mut lib = app.lib;
+        lib.write().replace_devices(list);
+        Ok::<(), String>(())
     });
     let mut confirm_revoke = use_signal(|| None::<Device>);
     let mut confirm_signout = use_signal(|| false);
@@ -344,7 +371,25 @@ fn AccountSection() -> Element {
     let mut error = use_signal(|| None::<String>);
 
     let me = app.session.read().as_ref().and_then(|s| s.me.clone());
-    let list = devices.read().clone();
+    // This device is the one signed in here (events don't say which is whose).
+    let my_id = me.as_ref().map(|m| m.device.id.clone());
+    let known: Vec<Device> = app
+        .lib
+        .read()
+        .devices
+        .values()
+        .map(|d| Device {
+            current: d.current || my_id.as_deref() == Some(d.id.as_str()),
+            ..d.clone()
+        })
+        .collect();
+    let list = match devices.read().clone() {
+        Some(Ok(())) => Some(Ok(devices_in_order(&known))),
+        Some(Err(e)) => Some(Err(e)),
+        // Known from events already: show them while the list loads.
+        None if !known.is_empty() => Some(Ok(devices_in_order(&known))),
+        None => None,
+    };
 
     rsx! {
         section { class: "set-sec",
@@ -361,7 +406,7 @@ fn AccountSection() -> Element {
         }
         section { class: "set-sec",
             h2 { "Devices" }
-            p { class: "help", "Every signed-in device has its own key. Revoke one to sign it out." }
+            p { class: "help", "Every signed-in device has its own key. Revoke one to sign it out. A device is online while Margin runs on it; the agent can only use it then." }
             if let Some(err) = error.read().clone() {
                 ErrorNotice { message: err }
             }
@@ -372,12 +417,16 @@ fn AccountSection() -> Element {
                     div {
                         for d in list {
                             div { key: "{d.id}", class: "device",
+                                span {
+                                    class: if d.online { "dot ok" } else { "dot" },
+                                    title: if d.online { "Online" } else { "Offline" },
+                                    "aria-hidden": "true",
+                                }
                                 div { class: "grow",
                                     "{d.name}"
                                     if d.current { span { class: "badge", style: "margin-left: 8px", "This device" } }
                                     small {
-                                        "Added {date(&d.created_at)}"
-                                        if let Some(seen) = d.last_seen_at { " · last seen {ago(&seen)}" }
+                                        "{presence_text(&d)} · added {date(&d.created_at)}"
                                     }
                                 }
                                 if d.current {
@@ -415,7 +464,9 @@ fn AccountSection() -> Element {
                             match api.revoke_device(&id).await {
                                 Ok(()) => {
                                     error.set(None);
-                                    devices.restart();
+                                    // DeviceDeleted says the same to every device.
+                                    let mut lib = app.lib;
+                                    lib.write().apply(Event::DeviceDeleted { id: id.clone() });
                                 }
                                 Err(e) => error.set(Some(app.failure(&e))),
                             }
@@ -662,6 +713,15 @@ pub fn effort_label(effort: ReasoningEffort) -> &'static str {
     }
 }
 
+/// The option Settings shows as chosen: one of `ReasoningEffort::ALL` (a "minimal" stored
+/// by an older build reads as Low, which is what it is sent as).
+pub fn shown_effort(effort: ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ReasoningEffort::Minimal => ReasoningEffort::Low,
+        e => e,
+    }
+}
+
 /// The model chats use (when not the one above) and how hard it thinks before answering.
 #[component]
 fn AgentSection(settings: Settings) -> Element {
@@ -674,7 +734,7 @@ fn AgentSection(settings: Settings) -> Element {
     let effort_busy = use_signal(|| false);
     let mut saved_note = use_signal(|| false);
     let dirty = model.read().trim() != current;
-    let effort = settings.reasoning_effort;
+    let effort = shown_effort(settings.reasoning_effort);
 
     rsx! {
         section { class: "set-sec",
@@ -1213,6 +1273,76 @@ mod tests {
         for e in ReasoningEffort::ALL {
             assert!(html.contains(effort_label(e)));
         }
+    }
+
+    #[test]
+    fn effort_from_an_older_build_shows_as_low() {
+        use crate::store::LibraryState;
+        assert_eq!(shown_effort(ReasoningEffort::Minimal), ReasoningEffort::Low);
+        assert_eq!(shown_effort(ReasoningEffort::Max), ReasoningEffort::Max);
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.reasoning_effort = ReasoningEffort::Minimal;
+        lib.settings = Some(settings);
+        let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
+        // Exactly one option is chosen, and it's Low; Minimal is never offered.
+        assert_eq!(html.matches(r#"aria-checked="true""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"aria-checked="true" tabindex="0">Low<"#),
+            "{html}"
+        );
+        assert!(!html.contains("Minimal"));
+        assert_eq!(ReasoningEffort::ALL.len(), 5);
+    }
+
+    fn device(id: &str, name: &str, online: bool, current: bool) -> Device {
+        use chrono::TimeZone;
+        Device {
+            id: id.into(),
+            name: name.into(),
+            created_at: chrono::Utc.timestamp_opt(1_760_000_000, 0).unwrap(),
+            last_seen_at: None,
+            current,
+            online,
+        }
+    }
+
+    #[test]
+    fn devices_show_who_is_online() {
+        use crate::store::LibraryState;
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        // Known from events: `current` isn't set there; this device is the signed-in one.
+        lib.merge_devices(vec![
+            device("d2", "iPhone", false, false),
+            device("d1", "test-mac", true, false),
+            device("d3", "iPad", true, false),
+        ]);
+        let html =
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Account));
+        assert!(html.contains(r#"class="dot ok""#), "{html}");
+        assert!(html.contains("Online · added"));
+        assert!(html.contains("Offline · added"));
+        // This device first, with its badge.
+        let mac = html.find(">test-mac").unwrap();
+        let phone = html.find(">iPhone").unwrap();
+        assert!(mac < phone);
+        assert!(html.contains(">This device<"));
+        let order: Vec<String> = devices_in_order(&[
+            device("a", "old", false, false),
+            Device {
+                created_at: chrono::Utc::now(),
+                ..device("b", "new", false, false)
+            },
+            device("c", "me", false, true),
+        ])
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+        assert_eq!(order, ["c", "b", "a"]);
+        let mut seen = device("x", "x", false, false);
+        assert_eq!(presence_text(&seen), "Offline");
+        seen.last_seen_at = Some(chrono::Utc::now());
+        assert_eq!(presence_text(&seen), "Offline · last seen just now");
     }
 
     #[test]

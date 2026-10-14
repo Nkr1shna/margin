@@ -105,7 +105,7 @@ impl OutlineDraft {
 }
 
 /// A proposal in whichever state it is: being drafted, failed, ready to edit and create,
-/// or created.
+/// created, or replaced by a newer outline in the chat.
 #[component]
 pub fn ProposalView(
     proposal: Proposal,
@@ -143,10 +143,29 @@ pub fn ProposalView(
         ProposalStatus::Failed { error } => rsx! {
             ErrorNotice { message: format!("Couldn't draft an outline. {error}") }
         },
+        // Only the chat's newest outline can create a course: this one stays as it was
+        // proposed, inactive.
         ProposalStatus::Superseded { .. } => rsx! {
-            div { class: "outline", role: "status",
+            div { class: "outline",
                 div { class: "outline-h",
-                    b { "A newer outline replaced this one." }
+                    b { "Earlier outline" }
+                    if let Some(o) = &proposal.outline {
+                        small { "{o.lessons.len()} lessons · ~{o.lessons.iter().map(|l| l.minutes).sum::<u32>()} min" }
+                    }
+                }
+                p { class: "muted", role: "status", style: "margin: 0 0 12px", "A newer outline replaced this one." }
+                if let Some(o) = proposal.outline.clone() {
+                    p { class: "muted", style: "margin: 0 0 12px", "Topic: ", b { style: "font-weight: 500; color: var(--fg)", "{o.topic_title}" } }
+                    for (i, lesson) in o.lessons.iter().enumerate() {
+                        div { key: "{i}", class: "ol-item",
+                            span { class: "n", "{i + 1}" }
+                            div { class: "ol-view",
+                                b { "{lesson.title}" }
+                                p { "{lesson.summary}" }
+                            }
+                            span { class: "n", style: "padding-top: 2px", "~{lesson.minutes} min" }
+                        }
+                    }
                 }
             }
         },

@@ -2745,6 +2745,10 @@ impl FakeState {
     /// Sets a chat's state; returns the changed chat.
     fn set_chat_state(&mut self, chat_id: &str, state: ChatState) -> Option<Chat> {
         let chat = self.chat_mut(chat_id)?;
+        // A turn that ends, however it ends, waits no longer.
+        if !state.is_busy() {
+            chat.waiting = None;
+        }
         chat.state = state;
         chat.updated_at = Utc::now();
         Some(chat.clone())
@@ -2894,6 +2898,30 @@ fn chat_title(text: &str) -> String {
     } else {
         let cut: String = line.chars().take(CHAT_TITLE_MAX - 1).collect();
         format!("{}…", cut.trim_end())
+    }
+}
+
+/// The title "the model" gives a chat after its first answer: the main words of the
+/// message's first line, at most six ("How do Fourier series converge?" → "Fourier
+/// series converge").
+fn model_title(text: &str) -> String {
+    const SKIP: &[&str] = &[
+        "a", "an", "the", "how", "do", "does", "what", "why", "is", "are", "me", "my", "on",
+        "about", "of", "to", "i", "can", "you", "please", "teach", "explain", "with",
+    ];
+    let words: Vec<&str> = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| !w.is_empty() && !SKIP.contains(&w.to_lowercase().as_str()))
+        .take(6)
+        .collect();
+    let title = capitalized(&words.join(" "));
+    if title.is_empty() {
+        chat_title(text)
+    } else {
+        title.chars().take(CHAT_TITLE_MAX).collect()
     }
 }
 
@@ -3210,23 +3238,35 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
         "source_ids": request.source_ids,
     });
     let n = outline.lessons.len();
-    let Some(proposal) = step(fake, chat_id, turn_id, |s| {
-        let proposal = Proposal {
-            id: s.id("proposal"),
-            request: request.clone(),
-            status: ProposalStatus::Ready,
-            outline: Some(outline.clone()),
-            created_at: Utc::now(),
-            chat_id: Some(chat_id.into()),
-        };
-        s.proposals.insert(proposal.id.clone(), proposal.clone());
-        (
-            vec![Event::ProposalChanged {
+    let Some(proposal) =
+        step(fake, chat_id, turn_id, |s| {
+            let proposal = Proposal {
+                id: s.id("proposal"),
+                request: request.clone(),
+                status: ProposalStatus::Ready,
+                outline: Some(outline.clone()),
+                created_at: Utc::now(),
+                chat_id: Some(chat_id.into()),
+            };
+            // Only the chat's newest outline can create a course.
+            let mut events = Vec::new();
+            for earlier in s.proposals.values_mut().filter(|p| {
+                p.chat_id.as_deref() == Some(chat_id) && p.status == ProposalStatus::Ready
+            }) {
+                earlier.status = ProposalStatus::Superseded {
+                    by: proposal.id.clone(),
+                };
+                events.push(Event::ProposalChanged {
+                    proposal: earlier.clone(),
+                });
+            }
+            s.proposals.insert(proposal.id.clone(), proposal.clone());
+            events.push(Event::ProposalChanged {
                 proposal: proposal.clone(),
-            }],
-            proposal,
-        )
-    }) else {
+            });
+            (events, proposal)
+        })
+    else {
         return;
     };
     let Some(call_id) = tool_call(
@@ -3369,17 +3409,277 @@ async fn accept_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, proposal: Pro
     }
 }
 
+/// Whether a message asks for one more lesson in a topic (the agent's `write_lesson`).
+fn wants_lesson(lower: &str) -> bool {
+    ["write a lesson", "add a lesson", "one more lesson"]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
+/// The topic a message names (a word of its title), else the first topic with lessons.
+fn topic_named(s: &FakeState, lower: &str) -> Option<Topic> {
+    let has_lessons = |t: &Topic| s.library.lessons.iter().any(|l| l.topic_id == t.id);
+    s.library
+        .topics
+        .iter()
+        .filter(|t| has_lessons(t))
+        .find(|t| {
+            t.title
+                .split_whitespace()
+                .any(|w| w.len() > 3 && lower.contains(&w.to_lowercase()))
+        })
+        .or_else(|| s.library.topics.iter().find(|t| has_lessons(t)))
+        .cloned()
+}
+
+/// Ends a turn with a result card for `target` and a short answer.
+async fn result_and_answer(
+    fake: &Fake,
+    chat_id: &str,
+    turn_id: &str,
+    call_id: String,
+    target: ResultTarget,
+    title: String,
+    answer: String,
+) {
+    if step(fake, chat_id, turn_id, |s| {
+        let card = s.add_item(
+            chat_id,
+            turn_id,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id,
+                card: Card::Result(ResultCard { target, title }),
+            },
+        );
+        (vec![Event::ChatItemChanged { item: card }], ())
+    })
+    .is_none()
+    {
+        return;
+    }
+    if streamed_item(
+        fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::AssistantText {
+            text: String::new(),
+        },
+        &answer,
+    )
+    .await
+    .is_some()
+    {
+        finish_turn(fake, chat_id, turn_id).await;
+    }
+}
+
+/// `write_lesson` ("write a lesson on …"): a lesson is added at the end of the topic the
+/// message names and written as a job; a result card follows it as it's written.
+async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str) {
+    let lower = prompt.to_lowercase();
+    let title = [" on ", " about "]
+        .iter()
+        .filter_map(|w| lower.find(w).map(|at| at + w.len()))
+        .min()
+        .and_then(|at| prompt.get(at..))
+        .map(|t| t.trim().trim_end_matches(['.', '?', '!']).to_string())
+        .filter(|t| !t.is_empty())
+        .map(|t| capitalized(&t))
+        .unwrap_or_else(|| "One more lesson".to_string());
+    let Some(lesson) = step(fake, chat_id, turn_id, |s| {
+        let Some(topic) = topic_named(s, &lower) else {
+            return (vec![], None);
+        };
+        let position = s
+            .library
+            .lessons
+            .iter()
+            .filter(|l| l.topic_id == topic.id)
+            .map(|l| l.position + 1)
+            .max()
+            .unwrap_or(0);
+        let lesson = Lesson {
+            citations: Vec::new(),
+            id: s.id("lesson"),
+            topic_id: topic.id.clone(),
+            title: title.clone(),
+            summary: format!("More on {}", topic.title),
+            position,
+            level: Level::Intro,
+            minutes: 10,
+            body_md: String::new(),
+            status: LessonStatus::Queued,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        s.library.lessons.push(lesson.clone());
+        (
+            vec![Event::LessonChanged {
+                lesson: lesson.clone(),
+            }],
+            Some(lesson),
+        )
+    })
+    .flatten() else {
+        return;
+    };
+    if fake.state.lock().unwrap().simulate {
+        tokio::spawn(simulate_lesson(fake.clone(), lesson.id.clone()));
+    }
+    let Some(call_id) = tool_call(
+        fake,
+        chat_id,
+        turn_id,
+        "write_lesson",
+        serde_json::json!({
+            "topic_id": lesson.topic_id, "title": lesson.title, "summary": lesson.summary,
+            "minutes": lesson.minutes, "level": "intro", "with_quiz": false,
+        }),
+        format!("Writing the lesson “{}”", lesson.title),
+        "Lesson queued".to_string(),
+        serde_json::json!({ "lesson_id": lesson.id }).to_string(),
+    )
+    .await
+    else {
+        return;
+    };
+    let answer = format!(
+        "I've added **{}** to the topic; it's being written now. The card shows how far along it is.",
+        lesson.title
+    );
+    result_and_answer(
+        fake,
+        chat_id,
+        turn_id,
+        call_id,
+        ResultTarget::Lesson {
+            lesson_id: lesson.id.clone(),
+        },
+        lesson.title,
+        answer,
+    )
+    .await;
+}
+
+/// `make_video` ("make a video of …"): the named lesson's video (else the first written
+/// lesson's) is queued; a result card follows it through the pipeline.
+async fn make_video_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str) {
+    let lower = prompt.to_lowercase();
+    let Some((lesson, video)) = step(fake, chat_id, turn_id, |s| {
+        let ready = |l: &&Lesson| l.status == LessonStatus::Ready;
+        let named = s.library.lessons.iter().filter(ready).find(|l| {
+            l.title
+                .split_whitespace()
+                .any(|w| w.len() > 3 && lower.contains(&w.to_lowercase()))
+        });
+        let Some(lesson) = named
+            .or_else(|| s.library.lessons.iter().find(ready))
+            .cloned()
+        else {
+            return (vec![], None);
+        };
+        let existing = s
+            .library
+            .videos
+            .iter()
+            .find(|v| v.lesson_id == lesson.id)
+            .map(|v| v.id.clone());
+        let id = existing.unwrap_or_else(|| s.id("video"));
+        s.library.videos.retain(|v| v.lesson_id != lesson.id);
+        let video = Video {
+            id,
+            lesson_id: lesson.id.clone(),
+            status: VideoStatus::Queued,
+            scene_code: None,
+            log: String::new(),
+            duration_seconds: None,
+            media: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        s.library.videos.push(video.clone());
+        (
+            vec![Event::VideoChanged {
+                video: video.clone(),
+            }],
+            Some((lesson, video)),
+        )
+    })
+    .flatten() else {
+        return;
+    };
+    if fake.state.lock().unwrap().simulate {
+        tokio::spawn(simulate_video(fake.clone(), video.id.clone()));
+    }
+    let Some(call_id) = tool_call(
+        fake,
+        chat_id,
+        turn_id,
+        "make_video",
+        serde_json::json!({ "lesson_id": lesson.id }),
+        format!("Making a video of “{}”", lesson.title),
+        "Video queued".to_string(),
+        serde_json::json!({ "video_id": video.id }).to_string(),
+    )
+    .await
+    else {
+        return;
+    };
+    let answer = format!(
+        "The video of **{}** is on its way: the scene is written, voiced and rendered on the service Mac. The card follows it.",
+        lesson.title
+    );
+    result_and_answer(
+        fake,
+        chat_id,
+        turn_id,
+        call_id,
+        ResultTarget::Video {
+            lesson_id: lesson.id.clone(),
+        },
+        lesson.title,
+        answer,
+    )
+    .await;
+}
+
+/// The text with its first letter upper-cased.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// The scripted answer to `prompt` (see the section comment). `retry` is a Continue or
 /// Retry, which never fails again.
 async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry: bool) {
     let (chat_id, turn_id) = (chat_id.as_str(), turn_id.as_str());
     let lower = prompt.to_lowercase();
-    let no_key = !fake.state.lock().unwrap().has_api_key;
-    if no_key || (lower.contains("fail") && !retry) {
-        let message = if no_key {
-            "Add an OpenAI API key in Settings first."
+    let (no_key, no_model) = {
+        let s = fake.state.lock().unwrap();
+        let model = s
+            .settings
+            .agent_model
+            .as_deref()
+            .unwrap_or(&s.settings.openai_model);
+        (!s.has_api_key, model.trim().is_empty())
+    };
+    if no_key || no_model || (lower.contains("fail") && !retry) {
+        let (message, code) = if no_key {
+            (
+                "Add an OpenAI API key in Settings first.",
+                error_code::NO_API_KEY,
+            )
+        } else if no_model {
+            ("Choose a model in Settings first.", error_code::NO_MODEL)
         } else {
-            "The model API answered 500 three times."
+            (
+                "The model API answered 500 three times.",
+                error_code::SERVER_ERROR,
+            )
         };
         step(&fake, chat_id, turn_id, |s| {
             let error = s.add_item(
@@ -3389,7 +3689,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
                 ChatItemKind::Error {
                     message: message.into(),
                     retryable: true,
-                    code: None,
+                    code: Some(code.into()),
                 },
             );
             let chat = s.set_chat_state(
@@ -3406,6 +3706,37 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
         start_pending(&fake, chat_id).await;
         return;
     }
+    // "slow down": the model API asks for a pause first (Retry-After); the chat shows
+    // it's waiting. With `chat_hang` the wait is an hour, to test Stop.
+    if lower.contains("slow down") && !retry {
+        let hang = fake.state.lock().unwrap().chat_hang;
+        let until = Utc::now() + chrono::Duration::seconds(if hang { 3600 } else { 5 });
+        let set_waiting = |waiting: Option<Waiting>| {
+            step(&fake, chat_id, turn_id, |s| {
+                let chat = s.chat_mut(chat_id).map(|c| {
+                    c.waiting = waiting;
+                    c.updated_at = Utc::now();
+                    c.clone()
+                });
+                (
+                    chat.map(|chat| vec![Event::ChatChanged { chat }])
+                        .unwrap_or_default(),
+                    (),
+                )
+            })
+        };
+        let waiting = Waiting {
+            until,
+            reason: "The model API asked Margin to slow down.".into(),
+        };
+        if set_waiting(Some(waiting)).is_none() || hang {
+            return;
+        }
+        pace(&fake, 5000).await;
+        if set_waiting(None).is_none() {
+            return;
+        }
+    }
     pace(&fake, 300).await;
     let Some(_) = streamed_item(
         &fake,
@@ -3420,6 +3751,15 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
     else {
         return;
     };
+
+    if wants_lesson(&lower) {
+        write_lesson_in_turn(&fake, chat_id, turn_id, &prompt).await;
+        return;
+    }
+    if lower.contains("make a video") || lower.contains("video of") {
+        make_video_in_turn(&fake, chat_id, turn_id, &prompt).await;
+        return;
+    }
 
     if wants_accept(&lower) {
         let ready = {
@@ -3634,8 +3974,27 @@ async fn finish_turn(fake: &Fake, chat_id: &str, turn_id: &str) {
                 model_calls: 2,
             });
             chat.state = ChatState::Idle;
+            chat.waiting = None;
             chat.updated_at = Utc::now();
             chat.clone()
+        });
+        // After the first answer the model names the chat (never over the owner's name).
+        let chat = chat.map(|chat| match chat.title_by {
+            TitleSource::FirstLine => {
+                let first = s.chat_items.get(chat_id).and_then(|items| {
+                    items.iter().find_map(|i| match &i.kind {
+                        ChatItemKind::UserMessage { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                });
+                let named = s.chat_mut(chat_id).expect("the chat exists");
+                if let Some(first) = first {
+                    named.title = model_title(&first);
+                    named.title_by = TitleSource::Model;
+                }
+                named.clone()
+            }
+            _ => chat,
         });
         (
             chat.map(|chat| vec![Event::ChatChanged { chat }])
@@ -3736,6 +4095,11 @@ async fn create_chat(
     }
     let (events, detail, turn) = {
         let mut s = fake.state.lock().unwrap();
+        if let Some(message) = &req.message
+            && let Err(r) = check_sources(&s, &message.source_ids)
+        {
+            return r;
+        }
         let now = Utc::now();
         let chat = Chat {
             id: s.id("chat"),
@@ -3815,18 +4179,65 @@ async fn patch_chat(
                 );
             }
             chat.title = title.chars().take(200).collect();
+            // The owner named it: the model never renames it.
+            chat.title_by = TitleSource::Owner;
         }
         if let Some(ids) = req.workspace_ids {
             chat.workspace_ids = ids;
         }
-        if let Some(ids) = req.source_ids {
-            chat.source_ids = ids;
-        }
+        let dropped: Vec<Id> = match req.source_ids {
+            Some(ids) => {
+                let dropped = chat
+                    .source_ids
+                    .iter()
+                    .filter(|id| !ids.contains(id))
+                    .cloned()
+                    .collect();
+                chat.source_ids = ids;
+                dropped
+            }
+            None => Vec::new(),
+        };
         chat.updated_at = Utc::now();
-        chat.clone()
+        let chat = chat.clone();
+        // Files no longer attached to a chat or a topic are deleted.
+        let orphans: Vec<Id> = dropped
+            .into_iter()
+            .filter(|id| {
+                let in_topic = s
+                    .library
+                    .sources
+                    .iter()
+                    .any(|src| &src.id == id && src.topic_id.is_some());
+                let in_chat = s.chats.iter().any(|c| c.source_ids.contains(id));
+                !in_topic && !in_chat
+            })
+            .collect();
+        s.library.sources.retain(|src| !orphans.contains(&src.id));
+        (chat, orphans)
     };
+    let (chat, orphans) = chat;
     publish(&fake, Event::ChatChanged { chat: chat.clone() });
+    for id in orphans {
+        publish(&fake, Event::SourceDeleted { id });
+    }
     Json(chat).into_response()
+}
+
+/// A message's files must be sources the service has.
+#[allow(clippy::result_large_err)]
+fn check_sources(s: &FakeState, ids: &[Id]) -> Result<(), Response> {
+    match ids
+        .iter()
+        .find(|id| !s.library.sources.iter().any(|src| &src.id == *id))
+    {
+        Some(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_source",
+            "A file attached to the message isn't on the service any more.",
+        )),
+        None => Ok(()),
+    }
 }
 
 async fn delete_chat(
@@ -3837,20 +4248,38 @@ async fn delete_chat(
     if let Err(r) = authorized(&headers) {
         return r;
     }
-    {
+    let orphans = {
         let mut s = fake.state.lock().unwrap();
-        let before = s.chats.len();
-        s.chats.retain(|c| c.id != id);
-        if s.chats.len() == before {
+        let Some(chat) = s.chats.iter().find(|c| c.id == id).cloned() else {
             return not_found();
-        }
+        };
+        s.chats.retain(|c| c.id != id);
         if let Some(items) = s.chat_items.remove(&id) {
             for item in items {
                 s.chat_outputs.remove(&item.id);
             }
         }
-    }
+        // Files only this chat had go with it.
+        let orphans: Vec<Id> = chat
+            .source_ids
+            .iter()
+            .filter(|sid| {
+                let in_topic = s
+                    .library
+                    .sources
+                    .iter()
+                    .any(|src| &src.id == *sid && src.topic_id.is_some());
+                !in_topic && !s.chats.iter().any(|c| c.source_ids.contains(sid))
+            })
+            .cloned()
+            .collect();
+        s.library.sources.retain(|src| !orphans.contains(&src.id));
+        orphans
+    };
     publish(&fake, Event::ChatDeleted { id });
+    for id in orphans {
+        publish(&fake, Event::SourceDeleted { id });
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -3868,6 +4297,9 @@ async fn send_message(
     }
     let (events, sent, turn) = {
         let mut s = fake.state.lock().unwrap();
+        if let Err(r) = check_sources(&s, &req.source_ids) {
+            return r;
+        }
         let (device_id, _) = s.current_device();
         let Some(chat) = s.chat_mut(&id) else {
             return not_found();
