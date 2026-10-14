@@ -392,6 +392,14 @@ impl Reranker for NoRerank {
 pub struct TakeK;
 
 /// The citation of one hit (`n` 0 until cited; `source_id` is the document id).
+/// The section a hit is in ("Chapter 2 > Fourier series"), for its citation; `None`
+/// when the chunker named none. `hit_citation` sets `Citation.section_path` to this
+/// once crates/shared adds the field (`section_path: citation_section_path(hit),`).
+pub fn citation_section_path(hit: &Hit) -> Option<String> {
+    let s = hit.passage.section_path.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
 pub fn hit_citation(hit: &Hit) -> Citation {
     let p = &hit.passage;
     Citation {
@@ -616,6 +624,17 @@ mod tests {
             rerank: None,
             highlight: None,
         }
+    }
+
+    #[test]
+    fn a_citation_names_its_section() {
+        let mut h = hit("alpha", 0, 0.9);
+        assert_eq!(citation_section_path(&h), None);
+        h.passage.section_path = " Chapter 2 > Fourier series ".into();
+        assert_eq!(
+            citation_section_path(&h).as_deref(),
+            Some("Chapter 2 > Fourier series")
+        );
     }
 
     #[tokio::test]

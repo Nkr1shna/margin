@@ -221,6 +221,8 @@ pub fn router(state: AppState) -> Router {
             get(settings::get_settings).patch(settings::patch_settings),
         )
         .route(routes::TOOLS, get(settings::tools))
+        // `routes::PIPELINE_VARIANTS` once crates/shared names it.
+        .route("/api/pipeline/variants", get(settings::pipeline_variants))
         .route(routes::DEVICES, get(auth::list_devices))
         .route("/api/devices/{id}", delete(auth::revoke_device))
         // Upload bodies are streamed to disk, each against its kind's limit.

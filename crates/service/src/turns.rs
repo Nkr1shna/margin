@@ -475,8 +475,9 @@ async fn run_turn(
     slot: Slot,
     trace: &TurnTrace,
 ) -> Result<TurnOutcome, Early> {
-    // A missing key or model ends the turn like a failed model call.
-    let ai = state.agent_ai_config().await.map_err(|e| Early {
+    // A missing key or model ends the turn like a failed model call. The chat route
+    // (`pipeline.routes.chat`) when set, else the agent model, else the main model.
+    let ai = state.route_ai_config(Route::Chat).await.map_err(|e| Early {
         code: match e.code {
             error_code::NO_API_KEY => error_code::NO_API_KEY,
             error_code::NO_MODEL => error_code::NO_MODEL,
@@ -516,13 +517,24 @@ async fn run_turn(
         .await
         .map_err(internal)?;
     let tools = traced_tools(&agent_tools::registry(state), trace);
-    let model = TracedModel::new(
+    let mut model = TracedModel::new(
         state.generator.agent_model(&ai),
         trace.clone(),
         &ai.model,
         trace::provider_of(&ai.base_url),
         None,
     );
+    // Condensing the history is a small task: `pipeline.routes.small` when set.
+    if let Some(small) = small_route(state).await {
+        model = model.with_small(small);
+    }
+    // The model the requests name: the routed chat model when Settings routes chat
+    // turns, else the agent model as before.
+    let chat_model = if routed(state, Route::Chat) {
+        Some(ai.model.clone())
+    } else {
+        settings.agent_model.clone()
+    };
     let sink = ServiceSink {
         state: state.clone(),
         chat_id: chat_id.to_string(),
@@ -541,7 +553,7 @@ async fn run_turn(
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
         origin_device: origin,
-        model: settings.agent_model.clone(),
+        model: chat_model,
         reasoning_effort: settings.reasoning_effort,
         history,
         workspaces,
@@ -550,6 +562,33 @@ async fn run_turn(
     let outcome = margin_agent::run_turn(deps, input).await;
     tracing::info!(chat = %chat_id, turn = %turn_id, ?outcome, "turn ended");
     Ok(outcome)
+}
+
+/// Whether Settings routes `route` to a model of its own (`pipeline.routes`).
+fn routed(state: &AppState, route: Route) -> bool {
+    state
+        .pipeline
+        .load()
+        .routes
+        .get(route)
+        .is_some_and(|m| !m.trim().is_empty())
+}
+
+/// The small-tasks route (titles, condensing): `route_ai_config(Route::Small)`, i.e.
+/// `pipeline.routes.small` or else the main model. `None` (logged) when it can't be
+/// configured; the caller then stays on the turn's model.
+async fn small_route(state: &AppState) -> Option<SmallRoute> {
+    match state.route_ai_config(Route::Small).await {
+        Ok(ai) => Some(SmallRoute {
+            client: state.generator.agent_model(&ai),
+            provider: trace::provider_of(&ai.base_url),
+            model: ai.model,
+        }),
+        Err(e) => {
+            tracing::warn!("the small-tasks model isn't configured: {}", e.message);
+            None
+        }
+    }
 }
 
 /// Ends a run: for a failed one, what the turn left unfinished (a panic or a storage
@@ -1594,35 +1633,26 @@ async fn ask_title(
         })
         .unwrap_or_default();
     let override_model = state.turns.title_model.lock().unwrap().clone();
-    let settings = state.settings_row().await?;
-    let (model, model_name) = match override_model {
-        Some(m) => {
-            let name = settings
-                .agent_model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| settings.openai_model.clone());
-            (m, name)
-        }
-        None => {
-            let ai = state
-                .agent_ai_config()
-                .await
-                .map_err(|e| anyhow::anyhow!(e.message))?;
-            (state.generator.agent_model(&ai), ai.model)
-        }
+    // A title is a small task: `pipeline.routes.small`, else the main model.
+    let ai = state
+        .route_ai_config(Route::Small)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let model = match override_model {
+        Some(m) => m,
+        None => state.generator.agent_model(&ai),
     };
     let model = TracedModel::new(
         model,
         TurnTrace::new(state, chat_id, turn_id, None),
-        &model_name,
-        trace::provider_of(&settings.openai_base_url),
+        &ai.model,
+        trace::provider_of(&ai.base_url),
         Some(Purpose::Title),
     );
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
     let request = ResponseRequest {
-        model: settings.agent_model.clone(),
+        model: Some(ai.model.clone()),
         input: vec![
             margin_agent::action_input(TITLE_INSTRUCTIONS),
             json!({"role": "user", "content": [{"type": "input_text", "text": data}]}),
@@ -1728,6 +1758,16 @@ pub struct TracedModel {
     provider: &'static str,
     purpose: Option<Purpose>,
     steps: AtomicU32,
+    /// Where the loop's condense calls go: the small-tasks route
+    /// (`pipeline.routes.small`), when it differs from the turn's.
+    small: Option<SmallRoute>,
+}
+
+/// The client and model of `Route::Small`.
+pub struct SmallRoute {
+    pub client: Arc<dyn ModelClient>,
+    pub model: String,
+    pub provider: &'static str,
 }
 
 impl TracedModel {
@@ -1745,7 +1785,19 @@ impl TracedModel {
             provider,
             purpose,
             steps: AtomicU32::new(0),
+            small: None,
         }
+    }
+
+    /// Sends the loop's condense calls (no tools) to the small-tasks route.
+    pub fn with_small(mut self, small: SmallRoute) -> Self {
+        self.small = Some(small);
+        self
+    }
+
+    /// A condense call of the loop: no tools, not the title.
+    fn is_condense(&self, req: &ResponseRequest) -> bool {
+        self.purpose.is_none() && req.tools.is_empty()
     }
 
     /// The call's row: route, model, provider, prompt version (a hash of the fixed
@@ -1782,10 +1834,20 @@ impl TracedModel {
 }
 
 impl ModelClient for TracedModel {
-    fn stream(&self, req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>> {
+    fn stream(&self, mut req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>> {
         Box::pin(async move {
-            let span = self.span(&req);
-            match self.inner.stream(req).await {
+            let client = match &self.small {
+                Some(small) if self.is_condense(&req) => {
+                    req.model = Some(small.model.clone());
+                    &small.client
+                }
+                _ => &self.inner,
+            };
+            let mut span = self.span(&req);
+            if let Some(small) = self.small.as_ref().filter(|_| self.is_condense(&req)) {
+                span.row.provider = Some(small.provider.to_string());
+            }
+            match client.stream(req).await {
                 Ok(stream) => Ok(
                     Box::pin(TracedStream::new(stream, span, self.trace.state.clone()))
                         as ResponseStream,
