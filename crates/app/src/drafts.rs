@@ -125,13 +125,15 @@ pub fn save_in_background(app: crate::state::AppCtx, id: Id) {
 
 /// Send every recorded edit now, blocking for at most `timeout`. For the window closing
 /// and the app quitting, when the app's own runtime is going away. Returns how many
-/// edits the service accepted.
+/// edits the service accepted. (Desktop only: the mobile shells have no quit hook.)
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn flush_blocking(timeout: Duration) -> usize {
     let drafts: Vec<(Id, Draft)> = std::mem::take(&mut *pending()).into_iter().collect();
     send_blocking(drafts, timeout)
 }
 
 /// Send these edits on a thread of their own, waiting at most `timeout`.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 fn send_blocking(drafts: Vec<(Id, Draft)>, timeout: Duration) -> usize {
     if drafts.is_empty() {
         return 0;
