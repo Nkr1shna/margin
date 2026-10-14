@@ -2,9 +2,10 @@
 //! normalized; Jupyter notebooks become their cells' sources and HTML loses its markup
 //! (headings and table rows kept in Markdown's spelling). Notebooks and HTML are
 //! recognized by extension or, for files stored without one, by their first bytes; the
-//! other text formats (`TextFormat`) by extension or contents. PDFs are read in `pdf.rs`,
-//! images with ImageIO and Vision OCR (`image.rs`), audio and video with AVFoundation
-//! (`av.rs`).
+//! other text formats (`TextFormat`) by extension or contents. On macOS PDFs are read in
+//! `pdf.rs`, images with ImageIO and Vision OCR (`image.rs`), audio and video with
+//! AVFoundation (`av.rs`); on Linux with pdfium (`pdf_pdfium.rs`), `image`/libheif
+//! (`image_linux.rs`) and tesseract (`ocr_tesseract.rs`), and ffmpeg (`av_ffmpeg.rs`).
 
 use std::path::Path;
 
@@ -147,24 +148,302 @@ fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn pdf(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
+    crate::pdf_pdfium::extract(path, media_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn image(path: &Path) -> Result<Extracted, EmbedError> {
+    linux::image(path, &crate::ocr_tesseract::recognize)
+}
+
+#[cfg(target_os = "linux")]
+fn audio(path: &Path) -> Result<Extracted, EmbedError> {
+    linux::audio(path, &linux::ffmpeg()?)
+}
+
+#[cfg(target_os = "linux")]
+fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
+    linux::video(path, media_dir, &linux::ffmpeg()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn pdf(_path: &Path, _media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract("reading PDFs needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading PDFs needs macOS or Linux".into(),
+    ))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn image(_path: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract("reading images needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading images needs macOS or Linux".into(),
+    ))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn audio(_path: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract("reading audio needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading audio needs macOS or Linux".into(),
+    ))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn video(_path: &Path, _media_dir: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract("reading video needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading video needs macOS or Linux".into(),
+    ))
+}
+
+/// A program at `$env` (when set), on PATH, or in the usual install folders.
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+pub(crate) fn find_program(name: &str, env: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    let executable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if let Some(path) = std::env::var_os(env).filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(path);
+        return executable(&path).then_some(path);
+    }
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.extend(
+        ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(PathBuf::from),
+    );
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/bin"));
+    }
+    dirs.into_iter()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.join(name))
+        .find(|p| executable(p))
+}
+
+/// The Linux readers' sources (`docs/plan-linux-service.md` §2.2–2.5), mirroring the
+/// macOS functions above: pdfium + tesseract, `image` (+ libheif) + tesseract, ffmpeg.
+/// Built on macOS too with the `linux-readers` feature, so they are tested there with
+/// stand-in programs.
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod linux {
+    use std::path::Path;
+
+    use image::DynamicImage;
+
+    use crate::av_ffmpeg::Ffmpeg;
+    use crate::{EmbedError, Extracted, Page};
+
+    /// Images with fewer non-space characters of recognized text than this have no text.
+    const IMAGE_MIN_TEXT_CHARS: usize = 4;
+
+    /// `ffmpeg` and `ffprobe`, or the error saying how to get them.
+    pub(crate) fn ffmpeg() -> Result<Ffmpeg, EmbedError> {
+        crate::av_ffmpeg::find_ffmpeg().ok_or_else(|| {
+            EmbedError::Extract(
+                "reading audio and video needs ffmpeg and ffprobe (apt install ffmpeg)".into(),
+            )
+        })
+    }
+
+    /// The image itself is the picture (decoded now to find a broken file early); its
+    /// OCR text, when there is some, is its one page.
+    pub(crate) fn image(
+        path: &Path,
+        ocr: &dyn Fn(&DynamicImage) -> Result<String, EmbedError>,
+    ) -> Result<Extracted, EmbedError> {
+        let image = crate::image_linux::load(path)?;
+        let image = crate::image_linux::shrink(image, crate::image_linux::OCR_MAX_SIDE);
+        let text = ocr(&image)?;
+        let pages = if text.chars().filter(|c| !c.is_whitespace()).count() >= IMAGE_MIN_TEXT_CHARS {
+            vec![Page { number: None, text }]
+        } else {
+            Vec::new()
+        };
+        Ok(Extracted {
+            pages,
+            pictures: vec![crate::Picture {
+                path: path.to_path_buf(),
+                page: None,
+                at_ms: None,
+                tokens: crate::ImageTokens::High,
+            }],
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn audio(path: &Path, tools: &Ffmpeg) -> Result<Extracted, EmbedError> {
+        let probe = tools.probe(path)?;
+        let samples = tools
+            .sound(path, &probe)?
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EmbedError::Extract("there's no sound in this file".into()))?;
+        Ok(Extracted {
+            duration_ms: Some(crate::sample_ms(samples.len())),
+            sound: Some(samples),
+            ..Default::default()
+        })
+    }
+
+    /// Frames at `frame_times` as JPEGs in `media_dir`, plus the soundtrack if any.
+    pub(crate) fn video(
+        path: &Path,
+        media_dir: &Path,
+        tools: &Ffmpeg,
+    ) -> Result<Extracted, EmbedError> {
+        let probe = tools.probe(path)?;
+        if !probe.video {
+            return Err(EmbedError::Extract(
+                "there's no picture in this video".into(),
+            ));
+        }
+        let duration = probe
+            .duration_ms
+            .ok_or_else(|| EmbedError::Extract("couldn't tell how long this video is".into()))?;
+        let (_, times) = crate::frame_times(duration);
+        std::fs::create_dir_all(media_dir)?;
+        let mut pictures = Vec::new();
+        tools.frames(path, &times, &mut |ms, image| {
+            let file = media_dir.join(crate::frame_file(ms));
+            crate::image_linux::write_jpeg(&image, &file, crate::image_linux::FRAME_JPEG_QUALITY)?;
+            pictures.push(crate::Picture {
+                path: file,
+                page: None,
+                at_ms: Some(ms),
+                tokens: crate::ImageTokens::Medium,
+            });
+            Ok(())
+        })?;
+        if pictures.is_empty() {
+            return Err(EmbedError::Extract(
+                "couldn't take any pictures from this video".into(),
+            ));
+        }
+        let sound = tools.sound(path, &probe)?.filter(|s| !s.is_empty());
+        Ok(Extracted {
+            pictures,
+            sound,
+            duration_ms: Some(duration),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::av_ffmpeg::tests::fake_ffmpeg;
+        use crate::image_linux::tests::{temp_dir, two_colors};
+
+        #[test]
+        fn images_are_their_picture_and_their_ocr_text() {
+            let dir = temp_dir("extract-image");
+            let path = dir.join("diagram.png");
+            crate::image_linux::write_png(&two_colors(5000, 100), &path).unwrap();
+            let doc = image(&path, &|img| {
+                // Read for OCR at most 4096 px on the longer side.
+                assert_eq!(img.width(), 4096);
+                Ok("Calvin cycle: RuBisCO".into())
+            })
+            .unwrap();
+            assert_eq!(
+                doc.pages,
+                vec![Page {
+                    number: None,
+                    text: "Calvin cycle: RuBisCO".into()
+                }]
+            );
+            assert_eq!(doc.pictures.len(), 1);
+            assert_eq!(doc.pictures[0].path, path);
+            assert_eq!(doc.pictures[0].tokens, crate::ImageTokens::High);
+            // A stray letter isn't text.
+            let photo = image(&path, &|_| Ok(" I ".into())).unwrap();
+            assert!(photo.pages.is_empty());
+            let bad = dir.join("bad.png");
+            std::fs::write(&bad, "nope").unwrap();
+            assert!(image(&bad, &|_| unreachable!()).is_err());
+        }
+
+        #[test]
+        fn audio_and_video_go_through_ffmpeg() {
+            let dir = temp_dir("extract-av");
+            let png = dir.join("frame.png");
+            crate::image_linux::write_png(&two_colors(640, 360), &png).unwrap();
+            let tools = fake_ffmpeg(
+                &dir,
+                r#"{"streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                    "format": {"duration": "12.0"}}"#,
+                &png,
+                60_000,
+            );
+            let media = dir.join("media");
+            let doc = video(Path::new("lecture.mp4"), &media, &tools).unwrap();
+            assert_eq!(doc.duration_ms, Some(12_000));
+            let times: Vec<u64> = doc.pictures.iter().map(|p| p.at_ms.unwrap()).collect();
+            assert_eq!(times, crate::frame_times(12_000).1);
+            for p in &doc.pictures {
+                assert_eq!(p.path, media.join(crate::frame_file(p.at_ms.unwrap())));
+                assert_eq!(p.tokens, crate::ImageTokens::Medium);
+                let jpeg = std::fs::read(&p.path).unwrap();
+                assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+            }
+            assert_eq!(doc.sound.as_ref().map(Vec::len), Some(32_000));
+
+            let doc = audio(Path::new("talk.mp3"), &tools).unwrap();
+            assert_eq!(doc.duration_ms, Some(2_000));
+            assert!(doc.pictures.is_empty() && doc.pages.is_empty());
+
+            // An audio file isn't a video; a file without sound isn't audio.
+            let mp3 = fake_ffmpeg(
+                &dir,
+                r#"{"streams": [{"codec_type": "audio"},
+                    {"codec_type": "video", "disposition": {"attached_pic": 1}}],
+                    "format": {"duration": "2.0"}}"#,
+                &png,
+                60_000,
+            );
+            assert!(video(Path::new("song.mp3"), &media, &mp3).is_err());
+            let silent = fake_ffmpeg(
+                &dir,
+                r#"{"streams": [{"codec_type": "video"}], "format": {"duration": "4.0"}}"#,
+                &png,
+                60_000,
+            );
+            let err = audio(Path::new("silent.mov"), &silent).unwrap_err();
+            assert!(err.to_string().contains("no sound"), "{err}");
+            let doc = video(Path::new("silent.mov"), &media, &silent).unwrap();
+            assert_eq!(doc.sound, None);
+        }
+
+        #[test]
+        fn programs_are_found_by_override_or_path() {
+            let dir = temp_dir("find");
+            let tool = dir.join("sometool");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            assert_eq!(
+                super::super::find_program("sometool", "MARGIN_TEST_NO_SUCH_ENV"),
+                None
+            );
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // SAFETY: tests in this crate don't read this variable elsewhere.
+            unsafe { std::env::set_var("MARGIN_TEST_SOMETOOL", &tool) };
+            assert_eq!(
+                super::super::find_program("sometool", "MARGIN_TEST_SOMETOOL"),
+                Some(tool.clone())
+            );
+            unsafe { std::env::set_var("MARGIN_TEST_SOMETOOL", dir.join("missing")) };
+            assert_eq!(
+                super::super::find_program("sometool", "MARGIN_TEST_SOMETOOL"),
+                None
+            );
+            unsafe { std::env::remove_var("MARGIN_TEST_SOMETOOL") };
+        }
+    }
 }
 
 fn normalize_newlines(text: &str) -> String {
