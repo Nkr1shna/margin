@@ -164,6 +164,11 @@ pub(crate) fn sound(path: &Path) -> Result<Option<Vec<f32>>, EmbedError> {
                 "couldn't decode the sound: {why}"
             )));
         }
+        // Float PCM out of AAC decoding and resampling can overshoot full scale slightly
+        // (and a broken frame can hold NaN); the encoders expect [-1, 1].
+        for s in &mut samples {
+            *s = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
+        }
         Ok(Some(samples))
     })
 }
