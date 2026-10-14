@@ -179,3 +179,32 @@ fn truncation_check_for_tooltips() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// iOS zooms into any field under 16px when it gets focus, whatever the pointer, and
+/// stays zoomed (the page then runs off the right edge): on iOS WebKit every field class
+/// is 16px, not only with a coarse pointer.
+#[test]
+fn fields_are_16px_on_ios_whatever_the_pointer() {
+    let start = CSS
+        .find("@supports (-webkit-touch-callout: none) {")
+        .expect("no iOS-only @supports block");
+    let inner = &CSS[start..];
+    let inner = &inner[inner.find('{').unwrap() + 1..];
+    let rule = &inner[..inner.find('}').unwrap()];
+    let (selectors, decls) = rule
+        .split_once('{')
+        .expect("no rule in the @supports block");
+    for class in [
+        ".input",
+        ".textarea",
+        ".select-input",
+        ".tree-input",
+        "select.chip",
+    ] {
+        assert!(
+            selectors.split(',').any(|s| s.trim() == class),
+            "{class} isn't 16px on iOS"
+        );
+    }
+    assert_eq!(token(decls, "font-size"), "16px");
+}

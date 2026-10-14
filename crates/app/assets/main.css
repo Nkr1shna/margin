@@ -741,6 +741,14 @@ details.collapse[open] > summary .chev { transform: none; }
   .tree-input { height: 44px; }
   select.select-input { height: 44px; }
 }
+/* iOS and iPadOS WebKit (the only engine with -webkit-touch-callout) zoom the page into
+   a field under 16px when it gets focus, whatever the pointer, and stay zoomed after:
+   the page ends up wider than the screen, its right edge cut off. `pointer: coarse`
+   above doesn't cover every case: an iPad with a trackpad or mouse, or the Simulator
+   driven with the Mac's pointer, can report a fine pointer. Pinch zoom stays on. */
+@supports (-webkit-touch-callout: none) {
+  .input, .textarea, .select-input, .tree-input, select.chip { font-size: 16px; }
+}
 @media (hover: none), (pointer: coarse) {
   .tree-row .more, .mnote .tools, .note-row .note-del { opacity: 1; }
 }
