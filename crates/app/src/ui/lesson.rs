@@ -470,7 +470,7 @@ fn VideoTeaser(video: Video, lesson_id: Id, title: String) -> Element {
     rsx! {
         div { class: "video-block",
             if let Some(media) = &video.media {
-                img { src: "{media.storyboard_url}", alt: "Storyboard for {title}" }
+                video { class: "teaser", src: "{media.mp4_url}", preload: "metadata", muted: true, "aria-label": "Video for {title}" }
             }
             div {
                 div { class: "vt", "{title}" }
@@ -972,16 +972,11 @@ fn VideoDetails(video: Video) -> Element {
                 class: "player",
                 controls: true,
                 preload: "metadata",
-                poster: "{media.storyboard_url}",
                 src: "{media.mp4_url}",
                 if let Some(track) = track {
                     track { kind: "captions", src: "{track}", srclang: "en", label: "Captions", default: true }
                 }
                 "Your system can't play this video."
-            }
-            div { class: "panel-sec",
-                h3 { "Storyboard" }
-                img { class: "storyboard", src: "{media.storyboard_url}", alt: "Storyboard frames" }
             }
         }
         if let Some(code) = &video.scene_code {

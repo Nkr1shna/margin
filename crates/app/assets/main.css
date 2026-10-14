@@ -264,7 +264,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .next { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 36px; padding: 16px 18px; border-radius: 6px; background: var(--surface); }
 .next small { display: block; font-size: 14px; font-weight: 500; color: var(--fg-2); }
 .video-block { display: grid; grid-template-columns: 240px 1fr; gap: 20px; align-items: center; margin: 28px 0 8px; }
-.video-block img { width: 240px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; background: var(--manim-bg); display: block; }
+.video-block video.teaser { width: 240px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; background: var(--manim-bg); display: block; }
 .video-block .vt { font-size: 17px; }
 .video-block .vs { font-size: 14px; font-weight: 500; color: var(--fg-2); margin-top: 2px; }
 
@@ -307,7 +307,6 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .bar { height: 3px; border-radius: 2px; background: var(--surface-2); overflow: hidden; width: 160px; }
 .bar i { display: block; height: 100%; background: var(--accent); }
 .player { width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; background: var(--manim-bg); display: block; }
-.storyboard { width: 100%; border-radius: 6px; display: block; background: var(--surface); }
 .panel-sec { display: grid; gap: 10px; }
 .panel-sec h3 { margin: 0; font-size: 13px; font-weight: 500; color: var(--fg-2); }
 .code, .log { font-family: var(--font-mono); font-size: 12px; line-height: 1.65; background: var(--surface); border-radius: 6px; padding: 10px 12px; margin: 0; overflow: auto; color: var(--fg-2); white-space: pre; max-height: 420px; }
@@ -387,7 +386,7 @@ details.collapse > summary { cursor: pointer; font-size: 13px; font-weight: 500;
   .margins { padding-top: 0 !important; border-top: 1px solid var(--line); padding: 20px 0 0 !important; }
   .add-note { position: fixed; left: 16px; right: 16px; bottom: 16px; top: auto !important; border: 0; border-radius: 12px; box-shadow: var(--pop-shadow); padding: 12px 14px; }
   .video-block { grid-template-columns: 1fr; }
-  .video-block img { width: 100%; }
+  .video-block video.teaser { width: 100%; }
   .studio { padding: 16px 16px 48px; }
   .studio-head h1 { font-size: 22px; }
   .notes-wrap.has-selection .note-list { display: none; }
