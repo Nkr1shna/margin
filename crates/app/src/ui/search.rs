@@ -37,6 +37,18 @@ fn route_for(app: &AppCtx, hit: &SearchHit) -> Route {
     }
 }
 
+/// What the palette's live region says for a search state.
+fn search_status(results: &Results) -> String {
+    match results {
+        Results::Idle => String::new(),
+        Results::Searching => "Searching…".into(),
+        Results::Failed(message) => format!("Search failed. {message}"),
+        Results::Hits(h) if h.is_empty() => "No matches.".into(),
+        Results::Hits(h) if h.len() == 1 => "1 result.".into(),
+        Results::Hits(h) => format!("{} results.", h.len()),
+    }
+}
+
 #[component]
 pub fn SearchPalette() -> Element {
     let mut app = use_app();
@@ -105,6 +117,12 @@ pub fn SearchPalette() -> Element {
                 "aria-modal": "true",
                 "aria-label": "Search",
                 onclick: move |e| e.stop_propagation(),
+                // Escape from anywhere in the palette (the field handles its own).
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        close();
+                    }
+                },
                 div { class: "palette-input",
                     Icon { name: "search" }
                     input {
@@ -151,9 +169,11 @@ pub fn SearchPalette() -> Element {
                         },
                     }
                     if current == Results::Searching {
-                        span { class: "spinner", "aria-label": "Searching" }
+                        span { class: "spinner", "aria-hidden": "true" }
                     }
                 }
+                // Always in the page, so screen readers hear each change of the search state.
+                div { class: "sr-only", role: "status", {search_status(&current)} }
                 div { class: "palette-list", id: "search-results", role: "listbox",
                     match current {
                         Results::Idle => rsx! {
@@ -200,5 +220,21 @@ pub fn SearchPalette() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_text_follows_the_search() {
+        assert_eq!(search_status(&Results::Idle), "");
+        assert_eq!(search_status(&Results::Searching), "Searching…");
+        assert_eq!(search_status(&Results::Hits(Vec::new())), "No matches.");
+        assert_eq!(
+            search_status(&Results::Failed("Offline.".into())),
+            "Search failed. Offline."
+        );
     }
 }

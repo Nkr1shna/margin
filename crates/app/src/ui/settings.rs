@@ -154,7 +154,9 @@ pub fn SettingsDialog() -> Element {
                 },
                 nav { class: "set-nav", "aria-label": "Settings",
                     div { class: "set-nav-head",
-                        h2 { "Settings" }
+                        // A caption, not a heading: the nav is named "Settings" and the
+                        // pane's title is the dialog's heading.
+                        div { class: "set-nav-title", "aria-hidden": "true", "Settings" }
                         button {
                             class: "icon-btn",
                             "aria-label": "Close settings",
@@ -196,7 +198,10 @@ pub fn SettingsDialog() -> Element {
                     }
                     div { class: "settings", key: "{pane:?}",
                         match pane {
-                            SettingsPane::General => rsx! { AppearanceSection {} },
+                            SettingsPane::General => rsx! {
+                                AppearanceSection {}
+                                TextSizeSection {}
+                            },
                             SettingsPane::Account => rsx! { AccountSection {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
                             SettingsPane::Ai => service_settings(|s| rsx! { AiSection { settings: s } }),
@@ -993,6 +998,56 @@ fn ToolRow(tool: ToolStatus) -> Element {
                 if let Some(Err(err)) = copied.read().clone() {
                     span { class: "save-state error", role: "alert", "{err}" }
                 }
+            }
+        }
+    }
+}
+
+/// How large everything in the window is drawn (page zoom), on every platform. The Mac
+/// and Linux also have View > Zoom In / Zoom Out / Actual Size; on iOS it multiplies
+/// the system text size.
+#[component]
+fn TextSizeSection() -> Element {
+    let app = use_app();
+    let current = crate::zoom::clamp(app.config.read().zoom);
+    let mut error = use_signal(|| None::<String>);
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Text size" }
+            p { class: "help",
+                if cfg!(all(feature = "desktop", target_os = "macos")) {
+                    "Makes text and controls larger or smaller. View › Zoom In (⌘+) and Zoom Out (⌘−) change it too."
+                } else if cfg!(feature = "desktop") {
+                    "Makes text and controls larger or smaller. View › Zoom In (Ctrl++) and Zoom Out (Ctrl+−) change it too."
+                } else {
+                    "Makes text and controls larger or smaller, on top of the system text size."
+                }
+            }
+            div { class: "field", style: "justify-self: start; min-width: 160px",
+                label { r#for: "text-size", "Size" }
+                select {
+                    id: "text-size",
+                    class: "select-input",
+                    onchange: move |e| {
+                        let Ok(level) = e.value().parse::<u32>() else { return };
+                        if let Err(e) = app.set_config(|c| c.zoom = level) {
+                            error.set(Some(format!("Changed for now, but couldn't be saved: {e}")));
+                        } else {
+                            error.set(None);
+                        }
+                    },
+                    for level in crate::zoom::STEPS.iter().copied() {
+                        option {
+                            key: "{level}",
+                            value: "{level}",
+                            selected: level == current,
+                            if level == crate::zoom::DEFAULT { "{level}% (default)" } else { "{level}%" }
+                        }
+                    }
+                }
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", "{err}" }
             }
         }
     }

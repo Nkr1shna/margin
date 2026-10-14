@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use margin_shared::{
-    EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note, Proposal, Settings, Source,
-    Topic, Video, VideoStatus,
+    EmbeddingModel, Event, Id, Lesson, LessonStatus, Library, Note, Proposal, ProposalStatus,
+    Settings, Source, Topic, Video, VideoStatus,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -290,15 +290,100 @@ impl LibraryState {
         out.sort_by_key(|n| std::cmp::Reverse(n.updated_at));
         out
     }
+
+    /// Where each piece of background work stands: lessons being written, videos being
+    /// made (by lesson) and outlines being drafted.
+    pub fn milestones(&self) -> Milestones {
+        let mut out = Milestones::new();
+        for lesson in self.lessons.values() {
+            let stage = match lesson.status {
+                LessonStatus::Queued | LessonStatus::Generating => Stage::Working,
+                LessonStatus::Ready => Stage::Done,
+                LessonStatus::Failed { .. } => Stage::Failed,
+            };
+            out.insert(Work::Lesson(lesson.id.clone()), stage);
+        }
+        for video in self.videos.values() {
+            let stage = match video.status {
+                VideoStatus::Ready => Stage::Done,
+                VideoStatus::Failed { .. } => Stage::Failed,
+                _ => Stage::Working,
+            };
+            out.insert(Work::Video(video.lesson_id.clone()), stage);
+        }
+        for proposal in self.proposals.values() {
+            let stage = match proposal.status {
+                ProposalStatus::Drafting => Stage::Working,
+                ProposalStatus::Ready | ProposalStatus::Accepted { .. } => Stage::Done,
+                ProposalStatus::Failed { .. } => Stage::Failed,
+            };
+            out.insert(Work::Proposal(proposal.id.clone()), stage);
+        }
+        out
+    }
+
+    /// What finished (or failed) since `before`, as sentences for screen readers. Work
+    /// that was already finished, or that appears finished (a reload), isn't announced.
+    pub fn announcements(&self, before: &Milestones) -> Vec<String> {
+        let mut out = Vec::new();
+        for (work, stage) in self.milestones() {
+            if before.get(&work) != Some(&Stage::Working) || stage == Stage::Working {
+                continue;
+            }
+            let done = stage == Stage::Done;
+            let lesson_title = |id: &str| {
+                self.lessons
+                    .get(id)
+                    .map(|l| l.title.clone())
+                    .unwrap_or_else(|| "a lesson".into())
+            };
+            out.push(match work {
+                Work::Lesson(id) if done => format!("Lesson written: {}.", lesson_title(&id)),
+                Work::Lesson(id) => format!("Couldn't write the lesson {}.", lesson_title(&id)),
+                Work::Video(id) if done => format!("Video ready: {}.", lesson_title(&id)),
+                Work::Video(id) => format!("Couldn't make the video for {}.", lesson_title(&id)),
+                Work::Proposal(id) if done => {
+                    let n = self
+                        .proposals
+                        .get(&id)
+                        .and_then(|p| p.outline.as_ref())
+                        .map_or(0, |o| o.lessons.len());
+                    match n {
+                        1 => "Outline ready: 1 lesson.".to_string(),
+                        n => format!("Outline ready: {n} lessons."),
+                    }
+                }
+                Work::Proposal(_) => "Couldn't draft an outline.".to_string(),
+            });
+        }
+        out
+    }
 }
 
+/// A piece of background work the app follows (see [`LibraryState::milestones`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Work {
+    Lesson(Id),
+    /// A lesson's video, keyed by the lesson (a re-render replaces the video).
+    Video(Id),
+    Proposal(Id),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Working,
+    Done,
+    Failed,
+}
+
+pub type Milestones = BTreeMap<Work, Stage>;
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use margin_shared::{
-        AskRequest, EmbeddingModelState, Level, ProposalStatus, SourceKind, SourceStatus,
-        VideoMedia,
+        AskRequest, EmbeddingModelState, Level, SourceKind, SourceStatus, VideoMedia,
     };
 
     fn ts(n: i64) -> chrono::DateTime<Utc> {
@@ -637,6 +722,81 @@ mod tests {
         ready.status = ProposalStatus::Ready;
         s.apply(Event::ProposalChanged { proposal: ready });
         assert_eq!(s.proposals["p1"].status, ProposalStatus::Ready);
+    }
+
+    #[test]
+    fn announces_finished_work_once() {
+        let mut s = sample();
+        s.apply(Event::LessonChanged {
+            lesson: lesson("l3", "f", 3, LessonStatus::Generating),
+        });
+        s.apply(Event::VideoChanged {
+            video: video("v2", "l2", VideoStatus::Scripting),
+        });
+        let mut p = Proposal {
+            id: "p1".into(),
+            request: AskRequest {
+                prompt: "Fourier".into(),
+                lesson_count: 2,
+                level: Level::Intro,
+                with_videos: false,
+                with_quiz: true,
+                parent_topic_id: None,
+                source_ids: vec![],
+            },
+            status: ProposalStatus::Drafting,
+            outline: None,
+            created_at: ts(0),
+        };
+        s.apply(Event::ProposalChanged {
+            proposal: p.clone(),
+        });
+        let before = s.milestones();
+        // Nothing finished yet; streaming text isn't news.
+        s.apply(Event::LessonDelta {
+            lesson_id: "l3".into(),
+            text: "More".into(),
+        });
+        assert!(s.announcements(&before).is_empty());
+
+        s.apply(Event::LessonChanged {
+            lesson: lesson("l3", "f", 3, LessonStatus::Ready),
+        });
+        s.apply(Event::VideoChanged {
+            video: video("v2", "l2", VideoStatus::Failed { error: "x".into() }),
+        });
+        p.status = ProposalStatus::Ready;
+        p.outline = Some(margin_shared::Outline {
+            topic_title: "Fourier".into(),
+            subject_title: "Signals".into(),
+            lessons: vec![
+                margin_shared::OutlineLesson {
+                    title: "a".into(),
+                    summary: String::new(),
+                    minutes: 5,
+                },
+                margin_shared::OutlineLesson {
+                    title: "b".into(),
+                    summary: String::new(),
+                    minutes: 5,
+                },
+            ],
+        });
+        s.apply(Event::ProposalChanged { proposal: p });
+        assert_eq!(
+            s.announcements(&before),
+            vec![
+                "Lesson written: Lesson l3.".to_string(),
+                "Couldn't make the video for Lesson l2.".to_string(),
+                "Outline ready: 2 lessons.".to_string(),
+            ]
+        );
+        // Measured from now, it's old news; work that shows up finished isn't announced.
+        let after = s.milestones();
+        s.apply(Event::LessonChanged {
+            lesson: lesson("l9", "f", 9, LessonStatus::Ready),
+        });
+        assert!(s.announcements(&after).is_empty());
     }
 
     #[test]

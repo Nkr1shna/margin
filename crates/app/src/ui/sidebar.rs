@@ -10,6 +10,7 @@ use crate::state::{LoadStatus, use_app};
 use crate::store::{LibraryState, VideoDot};
 use crate::ui::common::{
     BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR, focus_first,
+    focus_on_mount,
 };
 use crate::ui::settings::SettingsPane;
 use crate::ui::shell::close_drawer;
@@ -277,7 +278,8 @@ pub fn Sidebar() -> Element {
                     class: "icon-btn",
                     "aria-label": "Settings",
                     title: "Settings ({Command::Settings.shortcut()})",
-                    "aria-current": app.settings_open.read().is_some().to_string(),
+                    "aria-haspopup": "dialog",
+                    "aria-expanded": app.settings_open.read().is_some().to_string(),
                     onclick: move |_| app.settings_open.set(Some(SettingsPane::General)),
                     Icon { name: "gear" }
                 }
@@ -432,13 +434,15 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
                         },
                         Icon { name: "book", class: "leaf-ic" }
                         span { class: "grow", "{title}" }
+                        // The marks' meaning, in the row's name for screen readers.
+                        span { class: "sr-only", {lesson_state_text(generating || regenerating, dot)} }
                         if generating || regenerating {
-                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: if regenerating { "Starting over" } else { "Writing" } }
+                            span { class: "spinner", style: "width: 10px; height: 10px; border-width: 1.5px", title: if regenerating { "Starting over" } else { "Writing" }, "aria-hidden": "true" }
                         }
                         match dot {
-                            VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready" } },
-                            VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress" } },
-                            VideoDot::None => rsx! { span { class: "dot", title: "No video" } },
+                            VideoDot::Ready => rsx! { span { class: "dot ok", title: "Video ready", "aria-hidden": "true" } },
+                            VideoDot::InProgress => rsx! { span { class: "dot run", title: "Video in progress", "aria-hidden": "true" } },
+                            VideoDot::None => rsx! { span { class: "dot", title: "No video", "aria-hidden": "true" } },
                         }
                     }
                     button {
@@ -467,7 +471,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
                     },
                     button {
                         role: "menuitem",
-                        autofocus: true,
+                        onmounted: focus_on_mount,
                         onclick: {
                             let id = id.clone();
                             move |_| {
@@ -519,6 +523,20 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool, ready: boo
             }
         }
     }
+}
+
+/// The lesson row's writing and video state in words (the row shows it as marks).
+fn lesson_state_text(generating: bool, dot: VideoDot) -> String {
+    let mut parts = Vec::new();
+    if generating {
+        parts.push("writing");
+    }
+    match dot {
+        VideoDot::Ready => parts.push("video ready"),
+        VideoDot::InProgress => parts.push("video in progress"),
+        VideoDot::None => {}
+    }
+    parts.iter().map(|p| format!(", {p}")).collect()
 }
 
 /// Inline field renaming a lesson. Enter or leaving the field saves; Escape cancels.
@@ -578,7 +596,7 @@ fn LessonInput(id: Id, initial: String) -> Element {
             "aria-invalid": invalid.to_string(),
             "aria-describedby": invalid.then_some("tree-edit-err"),
             "aria-busy": busy.read().to_string(),
-            autofocus: true,
+            onmounted: focus_on_mount,
             initial_value: "{initial}",
             oninput: move |e| {
                 field_error.set(None);
@@ -781,7 +799,7 @@ fn TopicNode(id: Id) -> Element {
                     },
                     button {
                         role: "menuitem",
-                        autofocus: true,
+                        onmounted: focus_on_mount,
                         onclick: {
                             let id = id.clone();
                             move |_| {
@@ -1068,5 +1086,19 @@ mod tests {
             "fourier"
         ));
         assert!(!route_in_topic(&lib, &scoped, "linalg"));
+    }
+
+    #[test]
+    fn lesson_state_reads_as_words() {
+        assert_eq!(lesson_state_text(false, VideoDot::None), "");
+        assert_eq!(lesson_state_text(true, VideoDot::None), ", writing");
+        assert_eq!(
+            lesson_state_text(false, VideoDot::InProgress),
+            ", video in progress"
+        );
+        assert_eq!(
+            lesson_state_text(true, VideoDot::Ready),
+            ", writing, video ready"
+        );
     }
 }

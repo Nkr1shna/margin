@@ -57,6 +57,13 @@ pub struct LocalConfig {
     /// Sidebar width in CSS pixels, set by dragging its edge; `None` is the default.
     #[serde(default)]
     pub sidebar_width: Option<u32>,
+    /// Page zoom in percent (View > Zoom, Settings > General > Text size).
+    #[serde(default = "default_zoom")]
+    pub zoom: u32,
+}
+
+fn default_zoom() -> u32 {
+    crate::zoom::DEFAULT
 }
 
 impl Default for LocalConfig {
@@ -66,6 +73,7 @@ impl Default for LocalConfig {
             appearance: Appearance::System,
             sidebar_hidden: false,
             sidebar_width: None,
+            zoom: default_zoom(),
         }
     }
 }
@@ -189,9 +197,15 @@ mod tests {
             appearance: Appearance::Dark,
             sidebar_hidden: true,
             sidebar_width: Some(300),
+            zoom: 130,
         };
         save_to(&path, &config).unwrap();
         assert_eq!(load_from(&path), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Files from before the zoom setting load at 100%.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"service_url":"https://m.example"}"#).unwrap();
+        assert_eq!(load_from(&path).zoom, 100);
         std::fs::remove_dir_all(&dir).unwrap();
         // Missing file -> defaults.
         assert_eq!(load_from(&path), LocalConfig::default());

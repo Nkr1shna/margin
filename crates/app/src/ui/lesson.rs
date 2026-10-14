@@ -133,7 +133,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                         onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); menu_open.set(false) },
                         button {
                             role: "menuitem",
-                            autofocus: true,
+                            onmounted: crate::ui::common::focus_on_mount,
                             onclick: {
                                 let title = lesson.title.clone();
                                 move |_| {
@@ -972,12 +972,14 @@ fn VideoView(lesson_id: Id) -> Element {
         div { class: "studio",
             div { class: "studio-head",
                 h1 { "{lesson.title}" }
-                span { class: "status", role: "status", span { class: "{status_dot}" } "{status_text}" }
+                span { class: "status", span { class: "{status_dot}" } "{status_text}" }
+                // Live: the stage only, so a changing percentage isn't read out each time.
+                span { class: "sr-only", role: "status", {video_stage(video.as_ref().map(|v| &v.status))} }
                 if !in_progress {
                     button {
                         class: "btn btn-primary btn-sm",
                         disabled: *busy.read() || !lesson_ready,
-                        title: if lesson_ready { "" } else { "The lesson must finish writing first" },
+                        "aria-describedby": (!lesson_ready).then_some("make-video-why"),
                         onclick: move |_| {
                             if video_ready {
                                 confirm_rerender.set(true);
@@ -988,6 +990,9 @@ fn VideoView(lesson_id: Id) -> Element {
                         if *busy.read() { span { class: "spinner", style: "border-color: transparent; border-top-color: currentColor" } }
                         Icon { name: make_icon }
                         if video.is_some() { "Re-render" } else { "Make video" }
+                    }
+                    if !lesson_ready {
+                        p { id: "make-video-why", class: "studio-why", "The lesson must finish writing first." }
                     }
                 }
             }
@@ -1048,6 +1053,13 @@ fn VideoPlayer(video: Video) -> Element {
     let player_id = format!("player-{}", video.id);
     let ready = matches!(video.status, VideoStatus::Ready) && video.media.is_some();
     let has_poster = video.media.as_ref().is_some_and(|m| m.poster_url.is_some());
+    let label = app
+        .lib
+        .read()
+        .lessons
+        .get(&video.lesson_id)
+        .map(|l| format!("Video: {}", l.title))
+        .unwrap_or_else(|| "Lesson video".to_string());
     use_effect(use_reactive!(|cues, player_id, ready| {
         let Some(cues) = cues.filter(|c| !c.is_empty() && ready) else {
             return;
@@ -1087,6 +1099,7 @@ fn VideoPlayer(video: Video) -> Element {
             key: "{media.mp4_url}",
             id: "{player_id}",
             class: "player",
+            "aria-label": "{label}",
             controls: true,
             // iPhone plays in place, not fullscreen.
             "playsinline": "true",
@@ -1108,13 +1121,21 @@ fn VideoDetails(video: Video) -> Element {
     let pipeline = pipeline_steps(&video.status);
 
     rsx! {
-        div { class: "pipeline", "aria-label": "Video pipeline",
+        ol { class: "pipeline", "aria-label": "Video pipeline",
             for (label, state) in pipeline {
-                span { key: "{label}", class: "{state}", "{label}" }
+                li {
+                    key: "{label}",
+                    class: "{state}",
+                    "aria-current": (state == "now").then_some("step"),
+                    "{label}"
+                    span { class: "sr-only", {step_state_text(state)} }
+                }
             }
         }
         if let VideoStatus::Rendering { progress: Some(p) } = video.status {
-            div { class: "bar", role: "progressbar", "aria-valuenow": "{(p * 100.0).round()}", "aria-valuemin": "0", "aria-valuemax": "100",
+            div { class: "bar", role: "progressbar", "aria-label": "Rendering video",
+                "aria-valuenow": "{(p * 100.0).round()}", "aria-valuemin": "0", "aria-valuemax": "100",
+                "aria-valuetext": "{(p * 100.0).round()}% rendered",
                 i { style: "width: {(p * 100.0).clamp(0.0, 100.0)}%" }
             }
         }
@@ -1131,6 +1152,28 @@ fn VideoDetails(video: Video) -> Element {
                 pre { class: "log", "{video.log}" }
             }
         }
+    }
+}
+
+/// What a pipeline step's state means, for screen readers (the chips show it by color).
+fn step_state_text(state: &str) -> &'static str {
+    match state {
+        "done" => ", done",
+        "now" => ", in progress",
+        "fail" => "",
+        _ => ", not started",
+    }
+}
+
+/// The video's stage in words, without counts or percentages, for the studio's live
+/// region. Finishing and failing are announced app-wide (the shell), so they're blank.
+fn video_stage(status: Option<&VideoStatus>) -> &'static str {
+    match status {
+        Some(VideoStatus::Queued) => "Video queued",
+        Some(VideoStatus::Scripting) => "Writing the scene",
+        Some(VideoStatus::Voicing { .. }) => "Voicing the narration",
+        Some(VideoStatus::Rendering { .. }) => "Rendering the video",
+        None | Some(VideoStatus::Ready) | Some(VideoStatus::Failed { .. }) => "",
     }
 }
 

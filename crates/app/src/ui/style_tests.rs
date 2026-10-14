@@ -144,11 +144,17 @@ fn placeholder_and_danger_button_use_tokens() {
     assert!(CSS.contains(".btn-danger { background: var(--danger-bg); color: var(--on-danger); }"));
 }
 
+/// A stand-in for the browser globals margin.js touches while it loads: every property
+/// is another stand-in (callable, constructible), and assignments stick.
+const DOM_STUB: &str = r#"function stub(){const store={};return new Proxy(function(){},{get(t,k){if(k in store)return store[k];if(k===Symbol.toPrimitive)return ()=>'';if(k==='then'||typeof k==='symbol')return undefined;return store[k]=stub();},set(t,k,v){store[k]=v;return true},apply(){return stub()},construct(){return stub()}})}
+global.window=stub();global.document=stub();global.navigator={userAgent:'',platform:''};
+for (const k of ['MutationObserver','ResizeObserver','MouseEvent','KeyboardEvent','Event','CustomEvent','CSS','getComputedStyle','requestAnimationFrame','cancelAnimationFrame','location','history','localStorage','matchMedia','visualViewport','katex','renderMathInElement']) global[k]=stub();"#;
+
 /// Runs `MarginApp.truncated` under Node when it's installed (skipped otherwise).
 #[test]
 fn truncation_check_for_tooltips() {
     let script = format!(
-        "global.window={{addEventListener(){{}}}};global.document={{addEventListener(){{}}}};\n{JS}\n\
+        "{DOM_STUB}\n{JS}\n\
          const t=window.MarginApp.truncated;\n\
          const cases=[\
            [{{ellipsis:true,scrollWidth:120,clientWidth:100}},true],\

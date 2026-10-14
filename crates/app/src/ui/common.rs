@@ -151,6 +151,21 @@ pub fn js(body: &str) -> document::Eval {
     ))
 }
 
+/// `onmounted` handler that focuses the element once it is in the page. Use it instead
+/// of the `autofocus` attribute, which WebKit honours at most once per document, so
+/// menus, dialogs and fields opened later would otherwise start without focus.
+pub fn focus_on_mount(e: MountedEvent) {
+    spawn(async move {
+        let _ = e.set_focus(true).await;
+    });
+}
+
+/// Say `message` through the shell's polite live region (screen readers read it once).
+pub fn announce(message: &str) {
+    let arg = serde_json::to_string(message).unwrap_or_default();
+    let _ = js(&format!("MarginApp.announce({arg});"));
+}
+
 /// Typeset math inside the element with this id (after the DOM update lands).
 pub fn render_math(id: &str) {
     let id = serde_json::to_string(id).unwrap_or_default();
@@ -489,13 +504,7 @@ pub fn ConfirmDialog(
                     button {
                         class: if danger { "btn btn-danger btn-sm" } else { "btn btn-primary btn-sm" },
                         disabled: busy,
-                        autofocus: true,
-                        // `autofocus` doesn't take in a page that's already loaded: focus
-                        // starts here so Escape and Enter reach the dialog, not what's
-                        // behind it.
-                        onmounted: move |e| async move {
-                            let _ = e.set_focus(true).await;
-                        },
+                        onmounted: focus_on_mount,
                         onclick: move |_| {
                             if !busy {
                                 on_confirm.call(());

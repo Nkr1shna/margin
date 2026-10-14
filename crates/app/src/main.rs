@@ -16,6 +16,7 @@ mod sources;
 mod state;
 mod store;
 mod ui;
+mod zoom;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -36,13 +37,42 @@ const KATEX: Asset = asset!("/assets/katex", AssetOptions::folder());
 const FONTS: Asset = asset!("/assets/fonts", AssetOptions::folder());
 
 /// The page viewport. `viewport-fit=cover` runs the page under the notch and home
-/// indicator (main.css pads with the safe-area insets). On Android the soft keyboard
-/// resizes the page, so fixed panels and 100vh stay above it.
+/// indicator (main.css pads with the safe-area insets). Pinch zoom stays on. On Android
+/// the soft keyboard resizes the page, so fixed panels and 100vh stay above it.
 #[cfg(target_os = "android")]
-const VIEWPORT: &str =
-    "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content";
+macro_rules! index_viewport {
+    () => {
+        "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    };
+}
 #[cfg(not(target_os = "android"))]
-const VIEWPORT: &str = "width=device-width, initial-scale=1, viewport-fit=cover";
+macro_rules! index_viewport {
+    () => {
+        "width=device-width, initial-scale=1, viewport-fit=cover"
+    };
+}
+
+/// The page the webview starts from (in place of Dioxus's default): the document
+/// language for screen readers, the app's name, and one viewport (`index_viewport`).
+/// Keeps Dioxus's head and module-loader markers.
+const INDEX_HTML: &str = concat!(
+    r#"<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>Margin</title>
+        <meta name="viewport" content=""#,
+    index_viewport!(),
+    r#"">
+        <!-- CUSTOM HEAD -->
+    </head>
+    <body>
+        <div id="main"></div>
+        <!-- MODULE LOADER -->
+    </body>
+</html>
+"#
+);
 
 fn main() {
     #[cfg(feature = "desktop")]
@@ -64,15 +94,19 @@ fn main() {
                 .with_fullsize_content_view(true)
         };
         dioxus::LaunchBuilder::new()
-            .with_cfg(
+            .with_cfg(with_index(
                 Config::new()
                     .with_window(window)
                     .with_menu(menu_bar())
                     .with_custom_event_handler(flush_on_exit),
-            )
+            ))
             .launch(App);
     }
-    #[cfg(not(feature = "desktop"))]
+    #[cfg(all(feature = "mobile", not(feature = "desktop")))]
+    dioxus::LaunchBuilder::new()
+        .with_cfg(with_index(dioxus::mobile::Config::new()))
+        .launch(App);
+    #[cfg(not(any(feature = "desktop", feature = "mobile")))]
     dioxus::launch(App);
 }
 
@@ -95,6 +129,35 @@ fn flush_on_exit<T>(
         drafts::flush_blocking(Duration::from_secs(3));
     }
 }
+
+/// Release builds start from `INDEX_HTML`. Debug builds keep Dioxus's development page
+/// (it shows `dx serve`'s rebuild notices); margin.js sets its language and the root
+/// adds the viewport there.
+#[cfg(feature = "desktop")]
+fn with_index(cfg: dioxus::desktop::Config) -> dioxus::desktop::Config {
+    if cfg!(debug_assertions) {
+        cfg
+    } else {
+        cfg.with_custom_index(INDEX_HTML.to_string())
+    }
+}
+
+#[cfg(all(feature = "mobile", not(feature = "desktop")))]
+fn with_index(cfg: dioxus::mobile::Config) -> dioxus::mobile::Config {
+    if cfg!(debug_assertions) {
+        cfg
+    } else {
+        cfg.with_custom_index(INDEX_HTML.to_string())
+    }
+}
+
+/// Menu item ids for the View menu's zoom commands.
+#[cfg(feature = "desktop")]
+const ZOOM_IN: &str = "zoom-in";
+#[cfg(feature = "desktop")]
+const ZOOM_OUT: &str = "zoom-out";
+#[cfg(feature = "desktop")]
+const ZOOM_RESET: &str = "zoom-reset";
 
 /// The native menu bar. Besides the usual app and window commands it carries the Edit
 /// menu, which is what makes Cmd+Z/X/C/V/A work in text fields: the webview handles those
@@ -142,6 +205,19 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
     let edit = Submenu::new("Edit", true);
     let view = Submenu::new("View", true);
     let go = Submenu::new("Go", true);
+    let zoom_item = |id: &str, label: &str, key: Code| {
+        MenuItem::with_id(
+            id,
+            label,
+            true,
+            Some(Accelerator::new(Some(CMD_OR_CTRL), key)),
+        )
+    };
+    let (actual, bigger, smaller) = (
+        zoom_item(ZOOM_RESET, "Actual Size", Code::Digit0),
+        zoom_item(ZOOM_IN, "Zoom In", Code::Equal),
+        zoom_item(ZOOM_OUT, "Zoom Out", Code::Minus),
+    );
     let window = Submenu::new("Window", true);
     let menu = Menu::new();
     let built = app
@@ -171,7 +247,15 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
                 &PredefinedMenuItem::select_all(None),
             ])
         })
-        .and_then(|_| view.append_items(&[&toggle_sidebar]))
+        .and_then(|_| {
+            view.append_items(&[
+                &toggle_sidebar,
+                &PredefinedMenuItem::separator(),
+                &actual,
+                &bigger,
+                &smaller,
+            ])
+        })
         .and_then(|_| {
             go.append_items(&[&back, &forward, &PredefinedMenuItem::separator(), &search])
         })
@@ -226,6 +310,23 @@ fn App() -> Element {
         }
     });
 
+    // View > Zoom In / Zoom Out / Actual Size change the saved zoom level.
+    #[cfg(feature = "desktop")]
+    dioxus::desktop::use_muda_event_handler(move |event| {
+        let id = event.id().0.as_str();
+        let current = ctx.config.peek().zoom;
+        let next = match id {
+            ZOOM_IN => zoom::zoom_in(current),
+            ZOOM_OUT => zoom::zoom_out(current),
+            ZOOM_RESET => zoom::DEFAULT,
+            _ => return,
+        };
+        if next != current {
+            let _ = ctx.set_config(|c| c.zoom = next);
+        }
+    });
+    zoom::use_page_zoom(ctx);
+
     // Appearance: System follows prefers-color-scheme; Light/Dark set <html data-theme>.
     use_effect(move || {
         let theme = ctx.config.read().appearance.data_theme();
@@ -240,7 +341,10 @@ fn App() -> Element {
     let signed_in = ctx.session.read().is_some();
 
     rsx! {
-        document::Meta { name: "viewport", content: VIEWPORT }
+        if cfg!(debug_assertions) {
+            // Development page only (see `with_index`): replaces its no-zoom viewport.
+            document::Meta { name: "viewport", content: index_viewport!() }
+        }
         document::Style { {fonts} }
         document::Stylesheet { href: MAIN_CSS }
         if ui::common::UNIFIED_TITLE_BAR {
@@ -252,6 +356,7 @@ fn App() -> Element {
         if signed_in {
             SignedIn {}
         } else {
+            document::Title { "Sign in — Margin" }
             ui::signin::ConnectScreen {}
         }
     }
@@ -371,5 +476,24 @@ async fn live_loop(ctx: AppCtx) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INDEX_HTML;
+
+    #[test]
+    fn index_page_is_accessible_and_bootable() {
+        // What Dioxus needs: a head to add styles to, a body for its loader, the root.
+        for needed in ["</head>", "</body>", r#"<div id="main"></div>"#] {
+            assert!(INDEX_HTML.contains(needed), "{needed}");
+        }
+        assert!(INDEX_HTML.contains(r#"<html lang="en">"#));
+        assert!(INDEX_HTML.contains("<title>Margin</title>"));
+        // One viewport, which leaves pinch zoom alone.
+        assert_eq!(INDEX_HTML.matches(r#"name="viewport""#).count(), 1);
+        assert!(!INDEX_HTML.contains("user-scalable"));
+        assert!(!INDEX_HTML.contains("maximum-scale"));
     }
 }

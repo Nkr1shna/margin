@@ -34,6 +34,30 @@ pub enum Route {
         NotFound { segments: Vec<String> },
 }
 
+/// The document title for a screen (what assistive technology calls the web area).
+pub fn page_title(route: &Route, lib: &crate::store::LibraryState) -> String {
+    let lesson = |id: &str| lib.lessons.get(id).map(|l| l.title.clone());
+    let screen = match route {
+        Route::Ask {} => Some("Ask".to_string()),
+        Route::LessonRead { id } => lesson(id),
+        Route::LessonNotes { id } => lesson(id).map(|t| format!("{t}: Notes")),
+        Route::LessonVideo { id } => lesson(id).map(|t| format!("{t}: Video")),
+        Route::AllNotes {} => Some("All notes".to_string()),
+        Route::TopicNotes { topic_id } => lib
+            .topics
+            .get(topic_id)
+            .map(|t| format!("Notes in {}", t.title)),
+        Route::NoteOpen { id } | Route::TopicNoteOpen { id, .. } => {
+            lib.notes.get(id).map(|n| n.title.clone())
+        }
+        Route::NotFound { .. } => Some("Nothing here".to_string()),
+    };
+    match screen {
+        Some(s) if !s.trim().is_empty() => format!("{s} — Margin"),
+        _ => "Margin".to_string(),
+    }
+}
+
 #[component]
 fn Ask() -> Element {
     rsx! { AskScreen {} }
@@ -161,5 +185,43 @@ mod tests {
         assert_eq!(all.notes_scope(), Some(None));
         assert_eq!(Route::notes_list(None).notes_scope(), Some(None));
         assert_eq!(Route::Ask {}.notes_scope(), None);
+    }
+
+    use crate::store::LibraryState;
+    use crate::store::tests::{lesson, topic};
+    use margin_shared::LessonStatus;
+
+    #[test]
+    fn titles_name_the_screen() {
+        let mut lib = LibraryState::default();
+        lib.topics
+            .insert("f".into(), topic("f", None, "Fourier", 0));
+        lib.lessons
+            .insert("l1".into(), lesson("l1", "f", 0, LessonStatus::Ready));
+        let title = |r: Route| page_title(&r, &lib);
+        assert_eq!(title(Route::Ask {}), "Ask — Margin");
+        assert_eq!(
+            title(Route::LessonRead { id: "l1".into() }),
+            "Lesson l1 — Margin"
+        );
+        assert_eq!(
+            title(Route::LessonVideo { id: "l1".into() }),
+            "Lesson l1: Video — Margin"
+        );
+        assert_eq!(
+            title(Route::TopicNotes {
+                topic_id: "f".into()
+            }),
+            "Notes in Fourier — Margin"
+        );
+        // Not loaded (yet): just the app's name.
+        assert_eq!(title(Route::NoteOpen { id: "x".into() }), "Margin");
+        assert_eq!(
+            title(Route::TopicNoteOpen {
+                topic_id: "f".into(),
+                id: "x".into()
+            }),
+            "Margin"
+        );
     }
 }
