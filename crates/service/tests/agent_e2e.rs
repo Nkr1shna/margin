@@ -5,7 +5,9 @@
 //! restart of the service on the same store. A second test takes a course through the
 //! same path (phase 2): `propose_course` and its outline card, Create lessons with chips,
 //! the chat's record of it on the next turn, a delete parked on its confirmation card and
-//! approved from another device, and owner decision Q2 for overwriting notes.
+//! approved from another device, and owner decision Q2 for overwriting notes. A third
+//! (phase 3) adds a lesson, files the chat's attached file under its topic and makes the
+//! lesson's video, with their result cards.
 
 mod common;
 
@@ -29,7 +31,8 @@ use margin_service::state::{Author, StoredNote};
 use margin_service::turns::{CALL_INTERRUPTED, STOPPED, STOPPED_BY_RESTART};
 use margin_shared::{
     Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, Event, ItemStatus, Lesson,
-    LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, ToolOutputText, Topic,
+    LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, Source, ToolOutputText,
+    Topic,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -1189,4 +1192,197 @@ async fn a_course_a_delete_and_an_overwrite_run_through_the_real_client() {
         "The owner declined: Replace the text of your note “Formulas”?"
     );
     assert!(d.items.windows(2).all(|w| w[0].seq < w[1].seq));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: lesson and video jobs and a chat's files through the real client
+// ---------------------------------------------------------------------------
+
+/// The result card of `call_id` in the chat.
+fn result_card_of(d: &ChatDetail, call_id: &str) -> margin_shared::ResultCard {
+    d.items
+        .iter()
+        .find_map(|i| match &i.kind {
+            ChatItemKind::Card {
+                call_id: c,
+                card: Card::Result(r),
+            } if c == call_id => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no result card for {call_id}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lessons_videos_and_files_run_through_the_real_client() {
+    let (openai, fake) = start_fake_openai().await;
+    let h = start_service(None).await;
+    let t = h.sign_in("Mac").await;
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = h
+        .post(&t, "/api/topics")
+        .json(&json!({"parent_id": null, "title": "Optics"}))
+        .send()
+        .await
+        .unwrap();
+    let topic: Topic = r.json().await.unwrap();
+    let r = h.upload(&t, "lenses.md", None, "Thin lenses.").await;
+    assert_eq!(r.status(), 200);
+    let file: Source = r.json().await.unwrap();
+
+    // --- Turn 1, with a file attached: one step adds a lesson and files the file. ---
+    fake.push(calls_reply(
+        "resp_1",
+        &[
+            (
+                "call_write",
+                "write_lesson",
+                json!({"topic_id": topic.id, "title": "Lenses", "summary": "Thin lenses.",
+                    "minutes": 6, "level": "intro", "with_quiz": false}),
+            ),
+            (
+                "call_attach",
+                "attach_sources",
+                json!({"source_ids": [file.id], "topic_id": topic.id}),
+            ),
+        ],
+    ));
+    fake.push(text_reply("resp_2", "A lesson on lenses is being written."));
+    let r = h
+        .post(&t, "/api/chats")
+        .json(
+            &json!({"message": {"text": "Add a lesson on lenses from my file",
+            "source_ids": [file.id]}}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let chat_id = r.json::<ChatDetail>().await.unwrap().chat.id;
+    let d = wait_chat(&h, &t, &chat_id, |d| d.chat.state == ChatState::Idle).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "user: Add a lesson on lenses from my file".to_string(),
+            "call write_lesson: Adding the lesson “Lenses”".into(),
+            "call attach_sources: Filing 1 file under a topic".into(),
+            "result ok: Added “Lenses”".into(),
+            "card".into(),
+            "result ok: Filed 1 file under “Optics”".into(),
+            "assistant: A lesson on lenses is being written.".into(),
+        ]
+    );
+    let bodies = fake.bodies();
+    let offered: Vec<&str> = bodies[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["strict"] == true)
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for name in [
+        "write_lesson",
+        "regenerate_lesson",
+        "make_video",
+        "attach_sources",
+    ] {
+        assert!(offered.contains(&name), "{name} is offered: {offered:?}");
+    }
+    let lesson_id = output_in(&bodies[1], "call_write")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        result_card_of(&d, "call_write").target,
+        margin_shared::ResultTarget::Lesson {
+            lesson_id: lesson_id.clone()
+        }
+    );
+    assert_eq!(
+        output_in(&bodies[1], "call_attach")["filed"][0]["name"],
+        "lenses.md"
+    );
+    let filed: Source = h
+        .state
+        .store
+        .get(db::SOURCE, &file.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(filed.topic_id.as_deref(), Some(topic.id.as_str()));
+    let lesson: Lesson = eventually(|| async {
+        library(&h, &t)
+            .await
+            .lessons
+            .into_iter()
+            .find(|l| l.id == lesson_id && l.status == LessonStatus::Ready)
+    })
+    .await;
+    assert_eq!(lesson.title, "Lenses");
+
+    // --- Turn 2: a video of the written lesson. ---
+    fake.push(calls_reply(
+        "resp_3",
+        &[("call_video", "make_video", json!({"lesson_id": lesson_id}))],
+    ));
+    fake.push(text_reply("resp_4", "The video is on its way."));
+    let r = h
+        .post(&t, &format!("/api/chats/{chat_id}/messages"))
+        .json(&json!({"text": "And a video"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = wait_chat(&h, &t, &chat_id, |d| {
+        d.chat.state == ChatState::Idle
+            && d.items
+                .last()
+                .is_some_and(|i| line(i) == "assistant: The video is on its way.")
+    })
+    .await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: And a video".to_string(),
+            "call make_video: Making a video".into(),
+            "result ok: Making the video of “Lenses”".into(),
+            "card".into(),
+            "assistant: The video is on its way.".into(),
+        ]
+    );
+    assert_eq!(
+        result_card_of(&d, "call_video").target,
+        margin_shared::ResultTarget::Video {
+            lesson_id: lesson_id.clone()
+        }
+    );
+    eventually(|| async {
+        library(&h, &t)
+            .await
+            .videos
+            .iter()
+            .any(|v| v.lesson_id == lesson_id && v.status == margin_shared::VideoStatus::Ready)
+            .then_some(())
+    })
+    .await;
+    // The file stays with the topic when the chat goes.
+    let r = h
+        .delete(&t, &format!("/api/chats/{chat_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(
+        h.state
+            .store
+            .get::<Source>(db::SOURCE, &file.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

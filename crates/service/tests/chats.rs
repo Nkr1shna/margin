@@ -632,6 +632,8 @@ async fn read_tools_answer_from_the_library() {
         previous_body: None,
         previous_citations: None,
         author: Default::default(),
+        prompt: None,
+        with_quiz: false,
     };
     h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
     let r = h

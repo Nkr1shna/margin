@@ -13,7 +13,7 @@ use chrono::Utc;
 use margin_ai::LessonContext;
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
-    Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
+    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
 };
 
 use crate::chats::{self, StoredChatItem};
@@ -60,7 +60,9 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
 /// Stores a `Ready` proposal of `outline` made in chat `chat_id` (the agent's
 /// `propose_course`) and emits it. Checked like an accepted outline: a prompt, 1 to 12
 /// titled lessons, a topic title, a subject title when no parent topic is given (the
-/// parent must exist), and sources that exist and aren't another topic's.
+/// parent must exist), and sources that exist and aren't another topic's. Every earlier
+/// `Ready` proposal of the chat becomes `Superseded` by it (under the same `write_lock`),
+/// so only the newest outline in a chat can create a course.
 pub async fn propose(
     state: &AppState,
     chat_id: &str,
@@ -91,10 +93,28 @@ pub async fn propose(
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
     };
-    state
-        .store
-        .put(db::PROPOSAL, &proposal.id, &proposal)
-        .await?;
+    let superseded = {
+        let _w = state.write_lock.lock().await;
+        let mut earlier: Vec<Proposal> = state
+            .store
+            .list_where(db::PROPOSAL, "chat_id", chat_id)
+            .await?;
+        earlier.retain(|p| p.status == ProposalStatus::Ready);
+        for p in &mut earlier {
+            p.status = ProposalStatus::Superseded {
+                by: proposal.id.clone(),
+            };
+            state.store.put(db::PROPOSAL, &p.id, &*p).await?;
+        }
+        state
+            .store
+            .put(db::PROPOSAL, &proposal.id, &proposal)
+            .await?;
+        earlier
+    };
+    for p in &superseded {
+        state.emit_proposal(p);
+    }
     state.emit_proposal(&proposal);
     Ok(proposal)
 }
@@ -326,6 +346,8 @@ pub async fn accept_proposal(
                 previous_body: None,
                 previous_citations: None,
                 author: Author::Agent,
+                prompt: None,
+                with_quiz: false,
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
@@ -364,11 +386,18 @@ pub async fn regenerate(
     State(state): State<AppState>,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Lesson>> {
+    Ok(Json(regenerate_lesson(&state, &id).await?))
+}
+
+/// Queues a lesson to be written again and starts its job (`POST
+/// /api/lessons/{id}/regenerate` and the agent's `regenerate_lesson`). Its body stays
+/// until the new one is done, and comes back if writing fails.
+pub async fn regenerate_lesson(state: &AppState, id: &str) -> AppResult<Lesson> {
     state.ai_config().await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
-        let mut row = library::lesson(&state, &id).await?;
-        let running = state.lesson_jobs.lock().unwrap().contains_key(&id);
+        let mut row = library::lesson(state, id).await?;
+        let running = state.lesson_jobs.lock().unwrap().contains_key(id);
         if is_busy(&row.lesson.status) && running {
             return Err(AppError::conflict(
                 "lesson_busy",
@@ -377,12 +406,83 @@ pub async fn regenerate(
         }
         row.lesson.status = LessonStatus::Queued;
         row.lesson.updated_at = Utc::now();
-        state.store.put(db::LESSON, &id, &row).await?;
+        state.store.put(db::LESSON, id, &row).await?;
         row.lesson
     };
     state.emit_lesson(&lesson);
-    spawn_lesson_job(&state, id, false);
-    Ok(Json(state.public_lesson(&lesson)))
+    spawn_lesson_job(state, id.to_string(), false);
+    Ok(state.public_lesson(&lesson))
+}
+
+/// A lesson to add at the end of a topic (the agent's `write_lesson`).
+pub struct NewLesson {
+    pub topic_id: Id,
+    pub title: String,
+    pub summary: String,
+    pub minutes: u32,
+    pub level: Level,
+    pub with_quiz: bool,
+}
+
+/// Appends a Queued lesson, written by the agent, to a topic and starts its job. With no
+/// proposal behind it, the lesson keeps its own prompt (the request of the course its
+/// topic came from, when there is one) and quiz option for the lesson writer. No video
+/// follows it (`make_video` asks for one).
+pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson> {
+    let title = library::clean_title(&req.title, "lesson")?;
+    state.ai_config().await?;
+    let lesson = {
+        let _w = state.write_lock.lock().await;
+        library::topic(state, &req.topic_id).await?;
+        let siblings = topic_lessons(state, &req.topic_id).await?;
+        let position = siblings
+            .iter()
+            .map(|s| s.lesson.position + 1)
+            .max()
+            .unwrap_or(0);
+        // The course's request, so the new lesson is written for the same learner.
+        let mut prompt = None;
+        for s in &siblings {
+            if let Some(pid) = &s.proposal_id
+                && let Some(p) = state.store.get::<Proposal>(db::PROPOSAL, pid).await?
+            {
+                prompt = Some(p.request.prompt);
+                break;
+            }
+            if s.prompt.is_some() {
+                prompt = s.prompt.clone();
+                break;
+            }
+        }
+        let now = Utc::now();
+        let row = StoredLesson {
+            lesson: Lesson {
+                citations: Vec::new(),
+                id: new_id(),
+                topic_id: req.topic_id.clone(),
+                title,
+                summary: req.summary.trim().to_string(),
+                position,
+                level: req.level,
+                minutes: req.minutes,
+                body_md: String::new(),
+                status: LessonStatus::Queued,
+                created_at: now,
+                updated_at: now,
+            },
+            proposal_id: None,
+            previous_body: None,
+            previous_citations: None,
+            author: Author::Agent,
+            prompt,
+            with_quiz: req.with_quiz,
+        };
+        state.store.put(db::LESSON, &row.lesson.id, &row).await?;
+        row.lesson
+    };
+    state.emit_lesson(&lesson);
+    spawn_lesson_job(state, lesson.id.clone(), false);
+    Ok(state.public_lesson(&lesson))
 }
 
 /// Starts writing a Queued lesson in the background (at most three at once).
@@ -454,6 +554,7 @@ async fn lesson_context(
     let prompt = proposal
         .as_ref()
         .map(|p| p.request.prompt.clone())
+        .or_else(|| row.prompt.clone())
         .unwrap_or_else(|| row.lesson.title.clone());
 
     // The passages most relevant to this lesson, from its topic's sources.
@@ -476,7 +577,9 @@ async fn lesson_context(
         topic_title,
         prompt,
         level: row.lesson.level,
-        with_quiz: proposal.as_ref().is_some_and(|p| p.request.with_quiz),
+        with_quiz: proposal
+            .as_ref()
+            .map_or(row.with_quiz, |p| p.request.with_quiz),
         outline,
         index,
         passages,

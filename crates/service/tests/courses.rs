@@ -3,7 +3,8 @@
 //! chips and the chat's record of it, `accept_proposal`, the library write tools, the
 //! deletes and their confirmation cards (approve, deny, Stop, from another device), and
 //! owner decision Q2 (overwriting the owner's own writing asks; the agent's doesn't;
-//! appending never does).
+//! appending never does), superseded outlines, and the lesson and video jobs
+//! (`write_lesson`, `regenerate_lesson`, `make_video`) and `attach_sources`.
 
 mod common;
 
@@ -17,7 +18,8 @@ use margin_service::db;
 use margin_service::state::{Author, StoredLesson, StoredNote};
 use margin_shared::{
     Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Event, ItemStatus,
-    Lesson, LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, ResultTarget, Topic,
+    Lesson, LessonStatus, Level, Library, Me, Note, Proposal, ProposalStatus, ResultTarget, Source,
+    Topic, VideoStatus,
 };
 use serde_json::{Value, json};
 
@@ -281,13 +283,17 @@ async fn every_service_tool_is_strict_and_of_its_kind() {
         vec![
             "accept_proposal",
             "append_to_note",
+            "attach_sources",
             "create_note",
             "create_topic",
             "edit_lesson_title",
+            "make_video",
             "move_topic",
             "propose_course",
+            "regenerate_lesson",
             "rename_topic",
             "replace_note_body",
+            "write_lesson",
         ]
     );
     assert_eq!(
@@ -1333,4 +1339,597 @@ async fn denied_and_stopped_deletes_leave_things_as_they_were() {
     let lib = library(&h, &t).await;
     assert!(lib.lessons.is_empty());
     assert_eq!(lib.notes.len(), 1, "the lesson's note went with it");
+}
+
+// ---------------------------------------------------------------------------
+// Superseded outlines
+// ---------------------------------------------------------------------------
+
+async fn stored_proposal(h: &Harness, id: &str) -> Proposal {
+    h.state.store.get(db::PROPOSAL, id).await.unwrap().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_outline_in_a_chat_supersedes_the_earlier_one() {
+    let (h, t) = signed_in().await;
+    let (first, d) = h
+        .propose_in_chat(&t, &ask_request("Fourier", 2, false))
+        .await
+        .unwrap();
+    let chat_id = d.chat.id;
+    // Another chat's outline is left alone.
+    let (other, _) = h
+        .propose_in_chat(&t, &ask_request("Laplace", 1, false))
+        .await
+        .unwrap();
+
+    let mut sock = h.socket(&t).await;
+    script(
+        &h,
+        &[(
+            "call_p2",
+            "propose_course",
+            propose_args(&ask_request("Fourier, shorter", 1, false)),
+        )],
+        "Here is a shorter one.",
+    );
+    say(&h, &t, Some(&chat_id), "Make it shorter").await;
+    wait_chat(&h, &t, &chat_id, idle).await;
+    let second = output_for(&h, "call_p2")["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let superseded = ProposalStatus::Superseded { by: second.clone() };
+    let events = sock
+        .until(|e| matches!(e, Event::ProposalChanged { proposal } if proposal.id == second))
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ProposalChanged { proposal }
+            if proposal.id == first.id && proposal.status == superseded)),
+        "the earlier outline is announced as superseded first: {events:?}"
+    );
+    assert_eq!(stored_proposal(&h, &first.id).await.status, superseded);
+    assert_eq!(
+        stored_proposal(&h, &second).await.status,
+        ProposalStatus::Ready
+    );
+    assert_eq!(
+        stored_proposal(&h, &other.id).await.status,
+        ProposalStatus::Ready
+    );
+
+    // Create lessons on the old card is refused.
+    let r = h
+        .post(&t, &format!("/api/proposals/{}/accept", first.id))
+        .json(&json!({"outline": first.outline.clone().unwrap()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["code"], "superseded");
+    assert_eq!(body["message"], "A newer outline replaced this one.");
+
+    // So is accept_proposal, and the model is told which outline replaced it.
+    script(
+        &h,
+        &[(
+            "call_old",
+            "accept_proposal",
+            json!({"proposal_id": first.id}),
+        )],
+        "That one was replaced.",
+    );
+    say(&h, &t, Some(&chat_id), "Go with the first one").await;
+    wait_chat(&h, &t, &chat_id, idle).await;
+    let error = output_for(&h, "call_old")["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains(&second), "{error}");
+    assert!(library(&h, &t).await.topics.is_empty());
+
+    // The newest one still goes.
+    script(
+        &h,
+        &[(
+            "call_new",
+            "accept_proposal",
+            json!({"proposal_id": second}),
+        )],
+        "On their way.",
+    );
+    say(&h, &t, Some(&chat_id), "Then the short one").await;
+    let d = wait_chat(&h, &t, &chat_id, idle).await;
+    assert!(
+        last_turn(&d).contains(&"result ok: Created “Topic: Fourier, shorter” · 1 lesson".into()),
+        "{:?}",
+        last_turn(&d)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_proposal_says_where_a_course_went_when_its_topic_was_deleted() {
+    let (h, t) = signed_in().await;
+    let subject = new_topic(&h, &t, None, "Maths").await;
+    let mut req = ask_request("Laplace", 1, false);
+    req.parent_topic_id = Some(subject.id.clone());
+    let (p, d) = h.propose_in_chat(&t, &req).await.unwrap();
+    let r = h
+        .delete(&t, &format!("/api/topics/{}", subject.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    script(
+        &h,
+        &[("call_go", "accept_proposal", json!({"proposal_id": p.id}))],
+        "Done.",
+    );
+    say(&h, &t, Some(&d.chat.id), "Go ahead").await;
+    wait_chat(&h, &t, &d.chat.id, idle).await;
+    let out = output_for(&h, "call_go");
+    let subject_title = p.outline.unwrap().subject_title;
+    assert_eq!(
+        out["note"],
+        format!(
+            "The topic it was to go under was deleted; filed under the subject “{subject_title}” instead."
+        )
+    );
+
+    // Not said when nothing was deleted.
+    let (p, d) = h
+        .propose_in_chat(&t, &ask_request("Fourier", 1, false))
+        .await
+        .unwrap();
+    script(
+        &h,
+        &[("call_go2", "accept_proposal", json!({"proposal_id": p.id}))],
+        "Done.",
+    );
+    say(&h, &t, Some(&d.chat.id), "Go ahead").await;
+    wait_chat(&h, &t, &d.chat.id, idle).await;
+    assert!(output_for(&h, "call_go2").get("note").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Lesson and video jobs
+// ---------------------------------------------------------------------------
+
+async fn stored_lesson(h: &Harness, id: &str) -> StoredLesson {
+    h.state.store.get(db::LESSON, id).await.unwrap().unwrap()
+}
+
+/// An accepted course of `n` lessons (from `ask_request(prompt, ..)`) with `chips`,
+/// written.
+async fn course(h: &Harness, token: &str, prompt: &str, n: u32, chips: Value) -> Topic {
+    let p = h.propose(token, &ask_request(prompt, n, false)).await;
+    let r = h
+        .post(token, &format!("/api/proposals/{}/accept", p.id))
+        .json(&json!({"outline": p.outline.unwrap(), "chips": chips}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let topic: Topic = r.json().await.unwrap();
+    wait_lessons_ready(h, token, &topic.id).await;
+    topic
+}
+
+/// The result card's target in the chat's last turn.
+fn result_target(d: &ChatDetail) -> ResultTarget {
+    let start = d
+        .items
+        .iter()
+        .rposition(|i| matches!(i.kind, ChatItemKind::UserMessage { .. }))
+        .unwrap();
+    d.items[start..]
+        .iter()
+        .find_map(|i| match &i.kind {
+            ChatItemKind::Card {
+                card: Card::Result(r),
+                ..
+            } => Some(r.target.clone()),
+            _ => None,
+        })
+        .expect("a result card")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_lesson_adds_a_lesson_written_for_the_course() {
+    let (h, t) = signed_in().await;
+    let topic = course(
+        &h,
+        &t,
+        "Fourier",
+        1,
+        json!({"with_videos": true, "with_quiz": false}),
+    )
+    .await;
+    // The course's own lesson gets its video.
+    eventually(|| async { (library(&h, &t).await.videos.len() == 1).then_some(()) }).await;
+
+    script(
+        &h,
+        &[(
+            "call_w",
+            "write_lesson",
+            json!({
+                "topic_id": topic.id,
+                "title": "Gibbs phenomenon",
+                "summary": "The overshoot at a jump",
+                "minutes": 8,
+                "level": "advanced",
+                "with_quiz": true,
+            }),
+        )],
+        "It's being written.",
+    );
+    let chat = say(&h, &t, None, "Add a lesson on the Gibbs phenomenon").await;
+    let d = wait_chat(&h, &t, &chat, idle).await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Add a lesson on the Gibbs phenomenon",
+            "call write_lesson",
+            "result ok: Added “Gibbs phenomenon”",
+            "card result: Gibbs phenomenon",
+            "assistant: It's being written.",
+        ]
+    );
+    let out = output_for(&h, "call_w");
+    let id = out["id"].as_str().unwrap().to_string();
+    assert_eq!(out["position"], 1);
+    assert_eq!(out["level"], "advanced");
+    assert_eq!(
+        result_target(&d),
+        ResultTarget::Lesson {
+            lesson_id: id.clone()
+        }
+    );
+    let lessons = wait_lessons_ready(&h, &t, &topic.id).await;
+    assert_eq!(lessons.len(), 2);
+    let row = stored_lesson(&h, &id).await;
+    assert_eq!(row.lesson.position, 1);
+    assert_eq!(row.lesson.level, Level::Advanced);
+    assert_eq!(row.lesson.summary, "The overshoot at a jump");
+    assert_eq!(row.author, Author::Agent);
+    assert_eq!(row.proposal_id, None);
+    assert_eq!(
+        row.prompt.as_deref(),
+        Some("Fourier"),
+        "the course's request"
+    );
+    assert!(row.with_quiz);
+    // The writer is told the course's request, the tool's quiz option and its place.
+    let ctx = h
+        .generator
+        .lesson_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|c| c.outline[c.index].title == "Gibbs phenomenon")
+        .cloned()
+        .unwrap();
+    assert_eq!(ctx.prompt, "Fourier");
+    assert!(ctx.with_quiz);
+    assert_eq!(ctx.level, Level::Advanced);
+    assert_eq!((ctx.index, ctx.outline.len()), (1, 2));
+    // No video follows a lesson the agent added.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(library(&h, &t).await.videos.len(), 1);
+
+    // A topic with no course behind it: the lesson's title is its prompt.
+    let loose = new_topic(&h, &t, None, "Loose ends").await;
+    let registry = agent_tools::registry(&h.state);
+    let tool = registry.get("write_lesson").unwrap();
+    let args = |topic_id: &str, title: &str| {
+        json!({
+            "topic_id": topic_id,
+            "title": title,
+            "summary": "",
+            "minutes": 5,
+            "level": "intro",
+            "with_quiz": false,
+        })
+    };
+    let out = tool
+        .run(&tool_ctx(&chat), args(&loose.id, "Dirichlet conditions"))
+        .await;
+    assert!(out.ok, "{out:?}");
+    wait_lessons_ready(&h, &t, &loose.id).await;
+    let ctx = h
+        .generator
+        .lesson_requests
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(ctx.prompt, "Dirichlet conditions");
+    assert!(!ctx.with_quiz);
+
+    let out = tool.run(&tool_ctx(&chat), args("gone", "x")).await;
+    assert_eq!(out.summary, "That topic doesn't exist.");
+    let out = tool.run(&tool_ctx(&chat), args(&loose.id, "  ")).await;
+    assert_eq!(out.summary, "Give the lesson a title.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regenerating_a_lesson_asks_only_when_the_owner_edited_it() {
+    let (h, t) = signed_in().await;
+    let topic = course(&h, &t, "Optics", 1, json!({})).await;
+    let lesson = library(&h, &t)
+        .await
+        .lessons
+        .into_iter()
+        .find(|l| l.topic_id == topic.id)
+        .unwrap();
+    let written = || h.generator.lesson_requests.lock().unwrap().len();
+    let before = written();
+
+    // The agent's own lesson is rewritten right away.
+    script(
+        &h,
+        &[(
+            "call_g",
+            "regenerate_lesson",
+            json!({"lesson_id": lesson.id}),
+        )],
+        "Rewriting it.",
+    );
+    let chat = say(&h, &t, None, "Rewrite the first lesson").await;
+    let d = wait_chat(&h, &t, &chat, idle).await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Rewrite the first lesson",
+            "call regenerate_lesson",
+            "result ok: Rewriting “Lesson 1”",
+            "card result: Lesson 1",
+            "assistant: Rewriting it.",
+        ]
+    );
+    assert_eq!(
+        result_target(&d),
+        ResultTarget::Lesson {
+            lesson_id: lesson.id.clone()
+        }
+    );
+    eventually(|| async { (written() == before + 1).then_some(()) }).await;
+    wait_lessons_ready(&h, &t, &topic.id).await;
+
+    // Edited by the owner: it asks, and a denial keeps the owner's text.
+    let r = h
+        .patch(&t, &format!("/api/lessons/{}", lesson.id))
+        .json(&json!({"body_md": "My rewrite."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    script(
+        &h,
+        &[(
+            "call_g2",
+            "regenerate_lesson",
+            json!({"lesson_id": lesson.id}),
+        )],
+        "Left it.",
+    );
+    say(&h, &t, Some(&chat), "Rewrite it again").await;
+    let d = wait_chat(&h, &t, &chat, waiting).await;
+    let (item, card) = waiting_card(&d);
+    assert_eq!(card.tool, "regenerate_lesson");
+    assert_eq!(card.title, "Rewrite the lesson “Lesson 1”?");
+    assert_eq!(
+        card.detail,
+        "You edited its text; your edits would be lost."
+    );
+    assert_eq!(card.approve_label, "Rewrite");
+    confirm(&h, &t, &chat, &item.id, false).await;
+    wait_chat(&h, &t, &chat, idle).await;
+    let row = stored_lesson(&h, &lesson.id).await;
+    assert_eq!(row.lesson.body_md, "My rewrite.");
+    assert_eq!(row.author, Author::Owner);
+    assert_eq!(written(), before + 1);
+
+    // Approved: rewritten, and the agent's again.
+    script(
+        &h,
+        &[(
+            "call_g3",
+            "regenerate_lesson",
+            json!({"lesson_id": lesson.id}),
+        )],
+        "Rewriting it.",
+    );
+    say(&h, &t, Some(&chat), "Yes, really rewrite it").await;
+    let d = wait_chat(&h, &t, &chat, waiting).await;
+    let (item, _) = waiting_card(&d);
+    confirm(&h, &t, &chat, &item.id, true).await;
+    wait_chat(&h, &t, &chat, idle).await;
+    let row = eventually(|| async {
+        let row = stored_lesson(&h, &lesson.id).await;
+        (row.lesson.status == LessonStatus::Ready && row.lesson.body_md != "My rewrite.")
+            .then_some(row)
+    })
+    .await;
+    assert_eq!(row.author, Author::Agent);
+
+    // An unknown lesson can't be confirmed.
+    let registry = agent_tools::registry(&h.state);
+    let tool = registry.get("regenerate_lesson").unwrap();
+    assert_eq!(
+        tool.confirmation(&tool_ctx(&chat), &json!({"lesson_id": "gone"}))
+            .await,
+        Err("That lesson doesn't exist.".into())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn make_video_makes_a_ready_lessons_video() {
+    let (h, t) = signed_in().await;
+    let topic = course(&h, &t, "Optics", 1, json!({"with_videos": false})).await;
+    let lesson = library(&h, &t)
+        .await
+        .lessons
+        .into_iter()
+        .find(|l| l.topic_id == topic.id)
+        .unwrap();
+    assert!(library(&h, &t).await.videos.is_empty());
+
+    script(
+        &h,
+        &[("call_v", "make_video", json!({"lesson_id": lesson.id}))],
+        "It's on its way.",
+    );
+    let chat = say(&h, &t, None, "Make a video of it").await;
+    let d = wait_chat(&h, &t, &chat, idle).await;
+    assert_eq!(
+        last_turn(&d),
+        vec![
+            "user: Make a video of it",
+            "call make_video",
+            "result ok: Making the video of “Lesson 1”",
+            "card result: Lesson 1",
+            "assistant: It's on its way.",
+        ]
+    );
+    assert_eq!(
+        result_target(&d),
+        ResultTarget::Video {
+            lesson_id: lesson.id.clone()
+        }
+    );
+    let out = output_for(&h, "call_v");
+    assert_eq!(out["lesson_id"], lesson.id.as_str());
+    eventually(|| async {
+        let lib = library(&h, &t).await;
+        lib.videos
+            .iter()
+            .any(|v| v.lesson_id == lesson.id && v.status == VideoStatus::Ready)
+            .then_some(())
+    })
+    .await;
+
+    // Only a ready lesson gets one.
+    let now = chrono::Utc::now();
+    let queued = json!({
+        "id": "l-q", "topic_id": topic.id, "title": "Waiting", "summary": "",
+        "position": 5, "level": "intro", "minutes": 5, "body_md": "",
+        "status": {"state": "queued"}, "created_at": now, "updated_at": now, "citations": [],
+    });
+    h.state.store.put(db::LESSON, "l-q", &queued).await.unwrap();
+    let registry = agent_tools::registry(&h.state);
+    let tool = registry.get("make_video").unwrap();
+    let out = tool
+        .run(&tool_ctx(&chat), json!({"lesson_id": "l-q"}))
+        .await;
+    assert_eq!(
+        out.summary,
+        "The lesson is queued; make a video once it is ready."
+    );
+    let out = tool
+        .run(&tool_ctx(&chat), json!({"lesson_id": "gone"}))
+        .await;
+    assert_eq!(out.summary, "That lesson doesn't exist.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_sources_files_the_chats_files_under_a_topic() {
+    let (h, t) = signed_in().await;
+    let topic = new_topic(&h, &t, None, "Optics").await;
+    let elsewhere = new_topic(&h, &t, None, "Elsewhere").await;
+    let upload = |name: &'static str, topic_id: Option<String>| {
+        let h = &h;
+        let t = &t;
+        async move {
+            let r = h
+                .upload(t, name, topic_id.as_deref(), format!("{name} text"))
+                .await;
+            assert_eq!(r.status(), 200);
+            r.json::<Source>().await.unwrap()
+        }
+    };
+    let a = upload("a.md", None).await;
+    let b = upload("b.md", None).await;
+    let not_in_chat = upload("c.md", None).await;
+    let other_topics = upload("d.md", Some(elsewhere.id.clone())).await;
+
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["Got them."])));
+    let r = h
+        .post(&t, "/api/chats")
+        .json(&json!({"message": {"text": "Here are my files", "source_ids": [a.id, b.id, other_topics.id]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let chat = r.json::<ChatDetail>().await.unwrap().chat.id;
+    wait_chat(&h, &t, &chat, idle).await;
+
+    let registry = agent_tools::registry(&h.state);
+    let tool = registry.get("attach_sources").unwrap().clone();
+    let run = |ids: Vec<&str>, topic_id: &str| {
+        let tool = tool.clone();
+        let args = json!({"source_ids": ids, "topic_id": topic_id});
+        let ctx = tool_ctx(&chat);
+        async move { tool.run(&ctx, args).await }
+    };
+    let topic_of = |id: String| {
+        let h = &h;
+        async move {
+            let s: Source = h.state.store.get(db::SOURCE, &id).await.unwrap().unwrap();
+            s.topic_id
+        }
+    };
+
+    // Refused as a whole: nothing moves.
+    let out = run(vec![&a.id, &not_in_chat.id], &topic.id).await;
+    assert_eq!(
+        out.summary,
+        "“c.md” isn't attached to this chat; only the chat's files can be filed this way."
+    );
+    let out = run(vec![&a.id, &other_topics.id], &topic.id).await;
+    assert_eq!(out.summary, "“d.md” already belongs to another topic.");
+    assert_eq!(topic_of(a.id.clone()).await, None);
+    let out = run(vec![], &topic.id).await;
+    assert_eq!(out.summary, "Give the ids of the chat's files to file.");
+    let out = run(vec![&a.id], "gone").await;
+    assert_eq!(out.summary, "That topic doesn't exist.");
+    let out = run(vec!["nope"], &topic.id).await;
+    assert!(
+        out.summary.starts_with("There is no source nope."),
+        "{out:?}"
+    );
+
+    // Filed.
+    let mut sock = h.socket(&t).await;
+    let out = run(vec![&a.id, &b.id, &a.id], &topic.id).await;
+    assert!(out.ok, "{out:?}");
+    assert_eq!(out.summary, "Filed 2 files under “Optics”");
+    let v: Value = serde_json::from_str(&out.output).unwrap();
+    assert_eq!(v["filed"].as_array().unwrap().len(), 2);
+    sock.until(|e| {
+        matches!(e, Event::SourceChanged { source } if source.id == b.id
+            && source.topic_id.as_deref() == Some(topic.id.as_str()))
+    })
+    .await;
+    assert_eq!(topic_of(a.id.clone()).await, Some(topic.id.clone()));
+    let out = run(vec![&a.id], &topic.id).await;
+    assert_eq!(out.summary, "Already in “Optics”");
+
+    // The topic's sources stay when the chat is deleted.
+    let r = h
+        .delete(&t, &format!("/api/chats/{chat}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(topic_of(a.id.clone()).await, Some(topic.id.clone()));
+    assert_eq!(topic_of(b.id.clone()).await, Some(topic.id.clone()));
 }

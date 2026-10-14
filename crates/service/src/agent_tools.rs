@@ -10,14 +10,16 @@
 //!   owner's own writing), `propose_course` (outline card), `accept_proposal` (result
 //!   card); Destructive: `delete_topic`, `delete_lesson`, `delete_note`.
 //! - 3, Write: `write_lesson`, `regenerate_lesson` (confirms when the lesson body was
-//!   edited by the owner), `make_video` (result cards).
+//!   edited by the owner), `make_video` (result cards), `attach_sources` (files attached
+//!   to the chat go into a topic).
 //!
 //! Outputs are compact JSON the model reads; library text (lesson bodies, notes, source
 //! passages) only ever reaches the model this way, never in the developer prompt.
 //!
 //! Write and Destructive tools change the library through the same functions as the
 //! routes (`library::new_topic`, `ask::accept_proposal`, …) and run each change to its
-//! end even if the turn is stopped meanwhile (`to_the_end`). Who wrote a note or a
+//! end even if the turn is stopped meanwhile (`to_the_end`, which registers it with
+//! `Turns::register_write` so Stop records its real result). Who wrote a note or a
 //! lesson body (`state::Author`) decides whether overwriting it asks first.
 
 use std::collections::{HashMap, HashSet};
@@ -32,20 +34,22 @@ use margin_agent::{
 use margin_shared::{
     AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
     NewTopic, Note, NotePatch, Outline, OutlineCard, OutlineChips, OutlineLesson, PassagesCard,
-    Proposal, ResultCard, ResultTarget, Source, SourceStatus, Topic, TopicPatch, VideoStatus,
+    Proposal, ProposalStatus, ResultCard, ResultTarget, Source, SourceStatus, Topic, TopicPatch,
+    VideoStatus,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::library::{self, sort_topics};
 use crate::state::{AppState, Author, StoredLesson, StoredVideo};
-use crate::{ask, db, embedding, search, sources};
+use crate::{ask, db, embedding, search, sources, video};
 
 /// How long `search_sources` waits for sources still being read before searching what
 /// is ready.
-pub const SOURCE_SEARCH_WAIT: Duration = Duration::from_secs(30);
+pub const SOURCE_SEARCH_WAIT: Duration = Duration::from_secs(15);
 
 /// Every tool, service tools first then `margin_agent::device_tools()` (from phase 3),
 /// in a fixed order so the `tools` array is identical on every call.
@@ -68,6 +72,10 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(ReplaceNoteBody(state.clone()))));
     r.register(Arc::new(Typed(ProposeCourse(state.clone()))));
     r.register(Arc::new(Typed(AcceptProposalTool(state.clone()))));
+    r.register(Arc::new(Typed(WriteLesson(state.clone()))));
+    r.register(Arc::new(Typed(RegenerateLesson(state.clone()))));
+    r.register(Arc::new(Typed(MakeVideo(state.clone()))));
+    r.register(Arc::new(Typed(AttachSources(state.clone()))));
     r.register(Arc::new(Typed(DeleteTopic(state.clone()))));
     r.register(Arc::new(Typed(DeleteLesson(state.clone()))));
     r.register(Arc::new(Typed(DeleteNote(state.clone()))));
@@ -854,14 +862,32 @@ impl TypedTool for ListSources {
 /// Runs a change to the library to its end even when the turn is stopped meanwhile
 /// (Stop drops the tool's future): a topic, an accepted course or a delete is never
 /// left half done. Like a job a tool started, it carries on after Stop.
-async fn to_the_end<F>(work: F) -> ToolOutput
+///
+/// The change runs as its own task, registered as this call with
+/// `Turns::register_write` before it starts: Stop awaits it and records its real result
+/// (so the model doesn't make the change again). The task hands the tool a copy of
+/// that result.
+async fn to_the_end<F>(state: &AppState, ctx: &ToolContext, work: F) -> ToolOutput
 where
     F: Future<Output = ToolOutput> + Send + 'static,
 {
-    match tokio::spawn(work).await {
+    let (start, started) = oneshot::channel::<()>();
+    let (done, result) = oneshot::channel::<ToolOutput>();
+    let handle = tokio::spawn(async move {
+        // Registered first, so Stop never misses a change that ran.
+        let _ = started.await;
+        let out = work.await;
+        let _ = done.send(out.clone());
+        out
+    });
+    state
+        .turns
+        .register_write(&ctx.chat_id, &ctx.call_id, handle);
+    let _ = start.send(());
+    match result.await {
         Ok(out) => out,
-        Err(e) => {
-            tracing::error!("an agent tool's change failed: {e}");
+        Err(_) => {
+            tracing::error!("an agent tool's change failed (its task ended without a result)");
             ToolOutput::error("The service failed while making this change. Check its log.")
         }
     }
@@ -959,9 +985,9 @@ impl TypedTool for CreateTopic {
         format!("Creating the topic {}", quoted(&args.title))
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let req = NewTopic {
                 parent_id: args.parent_id,
                 title: args.title,
@@ -1013,9 +1039,9 @@ impl TypedTool for RenameTopic {
         format!("Renaming a topic to {}", quoted(&args.title))
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let before = match library::topic(&state, &args.topic_id).await {
                 Ok(t) => t,
                 Err(e) => return failed(e),
@@ -1070,9 +1096,9 @@ impl TypedTool for MoveTopic {
         }
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let index = args.position.map(|p| p as usize);
             let topic =
                 match library::place_topic(&state, &args.topic_id, args.parent_id, index).await {
@@ -1128,9 +1154,9 @@ impl TypedTool for EditLessonTitle {
         format!("Retitling a lesson {}", quoted(&args.title))
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let before = match library::lesson(&state, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
@@ -1185,9 +1211,9 @@ impl TypedTool for CreateNote {
         format!("Writing the note {}", quoted(&args.title))
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let title = match library::clean_title(&args.title, "note") {
                 Ok(t) => t,
                 Err(e) => return failed(e),
@@ -1245,9 +1271,9 @@ impl TypedTool for AppendToNote {
         "Adding to a note".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let text = args.text.trim();
             if text.is_empty() {
                 return ToolOutput::error("Give some text to add.");
@@ -1320,9 +1346,9 @@ impl TypedTool for ReplaceNoteBody {
         })
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let patch = NotePatch {
                 title: None,
                 body_md: Some(args.body_md),
@@ -1400,7 +1426,7 @@ impl TypedTool for ProposeCourse {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         let chat_id = ctx.chat_id.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let request = AskRequest {
                 prompt: args.prompt,
                 lesson_count: args.lessons.len() as u32,
@@ -1488,7 +1514,7 @@ impl TypedTool for AcceptProposalTool {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         let chat_id = ctx.chat_id.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let proposal: Option<Proposal> =
                 match state.store.get(db::PROPOSAL, &args.proposal_id).await {
                     Ok(p) => p,
@@ -1501,6 +1527,11 @@ impl TypedTool for AcceptProposalTool {
                 return ToolOutput::error(
                     "That proposal wasn't made in this chat; propose the course here first.",
                 );
+            }
+            if let ProposalStatus::Superseded { by } = &proposal.status {
+                return ToolOutput::error(format!(
+                    "A newer outline replaced this one (proposal_id {by}); only the newest outline in this chat can be accepted."
+                ));
             }
             let Some(outline) = proposal.outline.clone() else {
                 return ToolOutput::error("That proposal has no outline yet.");
@@ -1520,7 +1551,7 @@ impl TypedTool for AcceptProposalTool {
                     .collect(),
                 Err(e) => return internal(e),
             };
-            let output = json!({
+            let mut output = json!({
                 "topic_id": topic.id,
                 "topic_title": topic.title,
                 "parent_id": topic.parent_id,
@@ -1530,6 +1561,19 @@ impl TypedTool for AcceptProposalTool {
                 "with_quiz": accepted.request.with_quiz,
                 "status": "The lessons are queued and being written now (a few at a time); their progress shows on the card.",
             });
+            // The topic it was proposed under was deleted since: say where it went.
+            if proposal.request.parent_topic_id.is_some()
+                && accepted.request.parent_topic_id.is_none()
+            {
+                let subject = accepted
+                    .outline
+                    .as_ref()
+                    .map(|o| o.subject_title.clone())
+                    .unwrap_or_default();
+                output["note"] = json!(format!(
+                    "The topic it was to go under was deleted; filed under the subject “{subject}” instead."
+                ));
+            }
             let summary = format!(
                 "Created {} · {}",
                 quoted(&topic.title),
@@ -1543,6 +1587,334 @@ impl TypedTool for AcceptProposalTool {
             ))
         }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// write_lesson
+// ---------------------------------------------------------------------------
+
+pub struct WriteLesson(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteLessonArgs {
+    /// The topic to add the lesson to (it goes last).
+    pub topic_id: String,
+    /// The lesson's title.
+    pub title: String,
+    /// One line on what it covers; the lesson writer follows it.
+    pub summary: String,
+    /// Estimated reading time in minutes.
+    pub minutes: u32,
+    /// How advanced the lesson is (usually the level of the topic's other lessons).
+    pub level: LevelArg,
+    /// Whether the lesson ends with a short "Check yourself" quiz.
+    pub with_quiz: bool,
+}
+
+impl TypedTool for WriteLesson {
+    type Args = WriteLessonArgs;
+    const NAME: &'static str = "write_lesson";
+    const DESCRIPTION: &'static str = "Add one lesson at the end of an existing topic and have it written now: the lesson writer drafts it from the title and summary, the topic's other lessons, the request the course was made for and the topic's sources. Its progress shows on a card. For a new course with several lessons use propose_course instead. No video is made; use make_video once the lesson is ready.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Adding the lesson {}", quoted(&args.title))
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(&self.0, ctx, async move {
+            let req = ask::NewLesson {
+                topic_id: args.topic_id,
+                title: args.title,
+                summary: args.summary,
+                minutes: args.minutes,
+                level: args.level.into(),
+                with_quiz: args.with_quiz,
+            };
+            let lesson = match ask::append_lesson(&state, req).await {
+                Ok(l) => l,
+                Err(e) => return failed(e),
+            };
+            let output = json!({
+                "id": lesson.id,
+                "title": lesson.title,
+                "topic_id": lesson.topic_id,
+                "position": lesson.position,
+                "level": level_name(lesson.level),
+                "status": "The lesson is queued and being written now; its progress shows on the card.",
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Added {}", quoted(&lesson.title)),
+            )
+            .with_card(result_card(
+                ResultTarget::Lesson {
+                    lesson_id: lesson.id.clone(),
+                },
+                &lesson.title,
+            ))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regenerate_lesson
+// ---------------------------------------------------------------------------
+
+pub struct RegenerateLesson(pub AppState);
+
+impl TypedTool for RegenerateLesson {
+    type Args = LessonArgs;
+    const NAME: &'static str = "regenerate_lesson";
+    const DESCRIPTION: &'static str = "Write a lesson again from scratch (same title, summary and place in its topic). Its current text stays until the new one is done, and comes back if writing fails. When the owner edited the lesson's text, the app asks them to confirm first; lessons as they were written change right away.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Rewriting a lesson".into()
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        args: &'a Self::Args,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        Box::pin(async move {
+            let row = library::lesson(&self.0, &args.lesson_id)
+                .await
+                .map_err(|e| e.message)?;
+            // An empty body has none of the owner's edits to lose.
+            if row.author != Author::Owner || row.lesson.body_md.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ConfirmationPrompt {
+                title: format!("Rewrite the lesson {}?", quoted(&row.lesson.title)),
+                detail: "You edited its text; your edits would be lost.".into(),
+                approve_label: "Rewrite".into(),
+            }))
+        })
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(&self.0, ctx, async move {
+            let lesson = match ask::regenerate_lesson(&state, &args.lesson_id).await {
+                Ok(l) => l,
+                Err(e) => return failed(e),
+            };
+            let output = json!({
+                "id": lesson.id,
+                "title": lesson.title,
+                "topic_id": lesson.topic_id,
+                "status": "The lesson is queued and being written again now; its progress shows on the card.",
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Rewriting {}", quoted(&lesson.title)),
+            )
+            .with_card(result_card(
+                ResultTarget::Lesson {
+                    lesson_id: lesson.id.clone(),
+                },
+                &lesson.title,
+            ))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// make_video
+// ---------------------------------------------------------------------------
+
+pub struct MakeVideo(pub AppState);
+
+impl TypedTool for MakeVideo {
+    type Args = LessonArgs;
+    const NAME: &'static str = "make_video";
+    const DESCRIPTION: &'static str = "Make a narrated explainer video for a lesson that is ready (videos are made one at a time, so it may wait for others first). A lesson that already has a video gets it made again; one already being made is left as it is. Its progress shows on a card.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Making a video".into()
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(&self.0, ctx, async move {
+            let row = match library::lesson(&state, &args.lesson_id).await {
+                Ok(l) => l,
+                Err(e) => return failed(e),
+            };
+            if row.lesson.status != LessonStatus::Ready {
+                return ToolOutput::error(format!(
+                    "The lesson is {}; make a video once it is ready.",
+                    lesson_status(&row.lesson.status)
+                ));
+            }
+            if let Err(e) = state.ai_config().await {
+                return failed(e);
+            }
+            let already = match library::video_for_lesson(&state, &args.lesson_id).await {
+                Ok(v) => v.is_some_and(|v| video::in_progress(&v.video.status)),
+                Err(e) => return internal(e),
+            };
+            let stored = match video::enqueue(&state, &args.lesson_id).await {
+                Ok(v) => v,
+                Err(e) => return failed(e),
+            };
+            let title = row.lesson.title;
+            let (status, summary) = if already {
+                (
+                    "The video was already being made; it carries on.".to_string(),
+                    format!("Video of {} already on its way", quoted(&title)),
+                )
+            } else {
+                (
+                    "The video is queued and being made now (one at a time); its progress shows on the card.".to_string(),
+                    format!("Making the video of {}", quoted(&title)),
+                )
+            };
+            let output = json!({
+                "video_id": stored.video.id,
+                "lesson_id": args.lesson_id,
+                "lesson_title": title,
+                "video": video_status(Some(&stored)),
+                "status": status,
+            });
+            ToolOutput::ok(output.to_string(), summary).with_card(result_card(
+                ResultTarget::Video {
+                    lesson_id: args.lesson_id.clone(),
+                },
+                &title,
+            ))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attach_sources
+// ---------------------------------------------------------------------------
+
+pub struct AttachSources(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AttachSourcesArgs {
+    /// The files to file under the topic: ids of files attached to this chat (from
+    /// list_sources, attached_to_this_chat) that aren't in a topic yet.
+    pub source_ids: Vec<String>,
+    /// The topic they go into.
+    pub topic_id: String,
+}
+
+impl TypedTool for AttachSources {
+    type Args = AttachSourcesArgs;
+    const NAME: &'static str = "attach_sources";
+    const DESCRIPTION: &'static str = "File files attached to this chat under a topic, so they become the topic's sources: its lessons draw on them, and they stay when the chat is deleted. Only this chat's files that aren't in a topic yet; files already in that topic are left as they are.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!(
+            "Filing {} under a topic",
+            plural(args.source_ids.len(), "file", "files")
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
+        Box::pin(to_the_end(&self.0, ctx, async move {
+            match attach_chat_files(&state, &chat_id, &args.source_ids, &args.topic_id).await {
+                Ok(Ok(out)) => out,
+                Ok(Err(e)) => failed(e),
+                Err(e) => internal(e),
+            }
+        }))
+    }
+}
+
+/// `attach_sources`: checks every id is a file of the chat that isn't another topic's,
+/// then moves them into the topic (`sources::attach_locked`) under `write_lock` and
+/// emits after releasing it. `Ok(Err(..))` is a refusal the model reads; nothing moved.
+async fn attach_chat_files(
+    state: &AppState,
+    chat_id: &str,
+    source_ids: &[String],
+    topic_id: &str,
+) -> anyhow::Result<AppResult<ToolOutput>> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in source_ids {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Err(AppError::bad_request(
+            "Give the ids of the chat's files to file.",
+        )));
+    }
+    let (topic, moved, already, events) = {
+        let _w = state.write_lock.lock().await;
+        let topic = match library::topic(state, topic_id).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let chat: Option<Chat> = state.store.get(db::CHAT, chat_id).await?;
+        let in_chat: HashSet<String> = chat
+            .map(|c| c.source_ids.into_iter().collect())
+            .unwrap_or_default();
+        let mut moved = Vec::new();
+        let mut already = Vec::new();
+        for id in &ids {
+            let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
+                return Ok(Err(AppError::bad_request(format!(
+                    "There is no source {id}. Use list_sources to see the chat's files."
+                ))));
+            };
+            if !in_chat.contains(id) {
+                return Ok(Err(AppError::bad_request(format!(
+                    "{} isn't attached to this chat; only the chat's files can be filed this way.",
+                    quoted(&source.name)
+                ))));
+            }
+            match source.topic_id.as_deref() {
+                None => moved.push(source),
+                Some(t) if t == topic.id => already.push(source),
+                Some(_) => {
+                    return Ok(Err(AppError::bad_request(format!(
+                        "{} already belongs to another topic.",
+                        quoted(&source.name)
+                    ))));
+                }
+            }
+        }
+        let move_ids: Vec<String> = moved.iter().map(|s| s.id.clone()).collect();
+        let events = sources::attach_locked(state, &move_ids, &topic.id).await?;
+        (topic, moved, already, events)
+    };
+    for e in events {
+        state.emit(e);
+    }
+    let names = |list: &[Source]| -> Vec<Value> {
+        list.iter()
+            .map(|s| json!({ "id": s.id, "name": s.name }))
+            .collect()
+    };
+    let output = json!({
+        "topic_id": topic.id,
+        "topic_title": topic.title,
+        "filed": names(&moved),
+        "already_there": names(&already),
+    });
+    let summary = if moved.is_empty() {
+        format!("Already in {}", quoted(&topic.title))
+    } else {
+        format!(
+            "Filed {} under {}",
+            plural(moved.len(), "file", "files"),
+            quoted(&topic.title)
+        )
+    };
+    Ok(Ok(ToolOutput::ok(output.to_string(), summary)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1652,9 +2024,9 @@ impl TypedTool for DeleteTopic {
         })
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let contents = match TopicContents::load(&state, &args.topic_id).await {
                 Ok(c) => c,
                 Err(message) => return ToolOutput::error(message),
@@ -1736,9 +2108,9 @@ impl TypedTool for DeleteLesson {
         })
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let row = match library::lesson(&state, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
@@ -1799,9 +2171,9 @@ impl TypedTool for DeleteNote {
         })
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
-        Box::pin(to_the_end(async move {
+        Box::pin(to_the_end(&self.0, ctx, async move {
             let note = match library::note(&state, &args.note_id).await {
                 Ok(n) => n,
                 Err(e) => return failed(e),
@@ -1887,6 +2259,9 @@ mod tests {
             margin_agent::strict_schema::<ReplaceNoteBodyArgs>(),
             margin_agent::strict_schema::<ProposeCourseArgs>(),
             margin_agent::strict_schema::<AcceptProposalArgs>(),
+            margin_agent::strict_schema::<WriteLessonArgs>(),
+            margin_agent::strict_schema::<LessonArgs>(),
+            margin_agent::strict_schema::<AttachSourcesArgs>(),
         ] {
             margin_agent::check_strict_schema(&schema).unwrap_or_else(|e| panic!("{e}: {schema}"));
         }
