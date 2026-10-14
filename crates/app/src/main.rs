@@ -4,6 +4,7 @@ mod api;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
 mod config;
+mod drafts;
 mod events;
 #[cfg(test)]
 mod fake;
@@ -53,11 +54,36 @@ fn main() {
                 .with_fullsize_content_view(true)
         };
         dioxus::LaunchBuilder::new()
-            .with_cfg(Config::new().with_window(window).with_menu(menu_bar()))
+            .with_cfg(
+                Config::new()
+                    .with_window(window)
+                    .with_menu(menu_bar())
+                    .with_custom_event_handler(flush_on_exit),
+            )
             .launch(App);
     }
     #[cfg(not(feature = "desktop"))]
     dioxus::launch(App);
+}
+
+/// Closing the window or quitting ends the app's runtime, and with it any note save
+/// still waiting on its debounce; send those edits first.
+#[cfg(feature = "desktop")]
+fn flush_on_exit<T>(
+    event: &dioxus::desktop::tao::event::Event<'_, T>,
+    _: &dioxus::desktop::tao::event_loop::EventLoopWindowTarget<T>,
+) {
+    use dioxus::desktop::tao::event::{Event, WindowEvent};
+    if matches!(
+        event,
+        Event::LoopDestroyed
+            | Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            }
+    ) {
+        drafts::flush_blocking(Duration::from_secs(3));
+    }
 }
 
 /// The native menu bar. Besides the usual app and window commands it carries the Edit
