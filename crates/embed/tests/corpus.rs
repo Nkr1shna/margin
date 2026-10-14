@@ -29,9 +29,15 @@ const PROSE: [(&str, TextFormat); 8] = [
     ("folder/notes/README", TextFormat::Plain),
 ];
 
+/// A fresh folder per call: tests run in parallel, and a name shared between them (each
+/// `read` uses "media") let one test delete the folder while another created it.
 fn temp_dir(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("margin-embed-corpus-{name}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "margin-embed-corpus-{name}-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

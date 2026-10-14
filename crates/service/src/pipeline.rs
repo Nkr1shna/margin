@@ -39,6 +39,10 @@ pub struct Query {
     pub text: String,
     /// The query's embedding (`Purpose::Query`); empty for a lexical-only search.
     pub vector: Vec<f32>,
+    /// The version of the embedder that made `vector` (`Embedder::version`): the dense
+    /// leg compares it only with passages of that version (`embedder = $embedder`), so a
+    /// half re-embedded index never mixes vector spaces. Empty = no such filter.
+    pub embedder: String,
     pub scope: Scope,
     /// The caller's access paths; `None` = no filter (today's single owner). Retrievers
     /// must apply it inside the index query (pre-filter), never to their results.

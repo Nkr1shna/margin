@@ -1966,7 +1966,8 @@ mod lesson_retrieval {
             text: text.into(),
             file: None,
             chunk_hash: format!("h-{id}"),
-            embedder: "fake".into(),
+            // What the test embedder stamps (the dense leg compares only its vectors).
+            embedder: margin_service::ingest::EMBEDDER_VERSION.into(),
             vector: FakeEmbedder
                 .embed(&[text.to_string()], Purpose::DOCUMENT)
                 .unwrap()

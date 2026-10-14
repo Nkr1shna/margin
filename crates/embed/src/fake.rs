@@ -359,9 +359,11 @@ pub struct Recorder<E: Embedder> {
 
 impl<E: Embedder> Recorder<E> {
     pub fn new(inner: E) -> Self {
+        // Recorded as whichever backend `inner` is.
+        let recording = Recording::for_version(inner.version());
         Self {
             inner,
-            recording: std::sync::Mutex::new(Recording::new()),
+            recording: std::sync::Mutex::new(recording),
         }
     }
 
@@ -452,18 +454,30 @@ pub struct RecordedEmbedder {
 }
 
 impl RecordedEmbedder {
-    /// Opens a recording made for this `EMBEDDER_VERSION`.
+    /// Opens a recording made with one of the backends (`Backend::embedder_version`).
     pub fn open(path: &std::path::Path) -> Result<Self, EmbedError> {
         Self::new(Recording::load(path)?)
     }
 
-    /// Serves `recording`, which must be of this `EMBEDDER_VERSION`.
+    /// Serves `recording`, which must be of a backend's current version
+    /// (`Backend::of_version`); it then answers as that backend (`version()`).
     pub fn new(recording: Recording) -> Result<Self, EmbedError> {
-        if recording.version != crate::EMBEDDER_VERSION {
+        if crate::Backend::of_version(&recording.version).is_none() {
             return Err(EmbedError::Load(format!(
-                "the recording is of {}, this build embeds with {}: {RERECORD}",
+                "the recording is of {}, which no embedder of this build makes: {RERECORD}",
                 recording.version,
-                crate::EMBEDDER_VERSION
+            )));
+        }
+        Ok(Self { recording })
+    }
+
+    /// Serves `recording`, which must be of `backend`'s version.
+    pub fn for_backend(recording: Recording, backend: crate::Backend) -> Result<Self, EmbedError> {
+        if recording.version != backend.embedder_version() {
+            return Err(EmbedError::Load(format!(
+                "the recording is of {}, this run embeds with {}: {RERECORD}",
+                recording.version,
+                backend.embedder_version()
             )));
         }
         Ok(Self { recording })
@@ -536,6 +550,10 @@ impl Embedder for RecordedEmbedder {
                 })
             })
             .collect()
+    }
+
+    fn version(&self) -> &str {
+        &self.recording.version
     }
 }
 
@@ -682,6 +700,17 @@ mod tests {
         old.version = "embeddinggemma-2-coreml/title-none".into();
         let err = RecordedEmbedder::new(old.clone()).unwrap_err();
         assert!(err.to_string().contains("record-embeddings"), "{err}");
+        assert_eq!(replay.version(), crate::EMBEDDER_VERSION);
+        // Each backend's recording is served as that backend, and only where expected.
+        let onnx = crate::Backend::Onnx(crate::OnnxDtype::Q8);
+        let mut q8 = recording.clone();
+        q8.version = onnx.embedder_version().into();
+        assert_eq!(
+            RecordedEmbedder::new(q8.clone()).unwrap().version(),
+            onnx.embedder_version()
+        );
+        assert!(RecordedEmbedder::for_backend(q8.clone(), onnx).is_ok());
+        assert!(RecordedEmbedder::for_backend(q8, crate::Backend::CoreMl).is_err());
         let mut merged = Recording::new();
         assert!(merged.merge(old).is_err());
         merged.merge(recording.clone()).unwrap();

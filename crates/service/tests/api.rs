@@ -1842,7 +1842,7 @@ mod retrieval_api {
             text: text.into(),
             file: None,
             chunk_hash: format!("h-{id}"),
-            embedder: "fake".into(),
+            embedder: margin_service::ingest::EMBEDDER_VERSION.into(),
             vector: vector(text),
         }
     }

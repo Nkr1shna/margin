@@ -127,6 +127,7 @@ async fn seeded() -> Store {
 fn query(text: &str, vector: Vec<f32>, scope: Scope) -> Query {
     Query {
         text: text.into(),
+        embedder: String::new(),
         vector,
         scope,
         access: None,
@@ -328,6 +329,7 @@ async fn filters_are_inside_the_index_scans() {
         },
         modalities: vec!["text".into()],
         access: Some(vec!["company".into()]),
+        embedder: "test".into(),
     };
     let explain = |sql: String, extra: (&'static str, Value)| {
         let s = s.clone();
@@ -346,12 +348,16 @@ async fn filters_are_inside_the_index_scans() {
         plan.contains("KnnScan") && plan.contains("passage_vector"),
         "{plan}"
     );
-    // The scope, modality and access conditions are the KNN scan's own predicate.
+    // The scope, modality, access and embedder conditions are the KNN scan's own
+    // predicate.
     let knn = plan.split("KnnScan").next().unwrap();
     assert!(
         knn.contains("scope_ids CONTAINSANY") && knn.contains("CONTAINSANY ['company']"),
         "{plan}"
     );
+    assert!(knn.contains("embedder = 'test'"), "{plan}");
+    // The lexical leg doesn't filter by embedder.
+    assert!(!r.lex_sql(&filter, 40, "id").contains("embedder"));
     let plan = explain(r.lex_sql(&filter, 40, "id"), ("text", json!("entropy"))).await;
     assert!(
         plan.contains("FullTextScan") && plan.contains("passage_text"),
@@ -970,4 +976,22 @@ fn text_of_another_page_is_not_merged_in() {
     );
     let pages: Vec<Option<u32>> = packed.iter().map(|p| p.citation.page).collect();
     assert_eq!(pages, [Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn the_dense_leg_only_compares_vectors_of_the_query_embedder() {
+    let s = seeded().await;
+    let lib = Scope::Library;
+    let mut q = query("photosynthesis", unit(4), lib);
+    // Every seeded row is of embedder "test".
+    q.embedder = "test".into();
+    let hits = retriever(&s, "dense").search(&q).await.unwrap();
+    assert_eq!(hits[0].passage.id, "f");
+    // Vectors of another embedder (a half-finished re-embed) are never compared...
+    q.embedder = "embeddinggemma-2-onnx-q8/title-prefix-v1".into();
+    assert!(retriever(&s, "dense").search(&q).await.unwrap().is_empty());
+    // ...while the lexical leg still finds them.
+    let hits = retriever(&s, "hybrid-rrf").search(&q).await.unwrap();
+    assert_eq!(ids(&hits), ["c"]);
+    assert!(hits.iter().all(|h| h.dense_rank.is_none()));
 }

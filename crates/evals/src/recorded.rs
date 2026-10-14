@@ -25,11 +25,12 @@ use margin_embed::{Embedder, ImageTokens, Picture, Purpose};
 use crate::corpus::CorpusDoc;
 
 /// The embedder and prompt-prefix version the eval index is built with: EmbeddingGemma
-/// 2 with the document title prefix of §2.1 (`margin_embed::embedder_version()`).
+/// 2 on Core ML with the document title prefix of §2.1 (the baseline recording's; the
+/// ONNX backends have their own, `margin_embed::Backend::embedder_version`).
 /// Stamped on every passage row, eval run and recording; `compare` refuses to compare
 /// runs across versions unless told to.
 pub fn embedder_version() -> &'static str {
-    margin_embed::embedder_version()
+    margin_embed::embedder_version(margin_embed::Backend::CoreMl)
 }
 
 /// `evals/recorded/embeddings.bin`.

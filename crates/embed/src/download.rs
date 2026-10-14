@@ -1,11 +1,16 @@
-//! Fetching the model's files from Hugging Face: the text model, the vision and audio
-//! encoders and the tables they read, in one download with one progress total. The file
-//! list comes from the repo's tree API, so every file inside each `.mlpackage` is fetched
-//! whatever the package holds; anything else in the repo (README, …) is skipped.
+//! Fetching the model's files from Hugging Face in one download with one progress
+//! total. Which files depends on the backend (`Backend`, its `Manifest` below):
 //!
-//! Each file streams into `{path}.part` and is renamed when its size checks out. The
-//! list of files (with sizes) is written to `files.json` last, so a folder without it
-//! is an unfinished download.
+//! - Core ML (`REPO`): the text model, the vision and audio encoders (every file inside
+//!   each `.mlpackage`, whatever the package holds) and the tables they read.
+//! - ONNX (`ONNX_REPO`): the tokenizer, `config.json`, the processor configs, and the
+//!   three graphs (`onnx/model`, `onnx/vision_encoder`, `onnx/audio_encoder`) in one
+//!   format (`OnnxDtype`), each with its external data file(s).
+//!
+//! The file list comes from the repo's tree API; anything else in the repo (README, other
+//! formats, …) is skipped. Each file streams into `{path}.part` and is renamed when its
+//! size checks out. The list of files (with sizes) is written to `files.json` last, so a
+//! folder without it is an unfinished download.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +18,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::{EmbedError, REPO};
+use crate::{Backend, EmbedError, OnnxDtype};
 
 /// The Core ML package the text functions live in.
 pub(crate) const TEXT_PACKAGE: &str = "EmbeddingGemma2Text.mlpackage";
@@ -25,13 +30,40 @@ pub(crate) const AUDIO_PACKAGE: &str = "EmbeddingGemma2Audio.mlpackage";
 pub(crate) const PACKAGES: &[&str] = &[TEXT_PACKAGE, VISION_PACKAGE, AUDIO_PACKAGE];
 /// The vision encoder's patch position tables.
 pub(crate) const POSITION_TABLE: &str = "position_embeddings.f16";
-/// Top-level files the model reads besides the packages.
+/// Top-level files the Core ML model reads besides the packages.
 const TOP_FILES: &[&str] = &[
     "config.json",
     "tokenizer.json",
     "embeddings.bf16",
     POSITION_TABLE,
 ];
+
+/// The ONNX export's graphs: the text model (which also takes the encoders' feature
+/// rows), the image encoder and the audio encoder.
+pub(crate) const ONNX_TEXT_GRAPH: &str = "model";
+pub(crate) const ONNX_VISION_GRAPH: &str = "vision_encoder";
+pub(crate) const ONNX_AUDIO_GRAPH: &str = "audio_encoder";
+pub(crate) const ONNX_GRAPHS: &[&str] = &[ONNX_TEXT_GRAPH, ONNX_VISION_GRAPH, ONNX_AUDIO_GRAPH];
+/// Top-level files the ONNX backend can't do without.
+const ONNX_TOP_FILES: &[&str] = &["config.json", "tokenizer.json"];
+/// Top-level files fetched when the repo has them (the image and audio preprocessing
+/// settings the media path reads).
+const ONNX_OPTIONAL_FILES: &[&str] = &["processor_config.json", "preprocessor_config.json"];
+
+/// A graph's file in the repo (and in the model folder): `onnx/{graph}{suffix}.onnx`.
+pub(crate) fn onnx_graph(graph: &str, dtype: OnnxDtype) -> String {
+    format!("onnx/{graph}{}.onnx", dtype.file_suffix())
+}
+
+/// Whether `path` is `graph`'s file in `dtype` or one of its external data files
+/// (`….onnx_data`, `….onnx_data_1`, …).
+fn is_graph_file(path: &str, graph: &str, dtype: OnnxDtype) -> bool {
+    let file = onnx_graph(graph, dtype);
+    path == file
+        || path
+            .strip_prefix(&file)
+            .is_some_and(|rest| rest == "_data" || rest.starts_with("_data_"))
+}
 
 /// Where a package is kept compiled: `X.mlpackage` → `X.mlmodelc`.
 pub(crate) fn compiled_name(package: &str) -> String {
@@ -45,6 +77,59 @@ fn package_of(path: &str) -> Option<&'static str> {
             .is_some_and(|rest| rest.starts_with('/'))
     })
 }
+
+/// Which repo files a backend downloads and which it can't do without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Manifest(pub Backend);
+
+impl Manifest {
+    fn repo(self) -> &'static str {
+        self.0.repo()
+    }
+
+    /// Whether a download fetches `path`.
+    fn wanted(self, path: &str) -> bool {
+        match self.0 {
+            Backend::CoreMl => TOP_FILES.contains(&path) || package_of(path).is_some(),
+            Backend::Onnx(dtype) => {
+                ONNX_TOP_FILES.contains(&path)
+                    || ONNX_OPTIONAL_FILES.contains(&path)
+                    || ONNX_GRAPHS.iter().any(|g| is_graph_file(path, g, dtype))
+            }
+        }
+    }
+
+    /// The first required file (or package) `files` lacks.
+    fn missing(self, files: &[RemoteFile]) -> Option<String> {
+        let listed = |name: &str| files.iter().any(|f| f.path == name);
+        match self.0 {
+            Backend::CoreMl => TOP_FILES
+                .iter()
+                .find(|f| !listed(f))
+                .map(|f| f.to_string())
+                .or_else(|| {
+                    PACKAGES
+                        .iter()
+                        .find(|p| !files.iter().any(|f| package_of(&f.path) == Some(**p)))
+                        .map(|p| p.to_string())
+                }),
+            Backend::Onnx(dtype) => ONNX_TOP_FILES
+                .iter()
+                .map(|f| f.to_string())
+                .chain(ONNX_GRAPHS.iter().map(|g| onnx_graph(g, dtype)))
+                .find(|f| !listed(f)),
+        }
+    }
+
+    /// The compiled copy a new file makes stale (Core ML packages only).
+    fn compiled_of(self, path: &str) -> Option<&'static str> {
+        match self.0 {
+            Backend::CoreMl => package_of(path),
+            Backend::Onnx(_) => None,
+        }
+    }
+}
+
 /// Written after every file is in place.
 const MANIFEST: &str = "files.json";
 
@@ -63,13 +148,15 @@ struct TreeEntry {
     size: u64,
 }
 
-/// The files the model needs, from `{hf_base}/api/models/{REPO}/tree/main`.
+/// The files the model needs, from `{hf_base}/api/models/{repo}/tree/main`.
 pub(crate) async fn remote_files(
     client: &reqwest::Client,
     hf_base: &str,
+    manifest: Manifest,
 ) -> Result<Vec<RemoteFile>, EmbedError> {
+    let repo = manifest.repo();
     let url = format!(
-        "{}/api/models/{REPO}/tree/main?recursive=true",
+        "{}/api/models/{repo}/tree/main?recursive=true",
         base(hf_base)
     );
     let response = client
@@ -85,32 +172,27 @@ pub(crate) async fn remote_files(
     let files: Vec<RemoteFile> = tree
         .into_iter()
         .filter(|e| e.kind == "file")
-        .filter(|e| TOP_FILES.contains(&e.path.as_str()) || package_of(&e.path).is_some())
+        .filter(|e| manifest.wanted(&e.path))
         .map(|e| RemoteFile {
             path: e.path,
             size: e.size,
         })
         .collect();
-    for needed in TOP_FILES {
-        if !files.iter().any(|f| f.path == *needed) {
-            return Err(EmbedError::Download(format!("{REPO} has no {needed}")));
-        }
-    }
-    for package in PACKAGES {
-        if !files.iter().any(|f| package_of(&f.path) == Some(package)) {
-            return Err(EmbedError::Download(format!("{REPO} has no {package}")));
-        }
+    if let Some(needed) = manifest.missing(&files) {
+        return Err(EmbedError::Download(format!("{repo} has no {needed}")));
     }
     Ok(files)
 }
 
 pub(crate) async fn download(
     dir: &Path,
+    manifest: Manifest,
     client: &reqwest::Client,
     hf_base: &str,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(), EmbedError> {
-    let files = remote_files(client, hf_base).await?;
+    let repo = manifest.repo();
+    let files = remote_files(client, hf_base, manifest).await?;
     let total: u64 = files.iter().map(|f| f.size).sum();
     tokio::fs::create_dir_all(dir).await?;
     // Not complete until the new list is written.
@@ -133,7 +215,7 @@ pub(crate) async fn download(
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let url = format!("{}/{REPO}/resolve/main/{}", base(hf_base), file.path);
+        let url = format!("{}/{repo}/resolve/main/{}", base(hf_base), file.path);
         let partial = part_path(&target);
         let start = received;
         let result = fetch(client, &url, &partial, |n| {
@@ -157,7 +239,7 @@ pub(crate) async fn download(
         }
         received = start + written;
         tokio::fs::rename(&partial, &target).await?;
-        if let Some(package) = package_of(&file.path)
+        if let Some(package) = manifest.compiled_of(&file.path)
             && !fetched.contains(&package)
         {
             fetched.push(package);
@@ -206,18 +288,14 @@ async fn fetch(
 }
 
 /// Whether `files.json` exists and every file it lists is present at its size.
-pub(crate) fn is_complete(dir: &Path) -> bool {
+pub(crate) fn is_complete(dir: &Path, manifest: Manifest) -> bool {
     let Ok(bytes) = std::fs::read(dir.join(MANIFEST)) else {
         return false;
     };
     let Ok(files) = serde_json::from_slice::<Vec<RemoteFile>>(&bytes) else {
         return false;
     };
-    let listed = |name: &str| files.iter().any(|f| f.path == name);
-    TOP_FILES.iter().all(|f| listed(f))
-        && PACKAGES
-            .iter()
-            .all(|p| files.iter().any(|f| package_of(&f.path) == Some(p)))
+    manifest.missing(&files).is_none()
         && files.iter().all(|f| {
             file_path(dir, &f.path)
                 .ok()
@@ -293,7 +371,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
 
-    use crate::ModelFiles;
+    use crate::{ModelFiles, ONNX_REPO, REPO};
 
     use super::*;
 
@@ -305,6 +383,8 @@ mod tests {
         missing: Vec<String>,
         /// How many file requests it served.
         fetches: AtomicUsize,
+        /// The repo id it answers for.
+        name: &'static str,
     }
 
     fn fake_files() -> Vec<(String, Vec<u8>)> {
@@ -372,8 +452,8 @@ mod tests {
             found.map(|(_, b)| b.clone()).ok_or(StatusCode::NOT_FOUND)
         }
         let app = Router::new()
-            .route(&format!("/api/models/{REPO}/tree/main"), get(tree))
-            .route(&format!("/{REPO}/resolve/main/{{*path}}"), get(file))
+            .route(&format!("/api/models/{}/tree/main", repo.name), get(tree))
+            .route(&format!("/{}/resolve/main/{{*path}}", repo.name), get(file))
             .with_state(repo);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -421,6 +501,7 @@ mod tests {
             files: fake_files(),
             missing: vec![],
             fetches: 0.into(),
+            name: REPO,
         });
         let base = serve(repo.clone()).await;
         let client = reqwest::Client::new();
@@ -494,6 +575,7 @@ mod tests {
             files: fake_files(),
             missing: vec![weights.to_string()],
             fetches: 0.into(),
+            name: REPO,
         });
         let base = serve(repo).await;
         let files = ModelFiles::new(temp_dir("failed"));
@@ -518,6 +600,7 @@ mod tests {
             files,
             missing: vec![],
             fetches: 0.into(),
+            name: REPO,
         });
         let base = serve(repo).await;
         let err = ModelFiles::remote_size(&reqwest::Client::new(), &base)
@@ -534,6 +617,7 @@ mod tests {
             files,
             missing: vec![],
             fetches: 0.into(),
+            name: REPO,
         });
         let base = serve(repo).await;
         let err = ModelFiles::remote_size(&reqwest::Client::new(), &base)
@@ -543,18 +627,21 @@ mod tests {
     }
 
     /// Downloads the real model from Hugging Face when `MARGIN_EMBED_DOWNLOAD_TO` names a
-    /// folder (e.g. `~/Library/Caches/margin-embed-test/model` for the Core ML tests).
+    /// folder (e.g. `~/Library/Caches/margin-embed-test/model` for the Core ML tests), for
+    /// the backend `MARGIN_EMBED_BACKEND` names (`coreml` when unset; `onnx-q8` for the
+    /// ONNX tests' `~/Library/Caches/margin-embed-test/onnx-q8`).
     #[tokio::test]
     async fn real_download_when_asked() {
         let Some(dir) = std::env::var_os("MARGIN_EMBED_DOWNLOAD_TO") else {
             eprintln!("skipping: MARGIN_EMBED_DOWNLOAD_TO is not set");
             return;
         };
+        let backend = std::env::var("MARGIN_EMBED_BACKEND")
+            .ok()
+            .map_or(Backend::CoreMl, |name| name.parse().unwrap());
         let client = reqwest::Client::new();
-        let files = ModelFiles::new(PathBuf::from(dir));
-        let total = ModelFiles::remote_size(&client, crate::HF_BASE)
-            .await
-            .unwrap();
+        let files = ModelFiles::with_backend(PathBuf::from(dir), backend);
+        let total = files.remote_bytes(&client, crate::HF_BASE).await.unwrap();
         eprintln!("downloading {total} bytes to {}", files.dir.display());
         let step = AtomicUsize::new(0);
         files
@@ -568,6 +655,157 @@ mod tests {
             .unwrap();
         assert!(files.is_complete());
         assert!(files.size_on_disk() >= total);
+    }
+
+    /// The ONNX repo's layout: three graphs in five formats with external data, the
+    /// tokenizer and configs, and files no backend fetches.
+    fn fake_onnx_files() -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = [
+            ("config.json", b"{\"bos_token_id\": 2}".to_vec()),
+            ("tokenizer.json", vec![b't'; 2000]),
+            ("tokenizer_config.json", b"{}".to_vec()),
+            ("processor_config.json", b"{}".to_vec()),
+            ("preprocessor_config.json", b"{}".to_vec()),
+            ("README.md", b"# card".to_vec()),
+            ("onnx/model.onnx.bak", vec![1u8; 10]),
+        ]
+        .into_iter()
+        .map(|(p, b)| (p.to_string(), b))
+        .collect();
+        for (n, graph) in ONNX_GRAPHS.iter().enumerate() {
+            for (m, suffix) in ["", "_fp16", "_q4", "_q4f16", "_quantized"]
+                .iter()
+                .enumerate()
+            {
+                let size = 100 * (n + 1) + 10 * m;
+                files.push((format!("onnx/{graph}{suffix}.onnx"), vec![n as u8; size]));
+                files.push((
+                    format!("onnx/{graph}{suffix}.onnx_data"),
+                    vec![m as u8; size * 7],
+                ));
+            }
+        }
+        // A graph whose weights are split in two.
+        files.push((
+            "onnx/audio_encoder_quantized.onnx_data_1".into(),
+            vec![8u8; 333],
+        ));
+        files
+    }
+
+    #[test]
+    fn the_onnx_manifest_takes_one_format_and_its_data() {
+        let q8 = Manifest(Backend::Onnx(OnnxDtype::Q8));
+        let fp32 = Manifest(Backend::Onnx(OnnxDtype::Fp32));
+        assert_eq!(
+            onnx_graph("model", OnnxDtype::Q8),
+            "onnx/model_quantized.onnx"
+        );
+        assert!(q8.wanted("onnx/model_quantized.onnx"));
+        assert!(q8.wanted("onnx/model_quantized.onnx_data"));
+        assert!(q8.wanted("onnx/audio_encoder_quantized.onnx_data_1"));
+        assert!(q8.wanted("tokenizer.json"));
+        assert!(q8.wanted("processor_config.json"));
+        assert!(!q8.wanted("onnx/model.onnx"));
+        assert!(!q8.wanted("onnx/model_q4.onnx_data"));
+        assert!(!q8.wanted("embeddings.bf16"));
+        assert!(fp32.wanted("onnx/model.onnx"));
+        assert!(fp32.wanted("onnx/model.onnx_data"));
+        assert!(!fp32.wanted("onnx/model.onnx.bak"));
+        assert!(!fp32.wanted("onnx/model_quantized.onnx"));
+        assert!(!fp32.wanted("onnx/model_fp16.onnx_data"));
+        assert!(!Manifest(Backend::CoreMl).wanted("onnx/model.onnx"));
+        assert_eq!(q8.compiled_of("onnx/model_quantized.onnx"), None);
+    }
+
+    #[tokio::test]
+    async fn downloads_the_onnx_backend_from_its_own_repo() {
+        let repo = Arc::new(Repo {
+            files: fake_onnx_files(),
+            missing: vec![],
+            fetches: 0.into(),
+            name: ONNX_REPO,
+        });
+        let base = serve(repo.clone()).await;
+        let client = reqwest::Client::new();
+        let backend = Backend::Onnx(OnnxDtype::Q8);
+        let files = ModelFiles::with_backend(temp_dir("onnx-download"), backend);
+        let manifest = Manifest(backend);
+        let wanted: Vec<(String, Vec<u8>)> = fake_onnx_files()
+            .into_iter()
+            .filter(|(p, _)| manifest.wanted(p))
+            .collect();
+        // 3 graphs + 3 data files + the split + 4 top files.
+        assert_eq!(wanted.len(), 11);
+        let bytes: u64 = wanted.iter().map(|(_, b)| b.len() as u64).sum();
+        assert_eq!(files.remote_bytes(&client, &base).await.unwrap(), bytes);
+        assert!(!files.is_complete());
+
+        let last = Mutex::new((0, 0));
+        files
+            .download(&client, &base, &|r, t| *last.lock().unwrap() = (r, t))
+            .await
+            .unwrap();
+        assert_eq!(*last.lock().unwrap(), (bytes, bytes));
+        assert!(files.is_complete());
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), wanted.len());
+        for (path, content) in fake_onnx_files() {
+            let on_disk = std::fs::read(files.dir.join(&path)).ok();
+            if manifest.wanted(&path) {
+                assert_eq!(on_disk.as_ref(), Some(&content), "{path}");
+            } else {
+                assert_eq!(on_disk, None, "{path} should be skipped");
+            }
+        }
+        assert_eq!(
+            files.graph_path("model").unwrap(),
+            files.dir.join("onnx/model_quantized.onnx")
+        );
+        // The same folder doesn't count as another format's download, nor as Core ML's.
+        assert!(
+            !ModelFiles::with_backend(&files.dir, Backend::Onnx(OnnxDtype::Fp32)).is_complete()
+        );
+        assert!(!ModelFiles::new(&files.dir).is_complete());
+        // A missing data file makes it incomplete again.
+        std::fs::remove_file(files.dir.join("onnx/vision_encoder_quantized.onnx_data")).unwrap();
+        assert!(!files.is_complete());
+        files.download(&client, &base, &|_, _| {}).await.unwrap();
+        assert!(files.is_complete());
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), wanted.len() + 1);
+        files.remove().unwrap();
+        assert!(!files.is_complete());
+    }
+
+    #[tokio::test]
+    async fn an_onnx_repo_without_a_graph_in_the_format_is_an_error() {
+        let files: Vec<_> = fake_onnx_files()
+            .into_iter()
+            .filter(|(p, _)| !p.starts_with("onnx/vision_encoder_quantized"))
+            .collect();
+        let repo = Arc::new(Repo {
+            files,
+            missing: vec![],
+            fetches: 0.into(),
+            name: ONNX_REPO,
+        });
+        let base = serve(repo).await;
+        let err = ModelFiles::with_backend(temp_dir("onnx-missing"), Backend::Onnx(OnnxDtype::Q8))
+            .remote_bytes(&reqwest::Client::new(), &base)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("onnx/vision_encoder_quantized.onnx"),
+            "{err}"
+        );
+        // The fp32 graphs are all there.
+        let files = ModelFiles::with_backend(temp_dir("onnx-fp32"), Backend::Onnx(OnnxDtype::Fp32));
+        assert!(
+            files
+                .remote_bytes(&reqwest::Client::new(), &base)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

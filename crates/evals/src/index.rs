@@ -282,6 +282,7 @@ impl<'v> EvalIndex<'v> {
             let q = Query {
                 text: text.clone(),
                 vector: vector.clone(),
+                embedder: self.vectors.version().to_string(),
                 scope: scope.clone(),
                 access: None,
                 modalities: Vec::new(),

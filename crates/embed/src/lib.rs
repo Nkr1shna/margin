@@ -1,5 +1,6 @@
-//! Local embeddings for sources: EmbeddingGemma 2 (Core ML) run in-process for text,
-//! images and audio; reading sources (text and code, PDFKit + Vision OCR, ImageIO,
+//! Local embeddings for sources: EmbeddingGemma 2 run in-process for text, images and
+//! audio, on Core ML (macOS) or ONNX Runtime (Linux, and macOS with the `onnx` feature;
+//! `Backend`); reading sources (text and code, PDFKit + Vision OCR, ImageIO,
 //! AVFoundation, FluidAudio speech recognition); chunking; and ranking. See PLAN.md
 //! "Sources and embeddings".
 //!
@@ -8,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub use backend::{Backend, OnnxDtype, UnknownBackend, embedder_version};
 /// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
 pub use transcript::{FLUIDAUDIOCLI, Transcript, Word, find_fluidaudiocli, transcribe};
@@ -16,6 +18,7 @@ pub use transcript::{FLUIDAUDIOCLI, Transcript, Word, find_fluidaudiocli, transc
 mod audio;
 #[cfg(target_os = "macos")]
 mod av;
+mod backend;
 mod chunk;
 #[cfg(target_os = "macos")]
 mod coreml;
@@ -26,6 +29,8 @@ pub mod fake;
 mod image;
 #[cfg(all(test, target_os = "macos"))]
 mod media_tests;
+#[cfg(any(target_os = "linux", feature = "onnx"))]
+pub mod onnx;
 #[cfg(target_os = "macos")]
 mod pdf;
 mod rank;
@@ -33,8 +38,10 @@ mod transcript;
 #[cfg(target_os = "macos")]
 mod vision;
 
-/// Hugging Face repo the model is downloaded from.
+/// Hugging Face repo the Core ML model is downloaded from.
 pub const REPO: &str = "FluidInference/embeddinggemma-2-coreml";
+/// Hugging Face repo the ONNX export is downloaded from.
+pub const ONNX_REPO: &str = "onnx-community/embeddinggemma-2-ONNX";
 /// Default Hugging Face base URL; tests point downloads at a local server instead.
 pub const HF_BASE: &str = "https://huggingface.co";
 /// Embedding size.
@@ -60,9 +67,10 @@ pub const EMBED_BATCH: usize = 64;
 pub const DOCUMENT_PROMPT: &str = "title: none | text: ";
 /// The model's query prompt (`config.json` `prompts.search_query`).
 pub const QUERY_PROMPT: &str = "task: search result | query: ";
-/// The model and the way its inputs are prefixed. Stored on every passage as `embedder`;
-/// rows with another version are embedded again, and recordings are only served for
-/// their own version. Bump it when the prefix rules (`prompt`) or the model change.
+/// The Core ML model and the way its inputs are prefixed
+/// (`Backend::CoreMl.embedder_version()`; each backend has its own,
+/// `Backend::embedder_version`). Stored on every passage as `embedder`; rows with another
+/// version are embedded again, and recordings are only served for their own version.
 pub const EMBEDDER_VERSION: &str = "embeddinggemma-2-coreml/title-prefix-v1";
 /// Sample rate of the audio the audio encoder and the speech recognizer take (mono).
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -151,11 +159,6 @@ pub fn prompt(purpose: &Purpose) -> String {
     render_prompt(DOCUMENT_PROMPT, QUERY_PROMPT, purpose)
 }
 
-/// `EMBEDDER_VERSION`, for the service and the eval runner.
-pub fn embedder_version() -> &'static str {
-    EMBEDDER_VERSION
-}
-
 /// The title a chunk is embedded with: its section path, or the document's name when it
 /// has none (`docs/agent-rag-architecture.md` §2.1).
 pub fn chunk_title(document_name: &str, chunk: &Chunk) -> String {
@@ -239,6 +242,13 @@ pub trait Embedder: Send + Sync {
         }
         Ok(())
     }
+
+    /// The version stamped on what it embeds (`Backend::embedder_version`): rows of
+    /// another version are embedded again, and the dense leg compares only vectors of
+    /// the active one. Fakes keep the Core ML version unless they say otherwise.
+    fn version(&self) -> &str {
+        EMBEDDER_VERSION
+    }
 }
 
 /// Runs `prep` over `inputs` on a second thread while `run` turns each prepared input
@@ -282,21 +292,41 @@ pub(crate) fn pipelined<I: Sync, P: Send>(
     })
 }
 
-/// The downloaded model files in one folder (`data_dir/models/embeddinggemma-2`).
+/// The downloaded model files of one backend in one folder
+/// (`data_dir/models/{Backend::dir_name}`).
 #[derive(Debug, Clone)]
 pub struct ModelFiles {
     pub dir: PathBuf,
+    pub backend: Backend,
 }
 
 impl ModelFiles {
+    /// The Core ML download in `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self::with_backend(dir, Backend::CoreMl)
+    }
+
+    /// `backend`'s download in `dir`.
+    pub fn with_backend(dir: impl Into<PathBuf>, backend: Backend) -> Self {
+        Self {
+            dir: dir.into(),
+            backend,
+        }
     }
 
     /// Whether every file of every part (text, vision, audio) is present: a finished
     /// download.
     pub fn is_complete(&self) -> bool {
-        download::is_complete(&self.dir)
+        download::is_complete(&self.dir, download::Manifest(self.backend))
+    }
+
+    /// Path of an ONNX graph (`"model"`, `"vision_encoder"`, `"audio_encoder"`) of this
+    /// download; `None` for a Core ML download.
+    pub fn graph_path(&self, graph: &str) -> Option<PathBuf> {
+        match self.backend {
+            Backend::Onnx(dtype) => Some(self.dir.join(download::onnx_graph(graph, dtype))),
+            Backend::CoreMl => None,
+        }
     }
 
     /// Bytes on disk for the downloaded files.
@@ -304,15 +334,27 @@ impl ModelFiles {
         download::size_on_disk(&self.dir)
     }
 
-    /// Total bytes a download fetches (from the Hugging Face API), for showing before
-    /// the user starts it.
+    /// Total bytes the Core ML download fetches (from the Hugging Face API), for showing
+    /// before the user starts it. `remote_bytes` asks for this download's backend.
     pub async fn remote_size(client: &reqwest::Client, hf_base: &str) -> Result<u64, EmbedError> {
-        let files = download::remote_files(client, hf_base).await?;
+        ModelFiles::new(PathBuf::new())
+            .remote_bytes(client, hf_base)
+            .await
+    }
+
+    /// Total bytes this backend's download fetches (from the Hugging Face API).
+    pub async fn remote_bytes(
+        &self,
+        client: &reqwest::Client,
+        hf_base: &str,
+    ) -> Result<u64, EmbedError> {
+        let files =
+            download::remote_files(client, hf_base, download::Manifest(self.backend)).await?;
         Ok(files.iter().map(|f| f.size).sum())
     }
 
     /// Downloads every part of the model (the text model, the vision and audio encoders
-    /// and their tables) from `hf_base`/`REPO` (resolve/main) into `dir`, into temporary
+    /// and their tables) from `hf_base`/the backend's repo (resolve/main) into `dir`, into temporary
     /// names first so an interrupted download is never mistaken for a complete one; files
     /// already there from an earlier attempt are kept. `progress(received, total)` is
     /// called as bytes arrive, with one total for everything.
@@ -322,7 +364,14 @@ impl ModelFiles {
         hf_base: &str,
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), EmbedError> {
-        download::download(&self.dir, client, hf_base, progress).await
+        download::download(
+            &self.dir,
+            download::Manifest(self.backend),
+            client,
+            hf_base,
+            progress,
+        )
+        .await
     }
 
     /// Deletes the downloaded files (and the compiled model cache).
@@ -342,6 +391,13 @@ impl CoreMlEmbedder {
     /// `.mlpackage` on first use (cached next to it). The vision and audio encoders load
     /// (and compile) the first time they're needed. Blocking.
     pub fn load(files: &ModelFiles) -> Result<Self, EmbedError> {
+        if files.backend != Backend::CoreMl {
+            return Err(EmbedError::Load(format!(
+                "{} holds the {} model, not Core ML's",
+                files.dir.display(),
+                files.backend
+            )));
+        }
         coreml::Model::load(files).map(CoreMlEmbedder)
     }
 }
@@ -371,6 +427,135 @@ impl Embedder for CoreMlEmbedder {
         on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
     ) -> Result<(), EmbedError> {
         self.0.embed_pipelined(inputs, batch, on_batch)
+    }
+    fn version(&self) -> &str {
+        Backend::CoreMl.embedder_version()
+    }
+}
+
+/// How the ONNX backend runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnnxOptions {
+    /// ONNX Runtime intra-op threads; 0 = one less than the CPUs (at least one).
+    pub threads: usize,
+    /// Most padded tokens (rows × the longest row) in one run of the text graph; clamped
+    /// to `MAX_TOKENS..=8192`.
+    pub batch_tokens: usize,
+}
+
+impl Default for OnnxOptions {
+    fn default() -> Self {
+        Self {
+            threads: 0,
+            batch_tokens: 4096,
+        }
+    }
+}
+
+impl OnnxOptions {
+    /// The thread count to use.
+    pub fn threads(&self) -> usize {
+        if self.threads > 0 {
+            return self.threads;
+        }
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    /// `batch_tokens`, clamped.
+    pub fn batch_tokens(&self) -> usize {
+        self.batch_tokens.clamp(MAX_TOKENS, 8192)
+    }
+}
+
+/// EmbeddingGemma 2 on ONNX Runtime, CPU execution provider (`docs/plan-linux-service.md`
+/// §2.1). Text batches for real; Linux always, macOS with the `onnx` feature.
+#[cfg(any(target_os = "linux", feature = "onnx"))]
+pub struct OnnxEmbedder(onnx::Model);
+
+#[cfg(not(any(target_os = "linux", feature = "onnx")))]
+pub struct OnnxEmbedder(std::convert::Infallible);
+
+impl OnnxEmbedder {
+    /// Loads the tokenizer and the text graph of an ONNX download (`files.backend` names
+    /// the format). The encoders load the first time they're needed. Blocking.
+    #[cfg(any(target_os = "linux", feature = "onnx"))]
+    pub fn load(files: &ModelFiles, opts: &OnnxOptions) -> Result<Self, EmbedError> {
+        onnx::Model::load(files, opts).map(OnnxEmbedder)
+    }
+
+    #[cfg(not(any(target_os = "linux", feature = "onnx")))]
+    pub fn load(_files: &ModelFiles, _opts: &OnnxOptions) -> Result<Self, EmbedError> {
+        Err(EmbedError::Load(
+            "this build has no ONNX runtime (build margin-embed with the onnx feature)".into(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", feature = "onnx"))]
+impl Embedder for OnnxEmbedder {
+    fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed(texts, purpose)
+    }
+    fn count_tokens(&self, text: &str) -> usize {
+        self.0.count_tokens(text)
+    }
+    fn embed_images(
+        &self,
+        images: &[PathBuf],
+        tokens: ImageTokens,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed_images(images, tokens)
+    }
+    fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed_audio(windows)
+    }
+    fn embed_pipelined(
+        &self,
+        inputs: &[(String, Purpose)],
+        batch: usize,
+        on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
+    ) -> Result<(), EmbedError> {
+        self.0.embed_pipelined(inputs, batch, on_batch)
+    }
+    fn version(&self) -> &str {
+        self.0.version()
+    }
+}
+
+/// Loads the embedder `files.backend` names, with default ONNX options: what the
+/// service's `SourceTools::load` calls. An error for a backend this binary wasn't built
+/// with (`Backend::is_built`). Blocking.
+pub fn load_embedder(files: &ModelFiles) -> Result<std::sync::Arc<dyn Embedder>, EmbedError> {
+    load_embedder_with(files, &OnnxOptions::default())
+}
+
+/// `load_embedder` with these ONNX options.
+pub fn load_embedder_with(
+    files: &ModelFiles,
+    opts: &OnnxOptions,
+) -> Result<std::sync::Arc<dyn Embedder>, EmbedError> {
+    if !files.backend.is_built() {
+        return Err(EmbedError::Load(format!(
+            "this build can't run the {} embedder",
+            files.backend
+        )));
+    }
+    match files.backend {
+        #[cfg(target_os = "macos")]
+        Backend::CoreMl => Ok(std::sync::Arc::new(CoreMlEmbedder::load(files)?)),
+        #[cfg(any(target_os = "linux", feature = "onnx"))]
+        Backend::Onnx(_) => Ok(std::sync::Arc::new(OnnxEmbedder::load(files, opts)?)),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = opts;
+            Err(EmbedError::Load(format!(
+                "this build can't run the {} embedder",
+                files.backend
+            )))
+        }
     }
 }
 
@@ -767,7 +952,8 @@ mod tests {
             ..chunk
         };
         assert_eq!(chunk_title("notes.md", &chunk), "A > B");
-        assert_eq!(embedder_version(), EMBEDDER_VERSION);
+        assert_eq!(embedder_version(Backend::CoreMl), EMBEDDER_VERSION);
+        assert_eq!(fake::FakeEmbedder.version(), EMBEDDER_VERSION);
     }
 
     #[test]
