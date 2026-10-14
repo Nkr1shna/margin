@@ -188,6 +188,33 @@ fn tool_path(t: &ToolStatus) -> PathBuf {
     PathBuf::from(t.path.clone().unwrap_or_else(|| t.name.clone()))
 }
 
+/// The program that voices narration: `fluidaudiocli` (Core ML, macOS) or `margin-tts`
+/// (Kyutai's pocket-tts on the CPU, Linux), whichever Settings → Tools found, the
+/// FluidAudio one first. `Err` names the one this OS installs when neither is there.
+pub fn voice_tool(tools: &[ToolStatus]) -> Result<&ToolStatus, &'static str> {
+    tool(tools, "fluidaudiocli")
+        .or_else(|| tool(tools, "margin-tts"))
+        .ok_or(if cfg!(target_os = "macos") {
+            "fluidaudiocli"
+        } else {
+            "margin-tts"
+        })
+}
+
+/// pocket-tts voices whose licence is non-commercial only: never used for a video.
+pub const NON_COMMERCIAL_VOICES: &[&str] = &["cosette", "jean"];
+
+/// Why the voice in Settings can't be used, if it can't.
+pub fn voice_refused(voice: &str) -> Option<String> {
+    let v = voice.trim().to_ascii_lowercase();
+    NON_COMMERCIAL_VOICES.contains(&v.as_str()).then(|| {
+        format!(
+            "The voice \"{}\" is licensed for non-commercial use only. Choose another voice in Settings.",
+            voice.trim()
+        )
+    })
+}
+
 /// Scene code renders under macOS `sandbox-exec` unless the service was started with
 /// `--allow-unsandboxed-render` (development and tests only). Where `sandbox-exec`
 /// isn't available, `margin_video` refuses with `RenderError::Sandbox`.
@@ -224,20 +251,26 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         )
         .await;
     };
-    let Some(fluidaudio) = tool(&tools, "fluidaudiocli") else {
-        return fail(
-            state,
-            id,
-            &RenderError::ToolMissing("fluidaudiocli".into()).to_string(),
-            None,
-        )
-        .await;
+    let fluidaudio = match voice_tool(&tools) {
+        Ok(t) => t,
+        Err(missing) => {
+            return fail(
+                state,
+                id,
+                &RenderError::ToolMissing(missing.into()).to_string(),
+                None,
+            )
+            .await;
+        }
     };
+    let settings = state.settings_row().await?;
+    if let Some(why) = settings.voice.as_deref().and_then(voice_refused) {
+        return fail(state, id, &why, None).await;
+    }
     let ai = match state.route_ai_config(Route::Write).await {
         Ok(ai) => ai,
         Err(e) => return fail(state, id, &e.message, None).await,
     };
-    let settings = state.settings_row().await?;
     let config = RenderConfig {
         manimgx: tool_path(manimgx),
         voice: Voice::PocketTts {
@@ -551,6 +584,37 @@ mod tests {
         assert_eq!(text.lines().count(), LOG_LINES);
         assert!(text.starts_with("line 50\n"));
         assert!(text.ends_with("line 249"));
+    }
+
+    #[test]
+    fn narration_uses_whichever_voice_tool_is_there() {
+        let t = |name: &str, found| ToolStatus {
+            name: name.into(),
+            found,
+            path: Some(format!("/bin/{name}")),
+            version: None,
+            install_commands: Vec::new(),
+        };
+        let both = [t("margin-tts", true), t("fluidaudiocli", true)];
+        assert_eq!(voice_tool(&both).unwrap().name, "fluidaudiocli");
+        let linux = [t("fluidaudiocli", false), t("margin-tts", true)];
+        assert_eq!(voice_tool(&linux).unwrap().name, "margin-tts");
+        let none = [t("margin-tts", false)];
+        assert_eq!(
+            voice_tool(&none).unwrap_err(),
+            if cfg!(target_os = "macos") {
+                "fluidaudiocli"
+            } else {
+                "margin-tts"
+            }
+        );
+        assert!(
+            voice_refused(" Cosette ")
+                .unwrap()
+                .contains("non-commercial")
+        );
+        assert!(voice_refused("jean").is_some());
+        assert_eq!(voice_refused("alba"), None);
     }
 
     #[test]

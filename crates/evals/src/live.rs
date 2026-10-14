@@ -1,8 +1,10 @@
 //! The real things the opt-in runner uses, and only the runner: the OpenAI Responses
-//! and Claude Messages clients with the owner's keys from the service Mac's Keychain,
-//! the Core ML embedder, and PDFKit/Vision extraction. Nothing here runs in tests or
-//! CI: [`guard`] refuses when `CI` (or `MARGIN_EVAL_NO_LIVE`) is set, and every test
-//! drives these clients against local fakes, never a provider.
+//! and Claude Messages clients with the owner's keys from the service's secret store
+//! (the Keychain on a Mac, the secrets file on Linux), the real embedder of either
+//! backend (Core ML on a Mac, ONNX Runtime on Linux or a Mac built with `onnx`), and the
+//! platform's readers (PDFKit/Vision on a Mac, pdfium/tesseract on Linux). Nothing here
+//! runs in tests or CI: [`guard`] refuses when `CI` (or `MARGIN_EVAL_NO_LIVE`) is set,
+//! and every test drives these clients against local fakes, never a provider.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +12,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures_util::StreamExt;
 use margin_ai::{ResponseRequest, ResponsesClient, StreamEvent};
+use margin_embed::Backend;
 use margin_service::engines::BoxFuture;
 use margin_shared::context::TraceUsage;
 use serde::Deserialize;
@@ -17,9 +20,130 @@ use serde_json::{Value, json};
 
 use crate::model::{EvalModel, ModelReply, ModelRequest};
 
-/// The Keychain entries the runner reads (the service's names).
+/// The secrets the runner reads (the service's names).
 pub const OPENAI_KEY: &str = margin_service::secrets::OPENAI_API_KEY;
-pub const ANTHROPIC_KEY: &str = "anthropic-api-key";
+pub const ANTHROPIC_KEY: &str = margin_service::secrets::ANTHROPIC_API_KEY;
+
+/// Picks the embedding backend for a run: `MARGIN_EVAL_EMBEDDER` when set; else the
+/// variant's `embedder` stage when the command runs one (`variant_embedder`); else the
+/// service config's `embedder`. An unknown name, a stage that isn't a backend
+/// (`recorded`, `fake`) or a backend this build can't run is an error that says what to
+/// use instead.
+pub fn live_backend(
+    env: &dyn Fn(&str) -> Option<String>,
+    variant_embedder: Option<&str>,
+    config_embedder: &str,
+) -> anyhow::Result<Backend> {
+    let (name, from) = match env("MARGIN_EVAL_EMBEDDER").filter(|v| !v.trim().is_empty()) {
+        Some(v) => (v, "MARGIN_EVAL_EMBEDDER".to_string()),
+        None => match variant_embedder {
+            Some(v) => (v.to_string(), "the variant's [embedder]".to_string()),
+            None => (
+                config_embedder.to_string(),
+                "the service config's embedder".to_string(),
+            ),
+        },
+    };
+    let backend: Backend = name
+        .parse()
+        .with_context(|| format!("{from} doesn't name an embedding backend"))?;
+    anyhow::ensure!(
+        backend.is_built(),
+        "{from} is {backend}, which this build of margin-eval can't run (here: {}; build \
+         with `--features margin-embed/onnx` for the ONNX backends on macOS)",
+        Backend::default()
+    );
+    Ok(backend)
+}
+
+/// The service's config, or its defaults when there is none (a Mac that only runs evals).
+pub fn service_config() -> anyhow::Result<margin_service::config::Config> {
+    let path = margin_service::config::config_path();
+    if path.exists() {
+        margin_service::config::Config::load(&path)
+    } else {
+        Ok(margin_service::config::Config::default())
+    }
+}
+
+/// The store the service keeps its keys in (`service.toml`'s `secrets`/`secrets_file`).
+pub fn secret_store(
+    config: &margin_service::config::Config,
+) -> anyhow::Result<Arc<dyn margin_service::secrets::SecretStore>> {
+    config.secret_store()
+}
+
+/// The readers `extract_corpus` uses on this OS, as the extraction records them.
+pub fn reader_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "pdfkit+vision"
+    } else {
+        "pdfium+tesseract"
+    }
+}
+
+/// Where the corpus as `reader` read it lives under `evals/`: the Mac readers' at the
+/// original `recorded/extracted.json` (`EXTRACTED_FILE`), others' beside it
+/// (`recorded/extracted-pdfium+tesseract.json`): another OCR engine cuts other chunks.
+pub fn extraction_file(reader: &str) -> PathBuf {
+    if reader == "pdfkit+vision" {
+        PathBuf::from(crate::corpus::EXTRACTED_FILE)
+    } else {
+        PathBuf::from(format!("recorded/extracted-{reader}.json"))
+    }
+}
+
+/// The OS the run is on, for the extraction's record: `macOS 26.1` or the Linux
+/// distribution's name (`Ubuntu 24.04.3 LTS`).
+pub fn os_version() -> String {
+    if cfg!(target_os = "macos") {
+        let v = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "?".into());
+        format!("macOS {v}")
+    } else {
+        std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|t| os_release_name(&t))
+            .unwrap_or_else(|| std::env::consts::OS.to_string())
+    }
+}
+
+/// `PRETTY_NAME` (else `NAME` and `VERSION_ID`) from `/etc/os-release`.
+pub fn os_release_name(text: &str) -> Option<String> {
+    let field = |key: &str| {
+        text.lines().find_map(|l| {
+            let v = l.strip_prefix(key)?.strip_prefix('=')?;
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            (!v.is_empty()).then(|| v.to_string())
+        })
+    };
+    field("PRETTY_NAME").or_else(|| {
+        let name = field("NAME")?;
+        Some(match field("VERSION_ID") {
+            Some(v) => format!("{name} {v}"),
+            None => name,
+        })
+    })
+}
+
+/// Where a backend's recorded vectors live under `evals/`: Core ML's at the original
+/// `recorded/embeddings.bin` (`EMBEDDINGS_FILE`), every other backend's beside it,
+/// named by its version (`recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin`),
+/// so recording one never overwrites another.
+pub fn recording_file(backend: Backend) -> PathBuf {
+    match backend {
+        Backend::CoreMl => PathBuf::from(crate::recorded::EMBEDDINGS_FILE),
+        b => PathBuf::from(format!(
+            "recorded/embeddings-{}.bin",
+            b.embedder_version().replace('/', "+")
+        )),
+    }
+}
 
 /// Refuses to reach a real model or the real embedder in CI or when told not to.
 pub fn guard(env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<()> {
@@ -301,7 +425,7 @@ pub fn models(
         )));
     }
     let writer = writer.context(
-        "no model API key in the Keychain (openai-api-key or anthropic-api-key); set one in Margin's Settings on the service Mac",
+        "no model API key in the service's secret store (openai-api-key or anthropic-api-key); set one in Margin's Settings",
     )?;
     Ok(Models {
         writer,
@@ -315,11 +439,12 @@ pub fn models(
     })
 }
 
-/// The real embedder's vectors: EmbeddingGemma 2 on Core ML, pictures through its
-/// image encoder (a PDF page from the render `extract` wrote under `media`).
-#[cfg(target_os = "macos")]
+/// The real embedder's vectors: EmbeddingGemma 2 on the chosen backend (`live_backend`),
+/// pictures through its image encoder (a PDF page from the render `extract` wrote under
+/// `media`).
 pub struct LiveVectors {
-    pub embedder: margin_embed::CoreMlEmbedder,
+    pub embedder: Arc<dyn margin_embed::Embedder>,
+    pub backend: Backend,
     pub corpus: PathBuf,
     pub media: PathBuf,
 }
@@ -329,40 +454,55 @@ pub fn media_dir(media: &Path, document: &str) -> PathBuf {
     media.join(document.replace('/', "_"))
 }
 
-#[cfg(target_os = "macos")]
+/// The folder `backend`'s model is in: `MARGIN_EMBED_MODEL_DIR` when set, else the
+/// service's (`data_dir/models/<backend folder>`, where Settings and `margin-service
+/// download-model` put it).
+pub fn model_dir(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: &margin_service::config::Config,
+    backend: Backend,
+) -> PathBuf {
+    match env("MARGIN_EMBED_MODEL_DIR").filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => config.data_dir.join("models").join(backend.dir_name()),
+    }
+}
+
 impl LiveVectors {
-    /// Loads the model from `MARGIN_EMBED_MODEL_DIR` or the service's data folder.
-    pub fn load(corpus: &Path, media: &Path) -> anyhow::Result<Self> {
-        let dir = match std::env::var_os("MARGIN_EMBED_MODEL_DIR") {
-            Some(d) if !d.is_empty() => PathBuf::from(d),
-            _ => margin_service::config::Config::load(&margin_service::config::config_path())?
-                .embedding_model_dir(),
-        };
-        let files = margin_embed::ModelFiles::new(&dir);
+    /// Loads `backend`'s model from `model_dir`.
+    pub fn load(
+        corpus: &Path,
+        media: &Path,
+        config: &margin_service::config::Config,
+        backend: Backend,
+    ) -> anyhow::Result<Self> {
+        let dir = model_dir(&|k| std::env::var(k).ok(), config, backend);
+        let files = margin_embed::ModelFiles::with_backend(&dir, backend);
         anyhow::ensure!(
             files.is_complete(),
-            "the embedding model isn't downloaded in {} (download it in Margin's Settings)",
+            "the {} model isn't downloaded in {} (download it in Margin's Settings, or run \
+             `margin-service download-model --embedder {backend}`)",
+            backend.label(),
             dir.display()
         );
         Ok(Self {
-            embedder: margin_embed::CoreMlEmbedder::load(&files)?,
+            embedder: margin_embed::load_embedder(&files)?,
+            backend,
             corpus: corpus.into(),
             media: media.into(),
         })
     }
 }
 
-#[cfg(target_os = "macos")]
 impl crate::recorded::Vectors for LiveVectors {
     fn version(&self) -> &str {
-        crate::recorded::embedder_version()
+        self.embedder.version()
     }
     fn texts(
         &self,
         texts: &[String],
         purpose: &margin_embed::Purpose,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        use margin_embed::Embedder;
         Ok(self.embedder.embed(texts, purpose.clone())?)
     }
     fn picture(
@@ -371,7 +511,6 @@ impl crate::recorded::Vectors for LiveVectors {
         pic: &margin_embed::Picture,
         _text: &str,
     ) -> anyhow::Result<Vec<f32>> {
-        use margin_embed::Embedder;
         let path = match pic.page {
             Some(_) if doc.kind == margin_shared::SourceKind::Pdf => {
                 media_dir(&self.media, &doc.path).join(&pic.path)
@@ -382,8 +521,8 @@ impl crate::recorded::Vectors for LiveVectors {
     }
 }
 
-/// Reads every PDF and image of the corpus with the real readers (PDFKit, Vision OCR,
-/// ImageIO), rendering PDF pages under `media`.
+/// Reads every PDF and image of the corpus with the real readers (PDFKit and Vision OCR
+/// on a Mac, pdfium and tesseract on Linux), rendering PDF pages under `media`.
 pub fn extract_corpus(
     corpus: &Path,
     docs: &[crate::corpus::CorpusDoc],
@@ -441,6 +580,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cargo test -p margin-evals"), "{err}");
+    }
+
+    #[test]
+    fn the_backend_comes_from_the_env_the_variant_or_the_config() {
+        use margin_embed::OnnxDtype;
+        let none = |_: &str| None;
+        let here = Backend::default();
+        // The config's, when nothing else says.
+        assert_eq!(live_backend(&none, None, here.name()).unwrap(), here);
+        // The variant's stage wins over the config.
+        let r = live_backend(&none, Some("onnx-q8"), "coreml");
+        assert_eq!(r.is_ok(), Backend::Onnx(OnnxDtype::Q8).is_built());
+        // The environment wins over both.
+        let env = |k: &str| (k == "MARGIN_EVAL_EMBEDDER").then(|| here.name().to_string());
+        assert_eq!(live_backend(&env, Some("tf"), "tf").unwrap(), here);
+        // Not a backend, or not built here: said plainly.
+        let err = live_backend(&none, Some("recorded"), "coreml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("variant's [embedder]"), "{err}");
+        for b in Backend::ALL.into_iter().filter(|b| !b.is_built()) {
+            let err = live_backend(&none, None, b.name()).unwrap_err().to_string();
+            assert!(err.contains("can't run"), "{err}");
+        }
+    }
+
+    #[test]
+    fn recordings_and_model_folders_are_per_backend() {
+        use margin_embed::OnnxDtype;
+        assert_eq!(
+            recording_file(Backend::CoreMl),
+            PathBuf::from(crate::recorded::EMBEDDINGS_FILE)
+        );
+        assert_eq!(
+            recording_file(Backend::Onnx(OnnxDtype::Q8)),
+            PathBuf::from("recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin")
+        );
+        let c = margin_service::config::Config {
+            data_dir: PathBuf::from("/srv/data"),
+            ..Default::default()
+        };
+        let none = |_: &str| None;
+        assert_eq!(
+            model_dir(&none, &c, Backend::Onnx(OnnxDtype::Q8)),
+            PathBuf::from("/srv/data/models/embeddinggemma-2-onnx-q8")
+        );
+        let env = |k: &str| (k == "MARGIN_EMBED_MODEL_DIR").then(|| "/m".to_string());
+        assert_eq!(model_dir(&env, &c, Backend::CoreMl), PathBuf::from("/m"));
+        assert_eq!(
+            extraction_file("pdfkit+vision"),
+            PathBuf::from(crate::corpus::EXTRACTED_FILE)
+        );
+        assert_eq!(
+            extraction_file("pdfium+tesseract"),
+            PathBuf::from("recorded/extracted-pdfium+tesseract.json")
+        );
+    }
+
+    #[test]
+    fn the_linux_name_comes_from_os_release() {
+        assert_eq!(
+            os_release_name(
+                "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nPRETTY_NAME=\"Ubuntu 24.04.3 LTS\"\n"
+            )
+            .as_deref(),
+            Some("Ubuntu 24.04.3 LTS")
+        );
+        assert_eq!(
+            os_release_name("NAME=Debian\nVERSION_ID='13'\n").as_deref(),
+            Some("Debian 13")
+        );
+        assert_eq!(os_release_name(""), None);
+        assert!(!os_version().is_empty());
+        assert_eq!(
+            reader_name(),
+            if cfg!(target_os = "macos") {
+                "pdfkit+vision"
+            } else {
+                "pdfium+tesseract"
+            }
+        );
     }
 
     #[test]

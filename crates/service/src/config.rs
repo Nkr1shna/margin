@@ -17,9 +17,12 @@ pub const DEFAULT_GITHUB_OAUTH_URL: &str = "https://github.com";
 pub const DEFAULT_ENVIRONMENT: &str = "prod";
 /// The deploy environments (`docs/plan-deploy.md` §1); `GET /api/version` reports it.
 pub const ENVIRONMENTS: [&str; 2] = ["dev", "prod"];
-/// Where secrets are kept (`docs/plan-linux-service.md` §2.8): the login Keychain, or
-/// 0600 files under `data_dir/secrets` (a headless Linux service has no unlocked keyring).
+/// Where secrets are kept (`docs/plan-linux-service.md` §2.8): the login Keychain, or a
+/// 0600 file (`secrets::FileStore`; a headless Linux service has no unlocked keyring).
 pub const SECRET_STORES: [&str; 2] = ["keychain", "file"];
+/// The secrets file `secrets = "file"` uses when `secrets_file` isn't set: beside the
+/// data folder, not in it, so backups of the data folder never copy keys.
+pub const SECRETS_FILE: &str = "secrets.toml";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -46,10 +49,17 @@ pub struct Config {
     /// `"onnx-fp32"`, `"onnx-fp16"`). Default: Core ML on macOS, ONNX 8-bit elsewhere.
     #[serde(default = "default_embedder")]
     pub embedder: String,
-    /// `"keychain"` or `"file"` (`SECRET_STORES`). Default: the Keychain on macOS, files
-    /// elsewhere.
+    /// `"keychain"` or `"file"` (`SECRET_STORES`). Default: the Keychain on macOS, the
+    /// file elsewhere.
     #[serde(default = "default_secrets")]
     pub secrets: String,
+    /// The secrets file (`secrets::FileStore`, a 0600 TOML file of `name = "value"`
+    /// lines). Setting it means the file store whatever `secrets` says: the dev and prod
+    /// VMs set it to a file on the persistent share, which the deploy jobs fill from
+    /// GitHub Environment secrets. Unset, `secrets = "file"` uses `SECRETS_FILE` beside
+    /// `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_file: Option<PathBuf>,
 }
 
 fn default_public_url() -> String {
@@ -84,21 +94,42 @@ fn default_data_dir() -> PathBuf {
     app_support_dir().join("data")
 }
 
-/// `~/Library/Application Support/Margin`.
+/// The service's own folder: `~/Library/Application Support/Margin` on macOS,
+/// `/var/lib/margin` elsewhere (the systemd service's state directory). The data folder
+/// is `data` inside it, the secrets file sits beside that.
 pub fn app_support_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library")
-        .join("Application Support")
-        .join("Margin")
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join("Library")
+            .join("Application Support")
+            .join("Margin")
+    } else {
+        PathBuf::from(LINUX_STATE_DIR)
+    }
 }
 
-/// `MARGIN_CONFIG`, or `~/Library/Application Support/Margin/service.toml`.
+/// Where a Linux service keeps its data (`app_support_dir`).
+pub const LINUX_STATE_DIR: &str = "/var/lib/margin";
+/// Where a Linux service's config is (`config_path`).
+pub const LINUX_CONFIG_PATH: &str = "/etc/margin/service.toml";
+
+/// `MARGIN_CONFIG`, or the per-OS default: `~/Library/Application
+/// Support/Margin/service.toml` on macOS, `/etc/margin/service.toml` elsewhere.
 pub fn config_path() -> PathBuf {
     match std::env::var_os("MARGIN_CONFIG") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => app_support_dir().join("service.toml"),
+        _ => default_config_path(),
+    }
+}
+
+/// `config_path` without `MARGIN_CONFIG`.
+pub fn default_config_path() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        app_support_dir().join("service.toml")
+    } else {
+        PathBuf::from(LINUX_CONFIG_PATH)
     }
 }
 
@@ -115,6 +146,7 @@ impl Default for Config {
             environment: default_environment(),
             embedder: default_embedder(),
             secrets: default_secrets(),
+            secrets_file: None,
         }
     }
 }
@@ -188,12 +220,7 @@ impl Config {
             );
         }
         self.embedder_backend()?;
-        if !SECRET_STORES.contains(&self.secrets.as_str()) {
-            bail!(
-                "secrets is \"{}\"; it must be \"keychain\" or \"file\"",
-                self.secrets
-            );
-        }
+        self.secrets_path()?;
         for (name, url) in [
             ("public_url", &self.public_url),
             ("github_api_url", &self.github_api_url),
@@ -204,6 +231,31 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The secrets file when secrets are kept in a file (`secrets_file`, else
+    /// `SECRETS_FILE` beside `data_dir`), `None` for the Keychain; an error for an unknown
+    /// `secrets`.
+    pub fn secrets_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(file) = &self.secrets_file {
+            return Ok(Some(file.clone()));
+        }
+        match self.secrets.as_str() {
+            "keychain" => Ok(None),
+            "file" => {
+                let beside = match self.data_dir.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => self.data_dir.clone(),
+                };
+                Ok(Some(beside.join(SECRETS_FILE)))
+            }
+            other => bail!("secrets is \"{other}\"; it must be \"keychain\" or \"file\""),
+        }
+    }
+
+    /// The secret store this config names (`secrets::open_store`).
+    pub fn secret_store(&self) -> anyhow::Result<std::sync::Arc<dyn SecretStore>> {
+        crate::secrets::open_store(self)
     }
 
     pub fn db_dir(&self) -> PathBuf {
@@ -242,15 +294,18 @@ impl Config {
 }
 
 /// `margin-service setup`: asks for the environment (dev or prod), the public URL, the
-/// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret in the Keychain and writes
-/// the config file.
-pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
+/// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret
+/// in the store the config names (`secrets`/`secrets_file`: the Keychain by default on
+/// macOS, the secrets file elsewhere) and writes the config file.
+pub fn run_setup(path: &Path) -> anyhow::Result<()> {
     let existing = if path.exists() {
         Config::load(path).ok()
     } else {
         None
     };
     let mut config = existing.clone().unwrap_or_default();
+    let store = config.secret_store()?;
+    let secrets: &dyn SecretStore = &*store;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
 
@@ -283,7 +338,7 @@ pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
         let secret = ask_hidden(&mut input, prompt)?;
         if !secret.is_empty() {
             secrets.set(GITHUB_CLIENT_SECRET, &secret)?;
-            println!("  Stored in the Keychain.");
+            println!("  Stored in {}.", secrets.location());
             break;
         }
         if has_secret {
@@ -423,6 +478,33 @@ mod tests {
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paths_default_per_os() {
+        let data = default_data_dir();
+        assert!(data.ends_with("data"));
+        if cfg!(target_os = "macos") {
+            // Unchanged on the Mac.
+            assert!(
+                data.to_string_lossy()
+                    .ends_with("Library/Application Support/Margin/data")
+            );
+            assert!(
+                default_config_path()
+                    .to_string_lossy()
+                    .ends_with("Library/Application Support/Margin/service.toml")
+            );
+        } else {
+            assert_eq!(data, Path::new("/var/lib/margin/data"));
+            assert_eq!(default_config_path(), Path::new("/etc/margin/service.toml"));
+            // The secrets file: /var/lib/margin/secrets.toml, outside the backed-up data.
+            let c = Config::default();
+            assert_eq!(
+                c.secrets_path().unwrap().unwrap(),
+                Path::new("/var/lib/margin/secrets.toml")
+            );
+        }
     }
 
     #[test]

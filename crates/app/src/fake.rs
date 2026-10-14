@@ -4114,7 +4114,7 @@ async fn make_video_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &
         return;
     };
     let answer = format!(
-        "The video of **{}** is on its way: the scene is written, voiced and rendered on the service Mac. The card follows it.",
+        "The video of **{}** is on its way: the scene is written, voiced and rendered on the service. The card follows it.",
         lesson.title
     );
     result_and_answer(

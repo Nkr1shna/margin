@@ -520,7 +520,7 @@ impl App {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 "no_api_key",
-                "Add an OpenAI API key in Settings → AI provider first. It's stored in the service Mac's Keychain and never sent back.",
+                "Add an OpenAI API key in Settings → AI provider first. It's kept in the service's secret store and never sent back.",
             ));
         };
         if model.trim().is_empty() {

@@ -1,4 +1,4 @@
-//! Settings (the API key goes to the Keychain and never comes back) and tool status.
+//! Settings (the API key goes to the secret store and never comes back) and tool status.
 
 use axum::Json;
 use axum::extract::State;

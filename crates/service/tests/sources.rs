@@ -1025,6 +1025,64 @@ async fn sources_become_documents_with_located_passages_in_the_default_project()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_new_embedder_re_embeds_every_document_once_keeping_its_passages() {
+    use margin_service::ingest::{EMBEDDER_MIGRATION_PREFIX, embedder_migration, reembed};
+    use margin_service::state::SETTINGS_ID;
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
+    wait_source(&h, &t, &s.id, is_ready).await;
+    let before = h.state.store.passages_of(&s.id).await.unwrap();
+    // The worker's first start recorded the configured embedder.
+    let marker = embedder_migration(h.state.model_files.backend.embedder_version());
+    let settings = h.state.settings_row().await.unwrap();
+    assert!(
+        settings.migrations.contains(&marker),
+        "{:?}",
+        settings.migrations
+    );
+
+    // As if written by another backend: other vectors, another version, and the pass
+    // not yet run for this one.
+    let older: Vec<PassageRow> = before
+        .iter()
+        .map(|r| PassageRow {
+            embedder: "older-embedder".into(),
+            vector: vec![0.5; r.vector.len()],
+            ..r.clone()
+        })
+        .collect();
+    h.state.store.rewrite_vectors(&older).await.unwrap();
+    let mut row = h.state.settings_row().await.unwrap();
+    row.migrations
+        .retain(|m| !m.starts_with(EMBEDDER_MIGRATION_PREFIX));
+    row.migrations.push(embedder_migration("older-embedder"));
+    h.state
+        .store
+        .put(db::SETTINGS, SETTINGS_ID, &row)
+        .await
+        .unwrap();
+    assert!(h.state.store.passages_of(&s.id).await.unwrap()[0].embedder == "older-embedder");
+
+    reembed(&h.state).await.unwrap();
+    let after = h.state.store.passages_of(&s.id).await.unwrap();
+    // Same rows (ids, texts, places), the current model's vectors and version again.
+    assert_eq!(after, before);
+    let migrations = h.state.settings_row().await.unwrap().migrations;
+    assert!(migrations.contains(&marker));
+    assert!(!migrations.contains(&embedder_migration("older-embedder")));
+    assert_eq!(
+        document(&h, &s.id).await.status,
+        DocumentStatus::Ready { passages: 3 }
+    );
+
+    // Done once: a second call reads nothing.
+    let extracts = h.source_tools.extracts.load(Ordering::SeqCst);
+    reembed(&h.state).await.unwrap();
+    assert_eq!(h.source_tools.extracts.load(Ordering::SeqCst), extracts);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn reading_again_embeds_only_what_changed_and_moves_the_generation() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
@@ -1569,7 +1627,14 @@ async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows(
     .await;
     let t = h.sign_in("Mac").await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(h.state.settings_row().await.unwrap().migrations.is_empty());
+    assert!(
+        !h.state
+            .settings_row()
+            .await
+            .unwrap()
+            .migrations
+            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
+    );
     assert!(h.state.store.table_exists(db::CHUNK).await.unwrap());
     assert!(h.state.store.passages_of("s-a").await.unwrap().is_empty());
     // The old rows still answer, as passages without a document.

@@ -1,6 +1,6 @@
 //! Settings: service, account and devices, AI provider and key, the three model slots
 //! and the retrieval pipeline's stages and budget, the embedding model for sources, voice, render
-//! size, tools on the service Mac, trace retention, and appearance.
+//! size, tools on the service, trace retention, and appearance.
 
 use dioxus::prelude::*;
 use margin_shared::pipeline::{
@@ -261,7 +261,7 @@ fn ServiceSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Service" }
-            p { class: "help", "Where your library lives: the Margin service on the service Mac." }
+            p { class: "help", "Where your library lives: the Margin service." }
             if *editing.read() {
                 form {
                     style: "display: grid; gap: 14px",
@@ -698,11 +698,11 @@ fn AiSection(settings: Settings) -> Element {
                             button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                         }
                     }
-                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the service Mac's Keychain. It is never shown again." }
+                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its secret store (the Keychain on a Mac, a private file on Linux). It is never shown again." }
                 } else {
                     div { class: "key-saved",
                         Icon { name: "check" }
-                        span { class: "grow", style: "white-space: normal", "Saved in the service Mac's Keychain" }
+                        span { class: "grow", style: "white-space: normal", "Saved in the service's secret store" }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| replacing.set(true), "Replace" }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                     }
@@ -715,7 +715,7 @@ fn AiSection(settings: Settings) -> Element {
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the API key?",
-                message: "The key is deleted from the service Mac's Keychain. Asking and generating stop working until you add a key again.",
+                message: "The key is deleted from the service's secret store. Asking and generating stop working until you add a key again.",
                 confirm_label: "Remove key",
                 busy: *key_busy.read(),
                 on_cancel: move |_| confirm_remove.set(false),
@@ -1604,13 +1604,15 @@ fn SourcesSection() -> Element {
         section { class: "set-sec",
             h2 { "Embedding model" }
             p { class: "help",
-                "EmbeddingGemma 2 runs on the service Mac. It reads your sources ({SOURCE_KINDS}) and finds the passages, pages, pictures and clips that outlines and lessons draw on."
+                "EmbeddingGemma 2 runs on the service. It reads your sources ({SOURCE_KINDS}) and finds the passages, pages, pictures and clips that outlines and lessons draw on."
             }
             match (model, load.read().clone()) {
                 (Some(model), _) => rsx! {
                     div { class: "kv",
                         span { "Model" }
                         span { class: "mono", "{model.repo}" }
+                        span { "Runs on" }
+                        span { {model_runtime(&model.repo)} }
                         span { "Parts" }
                         span { "Text, image and audio encoders" }
                         span { "Status" }
@@ -1666,7 +1668,7 @@ fn SourcesSection() -> Element {
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the embedding model?",
-                message: "Its files are deleted from the service Mac. New sources wait in the queue until you download it again.",
+                message: "Its files are deleted from the service. New sources wait in the queue until you download it again.",
                 confirm_label: "Remove model",
                 busy: *busy.read(),
                 on_cancel: move |_| confirm_remove.set(false),
@@ -2313,7 +2315,7 @@ fn ToolsSection() -> Element {
     rsx! {
         section { class: "set-sec",
             div { class: "set-sec-head",
-                h2 { "Tools on the service Mac" }
+                h2 { "Tools on the service" }
                 button {
                     class: "btn btn-ghost btn-sm",
                     onclick: move |_| tools.restart(),
@@ -2321,7 +2323,7 @@ fn ToolsSection() -> Element {
                     "Check again"
                 }
             }
-            p { class: "help", "ManimGX renders videos. The FluidAudio CLI (fluidaudiocli) voices their narration and transcribes audio and video sources; without it, recordings are read without a transcript. Both run on the service Mac, and Margin never installs them for you." }
+            p { class: "help", "The programs the service runs to render videos, voice their narration and read sources. Each one says what it does; a missing one turns off only that part. They run on the service machine, and Margin never installs them for you." }
             match list {
                 None => rsx! { div { class: "skel", style: "width: 50%" } },
                 Some(Err(err)) => rsx! { ErrorNotice { message: err, on_retry: move |_| tools.restart() } },
@@ -2337,12 +2339,45 @@ fn ToolsSection() -> Element {
     }
 }
 
+/// The runtime the service's embedding model repo is for: the Core ML conversion runs on
+/// a Mac's Neural Engine, the ONNX export on the CPU with ONNX Runtime (a Linux service).
+fn model_runtime(repo: &str) -> &'static str {
+    if repo.to_ascii_lowercase().contains("onnx") {
+        "ONNX Runtime, on the CPU"
+    } else {
+        "Core ML, on the Neural Engine and GPU"
+    }
+}
+
+/// What a tool the service reports (Settings → Tools) is for, by its name.
+fn tool_purpose(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "manimgx" => "Renders lesson videos.",
+        "fluidaudiocli" => {
+            "Voices video narration and transcribes audio and video sources; without it, recordings are read without a transcript."
+        }
+        "margin-tts" => "Voices video narration.",
+        "tesseract" => {
+            "Reads text in images and scanned PDF pages; without it, they are read without their text."
+        }
+        "ffmpeg" => {
+            "Reads the sound and frames of audio and video sources (with ffprobe, from the same package)."
+        }
+        "bwrap" => {
+            "Runs the scene code of a video in a sandbox with no network; without it, videos don't render."
+        }
+        "pdfium" => "Reads PDF text and draws PDF pages.",
+        _ => return None,
+    })
+}
+
 #[component]
 fn ToolRow(tool: ToolStatus) -> Element {
     let mut copied = use_signal(|| None::<Result<(), String>>);
     // Bumped per copy, so only the latest one's timer resets the label.
     let mut copies = use_signal(|| 0u64);
     let commands = tool.install_commands.join("\n");
+    let purpose = tool_purpose(&tool.name);
     rsx! {
         div { class: "tool",
             div { class: "tool-h",
@@ -2358,8 +2393,11 @@ fn ToolRow(tool: ToolStatus) -> Element {
                     }
                 }
             }
+            if let Some(purpose) = purpose {
+                span { class: "muted", style: "font-size: 13px", "{purpose}" }
+            }
             if !tool.found && !tool.install_commands.is_empty() {
-                span { class: "muted", style: "font-size: 13px", "Install it on the service Mac with:" }
+                span { class: "muted", style: "font-size: 13px", "Install it on the service machine with:" }
                 div { class: "copy-wrap",
                     pre { class: "code", style: "padding-right: 90px", code { "{commands}" } }
                     button {

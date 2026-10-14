@@ -766,6 +766,51 @@ impl Store {
         Ok(())
     }
 
+    /// The inverse of `update_passages`: rewrites the vector and embedder (and the place
+    /// in the document) of up to `INSERT_MANY_MAX` stored passages (by `id`) whose text
+    /// and hash are unchanged, for a re-embed with another embedder version. The
+    /// passages keep their ids, so they never leave the index while it runs.
+    pub async fn rewrite_vectors(&self, rows: &[PassageRow]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            rows.len() <= INSERT_MANY_MAX,
+            "rewrite_vectors takes at most {INSERT_MANY_MAX} rows, not {}",
+            rows.len()
+        );
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.query_rows::<serde_json::Value>(
+            "FOR $r IN $rows { UPDATE type::record('passage', $r.id) SET \
+               vector = $r.vector, embedder = $r.embedder, \
+               project_id = $r.project_id, origin = $r.origin, scope_ids = $r.scope_ids, \
+               access = $r.access, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
+               page = $r.page, start_line = $r.start_line, end_line = $r.end_line, \
+               start_ms = $r.start_ms, end_ms = $r.end_ms, section_path = $r.section_path, \
+               file = $r.file RETURN NONE; };",
+            vec![("rows", serde_json::to_value(rows)?)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The documents with a passage whose `embedder` isn't `version`.
+    pub async fn documents_with_other_embedder(
+        &self,
+        version: &str,
+    ) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            document_id: String,
+        }
+        let rows: Vec<Row> = self
+            .query_rows(
+                "SELECT document_id FROM passage WHERE embedder != $e GROUP BY document_id",
+                vec![("e", serde_json::json!(version))],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| r.document_id).collect())
+    }
+
     /// Adds `scope_id` to the `scope_ids` of every passage of a document.
     pub async fn add_passage_scope(&self, document_id: &str, scope_id: &str) -> anyhow::Result<()> {
         self.query_rows::<serde_json::Value>(
