@@ -173,6 +173,7 @@ pub async fn run_turn(deps: TurnDeps<'_>, input: TurnInput) -> TurnOutcome {
                     ChatItemKind::Error {
                         message: error.clone(),
                         retryable: true,
+                        code: None,
                     },
                     ItemRecord::default(),
                 )
@@ -497,6 +498,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 ChatItemKind::Error {
                     message: error.clone(),
                     retryable,
+                    code: None,
                 },
                 ItemRecord::default(),
             )

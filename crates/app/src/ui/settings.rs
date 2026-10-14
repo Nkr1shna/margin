@@ -653,10 +653,12 @@ fn AiSection(settings: Settings) -> Element {
 /// How hard the agent thinks, in words.
 pub fn effort_label(effort: ReasoningEffort) -> &'static str {
     match effort {
-        ReasoningEffort::Minimal => "Minimal",
-        ReasoningEffort::Low => "Low",
+        // An older build's "minimal" is sent as low.
+        ReasoningEffort::Minimal | ReasoningEffort::Low => "Low",
         ReasoningEffort::Medium => "Medium",
         ReasoningEffort::High => "High",
+        ReasoningEffort::XHigh => "XHigh",
+        ReasoningEffort::Max => "Max",
     }
 }
 

@@ -227,11 +227,13 @@ mod tests {
         let chat = |title: &str| margin_shared::Chat {
             id: "c1".into(),
             title: title.into(),
+            title_by: Default::default(),
             state: margin_shared::ChatState::Idle,
             workspace_ids: vec![],
             source_ids: vec![],
             pending: None,
             usage: Default::default(),
+            waiting: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

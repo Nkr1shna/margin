@@ -34,7 +34,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 |---|---|---|---|---|
 | **1 Chat foundation** | `stream_response` with every `StreamEvent`, HTTP errors with `retry_after` | `run_turn` (steps, streaming into items, parallel Read calls, retries, step cap, budgets), `replay_input`, `unanswered_calls`, `user_message_input`, `system_prompt`, `strict_schema`, `Typed`, `truncate_output` | `chats` routes and storage, `turns` (start, run, stop, continue, pending, recovery, `ServiceSink`), Read tools, settings fields, `Generator::agent_model` | Ask screen becomes the chat (composer, transcript, streaming text, tool rows with on-demand output, Stop, Continue/Retry, pending message with cancel), Chats in the sidebar (New chat button; rename/delete by right-click/⋯ and long press), Settings: agent model + reasoning effort |
 | **2 Courses through the agent** | — | Confirmation parking (`wait_for_decision`), Write/Destructive ordering | Write and Destructive tools, `propose_course` + `accept_proposal`, `decide`, `AcceptProposal.chips`, `Proposal.chat_id` + Action on accept, Q2 provenance; remove `POST /api/ask` and the proposal job | Outline card (the existing outline editor with chips, Create lessons), result cards, confirmation cards (Approve/Deny from any device); remove the old Ask composer and `Api::ask` |
-| **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text` | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar) |
+| **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
 | **4 Folders** | — | Folder device tools | `workspaces` routes, folder tools allowed only with workspaces, folder-file citations (Q4: `Citation.file`, passages read through the device), folder context in `propose_course` | 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: Attach folder, handle storage, the four folder tools with the rules in `margin_shared::device`, Folders pane in Settings, "Attached: … on … · online/offline", stale/revoked handling, opening folder-file citations |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
 
@@ -48,16 +48,24 @@ of tools, so a search tool can be added later.
 
 All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
 
-- `Chat { id, title, state: ChatState, workspace_ids, source_ids, pending, usage, … }`.
+- `Chat { id, title, title_by: TitleSource, state: ChatState, workspace_ids, source_ids,
+  pending, usage, waiting: Option<Waiting { until, reason }>, … }`.
   `ChatState`: `Idle | Running { turn_id, device_id, started_at } | WaitingForUser {
   turn_id, device_id, item_id } | Interrupted { turn_id } | Failed { turn_id, error }`.
 - `ChatItem { id, chat_id, turn_id, seq, status: InProgress|Done|Cancelled, … , kind }`,
   kinds `UserMessage`, `AssistantText`, `Reasoning`, `ToolCall`, `ToolResult`, `Card`,
-  `Action`, `Error` (flattened, tag `kind`).
+  `Action`, `Error { message, retryable, code: Option<String> }` (flattened, tag `kind`).
+  `code` is one of `margin_shared::error_code`: `no_api_key`, `no_model`,
+  `rate_limited`, `server_error`, `network`, `context_too_long`, `incomplete`,
+  `bad_request`, `storage`, `interrupted` (`None` on items from older builds).
 - `Card`: `Outline { proposal_id }`, `Result { target, title }`, `Passages { query,
   passages }`, `Confirmation { tool, title, detail, approve_label, decision }`.
 - `Workspace`, `NewWorkspace`, `Platform`; `Device.online`; `Settings.reasoning_effort`
-  and `Settings.agent_model` (+ patch fields); `Proposal.chat_id`; `AcceptProposal.chips`.
+  and `Settings.agent_model` (+ patch fields); `Proposal.chat_id`; `AcceptProposal.chips`;
+  `ProposalStatus::Superseded { by }` (§5).
+- `ReasoningEffort::ALL` = Low, Medium, High, XHigh, Max (sent as `low`, `medium`,
+  `high`, `xhigh`, `max`), default Medium. A hidden `Minimal` exists only so settings
+  stored by an older build still parse; it is sent as `low` and Settings never offers it.
 - Events: `ChatChanged`, `ChatDeleted`, `ChatItemChanged`, `ChatItemDelta { offset }`,
   `WorkspaceChanged`, `WorkspaceDeleted`, `DeviceChanged`, `DeviceDeleted`.
 - Socket frames: `ServerFrame = Event | DirectedFrame { ToolRequest | ToolCancel }`
@@ -70,8 +78,16 @@ Service storage (`db.rs`): table `chat` holds `Chat`; `chat_item` holds
 `chats::StoredChatItem { item, model_items, full_output }` keyed by item id (query by
 `chat_id`); `workspace` holds `Workspace`. No migration of existing data.
 
-Title: set from the first message, its first line cut to `CHAT_TITLE_MAX` (60)
-characters, until renamed.
+Title (owner decision): set from the first message, its first line cut to
+`CHAT_TITLE_MAX` (60) characters (`title_by: FirstLine`; the app shows it in placeholder
+style). After the chat's first `Finished` turn, while `title_by` is still `FirstLine`,
+`turns` spawns a side task: one `ModelClient::stream` call, no tools, reasoning effort
+low, at most 30 output tokens, given the first user message and the final answer text
+("at most 6 words, no quotes"); the reply, trimmed and cut to `CHAT_TITLE_MAX`, is
+stored with `title_by: Model` → `ChatChanged`. It is not a tool and is not stored as an
+item. If the call fails (or a `ScriptedModel` has no reply left), it logs and the
+first-line title stays. `PATCH /api/chats/{id}` with a title sets `title_by: Owner`; the
+model never replaces an `Owner` title. The sidebar's new-chat row stays "New chat".
 
 ## 4. Lifecycle of a turn
 
@@ -89,13 +105,15 @@ characters, until renamed.
    `source_ids` += the message's → `ChatChanged`.
 3. Spawn `turns::run`; answer `MessageSent { chat, item: Some(user item) }`.
 
-On a busy chat (Running, WaitingForUser) the message becomes `chat.pending` →
+On a busy chat (Running, WaitingForUser — owner decision: a message sent while a
+confirmation is pending is queued too) the message becomes `chat.pending` →
 `ChatChanged`; answer `MessageSent { item: None }`; 409 `already_pending` if one exists.
 
 `turns::run` waits for one of `MAX_CONCURRENT_TURNS` (2) slots (the chat already shows
 Running; a turn waiting on a confirmation lets its slot go and takes one again once
 answered), loads the AI config (a missing key or model ends the turn like a failed model
-call: Error item with the `no_api_key`/`no_model` message, `retryable: true`), builds
+call: Error item with the `no_api_key`/`no_model` message and that `code`,
+`retryable: true`), builds
 `TurnInput` (agent model = `Settings.agent_model` else `openai_model`; reasoning effort;
 `history = replay_input(items)`; the chat's workspaces) and calls `run_turn` with
 `TurnDeps { model: generator.agent_model(ai), tools, sink: ServiceSink, devices:
@@ -175,7 +193,7 @@ gives `msg`.
 - Finished → service: `Idle` → `ChatChanged`; then the pending message, if any, starts
   the next turn exactly as in 4.1 (`pending = None` in the same `ChatChanged` as
   `Running`).
-- Failed → the loop already stored `Error { message, retryable }` → `ChatItemChanged`;
+- Failed → the loop already stored `Error { message, retryable, code }` → `ChatItemChanged`;
   service: `Failed { turn_id, error }` → `ChatChanged`; then the pending message, if
   any, starts the next turn (the Error item stays; Retry is offered only while the chat is
   `Failed`).
@@ -184,18 +202,26 @@ gives `msg`.
 
 - `stream()` returning `Err(e)` with `e.is_retryable()` (429, 5xx, network), or a
   stream ending in a retryable `Err` **before any `OutputItemAdded` of this attempt**:
-  wait `retry_after` if given, else `base_delay · 2^n`, either capped at `max_delay`
-  (`RetryPolicy::delay`; `margin_ai::Backoff` uses the same rule); retry up to `retries`
-  (3) times. Then fail.
+  wait `retry_after` if given, **uncapped** (owner decision: honoured as the server asks;
+  plus 0–1 s of jitter), else `base_delay · 2^n` capped at `max_delay`
+  (`RetryPolicy::delay`); retry up to `retries` (3) times. Then fail.
+- Before every such wait the loop calls `sink.retrying(until, reason)`: the service sets
+  `Chat.waiting = Some(Waiting { until, reason })` → `ChatChanged`, and the chat shows
+  it's waiting (until when, why, with Stop). When the wait ends the loop calls
+  `sink.clear_waiting()` (`waiting = None` → `ChatChanged`); the service also clears it
+  when the turn ends in any way (finished, failed, stopped, restart).
 - Anything after output started, `Failed`/`Error` events, non-retryable errors: no retry.
   Items of the attempt still `InProgress` → `update_item(Cancelled)` (no model items);
   each completed `function_call` of the attempt gets `ToolResult { ok: false, summary:
   "Not run" }` with output `{"error":"Not run: the response failed before it
   finished."}`; then the Error item (`retryable` = whether Continue may help: true for
   retryable errors that ran out of retries, `Incomplete`, network; false for 4xx other
-  than 429).
-- `Incomplete { reason }` (e.g. output token limit): items done so far are kept; Error
-  "The answer was cut off (…)" `retryable: true`.
+  than 429; `code` from `error_code`: `rate_limited`, `server_error`, `network`,
+  `context_too_long`, `incomplete`, `bad_request`, … — every Error the loop or the
+  service stores carries one).
+- `Incomplete { reason }` (`max_output_tokens`, `max_messages`, `content_filter`,
+  `steered`): items done so far are kept; Error "The answer was cut off (…)"
+  `retryable: true`, code `incomplete`.
 - A `SinkError` ends the turn as `Failed { error }` (the Error item is attempted; if
   storing it fails too, the service still sets `Failed`). After a `SinkError` or a panic
   the service first finishes what the turn left: `InProgress` items → `Cancelled`, each
@@ -208,14 +234,25 @@ gives `msg`.
 `turns::stop` under `write_lock`:
 
 1. Abort the task (`run_turn` is cancel-safe; pending `DeviceBridge` calls send
-   `ToolCancel`). Jobs started by tools (lessons, videos) carry on.
-2. Items of the turn still `InProgress` → `Cancelled` → `ChatItemChanged` each.
-3. For every `unanswered_calls` entry: `ToolResult { ok: false, summary: "Cancelled" }`
-   with `cancelled_call_output` → `ChatItemChanged`. A pending confirmation card →
-   `Denied { device_id, by_stop: true }` → `ChatItemChanged`.
-4. `Action { text: "Stopped by the owner." }` with `model_items: [action_input(text)]`
+   `ToolCancel`). Jobs started by tools (lessons, videos) carry on, and so do library
+   changes a Write tool already started: `agent_tools::to_the_end` registers each one
+   with `Turns::register_write(chat_id, call_id, handle)` before it runs.
+2. `Turns::take_writes(chat_id)` and await those handles, bounded (15 s in all). Each
+   that finished is recorded with its **real** result: `ToolResult { ok, summary }` with
+   its output → `ChatItemChanged`, the `ToolCall` → `Done`, its cards → `ChatItemChanged`
+   (so the model doesn't make the change again). One that doesn't finish in time:
+   `ToolResult { ok: false, summary: "Stopped" }` with output `{"error":"Stopped before
+   this change was confirmed; check whether it took effect."}`. (A write parked on a
+   confirmation never started; it is handled in step 4.) Whatever way a turn ends, the
+   service takes the chat's registered writes, so none outlive the turn.
+3. Items of the turn still `InProgress` → `Cancelled` → `ChatItemChanged` each.
+4. For every remaining `unanswered_calls` entry: `ToolResult { ok: false, summary:
+   "Cancelled" }` with `cancelled_call_output` → `ChatItemChanged`. A pending
+   confirmation card → `Denied { device_id, by_stop: true }` → `ChatItemChanged`.
+5. `Action { text: "Stopped by the owner." }` with `model_items: [action_input(text)]`
    → `ChatItemChanged`.
-5. `Idle` → `ChatChanged`; then the pending message, if any, starts the next turn.
+6. `Idle` (and `waiting: None`) → `ChatChanged`; then the pending message, if any,
+   starts the next turn.
 
 ### 4.7 Continue
 
@@ -246,7 +283,7 @@ answering."`. No events (nobody is connected yet).
 
 ### 4.10 Delete
 
-`DELETE /api/chats/{id}`: stop a busy turn (steps 1–3 of Stop, without the Action or the
+`DELETE /api/chats/{id}`: stop a busy turn (steps 1–4 of Stop, without the Action or the
 pending message), delete items, delete sources whose only attachment is this chat
 (`topic_id == None` and no other chat lists them), → `ChatDeleted`.
 
@@ -259,7 +296,7 @@ outputs, so nothing sits between a call and its output. What stores which model 
 
 | Item | model_items |
 |---|---|
-| `UserMessage` | `user_message_input(text, ctx)`: a developer context message (date, device, attached folders with online state, attached files with ids and statuses; names only as JSON strings marked as data, no warning or error text) then the user message. Built once, so replays are byte-identical and cache-friendly. |
+| `UserMessage` | `user_message_input(text, ctx)`: one user-role message whose first `input_text` part is the context (date, device, attached folders with online state, attached files with ids and statuses; names only as JSON strings marked as data, no warning or error text) and whose second part is what the owner typed. The context is in the user role, not a developer message, because developer text carries instruction authority and the names are untrusted. Built once, so replays are byte-identical and cache-friendly (messages stored by older builds keep their developer context message as stored). |
 | `Reasoning`, `AssistantText` | `[output_item.done item]` (reasoning carries `encrypted_content`) |
 | `ToolCall` | `[output_item.done function_call]` |
 | `ToolResult` | `[function_call_output]` |
@@ -309,7 +346,7 @@ nullable). Outputs are compact JSON text unless noted. `summary` is the tool row
 | `append_to_note` | Write | `note_id`, `text` | Never asks (Q2) |
 | `replace_note_body` | Write | `note_id`, `body_md` | Asks when the note is the owner's writing (Q2); an empty body has nothing to overwrite and never asks |
 | `propose_course` | Write | `prompt` (the learner's request), `topic_title`, `subject_title`, `lessons: [{title, summary, minutes}]` (1–12), `level`, `with_videos`, `with_quiz`, `parent_topic_id: Option`, `source_ids` | The model writes the outline; the service validates it like `ask::validate_outline`, stores a `Ready` `Proposal` with `chat_id`, card `Outline`. Options the owner didn't state are inferred; the chips on the card change them. |
-| `accept_proposal` | Write | `proposal_id` | Same as Create lessons with no edits; Result card for the topic. Only a proposal of the same chat; its result is the chat's record (no extra `Action`) |
+| `accept_proposal` | Write | `proposal_id` | Same as Create lessons with no edits; Result card for the topic. Only a proposal of the same chat; its result is the chat's record (no extra `Action`). A superseded proposal is refused (the model is told which newer one replaced it) |
 | `delete_topic` / `delete_lesson` / `delete_note` | Destructive | the id | Prompt names what goes with it (lessons, notes, videos, sources) |
 
 Q2 provenance (service-only fields `StoredNote.author`, `StoredLesson.author`:
@@ -318,12 +355,20 @@ note created through `POST /api/notes`, or whose body was changed through
 `PATCH /api/notes/{id}`, is the owner's (a retitle alone keeps the body's author). A
 lesson whose body was changed through `PATCH /api/lessons/{id}` is owner-edited; a lesson
 job that writes the body makes it the agent's. `replace_note_body` on the owner's note
-and `regenerate_lesson` on an owner-edited lesson ask first; once replaced, the note is
-the agent's writing. Appending keeps the author. Rows without the field read as the
+and `regenerate_lesson` on an owner-edited lesson ask first; once replaced (the owner
+approved), the note is the agent's writing (owner decision). Appending keeps the author. Rows without the field read as the
 owner's (safe default).
 
+Superseding: `propose_course` marks every earlier `Ready` proposal of the same chat
+`ProposalStatus::Superseded { by: <the new proposal id> }` (→ `ProposalChanged` each),
+under `write_lock` with storing the new one. Accepting a superseded proposal (route or
+tool) answers 409 `superseded` ("A newer outline replaced this one."); its outline card
+renders inactive with that line, so only the newest outline in a chat can create a
+course.
+
 Create lessons on the outline card: `POST proposal_accept` with the edited outline and
-`chips`; when the proposal has a `chat_id`, the service adds
+`chips`; on success the app opens the course's first lesson (owner decision), while the
+chat keeps the course card; when the proposal has a `chat_id`, the service adds
 `Action "Created the course “<topic>” with N lessons."` (with `action_input`) to that chat
 → `ChatItemChanged`, so the next turn knows. Accepting while that chat's turn is busy is
 fine: the action takes that turn's id and lands between items; replay moves it after the

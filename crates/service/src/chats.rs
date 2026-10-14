@@ -14,7 +14,7 @@ use chrono::Utc;
 use margin_shared::{
     CHAT_TITLE_MAX, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatPatch, ChatState,
     ConfirmRequest, DeviceRef, Event, Id, MessageSent, NewChat, NewMessage, PendingMessage, Source,
-    ToolOutputText, Usage,
+    TitleSource, ToolOutputText, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -317,11 +317,13 @@ pub async fn create_chat(
     let mut chat = Chat {
         id: new_id(),
         title: String::new(),
+        title_by: TitleSource::FirstLine,
         state: ChatState::Idle,
         workspace_ids,
         source_ids: Vec::new(),
         pending: None,
         usage: Usage::default(),
+        waiting: None,
         created_at: now,
         updated_at: now,
     };

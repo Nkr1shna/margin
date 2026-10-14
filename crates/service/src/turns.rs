@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use margin_agent::{
-    BoxFuture, ItemRecord, MessageContext, ReplayItem, RetryPolicy, SinkError, TurnDeps, TurnInput,
-    TurnOutcome, TurnSink,
+    BoxFuture, ItemRecord, MessageContext, ReplayItem, RetryPolicy, SinkError, ToolOutput,
+    TurnDeps, TurnInput, TurnOutcome, TurnSink,
 };
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
@@ -18,7 +18,7 @@ use margin_shared::{
 };
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::chats::{self, StoredChatItem};
 use crate::error::{AppError, AppResult};
@@ -71,6 +71,29 @@ impl Turns {
         if let Some(turn) = self.running.lock().unwrap().remove(chat_id) {
             turn.abort.abort();
         }
+    }
+
+    /// Registers a library change an agent tool runs to its end (`agent_tools::to_the_end`)
+    /// as the call `call_id` of the chat's running turn, before the change starts. The
+    /// handle's task returns the call's real `ToolOutput` (the tool itself gets a copy
+    /// another way, since the handle is given up here).
+    ///
+    /// Stop takes the chat's registered writes (`take_writes`) and awaits them, bounded
+    /// (15 s), so a write that finished is recorded with its real result and card instead
+    /// of "Cancelled" (the model would otherwise make it again); a write that doesn't
+    /// finish in time gets "Stopped before this change was confirmed; check whether it
+    /// took effect.". Whatever way the turn ends, the service takes what is left so
+    /// nothing stays registered past the turn.
+    pub fn register_write(&self, chat_id: &str, call_id: &str, write: JoinHandle<ToolOutput>) {
+        let _ = (chat_id, call_id, write);
+        unimplemented!("phase 3, service-turns")
+    }
+
+    /// Removes and returns the chat's registered writes as `(call_id, handle)`, in the
+    /// order they were registered. Empty when none are registered.
+    pub fn take_writes(&self, chat_id: &str) -> Vec<(String, JoinHandle<ToolOutput>)> {
+        let _ = chat_id;
+        unimplemented!("phase 3, service-turns")
     }
 
     /// Forgets what is kept in memory for a deleted chat.
@@ -459,6 +482,7 @@ async fn finish(
             ChatItemKind::Error {
                 message: early.message,
                 retryable: early.retryable,
+                code: None,
             },
         )
         .await?;

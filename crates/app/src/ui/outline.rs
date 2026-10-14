@@ -143,6 +143,13 @@ pub fn ProposalView(
         ProposalStatus::Failed { error } => rsx! {
             ErrorNotice { message: format!("Couldn't draft an outline. {error}") }
         },
+        ProposalStatus::Superseded { .. } => rsx! {
+            div { class: "outline", role: "status",
+                div { class: "outline-h",
+                    b { "A newer outline replaced this one." }
+                }
+            }
+        },
         ProposalStatus::Accepted { topic_id } => rsx! {
             CourseView {
                 topic_id,

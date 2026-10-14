@@ -1038,7 +1038,8 @@ async fn retries_run_out() {
         sink.kinds().last().unwrap(),
         &ChatItemKind::Error {
             message: error,
-            retryable: true
+            retryable: true,
+            code: None
         }
     );
 }

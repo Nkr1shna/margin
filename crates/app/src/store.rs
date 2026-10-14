@@ -444,7 +444,9 @@ impl LibraryState {
         for proposal in self.proposals.values() {
             let stage = match proposal.status {
                 ProposalStatus::Drafting => Stage::Working,
-                ProposalStatus::Ready | ProposalStatus::Accepted { .. } => Stage::Done,
+                ProposalStatus::Ready
+                | ProposalStatus::Accepted { .. }
+                | ProposalStatus::Superseded { .. } => Stage::Done,
                 ProposalStatus::Failed { .. } => Stage::Failed,
             };
             out.insert(Work::Proposal(proposal.id.clone()), stage);
@@ -1009,11 +1011,13 @@ pub(crate) mod tests {
         let chat = Chat {
             id: "c1".into(),
             title: "Fourier".into(),
+            title_by: Default::default(),
             state: ChatState::Idle,
             workspace_ids: vec![],
             source_ids: vec![],
             pending: None,
             usage: Default::default(),
+            waiting: None,
             created_at: ts(0),
             updated_at: ts(0),
         };
@@ -1078,11 +1082,13 @@ pub(crate) mod tests {
         Chat {
             id: id.into(),
             title: id.into(),
+            title_by: Default::default(),
             state: ChatState::Idle,
             workspace_ids: vec![],
             source_ids: vec![],
             pending: None,
             usage: Default::default(),
+            waiting: None,
             created_at: ts(0),
             updated_at: ts(updated),
         }

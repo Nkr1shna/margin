@@ -1,5 +1,6 @@
 //! How the loop hands its items to the service.
 
+use chrono::{DateTime, Utc};
 use margin_shared::{ChatItem, ChatItemKind, Decision, ItemStatus, Usage};
 use serde_json::Value;
 
@@ -65,4 +66,22 @@ pub trait TurnSink: Send + Sync {
         &'a self,
         card: &'a ChatItem,
     ) -> BoxFuture<'a, Result<Decision, SinkError>>;
+
+    /// The loop is about to sleep until `until` before retrying a model call (`reason`
+    /// says why, for the chat): the service sets `Chat.waiting` and emits
+    /// `Event::ChatChanged`. Called before every retry sleep.
+    fn retrying<'a>(
+        &'a self,
+        until: DateTime<Utc>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), SinkError>> {
+        let _ = (until, reason);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// The retry sleep is over: the service clears `Chat.waiting` and emits
+    /// `Event::ChatChanged`. The service also clears it when the turn ends.
+    fn clear_waiting(&self) -> BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async { Ok(()) })
+    }
 }

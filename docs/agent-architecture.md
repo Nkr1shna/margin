@@ -149,5 +149,12 @@ These answer the review's questions and are binding for the build.
 | Q5 Writes / commands | **Neither.** Attached folders are read-only; no shell commands. |
 | Q6 macOS distribution | **Direct distribution, not sandboxed.** Plain paths + bookmarks now; the handle abstraction keeps a sandboxed (security-scoped bookmark) variant possible. |
 | Appearance tool | **Left out.** The agent can't change theme/appearance; app control is navigate, open_citation, show_passage, toggle_sidebar. |
-| iOS continued processing | **Build it.** Long folder scans on iOS/iPadOS continue in the background with `BGContinuedProcessingTask` (iOS 26) and the system progress UI. |
+| iOS continued processing | **Build it.** Long folder scans on iOS/iPadOS continue in the background with `BGContinuedProcessingTask` (iOS 26) and the system progress UI. Scope (later answer): any running chat that reads a folder this iPhone/iPad holds keeps reading in the background through the task, not only long scans. |
+| Chat titles | **Written by the model after the first answer** (a small side call, not a tool); until then the first line of the first message stands in. The owner can rename a chat; the model never replaces the owner's title (`Chat.title_by`: first line / model / owner). |
+| Message during a pending confirmation | **Queued**, like a message sent while the agent answers: it becomes the chat's pending message and is sent when the turn ends. |
+| `Retry-After` | **Honoured as the server asks, uncapped**; the chat shows it's waiting (until when, and why) with Stop. Computed backoff stays capped. |
+| Sidebar | **The sidebar row stays "New chat"** (the new-chat screen and its row keep that name). |
+| Reasoning effort | **Low / Medium / High / XHigh / Max** in Settings, default Medium. A stored "minimal" from an older build reads as Low. |
+| After Create lessons | **The app opens the first lesson**; the chat keeps the course card. |
+| Approved replace | **When the owner approves the agent replacing their note, the note becomes the agent's writing** (later agent changes to it don't ask again). |
 | Already decided | Chats stored on the service and synced; Ask = chat with inline cards; Chats section in the sidebar; course options inferred/asked with chips on the outline card; agent acts freely, confirms deletes; 500 MB per audio/video file, 50 MB others; no folder upload, single-file sources stay. |

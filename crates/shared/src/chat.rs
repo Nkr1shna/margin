@@ -19,9 +19,12 @@ use crate::{Citation, Id, Level};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chat {
     pub id: Id,
-    /// Set from the first message (its first line, at most `CHAT_TITLE_MAX` characters)
-    /// until the owner renames the chat.
+    /// Set from the first message (its first line, at most `CHAT_TITLE_MAX` characters),
+    /// then written by the model after the first answer, until the owner renames the
+    /// chat. `title_by` says which.
     pub title: String,
+    #[serde(default)]
+    pub title_by: TitleSource,
     pub state: ChatState,
     /// Folders attached to the chat (`Workspace.id`), readable through the device that
     /// holds each one.
@@ -39,12 +42,42 @@ pub struct Chat {
     /// Tokens spent by every turn of this chat, for the footer.
     #[serde(default)]
     pub usage: Usage,
+    /// Set while the running turn waits before retrying a model call (the API asked it
+    /// to slow down or failed); the chat shows it's waiting. Cleared when the retry
+    /// starts or the turn ends.
+    #[serde(default)]
+    pub waiting: Option<Waiting>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 /// Longest generated chat title, in characters.
 pub const CHAT_TITLE_MAX: usize = 60;
+
+/// Who wrote `Chat.title`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// The first line of the first message, until the model names the chat (the app
+    /// shows it as a placeholder).
+    #[default]
+    FirstLine,
+    /// Written by the model after the chat's first answer.
+    Model,
+    /// The owner renamed the chat (`ChatPatch.title`); never replaced.
+    Owner,
+}
+
+/// A running turn waiting before it retries a model call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Waiting {
+    /// When the retry starts: the server's `Retry-After` as given (uncapped), else the
+    /// backoff delay.
+    pub until: DateTime<Utc>,
+    /// Why, in a short sentence for the chat, e.g. "The model API asked Margin to slow
+    /// down."
+    pub reason: String,
+}
 
 /// Where a chat's current (or last) turn is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,7 +263,38 @@ pub enum ChatItemKind {
     Action { text: String },
     /// The turn hit an error it could not get past. `retryable` errors show Retry
     /// (`routes::chat_continue`) while the chat is `ChatState::Failed`.
-    Error { message: String, retryable: bool },
+    Error {
+        message: String,
+        retryable: bool,
+        /// What kind of error, for the app to offer a fix (e.g. "Open Settings" for
+        /// `no_api_key`): one of the `error_code` constants. `None` on items stored by older builds.
+        #[serde(default)]
+        code: Option<String>,
+    },
+}
+
+/// `ChatItemKind::Error.code` values.
+pub mod error_code {
+    /// No API key is stored in the service Mac's Keychain.
+    pub const NO_API_KEY: &str = "no_api_key";
+    /// No model is set in Settings.
+    pub const NO_MODEL: &str = "no_model";
+    /// 429 after every retry.
+    pub const RATE_LIMITED: &str = "rate_limited";
+    /// 5xx after every retry, or a `failed`/`error` stream event.
+    pub const SERVER_ERROR: &str = "server_error";
+    /// The model API could not be reached, or the connection dropped.
+    pub const NETWORK: &str = "network";
+    /// The conversation no longer fits the model's context window.
+    pub const CONTEXT_TOO_LONG: &str = "context_too_long";
+    /// The answer was cut off (`Incomplete`).
+    pub const INCOMPLETE: &str = "incomplete";
+    /// The model API refused the request (4xx other than 429).
+    pub const BAD_REQUEST: &str = "bad_request";
+    /// The service could not store the turn's items.
+    pub const STORAGE: &str = "storage";
+    /// The turn ended without finishing (a panic or an unexpected stop).
+    pub const INTERRUPTED: &str = "interrupted";
 }
 
 /// What `ChatItemKind::apply_delta` did.
@@ -542,6 +606,7 @@ mod tests {
         Chat {
             id: "c1".into(),
             title: "Fourier".into(),
+            title_by: TitleSource::Model,
             state,
             workspace_ids: vec!["w1".into()],
             source_ids: vec![],
@@ -558,6 +623,10 @@ mod tests {
                 reasoning_tokens: 2,
                 model_calls: 1,
             },
+            waiting: Some(Waiting {
+                until: at(),
+                reason: "The model API asked Margin to slow down.".into(),
+            }),
             created_at: at(),
             updated_at: at(),
         }
@@ -630,6 +699,21 @@ mod tests {
         assert!(back.workspace_ids.is_empty());
         assert_eq!(back.pending, None);
         assert_eq!(back.usage, Usage::default());
+        assert_eq!(back.title_by, TitleSource::FirstLine);
+        assert_eq!(back.waiting, None);
+        let old_error: ChatItemKind =
+            serde_json::from_value(json!({"kind": "error", "message": "m", "retryable": true}))
+                .unwrap();
+        assert_eq!(
+            old_error,
+            ChatItemKind::Error {
+                message: "m".into(),
+                retryable: true,
+                code: None
+            }
+        );
+        let json = serde_json::to_value(TitleSource::Owner).unwrap();
+        assert_eq!(json, "owner");
     }
 
     #[test]
@@ -714,6 +798,7 @@ mod tests {
             ChatItemKind::Error {
                 message: "The model API returned 500.".into(),
                 retryable: true,
+                code: Some(error_code::SERVER_ERROR.into()),
             },
         ];
         for kind in kinds {
@@ -855,6 +940,7 @@ mod tests {
         let mut error = ChatItemKind::Error {
             message: "x".into(),
             retryable: false,
+            code: None,
         };
         assert_eq!(error.apply_delta(0, "y"), DeltaOutcome::NotStreaming);
     }

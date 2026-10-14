@@ -222,6 +222,11 @@ pub enum ProposalStatus {
     Failed {
         error: String,
     },
+    /// A later `propose_course` in the same chat replaced this outline before it was
+    /// accepted; `by` is the newer proposal. Accepting it answers 409 "superseded".
+    Superseded {
+        by: Id,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -561,32 +566,41 @@ pub struct Settings {
     pub agent_model: Option<String>,
 }
 
-/// Responses API `reasoning.effort` for the agent.
+/// Responses API `reasoning.effort` for the agent. Settings offers `ALL`, Medium by
+/// default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// Offered by older builds; kept only so stored settings still parse. Not in `ALL`,
+    /// and sent as "low".
+    #[doc(hidden)]
     Minimal,
     Low,
     #[default]
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
 }
 
 impl ReasoningEffort {
-    pub const ALL: [ReasoningEffort; 4] = [
-        ReasoningEffort::Minimal,
+    pub const ALL: [ReasoningEffort; 5] = [
         ReasoningEffort::Low,
         ReasoningEffort::Medium,
         ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
     ];
 
     /// The value sent as `reasoning.effort`.
     pub fn as_str(self) -> &'static str {
         match self {
-            ReasoningEffort::Minimal => "minimal",
-            ReasoningEffort::Low => "low",
+            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -855,9 +869,19 @@ mod tests {
         .unwrap();
         assert_eq!(old.reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(old.agent_model, None);
-        let json = serde_json::to_string(&ReasoningEffort::Minimal).unwrap();
-        assert_eq!(json, r#""minimal""#);
+        let json = serde_json::to_string(&ReasoningEffort::XHigh).unwrap();
+        assert_eq!(json, r#""xhigh""#);
         assert_eq!(ReasoningEffort::High.as_str(), "high");
+        assert_eq!(ReasoningEffort::XHigh.as_str(), "xhigh");
+        assert_eq!(ReasoningEffort::Max.as_str(), "max");
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
+        assert!(!ReasoningEffort::ALL.contains(&ReasoningEffort::Minimal));
+        // Settings stored by an older build that offered "minimal" still parse; it is
+        // sent as "low".
+        let stored: SettingsPatch =
+            serde_json::from_value(serde_json::json!({"reasoning_effort": "minimal"})).unwrap();
+        assert_eq!(stored.reasoning_effort, Some(ReasoningEffort::Minimal));
+        assert_eq!(ReasoningEffort::Minimal.as_str(), "low");
 
         let back: SettingsPatch = serde_json::from_str("{}").unwrap();
         assert_eq!(back.agent_model, None);
@@ -880,6 +904,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old_accept.chips, OutlineChips::default());
+        let superseded = ProposalStatus::Superseded { by: "p2".into() };
+        let json = serde_json::to_value(&superseded).unwrap();
+        assert_eq!(json, serde_json::json!({"state": "superseded", "by": "p2"}));
+        assert_eq!(
+            serde_json::from_value::<ProposalStatus>(json).unwrap(),
+            superseded
+        );
     }
 
     #[test]

@@ -139,7 +139,9 @@ fn line(item: &ChatItem) -> String {
             Card::Confirmation(c) => format!("card confirm: {:?}", c.decision),
         },
         ChatItemKind::Action { text } => format!("action: {text}"),
-        ChatItemKind::Error { message, retryable } => {
+        ChatItemKind::Error {
+            message, retryable, ..
+        } => {
             format!(
                 "error{}: {message}",
                 if *retryable { " (retry)" } else { "" }
@@ -967,7 +969,9 @@ async fn a_failed_turn_can_be_continued() {
     })
     .await;
     match &d.items[1].kind {
-        ChatItemKind::Error { message, retryable } => {
+        ChatItemKind::Error {
+            message, retryable, ..
+        } => {
             assert!(message.starts_with("Add an OpenAI API key"), "{message}");
             assert!(*retryable);
         }
@@ -1398,6 +1402,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
     let chat = Chat {
         id: "c1".into(),
         title: "Fourier".into(),
+        title_by: Default::default(),
         state: ChatState::WaitingForUser {
             turn_id: "t1".into(),
             device_id: "old-mac".into(),
@@ -1412,6 +1417,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
             created_at: now,
         }),
         usage: Usage::default(),
+        waiting: None,
         created_at: now,
         updated_at: now,
     };

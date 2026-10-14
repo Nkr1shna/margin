@@ -1307,6 +1307,13 @@ impl FakeState {
                     "This outline failed. Ask again.",
                 ));
             }
+            ProposalStatus::Superseded { .. } => {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "superseded",
+                    "A newer outline replaced this one.",
+                ));
+            }
         }
         if req.outline.topic_title.trim().is_empty()
             || req.outline.lessons.is_empty()
@@ -2444,6 +2451,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
     let chat = |id: &str, title: &str, state, at| Chat {
         id: id.into(),
         title: title.into(),
+        title_by: Default::default(),
         state,
         workspace_ids: vec![],
         source_ids: vec![],
@@ -2455,6 +2463,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             reasoning_tokens: 640,
             model_calls: 4,
         },
+        waiting: None,
         created_at: ts(at),
         updated_at: ts(at + 30),
     };
@@ -3380,6 +3389,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
                 ChatItemKind::Error {
                     message: message.into(),
                     retryable: true,
+                    code: None,
                 },
             );
             let chat = s.set_chat_state(
@@ -3730,11 +3740,13 @@ async fn create_chat(
         let chat = Chat {
             id: s.id("chat"),
             title: String::new(),
+            title_by: Default::default(),
             state: ChatState::Idle,
             workspace_ids: req.workspace_ids,
             source_ids: vec![],
             pending: None,
             usage: Usage::default(),
+            waiting: None,
             created_at: now,
             updated_at: now,
         };

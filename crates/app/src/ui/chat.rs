@@ -1629,6 +1629,7 @@ mod tests {
             ChatItemKind::Error {
                 message: "boom".into(),
                 retryable,
+                code: None,
             },
         )
     }
@@ -1866,6 +1867,7 @@ mod tests {
         failure.kind = ChatItemKind::Error {
             message: "The model API answered 500 three times.".into(),
             retryable: true,
+            code: None,
         };
         lib.chat_items.get_mut("c1").unwrap().push(failure);
         let html = render_route("/chat/c1", lib);

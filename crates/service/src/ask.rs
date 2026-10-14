@@ -242,6 +242,12 @@ pub async fn accept_proposal(
                     "This outline failed. Ask again.",
                 ));
             }
+            ProposalStatus::Superseded { .. } => {
+                return Err(AppError::conflict(
+                    "superseded",
+                    "A newer outline replaced this one.",
+                ));
+            }
         }
         let chips = req.chips;
         if let Some(level) = chips.level {
