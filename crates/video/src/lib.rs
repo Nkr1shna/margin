@@ -195,7 +195,7 @@ pub async fn render(
     .await?;
     // `inspect` exits 1 for layout problems, which don't stop a render.
     let layout_only = pass1.status.as_ref().is_some_and(|s| s.code() == Some(1))
-        && pass1.stderr.iter().all(|l| l.trim().is_empty())
+        && pass1.stderr.iter().all(|l| scene_error::is_noise(l))
         && pass1.stdout.iter().any(|l| l.starts_with("layout:"));
     if !layout_only {
         check_pass(&pass1)?;

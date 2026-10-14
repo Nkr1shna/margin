@@ -410,8 +410,19 @@ async fn library_crud_and_cascading_deletes() {
         (moved.parent_id.as_deref(), moved.position),
         (Some(a.id.as_str()), 1)
     );
-    // `null` can't be told apart from "unchanged" with the contract's Option<Option<_>> (see the report).
+    // An omitted parent_id leaves the parent unchanged.
     let same: Topic = h
+        .patch(&t, &format!("/api/topics/{}", b.id))
+        .json(&json!({"title": "B"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(same.parent_id.as_deref(), Some(a.id.as_str()));
+    // `null` moves the topic to the root.
+    let rooted: Topic = h
         .patch(&t, &format!("/api/topics/{}", b.id))
         .json(&json!({"parent_id": null}))
         .send()
@@ -420,7 +431,7 @@ async fn library_crud_and_cascading_deletes() {
         .json()
         .await
         .unwrap();
-    assert_eq!(same.parent_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(rooted.parent_id, None);
     let moved: Topic = h
         .patch(&t, &format!("/api/topics/{}", b.id))
         .json(&json!({"parent_id": subject.id}))

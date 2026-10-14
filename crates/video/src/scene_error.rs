@@ -28,9 +28,46 @@ fn frame_file(line: &str) -> Option<&str> {
         .then_some(file)
 }
 
-/// Lines a sandboxed Metal prints that say nothing about the scene.
-fn is_noise(line: &str) -> bool {
-    line.trim().is_empty() || line.starts_with("sandbox_extension_issue_file")
+/// Removes terminal control sequences (`ESC [ … letter`, `ESC ]…BEL`) and carriage returns.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Lines that say nothing about the scene: blank lines, what a sandboxed Metal prints,
+/// and ManimGX's progress spinner (e.g. `⠋ LessonScene  t = 2.5 s, play #0`).
+pub(crate) fn is_noise(line: &str) -> bool {
+    let clean = strip_ansi(line);
+    let clean = clean.trim();
+    clean.is_empty()
+        || clean.starts_with("sandbox_extension_issue_file")
+        || (clean.starts_with(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+            && clean.contains(" t = "))
 }
 
 pub(crate) fn scene_message(stderr: &[String], stdout: &[String]) -> String {
@@ -122,6 +159,24 @@ mod tests {
     #[test]
     fn falls_back_to_stdout() {
         assert_eq!(scene_message(&[], &v("boom")), "boom");
+    }
+
+    #[test]
+    fn spinner_and_escape_codes_are_noise() {
+        assert!(is_noise(
+            "\u{1b}[?25l\u{1b}[32m\u{280b}\u{1b}[0m LessonScene  t = 2.5 s, play #0"
+        ));
+        assert!(is_noise("\u{1b}[?25h\r\u{1b}[1A\u{1b}[2K"));
+        assert!(!is_noise(
+            "AttributeError: module 'manimgx' has no attribute 'ShowCreation'"
+        ));
+        assert_eq!(
+            scene_message(
+                &v("\u{1b}[?25l\u{280b} LessonScene  t = 1 s, play #0\nboom"),
+                &[]
+            ),
+            "boom"
+        );
     }
 
     #[test]

@@ -69,7 +69,9 @@ pub enum LessonStatus {
     /// The body is streaming in; `LessonDelta` events carry new text.
     Generating,
     Ready,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,11 +114,18 @@ pub enum VideoStatus {
     /// The model is writing the ManimGX scene.
     Scripting,
     /// Narration lines are being voiced with PocketTTS.
-    Voicing { done: u32, total: u32 },
+    Voicing {
+        done: u32,
+        total: u32,
+    },
     /// ManimGX is rendering. `progress` is 0.0..=1.0 when known.
-    Rendering { progress: Option<f32> },
+    Rendering {
+        progress: Option<f32>,
+    },
     Ready,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 /// One video per lesson. Re-rendering replaces the files and keeps the id.
@@ -188,8 +197,12 @@ pub enum ProposalStatus {
     Drafting,
     Ready,
     /// Accepted; `topic_id` is the topic that was created.
-    Accepted { topic_id: Id },
-    Failed { error: String },
+    Accepted {
+        topic_id: Id,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,7 +234,11 @@ pub struct NewTopic {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TopicPatch {
     pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
     pub parent_id: Option<Option<Id>>,
     pub position: Option<i64>,
 }
@@ -306,7 +323,11 @@ pub struct SettingsPatch {
     pub openai_model: Option<String>,
     /// `Some(key)` stores the key in the Keychain; `Some("")` deletes it.
     pub openai_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
     pub voice: Option<Option<String>>,
     pub render_width: Option<u32>,
     pub render_height: Option<u32>,
@@ -370,8 +391,13 @@ pub struct PollLoginRequest {
 pub enum LoginState {
     Pending,
     /// Returned exactly once; later polls return `Expired`.
-    Approved { token: String, github_login: String },
-    Denied { reason: String },
+    Approved {
+        token: String,
+        github_login: String,
+    },
+    Denied {
+        reason: String,
+    },
     Expired,
 }
 
@@ -389,20 +415,45 @@ pub struct Me {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Sent once right after the socket opens.
-    Hello { server_version: String },
-    TopicChanged { topic: Topic },
-    TopicDeleted { id: Id },
-    LessonChanged { lesson: Lesson },
+    Hello {
+        server_version: String,
+    },
+    TopicChanged {
+        topic: Topic,
+    },
+    TopicDeleted {
+        id: Id,
+    },
+    LessonChanged {
+        lesson: Lesson,
+    },
     /// Text appended to a generating lesson's body. Apply in order; a following
     /// `LessonChanged` carries the authoritative full body.
-    LessonDelta { lesson_id: Id, text: String },
-    LessonDeleted { id: Id },
-    NoteChanged { note: Note },
-    NoteDeleted { id: Id },
-    VideoChanged { video: Video },
-    VideoDeleted { id: Id },
-    ProposalChanged { proposal: Proposal },
-    SettingsChanged { settings: Settings },
+    LessonDelta {
+        lesson_id: Id,
+        text: String,
+    },
+    LessonDeleted {
+        id: Id,
+    },
+    NoteChanged {
+        note: Note,
+    },
+    NoteDeleted {
+        id: Id,
+    },
+    VideoChanged {
+        video: Video,
+    },
+    VideoDeleted {
+        id: Id,
+    },
+    ProposalChanged {
+        proposal: Proposal,
+    },
+    SettingsChanged {
+        settings: Settings,
+    },
 }
 
 /// Error body for every non-2xx API response.
@@ -421,22 +472,47 @@ mod tests {
     #[test]
     fn patch_fields_distinguish_unchanged_from_clear() {
         let unchanged = TopicPatch::default();
-        assert_eq!(serde_json::to_string(&unchanged).unwrap().contains("parent_id"), false);
+        assert!(
+            !serde_json::to_string(&unchanged)
+                .unwrap()
+                .contains("parent_id")
+        );
         let back: TopicPatch = serde_json::from_str("{}").unwrap();
         assert_eq!(back.parent_id, None);
 
-        let to_root = TopicPatch { parent_id: Some(None), ..Default::default() };
+        let to_root = TopicPatch {
+            parent_id: Some(None),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&to_root).unwrap();
         assert!(json.contains(r#""parent_id":null"#), "{json}");
-        assert_eq!(serde_json::from_str::<TopicPatch>(&json).unwrap().parent_id, Some(None));
+        assert_eq!(
+            serde_json::from_str::<TopicPatch>(&json).unwrap().parent_id,
+            Some(None)
+        );
 
-        let moved = TopicPatch { parent_id: Some(Some("t1".into())), ..Default::default() };
+        let moved = TopicPatch {
+            parent_id: Some(Some("t1".into())),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&moved).unwrap();
-        assert_eq!(serde_json::from_str::<TopicPatch>(&json).unwrap().parent_id, Some(Some("t1".into())));
+        assert_eq!(
+            serde_json::from_str::<TopicPatch>(&json).unwrap().parent_id,
+            Some(Some("t1".into()))
+        );
 
-        let clear_voice = SettingsPatch { voice: Some(None), ..Default::default() };
+        let clear_voice = SettingsPatch {
+            voice: Some(None),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&clear_voice).unwrap();
-        assert_eq!(serde_json::from_str::<SettingsPatch>(&json).unwrap().voice, Some(None));
-        assert_eq!(serde_json::from_str::<SettingsPatch>("{}").unwrap().voice, None);
+        assert_eq!(
+            serde_json::from_str::<SettingsPatch>(&json).unwrap().voice,
+            Some(None)
+        );
+        assert_eq!(
+            serde_json::from_str::<SettingsPatch>("{}").unwrap().voice,
+            None
+        );
     }
 }
