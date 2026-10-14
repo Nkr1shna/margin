@@ -215,14 +215,15 @@ pub fn voice_refused(voice: &str) -> Option<String> {
     })
 }
 
-/// Scene code renders under macOS `sandbox-exec` unless the service was started with
-/// `--allow-unsandboxed-render` (development and tests only). Where `sandbox-exec`
-/// isn't available, `margin_video` refuses with `RenderError::Sandbox`.
+/// Scene code renders under this OS's sandbox (`SandboxMode::native()`: macOS
+/// `sandbox-exec`, Linux bubblewrap) unless the service was started with
+/// `--allow-unsandboxed-render` (development and tests only). Where that sandbox can't
+/// run, `margin_video` refuses with `RenderError::Sandbox`.
 pub fn sandbox_mode(allow_unsandboxed: bool) -> SandboxMode {
     if allow_unsandboxed {
         SandboxMode::Unsandboxed
     } else {
-        SandboxMode::MacosSandboxExec
+        SandboxMode::native()
     }
 }
 
@@ -620,6 +621,13 @@ mod tests {
     #[test]
     fn unsandboxed_only_with_the_flag() {
         assert_eq!(sandbox_mode(true), SandboxMode::Unsandboxed);
-        assert_eq!(sandbox_mode(false), SandboxMode::MacosSandboxExec);
+        assert_eq!(
+            sandbox_mode(false),
+            if cfg!(target_os = "linux") {
+                SandboxMode::LinuxBubblewrap
+            } else {
+                SandboxMode::MacosSandboxExec
+            }
+        );
     }
 }

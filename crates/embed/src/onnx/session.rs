@@ -65,7 +65,7 @@ pub struct GraphPort {
 
 /// The process's ONNX Runtime environment: `ort` allows one per process, so it is made
 /// once and kept.
-fn environment() -> Result<&'static Environment, EmbedError> {
+pub(crate) fn environment() -> Result<&'static Environment, EmbedError> {
     static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
     ENV.get_or_init(|| {
         ort::init()

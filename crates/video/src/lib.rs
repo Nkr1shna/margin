@@ -52,11 +52,18 @@ use crate::process::{Stream, run_streaming};
 /// The Linux sandbox's arguments and host checks, public so they can be checked on any
 /// OS (see `sandbox_linux.rs`).
 pub use crate::sandbox::linux as bubblewrap;
+pub use crate::tools::ReaderTools;
 
 /// Finds `manimgx` and `fluidaudiocli` on PATH (and in `~/.local/bin`), with versions
 /// and the install commands to show when missing.
 pub async fn detect_tools() -> Vec<ToolStatus> {
-    tools::detect_tools().await
+    tools::detect_tools(None).await
+}
+
+/// `detect_tools`, with the source readers' rows (Linux: tesseract, ffmpeg, pdfium) taken
+/// from where the readers found them.
+pub async fn detect_tools_with(readers: ReaderTools) -> Vec<ToolStatus> {
+    tools::detect_tools(Some(readers)).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

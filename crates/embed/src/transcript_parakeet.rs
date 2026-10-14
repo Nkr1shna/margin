@@ -464,6 +464,11 @@ impl Parakeet {
     pub fn is_loaded(&self) -> bool {
         self.slot.is_loaded()
     }
+
+    /// Drops the model now (before its files are deleted). Returns whether it was loaded.
+    pub fn unload(&self) -> bool {
+        self.slot.clear()
+    }
 }
 
 /// Transcribes `samples` window by window with `recognizer` (see `windows`) and joins
@@ -781,6 +786,10 @@ mod tests {
         assert!(!parakeet.is_loaded());
         parakeet.transcribe(&samples).unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+        // Unloaded on demand (its files are about to be deleted), used or not.
+        assert!(parakeet.unload());
+        assert!(!parakeet.is_loaded());
+        assert!(!parakeet.unload());
     }
 
     #[test]

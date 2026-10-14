@@ -189,8 +189,12 @@ impl PipelineConfig {
 
 /// The kinds of stage a pipeline is made of, in the order Settings lists them. Each but
 /// "prompts" is a `StageCfg` of `PipelineConfig`; "prompts" is its prompt set's version.
-pub const STAGE_KINDS: [&str; 6] = [
+/// "embedder" is the service's own (`service.toml`'s `embedder`): the service sets it on
+/// every pipeline it runs, Settings shows it without a picker, and `with_stages_of` keeps
+/// it; the eval runner loads the one a variant names.
+pub const STAGE_KINDS: [&str; 7] = [
     "chunker",
+    "embedder",
     "retriever",
     "fusion",
     "reranker",
@@ -203,6 +207,7 @@ impl PipelineConfig {
     pub fn stage_name(&self, kind: &str) -> Option<&str> {
         Some(match kind {
             "chunker" => &self.chunker.name,
+            "embedder" => &self.embedder.name,
             "retriever" => &self.retriever.name,
             "fusion" => &self.fusion.name,
             "reranker" => &self.reranker.name,
@@ -219,6 +224,7 @@ impl PipelineConfig {
         let mut cfg = self.clone();
         let stage = match kind {
             "chunker" => &mut cfg.chunker,
+            "embedder" => &mut cfg.embedder,
             "retriever" => &mut cfg.retriever,
             "fusion" => &mut cfg.fusion,
             "reranker" => &mut cfg.reranker,
@@ -236,16 +242,23 @@ impl PipelineConfig {
     }
 
     /// This config's stages and prompts from `variant`; its model routes and budget stay
-    /// (Models and the budget form set those).
+    /// (Models and the budget form set those), and so does its embedder (the service's).
     pub fn with_stages_of(&self, variant: &PipelineConfig) -> PipelineConfig {
         PipelineConfig {
             routes: self.routes.clone(),
             budget: self.budget,
+            embedder: self.embedder.clone(),
             ..variant.clone()
         }
     }
 
-    /// Whether the stages and prompts are `variant`'s (routes and budget aside).
+    /// This config with `embedder` as its embedder stage (its params kept when the name
+    /// is the same): what a service running that backend stores and stamps.
+    pub fn with_embedder(&self, embedder: &str) -> PipelineConfig {
+        self.with_stage("embedder", embedder)
+    }
+
+    /// Whether the stages and prompts are `variant`'s (routes, budget and embedder aside).
     pub fn has_stages_of(&self, variant: &PipelineConfig) -> bool {
         self.with_stages_of(variant) == *self
     }
@@ -411,6 +424,12 @@ mod tests {
         assert_eq!(picked.budget, cfg.budget);
         assert!(picked.has_stages_of(&variant));
         assert!(!cfg.has_stages_of(&variant));
+        // The embedder is the service's: a variant naming another one doesn't change it.
+        let onnx = cfg.with_embedder("onnx-q8");
+        assert_eq!(onnx.stage_name("embedder"), Some("onnx-q8"));
+        let picked = onnx.with_stages_of(&variant.with_embedder("onnx-fp32"));
+        assert_eq!(picked.embedder.name, "onnx-q8");
+        assert!(picked.has_stages_of(&variant));
     }
 
     #[test]

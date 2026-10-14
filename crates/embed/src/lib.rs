@@ -53,6 +53,8 @@ mod pdf;
 mod pdf_pdfium;
 mod rank;
 mod transcript;
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+pub mod transcript_parakeet;
 #[cfg(target_os = "macos")]
 mod vision;
 

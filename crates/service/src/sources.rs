@@ -815,6 +815,19 @@ pub(crate) fn transcript_warning(kind: SourceKind, why: &str) -> String {
     }
 }
 
+/// The warning on an image or scanned PDF read without OCR, `why` being what's missing.
+pub(crate) fn ocr_warning(kind: SourceKind, why: &str) -> String {
+    let what = if kind == SourceKind::Pdf {
+        "Its scanned pages were read without their text"
+    } else {
+        "It was read without the text in it"
+    };
+    format!(
+        "{what}: {why}. Its pictures are still searched, but lessons can't quote that \
+         text. Read it again once that's fixed."
+    )
+}
+
 /// The uploaded file under a name with the original's extension (`input.m4a`, a link to
 /// `file`): AVFoundation picks the container format by extension and won't open an
 /// audio or video file without one. `file` itself when the name has no extension.

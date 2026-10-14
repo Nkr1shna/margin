@@ -19,15 +19,17 @@ pub const DEV_SERVICE_URL: &str = "https://devmargin.krishnanelloore.com";
 
 pub const USAGE: &str = "\
 margin-eval: Margin's opt-in eval runner. It calls real models with the owner's keys
-from the service Mac's Keychain and loads the real embedder, so it never runs in CI
-(it refuses when CI is set); CI runs `cargo test -p margin-evals` on recorded fixtures.
-It keeps its own database (--data, default ~/Library/Application Support/Margin/evals)
-and never opens the service's.
+from the service's secret store (the Keychain on a Mac, the secrets file on Linux) and
+loads the real embedder, so it never runs in CI (it refuses when CI is set); CI runs
+`cargo test -p margin-evals` on recorded fixtures. It keeps its own database (--data,
+default `evals` in the service's support folder: ~/Library/Application Support/Margin
+on a Mac, /var/lib/margin on Linux) and never opens the service's.
 
 Usage: margin-eval <command> [options]
 
 Commands:
-  record-embeddings     Read the corpus with PDFKit/Vision and record the extraction and
+  record-embeddings     Read the corpus with this OS's readers (PDFKit/Vision on a Mac,
+                        pdfium/tesseract/ffmpeg on Linux) and record the extraction and
                         the real EmbeddingGemma vectors of every corpus chunk, picture and
                         golden query (evals/recorded/{extracted.json,embeddings.bin})
   record-generations [--variant NAME]

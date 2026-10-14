@@ -126,6 +126,16 @@ impl<T> IdleSlot<T> {
         stale
     }
 
+    /// Drops the value whenever it was last used (a model being deleted). Returns
+    /// whether one was loaded.
+    #[cfg_attr(
+        not(any(test, target_os = "linux", feature = "speech-onnx")),
+        allow(dead_code)
+    )]
+    pub fn clear(&self) -> bool {
+        self.value.lock().unwrap().take().is_some()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_loaded(&self) -> bool {
         self.value.lock().unwrap().is_some()

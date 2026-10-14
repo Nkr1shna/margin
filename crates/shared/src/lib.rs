@@ -518,13 +518,39 @@ pub struct SourceUpload {
     pub received: u64,
 }
 
-/// The local embedding model (EmbeddingGemma 2, Core ML), downloaded on demand from
-/// Hugging Face into the service's data folder. Never bundled.
+/// The local embedding model (EmbeddingGemma 2 on Core ML or ONNX Runtime), downloaded on
+/// demand from Hugging Face into the service's data folder. Never bundled. With it, the
+/// speech model where the service downloads one, and the re-index after the embedder
+/// changed while it runs (Settings → Sources shows all three).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingModel {
     /// Hugging Face repo, "FluidInference/embeddinggemma-2-coreml".
     pub repo: String,
     pub state: EmbeddingModelState,
+    /// The speech model recordings are transcribed with, when the service downloads one
+    /// (Parakeet on ONNX Runtime, a Linux service). `None` where an installed program
+    /// transcribes instead (`fluidaudiocli` on a Mac, Settings → Tools).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<SpeechModel>,
+    /// The one pass that re-embeds every source after `service.toml`'s `embedder`
+    /// changed, while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reindex: Option<ReindexProgress>,
+}
+
+/// A speech model the service downloads (`EmbeddingModel.speech`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeechModel {
+    /// Hugging Face repo, "istupakov/parakeet-tdt-0.6b-v3-onnx".
+    pub repo: String,
+    pub state: EmbeddingModelState,
+}
+
+/// How far the re-index with a new embedder is: `done` of `total` documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReindexProgress {
+    pub done: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

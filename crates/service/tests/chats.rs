@@ -2919,8 +2919,13 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
     let (status, err) = api_error(r).await;
     assert_eq!((status, err.code.as_str()), (400, "bad_range"));
 
-    // The rollups sum them.
-    let hourly = rollup(&h, &t, "hour").await;
+    // The rollups sum them, once the chat's background re-index has traced too (it
+    // lands after the turn, and would otherwise change the rollup between snapshots).
+    let hourly = eventually(|| async {
+        let r = rollup(&h, &t, "hour").await;
+        r.iter().any(|r| r.kind == TraceKind::Ingest).then_some(r)
+    })
+    .await;
     let model_calls: Vec<&TraceRollup> = hourly
         .iter()
         .filter(|r| r.kind == TraceKind::ModelCall)

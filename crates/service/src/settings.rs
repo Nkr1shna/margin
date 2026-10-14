@@ -56,6 +56,14 @@ pub async fn patch_settings(
             row.reasoning_effort = effort;
         }
         if let Some(voice) = &patch.voice {
+            // pocket-tts voices licensed for non-commercial use only are never saved.
+            if let Some(why) = voice.as_deref().and_then(crate::video::voice_refused) {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "voice_not_allowed",
+                    why,
+                ));
+            }
             row.voice = voice
                 .as_ref()
                 .map(|v| v.trim().to_string())
@@ -87,10 +95,12 @@ pub async fn patch_settings(
         }
         let rebuilt = match &patch.pipeline {
             Some(cfg) => {
-                let pipeline = Pipeline::build(cfg, &state.registry).map_err(|e| {
+                // The embedder is the one this service runs, whatever the patch names.
+                let cfg = cfg.with_embedder(state.model_files.backend.name());
+                let pipeline = Pipeline::build(&cfg, &state.registry).map_err(|e| {
                     AppError::new(StatusCode::BAD_REQUEST, "bad_pipeline", format!("{e:#}."))
                 })?;
-                row.pipeline = cfg.clone();
+                row.pipeline = cfg;
                 Some(pipeline)
             }
             None => None,
@@ -211,9 +221,17 @@ pub fn named_variants(
 
 /// `GET /api/pipeline/variants`.
 pub async fn pipeline_variants(State(state): State<AppState>) -> Json<PipelineVariants> {
+    // Only the embedder this service runs: it is set in `service.toml`, not in Settings.
     let stages = STAGE_KINDS
         .iter()
-        .map(|k| (k.to_string(), state.registry.names(k)))
+        .map(|&k| {
+            let names = if k == "embedder" {
+                vec![state.model_files.backend.name().to_string()]
+            } else {
+                state.registry.names(k)
+            };
+            (k.to_string(), names)
+        })
         .collect();
     let dir = evals_dir();
     let variants = {

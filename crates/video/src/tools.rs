@@ -11,14 +11,15 @@ use std::time::Duration;
 
 use margin_shared::ToolStatus;
 
+use crate::bubblewrap::{BWRAP, INSTALL_COMMAND as BWRAP_INSTALL, USERNS_SETUP, find_bwrap};
+use crate::{MARGIN_TTS, MARGIN_TTS_SCRIPT};
+
 pub(crate) const MANIMGX: &str = "manimgx";
 pub(crate) const FLUIDAUDIOCLI: &str = "fluidaudiocli";
 /// Linux tool names, as the Tools rows show them.
-pub const MARGIN_TTS: &str = "margin-tts";
 pub const TESSERACT: &str = "tesseract";
 pub const FFMPEG: &str = "ffmpeg";
 pub const FFPROBE: &str = "ffprobe";
-pub const BWRAP: &str = "bwrap";
 pub const PDFIUM: &str = "pdfium";
 /// The library file pdfium-render binds.
 pub const PDFIUM_LIBRARY: &str = "libpdfium.so";
@@ -28,11 +29,23 @@ const FLUIDAUDIO_TAG: &str = "v0.17.7";
 /// The pdfium-binaries release the install commands fetch (BSD-3-Clause).
 const PDFIUM_RELEASE: &str = "chromium/8100";
 
-pub(crate) async fn detect_tools() -> Vec<ToolStatus> {
+/// Where the source readers' programs and library were found, by the code that runs
+/// them (`margin_embed::{find_tesseract, find_ffmpeg, find_pdfium}`, which also look at
+/// `$MARGIN_TESSERACT`/`$MARGIN_FFMPEG`/`$MARGIN_PDFIUM` and the service's tools folder),
+/// so the Tools rows say what ingest will actually use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReaderTools {
+    pub tesseract: Option<PathBuf>,
+    /// `ffmpeg` and `ffprobe`, found together or not at all.
+    pub ffmpeg: Option<(PathBuf, PathBuf)>,
+    pub pdfium: Option<PathBuf>,
+}
+
+pub(crate) async fn detect_tools(readers: Option<ReaderTools>) -> Vec<ToolStatus> {
     if cfg!(target_os = "macos") {
         macos_tools().await
     } else {
-        linux_tools().await
+        linux_tools(readers).await
     }
 }
 
@@ -76,16 +89,20 @@ async fn macos_tools() -> Vec<ToolStatus> {
     ]
 }
 
-async fn linux_tools() -> Vec<ToolStatus> {
+async fn linux_tools(readers: Option<ReaderTools>) -> Vec<ToolStatus> {
     let uv = find_executable("uv").is_some();
     let tts = find_executable(MARGIN_TTS);
-    let tesseract = find_executable(TESSERACT);
+    let readers = readers.unwrap_or_else(|| ReaderTools {
+        tesseract: find_executable(TESSERACT),
+        ffmpeg: find_executable(FFMPEG).zip(find_executable(FFPROBE)),
+        pdfium: find_pdfium(&pdfium_dirs()),
+    });
+    let tesseract = readers.tesseract;
     let tesseract_version = match &tesseract {
         Some(p) => tool_version(p, &["--version"], TESSERACT).await,
         None => None,
     };
-    let ffmpeg = find_executable(FFMPEG);
-    let ffprobe = find_executable(FFPROBE);
+    let (ffmpeg, ffprobe) = readers.ffmpeg.unzip();
     let ffmpeg_version = match &ffmpeg {
         Some(p) => tool_version(p, &["-version"], "ffmpeg version").await,
         None => None,
@@ -101,7 +118,7 @@ async fn linux_tools() -> Vec<ToolStatus> {
         tesseract_row(tesseract, tesseract_version),
         ffmpeg_row(ffmpeg, ffprobe, ffmpeg_version),
         bwrap_row(bwrap, bwrap_version),
-        pdfium_row(find_pdfium(&pdfium_dirs())),
+        pdfium_row(readers.pdfium),
     ]
 }
 
@@ -139,11 +156,10 @@ fn uv_install_commands(uv_found: bool) -> Vec<String> {
     }
 }
 
-/// The `margin-tts` script's text when this build carries it (LX-speech's
-/// `MARGIN_TTS_SCRIPT`, `include_str!("margin_tts.py")`); `None` installs it from a
-/// checkout of the repository instead.
+/// The `margin-tts` script this build carries (`MARGIN_TTS_SCRIPT`,
+/// `include_str!("margin_tts.py")`), written out by the install commands.
 fn margin_tts_script() -> Option<&'static str> {
-    None
+    Some(MARGIN_TTS_SCRIPT)
 }
 
 /// The narration voice on Linux (Kyutai's pocket-tts behind `margin-tts`, §2.7): a uv
@@ -211,22 +227,9 @@ pub(crate) fn bwrap_row(found: Option<PathBuf>, version: Option<String>) -> Tool
     let mut row = apt_row(BWRAP, found, version, BWRAP_INSTALL);
     if !row.found {
         row.install_commands
-            .extend(BWRAP_USERNS_SETUP.iter().map(|c| c.to_string()));
+            .extend(USERNS_SETUP.iter().map(|c| c.to_string()));
     }
     row
-}
-
-/// `apt install bubblewrap`. With LX-sandbox merged these are
-/// `crate::bubblewrap::{INSTALL_COMMAND, USERNS_SETUP}` and `find_bwrap` is
-/// `crate::bubblewrap::find_bwrap`.
-const BWRAP_INSTALL: &str = "sudo apt install bubblewrap";
-const BWRAP_USERNS_SETUP: &[&str] = &[
-    "echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/60-margin-userns.conf",
-    "sudo sysctl --system",
-];
-
-fn find_bwrap() -> Option<PathBuf> {
-    find_executable(BWRAP)
 }
 
 pub(crate) fn pdfium_row(found: Option<PathBuf>) -> ToolStatus {
@@ -494,7 +497,11 @@ mod tests {
 
     #[tokio::test]
     async fn this_os_lists_its_tools() {
-        let names: Vec<String> = detect_tools().await.into_iter().map(|t| t.name).collect();
+        let names: Vec<String> = detect_tools(None)
+            .await
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         if cfg!(target_os = "macos") {
             assert_eq!(names, [MANIMGX, FLUIDAUDIOCLI]);
         } else {

@@ -19,7 +19,8 @@ Usage:
   margin-service serve [--allow-unsandboxed-render]  Run the service
   margin-service download-model [--embedder NAME]    Download the embedding model (the configured
                                                      embedder, or NAME: coreml, onnx-q8,
-                                                     onnx-fp32, onnx-fp16) without the app
+                                                     onnx-fp32, onnx-fp16) without the app,
+                                                     and on Linux the speech model
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
@@ -113,6 +114,10 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             );
         }
         let secrets = config.secret_store()?;
+        // Tools a user installed without root (the pdfium library) are looked for here.
+        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
+        margin_embed::set_tools_dir(config.data_dir.join("tools"));
+        let source_tools = Arc::new(EmbedTools::new(&config.models_dir()));
         let store = Store::open(&config.db_dir()).await?;
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
@@ -133,7 +138,7 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             secrets,
             generator: Arc::new(AiGenerator),
             renderer: Arc::new(VideoRenderer),
-            source_tools: Arc::new(EmbedTools),
+            source_tools,
             hf_base: margin_embed::HF_BASE.into(),
             allow_unsandboxed_render,
         })
@@ -142,8 +147,9 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
     })
 }
 
-/// Downloads the embedding model into the data folder, printing progress: what the
-/// Settings button does, for a headless box (the provisioning script runs it).
+/// Downloads the embedding model into the data folder, and the speech model where this
+/// build transcribes with one (Linux), printing progress: what the Settings buttons do,
+/// for a headless box (the provisioning script runs it).
 fn download_model(embedder: Option<margin_embed::Backend>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -152,7 +158,12 @@ fn download_model(embedder: Option<margin_embed::Backend>) -> anyhow::Result<()>
         let config = Config::load(&config::config_path())?;
         let files = model_download::files_for(&config, embedder)?;
         let report = |line: &str| eprintln!("{line}");
-        model_download::run(&EmbedTools, &files, margin_embed::HF_BASE, &report).await
+        let tools = EmbedTools::new(&config.models_dir());
+        model_download::run(&tools, &files, margin_embed::HF_BASE, &report).await?;
+        if let Some(speech) = margin_service::engines::SourceTools::speech_model(&tools) {
+            model_download::run_speech(speech, margin_embed::HF_BASE, &report).await?;
+        }
+        Ok(())
     })
 }
 

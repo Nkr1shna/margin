@@ -452,6 +452,18 @@ impl Api {
             .await
     }
 
+    /// Start downloading the speech model (a Linux service); progress arrives as
+    /// `EmbeddingModelChanged` events.
+    pub async fn download_speech(&self) -> ApiResult<EmbeddingModel> {
+        self.post_empty(routes::SPEECH_MODEL_DOWNLOAD).await
+    }
+
+    /// Delete the downloaded speech model.
+    pub async fn delete_speech(&self) -> ApiResult<EmbeddingModel> {
+        self.json(self.request(Method::DELETE, routes::SPEECH_MODEL))
+            .await
+    }
+
     /// Every chat, newest first.
     pub async fn chats(&self) -> ApiResult<Vec<Chat>> {
         self.get(routes::CHATS).await
@@ -1375,6 +1387,45 @@ mod tests {
         let removed = api.delete_embedding().await.unwrap();
         assert!(matches!(
             removed.state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn speech_model_download_and_delete() {
+        use margin_shared::EmbeddingModelState;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        // A Mac service has none to download.
+        assert_eq!(api.embedding().await.unwrap().speech, None);
+        let err = api.download_speech().await.unwrap_err();
+        assert_eq!(
+            (err.status, err.code.as_str()),
+            (Some(409), "no_speech_model")
+        );
+        let err = api.delete_speech().await.unwrap_err();
+        assert_eq!(
+            (err.status, err.code.as_str()),
+            (Some(409), "no_speech_model")
+        );
+
+        fake.state.lock().unwrap().speech = Some(EmbeddingModelState::NotDownloaded {
+            download_bytes: crate::fake::SPEECH_DOWNLOAD_BYTES,
+        });
+        let downloading = api.download_speech().await.unwrap();
+        assert!(matches!(
+            downloading.speech.as_ref().unwrap().state,
+            EmbeddingModelState::Downloading { received: 0, .. }
+        ));
+        // The embedding model's part is unchanged.
+        assert!(matches!(
+            downloading.state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
+        assert_eq!(api.embedding().await.unwrap(), downloading);
+        let removed = api.delete_speech().await.unwrap();
+        assert!(matches!(
+            removed.speech.unwrap().state,
             EmbeddingModelState::NotDownloaded { .. }
         ));
     }

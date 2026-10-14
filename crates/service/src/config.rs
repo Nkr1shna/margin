@@ -279,6 +279,11 @@ impl Config {
     /// The downloaded embedding model of the configured backend (each backend has its
     /// own folder; an unknown backend falls back to the default's, and serving refuses
     /// it in `validate_for_serving`).
+    /// Where downloaded models are kept: `data_dir/models`.
+    pub fn models_dir(&self) -> PathBuf {
+        self.data_dir.join("models")
+    }
+
     pub fn embedding_model_dir(&self) -> PathBuf {
         let backend = self.embedder.parse().unwrap_or_default();
         self.data_dir

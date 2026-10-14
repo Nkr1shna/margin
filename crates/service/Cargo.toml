@@ -12,6 +12,13 @@ path = "src/main.rs"
 name = "margin_service"
 path = "src/lib.rs"
 
+[features]
+# Build the Linux paths on macOS, to check them here (both are always on for Linux):
+# the Linux readers' Tools rows and OCR warning, and Parakeet speech recognition (which
+# then transcribes in place of fluidaudiocli).
+linux-readers = ["margin-embed/linux-readers"]
+speech-onnx = ["margin-embed/speech-onnx"]
+
 [dependencies]
 margin-shared.workspace = true
 margin-ai.workspace = true

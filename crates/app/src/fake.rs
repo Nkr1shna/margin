@@ -43,6 +43,10 @@ pub struct FakeState {
     pub public_url: String,
     pub media_dir: Option<std::path::PathBuf>,
     pub embedding: EmbeddingModelState,
+    /// The speech model, as a Linux service reports it; `None` as on a Mac.
+    pub speech: Option<EmbeddingModelState>,
+    /// The re-index with a new embedder, while it runs.
+    pub reindex: Option<ReindexProgress>,
     /// Uploaded sources' bytes, served as their originals.
     pub source_files: HashMap<Id, Vec<u8>>,
     /// Uploads in parts (`routes::SOURCE_UPLOADS`) still arriving.
@@ -90,6 +94,10 @@ pub struct PartUpload {
 pub const EMBEDDING_REPO: &str = "FluidInference/embeddinggemma-2-coreml";
 /// What the fake says the model download weighs.
 pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 1_480_000_000;
+/// Hugging Face repo of the speech model a Linux service downloads.
+pub const SPEECH_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+/// What the fake says the speech model download weighs.
+pub const SPEECH_DOWNLOAD_BYTES: u64 = 670_000_000;
 
 #[derive(Clone)]
 pub struct Fake {
@@ -549,6 +557,8 @@ impl FakeState {
             embedding: EmbeddingModelState::NotDownloaded {
                 download_bytes: EMBEDDING_DOWNLOAD_BYTES,
             },
+            speech: None,
+            reindex: None,
             source_files: HashMap::new(),
             part_uploads: HashMap::new(),
             parts_received: 0,
@@ -583,6 +593,11 @@ impl FakeState {
         EmbeddingModel {
             repo: EMBEDDING_REPO.into(),
             state: self.embedding.clone(),
+            speech: self.speech.clone().map(|state| SpeechModel {
+                repo: SPEECH_REPO.into(),
+                state,
+            }),
+            reindex: self.reindex,
         }
     }
 
@@ -750,6 +765,8 @@ pub fn router(fake: Fake) -> Router {
             get(get_embedding).delete(delete_embedding),
         )
         .route("/api/embedding/download", post(download_embedding))
+        .route(routes::SPEECH_MODEL, axum::routing::delete(delete_speech))
+        .route(routes::SPEECH_MODEL_DOWNLOAD, post(download_speech))
         .route("/api/chats", get(list_chats).post(create_chat))
         .route(
             "/api/chats/{id}",
@@ -1803,6 +1820,7 @@ async fn patch_settings(
 /// `ingest.rs`, `retrieval.rs`), by kind (`STAGE_KINDS`).
 pub const FAKE_STAGES: &[(&str, &[&str])] = &[
     ("chunker", &["pages-v1", "sections-v2"]),
+    ("embedder", &["coreml"]),
     (
         "retriever",
         &["bm25", "dense", "hybrid-linear", "hybrid-rrf"],
@@ -2608,6 +2626,98 @@ async fn delete_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Respo
         },
     );
     Json(model).into_response()
+}
+
+/// Sets the speech model's state and sends the model; `None` when there is none.
+fn set_speech(fake: &Fake, state: EmbeddingModelState) -> Option<EmbeddingModel> {
+    let model = {
+        let mut s = fake.state.lock().unwrap();
+        s.speech.as_ref()?;
+        s.speech = Some(state);
+        s.embedding_model()
+    };
+    publish(
+        fake,
+        Event::EmbeddingModelChanged {
+            model: model.clone(),
+        },
+    );
+    Some(model)
+}
+
+fn no_speech_model() -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "no_speech_model",
+        "This service transcribes with an installed program (Settings → Tools), not a model it downloads.",
+    )
+}
+
+async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (current, simulate) = {
+        let s = fake.state.lock().unwrap();
+        (s.speech.clone(), s.simulate)
+    };
+    match current {
+        None => return no_speech_model(),
+        Some(EmbeddingModelState::Downloading { .. } | EmbeddingModelState::Ready { .. }) => {
+            return Json(fake.state.lock().unwrap().embedding_model()).into_response();
+        }
+        Some(_) => {}
+    }
+    let model = set_speech(
+        &fake,
+        EmbeddingModelState::Downloading {
+            received: 0,
+            total: SPEECH_DOWNLOAD_BYTES,
+        },
+    );
+    if simulate {
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            let total = SPEECH_DOWNLOAD_BYTES;
+            for step in 1..=5u64 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let downloading = matches!(
+                    fake.state.lock().unwrap().speech,
+                    Some(EmbeddingModelState::Downloading { .. })
+                );
+                if !downloading {
+                    return;
+                }
+                set_speech(
+                    &fake,
+                    if step == 5 {
+                        EmbeddingModelState::Ready { bytes: total }
+                    } else {
+                        EmbeddingModelState::Downloading {
+                            received: total * step / 5,
+                            total,
+                        }
+                    },
+                );
+            }
+        });
+    }
+    Json(model).into_response()
+}
+
+async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    match set_speech(
+        &fake,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: SPEECH_DOWNLOAD_BYTES,
+        },
+    ) {
+        Some(model) => Json(model).into_response(),
+        None => no_speech_model(),
+    }
 }
 
 async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {

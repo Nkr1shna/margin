@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use margin_embed::{
-    CHUNK_TOKENS, Chunk, Embedder, Extracted, FLUIDAUDIOCLI, ImageTokens, Page, Purpose,
-    SourceKind, Transcript, audio_windows, sample_ms,
+    CHUNK_TOKENS, Chunk, Embedder, Extracted, ImageTokens, Page, Purpose, SourceKind, Transcript,
+    audio_windows, sample_ms,
 };
 use margin_shared::context::{
     ACCESS_COMPANY, ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality,
@@ -932,12 +932,7 @@ async fn prepare(
                 match tokio::task::spawn_blocking(move || tools.transcribe(&samples, &work)).await?
                 {
                     Ok(Some(t)) => transcript = Some(t),
-                    Ok(None) => {
-                        no_transcript = Some(format!(
-                            "{FLUIDAUDIOCLI} isn't installed on the service (Settings → \
-                             Tools shows how to install it)"
-                        ))
-                    }
+                    Ok(None) => no_transcript = Some(state.source_tools.no_transcriber()),
                     Err(e) => no_transcript = Some(e.to_string()),
                 }
                 if let Some(why) = &no_transcript {
@@ -961,7 +956,17 @@ async fn prepare(
         }
     };
     let pages = extracted.pages.iter().filter_map(|p| p.number).max();
-    let warning = no_transcript.map(|why| sources::transcript_warning(kind, &why));
+    let no_ocr = needs_ocr(kind, &extracted)
+        .then(|| state.source_tools.ocr_missing())
+        .flatten()
+        .map(|why| sources::ocr_warning(kind, &why));
+    let warning = [
+        no_transcript.map(|why| sources::transcript_warning(kind, &why)),
+        no_ocr,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|a, b| format!("{a} {b}"));
     let sound = extracted.sound.clone().map(Arc::new);
 
     let (tools, counter, doc_c) = (state.source_tools.clone(), embedder.clone(), doc.clone());
@@ -990,6 +995,21 @@ async fn prepare(
         warning,
         sound,
     })
+}
+
+/// Whether reading `doc` needed OCR: an image, or a PDF with a page whose text layer is
+/// (nearly) empty, a scan, which the PDF reader OCRs.
+fn needs_ocr(kind: SourceKind, doc: &Extracted) -> bool {
+    /// The PDF reader OCRs pages with fewer non-space characters than this.
+    const SCAN_CHARS: usize = 16;
+    match kind {
+        SourceKind::Image => true,
+        SourceKind::Pdf => doc
+            .pages
+            .iter()
+            .any(|p| p.text.chars().filter(|c| !c.is_whitespace()).count() < SCAN_CHARS),
+        _ => false,
+    }
 }
 
 fn bytes_hash(path: &Path) -> anyhow::Result<String> {
@@ -1957,11 +1977,21 @@ pub async fn reembed(state: &AppState) -> anyhow::Result<()> {
         }
         for (i, d) in docs.iter().enumerate() {
             tracing::info!("re-indexing {} of {total} documents ({})", i + 1, d.name);
+            // Settings → Sources: "Re-indexing 3 of 12 documents".
+            embedding::set_reindex(
+                state,
+                Some(margin_shared::ReindexProgress {
+                    done: i as u64,
+                    total: total as u64,
+                }),
+            )
+            .await;
             if let Err(e) = ingest(state, &d.id).await {
                 tracing::warn!("document {} couldn't be re-embedded: {e:#}", d.id);
             }
         }
         if total > 0 {
+            embedding::set_reindex(state, None).await;
             tracing::info!("every document is embedded with {version}");
         }
     }

@@ -1064,7 +1064,27 @@ async fn a_new_embedder_re_embeds_every_document_once_keeping_its_passages() {
         .unwrap();
     assert!(h.state.store.passages_of(&s.id).await.unwrap()[0].embedder == "older-embedder");
 
+    let mut socket = h.socket(&t).await;
     reembed(&h.state).await.unwrap();
+    // Settings → Sources shows the pass while it runs, and nothing once it's done.
+    let events = socket
+        .until(|e| matches!(e, Event::EmbeddingModelChanged { model } if model.reindex.is_none()))
+        .await;
+    let progress: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::EmbeddingModelChanged { model } => Some(model.reindex),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        progress,
+        [
+            Some(margin_shared::ReindexProgress { done: 0, total: 1 }),
+            None
+        ]
+    );
+    assert_eq!(embedding(&h, &t).await.reindex, None);
     let after = h.state.store.passages_of(&s.id).await.unwrap();
     // Same rows (ids, texts, places), the current model's vectors and version again.
     assert_eq!(after, before);
@@ -1658,4 +1678,147 @@ async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows(
     .await;
     assert_eq!(chunks(&h, "s-a").await.len(), 3);
     assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_speech_model_downloads_shows_and_can_be_deleted_where_the_service_uses_one() {
+    use margin_shared::SpeechModel;
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    // A service that transcribes with an installed program has no speech model.
+    assert_eq!(embedding(&h, &t).await.speech, None);
+    for r in [
+        h.post(&t, routes::SPEECH_MODEL_DOWNLOAD),
+        h.delete(&t, routes::SPEECH_MODEL),
+    ] {
+        let (status, err) = api_error(r.send().await.unwrap()).await;
+        assert_eq!((status, err.code.as_str()), (409, "no_speech_model"));
+    }
+
+    h.source_tools
+        .has_speech_model
+        .store(true, Ordering::SeqCst);
+    let not_downloaded = Some(SpeechModel {
+        repo: FAKE_SPEECH_REPO.into(),
+        state: EmbeddingModelState::NotDownloaded {
+            download_bytes: FAKE_SPEECH_BYTES,
+        },
+    });
+    assert_eq!(embedding(&h, &t).await.speech, not_downloaded);
+    // Without it, recordings are read without a transcript and say where to get it.
+    let audio = upload_ok(&h, &t, "talk.mp3", None, "waves carry energy").await;
+    let audio = wait_source(&h, &t, &audio.id, is_ready).await;
+    match &audio.status {
+        SourceStatus::Ready {
+            warning: Some(warning),
+            ..
+        } => assert!(
+            warning.contains("the speech model isn't downloaded (Settings → Sources"),
+            "{warning}"
+        ),
+        other => panic!("expected Ready with a warning, got {other:?}"),
+    }
+    h.source_tools.speech.fail.store(true, Ordering::SeqCst);
+    let mut socket = h.socket(&t).await;
+    let m: EmbeddingModel = h
+        .post(&t, routes::SPEECH_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        m.speech.unwrap().state,
+        EmbeddingModelState::Downloading { .. }
+    ));
+    let failed = eventually(|| async {
+        let s = embedding(&h, &t).await.speech.unwrap();
+        matches!(s.state, EmbeddingModelState::Failed { .. }).then_some(s)
+    })
+    .await;
+    assert!(
+        matches!(&failed.state, EmbeddingModelState::Failed { error } if error.contains("offline")),
+        "{failed:?}"
+    );
+
+    // Retried: progress arrives as events, the embedding model's part unchanged.
+    h.post(&t, routes::SPEECH_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap();
+    // Deleting while it downloads is refused.
+    let (status, err) = api_error(h.delete(&t, routes::SPEECH_MODEL).send().await.unwrap()).await;
+    assert_eq!((status, err.code.as_str()), (409, "model_downloading"));
+    let events = socket
+        .until(|e| {
+            matches!(e, Event::EmbeddingModelChanged { model }
+                if matches!(model.speech.as_ref().map(|s| &s.state), Some(EmbeddingModelState::Ready { .. })))
+        })
+        .await;
+    let models: Vec<&EmbeddingModel> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::EmbeddingModelChanged { model } => Some(model),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        models.iter().any(|m| matches!(
+            m.speech.as_ref().unwrap().state,
+            EmbeddingModelState::Downloading { received, total: FAKE_SPEECH_BYTES } if received > 0
+        )),
+        "{models:?}"
+    );
+    assert!(models.iter().all(|m| m.state == models[0].state));
+    assert_eq!(
+        embedding(&h, &t).await.speech.unwrap().state,
+        EmbeddingModelState::Ready {
+            bytes: FAKE_SPEECH_BYTES
+        }
+    );
+    // Downloaded already: nothing to do.
+    h.post(&t, routes::SPEECH_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h.source_tools.speech.downloads.load(Ordering::SeqCst), 2);
+
+    let m: EmbeddingModel = h
+        .delete(&t, routes::SPEECH_MODEL)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(m.speech, not_downloaded);
+    assert_eq!(h.source_tools.speech.removes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_ocr_pictures_are_ready_with_a_warning() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    h.source_tools.no_ocr.store(true, Ordering::SeqCst);
+    let image = upload_ok(&h, &t, "board.png", None, "a whiteboard").await;
+    let image = wait_source(&h, &t, &image.id, is_ready).await;
+    match &image.status {
+        SourceStatus::Ready {
+            warning: Some(warning),
+            ..
+        } => {
+            assert!(warning.contains("without the text in it"), "{warning}");
+            assert!(warning.contains("tesseract"), "{warning}");
+        }
+        other => panic!("expected Ready with a warning, got {other:?}"),
+    }
+    // Text needs no OCR.
+    let text = upload_ok(&h, &t, "notes.md", None, FOURIER).await;
+    let text = wait_source(&h, &t, &text.id, is_ready).await;
+    assert!(
+        matches!(text.status, SourceStatus::Ready { warning: None, .. }),
+        "{:?}",
+        text.status
+    );
 }

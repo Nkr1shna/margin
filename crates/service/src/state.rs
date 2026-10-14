@@ -231,6 +231,15 @@ pub struct App {
     pub model_job: Mutex<ModelJob>,
     /// Bytes a download fetches, once Hugging Face has told us.
     pub model_download_bytes: Mutex<Option<u64>>,
+    /// The speech model's download in progress or the last one's failure
+    /// (`SourceTools::speech_model`).
+    pub speech_job: Mutex<ModelJob>,
+    /// Bytes the speech model's download fetches, once Hugging Face has told us.
+    pub speech_download_bytes: Mutex<Option<u64>>,
+    /// The re-index with a new embedder (`ingest::reembed`) while it runs.
+    pub reindex: Mutex<Option<margin_shared::ReindexProgress>>,
+    /// The last `EmbeddingModel` sent, so a progress event changes only its own part.
+    pub last_model: Mutex<Option<margin_shared::EmbeddingModel>>,
     /// Sources to read, one at a time.
     pub source_queue: mpsc::UnboundedSender<Id>,
     /// Uploads in parts a request is working on (`uploads`), one request at a time each.
@@ -464,7 +473,7 @@ impl App {
             render_fps: row.render_fps,
             reasoning_effort: row.reasoning_effort,
             agent_model: row.agent_model,
-            pipeline: row.pipeline,
+            pipeline: row.pipeline.with_embedder(self.model_files.backend.name()),
             trace_retention_days: row.trace_retention_days,
         })
     }

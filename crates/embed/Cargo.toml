@@ -37,7 +37,7 @@ linux-readers = ["dep:pdfium-render", "dep:image"]
 # package builds with `--no-default-features`.
 heic = ["dep:libheif-rs"]
 # Parakeet speech recognition on the same ONNX Runtime.
-speech-onnx = ["dep:parakeet-rs"]
+speech-onnx = ["onnx", "dep:parakeet-rs"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "half", "tracing", "download-binaries", "copy-dylibs", "tls-rustls", "api-31"] }
