@@ -237,10 +237,8 @@ async fn revoking_a_device_rejects_its_token_and_closes_its_socket() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    match sock_b.next_frame().await {
-        Frame::Closed(code) => assert_eq!(code, Some(1008)),
-        Frame::Event(e) => panic!("expected close, got {e:?}"),
-    }
+    // After presence and revocation events.
+    assert_eq!(sock_b.closed().await, Some(1008));
     assert_eq!(h.get(&b, "/api/me").send().await.unwrap().status(), 401);
     assert_eq!(h.get(&a, "/api/me").send().await.unwrap().status(), 200);
     assert_eq!(
@@ -269,10 +267,7 @@ async fn revoking_a_device_rejects_its_token_and_closes_its_socket() {
             .status(),
         204
     );
-    assert!(matches!(
-        sock_a.next_frame().await,
-        Frame::Closed(Some(1008))
-    ));
+    assert_eq!(sock_a.closed().await, Some(1008));
     assert_eq!(h.get(&a, "/api/me").send().await.unwrap().status(), 401);
 }
 

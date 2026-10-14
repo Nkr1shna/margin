@@ -1,5 +1,6 @@
 //! Assembles the service: state, routes, background workers, recovery, serving.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use axum::{Router, http::StatusCode};
 use chrono::Utc;
 use margin_embed::ModelFiles;
 use margin_shared::{
-    LessonStatus, Proposal, ProposalStatus, Source, SourceStatus, VideoStatus, routes,
+    Chat, LessonStatus, Proposal, ProposalStatus, Source, SourceStatus, VideoStatus, routes,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
@@ -28,8 +29,8 @@ use crate::secrets::{SecretStore, media_signing_key};
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
 use crate::turns::Turns;
 use crate::{
-    ask, chats, embedding, events, library, media, search, settings, sources, uploads, video,
-    workspaces,
+    ask, chats, embedding, events, library, media, search, settings, sources, turns, uploads,
+    video, workspaces,
 };
 
 pub struct Options {
@@ -279,7 +280,8 @@ pub struct Resume {
 
 /// Jobs a crash left mid-way are marked failed ("Interrupted when the service
 /// stopped."); lessons and videos still Queued are queued again. Sources being read are
-/// read again from the start; uploads never attached to a topic are deleted after 24 h.
+/// read again from the start; uploads never attached to a topic or a chat are deleted
+/// after 24 h. Chat turns left running become Interrupted (`turns::recover`).
 pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
     let _w = state.write_lock.lock().await;
     let now = Utc::now();
@@ -289,10 +291,19 @@ pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
         sources: Vec::new(),
     };
 
+    // Files attached to a chat stay while the chat exists.
+    let chats: Vec<Chat> = state.store.list(db::CHAT).await?;
+    let in_chats: HashSet<&str> = chats
+        .iter()
+        .flat_map(|c| c.source_ids.iter().map(String::as_str))
+        .collect();
     let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
     sources.sort_by_key(|s| s.created_at);
     for mut s in sources {
-        if s.topic_id.is_none() && now - s.created_at > sources::UNATTACHED_TTL {
+        if s.topic_id.is_none()
+            && !in_chats.contains(s.id.as_str())
+            && now - s.created_at > sources::UNATTACHED_TTL
+        {
             tracing::info!(
                 "deleting source {} ({}): never attached to a topic",
                 s.id,
@@ -369,6 +380,7 @@ pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
             state.store.put(db::PROPOSAL, &p.id.clone(), &p).await?;
         }
     }
+    turns::recover(state).await?;
     if !resume.lessons.is_empty() || !resume.videos.is_empty() || !resume.sources.is_empty() {
         tracing::info!(
             lessons = resume.lessons.len(),

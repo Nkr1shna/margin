@@ -989,6 +989,20 @@ pub async fn passages(state: &AppState, source_ids: &[Id], query: &str) -> Vec<R
     }
 }
 
+/// `passages` for the agent's `search_sources`: waits at most `wait` for sources still
+/// being read, and says why retrieval failed instead of going on without it.
+pub async fn passages_within(
+    state: &AppState,
+    source_ids: &[Id],
+    query: &str,
+    wait: Duration,
+) -> anyhow::Result<Vec<Retrieved>> {
+    if source_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    retrieve(state, source_ids, query, wait).await
+}
+
 /// Something retrieval can pick.
 enum Candidate {
     Text(ChunkRow),

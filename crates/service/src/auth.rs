@@ -11,7 +11,9 @@ use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
-use margin_shared::{Device, Id, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest};
+use margin_shared::{
+    Device, Event, Id, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
+};
 use serde::Deserialize;
 
 use crate::db;
@@ -584,8 +586,12 @@ pub async fn revoke_device(
             return Err(AppError::not_found("device"));
         }
         state.store.delete(db::DEVICE, &id).await?;
+        // Its folders can't be read any more.
+        crate::workspaces::delete_for_device_locked(&state, &id).await?;
     }
     let _ = state.revocations.send(id.clone());
+    state.devices.forget_device(&id);
+    state.emit(Event::DeviceDeleted { id: id.clone() });
     tracing::info!(device = %id, "device revoked");
     Ok(StatusCode::NO_CONTENT)
 }
