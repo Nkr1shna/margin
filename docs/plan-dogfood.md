@@ -11,7 +11,7 @@ The slice is one small area, **D (dogfood)**, plus two habits. It uses what R1 a
 | `docs/*.md`, `PLAN.md`, the briefs, `docs/agent-contract.md` | `margin-mcp ingest-dir docs PLAN.md` (D), one document per file, name `docs/<file>@<short sha>`, origin `agent:repo`; re-run replaces by name (same `ingest` diff-by-hash path R1-store builds) | from day one, by hand; then a `post-commit` hook on `claude/agent-build` |
 | Design decisions | `margin-mcp ingest --name "Decision: <topic>" --kind decision -` from the session that records them (also written to agent memory, §3) | each time one is made |
 | The owner's chats with Margin's agent | R1-store indexes `Origin::Library { kind: Chat }` on `Write` of a chat. **Check at integration**: if R1-store skips library origins, D adds `margin-mcp ingest-chats` over `GET /api/chats` until it does | automatic |
-| Claude Code session summaries | the `/margin-handoff` skill (D) writes a ≤ 60-line summary (what changed, why, open items, commit hashes) and calls `ingest_document` with actor `agent:claude-code` | end of every build session |
+| Claude Code session summaries | **automatic** (owner decision, 2026-10-14): a `SessionEnd` hook in `.claude/settings.json` runs `scripts/claude-session-summary.sh`, which builds a ≤ 60-line summary from facts (the session's commits, what is changed and not committed, where the session ended) and calls `margin-mcp ingest --kind handoff` (actor `agent:claude-code`); with no `margin-mcp`, no sign-in or no service it fails quietly. The `/margin-handoff` skill stays for a fuller hand-written handoff and the session's decisions | end of every session, automatically |
 | Source code | **not** through D. Code waits for the repository source (L6 / "after phase 5"). Until then Claude Code reads code from the checkout as it does today; the KB holds *why*, not *what* | — |
 | Non-repo material (PDFs, screenshots, mockups) | phase 4: attach the folder from the desktop app once 4a merges | after phase 4 |
 
@@ -31,9 +31,9 @@ Why a CLI for `docs/` instead of attaching the folder: the CLI is git-aware (the
 
 Auth: `margin-mcp login` runs the existing device sign-in (`POST /auth/start` with `device_name: "Claude Code (<host>)"`, opens the GitHub URL, polls `/auth/poll`) and stores the minted token in the macOS Keychain (`keyring` crate, service `margin-mcp`). It shows in Settings → Devices and is revoked there like any device. No token in a file, none in the repo. Server URL from `~/.config/margin/mcp.toml` (`url = "https://margin.krishnanelloore.com"`); tests pass an explicit URL to a fake.
 
-Wiring: `.mcp.json` at the repo root (`{"mcpServers":{"margin":{"command":"margin-mcp","args":["serve"]}}}`) and three lines in `CLAUDE.md`: search Margin before reading docs for context; record decisions with `ingest_document`; run `/margin-handoff` before ending. `cargo install --path crates/mcp` puts the binary on PATH.
+Wiring: `.mcp.json` at the repo root (`{"mcpServers":{"margin":{"command":"margin-mcp","args":["serve"]}}}`) and three lines in `CLAUDE.md`: search Margin before reading docs for context; record decisions with `ingest_document`; the session summary is saved automatically at the end (`/margin-handoff` adds a fuller one). `cargo install --path crates/mcp` puts the binary on PATH.
 
-Write-back is explicit, never ambient: only the handoff skill and deliberate `ingest_document` calls write; tool results and transcripts are not auto-ingested (noise, and prompts in transcripts are untrusted text).
+Write-back is bounded: the end-of-session summary hook, the handoff skill and deliberate `ingest_document` calls write; tool results and transcripts are not ingested (the hook keeps only the session's last answer, not the transcript) (noise, and prompts in transcripts are untrusted text).
 
 ## 3. Relation to the SurrealDB agent memory (Spectron, scope `project/margin`)
 
@@ -54,7 +54,7 @@ Prerequisites, all in the current queue:
 
 The D area (worktree `agent/d-mcp`, files exclusive):
 - `crates/mcp/` (new, `publish = false`): `Cargo.toml`, `src/{main,serve,login,ingest,client}.rs`, `tests/` on a fake axum service (the fake implements the four routes and `/auth/*` in memory, like the fake Responses server).
-- `.mcp.json`, `.claude/skills/margin-handoff/SKILL.md`, `scripts/ingest-docs.sh` (the post-commit hook body; the hook itself is installed by hand, never committed into `.git`).
+- `.mcp.json`, `.claude/skills/margin-handoff/SKILL.md`, `.claude/settings.json` + `scripts/claude-session-summary.sh` (the automatic summary), `scripts/ingest-docs.sh` (the post-commit hook body; the hook itself is installed by hand, never committed into `.git`).
 - `CLAUDE.md`: three added lines. `docs/HANDOFF.md`: a D row. `Cargo.toml` (workspace): one member line, the only shared file, added in the first commit before branching.
 - "Project: Margin" bootstrap: none. R1 creates exactly one project ("My library") and the context API resolves inside it; renaming or a second project is multi-project work R1 explicitly defers. The owner's whole library *is* the Margin project until then.
 
@@ -82,5 +82,5 @@ Order: **R1 + phase 4 (building) ∥ D (now, on the fake)** → owner installs R
 4. **`docs/` via the git-aware CLI (recommended) or by attaching the folder once 4a ships?** Recommend CLI for the repo, folders for everything else; never both for the same files.
 5. **Token in the macOS Keychain (recommended) or a 0600 file for Linux CI boxes?** Keychain; there is no CI use.
 6. **Commit `.mcp.json` and the skill to the repo?** Recommend yes; they carry no secrets and every clone gets the setup.
-7. **Should the handoff summary be mandatory (a `Stop` hook that refuses to end without it)?** Recommend no: a skill the owner invokes; a hook makes every short session noisy.
+7. **Should the handoff summary be mandatory?** Decided (owner, 2026-10-14): yes, automatic: a `SessionEnd` hook (once per session, not `Stop`, which fires after every answer) saves the summary and never blocks or fails the session; a session with no commits, changes or answer writes nothing.
 8. **Should chats with Margin's agent be in the KB by default?** Recommend yes (single user today; L2 scopes them when principals exist).

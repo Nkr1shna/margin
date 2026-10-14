@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 pub mod agent;
-#[cfg(feature = "r1-ai")]
 pub mod ai_judge;
 pub mod ci;
 pub mod citations;

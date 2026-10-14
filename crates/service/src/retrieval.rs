@@ -220,7 +220,18 @@ fn subtree(topics: &[Topic], id: &str) -> Vec<Id> {
 pub async fn resolve(store: &Store, scope: &Scope) -> anyhow::Result<Resolved> {
     let catalog = Catalog::load(store).await?;
     let mut out = Resolved::default();
-    resolve_into(store, &catalog, scope, &mut out).await?;
+    resolve_into(store, &catalog, scope, true, &mut out).await?;
+    Ok(out)
+}
+
+/// `resolve` for the index query itself: an id with no record behind it is kept as a
+/// key (`id IN scope_ids`, `document_id IN ids`) instead of refused, so passages filed
+/// under a scope id alone (the eval index's topic and folder) are found. Callers check
+/// the scope with `resolve` first.
+pub async fn resolve_for_index(store: &Store, scope: &Scope) -> anyhow::Result<Resolved> {
+    let catalog = Catalog::load(store).await?;
+    let mut out = Resolved::default();
+    resolve_into(store, &catalog, scope, false, &mut out).await?;
     Ok(out)
 }
 
@@ -228,6 +239,7 @@ fn resolve_into<'a>(
     store: &'a Store,
     catalog: &'a Catalog,
     scope: &'a Scope,
+    strict: bool,
     out: &'a mut Resolved,
 ) -> BoxFuture<'a, anyhow::Result<()>> {
     Box::pin(async move {
@@ -241,15 +253,17 @@ fn resolve_into<'a>(
                         if let Origin::Source { source_id } = &d.origin {
                             catalog.add_source(out, source_id);
                         }
-                    } else {
+                    } else if strict {
                         return Err(
                             BadScope(format!("There is no source or document {id}.")).into()
                         );
+                    } else {
+                        out.add_key(id);
                     }
                 }
             }
             Scope::Topic { id } => {
-                if !catalog.topics.iter().any(|t| &t.id == id) {
+                if strict && !catalog.topics.iter().any(|t| &t.id == id) {
                     return Err(BadScope(format!("There is no topic {id}.")).into());
                 }
                 let within = subtree(&catalog.topics, id);
@@ -264,7 +278,11 @@ fn resolve_into<'a>(
             }
             Scope::Chat { id } => {
                 let Some(chat) = store.get::<Chat>(db::CHAT, id).await? else {
-                    return Err(BadScope(format!("There is no chat {id}.")).into());
+                    if strict {
+                        return Err(BadScope(format!("There is no chat {id}.")).into());
+                    }
+                    out.add_key(id);
+                    return Ok(());
                 };
                 out.add_key(id);
                 for s in &chat.source_ids {
@@ -275,7 +293,7 @@ fn resolve_into<'a>(
                 }
             }
             Scope::Workspace { id } => {
-                if store.get::<Workspace>(db::WORKSPACE, id).await?.is_none() {
+                if strict && store.get::<Workspace>(db::WORKSPACE, id).await?.is_none() {
                     return Err(BadScope(format!("There is no folder {id}.")).into());
                 }
                 catalog.add_workspace(out, id);
@@ -288,7 +306,7 @@ fn resolve_into<'a>(
             }
             Scope::Union { scopes } => {
                 for s in scopes {
-                    resolve_into(store, catalog, s, out).await?;
+                    resolve_into(store, catalog, s, strict, out).await?;
                 }
             }
         }
@@ -422,7 +440,7 @@ struct Filter {
 
 impl Filter {
     async fn new(store: &Store, q: &Query) -> anyhow::Result<Self> {
-        let resolved = resolve(store, &q.scope).await?;
+        let resolved = resolve_for_index(store, &q.scope).await?;
         let access = match &q.access {
             Some(paths) => Some(visible_paths(store, paths).await?),
             None => None,

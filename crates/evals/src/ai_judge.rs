@@ -2,10 +2,6 @@
 //! `seriousness-v1`, `judge-v1`, `pair-v1`) and canary sets, sent through an
 //! [`EvalModel`] so either provider can judge (OpenAI with the prompt's strict JSON
 //! schema, Claude with a cache breakpoint after the constant block).
-//!
-//! Built with the `r1-ai` feature, which integration turns on (and then removes) when
-//! R1-ai's branch is merged: this file is written against its API (`agent/r1-ai`,
-//! commit 10c3a6a) and doesn't compile without it.
 
 use std::sync::Arc;
 

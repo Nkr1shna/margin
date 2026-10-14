@@ -875,3 +875,60 @@ async fn documents_read_by_ord_page_section_and_picture() {
     let h = context_hit(&pic, 0.5, None);
     assert_eq!((h.modality, h.page), (Modality::Picture, Some(2)));
 }
+
+#[tokio::test]
+async fn the_index_query_finds_scope_ids_without_records_behind_them() {
+    // The eval index files passages under a topic and a folder id alone.
+    let s = seeded().await;
+    let r = retriever(&s, "hybrid-rrf");
+    let hits = r
+        .search(&query("entropy", unit(1), Scope::Topic { id: "t1".into() }))
+        .await
+        .unwrap();
+    assert!(ids(&hits).contains(&"b"), "{:?}", ids(&hits));
+    assert!(!ids(&hits).contains(&"c"));
+    let hits = r
+        .search(&query(
+            "photosynthesis",
+            unit(2),
+            Scope::Sources {
+                ids: vec!["d2".into()],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ids(&hits), ["c"]);
+    // The checked resolution still refuses an unknown topic.
+    let err = resolve(&s, &Scope::Topic { id: "t1".into() })
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<BadScope>().is_some());
+}
+
+#[test]
+fn text_of_another_page_is_not_merged_in() {
+    let p = MmrV1::default();
+    let mk = |id, ord, page, score| Hit {
+        passage: row(P {
+            id,
+            doc: "pdf",
+            scope: &[],
+            modality: "text",
+            ord,
+            page: Some(page),
+            text: id,
+            v: unit(ord as usize),
+        }),
+        score,
+        dense_rank: None,
+        lex_rank: None,
+        rerank: None,
+        highlight: None,
+    };
+    let packed = p.pack(
+        vec![mk("one", 0, 1, 0.9), mk("two", 1, 2, 0.8)],
+        &budget(1_000_000, 8),
+    );
+    let pages: Vec<Option<u32>> = packed.iter().map(|p| p.citation.page).collect();
+    assert_eq!(pages, [Some(1), Some(2)]);
+}

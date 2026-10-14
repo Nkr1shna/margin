@@ -202,8 +202,8 @@ pub struct RecordSummary {
 pub async fn record_embeddings(env: &Env<'_>) -> anyhow::Result<RecordSummary> {
     let out_rec = env.paths.out.join(EMBEDDINGS_FILE);
     let seed = match Recording::load(&out_rec) {
-        Ok(r) if r.embedder_version == env.vectors.version() => r,
-        _ => Recording::new(env.vectors.version()),
+        Ok(r) if r.version == env.vectors.version() => r,
+        _ => Recording::for_version(env.vectors.version()),
     };
     let recording = RecordingVectors::new(env.vectors, seed)?;
     let mut chunkers = BTreeSet::new();
@@ -242,7 +242,7 @@ pub async fn record_embeddings(env: &Env<'_>) -> anyhow::Result<RecordSummary> {
     env.extraction.save(&env.paths.out.join(EXTRACTED_FILE))?;
     rec.save(&out_rec)?;
     Ok(RecordSummary {
-        vectors: rec.entries.len(),
+        vectors: rec.len().0,
         embedded,
         chunkers: chunkers.into_iter().collect(),
     })

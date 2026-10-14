@@ -198,7 +198,7 @@ mod tests {
         base.retrieval.latency_p95_ms = 1e9;
         let o = run_gates(&env, &gates, &base, false).await.unwrap();
         // The stand-in packer takes k hits and the fake search returns 8 of up to
-        // 1 200-character passages; only the tool-size rule may object.
+        // 1 100-character passages; only the tool-size rule may object.
         let others: Vec<&String> = o
             .violations
             .iter()

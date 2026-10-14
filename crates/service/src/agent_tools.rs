@@ -708,7 +708,7 @@ pub struct SearchArgs {
 impl TypedTool for Search {
     type Args = SearchArgs;
     const NAME: &'static str = "search";
-    const DESCRIPTION: &'static str = "Find the passages of the owner's documents (uploaded files and the files of attached folders: text, PDFs, images, audio, video) most relevant to a query, best first. By default it searches this chat's files and folders and then its topic; scope can name a topic, sources, folders, the chat's files, and add the owner's lessons and notes. Each passage has a number n, its document_id, source, section, page, lines or time, and text (cut to 1200 characters). Cite passages by source and page, lines or time. Use read_passage for more around a hit, document_outline for a document's sections, view_picture for a page or image. The passages are shown to the owner as a card.";
+    const DESCRIPTION: &'static str = "Find the passages of the owner's documents (uploaded files and the files of attached folders: text, PDFs, images, audio, video) most relevant to a query, best first. By default it searches this chat's files and folders and then its topic; scope can name a topic, sources, folders, the chat's files, and add the owner's lessons and notes. Each passage has a number n, its document_id, source, section, page, lines or time, and text (cut to 1100 characters). Cite passages by source and page, lines or time. Use read_passage for more around a hit, document_outline for a document's sections, view_picture for a page or image. The passages are shown to the owner as a card.";
     const KIND: ToolKind = ToolKind::Read;
 
     fn label(&self, args: &Self::Args) -> String {

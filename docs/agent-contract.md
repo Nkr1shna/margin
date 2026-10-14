@@ -546,7 +546,7 @@ agent's tools: one retrieval path for Margin's agent, external agents and the GU
 `margin_shared::CHAT_TITLE_MAX` 60; `chats::MAX_MESSAGE_BYTES` 32 KB.
 R1, `margin_shared::routes`: `RETRIEVAL_K_DENSE` 40, `RETRIEVAL_K_LEX` 40,
 `RETRIEVAL_K_FUSED` 24, `RRF_K` 60, `MMR_LAMBDA` 0.7, `TOOL_SEARCH_K_MAX` 12,
-`TOOL_OUTPUT_PASSAGE_CHARS` 1 200, `TOOL_READ_PASSAGES_MAX` 4;
+`TOOL_OUTPUT_PASSAGE_CHARS` 1 100, `TOOL_READ_PASSAGES_MAX` 4;
 `margin_shared::TRACE_RETENTION_DAYS` 90; `db::INSERT_MANY_MAX` 64;
 `retrieval::RETRIEVAL_CACHE_ENTRIES` 256; `trace::TRACE_CHANNEL` 4 096. `Budget`
 defaults: `share_of_window` 0.5, `min_score_pct` 25, `images_max` 8, `passages_min` 0

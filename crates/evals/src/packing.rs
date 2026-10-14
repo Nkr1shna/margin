@@ -205,12 +205,9 @@ mod tests {
         assert_eq!(one.text.chars().count(), TOOL_OUTPUT_PASSAGE_CHARS);
         let bytes = tool_output_bytes(&hits);
         assert!(bytes > TOOL_SEARCH_K_MAX * TOOL_OUTPUT_PASSAGE_CHARS);
-        // The contract's numbers don't fit together: twelve passages cut at 1 200
-        // characters plus their locators come to more than the 16 KB a tool output may
-        // be, so a search returning full-length chunks breaks the packing gate (and
-        // more so with non-ASCII text, where a character is several bytes). Reported to
-        // the orchestrator; the gate is what will show it on the corpus.
-        assert!(bytes > 16 * 1024, "{bytes}");
-        assert!(tool_output_bytes(&hits[..10]) < 16 * 1024);
+        // Twelve passages cut at `TOOL_OUTPUT_PASSAGE_CHARS` plus their locators fit the
+        // 16 KB a tool output may be (ASCII text; the tool drops the last passages when
+        // multi-byte text doesn't).
+        assert!(bytes <= 16 * 1024, "{bytes}");
     }
 }

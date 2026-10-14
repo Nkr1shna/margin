@@ -1,11 +1,11 @@
 ---
 name: margin-handoff
-description: End-of-session handoff for the Margin repo. Writes a short summary of this Claude Code session (what changed, why, open items, commit hashes) into Margin, the project's knowledge base, through the margin MCP server's ingest_document tool. Use when the owner runs /margin-handoff or asks to hand off or wrap up a build session.
+description: Fuller end-of-session handoff for the Margin repo (a factual summary is already saved automatically by the SessionEnd hook). Writes a short summary of this Claude Code session (what changed, why, open items, commit hashes) into Margin, the project's knowledge base, through the margin MCP server's ingest_document tool. Use when the owner runs /margin-handoff or asks to hand off or wrap up a build session.
 ---
 
 # /margin-handoff
 
-Write this session's handoff into Margin so the next session (and Margin's own agent) can find it.
+Write this session's handoff into Margin so the next session (and Margin's own agent) can find it. Every session already gets a factual summary at its end (commits, uncommitted changes, the last answer: `scripts/claude-session-summary.sh`, a `SessionEnd` hook); this skill adds the why, the open questions and the decisions.
 
 1. Gather the facts, don't guess them:
    - `git log --oneline <base>..HEAD` on the current branch (the base is the branch this work started from, usually `claude/agent-build`), and `git status --short`.

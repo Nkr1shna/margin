@@ -358,7 +358,7 @@ impl LiveVectors {
 #[cfg(target_os = "macos")]
 impl crate::recorded::Vectors for LiveVectors {
     fn version(&self) -> &str {
-        crate::recorded::EMBEDDER_VERSION
+        crate::recorded::embedder_version()
     }
     fn texts(
         &self,

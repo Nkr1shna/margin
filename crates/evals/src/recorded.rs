@@ -3,55 +3,43 @@
 //! record-embeddings` and replayed in CI so recall@k there is real, not bag of words
 //! (`docs/agent-rag-architecture.md` §3.1).
 //!
-//! # File format (`evals/recorded/embeddings.bin`)
-//!
-//! ```text
-//! b"MRGNVEC1"                       8 bytes, magic
-//! header_len: u32 LE                then header_len bytes of JSON:
-//!   {"embedder_version": "...", "dim": 768, "count": N}
-//! N entries, sorted by key:
-//!   key: [u8; 32]                   sha256(embedder_version ‖ 0x00 ‖ input)
-//!   vector: [f16 LE; dim]           IEEE half precision, L2-normalised before rounding
-//! ```
-//!
-//! `input` is exactly what the model is given: for a text the task prefix plus the text
-//! (`title: {title} | text: {chunk}`, `title: none | text: …` without a title, `task:
-//! search result | query: {query}`), for a picture `picture:{document}#{page}:{tokens}`
-//! (`page` empty for an image file; `tokens` the image encoder's soft-token count).
+//! The file is `margin_embed::fake::Recording`'s (one format and one reader for the
+//! service's `RecordedEmbedder` and the runner): f16 vectors keyed by `sha256(input)`,
+//! the embedder version in the header. `input` is exactly what the model is given: for
+//! a text the task prefix plus the text (`margin_embed::prompt`: `title: {title} |
+//! text: {chunk}`, `title: none | text: …` without a title, `task: search result |
+//! query: {query}`), the key `RecordedEmbedder::embed` looks up; for a picture
+//! `picture:{document}#{page}:{tokens}` (`page` empty for an image file; `tokens` the
+//! image encoder's soft-token count), so CI needn't render pages to find them.
 //! A text or picture that wasn't recorded is an error naming it, never a made-up
 //! vector, so a chunker change that cuts new chunk texts needs a deliberate re-record.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, bail};
 use margin_embed::fake::FakeEmbedder;
-use margin_embed::{DIM, Embedder, ImageTokens, Picture, Purpose};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use margin_embed::{Embedder, ImageTokens, Picture, Purpose};
 
 use crate::corpus::CorpusDoc;
 
 /// The embedder and prompt-prefix version the eval index is built with: EmbeddingGemma
-/// 2 with the document title prefix of §2.1. Stamped on every passage row, eval run and
-/// recording; `compare` refuses to compare runs across versions unless told to.
-pub const EMBEDDER_VERSION: &str = "embeddinggemma-2/title-prefix-v1";
+/// 2 with the document title prefix of §2.1 (`margin_embed::embedder_version()`).
+/// Stamped on every passage row, eval run and recording; `compare` refuses to compare
+/// runs across versions unless told to.
+pub fn embedder_version() -> &'static str {
+    margin_embed::embedder_version()
+}
 
 /// `evals/recorded/embeddings.bin`.
 pub const EMBEDDINGS_FILE: &str = "recorded/embeddings.bin";
 
-const MAGIC: &[u8; 8] = b"MRGNVEC1";
+pub use margin_embed::fake::Recording;
 
-/// What the model is given for `text` with `purpose`.
+/// What the model is given for `text` with `purpose` (the task prefix, then the text).
 pub fn model_input(purpose: &Purpose, text: &str) -> String {
-    match purpose {
-        Purpose::Document { title } => format!(
-            "title: {} | text: {text}",
-            title.as_deref().filter(|t| !t.is_empty()).unwrap_or("none")
-        ),
-        Purpose::Query => format!("task: search result | query: {text}"),
-    }
+    format!("{}{text}", margin_embed::prompt(purpose))
 }
 
 /// The input string standing for a picture.
@@ -61,16 +49,6 @@ pub fn picture_input(document: &str, page: Option<u32>, tokens: ImageTokens) -> 
         page.map(|p| p.to_string()).unwrap_or_default(),
         tokens.count()
     )
-}
-
-pub type Key = [u8; 32];
-
-pub fn key(embedder_version: &str, input: &str) -> Key {
-    let mut h = Sha256::new();
-    h.update(embedder_version.as_bytes());
-    h.update([0]);
-    h.update(input.as_bytes());
-    h.finalize().into()
 }
 
 /// Where the eval index gets its vectors: the recording (CI), the real model (the
@@ -83,114 +61,14 @@ pub trait Vectors: Send + Sync {
     fn picture(&self, doc: &CorpusDoc, pic: &Picture, text: &str) -> anyhow::Result<Vec<f32>>;
 }
 
-/// A set of recorded vectors, to write or to replay.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Recording {
-    pub embedder_version: String,
-    pub entries: BTreeMap<Key, Vec<f32>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Header {
-    embedder_version: String,
-    dim: usize,
-    count: usize,
-}
-
-impl Recording {
-    pub fn new(embedder_version: &str) -> Self {
-        Self {
-            embedder_version: embedder_version.to_string(),
-            entries: BTreeMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, input: &str, vector: Vec<f32>) {
-        self.entries
-            .insert(key(&self.embedder_version, input), vector);
-    }
-
-    pub fn get(&self, input: &str) -> Option<&Vec<f32>> {
-        self.entries.get(&key(&self.embedder_version, input))
-    }
-
-    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        let header = serde_json::to_vec(&Header {
-            embedder_version: self.embedder_version.clone(),
-            dim: DIM,
-            count: self.entries.len(),
-        })?;
-        let mut out = Vec::with_capacity(12 + header.len() + self.entries.len() * (32 + DIM * 2));
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(header.len() as u32).to_le_bytes());
-        out.extend_from_slice(&header);
-        for (k, v) in &self.entries {
-            anyhow::ensure!(
-                v.len() == DIM,
-                "a vector has {} dimensions, not {DIM}",
-                v.len()
-            );
-            out.extend_from_slice(k);
-            for x in v {
-                out.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-        if bytes.len() < 12 || &bytes[..8] != MAGIC {
-            bail!("not a Margin embeddings recording");
-        }
-        let hlen = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-        let header: Header = serde_json::from_slice(
-            bytes
-                .get(12..12 + hlen)
-                .context("the recording's header is cut off")?,
-        )?;
-        let mut pos = 12 + hlen;
-        let entry = 32 + header.dim * 2;
-        anyhow::ensure!(
-            bytes.len() == pos + header.count * entry,
-            "the recording holds {} bytes of entries, not {} × {entry}",
-            bytes.len() - pos,
-            header.count
-        );
-        let mut entries = BTreeMap::new();
-        for _ in 0..header.count {
-            let k: Key = bytes[pos..pos + 32].try_into()?;
-            let v = bytes[pos + 32..pos + entry]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| half::f16::from_le_bytes(*b).to_f32())
-                .collect();
-            entries.insert(k, v);
-            pos += entry;
-        }
-        Ok(Self {
-            embedder_version: header.embedder_version,
-            entries,
-        })
-    }
-
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path).with_context(|| {
-            format!(
-                "couldn't read {} (run `margin-eval record-embeddings` on the service Mac)",
-                path.display()
-            )
-        })?;
-        Self::from_bytes(&bytes).with_context(|| format!("bad {}", path.display()))
-    }
-
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, self.to_bytes()?)
-            .with_context(|| format!("couldn't write {}", path.display()))
-    }
+/// Reads a recording, saying how to make one when it is missing.
+pub fn load(path: &Path) -> anyhow::Result<Recording> {
+    Recording::load(path).with_context(|| {
+        format!(
+            "couldn't read {} (run `margin-eval record-embeddings` on the service Mac)",
+            path.display()
+        )
+    })
 }
 
 fn short(input: &str) -> String {
@@ -218,11 +96,11 @@ impl RecordedVectors {
     }
 
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Ok(Self::new(Recording::load(path)?))
+        Ok(Self::new(load(path)?))
     }
 
     fn lookup(&self, input: &str) -> anyhow::Result<Vec<f32>> {
-        match self.recording.get(input) {
+        match self.recording.get_input(input) {
             Some(v) => Ok(v.clone()),
             None => {
                 self.misses.lock().unwrap().push(short(input));
@@ -230,7 +108,7 @@ impl RecordedVectors {
                     "no recorded vector for \"{}\" (embedder {}): the chunker or the corpus \
                      changed since the recording; re-run `margin-eval record-embeddings`",
                     short(input),
-                    self.recording.embedder_version
+                    self.recording.version
                 )
             }
         }
@@ -239,7 +117,7 @@ impl RecordedVectors {
 
 impl Vectors for RecordedVectors {
     fn version(&self) -> &str {
-        &self.recording.embedder_version
+        &self.recording.version
     }
     fn texts(&self, texts: &[String], purpose: &Purpose) -> anyhow::Result<Vec<Vec<f32>>> {
         texts
@@ -267,9 +145,9 @@ pub struct RecordingVectors<'a> {
 impl<'a> RecordingVectors<'a> {
     pub fn new(inner: &'a dyn Vectors, seed: Recording) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            seed.embedder_version == inner.version(),
+            seed.version == inner.version(),
             "the existing recording is of {}, the embedder is {}",
-            seed.embedder_version,
+            seed.version,
             inner.version()
         );
         Ok(Self {
@@ -285,9 +163,7 @@ impl<'a> RecordingVectors<'a> {
     pub fn finish(self) -> Recording {
         let mut rec = self.recording.into_inner().unwrap();
         let used = self.used.into_inner().unwrap();
-        let keep: std::collections::HashSet<Key> =
-            used.iter().map(|i| key(&rec.embedder_version, i)).collect();
-        rec.entries.retain(|k, _| keep.contains(k));
+        rec.retain_inputs(used.iter().map(String::as_str));
         rec
     }
 
@@ -306,7 +182,7 @@ impl Vectors for RecordingVectors<'_> {
         let missing: Vec<usize> = {
             let rec = self.recording.lock().unwrap();
             (0..texts.len())
-                .filter(|i| rec.get(&inputs[*i]).is_none())
+                .filter(|i| rec.get_input(&inputs[*i]).is_none())
                 .collect()
         };
         if !missing.is_empty() {
@@ -314,21 +190,27 @@ impl Vectors for RecordingVectors<'_> {
             let vecs = self.inner.texts(&todo, purpose)?;
             let mut rec = self.recording.lock().unwrap();
             for (i, v) in missing.iter().zip(vecs) {
-                rec.insert(&inputs[*i], v);
+                rec.insert_input(&inputs[*i], v);
             }
             *self.embedded.lock().unwrap() += missing.len();
         }
         let rec = self.recording.lock().unwrap();
-        Ok(inputs.iter().map(|i| rec.get(i).unwrap().clone()).collect())
+        Ok(inputs
+            .iter()
+            .map(|i| rec.get_input(i).unwrap().clone())
+            .collect())
     }
     fn picture(&self, doc: &CorpusDoc, pic: &Picture, text: &str) -> anyhow::Result<Vec<f32>> {
         let input = picture_input(&doc.path, pic.page, pic.tokens);
         self.used.lock().unwrap().insert(input.clone());
-        if let Some(v) = self.recording.lock().unwrap().get(&input) {
+        if let Some(v) = self.recording.lock().unwrap().get_input(&input) {
             return Ok(v.clone());
         }
         let v = self.inner.picture(doc, pic, text)?;
-        self.recording.lock().unwrap().insert(&input, v.clone());
+        self.recording
+            .lock()
+            .unwrap()
+            .insert_input(&input, v.clone());
         *self.embedded.lock().unwrap() += 1;
         Ok(v)
     }
@@ -394,7 +276,7 @@ mod tests {
     use margin_shared::SourceKind;
 
     fn unit(i: usize) -> Vec<f32> {
-        let mut v = vec![0f32; DIM];
+        let mut v = vec![0f32; margin_embed::DIM];
         v[i] = 1.0;
         v
     }
@@ -431,34 +313,29 @@ mod tests {
             picture_input("pdf/a.pdf", Some(2), ImageTokens::High),
             "picture:pdf/a.pdf#2:280"
         );
-        assert_ne!(key("v1", "a"), key("v2", "a"));
     }
 
     #[test]
-    fn a_recording_round_trips_through_f16() {
-        let mut rec = Recording::new("v1");
+    fn recorded_texts_are_what_the_services_recorded_embedder_reads() {
+        use margin_embed::fake::RecordedEmbedder;
+        let mut rec = Recording::new();
         let mut v = unit(3);
         v[4] = 0.333;
-        rec.insert("title: none | text: a", v.clone());
-        rec.insert("task: search result | query: b", unit(7));
-        let bytes = rec.to_bytes().unwrap();
-        assert_eq!(&bytes[..8], MAGIC);
-        let back = Recording::from_bytes(&bytes).unwrap();
-        assert_eq!(back.embedder_version, "v1");
-        let got = back.get("title: none | text: a").unwrap();
-        assert!((got[4] - 0.333).abs() < 1e-3);
-        assert_eq!(got[3], 1.0);
-        assert!(Recording::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-        assert!(Recording::from_bytes(b"not a file").is_err());
-        let mut wrong = rec.clone();
-        wrong.insert("x", vec![0.0; 3]);
-        assert!(wrong.to_bytes().is_err());
+        rec.insert_input(&model_input(&Purpose::document(Some("Gibbs")), "a"), v);
+        let back = Recording::from_bytes(&rec.to_bytes()).unwrap();
+        let got = RecordedEmbedder::new(back)
+            .unwrap()
+            .embed(&["a".into()], Purpose::document(Some("Gibbs")))
+            .unwrap()
+            .remove(0);
+        // f16, and unit length again after it.
+        assert!((got[4] / got[3] - 0.333).abs() < 2e-3, "{got:?}");
     }
 
     #[test]
     fn replay_fails_loudly_on_a_miss() {
-        let mut rec = Recording::new("v1");
-        rec.insert(&model_input(&Purpose::Query, "known"), unit(1));
+        let mut rec = Recording::for_version("v1");
+        rec.insert_input(&model_input(&Purpose::Query, "known"), unit(1));
         let doc = CorpusDoc {
             path: "images/a.png".into(),
             kind: SourceKind::Image,
@@ -470,7 +347,7 @@ mod tests {
             at_ms: None,
             tokens: ImageTokens::High,
         };
-        rec.insert(&picture_input(&doc.path, None, ImageTokens::High), unit(2));
+        rec.insert_input(&picture_input(&doc.path, None, ImageTokens::High), unit(2));
         let r = RecordedVectors::new(rec);
         assert_eq!(
             r.texts(&["known".into()], &Purpose::Query).unwrap()[0],
@@ -492,9 +369,9 @@ mod tests {
     #[test]
     fn recording_embeds_only_what_is_new_and_drops_what_is_unused() {
         let inner = FakeVectors;
-        let mut seed = Recording::new(inner.version());
-        seed.insert(&model_input(&Purpose::Query, "old"), unit(5));
-        seed.insert(&model_input(&Purpose::Query, "stale"), unit(6));
+        let mut seed = Recording::for_version(inner.version());
+        seed.insert_input(&model_input(&Purpose::Query, "old"), unit(5));
+        seed.insert_input(&model_input(&Purpose::Query, "stale"), unit(6));
         let rv = RecordingVectors::new(&inner, seed).unwrap();
         let got = rv
             .texts(&["old".into(), "new words".into()], &Purpose::Query)
@@ -502,8 +379,11 @@ mod tests {
         assert_eq!(got[0], unit(5), "served from the seed");
         assert_eq!(rv.embedded(), 1);
         let rec = rv.finish();
-        assert_eq!(rec.entries.len(), 2);
-        assert!(rec.get(&model_input(&Purpose::Query, "stale")).is_none());
-        assert!(RecordingVectors::new(&inner, Recording::new("other")).is_err());
+        assert_eq!(rec.len().0, 2);
+        assert!(
+            rec.get_input(&model_input(&Purpose::Query, "stale"))
+                .is_none()
+        );
+        assert!(RecordingVectors::new(&inner, Recording::for_version("other")).is_err());
     }
 }

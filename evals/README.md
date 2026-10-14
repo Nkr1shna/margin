@@ -32,7 +32,7 @@ Two ways they run:
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
 | `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window, service URL. |
 | `recorded/extracted.json` | What PDFKit/Vision read from each PDF and image (CI replays it; another macOS can't reproduce OCR byte for byte). |
-| `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `crates/evals/src/recorded.rs`. A miss is an error, never a made-up vector. |
+| `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
@@ -40,7 +40,7 @@ Two ways they run:
 The judge rubrics, the question-generation and seriousness-grading prompts and the
 canary sets (10 trivial questions to reject, 5 serious ones to keep, 20 deliberately bad
 lessons) are R1-ai's, in `margin_ai::evals`; the runner uses them through
-`crates/evals/src/ai_judge.rs` (the `r1-ai` feature until that branch is merged).
+`crates/evals/src/ai_judge.rs`.
 
 ## First run on the service Mac (before R1 is called done)
 

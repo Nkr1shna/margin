@@ -249,16 +249,18 @@ impl Extraction {
                         .collect(),
                     sound: None,
                     duration_ms: None,
+                    format: margin_embed::TextFormat::Plain,
                 })
             }
             _ => {
                 let bytes = std::fs::read(corpus.join(&doc.path))
                     .with_context(|| format!("couldn't read {}", doc.path))?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                // As the service's `extract` reads it: the format from the name.
+                let format = margin_embed::TextFormat::detect(&doc.path, &text);
                 Ok(Extracted {
-                    pages: vec![Page {
-                        number: None,
-                        text: String::from_utf8_lossy(&bytes).into_owned(),
-                    }],
+                    pages: vec![Page { number: None, text }],
+                    format,
                     ..Default::default()
                 })
             }

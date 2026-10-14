@@ -203,6 +203,38 @@ impl Recording {
         }
     }
 
+    /// An empty recording for another embedder version (the eval runner records with
+    /// its own embedder's).
+    pub fn for_version(version: &str) -> Self {
+        Self {
+            version: version.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Adds a vector by the exact input the model was given: for a text `prompt(purpose)`
+    /// followed by the text (the key `embed` looks up), or a name standing for another
+    /// input (the eval runner's `picture:{document}#{page}:{tokens}`).
+    pub fn insert_input(&mut self, input: &str, vector: Vec<f32>) {
+        self.vectors
+            .insert(crate::sha256::digest(input.as_bytes()), vector);
+    }
+
+    /// The vector recorded for `input` (as `insert_input`).
+    pub fn get_input(&self, input: &str) -> Option<&Vec<f32>> {
+        self.vectors.get(&crate::sha256::digest(input.as_bytes()))
+    }
+
+    /// Keeps only the vectors of `inputs` (token counts stay), so a re-recording doesn't
+    /// pile up stale vectors.
+    pub fn retain_inputs<'a>(&mut self, inputs: impl IntoIterator<Item = &'a str>) {
+        let keep: std::collections::HashSet<Key> = inputs
+            .into_iter()
+            .map(|i| crate::sha256::digest(i.as_bytes()))
+            .collect();
+        self.vectors.retain(|k, _| keep.contains(k));
+    }
+
     /// How many vectors and token counts it holds.
     pub fn len(&self) -> (usize, usize) {
         (self.vectors.len(), self.tokens.len())

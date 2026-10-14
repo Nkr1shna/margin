@@ -307,8 +307,9 @@ pub const RRF_K: u32 = 60;
 pub const MMR_LAMBDA: f32 = 0.7;
 /// Most hits the agent's `search` tool returns.
 pub const TOOL_SEARCH_K_MAX: usize = 12;
-/// Longest passage text in a `search` tool output.
-pub const TOOL_OUTPUT_PASSAGE_CHARS: usize = 1_200;
+/// Longest passage text in a `search` tool output: `TOOL_SEARCH_K_MAX` of them with
+/// their locators fit the 16 KB a tool output may be.
+pub const TOOL_OUTPUT_PASSAGE_CHARS: usize = 1_100;
 /// Most adjacent passages one `read_passage` returns.
 pub const TOOL_READ_PASSAGES_MAX: usize = 4;
 

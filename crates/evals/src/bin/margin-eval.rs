@@ -124,7 +124,6 @@ fn media_dir(store_data: &Path) -> PathBuf {
     store_data.join("media")
 }
 
-#[cfg(feature = "r1-ai")]
 fn judges(models: &live::Models) -> Vec<Box<dyn Judge>> {
     models
         .small
@@ -133,27 +132,16 @@ fn judges(models: &live::Models) -> Vec<Box<dyn Judge>> {
         .collect()
 }
 
-#[cfg(feature = "r1-ai")]
 fn generator(models: &live::Models) -> Box<dyn Judge> {
     Box::new(margin_evals::ai_judge::AiJudge {
         model: models.writer.clone(),
     })
 }
 
-#[cfg(not(feature = "r1-ai"))]
-fn judges(_: &live::Models) -> Vec<Box<dyn Judge>> {
-    Vec::new()
-}
-
-#[cfg(not(feature = "r1-ai"))]
-fn generator(_: &live::Models) -> Box<dyn Judge> {
-    unreachable!("checked by need_judges")
-}
-
 fn need_judges(js: &[Box<dyn Judge>]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !js.is_empty(),
-        "judging needs R1-ai's eval prompts (`margin_ai::evals`): build with --features r1-ai until that branch is merged"
+        "judging needs a small model: set one in evals/runner.toml"
     );
     Ok(())
 }
@@ -182,8 +170,8 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     };
     let seed = Recording::load(&paths.evals.join(EMBEDDINGS_FILE))
         .ok()
-        .filter(|r| r.embedder_version == embedder.version())
-        .unwrap_or_else(|| Recording::new(embedder.version()));
+        .filter(|r| r.version == embedder.version())
+        .unwrap_or_else(|| Recording::for_version(embedder.version()));
     // Served from the recording where it has the vector, embedded live otherwise.
     let vectors: &'static RecordingVectors<'static> =
         Box::leak(Box::new(RecordingVectors::new(embedder, seed)?));

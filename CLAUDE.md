@@ -4,4 +4,4 @@ Margin is the knowledge base for building Margin (`docs/plan-dogfood.md`); the `
 
 - Search Margin (`search_context`) before reading docs for context; read around hits with `document_outline` and `read_passages`, and cite what you use.
 - Record each design decision with `ingest_document` (`kind: "decision"`) when it is made.
-- Run `/margin-handoff` before ending a build session.
+- The session summary is saved to Margin automatically when a session ends (`SessionEnd` hook, `scripts/claude-session-summary.sh`); run `/margin-handoff` for a fuller hand-written handoff with the session's decisions.
