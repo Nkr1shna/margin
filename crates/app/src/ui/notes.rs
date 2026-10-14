@@ -434,9 +434,12 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     let Some(initial) = initial else {
         return rsx! {};
     };
-    // An edit made earlier that the service doesn't have yet (the save after leaving
-    // the note failed): show it, and try again.
-    let restored = use_hook(|| drafts::get(&id));
+    // An edit the service doesn't have yet (a save after leaving the note that failed,
+    // or one an earlier run of the app left in the drafts file): show it, and try again.
+    let restored = use_hook(|| {
+        drafts::editing(&id, true);
+        drafts::get(&id)
+    });
     let mut title = use_signal(|| {
         restored
             .as_ref()
@@ -464,7 +467,10 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     // Leaving the note (another note, Back, the lesson chip) unmounts the editor and
     // cancels its debounced save: hand any unsaved edit to a task that outlives it.
     let drop_id = id.clone();
-    use_drop(move || drafts::save_in_background(app, drop_id.clone()));
+    use_drop(move || {
+        drafts::editing(&drop_id, false);
+        drafts::save_in_background(app, drop_id.clone());
+    });
 
     // Follow edits from other devices while there are no local unsaved changes.
     let follow_id = id.clone();
@@ -702,7 +708,7 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                                     // Stop any pending autosave, and don't save on the way out.
                                     let next = *generation.peek() + 1;
                                     generation.set(next);
-                                    drafts::take(&id);
+                                    drafts::discard(&id);
                                     let mut lib = app.lib;
                                     lib.write().apply(Event::NoteDeleted { id });
                                     confirm.set(false);

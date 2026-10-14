@@ -404,6 +404,8 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
         Ok(library) => {
             lib.write().replace_library(library);
             status.set(LoadStatus::Loaded);
+            // Note edits an earlier run (or a failed save) left unsent.
+            drafts::resume(ctx, api);
             true
         }
         Err(e) => {
