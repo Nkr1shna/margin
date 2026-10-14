@@ -15,8 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use margin_agent::{ModelClient, ScriptedModel};
-use margin_ai::{AiError, LessonContext, Passage, SceneRequest};
+use margin_agent::scripted::{text_reply, tool_calls_reply};
+use margin_agent::{ModelClient, Scripted, ScriptedModel};
+use margin_ai::{AiError, LessonContext, SceneRequest};
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
     Chunk, EmbedError, Embedder, Extracted, ImageTokens, ModelFiles, Page, Picture, Transcript,
@@ -29,8 +30,9 @@ use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY,
 use margin_service::server::{Options, Service};
 use margin_service::state::AppState;
 use margin_shared::{
-    AskRequest, DeviceFrame, DirectedFrame, Event, Level, LoginState, Outline, OutlineLesson,
-    ServerFrame, SourceKind, StartLogin, ToolStatus,
+    AskRequest, Card, ChatDetail, ChatItemKind, ChatState, DeviceFrame, DirectedFrame, Event,
+    Level, LoginState, Outline, OutlineLesson, Proposal, ServerFrame, SourceKind, StartLogin,
+    ToolStatus,
 };
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 use serde_json::json;
@@ -111,9 +113,6 @@ pub struct FakeGenerator {
     pub max_active: AtomicUsize,
     pub fail_lessons: Mutex<HashSet<String>>,
     pub scene_requests: Mutex<Vec<SceneRequest>>,
-    pub subjects_seen: Mutex<Vec<Vec<String>>>,
-    /// The source passages each outline request carried.
-    pub outline_passages: Mutex<Vec<Vec<Passage>>>,
     /// Every lesson request.
     pub lesson_requests: Mutex<Vec<LessonContext>>,
     /// Delay between lesson deltas.
@@ -143,35 +142,6 @@ pub fn outline_for(req: &AskRequest) -> Outline {
 }
 
 impl Generator for FakeGenerator {
-    fn propose_outline<'a>(
-        &'a self,
-        ai: &'a AiConfig,
-        req: &'a AskRequest,
-        existing_subjects: &'a [String],
-        passages: &'a [Passage],
-    ) -> BoxFuture<'a, Result<Outline, AiError>> {
-        Box::pin(async move {
-            assert_eq!(ai.api_key, API_KEY);
-            self.subjects_seen
-                .lock()
-                .unwrap()
-                .push(existing_subjects.to_vec());
-            self.outline_passages
-                .lock()
-                .unwrap()
-                .push(passages.to_vec());
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            if req.prompt.contains("FAIL") {
-                return Err(AiError::Http {
-                    status: 500,
-                    message: "boom".into(),
-                    retry_after: None,
-                });
-            }
-            Ok(outline_for(req))
-        })
-    }
-
     fn write_lesson<'a>(
         &'a self,
         _ai: &'a AiConfig,
@@ -934,6 +904,113 @@ impl Harness {
             other => panic!("expected Hello, got {other:?}"),
         }
         s
+    }
+}
+
+/// The arguments of the `propose_course` call that proposes `req` with
+/// `outline_for(req)`.
+pub fn propose_args(req: &AskRequest) -> serde_json::Value {
+    let outline = outline_for(req);
+    json!({
+        "prompt": req.prompt,
+        "topic_title": outline.topic_title,
+        "subject_title": outline.subject_title,
+        "lessons": outline.lessons.iter().map(|l| json!({
+            "title": l.title,
+            "summary": l.summary,
+            "minutes": l.minutes,
+        })).collect::<Vec<_>>(),
+        "level": req.level,
+        "with_videos": req.with_videos,
+        "with_quiz": req.with_quiz,
+        "parent_topic_id": req.parent_topic_id,
+        "source_ids": req.source_ids,
+    })
+}
+
+impl Harness {
+    /// Proposes a course the way the agent does: a new chat whose model calls
+    /// `propose_course` with `req` (outline `outline_for(req)`) and then answers.
+    /// Returns the proposal and the chat, or the tool's error (the result row's
+    /// summary).
+    pub async fn propose_in_chat(
+        &self,
+        token: &str,
+        req: &AskRequest,
+    ) -> Result<(Proposal, ChatDetail), String> {
+        let args = propose_args(req).to_string();
+        self.generator
+            .agent
+            .push(Scripted::Events(tool_calls_reply(&[(
+                "call_propose",
+                "propose_course",
+                &args,
+            )])));
+        self.generator
+            .agent
+            .push(Scripted::Events(text_reply(&["Here is an outline."])));
+        let r = self
+            .post(token, "/api/chats")
+            .json(&json!({"message": {"text": format!("A course, please: {}", req.prompt)}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+        let chat: ChatDetail = r.json().await.unwrap();
+        let detail = eventually(|| async {
+            let d: ChatDetail = self
+                .get(token, &format!("/api/chats/{}", chat.chat.id))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            (d.chat.state == ChatState::Idle).then_some(d)
+        })
+        .await;
+        let result = detail.items.iter().find_map(|i| match &i.kind {
+            ChatItemKind::ToolResult {
+                call_id,
+                ok,
+                summary,
+                ..
+            } if call_id == "call_propose" => Some((*ok, summary.clone())),
+            _ => None,
+        });
+        match result {
+            Some((true, _)) => {}
+            Some((false, summary)) => return Err(summary),
+            None => panic!("propose_course didn't run: {:?}", detail.items),
+        }
+        let proposal_id = detail
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Card {
+                    card: Card::Outline(c),
+                    ..
+                } => Some(c.proposal_id.clone()),
+                _ => None,
+            })
+            .expect("an outline card");
+        let proposal: Proposal = self
+            .get(token, &format!("/api/proposals/{proposal_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        Ok((proposal, detail))
+    }
+
+    /// `propose_in_chat`'s proposal; panics if the tool failed.
+    pub async fn propose(&self, token: &str, req: &AskRequest) -> Proposal {
+        match self.propose_in_chat(token, req).await {
+            Ok((p, _)) => p,
+            Err(e) => panic!("propose_course failed: {e}"),
+        }
     }
 }
 

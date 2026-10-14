@@ -629,6 +629,7 @@ async fn read_tools_answer_from_the_library() {
         proposal_id: None,
         previous_body: None,
         previous_citations: None,
+        author: Default::default(),
     };
     h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
     let r = h

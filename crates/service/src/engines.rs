@@ -7,9 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use margin_agent::ModelClient;
-use margin_ai::{AiError, LessonContext, Passage, ResponsesClient, SceneRequest};
+use margin_ai::{AiError, LessonContext, ResponsesClient, SceneRequest};
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
-use margin_shared::{AskRequest, Outline, SourceKind, ToolStatus};
+use margin_shared::{SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -37,15 +37,9 @@ impl std::fmt::Debug for AiConfig {
     }
 }
 
+/// The model work jobs need. Course outlines aren't here: the agent writes them as
+/// `propose_course` arguments in a chat turn (through `agent_model`).
 pub trait Generator: Send + Sync + 'static {
-    fn propose_outline<'a>(
-        &'a self,
-        ai: &'a AiConfig,
-        req: &'a AskRequest,
-        existing_subjects: &'a [String],
-        passages: &'a [Passage],
-    ) -> BoxFuture<'a, Result<Outline, AiError>>;
-
     fn write_lesson<'a>(
         &'a self,
         ai: &'a AiConfig,
@@ -83,18 +77,6 @@ fn client(ai: &AiConfig) -> ResponsesClient {
 }
 
 impl Generator for AiGenerator {
-    fn propose_outline<'a>(
-        &'a self,
-        ai: &'a AiConfig,
-        req: &'a AskRequest,
-        existing_subjects: &'a [String],
-        passages: &'a [Passage],
-    ) -> BoxFuture<'a, Result<Outline, AiError>> {
-        Box::pin(async move {
-            margin_ai::propose_outline(&client(ai), req, existing_subjects, passages).await
-        })
-    }
-
     fn write_lesson<'a>(
         &'a self,
         ai: &'a AiConfig,

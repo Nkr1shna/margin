@@ -103,25 +103,17 @@ async fn embedding(h: &Harness, token: &str) -> EmbeddingModel {
         .unwrap()
 }
 
-async fn ask(h: &Harness, token: &str, prompt: &str, source_ids: &[&str]) -> reqwest::Response {
+/// Has the agent propose a two-lesson course drawing on the sources; `Err` is the
+/// tool's error.
+async fn propose(
+    h: &Harness,
+    token: &str,
+    prompt: &str,
+    source_ids: &[&str],
+) -> Result<Proposal, String> {
     let mut req = ask_request(prompt, 2, false);
     req.source_ids = source_ids.iter().map(|s| s.to_string()).collect();
-    h.post(token, "/api/ask").json(&req).send().await.unwrap()
-}
-
-async fn wait_proposal(h: &Harness, token: &str, id: &str) -> Proposal {
-    eventually(|| async {
-        let p: Proposal = h
-            .get(token, &format!("/api/proposals/{id}"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        (p.status != ProposalStatus::Drafting).then_some(p)
-    })
-    .await
+    h.propose_in_chat(token, &req).await.map(|(p, _)| p)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -513,62 +505,31 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
     let unrelated = upload_ok(&h, &t, "bread.md", None, COOKING).await;
 
     // Sources must exist and not belong to another topic.
-    let (status, err) = api_error(ask(&h, &t, "Fourier", &["nope"]).await).await;
-    assert_eq!((status, err.code.as_str()), (400, "unknown_source"));
+    let err = propose(&h, &t, "Fourier", &["nope"]).await.unwrap_err();
+    assert_eq!(
+        err,
+        "One of the sources isn't on the service any more. Add it again."
+    );
     let elsewhere = new_topic(&h, &t, None, "Elsewhere").await;
     let filed = upload_ok(&h, &t, "other.md", Some(&elsewhere.id), "Other text.").await;
-    let (status, err) = api_error(ask(&h, &t, "Fourier", &[&filed.id]).await).await;
-    assert_eq!((status, err.code.as_str()), (400, "unknown_source"));
-    assert!(err.message.contains("other.md"), "{}", err.message);
+    let err = propose(&h, &t, "Fourier", &[&filed.id]).await.unwrap_err();
+    assert!(err.contains("other.md"), "{err}");
 
-    // Asked right away: the outline waits for the sources to be read, then uses them.
-    let r = ask(
+    // Proposed right away (duplicates dropped); the lessons wait for the sources to be
+    // read.
+    let p = propose(
         &h,
         &t,
         "Explain the Fourier coefficient of a periodic signal",
         &[&fourier.id, &pdf.id, &fourier.id],
     )
-    .await;
-    assert_eq!(r.status(), 200);
-    let p: Proposal = r.json().await.unwrap();
+    .await
+    .unwrap();
     assert_eq!(
         p.request.source_ids,
         vec![fourier.id.clone(), pdf.id.clone()]
     );
-    let p = wait_proposal(&h, &t, &p.id).await;
     assert_eq!(p.status, ProposalStatus::Ready);
-    let passages = h
-        .generator
-        .outline_passages
-        .lock()
-        .unwrap()
-        .last()
-        .cloned()
-        .unwrap();
-    // Every chunk of the two named sources (5 of them) and both pages of the PDF as
-    // pictures, best first, none of the third.
-    assert_eq!(passages.len(), 7, "{passages:?}");
-    let pictures: Vec<_> = passages.iter().filter(|p| p.image.is_some()).collect();
-    assert_eq!(pictures.len(), 2);
-    assert!(
-        pictures
-            .iter()
-            .all(|p| p.source == "dsp.pdf" && p.text.is_empty())
-    );
-    let mut pages: Vec<_> = pictures.iter().map(|p| p.page.unwrap()).collect();
-    pages.sort();
-    assert_eq!(pages, [1, 2]);
-    assert!(passages.iter().any(|p| p.source == "notes/fourier.md"
-        && p.page.is_none()
-        && p.text.starts_with("The coefficient a_n is the projection")));
-    assert!(passages.iter().any(|p| p.source == "dsp.pdf"
-        && p.page == Some(2)
-        && p.text == "The Fourier coefficient formula for a periodic signal."));
-    assert!(!passages.iter().any(|p| p.source == "bread.md"));
-    assert_eq!(
-        passages.iter().rfind(|p| p.image.is_none()).unwrap().text,
-        "Intro page."
-    );
 
     // Accepting attaches the Ask's sources (and their chunks) to the new topic.
     let mut socket = h.socket(&t).await;
@@ -691,16 +652,20 @@ async fn sources_wait_for_the_model_download() {
     let lib = library(&h, &t).await;
     assert_eq!(lib.sources[0].status, SourceStatus::Queued);
     assert_eq!(h.source_tools.extracts.load(Ordering::SeqCst), 0);
-    let r = ask(&h, &t, "Fourier coefficients", &[&s.id]).await;
-    assert_eq!(r.status(), 409);
-    let err: margin_shared::ApiError = r.json().await.unwrap();
-    assert_eq!(err.code, "no_embedding_model");
+    let err = propose(&h, &t, "Fourier coefficients", &[&s.id])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "Sources need the local embedding model. Download it in Settings → Sources."
+    );
 
     let r = h.post(&t, "/api/embedding/download").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    let r = ask(&h, &t, "Fourier coefficients", &[&s.id]).await;
-    assert_eq!(r.status(), 200);
-    let p: Proposal = r.json().await.unwrap();
+    let p = propose(&h, &t, "Fourier coefficients", &[&s.id])
+        .await
+        .unwrap();
+    assert_eq!(p.status, ProposalStatus::Ready);
     let s = wait_source(&h, &t, &s.id, is_ready).await;
     assert_eq!(
         s.status,
@@ -710,16 +675,19 @@ async fn sources_wait_for_the_model_download() {
             warning: None,
         }
     );
-    let p = wait_proposal(&h, &t, &p.id).await;
-    assert_eq!(p.status, ProposalStatus::Ready);
-    let passages = h
-        .generator
-        .outline_passages
-        .lock()
-        .unwrap()
-        .last()
-        .cloned()
+    // Its lessons are written with the source's passages once it's read.
+    let r = h
+        .post(&t, &format!("/api/proposals/{}/accept", p.id))
+        .json(&json!({"outline": p.outline.clone().unwrap()}))
+        .send()
+        .await
         .unwrap();
+    assert_eq!(r.status(), 200);
+    let passages = eventually(|| async {
+        let requests = h.generator.lesson_requests.lock().unwrap();
+        requests.first().map(|ctx| ctx.passages.clone())
+    })
+    .await;
     assert_eq!(passages.len(), 3);
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 }

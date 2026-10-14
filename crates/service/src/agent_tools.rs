@@ -14,15 +14,25 @@
 //!
 //! Outputs are compact JSON the model reads; library text (lesson bodies, notes, source
 //! passages) only ever reaches the model this way, never in the developer prompt.
+//!
+//! Write and Destructive tools change the library through the same functions as the
+//! routes (`library::new_topic`, `ask::accept_proposal`, …) and run each change to its
+//! end even if the turn is stopped meanwhile (`to_the_end`). Who wrote a note or a
+//! lesson body (`state::Author`) decides whether overwriting it asks first.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use margin_agent::{BoxFuture, ToolContext, ToolKind, ToolOutput, ToolRegistry, Typed, TypedTool};
+use margin_agent::{
+    BoxFuture, ConfirmationPrompt, ToolContext, ToolKind, ToolOutput, ToolRegistry, Typed,
+    TypedTool,
+};
 use margin_shared::{
-    Card, Chat, Citation, LessonStatus, Note, PassagesCard, Source, SourceStatus, Topic,
-    VideoStatus,
+    AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
+    NewTopic, Note, NotePatch, Outline, OutlineCard, OutlineChips, OutlineLesson, PassagesCard,
+    Proposal, ResultCard, ResultTarget, Source, SourceStatus, Topic, TopicPatch, VideoStatus,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -30,8 +40,8 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::library::{self, sort_topics};
-use crate::state::{AppState, StoredLesson, StoredVideo};
-use crate::{db, embedding, search, sources};
+use crate::state::{AppState, Author, StoredLesson, StoredVideo};
+use crate::{ask, db, embedding, search, sources};
 
 /// How long `search_sources` waits for sources still being read before searching what
 /// is ready.
@@ -49,6 +59,18 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(ListNotes(state.clone()))));
     r.register(Arc::new(Typed(SearchSources(state.clone()))));
     r.register(Arc::new(Typed(ListSources(state.clone()))));
+    r.register(Arc::new(Typed(CreateTopic(state.clone()))));
+    r.register(Arc::new(Typed(RenameTopic(state.clone()))));
+    r.register(Arc::new(Typed(MoveTopic(state.clone()))));
+    r.register(Arc::new(Typed(EditLessonTitle(state.clone()))));
+    r.register(Arc::new(Typed(CreateNote(state.clone()))));
+    r.register(Arc::new(Typed(AppendToNote(state.clone()))));
+    r.register(Arc::new(Typed(ReplaceNoteBody(state.clone()))));
+    r.register(Arc::new(Typed(ProposeCourse(state.clone()))));
+    r.register(Arc::new(Typed(AcceptProposalTool(state.clone()))));
+    r.register(Arc::new(Typed(DeleteTopic(state.clone()))));
+    r.register(Arc::new(Typed(DeleteLesson(state.clone()))));
+    r.register(Arc::new(Typed(DeleteNote(state.clone()))));
     r
 }
 
@@ -825,6 +847,982 @@ impl TypedTool for ListSources {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Write helpers
+// ---------------------------------------------------------------------------
+
+/// Runs a change to the library to its end even when the turn is stopped meanwhile
+/// (Stop drops the tool's future): a topic, an accepted course or a delete is never
+/// left half done. Like a job a tool started, it carries on after Stop.
+async fn to_the_end<F>(work: F) -> ToolOutput
+where
+    F: Future<Output = ToolOutput> + Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!("an agent tool's change failed: {e}");
+            ToolOutput::error("The service failed while making this change. Check its log.")
+        }
+    }
+}
+
+/// "a, b and c".
+fn and_list(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// "2 lessons and 1 note go with it." / "1 note goes with it."
+fn go_with_it(parts: &[String]) -> String {
+    let one = matches!(parts, [only] if only.starts_with("1 ") || only == "its video");
+    let verb = if one { "goes" } else { "go" };
+    format!("{} {verb} with it.", and_list(parts))
+}
+
+fn result_card(target: ResultTarget, title: &str) -> Card {
+    Card::Result(ResultCard {
+        target,
+        title: title.to_string(),
+    })
+}
+
+fn note_title(note: &Note) -> &str {
+    if note.title.is_empty() {
+        "Untitled note"
+    } else {
+        &note.title
+    }
+}
+
+/// The first `max` characters of `text` on one line, "…" when cut.
+fn excerpt(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short: String = one_line.chars().take(max).collect();
+    if one_line.chars().count() > max {
+        short.push('…');
+    }
+    short
+}
+
+/// A course level as the model writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelArg {
+    Intro,
+    Intermediate,
+    Advanced,
+}
+
+impl From<LevelArg> for Level {
+    fn from(level: LevelArg) -> Self {
+        match level {
+            LevelArg::Intro => Level::Intro,
+            LevelArg::Intermediate => Level::Intermediate,
+            LevelArg::Advanced => Level::Advanced,
+        }
+    }
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Intro => "intro",
+        Level::Intermediate => "intermediate",
+        Level::Advanced => "advanced",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// create_topic
+// ---------------------------------------------------------------------------
+
+pub struct CreateTopic(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTopicArgs {
+    /// The new topic's title.
+    pub title: String,
+    /// The topic to put it under; null for a new subject at the top level.
+    pub parent_id: Option<String>,
+}
+
+impl TypedTool for CreateTopic {
+    type Args = CreateTopicArgs;
+    const NAME: &'static str = "create_topic";
+    const DESCRIPTION: &'static str = "Create an empty topic, last under parent_id (or at the top level as a new subject when parent_id is null). For a course with lessons use propose_course instead.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Creating the topic {}", quoted(&args.title))
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let req = NewTopic {
+                parent_id: args.parent_id,
+                title: args.title,
+            };
+            let topic = match library::new_topic(&state, req).await {
+                Ok(t) => t,
+                Err(e) => return failed(e),
+            };
+            let output = json!({
+                "id": topic.id,
+                "title": topic.title,
+                "parent_id": topic.parent_id,
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Created {}", quoted(&topic.title)),
+            )
+            .with_card(result_card(
+                ResultTarget::Topic {
+                    topic_id: topic.id.clone(),
+                },
+                &topic.title,
+            ))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rename_topic
+// ---------------------------------------------------------------------------
+
+pub struct RenameTopic(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenameTopicArgs {
+    /// The topic's id.
+    pub topic_id: String,
+    /// Its new title.
+    pub title: String,
+}
+
+impl TypedTool for RenameTopic {
+    type Args = RenameTopicArgs;
+    const NAME: &'static str = "rename_topic";
+    const DESCRIPTION: &'static str = "Rename a topic (a subject or a topic under one).";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Renaming a topic to {}", quoted(&args.title))
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let before = match library::topic(&state, &args.topic_id).await {
+                Ok(t) => t,
+                Err(e) => return failed(e),
+            };
+            let patch = TopicPatch {
+                title: Some(args.title),
+                ..TopicPatch::default()
+            };
+            let topic = match library::update_topic(&state, &args.topic_id, patch).await {
+                Ok(t) => t,
+                Err(e) => return failed(e),
+            };
+            let output = json!({
+                "id": topic.id,
+                "title": topic.title,
+                "previous_title": before.title,
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Renamed to {}", quoted(&topic.title)),
+            )
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// move_topic
+// ---------------------------------------------------------------------------
+
+pub struct MoveTopic(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MoveTopicArgs {
+    /// The topic to move (with everything under it).
+    pub topic_id: String,
+    /// The topic to move it under; null to make it a subject at the top level.
+    pub parent_id: Option<String>,
+    /// Where among its new siblings, counting from 0 (0 = first); null to put it last.
+    pub position: Option<u32>,
+}
+
+impl TypedTool for MoveTopic {
+    type Args = MoveTopicArgs;
+    const NAME: &'static str = "move_topic";
+    const DESCRIPTION: &'static str = "Move a topic, with its lessons, notes and the topics under it, under another topic or to the top level, and/or reorder it among its siblings. To only reorder, pass its current parent_id.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        match args.parent_id {
+            Some(_) => "Moving a topic".into(),
+            None => "Moving a topic to the top level".into(),
+        }
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let index = args.position.map(|p| p as usize);
+            let topic =
+                match library::place_topic(&state, &args.topic_id, args.parent_id, index).await {
+                    Ok(t) => t,
+                    Err(e) => return failed(e),
+                };
+            let topics: Vec<Topic> = match state.store.list(db::TOPIC).await {
+                Ok(t) => t,
+                Err(e) => return internal(e),
+            };
+            let by_id: HashMap<&str, &Topic> = topics.iter().map(|t| (t.id.as_str(), t)).collect();
+            let summary = match topic.parent_id.as_deref().and_then(|p| by_id.get(p)) {
+                Some(parent) => format!(
+                    "Moved {} under {}",
+                    quoted(&topic.title),
+                    quoted(&parent.title)
+                ),
+                None => format!("Moved {} to the top level", quoted(&topic.title)),
+            };
+            let output = json!({
+                "id": topic.id,
+                "title": topic.title,
+                "parent_id": topic.parent_id,
+                "path": topic_path(&by_id, &topic.id),
+                "position": topic.position,
+            });
+            ToolOutput::ok(output.to_string(), summary)
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// edit_lesson_title
+// ---------------------------------------------------------------------------
+
+pub struct EditLessonTitle(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditLessonTitleArgs {
+    /// The lesson's id.
+    pub lesson_id: String,
+    /// Its new title.
+    pub title: String,
+}
+
+impl TypedTool for EditLessonTitle {
+    type Args = EditLessonTitleArgs;
+    const NAME: &'static str = "edit_lesson_title";
+    const DESCRIPTION: &'static str = "Change a lesson's title. The body is left as it is.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Retitling a lesson {}", quoted(&args.title))
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let before = match library::lesson(&state, &args.lesson_id).await {
+                Ok(l) => l,
+                Err(e) => return failed(e),
+            };
+            let patch = LessonPatch {
+                title: Some(args.title),
+                ..LessonPatch::default()
+            };
+            let lesson =
+                match library::update_lesson(&state, &args.lesson_id, patch, Author::Agent).await {
+                    Ok(l) => l,
+                    Err(e) => return failed(e),
+                };
+            let output = json!({
+                "id": lesson.id,
+                "title": lesson.title,
+                "previous_title": before.lesson.title,
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Retitled {}", quoted(&lesson.title)),
+            )
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// create_note
+// ---------------------------------------------------------------------------
+
+pub struct CreateNote(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateNoteArgs {
+    /// The topic the note belongs to.
+    pub topic_id: String,
+    /// A lesson of that topic to attach it to; null for a note on the topic itself.
+    pub lesson_id: Option<String>,
+    /// The note's title.
+    pub title: String,
+    /// The note in Markdown ($…$ for math).
+    pub body_md: String,
+}
+
+impl TypedTool for CreateNote {
+    type Args = CreateNoteArgs;
+    const NAME: &'static str = "create_note";
+    const DESCRIPTION: &'static str = "Write a new note in a topic, optionally attached to one of its lessons. The note is marked as yours (the assistant's), so you may later replace its text without asking.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Writing the note {}", quoted(&args.title))
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let title = match library::clean_title(&args.title, "note") {
+                Ok(t) => t,
+                Err(e) => return failed(e),
+            };
+            let req = NewNote {
+                topic_id: args.topic_id,
+                lesson_id: args.lesson_id,
+                title,
+                body_md: args.body_md,
+                quote: None,
+            };
+            let note = match library::new_note(&state, req, Author::Agent).await {
+                Ok(n) => n,
+                Err(e) => return failed(e),
+            };
+            let output = json!({
+                "id": note.id,
+                "title": note.title,
+                "topic_id": note.topic_id,
+                "lesson_id": note.lesson_id,
+            });
+            ToolOutput::ok(output.to_string(), format!("Wrote {}", quoted(&note.title))).with_card(
+                result_card(
+                    ResultTarget::Note {
+                        note_id: note.id.clone(),
+                    },
+                    &note.title,
+                ),
+            )
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// append_to_note
+// ---------------------------------------------------------------------------
+
+pub struct AppendToNote(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppendToNoteArgs {
+    /// The note's id.
+    pub note_id: String,
+    /// Markdown to add at the end, after a blank line.
+    pub text: String,
+}
+
+impl TypedTool for AppendToNote {
+    type Args = AppendToNoteArgs;
+    const NAME: &'static str = "append_to_note";
+    const DESCRIPTION: &'static str = "Add text at the end of a note (any note, the owner's too); what is already there is kept. Prefer this to replace_note_body when adding to a note.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Adding to a note".into()
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let text = args.text.trim();
+            if text.is_empty() {
+                return ToolOutput::error("Give some text to add.");
+            }
+            let note = match library::append_to_note(&state, &args.note_id, text).await {
+                Ok(n) => n,
+                Err(e) => return failed(e),
+            };
+            let title = note_title(&note).to_string();
+            let output = json!({
+                "id": note.id,
+                "title": title,
+                "body_bytes": note.body_md.len(),
+            });
+            ToolOutput::ok(output.to_string(), format!("Added to {}", quoted(&title)))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// replace_note_body
+// ---------------------------------------------------------------------------
+
+pub struct ReplaceNoteBody(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplaceNoteBodyArgs {
+    /// The note's id.
+    pub note_id: String,
+    /// The note's whole new text in Markdown; the old text is gone afterwards.
+    pub body_md: String,
+}
+
+impl TypedTool for ReplaceNoteBody {
+    type Args = ReplaceNoteBodyArgs;
+    const NAME: &'static str = "replace_note_body";
+    const DESCRIPTION: &'static str = "Replace a note's whole text (its title stays). Read the note first. When the owner wrote the note, the app asks them to confirm first; notes you wrote change right away.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Rewriting a note".into()
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        args: &'a Self::Args,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        Box::pin(async move {
+            let row = library::stored_note(&self.0, &args.note_id)
+                .await
+                .map_err(|e| e.message)?;
+            if row.author != Author::Owner {
+                return Ok(None);
+            }
+            let words = row.note.body_md.split_whitespace().count();
+            let detail = if words == 0 {
+                "You wrote this note; it's empty now.".to_string()
+            } else {
+                format!(
+                    "You wrote this note. Its text ({}) would be replaced by the assistant's; this can't be undone.",
+                    plural(words, "word", "words")
+                )
+            };
+            Ok(Some(ConfirmationPrompt {
+                title: format!(
+                    "Replace the text of your note {}?",
+                    quoted(note_title(&row.note))
+                ),
+                detail,
+                approve_label: "Replace".into(),
+            }))
+        })
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let patch = NotePatch {
+                title: None,
+                body_md: Some(args.body_md),
+            };
+            let note = match library::update_note(&state, &args.note_id, patch, Author::Agent).await
+            {
+                Ok(n) => n,
+                Err(e) => return failed(e),
+            };
+            let title = note_title(&note).to_string();
+            let output = json!({
+                "id": note.id,
+                "title": title,
+                "body_bytes": note.body_md.len(),
+            });
+            ToolOutput::ok(output.to_string(), format!("Rewrote {}", quoted(&title)))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// propose_course
+// ---------------------------------------------------------------------------
+
+pub struct ProposeCourse(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OutlineLessonArg {
+    /// The lesson's title.
+    pub title: String,
+    /// One line on what it covers.
+    pub summary: String,
+    /// Estimated reading time in minutes.
+    pub minutes: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeCourseArgs {
+    /// What the owner wants to learn, in their own words (with what they said about
+    /// their background and goal); the lesson writer reads it.
+    pub prompt: String,
+    /// The new topic's title, e.g. "Fourier series".
+    pub topic_title: String,
+    /// The subject (a top-level topic) to file the course under when parent_topic_id
+    /// is null; an existing subject with the same title is reused (see list_topics).
+    /// Ignored when parent_topic_id is given.
+    pub subject_title: String,
+    /// 1 to 12 lessons, in reading order.
+    pub lessons: Vec<OutlineLessonArg>,
+    /// How advanced the lessons are.
+    pub level: LevelArg,
+    /// Whether each lesson also gets a narrated explainer video once it is written.
+    pub with_videos: bool,
+    /// Whether each lesson ends with a short "Check yourself" quiz.
+    pub with_quiz: bool,
+    /// An existing topic to file the course under instead of a subject; null to use
+    /// subject_title.
+    pub parent_topic_id: Option<String>,
+    /// Sources the lessons draw on (ids from list_sources or the chat's attached
+    /// files): files not yet in a topic, or the parent topic's. Accepting the course
+    /// files them under it. Empty for none.
+    pub source_ids: Vec<String>,
+}
+
+impl TypedTool for ProposeCourse {
+    type Args = ProposeCourseArgs;
+    const NAME: &'static str = "propose_course";
+    const DESCRIPTION: &'static str = "Propose a course: an outline of lessons shown to the owner as an editable card in the chat, where they can change titles and the level, videos and quiz options, then press Create lessons. Nothing is written until the course is accepted (by that button, or by accept_proposal when the owner tells you to go ahead). Write the outline yourself; when the course should draw on the owner's sources, search them first and pass their ids. Infer the options the owner didn't state from what they said (their background for the level, whether they want videos or a quiz); when one matters and can't be inferred, ask them in one short question instead of proposing.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Proposing the course {}", quoted(&args.topic_title))
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
+        Box::pin(to_the_end(async move {
+            let request = AskRequest {
+                prompt: args.prompt,
+                lesson_count: args.lessons.len() as u32,
+                level: args.level.into(),
+                with_videos: args.with_videos,
+                with_quiz: args.with_quiz,
+                parent_topic_id: args.parent_topic_id,
+                source_ids: args.source_ids,
+            };
+            let outline = Outline {
+                topic_title: args.topic_title,
+                subject_title: args.subject_title,
+                lessons: args
+                    .lessons
+                    .into_iter()
+                    .map(|l| OutlineLesson {
+                        title: l.title,
+                        summary: l.summary,
+                        minutes: l.minutes,
+                    })
+                    .collect(),
+            };
+            let proposal = match ask::propose(&state, &chat_id, request, outline).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let Some(outline) = &proposal.outline else {
+                return ToolOutput::error("The outline wasn't kept.");
+            };
+            let filed_under = match &proposal.request.parent_topic_id {
+                Some(parent) => {
+                    let topics: Vec<Topic> = state.store.list(db::TOPIC).await.unwrap_or_default();
+                    let by_id: HashMap<&str, &Topic> =
+                        topics.iter().map(|t| (t.id.as_str(), t)).collect();
+                    topic_path(&by_id, parent)
+                }
+                None => outline.subject_title.clone(),
+            };
+            let req = &proposal.request;
+            let output = json!({
+                "proposal_id": proposal.id,
+                "topic_title": outline.topic_title,
+                "filed_under": filed_under,
+                "lessons": outline.lessons.iter().map(|l| &l.title).collect::<Vec<_>>(),
+                "level": level_name(req.level),
+                "with_videos": req.with_videos,
+                "with_quiz": req.with_quiz,
+                "source_ids": req.source_ids,
+                "next": "The owner sees the outline card. They can edit it and press Create lessons, or ask you to go ahead (then call accept_proposal with this proposal_id).",
+            });
+            let summary = format!(
+                "Proposed {} · {}",
+                quoted(&outline.topic_title),
+                plural(outline.lessons.len(), "lesson", "lessons")
+            );
+            ToolOutput::ok(output.to_string(), summary).with_card(Card::Outline(OutlineCard {
+                proposal_id: proposal.id.clone(),
+            }))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// accept_proposal
+// ---------------------------------------------------------------------------
+
+pub struct AcceptProposalTool(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcceptProposalArgs {
+    /// The proposal_id propose_course returned.
+    pub proposal_id: String,
+}
+
+impl TypedTool for AcceptProposalTool {
+    type Args = AcceptProposalArgs;
+    const NAME: &'static str = "accept_proposal";
+    const DESCRIPTION: &'static str = "Create the lessons of a course proposed in this chat, as it stands on its card (the same as the owner pressing Create lessons): the topic is created, its lessons are queued and written one after another, and videos follow when the course has them. Only when the owner said to go ahead.";
+    const KIND: ToolKind = ToolKind::Write;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Creating the lessons".into()
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
+        Box::pin(to_the_end(async move {
+            let proposal: Option<Proposal> =
+                match state.store.get(db::PROPOSAL, &args.proposal_id).await {
+                    Ok(p) => p,
+                    Err(e) => return internal(e),
+                };
+            let Some(proposal) = proposal else {
+                return ToolOutput::error("That proposal doesn't exist.");
+            };
+            if proposal.chat_id.as_deref() != Some(chat_id.as_str()) {
+                return ToolOutput::error(
+                    "That proposal wasn't made in this chat; propose the course here first.",
+                );
+            }
+            let Some(outline) = proposal.outline.clone() else {
+                return ToolOutput::error("That proposal has no outline yet.");
+            };
+            let req = AcceptProposal {
+                outline,
+                chips: OutlineChips::default(),
+            };
+            let (topic, accepted) = match ask::accept_proposal(&state, &proposal.id, req).await {
+                Ok(t) => t,
+                Err(e) => return failed(e),
+            };
+            let lessons: Vec<Value> = match library::topic_lessons(&state, &topic.id).await {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|l| json!({ "id": l.lesson.id, "title": l.lesson.title }))
+                    .collect(),
+                Err(e) => return internal(e),
+            };
+            let output = json!({
+                "topic_id": topic.id,
+                "topic_title": topic.title,
+                "parent_id": topic.parent_id,
+                "lessons": lessons,
+                "level": level_name(accepted.request.level),
+                "with_videos": accepted.request.with_videos,
+                "with_quiz": accepted.request.with_quiz,
+                "status": "The lessons are queued and being written now (a few at a time); their progress shows on the card.",
+            });
+            let summary = format!(
+                "Created {} · {}",
+                quoted(&topic.title),
+                plural(lessons.len(), "lesson", "lessons")
+            );
+            ToolOutput::ok(output.to_string(), summary).with_card(result_card(
+                ResultTarget::Topic {
+                    topic_id: topic.id.clone(),
+                },
+                &topic.title,
+            ))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete_topic, delete_lesson, delete_note
+// ---------------------------------------------------------------------------
+
+/// What deleting a topic takes with it.
+struct TopicContents {
+    title: String,
+    subtopics: usize,
+    lessons: usize,
+    notes: usize,
+    videos: usize,
+    sources: usize,
+}
+
+impl TopicContents {
+    async fn load(state: &AppState, topic_id: &str) -> Result<Self, String> {
+        let topic = library::topic(state, topic_id)
+            .await
+            .map_err(|e| e.message)?;
+        let counted = async {
+            let lib = Snapshot::load(state).await?;
+            let videos: Vec<StoredVideo> = state.store.list(db::VIDEO).await?;
+            let all_sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+            let within = subtree(&lib.topics, topic_id);
+            let lesson_ids: HashSet<&str> = lib
+                .lessons
+                .iter()
+                .filter(|l| within.contains(&l.lesson.topic_id))
+                .map(|l| l.lesson.id.as_str())
+                .collect();
+            anyhow::Ok(Self {
+                title: topic.title.clone(),
+                subtopics: within.len() - 1,
+                lessons: lesson_ids.len(),
+                notes: lib
+                    .notes
+                    .iter()
+                    .filter(|n| within.contains(&n.topic_id))
+                    .count(),
+                videos: videos
+                    .iter()
+                    .filter(|v| lesson_ids.contains(v.video.lesson_id.as_str()))
+                    .count(),
+                sources: all_sources
+                    .iter()
+                    .filter(|s| s.topic_id.as_ref().is_some_and(|t| within.contains(t)))
+                    .count(),
+            })
+        };
+        counted.await.map_err(|e| {
+            tracing::error!("couldn't count a topic's contents: {e:#}");
+            "The service couldn't read the library just now.".to_string()
+        })
+    }
+
+    fn parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.subtopics > 0 {
+            parts.push(plural(self.subtopics, "topic under it", "topics under it"));
+        }
+        for (n, one, many) in [
+            (self.lessons, "lesson", "lessons"),
+            (self.notes, "note", "notes"),
+            (self.videos, "video", "videos"),
+            (self.sources, "source", "sources"),
+        ] {
+            if n > 0 {
+                parts.push(plural(n, one, many));
+            }
+        }
+        parts
+    }
+}
+
+pub struct DeleteTopic(pub AppState);
+
+impl TypedTool for DeleteTopic {
+    type Args = TopicArgs;
+    const NAME: &'static str = "delete_topic";
+    const DESCRIPTION: &'static str = "Delete a topic with everything in it: the topics under it, their lessons, notes, videos and sources. The owner confirms in the app first; just call it.";
+    const KIND: ToolKind = ToolKind::Destructive;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Deleting a topic".into()
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        args: &'a Self::Args,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        Box::pin(async move {
+            let contents = TopicContents::load(&self.0, &args.topic_id).await?;
+            let parts = contents.parts();
+            let detail = if parts.is_empty() {
+                "It's empty.".to_string()
+            } else {
+                go_with_it(&parts)
+            };
+            Ok(Some(ConfirmationPrompt {
+                title: format!("Delete the topic {}?", quoted(&contents.title)),
+                detail,
+                approve_label: "Delete".into(),
+            }))
+        })
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let contents = match TopicContents::load(&state, &args.topic_id).await {
+                Ok(c) => c,
+                Err(message) => return ToolOutput::error(message),
+            };
+            if let Err(e) = library::remove_topic(&state, &args.topic_id).await {
+                return failed(e);
+            }
+            let output = json!({
+                "deleted": "topic",
+                "id": args.topic_id,
+                "title": contents.title,
+                "with_it": {
+                    "topics": contents.subtopics,
+                    "lessons": contents.lessons,
+                    "notes": contents.notes,
+                    "videos": contents.videos,
+                    "sources": contents.sources,
+                },
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Deleted {}", quoted(&contents.title)),
+            )
+        }))
+    }
+}
+
+pub struct DeleteLesson(pub AppState);
+
+impl TypedTool for DeleteLesson {
+    type Args = LessonArgs;
+    const NAME: &'static str = "delete_lesson";
+    const DESCRIPTION: &'static str = "Delete a lesson with its notes and its video. The owner confirms in the app first; just call it.";
+    const KIND: ToolKind = ToolKind::Destructive;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Deleting a lesson".into()
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        args: &'a Self::Args,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        Box::pin(async move {
+            let state = &self.0;
+            let row = library::lesson(state, &args.lesson_id)
+                .await
+                .map_err(|e| e.message)?;
+            let counted = async {
+                let notes: Vec<Note> = state
+                    .store
+                    .list_where(db::NOTE, "lesson_id", &args.lesson_id)
+                    .await?;
+                let video = library::video_for_lesson(state, &args.lesson_id).await?;
+                anyhow::Ok((notes.len(), video.is_some()))
+            };
+            let (notes, video) = counted.await.map_err(|e| {
+                tracing::error!("couldn't count a lesson's notes: {e:#}");
+                "The service couldn't read the library just now.".to_string()
+            })?;
+            let mut parts = Vec::new();
+            if notes > 0 {
+                parts.push(plural(notes, "note", "notes"));
+            }
+            if video {
+                parts.push("its video".to_string());
+            }
+            let detail = if parts.is_empty() {
+                "Nothing else goes with it.".to_string()
+            } else {
+                go_with_it(&parts)
+            };
+            Ok(Some(ConfirmationPrompt {
+                title: format!("Delete the lesson {}?", quoted(&row.lesson.title)),
+                detail,
+                approve_label: "Delete".into(),
+            }))
+        })
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let row = match library::lesson(&state, &args.lesson_id).await {
+                Ok(l) => l,
+                Err(e) => return failed(e),
+            };
+            if let Err(e) = library::remove_lesson(&state, &args.lesson_id).await {
+                return failed(e);
+            }
+            let output = json!({
+                "deleted": "lesson",
+                "id": args.lesson_id,
+                "title": row.lesson.title,
+                "topic_id": row.lesson.topic_id,
+            });
+            ToolOutput::ok(
+                output.to_string(),
+                format!("Deleted {}", quoted(&row.lesson.title)),
+            )
+        }))
+    }
+}
+
+pub struct DeleteNote(pub AppState);
+
+impl TypedTool for DeleteNote {
+    type Args = NoteArgs;
+    const NAME: &'static str = "delete_note";
+    const DESCRIPTION: &'static str =
+        "Delete a note. The owner confirms in the app first; just call it.";
+    const KIND: ToolKind = ToolKind::Destructive;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Deleting a note".into()
+    }
+
+    fn confirmation<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        args: &'a Self::Args,
+    ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
+        Box::pin(async move {
+            let row = library::stored_note(&self.0, &args.note_id)
+                .await
+                .map_err(|e| e.message)?;
+            let who = match row.author {
+                Author::Owner => "You wrote it",
+                Author::Agent => "The assistant wrote it",
+            };
+            let detail = if row.note.body_md.trim().is_empty() {
+                format!("{who}; it's empty.")
+            } else {
+                format!("{who}. It begins “{}”.", excerpt(&row.note.body_md, 80))
+            };
+            Ok(Some(ConfirmationPrompt {
+                title: format!("Delete the note {}?", quoted(note_title(&row.note))),
+                detail,
+                approve_label: "Delete".into(),
+            }))
+        })
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        let state = self.0.clone();
+        Box::pin(to_the_end(async move {
+            let note = match library::note(&state, &args.note_id).await {
+                Ok(n) => n,
+                Err(e) => return failed(e),
+            };
+            if let Err(e) = library::remove_note(&state, &args.note_id).await {
+                return failed(e);
+            }
+            let title = note_title(&note).to_string();
+            let output = json!({
+                "deleted": "note",
+                "id": args.note_id,
+                "title": title,
+            });
+            ToolOutput::ok(output.to_string(), format!("Deleted {}", quoted(&title)))
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1853,55 @@ mod tests {
         let by_id: HashMap<&str, &Topic> = all.iter().map(|t| (t.id.as_str(), t)).collect();
         assert_eq!(topic_path(&by_id, "c"), "A / B / C");
         assert_eq!(topic_path(&by_id, "gone"), "");
+    }
+
+    #[test]
+    fn lists_and_excerpts() {
+        let parts = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(and_list(&parts(&[])), "");
+        assert_eq!(and_list(&parts(&["2 lessons"])), "2 lessons");
+        assert_eq!(
+            and_list(&parts(&["1 topic under it", "2 lessons", "1 note"])),
+            "1 topic under it, 2 lessons and 1 note"
+        );
+        assert_eq!(excerpt("a\n\n  b  c", 10), "a b c");
+        assert_eq!(excerpt("abcdef", 3), "abc…");
+        assert_eq!(go_with_it(&parts(&["1 note"])), "1 note goes with it.");
+        assert_eq!(
+            go_with_it(&parts(&["its video"])),
+            "its video goes with it."
+        );
+        assert_eq!(go_with_it(&parts(&["2 notes"])), "2 notes go with it.");
+        assert_eq!(
+            go_with_it(&parts(&["1 note", "its video"])),
+            "1 note and its video go with it."
+        );
+    }
+
+    #[test]
+    fn write_tool_arguments_are_strict() {
+        for schema in [
+            margin_agent::strict_schema::<CreateTopicArgs>(),
+            margin_agent::strict_schema::<RenameTopicArgs>(),
+            margin_agent::strict_schema::<MoveTopicArgs>(),
+            margin_agent::strict_schema::<EditLessonTitleArgs>(),
+            margin_agent::strict_schema::<CreateNoteArgs>(),
+            margin_agent::strict_schema::<AppendToNoteArgs>(),
+            margin_agent::strict_schema::<ReplaceNoteBodyArgs>(),
+            margin_agent::strict_schema::<ProposeCourseArgs>(),
+            margin_agent::strict_schema::<AcceptProposalArgs>(),
+        ] {
+            margin_agent::check_strict_schema(&schema).unwrap_or_else(|e| panic!("{e}: {schema}"));
+        }
+        let schema = margin_agent::strict_schema::<ProposeCourseArgs>();
+        assert_eq!(
+            schema["properties"]["level"]["enum"],
+            json!(["intro", "intermediate", "advanced"])
+        );
+        assert_eq!(
+            schema["properties"]["lessons"]["items"]["required"],
+            json!(["minutes", "summary", "title"])
+        );
     }
 
     #[test]

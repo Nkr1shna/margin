@@ -9,7 +9,7 @@ use common::*;
 use margin_service::db;
 use margin_service::sources::{ChunkRow, MediaKind, MediaRow};
 use margin_shared::{
-    Citation, Event, Lesson, LessonStatus, Library, Proposal, ProposalStatus, Source, SourceKind,
+    Citation, Event, Lesson, LessonStatus, Library, ProposalStatus, Source, SourceKind,
     SourceStatus, Topic,
 };
 use margin_shared::{TranscriptSegment, routes};
@@ -77,25 +77,12 @@ async fn chunk_rows(h: &Harness, source_id: &str) -> Vec<ChunkRow> {
     rows
 }
 
-/// Asks with the sources, accepts the outline and waits for its one lesson to settle.
+/// Has the agent propose a one-lesson course on the sources, accepts it and waits for
+/// the lesson to settle.
 async fn lesson_from(h: &Harness, token: &str, prompt: &str, sources: &[&Source]) -> Lesson {
     let mut req = ask_request(prompt, 1, false);
     req.source_ids = sources.iter().map(|s| s.id.clone()).collect();
-    let r = h.post(token, "/api/ask").json(&req).send().await.unwrap();
-    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
-    let p: Proposal = r.json().await.unwrap();
-    let p = eventually(|| async {
-        let p: Proposal = h
-            .get(token, &format!("/api/proposals/{}", p.id))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        (p.status != ProposalStatus::Drafting).then_some(p)
-    })
-    .await;
+    let p = h.propose(token, &req).await;
     assert_eq!(p.status, ProposalStatus::Ready);
     let r = h
         .post(token, &format!("/api/proposals/{}/accept", p.id))
@@ -237,14 +224,12 @@ async fn images_are_embedded_shown_to_the_writer_and_cited() {
     let lesson = lesson_from(&h, &t, "Fourier coefficient projection", &[&image]).await;
     assert_eq!(lesson.status, LessonStatus::Ready);
     {
-        let outlines = h.generator.outline_passages.lock().unwrap();
-        let passage = &outlines.last().unwrap()[0];
+        let lessons = h.generator.lesson_requests.lock().unwrap();
+        let passage = &lessons[0].passages[0];
         assert_eq!(passage.source, "figures/diagram.png");
         let picture = passage.image.as_ref().unwrap();
         assert_eq!(picture.media_type, "image/jpeg");
         assert_eq!(picture.data, DIAGRAM.as_bytes());
-        let lessons = h.generator.lesson_requests.lock().unwrap();
-        assert!(lessons[0].passages[0].image.is_some());
     }
     assert_eq!(
         lesson.body_md,

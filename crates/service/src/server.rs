@@ -179,7 +179,6 @@ pub fn router(state: AppState) -> Router {
             "/api/notes/{id}",
             patch(library::patch_note).delete(library::delete_note),
         )
-        .route(routes::ASK, post(ask::ask))
         .route("/api/proposals/{id}", get(ask::get_proposal))
         .route("/api/proposals/{id}/accept", post(ask::accept))
         .route("/api/videos/{id}", get(video::get_video))
