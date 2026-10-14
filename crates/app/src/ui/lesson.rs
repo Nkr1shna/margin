@@ -16,7 +16,8 @@ use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
 use crate::ui::ask::level_label;
 use crate::ui::common::{
-    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, render_math_in,
+    ConfirmDialog, ErrorNotice, Icon, Loading, TopBar, ago, date, js, mark_quotes,
+    quote_marks_json, render_math_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -337,6 +338,10 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     use_drop(|| {
         let _ = js("MarginApp.stopSelection();");
     });
+    // Mark each margin note's passage in the text; a tap on one shows its note.
+    let marks_id = lesson_id.clone();
+    let marks = use_memo(move || quote_marks_json(app.lib.read().notes_for_lesson(&marks_id)));
+    use_effect(move || mark_quotes("lesson-body", &marks.read()));
 
     let lib = app.lib.read();
     let Some(lesson) = lib.lessons.get(&lesson_id).cloned() else {
@@ -991,6 +996,9 @@ fn VideoPlayer(video: Video) -> Element {
             id: "{player_id}",
             class: "player",
             controls: true,
+            // iPhone plays in place, not fullscreen.
+            "playsinline": "true",
+            "webkit-playsinline": "true",
             preload: "metadata",
             poster: media.poster_url.clone(),
             "data-poster": has_poster.to_string(),

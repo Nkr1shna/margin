@@ -672,7 +672,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
 
     rsx! {
         div {
-            class: "modal-scrim center",
+            class: "modal-scrim center sheet",
             onclick: move |_| on_close.call(()),
             div {
                 id: "sources-dialog",

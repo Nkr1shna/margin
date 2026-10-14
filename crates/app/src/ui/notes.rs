@@ -200,6 +200,7 @@ pub fn NotesScreen(topic: Option<Id>, selected: Option<Id>) -> Element {
                                 div {
                                     key: "{note.id}",
                                     class: "note-row",
+                                    "data-long-press": "true",
                                     // Right-click: the same actions as the row's buttons.
                                     oncontextmenu: {
                                         let id = note.id.clone();

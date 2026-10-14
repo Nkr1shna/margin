@@ -19,7 +19,8 @@ pub fn Shell() -> Element {
     let nav = navigator();
     let route = use_route::<Route>();
 
-    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+Shift+N opens All notes, Cmd/Ctrl+\ toggles the sidebar,
+    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+Shift+N opens All notes, Cmd/Ctrl+\ toggles the sidebar
+    // (or the drawer, in windows under 1024px),
     // Cmd/Ctrl+[ and ] go back and forward, from anywhere in the window.
     use_future(move || async move {
         let mut eval = js(
@@ -39,6 +40,11 @@ pub fn Shell() -> Element {
                     let hidden = app.config.peek().sidebar_hidden;
                     let _ = app.set_config(|c| c.sidebar_hidden = !hidden);
                     app.drawer_open.set(false);
+                }
+                // Below 1024px the sidebar is a drawer: the shortcut opens and closes it.
+                "drawer" => {
+                    let open = *app.drawer_open.peek();
+                    app.drawer_open.set(!open);
                 }
                 "ask" => {
                     app.search_open.set(false);

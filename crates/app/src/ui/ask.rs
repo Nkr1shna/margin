@@ -480,7 +480,7 @@ fn OutlineEditor(
                 p { class: "muted", style: "margin: 0 0 12px", "New topic: ", b { style: "font-weight: 500; color: var(--fg)", "{outline.topic_title}" } }
             }
             for (i, lesson) in outline.lessons.iter().cloned().enumerate() {
-                div { key: "{rows_rev}-{i}", class: "ol-item",
+                div { key: "{rows_rev}-{i}", class: if *editing.read() { "ol-item editing" } else { "ol-item" },
                     span { class: "n", "{i + 1}" }
                     if *editing.read() {
                         div { class: "ol-main",
@@ -527,7 +527,7 @@ fn OutlineEditor(
                                 Icon { name: "down" }
                             }
                             button {
-                                class: "icon-btn",
+                                class: "icon-btn ol-del",
                                 "aria-label": "Remove lesson {i + 1}",
                                 disabled: n == 1,
                                 onclick: move |_| { edit(&move |o: &mut Outline| { o.lessons.remove(i); }); rows_rev += 1; },

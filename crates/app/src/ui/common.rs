@@ -446,3 +446,68 @@ pub fn Loading(#[props(default = "Loading…".to_string())] label: String) -> El
         }
     }
 }
+
+/// The margin notes' passages to mark in a lesson body, as the JSON `MarginApp.markQuotes`
+/// takes: `[{id, quote}]` for each note that quotes the lesson.
+pub fn quote_marks_json<'a>(notes: impl IntoIterator<Item = &'a margin_shared::Note>) -> String {
+    let marks: Vec<serde_json::Value> = notes
+        .into_iter()
+        .filter_map(|n| {
+            let quote = n.quote.as_deref()?.trim();
+            (!quote.is_empty()).then(|| serde_json::json!({ "id": n.id, "quote": quote }))
+        })
+        .collect();
+    serde_json::Value::Array(marks).to_string()
+}
+
+/// Mark the notes' passages (from `quote_marks_json`) in the element with this id; the
+/// marks are kept as the body updates, and tapping one shows its note.
+pub fn mark_quotes(body_id: &str, marks_json: &str) {
+    let id = serde_json::to_string(body_id).unwrap_or_default();
+    let _ = js(&format!("MarginApp.markQuotes({id}, {marks_json});"));
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use margin_shared::Note;
+
+    use super::quote_marks_json;
+
+    fn note(id: &str, quote: Option<&str>) -> Note {
+        Note {
+            id: id.into(),
+            topic_id: "t".into(),
+            lesson_id: Some("l".into()),
+            title: String::new(),
+            body_md: String::new(),
+            quote: quote.map(Into::into),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn quote_marks_keep_only_notes_with_a_quote() {
+        let notes = [
+            note("a", Some("  the integral  ")),
+            note("b", None),
+            note("c", Some("   ")),
+            note("d", Some("say \"hi\" </script>")),
+        ];
+        let json = quote_marks_json(&notes);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "id": "a", "quote": "the integral" },
+                { "id": "d", "quote": "say \"hi\" </script>" },
+            ])
+        );
+    }
+
+    #[test]
+    fn quote_marks_of_no_notes_is_an_empty_list() {
+        assert_eq!(quote_marks_json(&[]), "[]");
+    }
+}
