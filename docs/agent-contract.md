@@ -50,7 +50,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **1 Chat foundation** | `stream_response` with every `StreamEvent`, HTTP errors with `retry_after` | `run_turn` (steps, streaming into items, parallel Read calls, retries, step cap, budgets), `replay_input`, `unanswered_calls`, `user_message_input`, `system_prompt`, `strict_schema`, `Typed`, `truncate_output` | `chats` routes and storage, `turns` (start, run, stop, continue, pending, recovery, `ServiceSink`), Read tools, settings fields, `Generator::agent_model` | Ask screen becomes the chat (composer, transcript, streaming text, tool rows with on-demand output, Stop, Continue/Retry, pending message with cancel), Chats in the sidebar (New chat button; rename/delete by right-click/⋯ and long press), Settings: agent model + reasoning effort |
 | **2 Courses through the agent** | — | Confirmation parking (`wait_for_decision`), Write/Destructive ordering | Write and Destructive tools, `propose_course` + `accept_proposal`, `decide`, `AcceptProposal.chips`, `Proposal.chat_id` + Action on accept, Q2 provenance; remove `POST /api/ask` and the proposal job | Outline card (the existing outline editor with chips, Create lessons), result cards, confirmation cards (Approve/Deny from any device); remove the old Ask composer and `Api::ask` |
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
-| **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files`, `search_folder` (service `Read` tools over `FolderIndex`) and `sync_folder` (the one device tool); rebuilt on R1's `Retriever` once R1's service areas merge | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
+| **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files` (service `Read` tools over the folder's rows and sources) and `sync_folder` (the one device tool); a folder's text is searched with R1's `search` scoped to the workspace | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
 | **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
@@ -240,8 +240,7 @@ error output, no run. Otherwise:
   exactly as sent; then the next step.
 
 Device tools call `DeviceBridge::call(device_id, DeviceCall { timeout })` with
-`FOLDER_TOOL_TIMEOUT` (60 s), `SEARCH_TEXT_TIMEOUT` (120 s) or `APP_CONTROL_TIMEOUT`
-(20 s). `Offline`/`TimedOut` give an error output naming the device, e.g. "iPhone isn't
+`FOLDER_TOOL_TIMEOUT` (60 s) or `APP_CONTROL_TIMEOUT` (20 s). `Offline`/`TimedOut` give an error output naming the device, e.g. "iPhone isn't
 connected to Margin right now (the app must be open to read the folder)."; `Failed(msg)`
 gives `msg`.
 
@@ -472,14 +471,17 @@ they stay in `Chat.source_ids` and, now in a topic, survive the chat's deletion.
 
 A folder's allow-listed files (prose documents, PDFs, images; `folder_file_type`) are
 copied to the service as they change and ingested there like sources; nothing is read
-from a device on demand. The model's folder tools are `list_files`, `find_files` and
-`search_folder` (service `Read` tools over a `FolderIndex`; `search_folder` becomes R1's
-`search` scoped to the workspace) and `sync_folder` (a device tool: `DeviceToolCall::
-SyncFolder`, answered `Done` with the plan's counts). The workspace must be one of the
-chat's. No per-file size cap and no picture cap (owner); `UPLOAD_PART_BYTES` still
+from a device on demand. The model's folder tools (`FOLDER_TOOLS`) are `list_files`
+and `find_files` (service `Read` tools over the folder's rows and sources) and
+`sync_folder` (a device tool: `DeviceToolCall::SyncFolder`, answered `Done` with the
+plan's counts); a folder's text is searched with R1's `search` scoped to the workspace.
+The workspace must be one of the chat's. A file the device lists but can't read (evicted
+to iCloud, locked) is sent in `SyncManifest.unreadable` with its reason; the service
+keeps what it has of it and records the list on `Workspace.unreadable`, which the
+Folders pane shows greyed out. No per-file size cap and no picture cap (owner); `UPLOAD_PART_BYTES` still
 bounds one request. The device-side `ListFiles`/`FindFiles`/`SearchText`/`ReadFile`
-calls and their outputs stay in the protocol until 4-agent replaces the agent's
-device-side folder tools (the app answers them "This build can't read folders yet.").
+calls and their outputs stay in the protocol for older services; the app answers them
+with an error (`tools::READ_ON_SERVICE`: the folder's files are on the service).
 
 ### R1, the retrieval tool family (service, replaces `search_sources`)
 
@@ -520,15 +522,22 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
   stamp; the hash is computed on the device), `FetchFile { workspace_id, path, stamp }`
   (upload that file now through `SOURCES`/`SOURCE_UPLOADS` with `workspace_id` and
   `modified`, answer `Done`; a stamp that no longer matches is `Err`; no size limit).
-  `workspace_id()` names the folder for all three. The app answers them "This build
-  can't read folders yet." until 4-core.
+  `workspace_id()` names the folder for all three; the app answers them from its sync
+  engine (`folders::sync`).
 
 ### R1, the context API (device token today; per-agent tokens later)
 
 `GET /api/projects`; `POST /api/context/search` (`ContextQuery` → `Vec<Hit>`, 400
 `bad_scope`); `GET /api/context/documents/{id}/outline` and `…/passages?from&to` (404,
 409 `not_ready`); `POST /api/context/ingest` (`ContextIngest` → `Document`, 400
-`bad_origin`; `actor = agent:<name>`); `GET /api/context/changes?since`;
+`bad_origin`; `actor = agent:<name>`); `GET /api/context/changes?since&limit` (one page,
+by generation: `limit` 1-500, default 100, 400 outside; `more` while others follow,
+and then `generation` is the page's last; margin-mcp reads every page and its
+`recent_changes` lists the latest 50, counting the rest); `GET /api/version` (no
+token: version, sha, environment); a search or passage read sent with
+`x-margin-agent: <name>` (margin-mcp sends `claude-code`) leaves trace rows with
+`actor: agent:<name>`, `via: mcp` and, for a search, the query, which
+`margin-eval harvest` turns into eval candidates (`docs/plan-dogfood.md` §6);
 `GET /api/traces?kind&from&to&trace_id` (JSON lines, oldest first, 400 `bad_range`);
 `GET /api/traces/rollup?bucket&from&to`. The handlers call the same functions as the
 agent's tools: one retrieval path for Margin's agent, external agents and the GUI.
@@ -537,8 +546,7 @@ agent's tools: one retrieval path for Margin's agent, external agents and the GU
 
 `margin_agent`: `MAX_STEPS` 40, `TOOL_OUTPUT_MAX_BYTES` 64 KB, `TURN_OUTPUT_MAX_BYTES`
 512 KB, `MODEL_RETRIES` 3, `RETRY_BASE_DELAY` 2 s, `RETRY_MAX_DELAY` 60 s,
-`MAX_CONCURRENT_TURNS` 2, `FOLDER_TOOL_TIMEOUT` 60 s, `SEARCH_TEXT_TIMEOUT` 120 s,
-`APP_CONTROL_TIMEOUT` 20 s, `COMPACT_THRESHOLD_TOKENS` 200 000 (phase 5).
+`MAX_CONCURRENT_TURNS` 2, `FOLDER_TOOL_TIMEOUT` 60 s, `APP_CONTROL_TIMEOUT` 20 s, `COMPACT_THRESHOLD_TOKENS` 200 000 (phase 5).
 `margin_shared::device`: `READ_FILE_MAX_LINES` 400, `READ_FILE_MAX_BYTES` 64 KB,
 `READ_FILE_MAX_BYTES_TOTAL` 2 MB, `SEARCH_MAX_BYTES` 50 MB, `SEARCH_MAX_SECONDS` 20,
 `MAX_LISTED_ENTRIES` 500, `MAX_TEXT_MATCHES` 200, `MATCH_LINE_MAX_CHARS` 300,

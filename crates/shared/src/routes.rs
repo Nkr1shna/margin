@@ -1,12 +1,14 @@
 //! HTTP routes, relative to the service base URL (e.g. `https://margin.krishnanelloore.com`).
 //!
-//! Everything under `/api` requires `Authorization: Bearer <device token>`, except the
-//! media routes, which are authorized by the signed query string the service puts in
-//! `VideoMedia` URLs. Errors use `ApiError` as the body.
+//! Everything under `/api` requires `Authorization: Bearer <device token>`, except
+//! `/api/version` (open, like `/health`) and the media routes, which are authorized by
+//! the signed query string the service puts in `VideoMedia` URLs. Errors use `ApiError`
+//! as the body.
 //!
 //! | Method | Path                                   | Body               | Response            |
 //! |--------|----------------------------------------|--------------------|---------------------|
 //! | GET    | /health                                |                    | "ok"                |
+//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes } |
 //! | POST   | /auth/start                            | StartLoginRequest  | StartLogin          |
 //! | POST   | /auth/poll                             | PollLoginRequest   | LoginState          |
 //! | GET    | /auth/github/callback?code&state       |                    | HTML page           |
@@ -60,12 +62,12 @@
 //! | POST   | /api/workspaces/{id}/sync              | SyncManifest       | SyncPlan (403 not_yours, 404, 400 bad_path) |
 //! | GET    | /api/workspaces/{id}/files             |                    | Vec<Source> (newest first, with media_url; 404) |
 //! | GET    | /api/projects                          |                    | Vec<context::Project> |
-//! | POST   | /api/context/search                    | context::ContextQuery | Vec<context::Hit> (400 bad_scope) |
+//! | POST   | /api/context/search                    | context::ContextQuery | Vec<context::Hit> (400 bad_scope; `x-margin-agent` names the agent for the trace) |
 //! | DELETE | /api/context/documents/{id}            |                    | 204 (404; 403 forbidden: not an agent's) |
 //! | GET    | /api/context/documents/{id}/outline    |                    | context::DocumentOutline (404; 409 not_ready) |
 //! | GET    | /api/context/documents/{id}/passages?from&to |              | Vec<context::Hit> (404; 409 not_ready) |
 //! | POST   | /api/context/ingest                    | context::ContextIngest | context::Document (400 bad_origin) |
-//! | GET    | /api/context/changes?since             |                    | context::ContextChanges |
+//! | GET    | /api/context/changes?since&limit       |                    | context::ContextChanges (one page by generation: limit 1-500, default 100; `more`; 400 outside) |
 //! | GET    | /api/traces?kind&from&to&trace_id      |                    | JSONL of context::TraceRow, oldest first (400 bad_range) |
 //! | GET    | /api/traces/rollup?bucket&from&to      |                    | Vec<context::TraceRollup> (400 bad_range) |
 //! | GET    | /api/events  (WebSocket upgrade; `?traces=1` adds Event::Trace) | DeviceFrame frames | ServerFrame frames  |
