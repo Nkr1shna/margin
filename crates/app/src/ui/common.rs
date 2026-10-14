@@ -180,6 +180,66 @@ pub fn date(t: &DateTime<Utc>) -> String {
     t.with_timezone(&Local).format("%b %-d, %Y").to_string()
 }
 
+/// The app's mark: the app icon (a page with a blue margin rule) drawn small, for the
+/// sidebar and the sign-in card. Keep in step with `icon/Margin.icon`.
+#[component]
+pub fn BrandMark() -> Element {
+    rsx! {
+        svg {
+            class: "mark",
+            "aria-hidden": "true",
+            view_box: "0 0 1024 1024",
+            defs {
+                linearGradient { id: "mark-bg", x1: "0", y1: "0", x2: "0", y2: "1",
+                    stop { offset: "0", stop_color: "#2b2b2e" }
+                    stop { offset: "1", stop_color: "#060607" }
+                }
+            }
+            rect { width: "1024", height: "1024", rx: "232", fill: "url(#mark-bg)" }
+            rect { x: "262", y: "196", width: "500", height: "632", rx: "64", fill: "#fff" }
+            rect { x: "372", y: "330", width: "300", height: "40", rx: "20", fill: "#cfcfcf" }
+            rect { x: "372", y: "450", width: "300", height: "40", rx: "20", fill: "#cfcfcf" }
+            rect { x: "372", y: "570", width: "220", height: "40", rx: "20", fill: "#cfcfcf" }
+            rect { x: "318", y: "270", width: "26", height: "484", rx: "13", fill: "#3a83f7" }
+            circle { cx: "220", cy: "437", r: "36", fill: "#3a83f7" }
+        }
+    }
+}
+
+/// Whether the window uses the unified title bar (macOS desktop), where the app draws
+/// the drag regions and leaves room for the traffic lights.
+pub const UNIFIED_TITLE_BAR: bool = cfg!(all(feature = "desktop", target_os = "macos"));
+
+/// The draggable background of a title-bar area. It fills its (positioned) parent behind
+/// the parent's content; CSS lets presses through everything in the bar but controls, so
+/// pressing empty bar or plain text moves the window and a double click zooms it.
+#[component]
+pub fn DragRegion() -> Element {
+    if !UNIFIED_TITLE_BAR {
+        return rsx! {};
+    }
+    rsx! {
+        div {
+            class: "drag-region",
+            "aria-hidden": "true",
+            onmousedown: move |e: MouseEvent| {
+                #[cfg(feature = "desktop")]
+                if e.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                    dioxus::desktop::window().drag();
+                }
+                let _ = e;
+            },
+            ondoubleclick: move |_| {
+                #[cfg(feature = "desktop")]
+                {
+                    let window = dioxus::desktop::window();
+                    window.set_maximized(!window.is_maximized());
+                }
+            },
+        }
+    }
+}
+
 /// The top bar of every screen: the drawer button (narrow screens), breadcrumbs, and
 /// screen controls on the right.
 #[component]
@@ -188,6 +248,7 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
     let last = crumbs.len().saturating_sub(1);
     rsx! {
         div { class: "topbar",
+            DragRegion {}
             button {
                 class: "icon-btn menu-btn",
                 "aria-label": "Open sidebar",

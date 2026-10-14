@@ -1,0 +1,25 @@
+/* macOS unified title bar. The window has no title bar of its own: content runs to the
+   top edge, the traffic lights sit at the left of the sidebar's first row (inset 16,32
+   in main.rs), and .drag-region elements move the window. */
+
+/* A drag region fills its bar behind the content. Presses fall through the bar's
+   non-interactive content to it; controls keep their clicks. */
+.drag-region { position: absolute; inset: 0; z-index: 0; }
+.topbar, .ws, .connect-bar { position: relative; }
+.topbar > :not(.drag-region), .ws > :not(.drag-region) { position: relative; z-index: 1; pointer-events: none; }
+.topbar button, .topbar a, .topbar input, .topbar select, .topbar [role="button"],
+.topbar .menu, .topbar .pop-scrim, .ws .live { pointer-events: auto; }
+
+/* The sidebar's first row shares the top bar's height and starts after the lights. */
+.sb-top { padding-top: 0; }
+.ws { height: 46px; padding-left: 74px; margin: 0 -2px; }
+
+/* Sign-in screen: an empty bar across the top to drag by. */
+.connect { position: relative; }
+.connect-bar { position: absolute; top: 0; left: 0; right: 0; height: 46px; }
+
+/* Narrow windows hide the sidebar, so the top bar makes room for the lights; the
+   drawer's own first row already does. */
+@media (max-width: 719px) {
+  .topbar { padding-left: 78px; }
+}

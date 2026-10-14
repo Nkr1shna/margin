@@ -7,7 +7,7 @@ use crate::config::Appearance;
 use crate::routes::Route;
 use crate::state::{LiveStatus, LoadStatus, use_app};
 use crate::store::VideoDot;
-use crate::ui::common::{ConfirmDialog, Icon};
+use crate::ui::common::{BrandMark, ConfirmDialog, DragRegion, Icon};
 
 /// Which inline topic editor is open in the tree.
 #[derive(Clone, PartialEq, Debug)]
@@ -90,7 +90,8 @@ pub fn Sidebar() -> Element {
             "aria-label": "Sidebar",
             div { class: "sb-top",
                 div { class: "ws",
-                    span { class: "mark", "aria-hidden": "true" }
+                    DragRegion {}
+                    BrandMark {}
                     span { class: "grow", "Margin" }
                     span { class: "live", title: "{live_label}",
                         span { class: "{live_class}" }

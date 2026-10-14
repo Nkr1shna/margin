@@ -12,7 +12,7 @@ use crate::api::Api;
 use crate::config::{self, normalize_service_url};
 use crate::secrets;
 use crate::state::{Session, use_app};
-use crate::ui::common::{Icon, open_external};
+use crate::ui::common::{BrandMark, DragRegion, Icon, open_external};
 
 #[derive(Clone, PartialEq, Debug)]
 enum Phase {
@@ -129,9 +129,10 @@ pub fn ConnectScreen() -> Element {
 
     rsx! {
         div { class: "connect",
+            div { class: "connect-bar", DragRegion {} }
             div { class: "connect-card",
                 div { class: "connect-head",
-                    span { class: "mark", "aria-hidden": "true" }
+                    BrandMark {}
                     "Margin"
                 }
                 h1 { "Connect to your Margin service" }

@@ -1,6 +1,8 @@
 //! The Margin app (desktop, iOS, Android): a thin, live client of the Margin service.
 
 mod api;
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+mod chrome;
 mod config;
 mod events;
 #[cfg(test)]
@@ -24,6 +26,8 @@ use crate::store::LibraryState;
 use crate::ui::common::js;
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
+/// Layout for the macOS unified title bar; loaded only when `UNIFIED_TITLE_BAR`.
+const UNIFIED_CSS: Asset = asset!("/assets/unified.css");
 const MARGIN_JS: Asset = asset!("/assets/margin.js");
 const KATEX: Asset = asset!("/assets/katex", AssetOptions::folder());
 const FONTS: Asset = asset!("/assets/fonts", AssetOptions::folder());
@@ -36,6 +40,17 @@ fn main() {
             .with_title("Margin")
             .with_inner_size(LogicalSize::new(1240.0, 800.0))
             .with_min_inner_size(LogicalSize::new(360.0, 480.0));
+        // Unified title bar: the content runs to the top edge, the traffic lights sit in
+        // the sidebar's header row, and the app draws its own drag regions
+        // (`ui::common::DragRegion`). `chrome` places the traffic lights.
+        #[cfg(target_os = "macos")]
+        let window = {
+            use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
+            window
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true)
+        };
         dioxus::LaunchBuilder::new()
             .with_cfg(Config::new().with_window(window).with_menu(menu_bar()))
             .launch(App);
@@ -98,6 +113,8 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
 
 #[component]
 fn App() -> Element {
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    chrome::use_traffic_lights();
     let ctx = use_context_provider(|| {
         let config = config::load();
         // Restore the session from the keychain, if this device signed in before.
@@ -143,6 +160,9 @@ fn App() -> Element {
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" }
         document::Style { {fonts} }
         document::Stylesheet { href: MAIN_CSS }
+        if ui::common::UNIFIED_TITLE_BAR {
+            document::Stylesheet { href: UNIFIED_CSS }
+        }
         document::Stylesheet { href: format!("{KATEX}/katex.min.css") }
         document::Script { src: format!("{KATEX}/katex.min.js") }
         document::Script { src: MARGIN_JS }

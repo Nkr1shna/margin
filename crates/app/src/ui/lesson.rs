@@ -368,9 +368,13 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     let quote_open = new_quote.read().clone();
     let topic_id = lesson.topic_id.clone();
     let lid = lesson.id.clone();
+    // The margin column only takes space once the lesson has notes or one is being
+    // written; until then the lesson is centered and a selection gets a small button.
+    let show_margins = !notes.is_empty() || quote_open.is_some();
+    let pill = if show_margins { None } else { sel.clone() };
 
     rsx! {
-        div { class: "margin-layout",
+        div { class: if show_margins { "margin-layout" } else { "margin-layout bare" },
             article { id: "lesson-doc", class: "doc",
                 div { class: "meta",
                     span { class: "cat", "Lesson {index + 1} of {total}" }
@@ -426,6 +430,16 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                     }
                 }
             }
+            if let Some(s) = pill {
+                button {
+                    class: "note-pill",
+                    style: "top: {s.top}px",
+                    onclick: move |_| new_quote.set(Some((s.text.clone(), s.top))),
+                    Icon { name: "plus" }
+                    "Note"
+                }
+            }
+            if show_margins {
             aside { class: "margins", "aria-label": "Margin notes",
                 if let Some((quote, top)) = quote_open {
                     div { class: "add-note", style: "top: {top}px",
@@ -456,9 +470,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                 for note in margin_notes {
                     NoteCard { key: "{note.id}", note: note.clone(), compact: true }
                 }
-                if notes.is_empty() {
-                    div { class: "mnote hint", "Select text in the lesson to add a note." }
-                }
+            }
             }
         }
     }
