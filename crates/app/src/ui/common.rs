@@ -5,7 +5,8 @@ use dioxus::prelude::*;
 
 use crate::state::use_app;
 
-// Icons from the mockup's SVG sprite (24×24, stroked).
+// Icons from the mockup's SVG sprite (24×24, stroked); "gear" is an eight-tooth cog
+// drawn in the same style (the sprite's was a sun-like burst).
 const ICONS: &[(&str, &str)] = &[
     (
         "search",
@@ -27,7 +28,7 @@ const ICONS: &[(&str, &str)] = &[
     ),
     (
         "gear",
-        r#"<circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/>"#,
+        r#"<path d="M10.45 5.28L10.67 3.10A9 9 0 0 1 13.33 3.10L13.55 5.28A6.9 6.9 0 0 1 15.66 6.15L17.35 4.77A9 9 0 0 1 19.23 6.65L17.85 8.34A6.9 6.9 0 0 1 18.72 10.45L20.90 10.67A9 9 0 0 1 20.90 13.33L18.72 13.55A6.9 6.9 0 0 1 17.85 15.66L19.23 17.35A9 9 0 0 1 17.35 19.23L15.66 17.85A6.9 6.9 0 0 1 13.55 18.72L13.33 20.90A9 9 0 0 1 10.67 20.90L10.45 18.72A6.9 6.9 0 0 1 8.34 17.85L6.65 19.23A9 9 0 0 1 4.77 17.35L6.15 15.66A6.9 6.9 0 0 1 5.28 13.55L3.10 13.33A9 9 0 0 1 3.10 10.67L5.28 10.45A6.9 6.9 0 0 1 6.15 8.34L4.77 6.65A9 9 0 0 1 6.65 4.77L8.34 6.15A6.9 6.9 0 0 1 10.45 5.28z"/><circle cx="12" cy="12" r="2.8"/>"#,
     ),
     (
         "play",

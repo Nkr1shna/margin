@@ -423,16 +423,26 @@ async fn me(State(fake): State<Fake>, headers: HeaderMap) -> Response {
 
 fn with_media(s: &FakeState, mut video: Video) -> Video {
     if video.status == VideoStatus::Ready {
-        let base = format!("{}/media/videos/{}", s.public_url, video.id);
-        video.media = Some(VideoMedia {
-            mp4_url: format!("{base}/video.mp4?exp=1&sig=x"),
-            storyboard_url: format!("{base}/storyboard.png?exp=1&sig=x"),
-            captions_url: Some(format!("{base}/captions.srt?exp=1&sig=x")),
-            poster_url: None,
-            expires_at: Utc::now() + chrono::Duration::hours(6),
-        });
+        video.media = Some(fake_media(s, &video.id));
     }
     video
+}
+
+/// Media URLs for a ready video. The poster is offered only when `media_dir` has a
+/// `poster.png` (like videos rendered before posters existed, there is none otherwise).
+fn fake_media(s: &FakeState, video_id: &Id) -> VideoMedia {
+    let base = format!("{}/media/videos/{}", s.public_url, video_id);
+    let has_poster = s
+        .media_dir
+        .as_ref()
+        .is_some_and(|d| d.join("poster.png").is_file());
+    VideoMedia {
+        mp4_url: format!("{base}/video.mp4?exp=1&sig=x"),
+        storyboard_url: format!("{base}/storyboard.png?exp=1&sig=x"),
+        captions_url: Some(format!("{base}/captions.srt?exp=1&sig=x")),
+        poster_url: has_poster.then(|| format!("{base}/poster.png?exp=1&sig=x")),
+        expires_at: Utc::now() + chrono::Duration::hours(6),
+    }
 }
 
 async fn library(State(fake): State<Fake>, headers: HeaderMap) -> Response {
@@ -724,7 +734,7 @@ async fn make_video(
 async fn simulate_video(fake: Fake, id: Id) {
     let step = |status: VideoStatus, log: &str, code: Option<&str>| {
         let mut s = fake.state.lock().unwrap();
-        let public = s.public_url.clone();
+        let media = fake_media(&s, &id);
         let v = s.library.videos.iter_mut().find(|v| v.id == id)?;
         v.status = status;
         v.log.push_str(log);
@@ -736,14 +746,7 @@ async fn simulate_video(fake: Fake, id: Id) {
         if video.status == VideoStatus::Ready {
             video.duration_seconds = Some(12.0);
             v.duration_seconds = Some(12.0);
-            let base = format!("{public}/media/videos/{}", video.id);
-            video.media = Some(VideoMedia {
-                mp4_url: format!("{base}/video.mp4?exp=1&sig=x"),
-                storyboard_url: format!("{base}/storyboard.png?exp=1&sig=x"),
-                captions_url: Some(format!("{base}/captions.srt?exp=1&sig=x")),
-                poster_url: None,
-                expires_at: Utc::now() + chrono::Duration::hours(6),
-            });
+            video.media = Some(media);
         }
         Some(video)
     };
@@ -1321,5 +1324,28 @@ async fn media(State(fake): State<Fake>, Path((id, file)): Path<(String, String)
             ([(header::CONTENT_TYPE, mime)], bytes).into_response()
         }
         Err(_) => not_found(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poster_is_offered_only_when_the_media_dir_has_one() {
+        let dir = std::env::temp_dir().join(format!("margin-fake-poster-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = FakeState::new();
+        state.public_url = "http://fake".into();
+        let id: Id = "video-1".into();
+        assert_eq!(fake_media(&state, &id).poster_url, None);
+        state.media_dir = Some(dir.clone());
+        assert_eq!(fake_media(&state, &id).poster_url, None);
+        std::fs::write(dir.join("poster.png"), b"png").unwrap();
+        assert_eq!(
+            fake_media(&state, &id).poster_url.as_deref(),
+            Some("http://fake/media/videos/video-1/poster.png?exp=1&sig=x")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

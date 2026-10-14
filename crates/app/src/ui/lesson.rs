@@ -853,7 +853,7 @@ fn VideoView(lesson_id: Id) -> Element {
     };
 
     let lesson_ready = lesson.status == LessonStatus::Ready;
-    let make_icon: &'static str = if video.is_some() { "refresh" } else { "play" };
+    let make_icon: &'static str = if video.is_some() { "refresh" } else { "video" };
     let (status_dot, status_text) = match video.as_ref().map(|v| &v.status) {
         None => ("dot", "No video yet".to_string()),
         Some(VideoStatus::Queued) => ("dot run", "Queued".to_string()),
@@ -938,6 +938,7 @@ fn VideoPlayer(video: Video) -> Element {
     // the video element's text-track API once both the player and the captions exist.
     let player_id = format!("player-{}", video.id);
     let ready = matches!(video.status, VideoStatus::Ready) && video.media.is_some();
+    let has_poster = video.media.as_ref().is_some_and(|m| m.poster_url.is_some());
     use_effect(use_reactive!(|cues, player_id, ready| {
         let Some(cues) = cues.filter(|c| !c.is_empty() && ready) else {
             return;
@@ -952,8 +953,10 @@ fn VideoPlayer(video: Video) -> Element {
                 for (const t of v.textTracks) {{ if (t.label === "Captions") t.mode = "disabled"; }}
                 const track = v.addTextTrack("captions", "Captions", "en");
                 for (const c of {json}) track.addCue(new VTTCue(c.start, c.end, c.text));
-                // Hidden over the thumbnail; shown once the video is played.
-                track.mode = v.dataset.thumb === "played" ? "showing" : "hidden";
+                // With a real poster, captions behave normally. Over the seeked-frame
+                // thumbnail (no poster) they stay hidden until the video is first played.
+                const thumb = v.dataset.poster !== "true" && v.dataset.thumb !== "played";
+                track.mode = thumb ? "hidden" : "showing";
             }})()"#,
             id = serde_json::to_string(&player_id).unwrap_or_default(),
         ));
@@ -962,25 +965,12 @@ fn VideoPlayer(video: Video) -> Element {
     let Some(media) = video.media.as_ref().filter(|_| ready) else {
         return rsx! {};
     };
-    // ManimGX videos open on a black frame, so until it's played the player shows a frame
-    // from a few seconds in as its thumbnail; the first Play starts from the beginning.
-    let thumbnail_js = format!(
-        r#"(function() {{
-            const v = document.getElementById({id});
-            if (!v || v.dataset.thumb) return;
-            v.dataset.thumb = "pending";
-            const show = function () {{
-                if (v.dataset.thumb !== "pending" || !isFinite(v.duration)) return;
-                v.dataset.thumb = "shown";
-                v.currentTime = Math.min(v.duration * 0.25, 3);
-            }};
-            if (v.readyState >= 1) show(); else v.addEventListener("loadedmetadata", show, {{ once: true }});
-            v.addEventListener("play", function () {{
-                if (v.dataset.thumb === "shown") v.currentTime = 0;
-                v.dataset.thumb = "played";
-                for (const t of v.textTracks) {{ if (t.label === "Captions" && t.mode === "hidden") t.mode = "showing"; }}
-            }}, {{ once: true }});
-        }})()"#,
+    // Applies the remembered volume and mute, and keeps them in sync across players,
+    // lessons and restarts. Without a poster (videos rendered before posters existed),
+    // ManimGX videos open on a black frame, so the player seeks a few seconds in to show
+    // a frame as the thumbnail; the first Play starts from the beginning.
+    let prepare_js = format!(
+        "MarginApp.preparePlayer({id}, {has_poster});",
         id = serde_json::to_string(&player_id).unwrap_or_default(),
     );
     rsx! {
@@ -990,9 +980,11 @@ fn VideoPlayer(video: Video) -> Element {
             class: "player",
             controls: true,
             preload: "metadata",
+            poster: media.poster_url.clone(),
+            "data-poster": has_poster.to_string(),
             src: "{media.mp4_url}",
             onmounted: move |_| {
-                document::eval(&thumbnail_js);
+                let _ = js(&prepare_js);
             },
             "Your system can't play this video."
         }
@@ -1021,12 +1013,6 @@ fn VideoDetails(video: Video) -> Element {
             }
         }
         VideoPlayer { video: video.clone() }
-        if let Some(code) = &video.scene_code {
-            div { class: "panel-sec",
-                h3 { "Scene code" }
-                pre { class: "code", "aria-label": "Scene code (read-only)", code { "{code}" } }
-            }
-        }
         if !video.log.is_empty() {
             details { class: "collapse",
                 summary { "Render log" }

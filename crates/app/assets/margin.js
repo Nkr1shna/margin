@@ -147,6 +147,45 @@
       if (theme) document.documentElement.setAttribute("data-theme", theme);
       else document.documentElement.removeAttribute("data-theme");
     },
+    // Set up a lesson video player once it's in the page: apply the remembered volume
+    // and mute, remember every change (volumechange) and mirror it on the other players,
+    // and, without a poster image, show a frame from a few seconds in as the thumbnail.
+    preparePlayer: function (id, hasPoster) {
+      var v = document.getElementById(id);
+      if (!v || v.__marginPrepared) return;
+      v.__marginPrepared = true;
+      var saved = readVolume();
+      if (saved) {
+        v.volume = saved.volume;
+        v.muted = saved.muted;
+      }
+      v.addEventListener("volumechange", function () {
+        writeVolume(v.volume, v.muted);
+        var players = document.querySelectorAll("video.player");
+        for (var i = 0; i < players.length; i++) {
+          var p = players[i];
+          if (p === v) continue;
+          if (p.volume !== v.volume) p.volume = v.volume;
+          if (p.muted !== v.muted) p.muted = v.muted;
+        }
+      });
+      if (hasPoster || v.dataset.thumb) return;
+      v.dataset.thumb = "pending";
+      var show = function () {
+        if (v.dataset.thumb !== "pending" || !isFinite(v.duration)) return;
+        v.dataset.thumb = "shown";
+        v.currentTime = Math.min(v.duration * 0.25, 3);
+      };
+      if (v.readyState >= 1) show(); else v.addEventListener("loadedmetadata", show, { once: true });
+      v.addEventListener("play", function () {
+        if (v.dataset.thumb === "shown") v.currentTime = 0;
+        v.dataset.thumb = "played";
+        for (var i = 0; i < v.textTracks.length; i++) {
+          var t = v.textTracks[i];
+          if (t.label === "Captions" && t.mode === "hidden") t.mode = "showing";
+        }
+      }, { once: true });
+    },
     scrollIntoView: function (selector) {
       var el = document.querySelector(selector);
       if (el) el.scrollIntoView({ block: "nearest" });
@@ -158,6 +197,27 @@
       return Promise.resolve(fallbackCopy(text));
     },
   };
+
+  // The player volume and mute, shared by every lesson video and kept across restarts.
+  var VOLUME_KEY = "margin.player.volume";
+  function readVolume() {
+    try {
+      var raw = window.localStorage.getItem(VOLUME_KEY);
+      if (!raw) return null;
+      var s = JSON.parse(raw);
+      if (typeof s.volume !== "number" || !(s.volume >= 0 && s.volume <= 1)) return null;
+      return { volume: s.volume, muted: s.muted === true };
+    } catch (e) {
+      return null;
+    }
+  }
+  function writeVolume(volume, muted) {
+    try {
+      window.localStorage.setItem(VOLUME_KEY, JSON.stringify({ volume: volume, muted: muted }));
+    } catch (e) {
+      // Storage unavailable: the setting still applies for this session's players.
+    }
+  }
 
   function fallbackCopy(text) {
     var ta = document.createElement("textarea");

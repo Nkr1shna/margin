@@ -382,17 +382,18 @@ fn NoteEditor(id: Id) -> Element {
                 if error.read().is_some() {
                     button { class: "btn btn-ghost btn-sm", onclick: move |_| schedule_retry(), "Retry" }
                 }
-                span { style: "flex: 1" }
-                div { class: "seg", role: "tablist", "aria-label": "Editor mode",
-                    button { role: "tab", "aria-selected": (!showing_preview).to_string(), onclick: move |_| preview.set(false), "Write" }
-                    button { role: "tab", "aria-selected": showing_preview.to_string(), onclick: move |_| preview.set(true), "Preview" }
-                }
-                button {
-                    class: "icon-btn",
-                    "aria-label": "Delete note",
-                    title: "Delete note",
-                    onclick: move |_| confirm.set(true),
-                    Icon { name: "trash" }
+                div { class: "note-tools",
+                    div { class: "seg", role: "tablist", "aria-label": "Editor mode",
+                        button { role: "tab", "aria-selected": (!showing_preview).to_string(), onclick: move |_| preview.set(false), "Write" }
+                        button { role: "tab", "aria-selected": showing_preview.to_string(), onclick: move |_| preview.set(true), "Preview" }
+                    }
+                    button {
+                        class: "icon-btn",
+                        "aria-label": "Delete note",
+                        title: "Delete note",
+                        onclick: move |_| confirm.set(true),
+                        Icon { name: "trash" }
+                    }
                 }
             }
             for rev in std::iter::once(remote_rev()) {
