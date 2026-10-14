@@ -858,6 +858,8 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
         bytes: FOURIER.len() as u64,
         status,
         created_at: now - chrono::Duration::hours(age_h),
+        workspace_id: None,
+        modified: None,
     };
     let rows = [
         source(

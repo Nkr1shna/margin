@@ -187,6 +187,7 @@ mod tests {
                     platform: Platform::Macos,
                     location: "~/Developer/margin".into(),
                     created_at: at(),
+                    sync: Default::default(),
                 },
                 false,
             )],
@@ -204,6 +205,8 @@ mod tests {
                 },
                 created_at: at(),
                 media_url: None,
+                workspace_id: None,
+                modified: None,
             }],
         }
     }

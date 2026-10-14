@@ -466,6 +466,7 @@ mod tests {
             document_id: None,
             start_line: None,
             end_line: None,
+            file: None,
         }
     }
 

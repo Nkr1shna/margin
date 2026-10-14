@@ -8,8 +8,11 @@ mod commands;
 mod config;
 mod drafts;
 mod events;
+// Phase 4's contract: 4-core and 4a/4b/4c build on it; nothing calls it yet.
 #[cfg(test)]
 mod fake;
+#[allow(dead_code)]
+mod folders;
 mod markdown;
 mod picker;
 mod routes;

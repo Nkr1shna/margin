@@ -312,6 +312,8 @@ pub async fn create(state: &AppState, id: &str, upload: Upload, bytes: u64) -> A
         bytes,
         status: SourceStatus::Queued,
         created_at: Utc::now(),
+        workspace_id: None,
+        modified: None,
     };
     {
         let _w = state.write_lock.lock().await;
@@ -1242,6 +1244,7 @@ fn retrieved(
             document_id: None,
             start_line: None,
             end_line: None,
+            file: None,
         },
     }
 }

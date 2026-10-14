@@ -27,10 +27,10 @@ pub fn kind_icon(kind: SourceKind) -> &'static str {
     }
 }
 
-/// Pick files (or a folder), queue them for upload to a topic or a chat's composer, and
-/// say what was left out.
-pub async fn add_sources(app: AppCtx, to: Destination, folder: bool) -> Option<String> {
-    let selection = picker::pick(folder).await?;
+/// Pick files, queue them for upload to a topic or a chat's composer, and say what was
+/// left out.
+pub async fn add_sources(app: AppCtx, to: Destination) -> Option<String> {
+    let selection = picker::pick_files().await?;
     let mut note = selection.summary();
     if selection.files.is_empty() && note.is_none() {
         note = Some(match &selection.folder {
@@ -343,7 +343,7 @@ pub fn AddSourcesMenu(
         let to = Destination::Chat(chat_id.clone());
         spawn(async move {
             picking.set(true);
-            let note = add_sources(app, to, false).await;
+            let note = add_sources(app, to).await;
             picking.set(false);
             on_note.call(note);
         });
@@ -752,20 +752,17 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
     drop(lib);
     let empty = groups.is_empty() && lines.is_empty();
 
-    let add = move |folder: bool| {
+    let add = move |_| {
         let topic_id = topic_id.clone();
-        move |_| {
-            let topic_id = topic_id.clone();
-            if *picking.peek() {
-                return;
-            }
-            spawn(async move {
-                picking.set(true);
-                let added = add_sources(app, Destination::Topic(topic_id), folder).await;
-                picking.set(false);
-                note.set(added);
-            });
+        if *picking.peek() {
+            return;
         }
+        spawn(async move {
+            picking.set(true);
+            let added = add_sources(app, Destination::Topic(topic_id)).await;
+            picking.set(false);
+            note.set(added);
+        });
     };
 
     rsx! {
@@ -890,16 +887,9 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                     button {
                         class: "btn btn-secondary btn-sm",
                         disabled: *picking.read(),
-                        onclick: add(false),
+                        onclick: add,
                         Icon { name: "file-add" }
                         "Add files…"
-                    }
-                    button {
-                        class: "btn btn-secondary btn-sm",
-                        disabled: *picking.read(),
-                        onclick: add(true),
-                        Icon { name: "folder" }
-                        "Add folder…"
                     }
                     if *picking.read() { span { class: "spinner" } }
                     span { class: "grow" }

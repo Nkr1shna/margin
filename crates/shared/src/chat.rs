@@ -460,8 +460,10 @@ pub enum Decision {
 // Workspaces (attached folders)
 // ---------------------------------------------------------------------------
 
-/// A folder one device lets the agent read. The handle (path, bookmark or tree URI)
-/// stays on that device; the service keeps only this description. Read-only.
+/// A folder one device holds and attaches to chats. The handle (path, bookmark or tree
+/// URI) stays on that device; its allow-listed files (`folder_file_type`) are copied to
+/// the service as they change and read there like sources, so the agent searches what
+/// the service stores. Read-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Id,
@@ -475,6 +477,9 @@ pub struct Workspace {
     /// "iCloud Drive/Notes"). Display only; never used to read.
     pub location: String,
     pub created_at: DateTime<Utc>,
+    /// The service's counts of the folder's files (it keeps them up to date).
+    #[serde(default)]
+    pub sync: WorkspaceSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,18 +575,68 @@ pub struct OutlineChips {
     pub with_quiz: Option<bool>,
 }
 
-/// A passage of a file in an attached folder, for folder-file citations (owner decision
-/// Q4). Phase 4 adds `file: Option<WorkspaceFile>` to `Citation`; such a citation is
-/// opened by asking the device holding the folder to read it (`DeviceToolCall::ReadFile`
-/// through `routes::chat_item_output`-style on-demand loading), and shows that device
-/// offline otherwise.
+/// A file of an attached folder, as a citation names it (`Citation.file`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceFile {
     pub workspace_id: Id,
-    /// Relative to the workspace root.
+    /// Relative to the folder's root, `/`-separated.
     pub path: String,
-    pub start_line: u32,
-    pub end_line: u32,
+}
+
+/// What the service keeps about an attached folder's files (`Workspace.sync`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceSync {
+    /// Files of the folder the service has (any status).
+    pub files: u32,
+    /// Their size as uploaded (originals; what reading them adds is not counted).
+    pub bytes: u64,
+    /// Files the last manifest listed that the service hasn't received yet.
+    pub uploading: u32,
+    /// Files received and still being read (Queued or Processing).
+    pub reading: u32,
+    /// Files that couldn't be read.
+    pub failed: u32,
+    /// When the holding device last sent a manifest; `None`: never synced.
+    pub last_synced_at: Option<DateTime<Utc>>,
+}
+
+/// A file's stamp: what tells the service whether its copy is current. The device
+/// hashes the file (SHA-256, streamed) so an in-place edit that keeps size and time is
+/// still seen (owner Q5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub bytes: u64,
+    #[serde(default)]
+    pub modified: Option<DateTime<Utc>>,
+    /// Lower-case hex SHA-256 of the file's bytes.
+    pub sha256: String,
+}
+
+/// One allow-listed file of a folder, as the holding device sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestFile {
+    /// Relative to the folder's root, `/`-separated.
+    pub path: String,
+    pub kind: crate::FolderFileType,
+    #[serde(flatten)]
+    pub stamp: FileStamp,
+}
+
+/// `POST routes::workspace_sync(id)`: every allow-listed, visible file of the folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncManifest {
+    pub files: Vec<ManifestFile>,
+}
+
+/// The answer to a manifest: the paths to upload (new or changed, in name order), how
+/// many files were already current, and how many the service removed (deleted on the
+/// device, or changed and so replaced).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPlan {
+    pub upload: Vec<String>,
+    pub kept: u32,
+    pub removed: u32,
 }
 
 #[cfg(test)]
@@ -781,6 +836,7 @@ mod tests {
                         document_id: None,
                         start_line: None,
                         end_line: None,
+                        file: None,
                     }],
                 }),
             },
@@ -847,6 +903,7 @@ mod tests {
                     platform: Platform::Macos,
                     location: "~/Developer/margin".into(),
                     created_at: at(),
+                    sync: Default::default(),
                 },
             },
             Event::WorkspaceDeleted { id: "w1".into() },
@@ -912,9 +969,7 @@ mod tests {
         });
         round_trip(&WorkspaceFile {
             workspace_id: "w".into(),
-            path: "src/main.rs".into(),
-            start_line: 1,
-            end_line: 20,
+            path: "notes/ch1.md".into(),
         });
     }
 
@@ -964,5 +1019,83 @@ mod tests {
         total.add(&one);
         assert_eq!(total.input_tokens, 6);
         assert_eq!(total.model_calls, 2);
+    }
+
+    #[test]
+    fn folder_files_in_citations_sources_and_workspaces() {
+        // Citations stored before folders parse, and say nothing about a file.
+        let old: crate::Citation = serde_json::from_value(json!({
+            "n": 1, "source_id": "s", "source_name": "a.pdf", "kind": "pdf", "page": 3,
+            "start_ms": null, "end_ms": null, "excerpt": "x", "image_url": null
+        }))
+        .unwrap();
+        assert_eq!(old.file, None);
+        assert_eq!(old.document_id, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("file"));
+        let cited = crate::Citation {
+            file: Some(WorkspaceFile {
+                workspace_id: "w".into(),
+                path: "papers/a.pdf".into(),
+            }),
+            source_name: "notes/papers/a.pdf".into(),
+            ..old
+        };
+        let back = round_trip(&cited);
+        assert_eq!(
+            back["file"],
+            json!({"workspace_id": "w", "path": "papers/a.pdf"})
+        );
+
+        let source: crate::Source = serde_json::from_value(json!({
+            "id": "s", "topic_id": null, "name": "a.md", "folder": null, "kind": "text",
+            "bytes": 3, "status": {"state": "queued"}, "created_at": "2025-10-09T08:53:20Z"
+        }))
+        .unwrap();
+        assert_eq!((source.workspace_id.clone(), source.modified), (None, None));
+        round_trip(&crate::Source {
+            workspace_id: Some("w".into()),
+            modified: Some(at()),
+            folder: Some("notes".into()),
+            ..source
+        });
+
+        let ws: Workspace = serde_json::from_value(json!({
+            "id": "w", "name": "notes", "device_id": "d", "device_name": "Mac",
+            "platform": "macos", "location": "~/notes", "created_at": "2025-10-09T08:53:20Z"
+        }))
+        .unwrap();
+        assert_eq!(ws.sync, WorkspaceSync::default());
+        round_trip(&Workspace {
+            sync: WorkspaceSync {
+                files: 3,
+                bytes: 10,
+                uploading: 1,
+                reading: 1,
+                failed: 0,
+                last_synced_at: Some(at()),
+            },
+            ..ws
+        });
+
+        let manifest = SyncManifest {
+            files: vec![ManifestFile {
+                path: "papers/a.pdf".into(),
+                kind: crate::FolderFileType::Pdf,
+                stamp: FileStamp {
+                    bytes: 12,
+                    modified: Some(at()),
+                    sha256: "ab".repeat(32),
+                },
+            }],
+        };
+        let json = round_trip(&manifest);
+        // The stamp is flattened into the file.
+        assert_eq!(json["files"][0]["bytes"], 12);
+        assert_eq!(json["files"][0]["kind"], "pdf");
+        round_trip(&SyncPlan {
+            upload: vec!["papers/a.pdf".into()],
+            kept: 2,
+            removed: 1,
+        });
     }
 }

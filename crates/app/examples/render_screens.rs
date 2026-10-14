@@ -45,6 +45,8 @@ mod config;
 mod drafts;
 #[path = "../src/fake.rs"]
 mod fake;
+#[path = "../src/folders/mod.rs"]
+mod folders;
 #[path = "../src/markdown.rs"]
 mod markdown;
 #[path = "../src/picker/mod.rs"]
@@ -314,6 +316,8 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
             bytes: upload.bytes,
             status,
             created_at: Utc::now(),
+            workspace_id: None,
+            modified: None,
         };
         lib.sources.insert(source.id.clone(), source.clone());
         upload.state = UploadState::Done(source);

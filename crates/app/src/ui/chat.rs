@@ -2542,6 +2542,8 @@ mod tests {
                 status: margin_shared::SourceStatus::Processing { done: 1, total: 4 },
                 created_at: Utc::now(),
                 media_url: None,
+                workspace_id: None,
+                modified: None,
             },
         );
         lib.chats.get_mut("c1").unwrap().source_ids = vec!["s-chat".into(), "gone".into()];

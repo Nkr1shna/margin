@@ -621,6 +621,8 @@ pub(crate) mod tests {
             bytes: 100,
             status: SourceStatus::Queued,
             created_at: ts(0),
+            workspace_id: None,
+            modified: None,
         }
     }
 
@@ -1256,6 +1258,7 @@ pub(crate) mod tests {
                 platform: margin_shared::Platform::Macos,
                 location: "~/margin".into(),
                 created_at: ts(0),
+                sync: Default::default(),
             },
         );
         s.apply(Event::DeviceDeleted { id: "d1".into() });

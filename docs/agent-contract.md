@@ -50,7 +50,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **1 Chat foundation** | `stream_response` with every `StreamEvent`, HTTP errors with `retry_after` | `run_turn` (steps, streaming into items, parallel Read calls, retries, step cap, budgets), `replay_input`, `unanswered_calls`, `user_message_input`, `system_prompt`, `strict_schema`, `Typed`, `truncate_output` | `chats` routes and storage, `turns` (start, run, stop, continue, pending, recovery, `ServiceSink`), Read tools, settings fields, `Generator::agent_model` | Ask screen becomes the chat (composer, transcript, streaming text, tool rows with on-demand output, Stop, Continue/Retry, pending message with cancel), Chats in the sidebar (New chat button; rename/delete by right-click/⋯ and long press), Settings: agent model + reasoning effort |
 | **2 Courses through the agent** | — | Confirmation parking (`wait_for_decision`), Write/Destructive ordering | Write and Destructive tools, `propose_course` + `accept_proposal`, `decide`, `AcceptProposal.chips`, `Proposal.chat_id` + Action on accept, Q2 provenance; remove `POST /api/ask` and the proposal job | Outline card (the existing outline editor with chips, Create lessons), result cards, confirmation cards (Approve/Deny from any device); remove the old Ask composer and `Api::ask` |
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
-| **4 Folders** | — | Folder device tools | `workspaces` routes, folder tools allowed only with workspaces, folder-file citations (Q4: `Citation.file`, passages read through the device), folder context in `propose_course` | 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: Attach folder, handle storage, the four folder tools with the rules in `margin_shared::device`, Folders pane in Settings, "Attached: … on … · online/offline", stale/revoked handling, opening folder-file citations |
+| **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files`, `search_folder` (service `Read` tools over `FolderIndex`) and `sync_folder` (the one device tool); rebuilt on R1's `Retriever` once R1's service areas merge | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
 | **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
@@ -78,6 +78,15 @@ All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
   `bad_request`, `storage`, `interrupted` (`None` on items from older builds).
 - `Card`: `Outline { proposal_id }`, `Result { target, title }`, `Passages { query,
   passages }`, `Confirmation { tool, title, detail, approve_label, decision }`.
+- Phase 4: `Source.workspace_id` and `Source.modified` (a folder file and its stamp);
+  `Citation.file: Option<WorkspaceFile { workspace_id, path }>`; `Workspace.sync:
+  WorkspaceSync { files, bytes, uploading, reading, failed, last_synced_at }`;
+  `SyncManifest { files: Vec<ManifestFile { path, kind, bytes, modified, sha256 }> }`
+  (`FileStamp` flattened), `SyncPlan { upload, kept, removed }`; the allow-list
+  `FolderFileType`, `FOLDER_FILE_EXTENSIONS`, `FOLDER_FILE_NAMES`, `folder_file_type`,
+  `FOLDER_FILE_TYPES_TEXT`; `is_skipped_name` keeps only hidden and secret-looking
+  names. Routes `workspace_sync(id)`, `workspace_files(id)`; `SOURCES`/`SOURCE_UPLOADS`
+  take `workspace_id` and `modified`.
 - `Workspace`, `NewWorkspace`, `Platform`; `Device.online`; `Settings.reasoning_effort`
   and `Settings.agent_model` (+ patch fields); `Proposal.chat_id`; `AcceptProposal.chips`;
   `ProposalStatus::Superseded { by }` (§5).
@@ -459,20 +468,18 @@ has them without a proposal; the lesson is written without a video (`first_write
 false). `attach_sources` takes only files attached to this chat and not yet in a topic;
 they stay in `Chat.source_ids` and, now in a topic, survive the chat's deletion.
 
-### Phase 4, folders (device, read-only)
+### Phase 4, folders (`docs/agent-phase4-brief.md`, adjusted by the RAG doc §2.7, §6.6)
 
-`list_files {workspace_id, path}`, `find_files {workspace_id, path, pattern}`,
-`search_text {workspace_id, query, path, pattern: Option}`, `read_file {workspace_id,
-path, start_line, max_lines}` → the matching `DeviceToolCall`. The workspace must be one
-of the chat's; the request goes to its device. The device applies
-`margin_shared::device` rules (`relative_components`, `is_skipped_name`, the
-`READ_FILE_*`/`SEARCH_*`/`MAX_*` limits, canonical prefix check against symlinks out).
-
-Folder-file citations (Q4): `Citation` gains `file: Option<WorkspaceFile>`;
-`propose_course` gains `folder_files: Vec<WorkspaceFile>`; when its lessons are written
-the service reads those spans through the holding device (`read_file`) and passes them
-as passages; opening such a citation reads the file on that device, or says it's
-offline.
+A folder's allow-listed files (prose documents, PDFs, images; `folder_file_type`) are
+copied to the service as they change and ingested there like sources; nothing is read
+from a device on demand. The model's folder tools are `list_files`, `find_files` and
+`search_folder` (service `Read` tools over a `FolderIndex`; `search_folder` becomes R1's
+`search` scoped to the workspace) and `sync_folder` (a device tool: `DeviceToolCall::
+SyncFolder`, answered `Done` with the plan's counts). The workspace must be one of the
+chat's. No per-file size cap and no picture cap (owner); `UPLOAD_PART_BYTES` still
+bounds one request. The device-side `ListFiles`/`FindFiles`/`SearchText`/`ReadFile`
+calls and their outputs stay in the protocol until 4-agent replaces the agent's
+device-side folder tools (the app answers them "This build can't read folders yet.").
 
 ### R1, the retrieval tool family (service, replaces `search_sources`)
 
@@ -507,6 +514,14 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
   it goes to the background (`LiveStatus::Background`) and reconnects on return.
 - Revoking a device: `DeviceHub::forget_device`, its workspaces deleted (detached from
   chats → `ChatChanged`, `WorkspaceDeleted`), `DeviceDeleted`.
+- Phase 4 calls to the holding device: `SyncFolder { workspace_id }` (walk, `POST` the
+  manifest, answer `Done`, upload in the background), `Manifest { workspace_id }` →
+  `DeviceToolOutput::Manifest { files }` (every allow-listed visible file with its
+  stamp; the hash is computed on the device), `FetchFile { workspace_id, path, stamp }`
+  (upload that file now through `SOURCES`/`SOURCE_UPLOADS` with `workspace_id` and
+  `modified`, answer `Done`; a stamp that no longer matches is `Err`; no size limit).
+  `workspace_id()` names the folder for all three. The app answers them "This build
+  can't read folders yet." until 4-core.
 
 ### R1, the context API (device token today; per-agent tokens later)
 
@@ -526,7 +541,8 @@ agent's tools: one retrieval path for Margin's agent, external agents and the GU
 `APP_CONTROL_TIMEOUT` 20 s, `COMPACT_THRESHOLD_TOKENS` 200 000 (phase 5).
 `margin_shared::device`: `READ_FILE_MAX_LINES` 400, `READ_FILE_MAX_BYTES` 64 KB,
 `READ_FILE_MAX_BYTES_TOTAL` 2 MB, `SEARCH_MAX_BYTES` 50 MB, `SEARCH_MAX_SECONDS` 20,
-`MAX_LISTED_ENTRIES` 500, `MAX_TEXT_MATCHES` 200, `MATCH_LINE_MAX_CHARS` 300.
+`MAX_LISTED_ENTRIES` 500, `MAX_TEXT_MATCHES` 200, `MATCH_LINE_MAX_CHARS` 300,
+`FOLDER_SYNC_INTERVAL_SECS` 900. Phase 4 adds no file, page or picture caps (owner).
 `margin_shared::CHAT_TITLE_MAX` 60; `chats::MAX_MESSAGE_BYTES` 32 KB.
 R1, `margin_shared::routes`: `RETRIEVAL_K_DENSE` 40, `RETRIEVAL_K_LEX` 40,
 `RETRIEVAL_K_FUSED` 24, `RRF_K` 60, `MMR_LAMBDA` 0.7, `TOOL_SEARCH_K_MAX` 12,
@@ -561,6 +577,13 @@ defaults: `share_of_window` 0.5, `min_score_pct` 25, `images_max` 8, `passages_m
   folder access code.
 
 Never call the real OpenAI API; never touch the running service or its data folder.
+
+**Phase 4**: the e2e tests of `docs/agent-phase4-brief.md` D13, rewritten by the
+phase's integrator for the ingest path (`docs/agent-rag-architecture.md` §6.6); the
+first commit has the allow-list, frame and wire-type round trips, `StdDir` against temp
+dirs (listing, stat, streaming open, symlinks refused at every component), and the
+folder handle and unbuilt-platform tests. Storage: chunk and media rows (and R1's
+passages) carry the folder's `workspace_id` as their scope.
 
 **R1** (first commit, already in): the SurrealQL the design relies on runs on `kv-mem`
 (`db.rs` tests: HNSW nearest with scope and access pre-filters and `EXPLAIN` showing

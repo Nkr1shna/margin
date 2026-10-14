@@ -421,6 +421,7 @@ fn workspace() -> Workspace {
         platform: Platform::Macos,
         location: "~/Developer/margin".into(),
         created_at: at(),
+        sync: Default::default(),
     }
 }
 

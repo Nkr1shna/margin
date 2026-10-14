@@ -88,7 +88,10 @@ pub fn plan(
         DeviceToolCall::ListFiles { .. }
         | DeviceToolCall::FindFiles { .. }
         | DeviceToolCall::SearchText { .. }
-        | DeviceToolCall::ReadFile { .. } => Err("That isn't an app-control tool.".into()),
+        | DeviceToolCall::ReadFile { .. }
+        | DeviceToolCall::SyncFolder { .. }
+        | DeviceToolCall::Manifest { .. }
+        | DeviceToolCall::FetchFile { .. } => Err("That isn't an app-control tool.".into()),
     }
 }
 
@@ -200,6 +203,7 @@ fn passage(
             document_id: None,
             start_line: None,
             end_line: None,
+            file: None,
         },
     };
     shown.n = 1;
@@ -341,6 +345,7 @@ mod tests {
             document_id: None,
             start_line: None,
             end_line: None,
+            file: None,
         }
     }
 

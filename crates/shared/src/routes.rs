@@ -31,11 +31,11 @@
 //! | GET    | /api/tools                             |                    | Vec<ToolStatus>     |
 //! | GET    | /api/devices                           |                    | Vec<Device>         |
 //! | DELETE | /api/devices/{id}                      |                    | 204                 |
-//! | POST   | /api/sources?name&folder&topic_id      | file bytes         | Source (Queued)     |
+//! | POST   | /api/sources?name&folder&topic_id&workspace_id&modified | file bytes | Source (Queued) |
 //! | DELETE | /api/sources/{id}                      |                    | 204 (chunks too)    |
 //! | POST   | /api/sources/{id}/reprocess            |                    | Source (Queued)     |
 //! | GET    | /api/sources/{id}/transcript           |                    | Vec<TranscriptSegment> |
-//! | POST   | /api/source-uploads?name&folder&topic_id&bytes |            | SourceUpload        |
+//! | POST   | /api/source-uploads?name&folder&topic_id&workspace_id&modified&bytes | | SourceUpload |
 //! | PUT    | /api/source-uploads/{id}?offset        | part bytes         | SourceUpload        |
 //! | POST   | /api/source-uploads/{id}/finish        |                    | Source (Queued)     |
 //! | DELETE | /api/source-uploads/{id}               |                    | 204                 |
@@ -55,7 +55,9 @@
 //! | GET    | /api/chats/{id}/items/{item}/output    |                    | ToolOutputText      |
 //! | GET    | /api/workspaces                        |                    | Vec<Workspace>      |
 //! | POST   | /api/workspaces                        | NewWorkspace       | Workspace (of the calling device) |
-//! | DELETE | /api/workspaces/{id}                   |                    | 204                 |
+//! | DELETE | /api/workspaces/{id}                   |                    | 204 (its files' sources too) |
+//! | POST   | /api/workspaces/{id}/sync              | SyncManifest       | SyncPlan (403 not_yours, 404, 400 bad_path) |
+//! | GET    | /api/workspaces/{id}/files             |                    | Vec<Source> (newest first, with media_url; 404) |
 //! | GET    | /api/projects                          |                    | Vec<context::Project> |
 //! | POST   | /api/context/search                    | context::ContextQuery | Vec<context::Hit> (400 bad_scope) |
 //! | GET    | /api/context/documents/{id}/outline    |                    | context::DocumentOutline (404; 409 not_ready) |
@@ -92,6 +94,15 @@ pub const WORKSPACES: &str = "/api/workspaces";
 /// parameters. Without `topic_id` the source waits to be named in an
 /// `AskRequest.source_ids`. Files over `UPLOAD_PART_BYTES` go through `SOURCE_UPLOADS`
 /// instead. Too big: 413 with code "too_large".
+///
+/// With `workspace_id` (and `modified`, RFC 3339) the file is a file of the calling
+/// device's attached folder: `name` is its path inside the folder (400 "bad_path" unless
+/// `device::relative_components` accepts it), `folder` is ignored and set to the folder's
+/// name, `topic_id` must be absent (400), its type must be one
+/// `device::folder_file_type` knows (400 "unsupported"), the folder must exist (404) and
+/// be the caller's (403 "not_yours"). The kind's size limit doesn't apply (owner: no
+/// limit); only `UPLOAD_PART_BYTES` bounds one request. An earlier source of the same
+/// folder and path is replaced.
 pub const SOURCES: &str = "/api/sources";
 /// A source uploaded in parts. `POST ?name&folder&topic_id&bytes` (the query of
 /// `SOURCES`, plus the file's size) checks the name and size and starts it; each
@@ -99,6 +110,7 @@ pub const SOURCES: &str = "/api/sources";
 /// `UPLOAD_PART_BYTES` (a part at any other offset is refused with 409 "wrong_offset",
 /// and the body says where to go on); `POST source_upload_finish(id)` once all of it is
 /// there turns it into a Queued `Source`. Unfinished uploads are dropped after a day.
+/// `workspace_id` and `modified` work as for `SOURCES`.
 pub const SOURCE_UPLOADS: &str = "/api/source-uploads";
 pub const EMBEDDING: &str = "/api/embedding";
 /// The projects (corpora) on this service; today exactly one, "My library".
@@ -251,6 +263,18 @@ pub fn chat_item_output(chat_id: &str, item_id: &str) -> String {
 pub fn workspace(id: &str) -> String {
     format!("/api/workspaces/{id}")
 }
+/// The holding device sends its folder's manifest (`SyncManifest`) and gets back what to
+/// upload (`SyncPlan`). Sources no longer listed, or whose stamp changed, are deleted;
+/// the same manifest twice uploads nothing twice. 404; 403 "not_yours" unless the
+/// caller holds the folder; 400 "bad_path" for a path `relative_components` refuses (a
+/// path whose type isn't allowed is ignored).
+pub fn workspace_sync(id: &str) -> String {
+    format!("/api/workspaces/{id}/sync")
+}
+/// The folder's files as sources, newest first, with `media_url`. 404.
+pub fn workspace_files(id: &str) -> String {
+    format!("/api/workspaces/{id}/files")
+}
 /// A document's sections (`context::DocumentOutline`). 404 unknown document; 409
 /// "not_ready" while it is first being indexed.
 pub fn context_document_outline(id: &str) -> String {
@@ -313,6 +337,12 @@ mod tests {
             source_limits_text(),
             "Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
+    }
+
+    #[test]
+    fn workspace_routes() {
+        assert_eq!(workspace_sync("w1"), "/api/workspaces/w1/sync");
+        assert_eq!(workspace_files("w1"), "/api/workspaces/w1/files");
     }
 
     #[test]

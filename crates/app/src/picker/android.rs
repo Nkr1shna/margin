@@ -1,10 +1,10 @@
-//! Android: the Storage Access Framework. `ACTION_OPEN_DOCUMENT` (several files) or
-//! `ACTION_OPEN_DOCUMENT_TREE` (a folder) is launched by `MarginPicker.kt`, which build.rs
-//! adds to dx's Gradle project: it registers a one-off activity result callback with the
-//! activity's `ActivityResultRegistry` (dx's `MainActivity` is an `AppCompatActivity`
-//! through wry's `WryActivity`) and hands the picked URIs back to `on_picked`. Folders
-//! are walked with `DocumentsContract` by the desktop rules, and the chosen documents
-//! are copied through the `ContentResolver` into the staging folder.
+//! Android: the Storage Access Framework. `ACTION_OPEN_DOCUMENT` (several files) is
+//! launched by `MarginPicker.kt`, which build.rs adds to dx's Gradle project: it
+//! registers a one-off activity result callback with the activity's
+//! `ActivityResultRegistry` (dx's `MainActivity` is an `AppCompatActivity` through wry's
+//! `WryActivity`) and hands the picked URIs back to `on_picked`. The chosen documents are
+//! copied through the `ContentResolver` into the staging folder. (`MarginPicker.kt`
+//! keeps `treeRoot`/`children` for the folder access 4c builds.)
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -15,12 +15,11 @@ use jni::sys::jlong;
 use jni::{JNIEnv, JavaVM, NativeMethod};
 use tokio::sync::oneshot;
 
-use crate::sources::{Entry, EntryKind, Selection, Tree, select_named, select_tree};
+use crate::folders::FolderPick;
+use crate::sources::{Selection, select_named};
 
 /// The Kotlin side, in the package dx gives wry's classes.
 const CLASS: &str = "dev.dioxus.main.MarginPicker";
-/// `DocumentsContract.Document.MIME_TYPE_DIR`.
-const MIME_DIR: &str = "vnd.android.document/directory";
 
 /// What a pick hands back: the picked URIs (empty: cancelled), or `None` when the picker
 /// couldn't be shown.
@@ -227,7 +226,12 @@ fn call_strings(
     strings(env, &result).map(Some)
 }
 
-pub async fn pick(folder: bool) -> Option<Selection> {
+/// The folder picker (4c: the tree picker with a persisted read grant). Not built yet.
+pub async fn pick_folder() -> Option<FolderPick> {
+    None
+}
+
+pub async fn pick_files() -> Option<Selection> {
     let Some(looper) = EventLoopLooper::current() else {
         eprintln!("picker: the app's thread has no looper");
         return None;
@@ -250,7 +254,7 @@ pub async fn pick(folder: bool) -> Option<Selection> {
             "(Landroid/app/Activity;ZJ)V",
             &[
                 JValue::Object(&activity()),
-                JValue::Bool(folder.into()),
+                JValue::Bool(false.into()),
                 JValue::Long(token),
             ],
         )?;
@@ -266,24 +270,16 @@ pub async fn pick(folder: bool) -> Option<Selection> {
     }
     let dir = super::new_staging_dir()?;
     tokio::task::spawn_blocking(move || {
-        let selection = if folder {
-            select_document_tree(&uris[0])?
-        } else {
-            select_documents(uris)
-        };
-        Some(selection.stage(&dir, |doc, to| copy(&doc.uri, to)))
+        select_documents(uris).stage(&dir, |doc, to| copy(&doc.uri, to))
     })
     .await
     .ok()
-    .flatten()
 }
 
 /// A document: its URI, and its size when the provider knows it.
 #[derive(Debug, Clone)]
 struct Doc {
     uri: String,
-    /// The document id inside its tree (folder walks only).
-    id: String,
     size: Option<u64>,
 }
 
@@ -309,85 +305,11 @@ fn select_documents(uris: Vec<String>) -> Selection<Doc> {
                 Some([name, size]) => (name.clone(), parse_size(size)),
                 _ => (String::new(), None),
             };
-            let doc = Doc {
-                uri,
-                id: String::new(),
-                size,
-            };
+            let doc = Doc { uri, size };
             (doc, name)
         })
         .collect();
     select_named(docs, |doc| doc.size)
-}
-
-/// A picked tree (`content://…/tree/…`), walked by the desktop folder rules.
-struct DocumentTree {
-    tree: String,
-}
-
-impl Tree for DocumentTree {
-    type Node = Doc;
-
-    fn entries(&self, dir: &Doc) -> Option<Vec<Entry<Doc>>> {
-        let rows = java(|env| {
-            call_strings(
-                env,
-                "children",
-                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;",
-                &[&self.tree, &dir.id],
-            )
-        })
-        .flatten()?;
-        Some(children(&rows))
-    }
-
-    fn size(&self, file: &Doc) -> Option<u64> {
-        file.size
-    }
-}
-
-/// `MarginPicker.children`'s rows (five strings each) as entries.
-fn children(rows: &[String]) -> Vec<Entry<Doc>> {
-    let (rows, _) = rows.as_chunks::<5>();
-    rows.iter()
-        .map(|[id, uri, name, mime, size]| Entry {
-            name: name.clone(),
-            kind: if mime == MIME_DIR {
-                EntryKind::Folder
-            } else {
-                EntryKind::File
-            },
-            node: Doc {
-                id: id.clone(),
-                uri: uri.clone(),
-                size: parse_size(size),
-            },
-        })
-        .collect()
-}
-
-fn select_document_tree(tree: &str) -> Option<Selection<Doc>> {
-    let root = java(|env| {
-        call_strings(
-            env,
-            "treeRoot",
-            "(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;",
-            &[tree],
-        )
-    })
-    .flatten()?;
-    let [id, name] = root.as_slice() else {
-        return None;
-    };
-    let root = Doc {
-        uri: tree.to_string(),
-        id: id.clone(),
-        size: None,
-    };
-    let tree = DocumentTree {
-        tree: tree.to_string(),
-    };
-    Some(select_tree(&tree, &root, name.clone()))
 }
 
 /// Copy a document into `to` through the `ContentResolver`.

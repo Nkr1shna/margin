@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Id};
+use crate::{Event, FileStamp, Id, ManifestFile, SourceKind};
 
 /// Anything the service sends on the events socket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +88,23 @@ pub enum DeviceToolCall {
         start_line: u32,
         max_lines: u32,
     },
+    /// Send what changed in a folder this device holds: walk it, `POST` the manifest
+    /// (`routes::workspace_sync`), answer `Done` with the plan's counts once the service
+    /// has answered, and upload the plan's files in the background.
+    SyncFolder { workspace_id: Id },
+    /// Walk a folder this device holds and answer `DeviceToolOutput::Manifest` with every
+    /// allow-listed, visible file and its stamp (the hash computed on the device).
+    Manifest { workspace_id: Id },
+    /// Upload one file of a folder this device holds to the service now, through
+    /// `routes::SOURCES` / `routes::SOURCE_UPLOADS` with `workspace_id` and `modified`,
+    /// and answer `Done` once it is received. `stamp` is what the service expects; a file
+    /// whose stamp no longer matches is not sent (`Err`, the next sync catches it). No
+    /// size limit (owner): large files go up in parts.
+    FetchFile {
+        workspace_id: Id,
+        path: String,
+        stamp: FileStamp,
+    },
     /// Show a screen in the app.
     Navigate { to: NavTarget },
     /// Open a lesson's citation `n` in the source viewer.
@@ -109,7 +126,10 @@ impl DeviceToolCall {
             DeviceToolCall::ListFiles { workspace_id, .. }
             | DeviceToolCall::FindFiles { workspace_id, .. }
             | DeviceToolCall::SearchText { workspace_id, .. }
-            | DeviceToolCall::ReadFile { workspace_id, .. } => Some(workspace_id),
+            | DeviceToolCall::ReadFile { workspace_id, .. }
+            | DeviceToolCall::SyncFolder { workspace_id }
+            | DeviceToolCall::Manifest { workspace_id }
+            | DeviceToolCall::FetchFile { workspace_id, .. } => Some(workspace_id),
             DeviceToolCall::Navigate { .. }
             | DeviceToolCall::OpenCitation { .. }
             | DeviceToolCall::ShowPassage { .. }
@@ -185,8 +205,11 @@ pub enum DeviceToolOutput {
         total_lines: u32,
         text: String,
     },
-    /// App-control tools: what was done, e.g. "Opened “Fourier series · Lesson 2”."
+    /// App-control tools, `SyncFolder` and `FetchFile`: what was done, e.g. "Opened
+    /// “Fourier series · Lesson 2”." or "Synced “notes”: 3 files to send, 1 removed."
     Done { message: String },
+    /// `Manifest`: the folder's allow-listed, visible files, in path order.
+    Manifest { files: Vec<ManifestFile> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,7 +221,13 @@ pub struct FileEntry {
     pub bytes: u64,
     pub modified: Option<DateTime<Utc>>,
     /// Listed but not readable as text (binary, or larger than `READ_FILE_MAX_BYTES_TOTAL`).
+    /// Kept for the device-side tools until 4-agent replaces them with service tools,
+    /// which use `kind`.
+    #[serde(default)]
     pub binary: bool,
+    /// The allow-listed type of a file; `None` for folders.
+    #[serde(default)]
+    pub kind: Option<FolderFileType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,11 +237,92 @@ pub struct TextMatch {
     pub line: u32,
     /// The line, cut to `MATCH_LINE_MAX_CHARS`.
     pub text: String,
+    /// The PDF page the match is on.
+    #[serde(default)]
+    pub page: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
 // Folder rules, applied by the device that holds the folder
 // ---------------------------------------------------------------------------
+
+/// The only kinds of file a folder sync takes (owner Q2): prose documents, PDFs and
+/// images. Code comes in through a repository source, not a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderFileType {
+    Text,
+    Pdf,
+    Image,
+}
+
+impl FolderFileType {
+    /// The kind of source the file becomes on the service.
+    pub fn source_kind(self) -> SourceKind {
+        match self {
+            FolderFileType::Text => SourceKind::Text,
+            FolderFileType::Pdf => SourceKind::Pdf,
+            FolderFileType::Image => SourceKind::Image,
+        }
+    }
+}
+
+/// The only files a folder sync takes, by extension. One table, extended as the owner
+/// allows more; nothing else anywhere decides what a folder file is.
+pub const FOLDER_FILE_EXTENSIONS: &[(&str, FolderFileType)] = &[
+    ("md", FolderFileType::Text),
+    ("markdown", FolderFileType::Text),
+    ("txt", FolderFileType::Text),
+    ("text", FolderFileType::Text),
+    ("rst", FolderFileType::Text),
+    ("adoc", FolderFileType::Text),
+    ("org", FolderFileType::Text),
+    ("tex", FolderFileType::Text),
+    ("bib", FolderFileType::Text),
+    ("html", FolderFileType::Text),
+    ("htm", FolderFileType::Text),
+    ("pdf", FolderFileType::Pdf),
+    ("png", FolderFileType::Image),
+    ("jpg", FolderFileType::Image),
+    ("jpeg", FolderFileType::Image),
+    ("heic", FolderFileType::Image),
+    ("heif", FolderFileType::Image),
+    ("webp", FolderFileType::Image),
+    ("gif", FolderFileType::Image),
+    ("tif", FolderFileType::Image),
+    ("tiff", FolderFileType::Image),
+    ("bmp", FolderFileType::Image),
+];
+
+/// Extension-less names that are text.
+pub const FOLDER_FILE_NAMES: &[&str] = &["readme", "license"];
+
+/// What the folder sync takes, as people read it.
+pub const FOLDER_FILE_TYPES_TEXT: &str =
+    "text documents (.md, .txt, .rst, .tex, .html…), PDFs and images";
+
+/// The type of a file the sync takes, by its name or path (case-insensitive); `None` is
+/// invisible: not listed, not uploaded, not searched. Hidden and secret-looking names
+/// (`is_skipped_name`) are always `None`.
+pub fn folder_file_type(name: &str) -> Option<FolderFileType> {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if file.is_empty() || is_skipped_name(file) {
+        return None;
+    }
+    let lower = file.to_lowercase();
+    match lower.rsplit_once('.') {
+        Some((_, ext)) => FOLDER_FILE_EXTENSIONS
+            .iter()
+            .find(|(e, _)| *e == ext)
+            .map(|(_, t)| *t),
+        None => FOLDER_FILE_NAMES
+            .contains(&lower.as_str())
+            .then_some(FolderFileType::Text),
+    }
+}
+
+/// How often a device that holds a folder syncs it while Margin runs.
+pub const FOLDER_SYNC_INTERVAL_SECS: u64 = 900;
 
 /// Most lines one `ReadFile` returns.
 pub const READ_FILE_MAX_LINES: u32 = 400;
@@ -281,24 +391,12 @@ pub fn relative_components(path: &str) -> Result<Vec<String>, PathError> {
     Ok(out)
 }
 
-/// Names the folder tools never list or read: hidden files and folders, `.git`, build
-/// and dependency folders, and files that may hold secrets.
+/// Names a folder sync never lists, uploads or reads: hidden files and folders (`.git`,
+/// `.env*`, `.ssh` …) and files that may hold secrets. Folders are walked whatever their
+/// name (owner Q2); what is taken from them is decided by `folder_file_type`.
 pub fn is_skipped_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     if lower.starts_with('.') {
-        return true; // hidden, .git, .env*, .ssh …
-    }
-    const FOLDERS: &[&str] = &[
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        "venv",
-        "deriveddata",
-        "pods",
-    ];
-    if FOLDERS.contains(&lower.as_str()) {
         return true;
     }
     lower.ends_with(".pem")
@@ -380,6 +478,21 @@ mod tests {
                 start_ms: Some(1500),
             },
             DeviceToolCall::ToggleSidebar { visible: None },
+            DeviceToolCall::SyncFolder {
+                workspace_id: "w".into(),
+            },
+            DeviceToolCall::Manifest {
+                workspace_id: "w".into(),
+            },
+            DeviceToolCall::FetchFile {
+                workspace_id: "w".into(),
+                path: "papers/a.pdf".into(),
+                stamp: FileStamp {
+                    bytes: 3,
+                    modified: None,
+                    sha256: "00".repeat(32),
+                },
+            },
         ];
         for call in calls {
             let frame = request(call);
@@ -420,6 +533,7 @@ mod tests {
                         bytes: 0,
                         modified: None,
                         binary: false,
+                        kind: None,
                     }],
                     truncated: false,
                 },
@@ -430,6 +544,7 @@ mod tests {
                         path: "a.rs".into(),
                         line: 3,
                         text: "fn main() {}".into(),
+                        page: None,
                     }],
                     truncated: true,
                 },
@@ -446,6 +561,19 @@ mod tests {
             DeviceToolResult::Ok {
                 output: DeviceToolOutput::Done {
                     message: "Opened.".into(),
+                },
+            },
+            DeviceToolResult::Ok {
+                output: DeviceToolOutput::Manifest {
+                    files: vec![ManifestFile {
+                        path: "notes/a.md".into(),
+                        kind: FolderFileType::Text,
+                        stamp: FileStamp {
+                            bytes: 1,
+                            modified: None,
+                            sha256: "ff".repeat(32),
+                        },
+                    }],
                 },
             },
             DeviceToolResult::Err {
@@ -469,6 +597,13 @@ mod tests {
             max_lines: 1,
         };
         assert_eq!(read.workspace_id(), Some("w"));
+        assert_eq!(
+            DeviceToolCall::SyncFolder {
+                workspace_id: "w2".into()
+            }
+            .workspace_id(),
+            Some("w2")
+        );
         assert_eq!(
             DeviceToolCall::ToggleSidebar {
                 visible: Some(true)
@@ -515,16 +650,70 @@ mod tests {
         for name in [
             ".git",
             ".env.local",
-            "node_modules",
-            "target",
             "id_rsa.pub",
             "credentials.json",
+            "credentials.txt",
             "cert.p12",
         ] {
             assert!(is_skipped_name(name), "{name}");
         }
-        for name in ["src", "README.md", "notes.txt", "keyboard.md"] {
+        // Folders are walked whatever their name.
+        for name in [
+            "src",
+            "README.md",
+            "notes.txt",
+            "keyboard.md",
+            "build",
+            "target",
+            "node_modules",
+        ] {
             assert!(!is_skipped_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_folder_allow_list() {
+        let mut seen = std::collections::HashSet::new();
+        for (ext, _) in FOLDER_FILE_EXTENSIONS {
+            assert!(seen.insert(*ext), "{ext} twice");
+            assert_eq!(*ext, ext.to_lowercase());
+        }
+        assert_eq!(folder_file_type("Notes/Ch1.MD"), Some(FolderFileType::Text));
+        assert_eq!(folder_file_type("scan.PDF"), Some(FolderFileType::Pdf));
+        assert_eq!(folder_file_type("photo.heic"), Some(FolderFileType::Image));
+        assert_eq!(folder_file_type("README"), Some(FolderFileType::Text));
+        assert_eq!(folder_file_type("docs/LICENSE"), Some(FolderFileType::Text));
+        assert_eq!(
+            folder_file_type("build/notes.md"),
+            Some(FolderFileType::Text)
+        );
+        for invisible in [
+            "main.rs",
+            "data.json",
+            "table.csv",
+            "config.yaml",
+            "archive.zip",
+            "talk.m4a",
+            "lecture.mov",
+            "Makefile",
+            ".env",
+            ".hidden.md",
+            "credentials.txt",
+            "build",
+            "",
+        ] {
+            assert_eq!(folder_file_type(invisible), None, "{invisible}");
+        }
+        assert_eq!(FolderFileType::Pdf.source_kind(), SourceKind::Pdf);
+        assert_eq!(FolderFileType::Text.source_kind(), SourceKind::Text);
+        assert_eq!(FolderFileType::Image.source_kind(), SourceKind::Image);
+        // Every allow-listed extension is a source kind the service reads.
+        for (ext, t) in FOLDER_FILE_EXTENSIONS {
+            assert_eq!(
+                SourceKind::for_name(&format!("x.{ext}")),
+                Some(t.source_kind()),
+                "{ext}"
+            );
         }
     }
 }

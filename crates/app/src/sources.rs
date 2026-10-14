@@ -1,5 +1,6 @@
-//! Adding files and folders as sources: which files qualify, the limits on one add, the
-//! upload queue's records, and how sizes and statuses read. Pure data: no Dioxus here,
+//! Adding files as sources: which files qualify, the limits on one add, the upload
+//! queue's records, and how sizes and statuses read. (Folders aren't uploaded as a pick;
+//! they are attached and synced, `crate::folders`.) Pure data: no Dioxus here,
 //! so it is unit-tested directly.
 
 use std::path::{Path, PathBuf};
@@ -15,17 +16,6 @@ pub const MAX_FILES_PER_ADD: usize = 300;
 /// a photo library) stops well short of filling the service Mac's disk. Any one file
 /// a source may be always fits, so the cap never stands in the way of a single file.
 pub const MAX_BYTES_PER_ADD: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Folders a walk never enters (besides hidden ones): version control, dependencies,
-/// build output and caches.
-const SKIPPED_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "build",
-    "dist",
-    "venv",
-    "__pycache__",
-];
 
 /// A file chosen to upload. `P` is how the file is reached: a local path, or (while a
 /// mobile picker works out what to copy) the platform's handle for it.
@@ -238,16 +228,16 @@ fn local_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.len())
 }
 
-/// What an entry in a folder is.
+/// What an entry in a folder is. (The walk machinery is kept for the folder sync,
+/// 4-core; nothing walks a folder until then.)
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Folder,
     File,
     /// Symbolic links and other special files: passed over.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
     Other,
     /// Its type couldn't be read: counted as unreadable.
-    #[cfg_attr(target_os = "android", allow(dead_code))]
     Unknown,
 }
 
@@ -259,8 +249,7 @@ pub struct Entry<N> {
     pub kind: EntryKind,
 }
 
-/// Folders a walk can list: the local file system, or a picker's document tree (Android's
-/// Storage Access Framework).
+/// Folders a walk can list (a held folder, through `crate::folders::Dir`).
 pub trait Tree {
     /// A folder or file in the tree.
     type Node;
@@ -270,52 +259,11 @@ pub trait Tree {
     fn size(&self, file: &Self::Node) -> Option<u64>;
 }
 
-/// The local file system.
-// Android picks documents through the Storage Access Framework, not local paths.
-#[cfg_attr(target_os = "android", allow(dead_code))]
-struct Local;
-
-impl Tree for Local {
-    type Node = PathBuf;
-
-    fn entries(&self, dir: &PathBuf) -> Option<Vec<Entry<PathBuf>>> {
-        let read = std::fs::read_dir(dir).ok()?;
-        Some(
-            read.filter_map(Result::ok)
-                .map(|entry| Entry {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    kind: match entry.file_type() {
-                        Ok(t) if t.is_dir() => EntryKind::Folder,
-                        Ok(t) if t.is_file() => EntryKind::File,
-                        Ok(_) => EntryKind::Other,
-                        Err(_) => EntryKind::Unknown,
-                    },
-                    node: entry.path(),
-                })
-                .collect(),
-        )
-    }
-
-    fn size(&self, file: &PathBuf) -> Option<u64> {
-        local_size(file)
-    }
-}
-
-/// Every source file under `root`, named by its path inside it. Hidden entries, symbolic
-/// links and `SKIPPED_DIRS` are passed over; files are visited in name order, so the
-/// limits keep the same files every time.
-// Android picks documents through the Storage Access Framework, not local paths.
-#[cfg_attr(target_os = "android", allow(dead_code))]
-pub fn select_folder(root: &Path) -> Selection {
-    let name = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string());
-    select_tree(&Local, &root.to_path_buf(), name)
-}
-
-/// Every source file under `root` in `tree`, which the user knows as `name`, by the same
-/// rules as `select_folder`.
+/// Every source file under `root` in `tree`, which the user knows as `name`: hidden
+/// entries are passed over, folders are walked whatever their name, files are visited in
+/// name order so the limits keep the same files every time. Kept for the folder sync
+/// (4-core), which queues a folder's uploads through `Selection` and `Upload`.
+#[allow(dead_code)]
 pub fn select_tree<T: Tree>(tree: &T, root: &T::Node, name: String) -> Selection<T::Node> {
     let mut selection = Selection {
         folder: Some(name),
@@ -336,11 +284,7 @@ fn walk<T: Tree>(tree: &T, dir: &T::Node, prefix: &str, selection: &mut Selectio
         }
         let rel = format!("{prefix}{}", entry.name);
         match entry.kind {
-            EntryKind::Folder => {
-                if !SKIPPED_DIRS.contains(&entry.name.as_str()) {
-                    walk(tree, &entry.node, &format!("{rel}/"), selection);
-                }
-            }
+            EntryKind::Folder => walk(tree, &entry.node, &format!("{rel}/"), selection),
             EntryKind::File => selection.offer(entry.node, rel, |node| tree.size(node)),
             EntryKind::Other => {}
             EntryKind::Unknown => selection.unreadable += 1,
@@ -506,7 +450,7 @@ pub fn status_text(status: &SourceStatus) -> (Tone, String) {
 /// Sources menu and a topic's Sources dialog alike.
 pub fn kinds_text() -> String {
     format!(
-        "Add {} files, or a whole folder. {}",
+        "Add {} files. {}",
         margin_shared::SOURCE_KINDS,
         routes::source_limits_text()
     )
@@ -577,51 +521,11 @@ mod tests {
     }
 
     #[test]
-    fn folder_walk_skips_hidden_and_build_folders() {
-        let dir = TempDir::new("walk");
-        dir.file("README", 10);
-        dir.file("notes/ch1.md", 10);
-        dir.file("notes/ch2.md", 10);
-        dir.file("src/main.rs", 10);
-        dir.file("src/archive.zip", 10);
-        dir.file(".hidden.md", 10);
-        dir.file(".git/config.toml", 10);
-        dir.file(".venv/lib.py", 10);
-        dir.file("venv/lib.py", 10);
-        dir.file("node_modules/x/index.js", 10);
-        dir.file("target/debug/out.rs", 10);
-        dir.file("build/out.txt", 10);
-        dir.file("dist/app.js", 10);
-        dir.file("pkg/__pycache__/m.py", 10);
-        dir.file("Cargo.lock", 10);
-        let selection = select_folder(&dir.0);
-        let names: Vec<_> = selection.files.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["README", "notes/ch1.md", "notes/ch2.md", "src/main.rs"]
-        );
-        let folder = dir.0.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(
-            selection
-                .files
-                .iter()
-                .all(|f| f.folder.as_deref() == Some(folder.as_str()))
-        );
-        assert_eq!(selection.files[3].kind, SourceKind::Code);
-        assert_eq!(selection.unsupported, 2);
-        assert_eq!(
-            selection.summary().as_deref(),
-            Some("Added 4 files. Skipped 2 files Margin can't read.")
-        );
-    }
-
-    #[test]
     fn limits_cap_files_and_bytes_per_add() {
-        let dir = TempDir::new("limits");
-        for i in 0..MAX_FILES_PER_ADD + 5 {
-            dir.file(&format!("n{i:04}.txt"), 1);
-        }
-        let selection = select_folder(&dir.0);
+        let many: Vec<(String, String)> = (0..MAX_FILES_PER_ADD + 5)
+            .map(|i| ("1".to_string(), format!("n{i:04}.txt")))
+            .collect();
+        let selection = select_named(many, |size: &String| size.parse().ok());
         assert_eq!(selection.files.len(), MAX_FILES_PER_ADD);
         assert_eq!(selection.files[0].name, "n0000.txt");
         assert_eq!(selection.over_limit, 5);
@@ -734,14 +638,21 @@ mod tests {
         ]);
         let selection = select_tree(&tree, &"root".to_string(), "Notes".into());
         let names: Vec<_> = selection.files.iter().map(|f| f.name.as_str()).collect();
+        // Hidden folders are skipped; others are walked whatever their name.
         assert_eq!(
             names,
-            vec!["Alpha/a.pdf", "Alpha/b.rs", "photo.png", "zeta.md"]
+            vec![
+                "Alpha/a.pdf",
+                "Alpha/b.rs",
+                "node_modules/x.js",
+                "photo.png",
+                "zeta.md"
+            ]
         );
         assert_eq!(selection.files[0].path, "root/Alpha/a.pdf");
         assert_eq!(selection.files[0].kind, SourceKind::Pdf);
-        assert_eq!(selection.files[2].kind, SourceKind::Image);
-        assert_eq!(selection.files[3].bytes, 5);
+        assert_eq!(selection.files[3].kind, SourceKind::Image);
+        assert_eq!(selection.files[4].bytes, 5);
         assert!(
             selection
                 .files
@@ -821,7 +732,7 @@ mod tests {
     fn the_copy_lists_every_kind_and_the_limits() {
         assert_eq!(
             kinds_text(),
-            "Add text, code, PDFs, images, audio and video files, or a whole folder. \
+            "Add text, code, PDFs, images, audio and video files. \
              Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
         assert_eq!(

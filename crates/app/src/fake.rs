@@ -200,6 +200,7 @@ pub fn sample_citations() -> Vec<Citation> {
         document_id: None,
         start_line: None,
         end_line: None,
+        file: None,
     };
     vec![
         Citation {
@@ -361,6 +362,8 @@ pub fn sample_library() -> Library {
                     warning: None,
                 },
                 created_at: ts(30),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: Some(media_url("s2", "original")),
@@ -376,6 +379,8 @@ pub fn sample_library() -> Library {
                     warning: None,
                 },
                 created_at: ts(31),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: None,
@@ -389,6 +394,8 @@ pub fn sample_library() -> Library {
                     error: "The file isn't valid UTF-8 text.".into(),
                 },
                 created_at: ts(32),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: Some(media_url("s7", "original")),
@@ -404,6 +411,8 @@ pub fn sample_library() -> Library {
                     warning: None,
                 },
                 created_at: ts(33),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: Some(media_url("s4", "original")),
@@ -419,6 +428,8 @@ pub fn sample_library() -> Library {
                     warning: None,
                 },
                 created_at: ts(34),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: Some(media_url("s5", "original")),
@@ -434,6 +445,8 @@ pub fn sample_library() -> Library {
                     warning: None,
                 },
                 created_at: ts(35),
+                workspace_id: None,
+                modified: None,
             },
             Source {
                 media_url: Some(media_url("s6", "original")),
@@ -445,6 +458,8 @@ pub fn sample_library() -> Library {
                 bytes: 127_994,
                 status: SourceStatus::Ready { chunks: 5, pages: None, warning: None, },
                 created_at: ts(36),
+                workspace_id: None,
+                modified: None,
             },
         ],
     }
@@ -1797,6 +1812,8 @@ fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) 
             bytes: body.len() as u64,
             status: SourceStatus::Queued,
             created_at: Utc::now(),
+            workspace_id: None,
+            modified: None,
         };
         s.source_files.insert(source.id.clone(), body);
         s.library.sources.push(source.clone());
@@ -4677,6 +4694,7 @@ async fn create_workspace(
             platform: req.platform,
             location: req.location,
             created_at: Utc::now(),
+            sync: Default::default(),
         };
         s.workspaces.push(workspace.clone());
         workspace

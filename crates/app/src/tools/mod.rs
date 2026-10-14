@@ -131,7 +131,10 @@ async fn answer_within<H: Host>(
         DeviceToolCall::ListFiles { .. }
         | DeviceToolCall::FindFiles { .. }
         | DeviceToolCall::SearchText { .. }
-        | DeviceToolCall::ReadFile { .. } => DeviceToolResult::Err {
+        | DeviceToolCall::ReadFile { .. }
+        | DeviceToolCall::SyncFolder { .. }
+        | DeviceToolCall::Manifest { .. }
+        | DeviceToolCall::FetchFile { .. } => DeviceToolResult::Err {
             message: FOLDERS_NOT_YET.into(),
         },
         call @ (DeviceToolCall::Navigate { .. }

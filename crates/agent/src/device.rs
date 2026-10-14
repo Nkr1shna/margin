@@ -191,6 +191,16 @@ pub fn device_output_text(output: &DeviceToolOutput) -> String {
             out
         }
         DeviceToolOutput::Done { message } => message.clone(),
+        DeviceToolOutput::Manifest { files } => {
+            if files.is_empty() {
+                return "No files.".into();
+            }
+            files
+                .iter()
+                .map(|f| format!("{}  ({})", f.path, size_text(f.stamp.bytes)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
 }
 
@@ -226,6 +236,10 @@ fn output_summary(output: &DeviceToolOutput) -> String {
             ..
         } => format!("Lines {start_line}–{end_line} of {total_lines}"),
         DeviceToolOutput::Done { message } => message.clone(),
+        DeviceToolOutput::Manifest { files } => match files.len() {
+            1 => "1 file".into(),
+            n => format!("{n} files"),
+        },
     }
 }
 
@@ -820,6 +834,7 @@ mod tests {
                 platform: Platform::Macos,
                 location: "~/Developer/margin".into(),
                 created_at: at(),
+                sync: Default::default(),
             }],
             devices,
         }
@@ -863,11 +878,13 @@ mod tests {
                     path: "src/a.rs".into(),
                     line: 3,
                     text: "fn main() {}".into(),
+                    page: None,
                 },
                 TextMatch {
                     path: "src/b.rs".into(),
                     line: 9,
                     text: "main();".into(),
+                    page: None,
                 },
             ],
             truncated: false,
@@ -1037,6 +1054,7 @@ mod tests {
                     bytes: 0,
                     modified: None,
                     binary: false,
+                    kind: None,
                 },
                 FileEntry {
                     path: "README.md".into(),
@@ -1044,6 +1062,7 @@ mod tests {
                     bytes: 2150,
                     modified: Some(at()),
                     binary: false,
+                    kind: None,
                 },
                 FileEntry {
                     path: "logo.png".into(),
@@ -1051,6 +1070,7 @@ mod tests {
                     bytes: 12,
                     modified: None,
                     binary: true,
+                    kind: None,
                 },
             ],
             truncated: true,

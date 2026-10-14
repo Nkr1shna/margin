@@ -333,6 +333,15 @@ pub struct Source {
     /// Signed URL of the original file, for viewing it (images, PDFs, audio, video).
     #[serde(default)]
     pub media_url: Option<String>,
+    /// Set for a file of an attached folder: the folder (workspace) it belongs to. Then
+    /// `folder` holds the folder's name, `name` the path inside it, and `topic_id` is
+    /// `None`; it never belongs to a topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Id>,
+    /// The file's modification time on the device that holds it; with `bytes`, the
+    /// file's stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<DateTime<Utc>>,
 }
 
 /// A numbered reference in a lesson to the source passage it drew on. The lesson body
@@ -365,6 +374,11 @@ pub struct Citation {
     pub start_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u32>,
+    /// Set when the passage is from a file of an attached folder: which folder and which
+    /// path (display only; the citation is otherwise an ordinary source citation, and
+    /// `source_name` reads "`folder`/`path`").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<WorkspaceFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

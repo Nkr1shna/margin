@@ -1,21 +1,22 @@
-//! Desktop: rfd's file and folder dialogs (an AppKit sheet on macOS, the XDG portal on
-//! Linux). The files are read where they are.
+//! Desktop: rfd's file dialog (an AppKit sheet on macOS, the XDG portal on Linux). The
+//! files are read where they are.
 
-use crate::sources::{Selection, select_files, select_folder};
+use crate::folders::FolderPick;
+use crate::sources::{Selection, select_files};
 
-pub async fn pick(folder: bool) -> Option<Selection> {
-    let dialog = rfd::AsyncFileDialog::new();
-    if folder {
-        let handle = dialog.set_title("Add a folder").pick_folder().await?;
-        let root = handle.path().to_path_buf();
-        tokio::task::spawn_blocking(move || select_folder(&root))
-            .await
-            .ok()
-    } else {
-        let handles = dialog.set_title("Add files").pick_files().await?;
-        let paths = handles.iter().map(|h| h.path().to_path_buf()).collect();
-        tokio::task::spawn_blocking(move || select_files(paths))
-            .await
-            .ok()
-    }
+pub async fn pick_files() -> Option<Selection> {
+    let handles = rfd::AsyncFileDialog::new()
+        .set_title("Add files")
+        .pick_files()
+        .await?;
+    let paths = handles.iter().map(|h| h.path().to_path_buf()).collect();
+    tokio::task::spawn_blocking(move || select_files(paths))
+        .await
+        .ok()
+}
+
+/// The folder picker (4a: rfd's folder dialog, a bookmark on macOS, the TCC probe). Not
+/// built yet.
+pub async fn pick_folder() -> Option<FolderPick> {
+    None
 }

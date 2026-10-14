@@ -543,6 +543,7 @@ pub fn hit_citation(hit: &Hit) -> Citation {
         document_id: Some(p.document_id.clone()),
         start_line: p.start_line.map(|v| v as u32),
         end_line: p.end_line.map(|v| v as u32),
+        file: None,
     }
 }
 

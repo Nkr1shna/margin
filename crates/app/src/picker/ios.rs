@@ -1,8 +1,7 @@
 //! iOS and iPadOS: `UIDocumentPickerViewController`, presented over the app's view
-//! controller. Files and folders are opened in place, so each picked URL is a security
-//! scope: inside it the folder is walked like a desktop folder and the chosen files are
-//! copied (with file coordination, which downloads cloud files first) into the staging
-//! folder.
+//! controller. Files are opened in place, so each picked URL is a security scope: inside
+//! it the chosen files are copied (with file coordination, which downloads cloud files
+//! first) into the staging folder.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -17,10 +16,11 @@ use objc2_foundation::{
     NSObjectProtocol, NSString, NSURL,
 };
 use objc2_ui_kit::{UIDocumentPickerDelegate, UIDocumentPickerViewController, UIViewController};
-use objc2_uniform_type_identifiers::{UTTypeData, UTTypeFolder};
+use objc2_uniform_type_identifiers::UTTypeData;
 use tokio::sync::oneshot;
 
-use crate::sources::{Selection, select_files, select_folder};
+use crate::folders::FolderPick;
+use crate::sources::{Selection, select_files};
 
 /// What the picker hands back: the picked URLs, empty when it was cancelled.
 type Picked = Vec<Retained<NSURL>>;
@@ -83,19 +83,16 @@ use dioxus::desktop as dioxus_host;
 use dioxus::mobile as dioxus_host;
 
 /// Show the picker; the delegate must live until it replies.
-fn present(
-    mtm: MainThreadMarker,
-    folder: bool,
-) -> Option<(Retained<Delegate>, oneshot::Receiver<Picked>)> {
+fn present(mtm: MainThreadMarker) -> Option<(Retained<Delegate>, oneshot::Receiver<Picked>)> {
     let host = top_view_controller()?;
-    // SAFETY: UTType constants from UniformTypeIdentifiers, always initialized.
-    let kind = unsafe { if folder { UTTypeFolder } else { UTTypeData } };
+    // SAFETY: a UTType constant from UniformTypeIdentifiers, always initialized.
+    let kind = unsafe { UTTypeData };
     let types = NSArray::from_slice(&[kind]);
     let picker = UIDocumentPickerViewController::initForOpeningContentTypes(
         UIDocumentPickerViewController::alloc(mtm),
         &types,
     );
-    picker.setAllowsMultipleSelection(!folder);
+    picker.setAllowsMultipleSelection(true);
     let (tx, rx) = oneshot::channel();
     let delegate = Delegate::new(mtm, tx);
     picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -103,12 +100,17 @@ fn present(
     Some((delegate, rx))
 }
 
-pub async fn pick(folder: bool) -> Option<Selection> {
+/// The folder picker (4b: a security-scoped bookmark, name and location). Not built yet.
+pub async fn pick_folder() -> Option<FolderPick> {
+    None
+}
+
+pub async fn pick_files() -> Option<Selection> {
     let Some(mtm) = MainThreadMarker::new() else {
         eprintln!("the document picker can only be shown from the main thread");
         return None;
     };
-    let Some((delegate, reply)) = present(mtm, folder) else {
+    let Some((delegate, reply)) = present(mtm) else {
         eprintln!("couldn't find a view controller to show the document picker over");
         return None;
     };
@@ -133,11 +135,7 @@ pub async fn pick(folder: bool) -> Option<Selection> {
         .collect();
     let staged = match super::new_staging_dir() {
         Some(dir) => tokio::task::spawn_blocking(move || {
-            let selection = match (folder, paths.first()) {
-                (true, Some(root)) => select_folder(root),
-                _ => select_files(paths),
-            };
-            selection.stage(&dir, |from, to| coordinated_copy(from, to))
+            select_files(paths).stage(&dir, |from, to| coordinated_copy(from, to))
         })
         .await
         .ok(),

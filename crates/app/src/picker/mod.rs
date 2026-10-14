@@ -1,7 +1,8 @@
-//! The system pickers that add sources: files or a folder, chosen with the platform's own
-//! picker (AppKit or the XDG portal on desktop, `UIDocumentPickerViewController` on iOS
-//! and iPadOS, the Storage Access Framework on Android). Each returns the same
-//! `Selection` of files to upload, read from local paths.
+//! The system pickers: files to add as sources (AppKit or the XDG portal on desktop,
+//! `UIDocumentPickerViewController` on iOS and iPadOS, the Storage Access Framework on
+//! Android), each returning the same `Selection` of files to upload, read from local
+//! paths; and a folder to attach (`pick_folder`), which is held in place and synced, not
+//! uploaded as a pick (owner decision: no folder upload).
 //!
 //! Dioxus 0.7.9's `<input type=file>` can't be used for this on mobile: it asks the host,
 //! which has no picker there and answers with no files.
@@ -13,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::folders::FolderPick;
 use crate::sources::Selection;
 
 #[cfg(target_os = "android")]
@@ -29,10 +31,17 @@ use desktop as platform;
 #[cfg(target_os = "ios")]
 use ios as platform;
 
-/// Ask for files (several at once) or a folder and choose what to upload from them;
-/// `None` when the picker was cancelled or couldn't be shown.
-pub async fn pick(folder: bool) -> Option<Selection> {
-    platform::pick(folder).await
+/// Ask for files (several at once) and choose what to upload from them; `None` when the
+/// picker was cancelled or couldn't be shown.
+pub async fn pick_files() -> Option<Selection> {
+    platform::pick_files().await
+}
+
+/// Ask for a folder to attach and keep a handle to it (4a/4b/4c build it per platform);
+/// `None` when the picker was cancelled, couldn't be shown, or isn't built here yet.
+#[allow(dead_code)] // Attach folder (4-core) calls it.
+pub async fn pick_folder() -> Option<FolderPick> {
+    platform::pick_folder().await
 }
 
 /// Where picked files wait for their upload; `None` on desktop, which reads the files
