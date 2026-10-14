@@ -516,6 +516,9 @@ pub fn EmbeddingNotice() -> Element {
         return rsx! {};
     };
     let download = move |_| async move {
+        if *busy.peek() {
+            return;
+        }
         busy.set(true);
         error.set(download_embedding(app).await.err());
         busy.set(false);
@@ -556,7 +559,12 @@ pub fn EmbeddingNotice() -> Element {
                                         class: "btn btn-primary btn-sm",
                                         disabled: *busy.read(),
                                         onclick: download,
-                                        "Try again"
+                                        if *busy.read() {
+                                            span { class: "spinner" }
+                                            "Starting…"
+                                        } else {
+                                            "Try again"
+                                        }
                                     }
                                 },
                                 _ => rsx! {},

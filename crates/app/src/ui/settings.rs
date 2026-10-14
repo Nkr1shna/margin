@@ -7,7 +7,43 @@ use margin_shared::{Device, EmbeddingModelState, Event, Settings, SettingsPatch,
 use crate::config::{Appearance, normalize_service_url};
 use crate::sources::human_bytes;
 use crate::state::use_app;
-use crate::ui::common::{ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, js};
+use crate::ui::common::{
+    ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js,
+};
+
+/// How long a Copy button says "Copied".
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why the AI provider's base URL can't be saved, if it can't (checked before sending).
+fn base_url_problem(input: &str) -> Option<&'static str> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Some("Enter the API's base URL.");
+    }
+    let Some(rest) = t
+        .strip_prefix("https://")
+        .or_else(|| t.strip_prefix("http://"))
+    else {
+        return Some("The base URL must start with https:// or http://.");
+    };
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return Some("That doesn't look like a web address.");
+    }
+    None
+}
+
+/// The label of a Save button: "Saving…" with a spinner while busy.
+#[component]
+fn SaveLabel(busy: bool, #[props(default = "Save".to_string())] label: String) -> Element {
+    rsx! {
+        if busy {
+            span { class: "spinner" }
+            "Saving…"
+        } else {
+            "{label}"
+        }
+    }
+}
 use crate::ui::sources::{Progress, download_embedding, refresh_embedding};
 
 /// The panes of the Settings dialog, in sidebar order.
@@ -172,36 +208,48 @@ fn ServiceSection() -> Element {
             h2 { "Service" }
             p { class: "help", "The Margin service on your Mac that keeps your library." }
             if *editing.read() {
-                div { class: "field",
-                    label { r#for: "svc-url", "Service address" }
-                    input {
-                        id: "svc-url",
-                        class: "input",
-                        r#type: "url",
-                        initial_value: "{value}",
-                        oninput: move |e| value.set(e.value()),
-                    }
-                }
-                if let Some(err) = error.read().clone() {
-                    span { class: "save-state error", "{err}" }
-                }
-                div { class: "row-actions",
-                    button {
-                        class: "btn btn-primary btn-sm",
-                        onclick: {
-                            let current = current.clone();
-                            move |_| match normalize_service_url(&value.peek()) {
+                form {
+                    style: "display: grid; gap: 14px",
+                    onsubmit: {
+                        let current = current.clone();
+                        move |e: FormEvent| {
+                            e.prevent_default();
+                            match normalize_service_url(&value.peek()) {
                                 Ok(url) if url == current => editing.set(false),
                                 Ok(url) => {
                                     error.set(None);
                                     confirm.set(Some(url));
                                 }
-                                Err(e) => error.set(Some(e)),
+                                Err(e) => {
+                                    error.set(Some(e));
+                                    focus_first("#svc-url");
+                                }
                             }
-                        },
-                        "Change service"
+                        }
+                    },
+                    div { class: "field",
+                        label { r#for: "svc-url", "Service address" }
+                        input {
+                            id: "svc-url",
+                            class: "input",
+                            r#type: "url",
+                            "aria-invalid": error.read().is_some().to_string(),
+                            "aria-describedby": error.read().is_some().then_some("svc-url-err"),
+                            initial_value: "{value}",
+                            onmounted: move |e| async move { let _ = e.set_focus(true).await; },
+                            oninput: move |e| {
+                                error.set(None);
+                                value.set(e.value());
+                            },
+                        }
+                        if let Some(err) = error.read().clone() {
+                            span { id: "svc-url-err", class: "field-error", role: "alert", "{err}" }
+                        }
                     }
-                    button { class: "btn btn-ghost btn-sm", onclick: move |_| editing.set(false), "Cancel" }
+                    div { class: "row-actions",
+                        button { r#type: "submit", class: "btn btn-primary btn-sm", "Change service" }
+                        button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| editing.set(false), "Cancel" }
+                    }
                 }
             } else {
                 div { class: "kv",
@@ -402,6 +450,8 @@ fn AiSection(settings: Settings) -> Element {
     let busy = use_signal(|| false);
     let key_busy = use_signal(|| false);
     let mut saved_note = use_signal(|| false);
+    let mut base_error = use_signal(|| None::<&'static str>);
+    let mut model_error = use_signal(|| None::<&'static str>);
 
     let dirty = *base.read() != settings.openai_base_url || *model.read() != settings.openai_model;
     let show_key_input = !settings.has_api_key || *replacing.read();
@@ -410,80 +460,131 @@ fn AiSection(settings: Settings) -> Element {
         section { class: "set-sec",
             h2 { "AI provider" }
             p { class: "help", "Margin uses an OpenAI-compatible Responses API for outlines, lessons and video scenes." }
-            div { class: "grid2",
-                div { class: "field",
-                    label { r#for: "ai-base", "Base URL" }
-                    input { id: "ai-base", class: "input", r#type: "url", initial_value: "{base}", oninput: move |e| { saved_note.set(false); base.set(e.value()) } }
-                }
-                div { class: "field",
-                    label { r#for: "ai-model", "Model" }
-                    input { id: "ai-model", class: "input", initial_value: "{model}", oninput: move |e| { saved_note.set(false); model.set(e.value()) } }
-                }
-            }
-            if let Some(err) = error.read().clone() {
-                span { class: "save-state error", "{err}" }
-            }
-            div { class: "row-actions",
-                button {
-                    class: "btn btn-primary btn-sm",
-                    disabled: !dirty || *busy.read(),
-                    onclick: {
+            form {
+                style: "display: grid; gap: 14px",
+                onsubmit: {
+                    let settings = settings.clone();
+                    move |e: FormEvent| {
+                        e.prevent_default();
                         let settings = settings.clone();
-                        move |_| {
-                            let settings = settings.clone();
-                            async move {
-                                let b = base.peek().trim().to_string();
-                                let m = model.peek().trim().to_string();
-                                let patch = SettingsPatch {
-                                    openai_base_url: (b != settings.openai_base_url).then_some(b),
-                                    openai_model: (m != settings.openai_model).then_some(m),
-                                    ..Default::default()
-                                };
-                                if save_settings(app, patch, error, busy).await {
-                                    saved_note.set(true);
-                                }
+                        async move {
+                            if *busy.peek() {
+                                return;
+                            }
+                            let b = base.peek().trim().to_string();
+                            let m = model.peek().trim().to_string();
+                            if b == settings.openai_base_url && m == settings.openai_model {
+                                return;
+                            }
+                            // Checked here, each under its own field, before anything is sent.
+                            let b_problem = base_url_problem(&b);
+                            let m_problem = m.is_empty().then_some("Enter a model name.");
+                            base_error.set(b_problem);
+                            model_error.set(m_problem);
+                            if b_problem.is_some() {
+                                focus_first("#ai-base");
+                                return;
+                            }
+                            if m_problem.is_some() {
+                                focus_first("#ai-model");
+                                return;
+                            }
+                            let patch = SettingsPatch {
+                                openai_base_url: (b != settings.openai_base_url).then_some(b),
+                                openai_model: (m != settings.openai_model).then_some(m),
+                                ..Default::default()
+                            };
+                            if save_settings(app, patch, error, busy).await {
+                                saved_note.set(true);
                             }
                         }
-                    },
-                    "Save"
+                    }
+                },
+                div { class: "grid2",
+                    div { class: "field",
+                        label { r#for: "ai-base", "Base URL" }
+                        input {
+                            id: "ai-base",
+                            class: "input",
+                            r#type: "url",
+                            "aria-invalid": base_error.read().is_some().to_string(),
+                            "aria-describedby": base_error.read().is_some().then_some("ai-base-err"),
+                            initial_value: "{base}",
+                            oninput: move |e| { saved_note.set(false); base_error.set(None); base.set(e.value()) },
+                        }
+                        if let Some(err) = *base_error.read() {
+                            span { id: "ai-base-err", class: "field-error", "{err}" }
+                        }
+                    }
+                    div { class: "field",
+                        label { r#for: "ai-model", "Model" }
+                        input {
+                            id: "ai-model",
+                            class: "input",
+                            "aria-invalid": model_error.read().is_some().to_string(),
+                            "aria-describedby": model_error.read().is_some().then_some("ai-model-err"),
+                            initial_value: "{model}",
+                            oninput: move |e| { saved_note.set(false); model_error.set(None); model.set(e.value()) },
+                        }
+                        if let Some(err) = *model_error.read() {
+                            span { id: "ai-model-err", class: "field-error", "{err}" }
+                        }
+                    }
                 }
-                if *saved_note.read() && !dirty {
-                    span { class: "save-state", "Saved" }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+                div { class: "row-actions",
+                    button {
+                        r#type: "submit",
+                        class: "btn btn-primary btn-sm",
+                        disabled: !dirty || *busy.read(),
+                        SaveLabel { busy: *busy.read() }
+                    }
+                    if *saved_note.read() && !dirty {
+                        span { class: "save-state", role: "status", "Saved" }
+                    }
                 }
             }
             div { class: "field",
-                span { class: "label", "API key" }
+                label { r#for: "ai-key", "API key" }
                 if show_key_input {
-                    div { class: "row-actions",
+                    form {
+                        class: "row-actions",
+                        onsubmit: move |e: FormEvent| async move {
+                            e.prevent_default();
+                            let k = key.peek().trim().to_string();
+                            if k.is_empty() || *key_busy.peek() {
+                                return;
+                            }
+                            let patch = SettingsPatch { openai_api_key: Some(k), ..Default::default() };
+                            if save_settings(app, patch, key_error, key_busy).await {
+                                key.set(String::new());
+                                key_rev += 1;
+                                replacing.set(false);
+                            }
+                        },
                         for rev in std::iter::once(key_rev()) {
                         input {
                             key: "{rev}",
+                            id: "ai-key",
                             class: "input",
                             style: "flex: 1; min-width: 220px",
                             r#type: "password",
                             autocomplete: "off",
                             placeholder: "sk-…",
-                            "aria-label": "API key",
                             initial_value: "{key}",
                             oninput: move |e| key.set(e.value()),
                         }
                         }
                         button {
+                            r#type: "submit",
                             class: "btn btn-primary btn-sm",
                             disabled: key.read().trim().is_empty() || *key_busy.read(),
-                            onclick: move |_| async move {
-                                let k = key.peek().trim().to_string();
-                                let patch = SettingsPatch { openai_api_key: Some(k), ..Default::default() };
-                                if save_settings(app, patch, key_error, key_busy).await {
-                                    key.set(String::new());
-                                    key_rev += 1;
-                                    replacing.set(false);
-                                }
-                            },
-                            "Save key"
+                            SaveLabel { busy: *key_busy.read(), label: "Save key" }
                         }
                         if settings.has_api_key {
-                            button { class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
+                            button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                         }
                     }
                     p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the Mac's Keychain. It is never shown again." }
@@ -623,6 +724,7 @@ fn VoiceSection(settings: Settings) -> Element {
     let mut voice = use_signal(|| settings.voice.clone().unwrap_or_default());
     let error = use_signal(|| None::<String>);
     let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
     let current = settings.voice.clone().unwrap_or_default();
     let dirty = voice.read().trim() != current;
 
@@ -630,31 +732,42 @@ fn VoiceSection(settings: Settings) -> Element {
         section { class: "set-sec",
             h2 { "Voice" }
             p { class: "help", "The PocketTTS voice that narrates videos. Leave empty for the default voice." }
-            div { class: "row-actions",
+            form {
+                class: "row-actions",
+                onsubmit: move |e: FormEvent| async move {
+                    e.prevent_default();
+                    if *busy.peek() {
+                        return;
+                    }
+                    let v = voice.peek().trim().to_string();
+                    let patch = SettingsPatch {
+                        voice: Some(if v.is_empty() { None } else { Some(v) }),
+                        ..Default::default()
+                    };
+                    if save_settings(app, patch, error, busy).await {
+                        saved_note.set(true);
+                    }
+                },
                 input {
                     class: "input",
                     style: "flex: 1; min-width: 220px",
                     "aria-label": "Voice name",
                     placeholder: "Default voice",
                     initial_value: "{voice}",
-                    oninput: move |e| voice.set(e.value()),
+                    oninput: move |e| { saved_note.set(false); voice.set(e.value()) },
                 }
                 button {
+                    r#type: "submit",
                     class: "btn btn-primary btn-sm",
                     disabled: !dirty || *busy.read(),
-                    onclick: move |_| async move {
-                        let v = voice.peek().trim().to_string();
-                        let patch = SettingsPatch {
-                            voice: Some(if v.is_empty() { None } else { Some(v) }),
-                            ..Default::default()
-                        };
-                        save_settings(app, patch, error, busy).await;
-                    },
-                    "Save"
+                    SaveLabel { busy: *busy.read() }
+                }
+                if *saved_note.read() && !dirty {
+                    span { class: "save-state", role: "status", "Saved" }
                 }
             }
             if let Some(err) = error.read().clone() {
-                span { class: "save-state error", "{err}" }
+                span { class: "save-state error", role: "alert", "{err}" }
             }
         }
     }
@@ -676,6 +789,7 @@ fn RenderSection(settings: Settings) -> Element {
     let mut fps = use_signal(|| settings.render_fps);
     let error = use_signal(|| None::<String>);
     let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
     let dirty = *size.read() != (settings.render_width, settings.render_height)
         || *fps.read() != settings.render_fps;
     let (w, h) = *size.read();
@@ -696,6 +810,7 @@ fn RenderSection(settings: Settings) -> Element {
                             if let Some((a, b)) = e.value().split_once('x')
                                 && let (Ok(a), Ok(b)) = (a.parse(), b.parse())
                             {
+                                saved_note.set(false);
                                 size.set((a, b));
                             }
                         },
@@ -714,6 +829,7 @@ fn RenderSection(settings: Settings) -> Element {
                         class: "select-input",
                         onchange: move |e| {
                             if let Ok(v) = e.value().parse() {
+                                saved_note.set(false);
                                 fps.set(v);
                             }
                         },
@@ -727,13 +843,16 @@ fn RenderSection(settings: Settings) -> Element {
                 }
             }
             if let Some(err) = error.read().clone() {
-                span { class: "save-state error", "{err}" }
+                span { class: "save-state error", role: "alert", "{err}" }
             }
             div { class: "row-actions",
                 button {
                     class: "btn btn-primary btn-sm",
                     disabled: !dirty || *busy.read(),
                     onclick: move |_| async move {
+                        if *busy.peek() {
+                            return;
+                        }
                         let (w, h) = *size.peek();
                         let patch = SettingsPatch {
                             render_width: Some(w),
@@ -741,9 +860,14 @@ fn RenderSection(settings: Settings) -> Element {
                             render_fps: Some(*fps.peek()),
                             ..Default::default()
                         };
-                        save_settings(app, patch, error, busy).await;
+                        if save_settings(app, patch, error, busy).await {
+                            saved_note.set(true);
+                        }
                     },
-                    "Save"
+                    SaveLabel { busy: *busy.read() }
+                }
+                if *saved_note.read() && !dirty {
+                    span { class: "save-state", role: "status", "Saved" }
                 }
             }
         }
@@ -789,6 +913,8 @@ fn ToolsSection() -> Element {
 #[component]
 fn ToolRow(tool: ToolStatus) -> Element {
     let mut copied = use_signal(|| None::<Result<(), String>>);
+    // Bumped per copy, so only the latest one's timer resets the label.
+    let mut copies = use_signal(|| 0u64);
     let commands = tool.install_commands.join("\n");
     rsx! {
         div { class: "tool",
@@ -816,7 +942,19 @@ fn ToolRow(tool: ToolStatus) -> Element {
                             move |_| {
                                 let commands = commands.clone();
                                 async move {
-                                    copied.set(Some(copy_to_clipboard(commands).await));
+                                    let n = *copies.peek() + 1;
+                                    copies.set(n);
+                                    copied.set(None);
+                                    let result = copy_to_clipboard(commands).await;
+                                    let ok = result.is_ok();
+                                    copied.set(Some(result));
+                                    if ok {
+                                        // Back to "Copy" after a moment, so a second copy shows too.
+                                        tokio::time::sleep(COPIED_FOR).await;
+                                        if *copies.peek() == n {
+                                            copied.set(None);
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -827,8 +965,12 @@ fn ToolRow(tool: ToolStatus) -> Element {
                         }
                     }
                 }
+                // Announced to screen readers; the button label says the same.
+                span { class: "sr-only", role: "status",
+                    if matches!(*copied.read(), Some(Ok(()))) { "Copied to the clipboard" }
+                }
                 if let Some(Err(err)) = copied.read().clone() {
-                    span { class: "save-state error", "{err}" }
+                    span { class: "save-state error", role: "alert", "{err}" }
                 }
             }
         }
@@ -864,5 +1006,29 @@ fn AppearanceSection() -> Element {
                 span { class: "save-state error", "{err}" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_problem_checks_the_address() {
+        assert_eq!(base_url_problem("https://api.openai.com/v1"), None);
+        assert_eq!(base_url_problem(" http://localhost:1234/v1 "), None);
+        assert_eq!(base_url_problem("  "), Some("Enter the API's base URL."));
+        assert_eq!(
+            base_url_problem("api.openai.com"),
+            Some("The base URL must start with https:// or http://.")
+        );
+        assert_eq!(
+            base_url_problem("https://"),
+            Some("That doesn't look like a web address.")
+        );
+        assert_eq!(
+            base_url_problem("https://my host"),
+            Some("That doesn't look like a web address.")
+        );
     }
 }
