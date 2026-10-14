@@ -1,27 +1,34 @@
 # Builds the apps per environment (docs/plan-deploy.md §4, §8) on the host runner and
-# publishes them as GitHub releases, so every deployed service has a matching app:
+# publishes them as GitHub releases. Runs on merges that change the app (path filter below),
+# independently of the service's CD (build-service.yml), so a UI-only merge rebuilds only
+# the app and a service-only merge redeploys only the service:
 #
-#   after a successful deploy-dev    -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
-#   after a successful deploy-prod   -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
-#   a v* tag                         -> both environments, release named after the tag
-#   workflow_dispatch                -> workflow artifacts only, no release
+#   a merge into dev      -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
+#   a merge into release  -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
+#   a v* tag              -> both environments, release named after the tag
+#   workflow_dispatch     -> workflow artifacts only, no release
 #
-# Each build is of the exact commit that was deployed (the deployed-<env>-<sha> artifact).
 # A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
 # the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
 # Margin.app (Margin Dev.app for dev: its own name, bundle id, settings and Keychain
-# entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight wait on the Apple Developer
-# account, owner question 7). Android: the APK, skipped while the runner has no Android SDK.
-#
-# workflow_run triggers only take effect once this file is on the default branch (dev).
+# entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight
+# wait on the Apple Developer account, owner question 7). Android: the APK, skipped while
+# the runner has no Android SDK.
 name: apps
 
 on:
-  workflow_run:
-    workflows: [deploy-dev, deploy-prod]
-    types: [completed]
   push:
+    branches: [dev, release]
     tags: ["v*"]
+    # Only merges that change what the app is built from (margin-app and margin-shared, per
+    # `cargo metadata`). Service-only merges go to build-service alone. (Tag pushes ignore
+    # path filters and always build.)
+    paths:
+      - "crates/app/**"
+      - "crates/shared/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/apps.yml"
   workflow_dispatch:
     inputs:
       environment:
@@ -36,12 +43,11 @@ permissions:
   actions: read
 
 concurrency:
-  group: apps-${{ github.event.workflow_run.name || github.ref }}
+  group: apps-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   plan:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, macOS, ARM64, margin]
     outputs:
       environments: ${{ steps.pick.outputs.environments }}
@@ -53,27 +59,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           CHOICE: ${{ inputs.environment }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_NAME: ${{ github.event.workflow_run.name }}
         run: |
           case "$EVENT" in
-            workflow_run)
-              case "$RUN_NAME" in
-                deploy-dev) env=dev ;;
-                deploy-prod) env=prod ;;
-                *) echo "::error::unexpected workflow $RUN_NAME"; exit 1 ;;
-              esac
-              # The commit that was actually deployed, from the run's deployed-<env>-<sha> artifact.
-              name="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
-                --jq "[.artifacts[] | select(.name | startswith(\"deployed-$env-\"))][0].name")"
-              sha="${name#deployed-$env-}"
-              environments="[\"$env\"]"
-              release="$env"
-              ;;
             push)
               sha="$GITHUB_SHA"
-              environments='["prod","dev"]'
-              release=tag
+              case "$GITHUB_REF" in
+                refs/heads/dev) environments='["dev"]'; release=dev ;;
+                refs/heads/release) environments='["prod"]'; release=prod ;;
+                refs/tags/*) environments='["prod","dev"]'; release=tag ;;
+                *) echo "::error::unexpected ref $GITHUB_REF"; exit 1 ;;
+              esac
               ;;
             workflow_dispatch)
               sha="$GITHUB_SHA"
@@ -186,7 +181,7 @@ jobs:
           export PATH="/opt/homebrew/bin:$PATH"
           short="${SHA::12}"
           cat > notes.md <<EOF
-          Margin apps built from \`$short\`, the commit deployed to $KIND.
+          Margin apps built from \`$short\` on ${GITHUB_REF_NAME}.
 
           The desktop app is signed ad hoc, not notarized: after moving it to Applications,
           run \`xattr -dr com.apple.quarantine "/Applications/Margin Dev.app"\` (dev) or
