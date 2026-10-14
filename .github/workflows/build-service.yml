@@ -17,11 +17,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
-    uses: ./.github/workflows/test.yml
-
+  # No test job: merges into dev and release only come through PRs whose `test` check
+  # passed on the PR branch kept up to date with the base (the repository ruleset), so the
+  # merged commit is the one CI tested.
   build:
-    needs: test
     runs-on: [self-hosted, macOS, ARM64, margin]
     timeout-minutes: 60
     env:
