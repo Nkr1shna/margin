@@ -311,6 +311,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .pipeline span.fail { color: var(--danger); border-color: var(--danger); }
 .bar { height: 3px; border-radius: 2px; background: var(--surface-2); overflow: hidden; width: 160px; }
 .bar i { display: block; height: 100%; background: var(--accent); }
+.player:focus:not(:focus-visible) { outline: none; }
 .player { width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; background: var(--manim-bg); display: block; box-shadow: 0 0 0 1px var(--line); }
 .panel-sec { display: grid; gap: 10px; }
 .panel-sec h3 { margin: 0; font-size: 13px; font-weight: 500; color: var(--fg-2); }

@@ -322,7 +322,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     // Listen for text selections inside the lesson body.
     use_future(move || async move {
         let mut eval = js(
-            "MarginApp.watchSelection('lesson-body', function (s) { dioxus.send(s); });\nawait new Promise(function () {});",
+            "MarginApp.watchSelection('lesson-doc', function (s) { dioxus.send(s); });\nawait new Promise(function () {});",
         );
         while let Ok(sel) = eval.recv::<Selection>().await {
             if sel.text.is_empty() {
@@ -370,7 +370,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
 
     rsx! {
         div { class: "margin-layout",
-            article { class: "doc",
+            article { id: "lesson-doc", class: "doc",
                 div { class: "meta",
                     span { class: "cat", "Lesson {index + 1} of {total}" }
                     span { "{lesson.minutes} min read" }
@@ -951,23 +951,48 @@ fn VideoPlayer(video: Video) -> Element {
                 for (const t of v.textTracks) {{ if (t.label === "Captions") t.mode = "disabled"; }}
                 const track = v.addTextTrack("captions", "Captions", "en");
                 for (const c of {json}) track.addCue(new VTTCue(c.start, c.end, c.text));
-                track.mode = "showing";
+                // Hidden over the thumbnail; shown once the video is played.
+                track.mode = v.dataset.thumb === "played" ? "showing" : "hidden";
             }})()"#,
             id = serde_json::to_string(&player_id).unwrap_or_default(),
         ));
     }));
 
-
     let Some(media) = video.media.as_ref().filter(|_| ready) else {
         return rsx! {};
     };
+    // ManimGX videos open on a black frame, so until it's played the player shows a frame
+    // from a few seconds in as its thumbnail; the first Play starts from the beginning.
+    let thumbnail_js = format!(
+        r#"(function() {{
+            const v = document.getElementById({id});
+            if (!v || v.dataset.thumb) return;
+            v.dataset.thumb = "pending";
+            const show = function () {{
+                if (v.dataset.thumb !== "pending" || !isFinite(v.duration)) return;
+                v.dataset.thumb = "shown";
+                v.currentTime = Math.min(v.duration * 0.25, 3);
+            }};
+            if (v.readyState >= 1) show(); else v.addEventListener("loadedmetadata", show, {{ once: true }});
+            v.addEventListener("play", function () {{
+                if (v.dataset.thumb === "shown") v.currentTime = 0;
+                v.dataset.thumb = "played";
+                for (const t of v.textTracks) {{ if (t.label === "Captions" && t.mode === "hidden") t.mode = "showing"; }}
+            }}, {{ once: true }});
+        }})()"#,
+        id = serde_json::to_string(&player_id).unwrap_or_default(),
+    );
     rsx! {
         video {
+            key: "{media.mp4_url}",
             id: "{player_id}",
             class: "player",
             controls: true,
             preload: "metadata",
             src: "{media.mp4_url}",
+            onmounted: move |_| {
+                document::eval(&thumbnail_js);
+            },
             "Your system can't play this video."
         }
     }
