@@ -538,6 +538,12 @@
       if (m.ellipsis && m.scrollWidth > m.clientWidth) return true;
       return !!m.clamped && m.scrollHeight > m.clientHeight + 1;
     },
+    // Whether a tooltip only repeats the text already on screen (a row's title that is
+    // its own label): then it shows only while that text is cut off.
+    repeatsText: function (tip, text) {
+      var norm = function (s) { return (s || "").replace(/\s+/g, " ").trim(); };
+      return norm(tip) === norm(text);
+    },
     // Focus (and show) the first element matching the selector once the pending DOM
     // update has landed; tries for a few frames, since Rust renders asynchronously.
     focusFirst: function (selector) {
@@ -697,7 +703,8 @@
     function target(node) {
       for (var n = node; n && n.nodeType === 1 && n !== document.body; n = n.parentElement) {
         adoptTitle(n);
-        if (n.getAttribute("data-tip") || n.getAttribute("title")) return n;
+        var tip = n.getAttribute("data-tip") || n.getAttribute("title");
+        if (tip && !window.MarginApp.repeatsText(tip, fullText(n))) return n;
         if (isTruncated(n)) return n;
       }
       return null;

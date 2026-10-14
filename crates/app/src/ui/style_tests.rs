@@ -283,3 +283,61 @@ fn fields_are_16px_on_ios_whatever_the_pointer() {
     }
     assert_eq!(token(decls, "font-size"), "16px");
 }
+
+/// Nothing in a chat scrolls the transcript sideways: the log is one column exactly as
+/// wide as the pane (an `auto` track grows to its widest item's min-content, so a long
+/// reasoning headline or a code block once widened every row past the window), long
+/// text wraps, and only code blocks and tables scroll, inside themselves.
+#[test]
+fn chat_transcript_never_scrolls_sideways() {
+    let log = block(".chat-log {");
+    assert_eq!(token(log, "display"), "grid");
+    assert_eq!(token(log, "grid-template-columns"), "minmax(0, 1fr)");
+    let items = block(".chat-log > * {");
+    assert_eq!(token(items, "min-width"), "0");
+    assert_eq!(token(items, "max-width"), "100%");
+
+    // Reasoning: the headline is one line cut with an ellipsis; the summary wraps.
+    let summary = block(".reasoning > summary {");
+    assert_eq!(token(summary, "max-width"), "100%");
+    assert_eq!(token(summary, "min-width"), "0");
+    let headline = block(".reasoning > summary .faint {");
+    for (name, value) in [
+        ("min-width", "0"),
+        ("overflow", "hidden"),
+        ("text-overflow", "ellipsis"),
+        ("white-space", "nowrap"),
+    ] {
+        assert_eq!(token(headline, name), value, "headline {name}");
+    }
+    let body = block(".reasoning-md {");
+    assert_eq!(token(body, "min-width"), "0");
+    assert_eq!(token(body, "overflow-wrap"), "anywhere");
+
+    // Markdown (answers and reasoning): text wraps; code blocks and tables scroll.
+    assert_eq!(token(block(".md {"), "overflow-wrap"), "anywhere");
+    for rule in [".md pre {", ".md table {"] {
+        assert_eq!(token(block(rule), "overflow-x"), "auto", "{rule}");
+        assert_eq!(token(block(rule), "max-width"), "100%", "{rule}");
+    }
+    // Tool output wraps inside its box; tool and card rows can shrink.
+    let output = block(".tool-body .code {");
+    assert_eq!(token(output, "white-space"), "pre-wrap");
+    assert_eq!(token(output, "overflow-wrap"), "anywhere");
+    assert_eq!(token(block(".tool-label {"), "min-width"), "0");
+    assert_eq!(token(block(".tool-row {"), "min-width"), "0");
+    assert_eq!(token(block(".chat-card {"), "min-width"), "0");
+    assert_eq!(token(block(".msg-user .bubble {"), "overflow-wrap"), "anywhere");
+}
+
+/// A title that only repeats an element's own text (a tool row's label) shows as a
+/// tooltip only while that text is cut off.
+#[test]
+fn repeated_titles_are_not_tooltips() {
+    run_js(
+        "eq(M.repeatsText('Listing the topics','Listing the topics'),true,'same');\n\
+         eq(M.repeatsText(' Listing  the\\ntopics ','Listing the topics'),true,'spacing');\n\
+         eq(M.repeatsText('Engineering / Control','Control'),false,'a path');\n\
+         eq(M.repeatsText('Stop the answer',''),false,'an icon button');",
+    );
+}
