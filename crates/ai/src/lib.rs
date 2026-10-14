@@ -425,18 +425,31 @@ impl StreamState {
 // Margin's generation tasks
 // ---------------------------------------------------------------------------
 
+/// An excerpt of one of the learner's sources, retrieved because it is relevant to what
+/// is being written. Outlines and lessons are based on these where they cover the topic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Passage {
+    /// The source's name, e.g. "notes/ch1.md".
+    pub source: String,
+    /// PDF page the passage is on.
+    pub page: Option<u32>,
+    pub text: String,
+}
+
 /// Proposes a course outline. `existing_subjects` are the titles of root topics, so the
 /// model can file the topic under one of them (it may also invent a new subject).
-/// The result has exactly `req.lesson_count` lessons.
+/// `passages` are the excerpts of the learner's sources most relevant to the request
+/// (empty without sources). The result has exactly `req.lesson_count` lessons.
 pub async fn propose_outline(
     client: &ResponsesClient,
     req: &AskRequest,
     existing_subjects: &[String],
+    passages: &[Passage],
 ) -> Result<Outline, AiError> {
     let outline: Outline = client
         .structured(
-            &prompts::outline_instructions(req.lesson_count, req.level),
-            &prompts::outline_input(req, existing_subjects),
+            &prompts::outline_instructions(req.lesson_count, req.level, !passages.is_empty()),
+            &prompts::outline_input(req, existing_subjects, passages),
             prompts::OUTLINE_SCHEMA_NAME,
             prompts::outline_schema(),
         )
@@ -504,6 +517,9 @@ pub struct LessonContext {
     pub outline: Vec<OutlineLesson>,
     /// Index into `outline` of the lesson to write.
     pub index: usize,
+    /// Excerpts of the learner's sources most relevant to this lesson (empty without
+    /// sources).
+    pub passages: Vec<Passage>,
 }
 
 /// Streams a lesson body as Markdown (see `Lesson::body_md` for conventions).

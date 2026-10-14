@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use margin_ai::{
-    AiError, FailedScene, LessonContext, ResponsesClient, SceneRequest, propose_outline,
+    AiError, FailedScene, LessonContext, Passage, ResponsesClient, SceneRequest, propose_outline,
     write_lesson, write_scene,
 };
 use margin_shared::{AskRequest, Level, OutlineLesson};
@@ -380,7 +380,9 @@ async fn propose_outline_parses_structured_output() {
         "Signals & Systems".to_string(),
         "Linear Algebra".to_string(),
     ];
-    let outline = propose_outline(&client, &ask(3), &subjects).await.unwrap();
+    let outline = propose_outline(&client, &ask(3), &subjects, &[])
+        .await
+        .unwrap();
     assert_eq!(outline.topic_title, "Fourier series");
     assert_eq!(outline.subject_title, "Signals & Systems");
     assert_eq!(outline.lessons.len(), 3);
@@ -408,6 +410,35 @@ async fn propose_outline_parses_structured_output() {
             .unwrap()
             .contains("exactly 3 lessons")
     );
+    assert!(!input.contains("SOURCE PASSAGES"));
+}
+
+fn passages() -> Vec<Passage> {
+    vec![Passage {
+        source: "dsp.pdf".into(),
+        page: Some(12),
+        text: "The coefficient a_n is the projection onto cos(n x).".into(),
+    }]
+}
+
+#[tokio::test]
+async fn propose_outline_sends_source_passages() {
+    let (client, fake) = spawn(vec![Reply::Json(
+        StatusCode::OK,
+        message_response(&outline_json(2)),
+    )])
+    .await;
+    propose_outline(&client, &ask(2), &[], &passages())
+        .await
+        .unwrap();
+    let (_, req) = last_request(&fake);
+    let input = req["input"].as_str().unwrap();
+    assert!(input.contains("=== BEGIN SOURCE PASSAGES ==="));
+    assert!(
+        input.contains("[1] dsp.pdf, p. 12:\nThe coefficient a_n is the projection onto cos(n x).")
+    );
+    let ins = req["instructions"].as_str().unwrap();
+    assert!(ins.contains("Base the outline on the sources"));
 }
 
 #[tokio::test]
@@ -417,7 +448,7 @@ async fn propose_outline_rejects_the_wrong_lesson_count() {
         message_response(&outline_json(4)),
     )])
     .await;
-    match propose_outline(&client, &ask(3), &[]).await {
+    match propose_outline(&client, &ask(3), &[], &[]).await {
         Err(AiError::Parse(m)) => assert!(m.contains("asked for 3 lessons"), "{m}"),
         other => panic!("expected Parse, got {other:?}"),
     }
@@ -432,7 +463,7 @@ async fn propose_outline_rejects_empty_fields() {
     )])
     .await;
     assert!(matches!(
-        propose_outline(&client, &ask(1), &[]).await,
+        propose_outline(&client, &ask(1), &[], &[]).await,
         Err(AiError::Parse(_))
     ));
 }
@@ -453,7 +484,7 @@ async fn structured_output_that_violates_the_schema_is_parse() {
     ])
     .await;
     for _ in 0..4 {
-        match propose_outline(&client, &ask(1), &[]).await {
+        match propose_outline(&client, &ask(1), &[], &[]).await {
             Err(AiError::Parse(_)) => {}
             other => panic!("expected Parse, got {other:?}"),
         }
@@ -472,7 +503,7 @@ async fn structured_refusal_and_incomplete_are_incomplete() {
     ])
     .await;
     for expected in ["I won't.", "token limit", "Boom."] {
-        match propose_outline(&client, &ask(1), &[]).await {
+        match propose_outline(&client, &ask(1), &[], &[]).await {
             Err(AiError::Incomplete(m)) => assert!(m.contains(expected), "{m}"),
             other => panic!("expected Incomplete, got {other:?}"),
         }
@@ -486,7 +517,7 @@ async fn structured_error_status_is_http() {
         json!({"error": {"message": "Invalid schema for response_format 'course_outline'.", "type": "invalid_request_error", "code": null}}),
     )])
     .await;
-    match propose_outline(&client, &ask(1), &[]).await {
+    match propose_outline(&client, &ask(1), &[], &[]).await {
         Err(AiError::Http {
             status: 400,
             message,
@@ -519,6 +550,7 @@ fn lesson_ctx(index: usize) -> LessonContext {
             },
         ],
         index,
+        passages: vec![],
     }
 }
 
@@ -545,6 +577,22 @@ async fn write_lesson_streams_and_cleans_the_body() {
     let input = req["input"].as_str().unwrap();
     assert!(input.contains("Write lesson 2 of 2: \"Coefficients\""));
     assert!(input.contains("\"Waves as sums\""));
+    assert!(!input.contains("SOURCE PASSAGES"));
+}
+
+#[tokio::test]
+async fn write_lesson_sends_source_passages() {
+    let (client, fake) = spawn(vec![chunked(&text_stream(&["## Idea\n\nText.\n"]), 64)]).await;
+    let mut ctx = lesson_ctx(1);
+    ctx.passages = passages();
+    write_lesson(&client, &ctx, |_| {}).await.unwrap();
+    let (_, req) = last_request(&fake);
+    let ins = req["instructions"].as_str().unwrap();
+    assert!(ins.contains("Mention the source by name"));
+    let input = req["input"].as_str().unwrap();
+    assert!(
+        input.contains("[1] dsp.pdf, p. 12:\nThe coefficient a_n is the projection onto cos(n x).")
+    );
 }
 
 #[tokio::test]
