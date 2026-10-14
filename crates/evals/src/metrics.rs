@@ -138,6 +138,69 @@ fn weighted_kappa(a: &[u8], b: &[u8], weight: impl Fn(usize, usize) -> f64) -> f
     if pe == 0.0 { 1.0 } else { 1.0 - po / pe }
 }
 
+/// The `p`th percentile (0–100) of `values` by nearest rank: the smallest value with at
+/// least `p` % of the values at or below it. 0 for no values.
+pub fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let rank = ((p / 100.0) * v.len() as f64).ceil() as usize;
+    v[rank.clamp(1, v.len()) - 1]
+}
+
+/// A paired bootstrap interval for the mean of per-item differences `b − a`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Interval {
+    pub mean: f64,
+    pub lo: f64,
+    pub hi: f64,
+    pub n: usize,
+}
+
+impl Interval {
+    /// Whether the interval excludes zero: the difference is more than noise.
+    pub fn significant(&self) -> bool {
+        self.lo > 0.0 || self.hi < 0.0
+    }
+}
+
+/// The 95 % paired bootstrap interval of `mean(b − a)`: the per-item differences are
+/// resampled with replacement `iters` times (a fixed-seed generator, so a report is
+/// reproducible) and the 2.5th and 97.5th percentiles of the resampled means taken.
+/// Paired, because the question is whether variant `b` helped on the same queries.
+pub fn paired_bootstrap(a: &[f64], b: &[f64], iters: usize, seed: u64) -> Interval {
+    assert_eq!(a.len(), b.len(), "a paired bootstrap needs paired values");
+    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| y - x).collect();
+    let n = d.len();
+    if n == 0 {
+        return Interval {
+            mean: 0.0,
+            lo: 0.0,
+            hi: 0.0,
+            n,
+        };
+    }
+    let mut state = seed | 1;
+    let mut next = move || {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let means: Vec<f64> = (0..iters.max(1))
+        .map(|_| (0..n).map(|_| d[(next() % n as u64) as usize]).sum::<f64>() / n as f64)
+        .collect();
+    Interval {
+        mean: mean(&d),
+        lo: percentile(&means, 2.5),
+        hi: percentile(&means, 97.5),
+        n,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +259,40 @@ mod tests {
         close(dedup_rate(&[false, true, false, true], 4), 0.5);
         close(dedup_rate(&[false, true, true], 2), 0.5);
         assert_eq!(dedup_rate(&[], 5), 0.0);
+    }
+
+    #[test]
+    fn percentiles_by_nearest_rank() {
+        let v = [5.0, 1.0, 3.0, 2.0, 4.0];
+        assert_eq!(percentile(&v, 0.0), 1.0);
+        assert_eq!(percentile(&v, 20.0), 1.0);
+        assert_eq!(percentile(&v, 21.0), 2.0);
+        assert_eq!(percentile(&v, 50.0), 3.0);
+        assert_eq!(percentile(&v, 95.0), 5.0);
+        assert_eq!(percentile(&v, 100.0), 5.0);
+        assert_eq!(percentile(&[], 50.0), 0.0);
+    }
+
+    #[test]
+    fn paired_bootstrap_intervals() {
+        // Every query improved by exactly 0.1: no spread at all.
+        let a = [0.2, 0.5, 0.7, 0.1];
+        let b = [0.3, 0.6, 0.8, 0.2];
+        let i = paired_bootstrap(&a, &b, 1000, 7);
+        close(i.mean, 0.1);
+        close(i.lo, 0.1);
+        close(i.hi, 0.1);
+        assert!(i.significant());
+        // Half better, half worse by the same amount: the interval straddles zero.
+        let a = [0.0; 40];
+        let b: Vec<f64> = (0..40).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let i = paired_bootstrap(&a, &b, 2000, 7);
+        close(i.mean, 0.0);
+        assert!(i.lo < 0.0 && i.hi > 0.0, "{i:?}");
+        assert!(!i.significant());
+        // Reproducible with the same seed.
+        assert_eq!(i, paired_bootstrap(&a, &b, 2000, 7));
+        assert_eq!(paired_bootstrap(&[], &[], 10, 1).n, 0);
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# The opt-in runner's endpoints and models (margin-eval; never read in CI). Keys are
+# not here: the runner reads `openai-api-key` and `anthropic-api-key` from the service
+# Mac's Keychain, as the service does. With both keys, writing uses Claude and every
+# judge and grader runs once per provider (two judges give the inter-judge κ); with one,
+# that provider does everything and agreement is measured between passage orders.
+
+openai_base_url = "https://api.openai.com/v1"
+anthropic_base_url = "https://api.anthropic.com"
+# The writing model's context window, which the lesson budget (share_of_window) is a
+# share of.
+window_tokens = 200000
+# Where `export` and `report --traces` read the service's trace rows from.
+service_url = "http://127.0.0.1:8787"
+
+[models]
+# Chats (the agent suite runs Margin's agent loop on the Responses API).
+openai_chat = "gpt-6.1-sol"
+# Lessons, scenes, the planner, question generation (docs/agent-rag-architecture.md §2.6).
+openai_write = "gpt-6.1-sol"
+anthropic_write = "claude-sonnet-5-5"
+# Small tasks: seriousness grading and judging.
+openai_small = "gpt-6-luna"
+anthropic_small = "claude-haiku-5-5"

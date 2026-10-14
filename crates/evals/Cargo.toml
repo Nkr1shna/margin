@@ -8,9 +8,30 @@ publish = false
 name = "margin-eval"
 path = "src/bin/margin-eval.rs"
 
+[features]
+# R1-ai's eval prompts and canaries (`margin_ai::evals`, branch agent/r1-ai): the real
+# judges in `ai_judge.rs`. Integration enables it once that branch is merged, then
+# drops the feature and the cfg.
+r1-ai = []
+
 [dependencies]
 margin-shared.workspace = true
+margin-ai.workspace = true
+margin-agent.workspace = true
+margin-embed.workspace = true
+margin-service = { path = "../service" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["query"] }
+futures-util.workspace = true
 toml = "=1.1.8"
+sha2 = "=0.11.1"
+hex = "=0.4.3"
+half = "=2.7.1"
+base64 = "=0.23.1"
+
+[dev-dependencies]
+axum = "=0.8.9"
