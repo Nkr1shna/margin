@@ -123,6 +123,9 @@ pub struct FakeGenerator {
     pub lesson_body: Mutex<Option<String>>,
     /// The model chat turns call: queue replies with `agent.push(..)`.
     pub agent: Arc<ScriptedModel>,
+    /// When set, chat turns call the real `ResponsesClient` at Settings' base URL
+    /// instead of `agent` (point it at a fake Responses API).
+    pub agent_over_http: AtomicBool,
 }
 
 pub fn outline_for(req: &AskRequest) -> Outline {
@@ -229,6 +232,13 @@ impl Generator for FakeGenerator {
 
     fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
         assert_eq!(ai.api_key, API_KEY);
+        if self.agent_over_http.load(Ordering::SeqCst) {
+            return Arc::new(margin_ai::ResponsesClient::new(
+                ai.base_url.clone(),
+                ai.api_key.clone(),
+                ai.model.clone(),
+            ));
+        }
         self.agent.clone()
     }
 }

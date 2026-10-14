@@ -1108,7 +1108,7 @@ async fn an_incomplete_answer_fails_retryably() {
     assert_eq!(
         outcome,
         TurnOutcome::Failed {
-            error: "The answer was cut off (max_output_tokens).".into(),
+            error: "The answer was cut off (it reached the output length limit).".into(),
             retryable: true
         }
     );

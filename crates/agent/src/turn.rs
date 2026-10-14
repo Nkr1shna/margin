@@ -245,6 +245,15 @@ impl CallError {
     }
 }
 
+/// `response.incomplete`'s reason in words for the Error item; unknown reasons as sent.
+fn incomplete_reason(reason: &str) -> &str {
+    match reason {
+        "max_output_tokens" => "it reached the output length limit",
+        "content_filter" => "the content filter stopped it",
+        other => other,
+    }
+}
+
 fn is_too_long(lowercase_message: &str) -> bool {
     lowercase_message.contains("context_length_exceeded")
         || lowercase_message.contains("context window")
@@ -602,7 +611,8 @@ impl<'t, 'a> Turn<'t, 'a> {
                 }
                 StreamEvent::Incomplete { reason, usage } => {
                     sink.add_usage(&usage).await?;
-                    let message = format!("The answer was cut off ({reason}).");
+                    let message =
+                        format!("The answer was cut off ({}).", incomplete_reason(&reason));
                     return self.abandon(open, &calls, message, true).await;
                 }
                 StreamEvent::Failed { code, message } | StreamEvent::Error { code, message } => {

@@ -921,7 +921,14 @@ mod tests {
             message: "slow".into(),
             retry_after: Some(Duration::from_secs(9)),
         };
-        assert_eq!(b.delay(0, &limited), Some(Duration::from_secs(9)));
+        // Retry-After is honoured up to the cap.
+        assert_eq!(b.delay(0, &limited), Some(Duration::from_secs(5)));
+        let soon = AiError::Http {
+            status: 429,
+            message: "slow".into(),
+            retry_after: Some(Duration::from_secs(3)),
+        };
+        assert_eq!(b.delay(0, &soon), Some(Duration::from_secs(3)));
         assert_eq!(
             b.delay(0, &AiError::Network("x".into())),
             Some(Duration::from_secs(2))

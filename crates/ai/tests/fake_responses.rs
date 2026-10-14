@@ -1333,7 +1333,7 @@ fn quick() -> Backoff {
     Backoff {
         retries: 3,
         base_delay: Duration::from_millis(1),
-        max_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(100),
     }
 }
 
@@ -1354,7 +1354,7 @@ async fn stream_response_with_retries_retries_429_and_5xx_then_streams() {
         .stream_response_with_retries(&agent_request(), &quick())
         .await
         .unwrap();
-    // The 429's Retry-After (50 ms) was honoured although it is past `max_delay`.
+    // The 429's Retry-After (50 ms, under `max_delay`) was honoured.
     assert!(started.elapsed() >= Duration::from_millis(50));
     let events = drain(stream).await;
     assert!(matches!(

@@ -233,7 +233,6 @@ async fn upload_ready(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn a_message_starts_a_turn_that_streams_and_finishes() {
     let (h, t) = signed_in().await;
     h.generator
@@ -375,7 +374,6 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn agent_settings_pick_the_model_and_reasoning_effort() {
     let (h, t) = signed_in().await;
     let r = h
@@ -461,7 +459,6 @@ async fn agent_settings_are_stored() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn tool_calls_run_and_their_outputs_load_on_demand() {
     let (h, t) = signed_in().await;
     let topic = new_topic(&h, &t, None, "Fourier series").await;
@@ -558,7 +555,6 @@ async fn tool_calls_run_and_their_outputs_load_on_demand() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn read_tools_answer_from_the_library() {
     let (h, t) = signed_in().await;
     let subject = new_topic(&h, &t, None, "Signals").await;
@@ -732,7 +728,6 @@ async fn read_tools_answer_from_the_library() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn a_message_sent_while_busy_waits_and_goes_next() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
@@ -824,7 +819,6 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn stop_keeps_streamed_text_and_answers_open_calls() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
@@ -919,7 +913,6 @@ async fn stop_keeps_streamed_text_and_answers_open_calls() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn a_failed_turn_can_be_continued() {
     let h = start().await;
     *h.state.turns.retry.lock().unwrap() = RetryPolicy::immediate();
@@ -991,7 +984,6 @@ async fn a_failed_turn_can_be_continued() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn at_most_two_turns_run_at_once() {
     let (h, t) = signed_in().await;
     h.generator.agent.push(hanging_text("a"));
@@ -1194,7 +1186,6 @@ async fn deny_answers_a_confirmation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn stop_denies_a_waiting_confirmation() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
@@ -1266,7 +1257,6 @@ async fn put_item(store: &Store, item: ChatItem, model_items: Vec<Value>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn a_restart_interrupts_running_turns_and_continue_resumes() {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
@@ -1618,7 +1608,6 @@ async fn chats_are_renamed_listed_and_checked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs margin-agent phase 1 (agent/p1-agent)"]
 async fn deleting_a_chat_stops_it_and_takes_its_own_files() {
     let (h, t) = signed_in().await;
     let topic = new_topic(&h, &t, None, "Kept").await;

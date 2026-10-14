@@ -179,8 +179,9 @@ gives `msg`.
 
 - `stream()` returning `Err(e)` with `e.is_retryable()` (429, 5xx, network), or a
   stream ending in a retryable `Err` **before any `OutputItemAdded` of this attempt**:
-  wait `retry_after` if given, else `base_delay · 2^n`, capped at `max_delay`; retry up
-  to `retries` (3) times. Then fail.
+  wait `retry_after` if given, else `base_delay · 2^n`, either capped at `max_delay`
+  (`RetryPolicy::delay`; `margin_ai::Backoff` uses the same rule); retry up to `retries`
+  (3) times. Then fail.
 - Anything after output started, `Failed`/`Error` events, non-retryable errors: no retry.
   Items of the attempt still `InProgress` → `update_item(Cancelled)` (no model items);
   each completed `function_call` of the attempt gets `ToolResult { ok: false, summary:

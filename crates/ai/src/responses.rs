@@ -313,14 +313,14 @@ impl Default for Backoff {
 impl Backoff {
     /// The pause before the next attempt after `err`, where `attempt` counts the retries
     /// already made; `None` when `err` isn't worth retrying or the retries are used up.
-    /// A `Retry-After` from the API is honoured as given, even past `max_delay`:
-    /// retrying sooner would only be refused again.
+    /// A `Retry-After` from the API is honoured up to `max_delay`, the same rule as the
+    /// agent loop's `RetryPolicy`, so a turn never waits longer than that between tries.
     pub fn delay(&self, attempt: u32, err: &AiError) -> Option<Duration> {
         if attempt >= self.retries || !err.is_retryable() {
             return None;
         }
         if let Some(after) = err.retry_after() {
-            return Some(after);
+            return Some(after.min(self.max_delay));
         }
         let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
         Some(
