@@ -9,6 +9,10 @@ use crate::ui::search::SearchPalette;
 use crate::ui::settings::{SettingsDialog, SettingsPane};
 use crate::ui::sidebar::Sidebar;
 
+/// Sidebar width limits when resizing by dragging, in CSS pixels.
+const SIDEBAR_MIN: u32 = 200;
+const SIDEBAR_MAX: u32 = 480;
+
 #[component]
 pub fn Shell() -> Element {
     let mut app = use_app();
@@ -45,6 +49,17 @@ pub fn Shell() -> Element {
         }
     });
 
+    // Dragging the sidebar's edge resizes it; the width is saved (0 = back to default).
+    use_future(move || async move {
+        let mut eval = js(&format!(
+            "MarginApp.watchSidebarResize({SIDEBAR_MIN}, {SIDEBAR_MAX}, function (w) {{ dioxus.send(w); }});\nawait new Promise(function () {{}});"
+        ));
+        while let Ok(width) = eval.recv::<u32>().await {
+            let width = (width > 0).then(|| width.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+            let _ = app.set_config(|c| c.sidebar_width = width);
+        }
+    });
+
     // On every route change: close the drawer (narrow screens) and start the new page at
     // the top. Pages reuse the same scroll element, so its offset would otherwise carry over.
     use_effect(use_reactive!(|route| {
@@ -59,9 +74,17 @@ pub fn Shell() -> Element {
     let live = app.live.read().clone();
     let drawer_open = *app.drawer_open.read();
     let sidebar_hidden = app.config.read().sidebar_hidden;
+    let sidebar_style = app
+        .config
+        .read()
+        .sidebar_width
+        .map(|w| format!("--sb-w: {w}px"))
+        .unwrap_or_default();
 
     rsx! {
-        div { class: if sidebar_hidden { "app sb-hidden" } else { "app" },
+        div {
+            class: if sidebar_hidden { "app sb-hidden" } else { "app" },
+            style: "{sidebar_style}",
             if drawer_open {
                 div {
                     class: "drawer-scrim",

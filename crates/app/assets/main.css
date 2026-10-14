@@ -146,7 +146,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 
 /* ---------- app frame ---------- */
 .app { height: 100vh; display: flex; min-height: 0; }
-.sb { width: 256px; flex: none; background: var(--sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.sb { width: var(--sb-w, 256px); flex: none; position: relative; background: var(--sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
 .sb-top { padding: 10px 10px 4px; display: grid; gap: 2px; }
 .ws { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--r-ctl); font-weight: 500; }
 .mark { width: 20px; height: 20px; flex: none; display: block; }
@@ -156,7 +156,12 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .row .k { font-size: 11.5px; color: var(--fg-3); font-family: var(--font-mono); }
 .row .count { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 .sb-label { padding: 14px 10px 4px 16px; font-size: 13px; color: var(--fg-3); font-weight: 500; display: flex; align-items: center; justify-content: space-between; }
-.sb-scroll { flex: 1; overflow: auto; padding: 0 10px 10px; }
+.sb-scroll { flex: 1; overflow: hidden auto; padding: 0 10px 10px; }
+/* Drag the sidebar's right edge to resize it; double-click resets. */
+.sb-resize { position: absolute; top: 0; bottom: 0; right: -3px; width: 6px; cursor: col-resize; z-index: 5; }
+.sb-resize:hover, .sb-resize.active { background: var(--line-2); }
+body.resizing-sb { cursor: col-resize; }
+body.resizing-sb * { user-select: none !important; }
 .sb-foot { padding: 8px 10px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
 .avatar { width: 24px; height: 24px; border-radius: 50%; background: var(--surface-2); display: grid; place-items: center; font-size: 11px; font-weight: 600; color: var(--fg-2); flex: none; }
 
@@ -167,7 +172,9 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 /* Lesson and notes rows have no actions button; line their dots and counts up with the
    topic counts (row padding + the 24px actions button). */
 .tree li > .row { padding-right: 32px; }
-.tree-row { display: flex; align-items: center; border-radius: 6px; }
+.tree-row { display: flex; align-items: center; border-radius: 6px; min-width: 0; }
+/* The row shares the line with its ⋯ button, so it takes what's left, not 100%. */
+.tree-row .row { flex: 1; min-width: 0; width: auto; }
 .tree-row:hover, .tree-row:focus-within { background: var(--hover); }
 .tree-row .row:hover { background: transparent; }
 .tree-row .more { opacity: 0; }
@@ -421,6 +428,7 @@ details.collapse > summary { cursor: pointer; font-size: 13px; font-weight: 500;
 @media (max-width: 719px) {
   .sb { position: fixed; z-index: 50; top: 0; bottom: 0; left: 0; width: min(300px, 86vw); transform: translateX(-100%); transition: transform .2s ease; box-shadow: var(--pop-shadow); padding-top: env(safe-area-inset-top); }
   .sb.open { transform: none; }
+  .sb-resize { display: none; }
   .drawer-scrim { display: block; position: fixed; inset: 0; background: var(--scrim); z-index: 49; }
   .menu-btn.menu-narrow { display: inline-flex; }
   .topbar { padding: 0 8px; padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }

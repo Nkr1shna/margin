@@ -130,6 +130,44 @@
       if (sel) sel.removeAllRanges();
     },
     // Global shortcuts: Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask.
+    // Resizing the sidebar by its right edge. The width follows the pointer live (a CSS
+    // variable on .app); the final width is sent to the app to save. Double-click resets.
+    watchSidebarResize: function (min, max, send) {
+      if (window.MarginApp._stopResize) window.MarginApp._stopResize();
+      function app() { return document.querySelector(".app"); }
+      function onDown(e) {
+        var handle = e.target.closest && e.target.closest(".sb-resize");
+        if (!handle || e.button !== 0) return;
+        e.preventDefault();
+        var sb = handle.parentElement;
+        var startX = e.clientX, startW = sb.getBoundingClientRect().width, width = startW;
+        handle.classList.add("active");
+        document.body.classList.add("resizing-sb");
+        function onMove(ev) {
+          width = Math.round(Math.min(max, Math.max(min, startW + ev.clientX - startX)));
+          var a = app();
+          if (a) a.style.setProperty("--sb-w", width + "px");
+        }
+        function onUp() {
+          document.removeEventListener("mousemove", onMove, true);
+          document.removeEventListener("mouseup", onUp, true);
+          handle.classList.remove("active");
+          document.body.classList.remove("resizing-sb");
+          if (width !== startW) send(width);
+        }
+        document.addEventListener("mousemove", onMove, true);
+        document.addEventListener("mouseup", onUp, true);
+      }
+      function onDbl(e) {
+        if (e.target.closest && e.target.closest(".sb-resize")) send(0);
+      }
+      document.addEventListener("mousedown", onDown, true);
+      document.addEventListener("dblclick", onDbl, true);
+      window.MarginApp._stopResize = function () {
+        document.removeEventListener("mousedown", onDown, true);
+        document.removeEventListener("dblclick", onDbl, true);
+      };
+    },
     watchShortcuts: function (send) {
       if (window.MarginApp._stopShortcuts) window.MarginApp._stopShortcuts();
       function onKey(e) {

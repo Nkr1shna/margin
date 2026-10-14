@@ -54,6 +54,9 @@ pub struct LocalConfig {
     /// The sidebar is collapsed (wide windows; narrow ones always use the drawer).
     #[serde(default)]
     pub sidebar_hidden: bool,
+    /// Sidebar width in CSS pixels, set by dragging its edge; `None` is the default.
+    #[serde(default)]
+    pub sidebar_width: Option<u32>,
 }
 
 impl Default for LocalConfig {
@@ -62,6 +65,7 @@ impl Default for LocalConfig {
             service_url: None,
             appearance: Appearance::System,
             sidebar_hidden: false,
+            sidebar_width: None,
         }
     }
 }
@@ -184,6 +188,7 @@ mod tests {
             service_url: Some("https://m.example".into()),
             appearance: Appearance::Dark,
             sidebar_hidden: true,
+            sidebar_width: Some(300),
         };
         save_to(&path, &config).unwrap();
         assert_eq!(load_from(&path), config);

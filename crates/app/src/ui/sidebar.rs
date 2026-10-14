@@ -92,6 +92,13 @@ pub fn Sidebar() -> Element {
         aside {
             class: if drawer_open { "sb open" } else { "sb" },
             "aria-label": "Sidebar",
+            div {
+                class: "sb-resize",
+                role: "separator",
+                "aria-orientation": "vertical",
+                "aria-label": "Resize sidebar",
+                title: "Drag to resize, double-click to reset",
+            }
             div { class: "sb-top",
                 div { class: "ws",
                     DragRegion {}
