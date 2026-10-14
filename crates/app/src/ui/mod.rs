@@ -8,3 +8,6 @@ pub mod shell;
 pub mod sidebar;
 pub mod signin;
 pub mod sources;
+
+#[cfg(test)]
+mod style_tests;

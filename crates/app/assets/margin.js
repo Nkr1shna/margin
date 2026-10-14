@@ -293,6 +293,13 @@
       var el = document.querySelector(selector);
       if (el) el.scrollIntoView({ block: "nearest" });
     },
+    // Whether a box's text is cut off: an ellipsis that is in use (content wider than the
+    // box) or a line clamp that hides lines. Takes plain numbers so it can be tested
+    // without layout.
+    truncated: function (m) {
+      if (m.ellipsis && m.scrollWidth > m.clientWidth) return true;
+      return !!m.clamped && m.scrollHeight > m.clientHeight + 1;
+    },
     copyText: function (text) {
       if (navigator.clipboard && window.isSecureContext) {
         return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fallbackCopy(text); });
@@ -337,15 +344,45 @@
       }
       return tip;
     }
+    // The nearest element under the pointer that has a tooltip: its own title/data-tip,
+    // or, for text cut off with an ellipsis or a line clamp, its full text.
     function target(node) {
-      var t = node && node.closest ? node.closest("[title], [data-tip]") : null;
-      if (!t) return null;
-      if (t.hasAttribute("title")) {
-        var text = t.getAttribute("title");
-        t.removeAttribute("title");
-        if (text) t.setAttribute("data-tip", text); else t.removeAttribute("data-tip");
+      for (var n = node; n && n.nodeType === 1 && n !== document.body; n = n.parentElement) {
+        if (n.hasAttribute("title")) {
+          var text = n.getAttribute("title");
+          n.removeAttribute("title");
+          if (text) n.setAttribute("data-tip", text); else n.removeAttribute("data-tip");
+        }
+        if (n.getAttribute("data-tip")) return n;
+        if (isTruncated(n)) return n;
       }
-      return t.getAttribute("data-tip") ? t : null;
+      return null;
+    }
+    // A focused control whose label is cut off (a sidebar row, a note in the list):
+    // its first truncated descendant, so keyboard users get the full text too.
+    function truncatedInside(node) {
+      var kids = node.querySelectorAll ? node.querySelectorAll("*") : [];
+      for (var i = 0; i < kids.length && i < 24; i++) {
+        if (isTruncated(kids[i])) return kids[i];
+      }
+      return null;
+    }
+    function tipText(t) {
+      return t.getAttribute("data-tip") || fullText(t);
+    }
+    function fullText(t) {
+      return (t.textContent || "").replace(/\s+/g, " ").trim();
+    }
+    function isTruncated(n) {
+      if (n.matches("input, textarea, select, [contenteditable]") || !fullText(n)) return false;
+      var cs = window.getComputedStyle(n);
+      var clamp = cs.webkitLineClamp || cs.getPropertyValue("-webkit-line-clamp");
+      return window.MarginApp.truncated({
+        ellipsis: cs.textOverflow === "ellipsis",
+        clamped: !!clamp && clamp !== "none",
+        scrollWidth: n.scrollWidth, clientWidth: n.clientWidth,
+        scrollHeight: n.scrollHeight, clientHeight: n.clientHeight,
+      });
     }
     function hide() {
       clearTimeout(timer);
@@ -356,7 +393,9 @@
     function show(t) {
       if (!document.body.contains(t)) return;
       var box = el();
-      box.textContent = t.getAttribute("data-tip");
+      var text = tipText(t);
+      if (!text) return;
+      box.textContent = text;
       box.classList.add("show");
       var r = t.getBoundingClientRect(), b = box.getBoundingClientRect();
       var top = r.bottom + 6;
@@ -388,7 +427,7 @@
       if (current && !(e.relatedTarget && current.contains(e.relatedTarget))) hide();
     }, true);
     document.addEventListener("focusin", function (e) {
-      if (finePointer() && e.target.matches && e.target.matches(":focus-visible")) arm(target(e.target), 300);
+      if (finePointer() && e.target.matches && e.target.matches(":focus-visible")) arm(target(e.target) || truncatedInside(e.target), 300);
     }, true);
     document.addEventListener("focusout", hide, true);
     ["mousedown", "pointerdown", "touchstart", "keydown", "scroll", "wheel"].forEach(function (type) {
