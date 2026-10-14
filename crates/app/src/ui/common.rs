@@ -251,8 +251,13 @@ pub fn TopBar(crumbs: Vec<String>, children: Element) -> Element {
             DragRegion {}
             button {
                 class: "icon-btn menu-btn",
-                "aria-label": "Open sidebar",
-                onclick: move |_| app.drawer_open.set(true),
+                "aria-label": "Show sidebar",
+                title: "Show sidebar (⌘\\)",
+                // Wide windows un-collapse the sidebar; narrow ones open the drawer.
+                onclick: move |_| {
+                    let _ = app.set_config(|c| c.sidebar_hidden = false);
+                    app.drawer_open.set(true);
+                },
                 Icon { name: "panel" }
             }
             nav { class: "crumbs", "aria-label": "Breadcrumbs",

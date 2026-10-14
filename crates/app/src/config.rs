@@ -51,6 +51,9 @@ pub struct LocalConfig {
     pub service_url: Option<String>,
     #[serde(default)]
     pub appearance: Appearance,
+    /// The sidebar is collapsed (wide windows; narrow ones always use the drawer).
+    #[serde(default)]
+    pub sidebar_hidden: bool,
 }
 
 impl Default for LocalConfig {
@@ -58,6 +61,7 @@ impl Default for LocalConfig {
         Self {
             service_url: None,
             appearance: Appearance::System,
+            sidebar_hidden: false,
         }
     }
 }
@@ -179,6 +183,7 @@ mod tests {
         let config = LocalConfig {
             service_url: Some("https://m.example".into()),
             appearance: Appearance::Dark,
+            sidebar_hidden: true,
         };
         save_to(&path, &config).unwrap();
         assert_eq!(load_from(&path), config);

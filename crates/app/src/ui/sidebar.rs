@@ -5,7 +5,7 @@ use margin_shared::{Id, NewTopic, TopicPatch};
 
 use crate::config::Appearance;
 use crate::routes::Route;
-use crate::state::{LiveStatus, LoadStatus, use_app};
+use crate::state::{LoadStatus, use_app};
 use crate::store::VideoDot;
 use crate::ui::common::{BrandMark, ConfirmDialog, DragRegion, Icon};
 
@@ -50,7 +50,6 @@ pub fn Sidebar() -> Element {
         .collect();
     let note_count = lib.notes.len();
     let loaded = *app.lib_status.read() == LoadStatus::Loaded;
-    let live = app.live.read().clone();
     let login = app
         .session
         .read()
@@ -60,11 +59,6 @@ pub fn Sidebar() -> Element {
     let drawer_open = *app.drawer_open.read();
     drop(lib);
 
-    let (live_class, live_label) = match live {
-        LiveStatus::Live => ("dot ok", "Live"),
-        LiveStatus::Connecting => ("dot run", "Connecting"),
-        LiveStatus::Reconnecting { .. } => ("dot", "Offline"),
-    };
     let initial = login
         .as_deref()
         .and_then(|l| l.chars().next())
@@ -93,9 +87,18 @@ pub fn Sidebar() -> Element {
                     DragRegion {}
                     BrandMark {}
                     span { class: "grow", "Margin" }
-                    span { class: "live", title: "{live_label}",
-                        span { class: "{live_class}" }
-                        span { class: "sr-only", "{live_label}" }
+                    button {
+                        class: "icon-btn sb-toggle",
+                        "aria-label": "Hide sidebar",
+                        title: "Hide sidebar (⌘\\)",
+                        onclick: move |_| {
+                            if drawer_open {
+                                app.drawer_open.set(false);
+                            } else {
+                                let _ = app.set_config(|c| c.sidebar_hidden = true);
+                            }
+                        },
+                        Icon { name: "panel" }
                     }
                 }
                 button {

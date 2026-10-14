@@ -14,7 +14,8 @@ pub fn Shell() -> Element {
     let nav = navigator();
     let route = use_route::<Route>();
 
-    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, from anywhere in the window.
+    // Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask, Cmd/Ctrl+\ toggles the sidebar,
+    // from anywhere in the window.
     use_future(move || async move {
         let mut eval = js(
             "MarginApp.watchShortcuts(function (m) { dioxus.send(m); });\nawait new Promise(function () {});",
@@ -22,6 +23,11 @@ pub fn Shell() -> Element {
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
                 "search" => app.search_open.set(true),
+                "sidebar" => {
+                    let hidden = app.config.peek().sidebar_hidden;
+                    let _ = app.set_config(|c| c.sidebar_hidden = !hidden);
+                    app.drawer_open.set(hidden);
+                }
                 "ask" => {
                     app.search_open.set(false);
                     nav.push(Route::Ask {});
@@ -44,9 +50,10 @@ pub fn Shell() -> Element {
     let lib_status = app.lib_status.read().clone();
     let live = app.live.read().clone();
     let drawer_open = *app.drawer_open.read();
+    let sidebar_hidden = app.config.read().sidebar_hidden;
 
     rsx! {
-        div { class: "app",
+        div { class: if sidebar_hidden { "app sb-hidden" } else { "app" },
             if drawer_open {
                 div {
                     class: "drawer-scrim",

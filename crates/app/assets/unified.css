@@ -8,7 +8,7 @@
 .topbar, .ws, .connect-bar { position: relative; }
 .topbar > :not(.drag-region), .ws > :not(.drag-region) { position: relative; z-index: 1; pointer-events: none; }
 .topbar button, .topbar a, .topbar input, .topbar select, .topbar [role="button"],
-.topbar .menu, .topbar .pop-scrim, .ws .live { pointer-events: auto; }
+.topbar .menu, .topbar .pop-scrim, .ws button { pointer-events: auto; }
 
 /* The sidebar's first row shares the top bar's height and starts after the lights. */
 .sb-top { padding-top: 0; }
@@ -23,3 +23,4 @@
 @media (max-width: 719px) {
   .topbar { padding-left: 78px; }
 }
+.app.sb-hidden .topbar { padding-left: 78px; }

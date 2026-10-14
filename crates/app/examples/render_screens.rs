@@ -81,6 +81,7 @@ fn Harness(props: HarnessProps) -> Element {
             config: Signal::new(config::LocalConfig {
                 service_url: Some("https://margin.krishnanelloore.com".into()),
                 appearance: config::Appearance::System,
+                sidebar_hidden: false,
             }),
             session: Signal::new(session),
             signed_out_reason: Signal::new(None),

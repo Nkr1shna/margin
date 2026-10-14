@@ -137,6 +137,7 @@
         var k = (e.key || "").toLowerCase();
         if (k === "k") { e.preventDefault(); send("search"); }
         else if (k === "n") { e.preventDefault(); send("ask"); }
+        else if (k === "\\") { e.preventDefault(); send("sidebar"); }
       }
       document.addEventListener("keydown", onKey, true);
       window.MarginApp._stopShortcuts = function () {
