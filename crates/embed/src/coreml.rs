@@ -130,6 +130,15 @@ impl Model {
         };
         let document_prompt = prompt("document")?;
         let query_prompt = prompt("search_query")?;
+        if document_prompt != crate::DOCUMENT_PROMPT || query_prompt != crate::QUERY_PROMPT {
+            // Recordings and `EMBEDDER_VERSION` assume the prompts this crate knows.
+            tracing::warn!(
+                "the model's prompts ({document_prompt:?}, {query_prompt:?}) differ from \
+                 {:?}, {:?}: bump EMBEDDER_VERSION",
+                crate::DOCUMENT_PROMPT,
+                crate::QUERY_PROMPT
+            );
+        }
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| EmbedError::Load(format!("tokenizer.json: {e}")))?;
@@ -186,18 +195,11 @@ impl Model {
         })
     }
 
-    /// `<bos>`, the prefixed text's tokens (at most `MAX_TOKENS - 2`), `<eos>`.
+    /// `<bos>`, the prefixed text's tokens (at most `MAX_TOKENS - 2`), `<eos>`. The prefix
+    /// is the model's prompt for `purpose`; a document's title replaces `none` in
+    /// "title: none | text: " (`crate::render_prompt`).
     fn token_ids(&self, text: &str, purpose: &Purpose) -> Result<Vec<u32>, EmbedError> {
-        let titled;
-        let prompt = match purpose {
-            Purpose::Document { title: None } => &self.document_prompt,
-            Purpose::Document { title: Some(title) } => {
-                // The model's prompt is "title: none | text: "; a title replaces "none".
-                titled = self.document_prompt.replacen("none", title.trim(), 1);
-                &titled
-            }
-            Purpose::Query => &self.query_prompt,
-        };
+        let prompt = crate::render_prompt(&self.document_prompt, &self.query_prompt, purpose);
         let encoding = self
             .tokenizer
             .encode(format!("{prompt}{text}"), false)
@@ -232,6 +234,28 @@ impl Model {
     fn embed_one(&self, text: &str, purpose: &Purpose) -> Result<Vec<f32>, EmbedError> {
         let ids = self.token_ids(text, purpose)?;
         self.embed_rows(self.rows_of(&ids))
+    }
+
+    /// Tokenizing and the table lookups (`rows_of`) run on a second thread while this one
+    /// runs the model, so the Neural Engine never waits for the tokenizer
+    /// (`docs/agent-rag-architecture.md` §2.1). The functions are single-sequence, so
+    /// each input is still one prediction.
+    pub(crate) fn embed_pipelined(
+        &self,
+        inputs: &[(String, Purpose)],
+        batch: usize,
+        on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
+    ) -> Result<(), EmbedError> {
+        crate::pipelined(
+            inputs,
+            batch,
+            &|(text, purpose): &(String, Purpose)| {
+                let ids = self.token_ids(text, purpose)?;
+                Ok(self.rows_of(&ids))
+            },
+            &mut |rows| self.embed_rows(rows),
+            on_batch,
+        )
     }
 
     /// The embedding of a media item's encoder rows (`count` × `hidden`, fp16):
@@ -671,8 +695,9 @@ pub(crate) fn describe(error: &NSError) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Against the real model, when it is on this Mac: `MARGIN_EMBED_MODEL_DIR`, or
-    //! `~/Library/Caches/margin-embed-test/model`. Skipped (with a message) otherwise.
+    //! Against the real model, only when asked for: `MARGIN_REAL_MODEL_TESTS=1` and the
+    //! model in `MARGIN_EMBED_MODEL_DIR` (or `~/Library/Caches/margin-embed-test/model`).
+    //! A plain `cargo test` never loads it; these tests skip with a message.
 
     use std::path::PathBuf;
 
@@ -680,6 +705,9 @@ mod tests {
     use crate::cosine;
 
     fn model_dir() -> Option<PathBuf> {
+        if !crate::real_model_tests() {
+            return None;
+        }
         let dir = match std::env::var_os("MARGIN_EMBED_MODEL_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => PathBuf::from(std::env::var_os("HOME")?)
@@ -729,6 +757,54 @@ mod tests {
         // The prefix matters: the same text as a query is a different vector.
         let query = embed(model, &texts[..1], Purpose::Query);
         assert!(cosine(&first[0], &query[0]) < 0.999);
+    }
+
+    #[test]
+    fn real_model_pipelined_matches_one_by_one_and_titles_count() {
+        let Some(model) = model() else { return };
+        let inputs: Vec<(String, Purpose)> = (0..7)
+            .map(|i| {
+                (
+                    format!("Passage {i} about the Calvin cycle and RuBisCO."),
+                    if i % 2 == 0 {
+                        Purpose::document(Some("Photosynthesis > The Calvin cycle"))
+                    } else {
+                        Purpose::DOCUMENT
+                    },
+                )
+            })
+            .collect();
+        let mut got = vec![Vec::new(); inputs.len()];
+        model
+            .embed_pipelined(&inputs, 3, &mut |first, vectors| {
+                for (i, v) in vectors.into_iter().enumerate() {
+                    got[first + i] = v;
+                }
+                Ok(())
+            })
+            .unwrap();
+        for ((text, purpose), v) in inputs.iter().zip(&got) {
+            let one = &model
+                .embed(std::slice::from_ref(text), purpose.clone())
+                .unwrap()[0];
+            assert_eq!(one, v);
+        }
+        // The title is part of what the model reads.
+        let untitled = &model
+            .embed(std::slice::from_ref(&inputs[0].0), Purpose::DOCUMENT)
+            .unwrap()[0];
+        assert!(cosine(&got[0], untitled) < 0.9999);
+        // The model's own prompts are the ones recordings are keyed by.
+        for purpose in [
+            Purpose::DOCUMENT,
+            Purpose::document(Some("A > B")),
+            Purpose::Query,
+        ] {
+            assert_eq!(
+                crate::render_prompt(&model.0.document_prompt, &model.0.query_prompt, &purpose),
+                crate::prompt(&purpose)
+            );
+        }
     }
 
     #[test]

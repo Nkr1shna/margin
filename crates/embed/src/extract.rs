@@ -1,20 +1,24 @@
 //! Reading source files. Text and code are decoded as UTF-8 (lossy) with newlines
-//! normalized; Jupyter notebooks become their cells' sources and HTML loses its markup.
-//! Notebooks and HTML are recognized by extension or, for files stored without one, by
-//! their first bytes. PDFs are read in `pdf.rs`, images with ImageIO (`image.rs`), audio
-//! and video with AVFoundation (`av.rs`).
+//! normalized; Jupyter notebooks become their cells' sources and HTML loses its markup
+//! (headings and table rows kept in Markdown's spelling). Notebooks and HTML are
+//! recognized by extension or, for files stored without one, by their first bytes; the
+//! other text formats (`TextFormat`) by extension or contents. PDFs are read in `pdf.rs`,
+//! images with ImageIO and Vision OCR (`image.rs`), audio and video with AVFoundation
+//! (`av.rs`).
 
 use std::path::Path;
 
-use crate::{EmbedError, Extracted, Page, SourceKind};
+use crate::{EmbedError, Extracted, Page, SourceKind, TextFormat};
 
+/// With `render_pages` false, PDF pages aren't drawn (`pdf_page_picture` does it later).
 pub(crate) fn extract(
     path: &Path,
     kind: SourceKind,
     media_dir: &Path,
+    render_pages: bool,
 ) -> Result<Extracted, EmbedError> {
     match kind {
-        SourceKind::Pdf => pdf(path, media_dir),
+        SourceKind::Pdf => pdf(path, render_pages.then_some(media_dir)),
         SourceKind::Image => image(path),
         SourceKind::Audio => audio(path),
         SourceKind::Video => video(path, media_dir),
@@ -25,17 +29,28 @@ pub(crate) fn extract(
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            let text = if ext == "ipynb" || (ext.is_empty() && looks_like_notebook(&text)) {
-                notebook(&text).unwrap_or(text)
-            } else if matches!(ext.as_str(), "html" | "htm")
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (text, format) = if ext == "ipynb" || (ext.is_empty() && looks_like_notebook(&text))
+            {
+                (notebook(&text).unwrap_or(text), TextFormat::Plain)
+            } else if matches!(ext.as_str(), "html" | "htm" | "xhtml")
                 || (ext.is_empty() && looks_like_html(&text))
             {
-                strip_html(&text)
+                (strip_html(&text), TextFormat::Html)
             } else {
-                text
+                let format = TextFormat::detect(&name, &text);
+                (text, format)
             };
             Ok(Extracted {
                 pages: vec![Page { number: None, text }],
+                format: if kind == SourceKind::Text {
+                    format
+                } else {
+                    TextFormat::Plain
+                },
                 ..Default::default()
             })
         }
@@ -43,19 +58,33 @@ pub(crate) fn extract(
 }
 
 #[cfg(target_os = "macos")]
-fn pdf(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
-    crate::pdf::extract(path, Some(media_dir))
+fn pdf(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
+    crate::pdf::extract(path, media_dir)
 }
 
-/// The image itself is the picture; decoding it now finds a broken file early.
+/// Images with fewer non-space characters of recognized text than this have no text
+/// (a photo's stray "I" isn't worth a chunk).
+#[cfg(target_os = "macos")]
+const IMAGE_MIN_TEXT_CHARS: usize = 4;
+
+/// The image itself is the picture; decoding it now finds a broken file early. Its text
+/// (a diagram's labels, a photographed page), read with Vision OCR, is its one page, so
+/// the picture is found by its words too (`docs/agent-rag-architecture.md` §2.1).
 #[cfg(target_os = "macos")]
 fn image(path: &Path) -> Result<Extracted, EmbedError> {
-    let image = crate::image::load(path, Some(64))?;
+    let image = crate::image::load(path, Some(crate::image::OCR_MAX_SIDE))?;
     let (width, height) = crate::image::size(&image);
     if width == 0 || height == 0 {
         return Err(EmbedError::Extract("the image is empty".into()));
     }
+    let text = crate::image::recognize_text(&image)?;
+    let pages = if text.chars().filter(|c| !c.is_whitespace()).count() >= IMAGE_MIN_TEXT_CHARS {
+        vec![Page { number: None, text }]
+    } else {
+        Vec::new()
+    };
     Ok(Extracted {
+        pages,
         pictures: vec![crate::Picture {
             path: path.to_path_buf(),
             page: None,
@@ -119,7 +148,7 @@ fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pdf(_path: &Path, _media_dir: &Path) -> Result<Extracted, EmbedError> {
+fn pdf(_path: &Path, _media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
     Err(EmbedError::Extract("reading PDFs needs macOS".into()))
 }
 
@@ -193,7 +222,9 @@ fn notebook(text: &str) -> Option<String> {
 }
 
 /// Crude HTML to text: drops comments, `<script>`/`<style>` and every tag, turns block
-/// tags into line breaks and decodes common entities.
+/// tags into line breaks and decodes common entities. Structure the chunker reads is kept
+/// in Markdown's spelling: `<hN>` becomes a line starting with N `#`s, and each table
+/// row one `| cell | cell |` line, the rows of a table on consecutive lines.
 fn strip_html(html: &str) -> String {
     const BLOCKS: &[&str] = &[
         "p",
@@ -222,6 +253,8 @@ fn strip_html(html: &str) -> String {
     ];
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
+    // Inside a heading or a table cell, line breaks in the text are spaces.
+    let mut inline = false;
     let mut i = 0;
     while i < html.len() {
         let rest = &html[i..];
@@ -231,6 +264,7 @@ fn strip_html(html: &str) -> String {
         }
         if rest.starts_with('<') {
             let end = rest.find('>').map_or(rest.len(), |e| e + 1);
+            let closing = lower[i + 1..].starts_with('/');
             let tag = lower[i + 1..i + end]
                 .trim_start_matches('/')
                 .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
@@ -238,27 +272,66 @@ fn strip_html(html: &str) -> String {
                 .unwrap_or("")
                 .to_string();
             i += end;
-            if (tag == "script" || tag == "style") && !lower[i - end..i].starts_with("</") {
+            if (tag == "script" || tag == "style") && !closing {
                 let close = format!("</{tag}");
                 i += lower[i..].find(&close).unwrap_or(html.len() - i);
                 continue;
             }
-            if BLOCKS.contains(&tag.as_str()) {
-                out.push('\n');
+            let heading = match tag.as_bytes() {
+                [b'h', d @ b'1'..=b'6'] => Some((d - b'0') as usize),
+                _ => None,
+            };
+            match (tag.as_str(), heading, closing) {
+                (_, Some(level), false) => {
+                    out.push('\n');
+                    out.push_str(&"#".repeat(level));
+                    out.push(' ');
+                    inline = true;
+                }
+                ("tr", _, false) => out.push_str("\n|"),
+                ("tr", _, true) => {}
+                ("td" | "th", _, false) => {
+                    out.push(' ');
+                    inline = true;
+                }
+                ("td" | "th", _, true) => {
+                    out.push_str(" |");
+                    inline = false;
+                }
+                _ => {
+                    if heading.is_some() {
+                        inline = false;
+                    }
+                    if BLOCKS.contains(&tag.as_str()) {
+                        out.push('\n');
+                    }
+                }
             }
             continue;
         }
         let next = rest.find('<').unwrap_or(rest.len());
-        out.push_str(&rest[..next]);
+        if inline {
+            out.push_str(&rest[..next].replace('\n', " "));
+        } else {
+            out.push_str(&rest[..next]);
+        }
         i += next;
     }
     let text = decode_entities(&out);
-    // Collapse runs of spaces and of blank lines left by the markup.
+    // Collapse runs of spaces and of blank lines left by the markup; the rows of one
+    // table stay on consecutive lines.
     let mut lines: Vec<String> = Vec::new();
     for line in text.lines() {
         let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.is_empty() && lines.last().is_none_or(|l| l.is_empty()) {
             continue;
+        }
+        if line.starts_with('|')
+            && lines.len() >= 2
+            && lines[lines.len() - 1].is_empty()
+            && lines[lines.len() - 2].starts_with('|')
+        {
+            lines.pop();
         }
         lines.push(line);
     }
@@ -319,7 +392,7 @@ mod tests {
     }
 
     fn text_of(path: &Path, kind: SourceKind) -> String {
-        let doc = extract(path, kind, Path::new("/nonexistent")).unwrap();
+        let doc = extract(path, kind, Path::new("/nonexistent"), true).unwrap();
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].number, None);
         doc.pages[0].text.clone()
@@ -367,7 +440,7 @@ mod tests {
             <script>var x = \"<p>\";</script></head><body><!-- hidden -->\
             <h1>Heading</h1><p>Fish &amp; chips &lt;3 &#233;t&#xE9;&#x21; &bogus; a&b</p>\
             <ul><li>one</li><li>two</li></ul></body></html>";
-        let expected = "T\nHeading\n\nFish & chips <3 été! &bogus; a&b\n\none\n\ntwo";
+        let expected = "T\n# Heading\n\nFish & chips <3 été! &bogus; a&b\n\none\n\ntwo";
         assert_eq!(
             text_of(&write("page.html", html.as_bytes()), SourceKind::Text),
             expected
@@ -375,6 +448,58 @@ mod tests {
         assert_eq!(
             text_of(&write("page-no-ext", html.as_bytes()), SourceKind::Text),
             expected
+        );
+        let doc = extract(
+            &write("page.html", html.as_bytes()),
+            SourceKind::Text,
+            Path::new("/nonexistent"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(doc.format, TextFormat::Html);
+    }
+
+    #[test]
+    fn html_headings_and_tables_keep_their_shape() {
+        let html = "<html><body><h2 class='x'>\n  Merge\n  sort\n</h2>\n<p>Text.</p>\n\
+            <table>\n<thead>\n<tr><th>Algorithm</th><th>Worst</th></tr>\n</thead>\n<tbody>\n\
+            <tr><td>Merge\nsort</td><td>O(n log n)</td></tr>\n\
+            <tr><td>Quicksort</td><td>O(n<sup>2</sup>)</td></tr>\n</tbody>\n</table>\
+            <p>After.</p></body></html>";
+        assert_eq!(
+            text_of(&write("table.html", html.as_bytes()), SourceKind::Text),
+            "## Merge sort\n\nText.\n\n| Algorithm | Worst |\n| Merge sort | O(n log n) |\n\
+             | Quicksort | O(n2) |\n\nAfter."
+        );
+    }
+
+    #[test]
+    fn text_formats_are_recorded() {
+        let format = |name: &str, text: &str, kind| {
+            extract(
+                &write(name, text.as_bytes()),
+                kind,
+                Path::new("/nonexistent"),
+                true,
+            )
+            .unwrap()
+            .format
+        };
+        assert_eq!(format("a.md", "x", SourceKind::Text), TextFormat::Markdown);
+        assert_eq!(format("a.rst", "x", SourceKind::Text), TextFormat::Rst);
+        assert_eq!(format("a.tex", "x", SourceKind::Text), TextFormat::Latex);
+        assert_eq!(
+            format("README", "# A\n\nb", SourceKind::Text),
+            TextFormat::Markdown
+        );
+        assert_eq!(
+            format("a.txt", "plain words", SourceKind::Text),
+            TextFormat::Plain
+        );
+        // Code is code, whatever its comments look like.
+        assert_eq!(
+            format("a.py", "# A comment\nx = 1", SourceKind::Code),
+            TextFormat::Plain
         );
     }
 
@@ -384,6 +509,7 @@ mod tests {
             Path::new("/nonexistent/margin.txt"),
             SourceKind::Text,
             Path::new("/nonexistent"),
+            true,
         )
         .unwrap_err();
         assert!(matches!(err, EmbedError::Extract(_)));
