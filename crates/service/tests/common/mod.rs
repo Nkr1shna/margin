@@ -437,6 +437,10 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
     let hf = Arc::new(FakeHf::default());
     let app = Router::new()
         .route(&format!("/api/models/{}", margin_embed::REPO), get(size))
+        .route(
+            &format!("/api/models/{}", margin_embed::ONNX_REPO),
+            get(size),
+        )
         .route(&model_path(), get(file))
         .with_state(hf.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -510,11 +514,12 @@ impl SourceTools for FakeSourceTools {
 
     fn remote_size<'a>(
         &'a self,
+        files: &'a ModelFiles,
         http: &'a reqwest::Client,
         hf_base: &'a str,
     ) -> BoxFuture<'a, Result<u64, EmbedError>> {
         Box::pin(async move {
-            let url = format!("{hf_base}/api/models/{}", margin_embed::REPO);
+            let url = format!("{hf_base}/api/models/{}", files.backend.repo());
             let v: serde_json::Value = http
                 .get(url)
                 .send()

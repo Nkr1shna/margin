@@ -366,7 +366,7 @@ async fn github_login_for_code(state: &AppState, code: &str) -> Result<String, S
         Err(e) => {
             tracing::error!("couldn't read the GitHub client secret: {e:#}");
             return Err(
-                "The service couldn't read its GitHub client secret from the Keychain.".into(),
+                "The service couldn't read its GitHub client secret from its secret store.".into(),
             );
         }
     };

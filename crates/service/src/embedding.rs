@@ -1,4 +1,5 @@
-//! The local embedding model (EmbeddingGemma 2, Core ML): `GET/POST/DELETE
+//! The local embedding model (EmbeddingGemma 2 on the configured backend: Core ML or
+//! ONNX Runtime, `service.toml`'s `embedder`): `GET/POST/DELETE
 //! /api/embedding`. Never bundled: downloaded from Hugging Face when the owner asks,
 //! loaded on first use, and dropped when deleted.
 
@@ -48,7 +49,7 @@ async fn download_bytes(state: &AppState) -> u64 {
     }
     match state
         .source_tools
-        .remote_size(&state.http, &state.hf_base)
+        .remote_size(&state.model_files, &state.http, &state.hf_base)
         .await
     {
         Ok(bytes) => {
@@ -88,7 +89,7 @@ pub async fn model(state: &AppState) -> EmbeddingModel {
         },
     };
     EmbeddingModel {
-        repo: margin_embed::REPO.into(),
+        repo: state.model_files.backend.repo().into(),
         state: model_state,
     }
 }
@@ -147,7 +148,7 @@ async fn run_download(state: AppState) {
         emit_model(
             &state,
             &EmbeddingModel {
-                repo: margin_embed::REPO.into(),
+                repo: state.model_files.backend.repo().into(),
                 state: EmbeddingModelState::Downloading { received, total },
             },
         );

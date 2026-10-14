@@ -1,5 +1,6 @@
 //! `margin-service setup` | `margin-service serve [--allow-unsandboxed-render]` |
-//! `margin-service scrub-restored` | `margin-service version`
+//! `margin-service download-model [--embedder NAME]` | `margin-service scrub-restored` |
+//! `margin-service version`
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use margin_service::config::{self, Config};
 use margin_service::db::Store;
+use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
 use margin_service::{restore, version};
@@ -15,18 +17,36 @@ const USAGE: &str = "\
 Usage:
   margin-service setup                               Write the config and store the GitHub client secret
   margin-service serve [--allow-unsandboxed-render]  Run the service
+  margin-service download-model [--embedder NAME]    Download the embedding model (the configured
+                                                     embedder, or NAME: coreml, onnx-q8,
+                                                     onnx-fp32, onnx-fp16) without the app
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
   margin-service version                             Print the build's version and commit
+";
 
-Config: $MARGIN_CONFIG, or ~/Library/Application Support/Margin/service.toml";
+/// Where the config is read from on this OS, for the help text.
+fn config_help() -> String {
+    format!(
+        "Config: $MARGIN_CONFIG, or {}",
+        config::default_config_path().display()
+    )
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = format!("{USAGE}\n{}", config_help());
     let result = match args.first().map(String::as_str) {
         Some("setup") if args.len() == 1 => config::run_setup(&config::config_path()),
         Some("scrub-restored") if args.len() == 1 => scrub_restored(),
+        Some("download-model") => match model_download::parse_args(&args[1..]) {
+            Ok(embedder) => download_model(embedder),
+            Err(e) => {
+                eprintln!("{e}\n\n{usage}");
+                return ExitCode::from(2);
+            }
+        },
         Some("version" | "--version") if args.len() == 1 => {
             println!(
                 "margin-service {} ({})",
@@ -41,7 +61,7 @@ fn main() -> ExitCode {
                 match a.as_str() {
                     "--allow-unsandboxed-render" => allow_unsandboxed = true,
                     other => {
-                        eprintln!("unknown option {other}\n\n{USAGE}");
+                        eprintln!("unknown option {other}\n\n{usage}");
                         return ExitCode::from(2);
                     }
                 }
@@ -49,11 +69,11 @@ fn main() -> ExitCode {
             serve(allow_unsandboxed)
         }
         Some("-h" | "--help" | "help") => {
-            println!("{USAGE}");
+            println!("{usage}");
             return ExitCode::SUCCESS;
         }
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{usage}");
             return ExitCode::from(2);
         }
     };
@@ -89,22 +109,24 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         }
         if allow_unsandboxed_render {
             tracing::warn!(
-                "--allow-unsandboxed-render: scene code will run WITHOUT the macOS sandbox"
+                "--allow-unsandboxed-render: scene code will run WITHOUT the render sandbox"
             );
         }
+        let secrets = config.secret_store()?;
         let store = Store::open(&config.db_dir()).await?;
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
             .with_context(|| format!("couldn't listen on {}", config.bind))?;
         tracing::info!(
-            "Margin service {} ({}) listening on {} (public URL {}, environment {})",
+            "Margin service {} ({}) listening on {} (public URL {}, environment {}, embedder {}, secrets in {})",
             env!("CARGO_PKG_VERSION"),
             version::BUILD_SHA,
             config.bind,
             config.public_url,
-            config.environment
+            config.environment,
+            config.embedder,
+            secrets.location()
         );
-        let secrets = config.secret_store();
         let service = Service::start(Options {
             config,
             store,
@@ -117,6 +139,20 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         })
         .await?;
         service.serve(listener, shutdown_signal()).await
+    })
+}
+
+/// Downloads the embedding model into the data folder, printing progress: what the
+/// Settings button does, for a headless box (the provisioning script runs it).
+fn download_model(embedder: Option<margin_embed::Backend>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let config = Config::load(&config::config_path())?;
+        let files = model_download::files_for(&config, embedder)?;
+        let report = |line: &str| eprintln!("{line}");
+        model_download::run(&EmbedTools, &files, margin_embed::HF_BASE, &report).await
     })
 }
 
