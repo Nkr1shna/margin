@@ -36,15 +36,24 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --locked -p margin-service
+      # The signing identity comes from the repository secrets into a keychain that lives
+      # only for this job (deploy/scripts/signing-keychain.sh); the runner keeps none.
       - name: Sign
+        env:
+          P12_BASE64: ${{ secrets.MARGIN_SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MARGIN_SIGNING_P12_PASSWORD }}
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/margin-signing-${{ github.run_id }}-${{ github.run_attempt }}.keychain-db
         run: |
-          if ! security find-identity -v -p codesigning | grep -q "\"$SIGNING_IDENTITY\""; then
-            echo "::error::No code-signing identity \"$SIGNING_IDENTITY\" in the runner's Keychain (runbook step 8)."
-            exit 1
-          fi
-          codesign --force --sign "$SIGNING_IDENTITY" --identifier com.krishnanelloore.margin.service \
-            target/release/margin-service
+          identity="$(deploy/scripts/signing-keychain.sh create "$SIGNING_KEYCHAIN")"
+          echo "Signing as \"$SIGNING_IDENTITY\" ($identity)."
+          codesign --force --keychain "$SIGNING_KEYCHAIN" --sign "$identity" \
+            --identifier com.krishnanelloore.margin.service target/release/margin-service
           codesign --verify --verbose target/release/margin-service
+      - name: Remove the signing keychain
+        if: always()
+        env:
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/margin-signing-${{ github.run_id }}-${{ github.run_attempt }}.keychain-db
+        run: deploy/scripts/signing-keychain.sh delete "$SIGNING_KEYCHAIN"
       - name: Check the stamp
         run: |
           out="$(target/release/margin-service version)"
