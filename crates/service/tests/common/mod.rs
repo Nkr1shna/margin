@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -203,6 +203,15 @@ pub fn mp4_content() -> Vec<u8> {
     (0..MP4_BYTES).map(|i| (i % 251) as u8).collect()
 }
 
+pub const POSTER_BYTES: usize = 1024;
+
+/// The fake poster: a PNG signature followed by a recognisable byte pattern.
+pub fn poster_content() -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend((bytes.len()..POSTER_BYTES).map(|i| (i % 241) as u8));
+    bytes
+}
+
 #[derive(Default)]
 pub struct FakeRenderer {
     pub missing: Mutex<HashSet<String>>,
@@ -210,6 +219,8 @@ pub struct FakeRenderer {
     pub scene_failures: AtomicU32,
     pub renders: AtomicU32,
     pub configs: Mutex<Vec<RenderConfig>>,
+    /// When set, renders return no poster (like a scene without a poster shot).
+    pub no_poster: AtomicBool,
 }
 
 impl Renderer for FakeRenderer {
@@ -275,8 +286,15 @@ impl Renderer for FakeRenderer {
             tokio::fs::write(&captions, "1\n00:00:00,000 --> 00:00:01,000\nHello\n")
                 .await
                 .unwrap();
+            let poster = if self.no_poster.load(Ordering::SeqCst) {
+                None
+            } else {
+                let poster = out_dir.join("LessonScene_poster.png");
+                tokio::fs::write(&poster, poster_content()).await.unwrap();
+                Some(poster)
+            };
             Ok(RenderOutput {
-                poster: None,
+                poster,
                 mp4,
                 storyboard,
                 captions: Some(captions),

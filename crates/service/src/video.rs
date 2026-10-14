@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::library::{self, video_for_lesson};
-use crate::state::{AppState, CAPTIONS_FILE, MP4_FILE, STORYBOARD_FILE, StoredVideo, new_id};
+use crate::state::{
+    AppState, CAPTIONS_FILE, MP4_FILE, POSTER_FILE, STORYBOARD_FILE, StoredVideo, new_id,
+};
 
 pub const LOG_LINES: usize = 200;
 /// Progress-only updates are saved and sent at most this often.
@@ -81,6 +83,7 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
                 v.video.duration_seconds = None;
                 v.video.updated_at = now;
                 v.has_captions = false;
+                v.has_poster = false;
                 state.store.put(db::VIDEO, &v.video.id, &v).await?;
                 (v, true)
             }
@@ -98,6 +101,7 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
                         updated_at: now,
                     },
                     has_captions: false,
+                    has_poster: false,
                 };
                 state.store.put(db::VIDEO, &v.video.id, &v).await?;
                 (v, true)
@@ -251,6 +255,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         v.video.log = log_text;
         v.video.duration_seconds = None;
         v.has_captions = false;
+        v.has_poster = false;
     })
     .await?
     {
@@ -360,6 +365,13 @@ async fn finish(
         }
         None => false,
     };
+    let has_poster = match &out.poster {
+        Some(p) => {
+            place(p, &dir.join(POSTER_FILE)).await?;
+            true
+        }
+        None => false,
+    };
     log.push("Done.".into());
     let log_text = log.text();
     let exists = update(state, id, move |v| {
@@ -367,6 +379,7 @@ async fn finish(
         v.video.duration_seconds = out.duration_seconds;
         v.video.log = log_text;
         v.has_captions = has_captions;
+        v.has_poster = has_poster;
     })
     .await?;
     if !exists {
