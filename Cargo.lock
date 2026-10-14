@@ -5137,6 +5137,7 @@ name = "margin-video"
 version = "0.1.0"
 dependencies = [
  "margin-shared",
+ "miniz_oxide 0.9.1",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

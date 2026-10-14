@@ -35,4 +35,9 @@ class LessonScene(m.Scene):
             "[Clear the board], and keep that one equation in mind.",
             m.FadeOut(*self.mobjects),
         )
-        self.wait(1)
+
+        # The poster shot (the thumbnail): title and key formula together, then held.
+        poster_title = m.Text("The Pythagorean theorem", font_size=56).to_edge(m.UP)
+        poster_formula = m.MathTex("a^2 + b^2 = c^2", font_size=96).move_to([0, -0.4, 0])
+        self.play(m.FadeIn(poster_title), m.Write(poster_formula))
+        self.wait(2)

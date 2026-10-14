@@ -2,7 +2,10 @@
 
 These scenes follow exactly the rules `write_scene` gives the model (one `LessonScene`,
 `import manimgx as m` plus optionally `math`, narration only through `self.say` with one
-`[bracketed]` span per animation, no `voice`, inside x in [-7, 7] and y in [-4, 4]).
+`[bracketed]` span per animation, no `voice`, inside x in [-7, 7] and y in [-4, 4],
+ending on the poster shot: title and key formula or diagram played in after the last
+line, then `self.wait(2)` as the last statement, which the renderer saves as the
+video's thumbnail).
 They prove that those rules produce scenes ManimGX 0.1.1 renders.
 
 - `prompt_example_scene.py` is included verbatim in the prompt (`prompts::EXAMPLE_SCENE`).

@@ -108,4 +108,11 @@ class LessonScene(m.Scene):
             m.FadeIn(stack, shift=m.LEFT),
         )
         self.play(m.FadeOut(*self.mobjects), run_time=0.8)
-        self.wait(1)
+
+        # The poster shot: the title and one formula, held to the end.
+        poster_title = m.Text("A tour of the reference", font_size=56).to_edge(m.UP)
+        poster_formula = m.MathTex(r"c = \sqrt{a^2 + b^2}", font_size=96).move_to(
+            [0, -0.4, 0]
+        )
+        self.play(m.FadeIn(poster_title), m.Write(poster_formula))
+        self.wait(2)

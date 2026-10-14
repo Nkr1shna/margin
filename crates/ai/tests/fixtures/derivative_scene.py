@@ -70,4 +70,11 @@ class LessonScene(m.Scene):
         )
         self.say("Keep that picture in mind: a derivative is a slope.")
         self.say("[Let's clear the board.]", m.FadeOut(*self.mobjects))
-        self.wait(1)
+
+        # The poster shot: the title and the definition, held to the end.
+        poster_title = m.Text("What a derivative measures", font_size=56).to_edge(m.UP)
+        poster_limit = m.MathTex(
+            r"f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}", font_size=72
+        ).move_to([0, -0.5, 0])
+        self.play(m.FadeIn(poster_title), m.Write(poster_limit))
+        self.wait(2)

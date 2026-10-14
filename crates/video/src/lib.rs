@@ -8,7 +8,10 @@
 //! 3. Voice each line with `fluidaudiocli` (NOT sandboxed: it downloads models and
 //!    caches them in the user's library). Report `Voicing { done, total }`.
 //! 4. Pass 2 (sandboxed): `manimgx render` with a voice that returns the WAV made in
-//!    step 3 for each line. ManimGX mixes audio, writes the MP4, storyboard and captions.
+//!    step 3 for each line. ManimGX mixes audio, writes the MP4, storyboard and captions;
+//!    the voice module also captures the poster during this render (no second render):
+//!    it draws each held frame as it is sent and, if the video ends on a hold of at
+//!    least half a second (the scene's closing poster shot), saves it as `poster.png`.
 //!
 //! Sandboxing (macOS `sandbox-exec`): no network, writes only inside `work_dir` (plus
 //! the temp dirs Python needs), reads allowed. On other platforms rendering is refused
@@ -16,8 +19,9 @@
 //! through `--allow-unsandboxed-render`, for testing).
 //!
 //! Files in `work_dir` after a render:
-//! - `video.mp4`, `storyboard.png` (more sheets: `storyboard-2.png`, …) and, when the
-//!   scene speaks, `captions.srt`: the outputs.
+//! - `video.mp4`, `storyboard.png` (more sheets: `storyboard-2.png`, …), when the
+//!   scene speaks, `captions.srt`, and when it ends on a held, non-blank poster shot,
+//!   `poster.png` (that closing frame, RGBA at the render size): the outputs.
 //! - `scene.py`: the scene as given, plus two appended lines that install the voice
 //!   (`import margin_voice …; _margin_voice.attach(globals())`).
 //! - `margin_voice.py`: the voice module (see that file).
@@ -270,8 +274,10 @@ pub async fn render(
     };
     let duration_seconds =
         printed_duration(&pass2.stdout, VIDEO_FILE).or_else(|| mp4::duration_seconds(&video));
+    // Written by the voice module during pass 2; missing if it couldn't be captured.
+    let poster = Some(work_dir.join(POSTER_FILE)).filter(|p| p.is_file());
     Ok(RenderOutput {
-        poster: None,
+        poster,
         mp4: video,
         storyboard,
         captions,
@@ -481,6 +487,8 @@ fn printed_duration(stdout: &[String], file: &str) -> Option<f32> {
 /// Removes outputs of an earlier render, so a failed render never leaves stale ones.
 fn remove_old_outputs(work_dir: &Path) -> Result<(), RenderError> {
     remove_file(&work_dir.join(VIDEO_FILE))?;
+    remove_file(&work_dir.join(POSTER_FILE))?;
+    remove_file(&work_dir.join(format!("{POSTER_FILE}.partial")))?;
     remove_file(&work_dir.join(CAPTIONS_FILE))?;
     remove_file(&work_dir.join("video.srt"))?;
     remove_sheets(work_dir, "storyboard")?;

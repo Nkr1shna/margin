@@ -63,6 +63,20 @@ class LessonScene(m.Scene):
 
         self.say(
             "[Clear the board], and keep that one equation in mind.",
-            m.FadeOut(m.VGroup(title, tri, corner, la, lb, lc, example)),
+            m.FadeOut(m.VGroup(title, tri, corner, la, lb, lc, example, solved)),
         )
-        self.wait(1)
+
+        # The poster shot: the title, the triangle and its theorem, held to the end.
+        poster_title = m.Text("The Pythagorean theorem", font_size=56).to_edge(m.UP)
+        poster_tri = m.Polygon(
+            [-5.5, -2.8, 0],
+            [-2.0, -2.8, 0],
+            [-5.5, 0.7, 0],
+            color=m.BLUE,
+            fill_opacity=0.4,
+        )
+        poster_formula = m.MathTex("a^2 + b^2 = c^2", font_size=80).move_to(
+            [2.3, -1.0, 0]
+        )
+        self.play(m.FadeIn(poster_title), m.Create(poster_tri), m.Write(poster_formula))
+        self.wait(2)

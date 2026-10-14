@@ -338,6 +338,7 @@ Hard rules (the renderer rejects or breaks on anything else):
 5. No network, no files: do not open, read or write files, no `ImageMobject`, `SVGMobject` or `Code(code_file=...)`, no `open`, `exec`, `eval` or `__import__`, no changes to `m.config`.
 6. Everything visible stays inside the frame: x in [-7, 7], y in [-4, 4]. Text never overlaps other text or lies across lines and shapes: give each element its own place, and remove or move old elements before reusing their space.
 7. Total length between 60 and 150 seconds. Narration is about 2.5 spoken words per second, so write 150 to 350 words of narration in roughly 8 to 18 `say` lines of one or two sentences each.
+8. End with the poster shot, which becomes the video's thumbnail: after the last `say` line, clear the board, then bring the lesson title (at the top, `font_size=56`, `.to_edge(m.UP)`) and the lesson's single most important diagram or formula (large, below the title; a diagram may have its one key formula beside it) onto the screen together in one `self.play(...)`, and make `self.wait(2)` the last statement of `construct`. Nothing fades out or changes after it: no `FadeOut` at the end. Keep the poster shot uncluttered (the title and that one picture or formula, nothing else, font sizes of at least 48) and inside the frame, so it reads at thumbnail size.
 
 How to make it good:
 - Teach the lesson's central idea visually, not the whole lesson: one clear story with a beginning (the question), a middle (the picture or derivation that answers it) and an end (the takeaway, restated).
@@ -433,6 +434,16 @@ mod tests {
     fn outline_prompt_states_the_count() {
         assert!(outline_instructions(5, Level::Advanced).contains("exactly 5 lessons"));
         assert!(outline_instructions(1, Level::Intro).contains("exactly 1 lesson,"));
+    }
+
+    #[test]
+    fn scene_prompt_asks_for_a_held_poster_shot() {
+        let ins = scene_instructions();
+        assert!(ins.contains("8. End with the poster shot"));
+        assert!(ins.contains("`self.wait(2)` the last statement of `construct`"));
+        // The example the model copies ends that way too.
+        assert!(EXAMPLE_SCENE.trim_end().ends_with("self.wait(2)"));
+        assert!(ins.contains(EXAMPLE_SCENE));
     }
 
     #[test]

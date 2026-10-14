@@ -19,6 +19,100 @@ class LessonScene(m.Scene):
         self.wait(0.2)
 "#;
 
+/// Ends the way the prompt asks every lesson scene to: the title and the key picture
+/// brought on together after the last line, then held with `self.wait(2)`.
+const POSTER_SHOT: &str = r#"import manimgx as m
+
+
+class LessonScene(m.Scene):
+    def construct(self) -> None:
+        circle = m.Circle(radius=1.5, color=m.BLUE, fill_opacity=0.6)
+        self.say("Here is [a circle].", m.Create(circle))
+        self.say("[Clear the board].", m.FadeOut(circle))
+        title = m.Text("Circles", font_size=56).to_edge(m.UP)
+        formula = m.MathTex(r"A = \pi r^2", font_size=72).move_to([2.5, -0.5, 0])
+        disc = m.Circle(radius=1.5, color=m.BLUE, fill_opacity=0.6).move_to([-3, -0.5, 0])
+        self.play(m.FadeIn(title), m.FadeIn(disc), m.Write(formula))
+        self.wait(2)
+"#;
+
+/// A decoded 8-bit RGBA PNG: width, height and pixels (rows from the top).
+fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+    let mut at = 8;
+    let (mut width, mut height) = (0, 0);
+    let mut idat = Vec::new();
+    let mut ended = false;
+    while at + 12 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let data = &bytes[at + 8..at + 8 + len];
+        let crc = u32::from_be_bytes(bytes[at + 8 + len..at + 12 + len].try_into().unwrap());
+        assert_eq!(crc, crc32(&bytes[at + 4..at + 8 + len]), "bad CRC");
+        match kind {
+            b"IHDR" => {
+                width = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                assert_eq!(&data[8..], &[8, 6, 0, 0, 0], "8-bit RGBA, no interlace");
+            }
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => ended = true,
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    assert!(ended && width > 0 && height > 0);
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).expect("IDAT inflates");
+    let stride = width as usize * 4;
+    assert_eq!(raw.len(), height as usize * (stride + 1));
+    let mut pixels = Vec::with_capacity(height as usize * stride);
+    for row in raw.chunks(stride + 1) {
+        assert_eq!(row[0], 0, "rows are unfiltered");
+        pixels.extend_from_slice(&row[1..]);
+    }
+    (width, height, pixels)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |mut c, &b| {
+        c ^= u32::from(b);
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+        c
+    })
+}
+
+/// The poster is a PNG at the render size showing the poster shot, not a blank frame.
+fn assert_poster(out: &RenderOutput, config: &RenderConfig, events: &[RenderProgress]) {
+    let poster = out
+        .poster
+        .as_ref()
+        .unwrap_or_else(|| panic!("no poster: {events:?}"));
+    assert_eq!(poster.file_name().unwrap(), "poster.png");
+    let (width, height, pixels) = decode_png(&std::fs::read(poster).unwrap());
+    assert_eq!((width, height), (config.width, config.height));
+    let background = &pixels[..4];
+    let drawn = pixels.chunks(4).filter(|p| *p != background).count();
+    let total = (width * height) as usize;
+    assert!(drawn * 20 > total, "{drawn} of {total} pixels drawn");
+    // The title is in the top quarter and the disc (blue) below it.
+    let top = &pixels[..stride(width) * (height as usize / 4)];
+    assert!(top.chunks(4).any(|p| p != background), "no title");
+    assert!(
+        pixels.chunks(4).any(|p| p[2] > 150 && p[0] < 120),
+        "no blue disc"
+    );
+}
+
+fn stride(width: u32) -> usize {
+    width as usize * 4
+}
+
 async fn tool(name: &str) -> Option<PathBuf> {
     let tools = detect_tools().await;
     tools
@@ -194,6 +288,77 @@ class LessonScene(m.Scene):
 }
 
 #[tokio::test]
+async fn poster_unsandboxed() {
+    let config = config(SandboxMode::Unsandboxed, Voice::Silent).await;
+    let (result, events) = run("poster-unsandboxed", POSTER_SHOT, &config).await;
+    let out = result.unwrap();
+    assert!(out.mp4.is_file());
+    assert_poster(&out, &config, &events);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn poster_sandboxed() {
+    let config = config(SandboxMode::MacosSandboxExec, Voice::Silent).await;
+    let (result, events) = run("poster-sandboxed", POSTER_SHOT, &config).await;
+    let out = result.unwrap();
+    assert_poster(&out, &config, &events);
+
+    // A re-render that can't make a poster leaves no stale one behind.
+    let job = RenderJob {
+        work_dir: out.mp4.parent().unwrap().to_path_buf(),
+        scene_code: NARRATED.to_string(),
+    };
+    let again = render(&job, &config, |_| {}).await.unwrap();
+    assert!(again.poster.is_none());
+    assert!(!out.poster.unwrap().exists());
+}
+
+/// Poster capture never fails a render: whatever goes wrong, the video is made and the
+/// poster is `None`, with the reason in the log.
+#[tokio::test]
+async fn no_poster_still_renders() {
+    let config = config(SandboxMode::Unsandboxed, Voice::Silent).await;
+    let fades_out = POSTER_SHOT.replace(
+        "        self.wait(2)\n",
+        "        self.play(m.FadeOut(*self.mobjects))\n        self.wait(2)\n",
+    );
+    // Encoding the PNG raises (the scene breaks zlib, which the voice module uses).
+    let broken_png = format!(
+        "import zlib\n\n{}",
+        POSTER_SHOT.replace(
+            "        self.wait(2)\n",
+            "        zlib.compress = None\n        self.wait(2)\n"
+        )
+    );
+    let cases = [
+        (
+            "poster-no-hold",
+            NARRATED.to_string(),
+            "doesn't end on a held",
+        ),
+        ("poster-blank", fades_out, "single color"),
+        ("poster-error", broken_png, "TypeError"),
+    ];
+    for (name, code, why) in cases {
+        let (result, events) = run(name, &code, &config).await;
+        let out = result.unwrap_or_else(|e| panic!("{name}: {e}\n{events:?}"));
+        assert!(out.mp4.is_file(), "{name}");
+        assert!(out.poster.is_none(), "{name}");
+        assert!(!out.mp4.with_file_name("poster.png").exists(), "{name}");
+        assert!(
+            !out.mp4.with_file_name("poster.png.partial").exists(),
+            "{name}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, RenderProgress::Log(l)
+                if l.starts_with("margin: poster skipped:") && l.contains(why))),
+            "{name}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn broken_scene_reports_the_line_and_hint() {
     let code = r#"import manimgx as m
 
@@ -362,17 +527,16 @@ async fn pocket_tts_narration() {
     } else {
         SandboxMode::Unsandboxed
     };
-    let (result, events) = run(
-        "pocket",
-        NARRATED,
-        &config(sandbox, Voice::PocketTts { cli, voice: None }).await,
-    )
-    .await;
+    // The poster shot scene: real speech is longer or shorter than pass 1's estimate, and
+    // the poster is still the closing hold.
+    let config = config(sandbox, Voice::PocketTts { cli, voice: None }).await;
+    let (result, events) = run("pocket", POSTER_SHOT, &config).await;
     let out = match result {
         Ok(out) => out,
         Err(e) => panic!("{e}\n{events:?}"),
     };
     assert_rendered(&out, &events);
+    assert_poster(&out, &config, &events);
 
     // Each line was voiced, and the voice is not silence.
     let narration = out.mp4.with_file_name(".margin").join("narration");

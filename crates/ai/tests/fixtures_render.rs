@@ -63,6 +63,26 @@ fn fixtures_follow_the_prompt_rules_and_run_in_manimgx() {
         assert!(code.contains("class LessonScene(m.Scene):"), "{scene:?}");
         assert!(code.contains("self.say("), "{scene:?}");
         assert!(!code.contains("voice"), "no voice: {scene:?}");
+        // Rule 8: it ends on the poster shot, held, with nothing fading out after it.
+        assert_eq!(
+            code.lines().rev().find(|l| !l.trim().is_empty()),
+            Some("        self.wait(2)"),
+            "the last statement holds the poster shot: {scene:?}"
+        );
+        let last_play = code.rfind("self.play(").unwrap_or(0);
+        assert!(
+            last_play > code.rfind("self.say(").unwrap(),
+            "the poster shot is played after the last line: {scene:?}"
+        );
+        let poster_shot = &code[last_play..];
+        assert!(
+            !poster_shot.contains("FadeOut") && !poster_shot.contains("Uncreate"),
+            "nothing leaves after the poster shot: {scene:?}"
+        );
+        assert!(
+            poster_shot.contains("FadeIn(poster_title)"),
+            "the poster shot shows the title: {scene:?}"
+        );
         for line in code
             .lines()
             .filter(|l| l.starts_with("import ") || l.starts_with("from "))
