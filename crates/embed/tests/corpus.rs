@@ -4,7 +4,9 @@
 //! tables and code blocks stay whole, hashes are stable and change only where the text
 //! does, and a recording replays the corpus exactly. Fakes and recordings only: the
 //! token counter is `FakeEmbedder`'s, and no real model is loaded. The PDF and image
-//! tests use PDFKit and Vision (macOS), not the embedding model.
+//! tests use PDFKit and Vision on macOS, not the embedding model; their Linux twins
+//! (pdfium, tesseract, `image`, ffmpeg) run only with `MARGIN_REAL_TOOLS=1`, and the ONNX
+//! media encoders on the corpus only with `MARGIN_REAL_MODEL_TESTS=1` and a model.
 
 use std::path::{Path, PathBuf};
 
@@ -463,5 +465,266 @@ mod mac {
             assert_eq!(doc.pictures.len(), 1);
             assert!(doc.pages.is_empty(), "{scene}: {:?}", doc.pages);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    //! The Linux readers (pdfium, tesseract, `image`, ffmpeg) on the corpus, through the
+    //! public API, with the real programs: only with `MARGIN_REAL_TOOLS=1`, which the
+    //! Linux runner sets because it has the apt packages and the pdfium library.
+
+    use super::*;
+
+    fn real_tools() -> bool {
+        let on = std::env::var("MARGIN_REAL_TOOLS").is_ok_and(|v| v == "1");
+        if !on {
+            eprintln!("skipping: the real-tool reader tests need MARGIN_REAL_TOOLS=1");
+        }
+        on
+    }
+
+    fn source_pages(name: &str) -> Vec<String> {
+        std::fs::read_to_string(corpus().join("sources").join(name))
+            .unwrap()
+            .split("\n\\f\n")
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn pdfs_are_read_with_pdfium_and_pages_drawn_on_demand() {
+        if !real_tools() {
+            return;
+        }
+        assert!(
+            margin_embed::find_pdfium().is_some(),
+            "pdfium isn't installed"
+        );
+        let pdf = corpus().join("pdf/rc-circuits.pdf");
+        let media = temp_dir("pdfium-media");
+        let doc = margin_embed::extract_lazy(&pdf, SourceKind::Pdf, &media).unwrap();
+        let sources = source_pages("rc-circuits.txt");
+        assert_eq!(doc.pages.len(), sources.len());
+        assert!(doc.pictures.is_empty());
+        for (page, source) in doc.pages.iter().zip(&sources) {
+            let first = source.lines().next().unwrap();
+            assert!(
+                normalize(&page.text).contains(&normalize(first)),
+                "{first:?}"
+            );
+        }
+        let eager = margin_embed::extract(&pdf, SourceKind::Pdf, &media).unwrap();
+        assert_eq!(eager.pictures.len(), eager.pages.len());
+        assert_eq!(eager.pages, doc.pages);
+        let out = temp_dir("pdfium-page").join("page-2.png");
+        margin_embed::pdf_page_picture(&pdf, 2, &out).unwrap();
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            std::fs::read(&eager.pictures[1].path).unwrap()
+        );
+        assert!(margin_embed::pdf_page_picture(&pdf, 99, &out).is_err());
+    }
+
+    #[test]
+    fn a_scanned_pdf_is_read_with_tesseract() {
+        if !real_tools() {
+            return;
+        }
+        assert!(
+            margin_embed::find_tesseract().is_some(),
+            "tesseract isn't installed"
+        );
+        let doc = margin_embed::extract_lazy(
+            &corpus().join("pdf/glacier-scan.pdf"),
+            SourceKind::Pdf,
+            &temp_dir("scan"),
+        )
+        .unwrap();
+        let text = normalize(
+            &doc.pages
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>(),
+        )
+        .to_lowercase();
+        assert!(text.contains("accumulation zone"), "{text}");
+        assert!(text.contains("equilibrium line"), "{text}");
+    }
+
+    #[test]
+    fn diagram_labels_are_read_and_photos_have_none() {
+        if !real_tools() {
+            return;
+        }
+        let read = |name: &str| {
+            margin_embed::extract(
+                &corpus().join("images").join(name),
+                SourceKind::Image,
+                &temp_dir("img"),
+            )
+            .unwrap()
+        };
+        let calvin = read("calvin-cycle.png");
+        assert_eq!(calvin.pictures.len(), 1);
+        let text = calvin.pages[0].text.to_lowercase();
+        assert!(text.contains("calvin cycle"), "{text}");
+        assert!(
+            read("carnot-pv-diagram.png").pages[0]
+                .text
+                .to_lowercase()
+                .contains("adiabatic")
+        );
+        for scene in ["scene-red-bicycle.png", "scene-sailboat-sunset.png"] {
+            let doc = read(scene);
+            assert_eq!(doc.pictures.len(), 1);
+            assert!(doc.pages.is_empty(), "{scene}: {:?}", doc.pages);
+        }
+        let jpeg =
+            margin_embed::jpeg_for_model(&corpus().join("images/calvin-cycle.png"), 256).unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn ffmpeg_reads_the_speech_fixture() {
+        if !real_tools() {
+            return;
+        }
+        assert!(
+            margin_embed::find_ffmpeg().is_some(),
+            "ffmpeg isn't installed"
+        );
+        // The mel fixture's samples, written as a 16-bit WAV and read back by ffmpeg.
+        let samples = speech_samples();
+        let wav = temp_dir("wav").join("speech.wav");
+        let data = samples.len() as u32 * 2;
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(36 + data).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        // Chunk size, PCM + mono, rate, bytes per second, block align + bits.
+        for v in [16u32, 1 | (1 << 16), 16_000, 32_000, 2 | (16 << 16)] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data.to_le_bytes());
+        for s in &samples {
+            bytes.extend_from_slice(&((s * 32768.0).round() as i16).to_le_bytes());
+        }
+        std::fs::write(&wav, bytes).unwrap();
+        let doc = margin_embed::extract(&wav, SourceKind::Audio, &temp_dir("audio")).unwrap();
+        let sound = doc.sound.unwrap();
+        assert_eq!(sound.len(), samples.len());
+        let worst = sound
+            .iter()
+            .zip(&samples)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-3, "{worst}");
+        assert!(margin_embed::extract(&wav, SourceKind::Video, &temp_dir("v")).is_err());
+    }
+}
+
+/// The samples of the mel fixture (`tests/fixtures/mel/speech.mel.bin`): 2.5 s of
+/// synthesized speech, 16 kHz mono ("The Carnot cycle has two isothermal and two
+/// adiabatic steps.").
+#[cfg(any(target_os = "linux", feature = "onnx"))]
+fn speech_samples() -> Vec<f32> {
+    let bytes = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mel/speech.mel.bin"),
+    )
+    .unwrap();
+    assert_eq!(&bytes[..4], b"MELF");
+    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    bytes[20..20 + 2 * n]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", feature = "onnx"))]
+mod onnx_media {
+    //! The ONNX image and audio encoders on the corpus pictures and the speech fixture,
+    //! with the real model: only with `MARGIN_REAL_MODEL_TESTS=1` and a downloaded ONNX
+    //! q8 model in `MARGIN_EMBED_ONNX_DIR` (as `tests/onnx_text.rs`).
+
+    use super::*;
+    use margin_embed::{
+        Backend, ImageTokens, ModelFiles, OnnxDtype, OnnxEmbedder, OnnxOptions, cosine,
+    };
+
+    fn files() -> Option<ModelFiles> {
+        if std::env::var("MARGIN_REAL_MODEL_TESTS").is_ok_and(|v| v == "1")
+            && let Some(dir) = std::env::var_os("MARGIN_EMBED_ONNX_DIR")
+        {
+            let files = ModelFiles::with_backend(PathBuf::from(dir), Backend::Onnx(OnnxDtype::Q8));
+            if files.is_complete() {
+                return Some(files);
+            }
+        }
+        eprintln!(
+            "skipping: needs MARGIN_REAL_MODEL_TESTS=1 and a downloaded model in \
+             MARGIN_EMBED_ONNX_DIR"
+        );
+        None
+    }
+
+    #[test]
+    fn real_model_embeds_corpus_pictures_and_speech() {
+        let Some(files) = files() else {
+            return;
+        };
+        // The encoders' graphs, for the record.
+        for graph in ["vision_encoder", "audio_encoder"] {
+            let path = files.graph_path(graph).unwrap();
+            eprintln!(
+                "{graph}: {:?}",
+                margin_embed::onnx::describe_graph(&path).unwrap()
+            );
+        }
+        let model = OnnxEmbedder::load(&files, &OnnxOptions::default()).unwrap();
+        let images: Vec<PathBuf> = [
+            "scene-red-bicycle.png",
+            "scene-sailboat-sunset.png",
+            "calvin-cycle.png",
+        ]
+        .iter()
+        .map(|n| corpus().join("images").join(n))
+        .collect();
+        let pictures = model.embed_images(&images, ImageTokens::High).unwrap();
+        let frames = model
+            .embed_images(&images[..1], ImageTokens::Medium)
+            .unwrap();
+        let queries = model
+            .embed(
+                &[
+                    "a red bicycle".to_string(),
+                    "a sailboat at sunset".to_string(),
+                    "the Calvin cycle in photosynthesis".to_string(),
+                    "the Carnot cycle's isothermal and adiabatic steps".to_string(),
+                ],
+                Purpose::Query,
+            )
+            .unwrap();
+        for v in pictures.iter().chain(&frames) {
+            assert_eq!(v.len(), margin_embed::DIM);
+            assert!((v.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 1e-3);
+        }
+        // Each picture query finds its own picture first.
+        for (q, query) in queries[..3].iter().enumerate() {
+            let scores: Vec<f32> = pictures.iter().map(|p| cosine(query, p)).collect();
+            let best = (0..3)
+                .max_by(|a, b| scores[*a].total_cmp(&scores[*b]))
+                .unwrap();
+            assert_eq!(best, q, "query {q}: {scores:?}");
+        }
+        // Fewer tokens for the same picture stays close to it.
+        assert!(cosine(&frames[0], &pictures[0]) > 0.8);
+        // The spoken sentence is nearer its own topic than another.
+        let speech = model.embed_audio(&[speech_samples()]).unwrap();
+        let carnot = cosine(&speech[0], &queries[3]);
+        let bicycle = cosine(&speech[0], &queries[0]);
+        assert!(carnot > bicycle, "{carnot} vs {bicycle}");
     }
 }

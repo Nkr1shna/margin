@@ -5,17 +5,24 @@
 //! The text graph does what `coreml.rs` does by hand (token table lookup, scaling,
 //! pooling, projection) and returns `sentence_embedding` `[batch, 768]`, normalised; its
 //! media inputs (`image_features`, `video_features`, `audio_features`, `[n, 512]`) are
-//! empty for text. Text inputs are batched for real (`text.rs`). The vision and audio
-//! encoders (`onnx/vision_encoder*`, `onnx/audio_encoder*`) are the media area's: they
-//! load on first use and unload after `ENCODER_IDLE` (`IdleSlot`), and their feature rows
-//! go in at the placeholder tokens below.
+//! empty for text. Text inputs are batched for real (`text.rs`). Pictures and sound go
+//! through the vision and audio encoders first (`vision.rs`, `audio.rs`, `mel.rs`;
+//! `onnx/vision_encoder*`, `onnx/audio_encoder*`), which load on first use and unload
+//! after `ENCODER_IDLE` (`IdleSlot`, swept on every call); their feature rows go into the
+//! text graph's `image_features`/`audio_features` input at the placeholder tokens of
+//! `<bos> <|image> <image>… <image|> <eos>` (or the audio tokens), one item per run, the
+//! wrapping `coreml.rs` uses.
 //!
-//! The encoders' input names were not dumped yet (the spike loaded the text graph only).
-//! `describe_graph` prints any graph's inputs; the real-model test
-//! `real_encoder_graphs_are_described` (`tests/onnx_text.rs`) runs it on both encoders.
+//! The encoders' input and output names are read from the graphs when they load;
+//! `describe_graph` prints any graph's inputs, and the real-model tests in
+//! `tests/corpus.rs` (`real_model_embeds_corpus_pictures_and_speech`) runs both encoders
+//! end to end.
 
+pub(crate) mod audio;
+pub(crate) mod mel;
 pub(crate) mod session;
 pub(crate) mod text;
+pub(crate) mod vision;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,10 +31,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::download::ONNX_TEXT_GRAPH;
+use crate::download::{ONNX_AUDIO_GRAPH, ONNX_TEXT_GRAPH, ONNX_VISION_GRAPH};
 use crate::{Backend, DIM, EmbedError, Embedder, ImageTokens, ModelFiles, OnnxOptions, Purpose};
-use session::{OrtTextGraph, TextGraph};
+use audio::{AudioGraph, OrtAudioGraph};
+use session::{AUDIO_FEATURES, IMAGE_FEATURES, MediaRows, OrtTextGraph, TextGraph};
 use text::Tokens;
+use vision::{OrtVisionGraph, VisionGraph};
 
 pub use session::{GraphPort, describe as describe_graph};
 
@@ -80,7 +89,6 @@ pub(crate) struct IdleSlot<T> {
     value: Mutex<Option<(Arc<T>, Instant)>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // The media area wires the encoders to it.
 impl<T> IdleSlot<T> {
     pub fn new(idle: Duration) -> Self {
         Self {
@@ -118,16 +126,26 @@ impl<T> IdleSlot<T> {
         stale
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_loaded(&self) -> bool {
         self.value.lock().unwrap().is_some()
     }
 }
+
+/// Makes an encoder when it is first needed (again after it was unloaded).
+pub(crate) type Loader<T> = Box<dyn Fn() -> Result<T, EmbedError> + Send + Sync>;
+
+type Encoder<T> = IdleSlot<Mutex<Box<T>>>;
 
 pub(crate) struct Model {
     backend: Backend,
     tokens: Tokens,
     graph: Mutex<Box<dyn TextGraph>>,
     batch_tokens: usize,
+    vision: Encoder<dyn VisionGraph>,
+    audio: Encoder<dyn AudioGraph>,
+    load_vision: Loader<Box<dyn VisionGraph>>,
+    load_audio: Loader<Box<dyn AudioGraph>>,
 }
 
 fn load_tokens(dir: &Path) -> Result<Tokens, EmbedError> {
@@ -163,12 +181,24 @@ impl Model {
             .graph_path(ONNX_TEXT_GRAPH)
             .ok_or(EmbedError::NotDownloaded)?;
         let graph = OrtTextGraph::load(&path, opts.threads())?;
-        Ok(Self::from_parts(
-            files.backend,
-            tokens,
-            Box::new(graph),
-            opts,
-        ))
+        let threads = opts.threads();
+        let vision_path = files
+            .graph_path(ONNX_VISION_GRAPH)
+            .ok_or(EmbedError::NotDownloaded)?;
+        let audio_path = files
+            .graph_path(ONNX_AUDIO_GRAPH)
+            .ok_or(EmbedError::NotDownloaded)?;
+        Ok(
+            Self::from_parts(files.backend, tokens, Box::new(graph), opts).with_encoders(
+                Box::new(move || {
+                    Ok(Box::new(OrtVisionGraph::load(&vision_path, threads)?)
+                        as Box<dyn VisionGraph>)
+                }),
+                Box::new(move || {
+                    Ok(Box::new(OrtAudioGraph::load(&audio_path, threads)?) as Box<dyn AudioGraph>)
+                }),
+            ),
+        )
     }
 
     pub(crate) fn from_parts(
@@ -182,7 +212,58 @@ impl Model {
             tokens,
             graph: Mutex::new(graph),
             batch_tokens: opts.batch_tokens(),
+            vision: IdleSlot::new(ENCODER_IDLE),
+            audio: IdleSlot::new(ENCODER_IDLE),
+            load_vision: Box::new(|| Err(EmbedError::Load("no image encoder".into()))),
+            load_audio: Box::new(|| Err(EmbedError::Load("no audio encoder".into()))),
         }
+    }
+
+    /// The model with these encoder loaders (the real graphs, or stubs in tests).
+    pub(crate) fn with_encoders(
+        mut self,
+        vision: Loader<Box<dyn VisionGraph>>,
+        audio: Loader<Box<dyn AudioGraph>>,
+    ) -> Self {
+        self.load_vision = vision;
+        self.load_audio = audio;
+        self
+    }
+
+    /// Unloads encoders unused for `ENCODER_IDLE`.
+    fn sweep(&self, now: Instant) {
+        self.vision.sweep(now);
+        self.audio.sweep(now);
+    }
+
+    /// The embedding of one media item's encoder rows (`count` of them): `<bos> start`,
+    /// `count` placeholder tokens, `end <eos>`, the rows going in at the placeholders.
+    fn embed_media(
+        &self,
+        rows: &[f32],
+        count: usize,
+        (start, placeholder, end): (u32, u32, u32),
+        input: &str,
+    ) -> Result<Vec<f32>, EmbedError> {
+        let mut ids = Vec::with_capacity(count + 4);
+        ids.extend([self.tokens.bos as i64, start as i64]);
+        ids.extend(std::iter::repeat_n(placeholder as i64, count));
+        ids.extend([end as i64, self.tokens.eos as i64]);
+        let mut graph = self
+            .graph
+            .lock()
+            .map_err(|_| EmbedError::Embed("the model failed earlier".into()))?;
+        let mut v = graph.run_media(&ids, MediaRows { input, rows, count })?;
+        if v.len() != DIM || v.iter().any(|x| !x.is_finite()) {
+            return Err(EmbedError::Embed(
+                "the model returned a malformed vector".into(),
+            ));
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        Ok(v)
     }
 
     fn run(&self, ids: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -195,12 +276,6 @@ impl Model {
             .map_err(|_| EmbedError::Embed("the model failed earlier".into()))?;
         text::run_batched(graph.as_mut(), ids, self.batch_tokens, self.tokens.pad)
     }
-
-    fn not_yet(what: &str) -> EmbedError {
-        EmbedError::Embed(format!(
-            "embedding {what} with the ONNX model isn't available in this build yet"
-        ))
-    }
 }
 
 impl Embedder for Model {
@@ -209,6 +284,7 @@ impl Embedder for Model {
             .iter()
             .map(|t| self.tokens.ids(t, &purpose))
             .collect::<Result<_, _>>()?;
+        self.sweep(Instant::now());
         self.run(&ids)
     }
 
@@ -219,19 +295,61 @@ impl Embedder for Model {
     fn embed_images(
         &self,
         images: &[PathBuf],
-        _tokens: ImageTokens,
+        tokens: ImageTokens,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
-        Err(Self::not_yet("pictures"))
+        let now = Instant::now();
+        self.sweep(now);
+        let encoder = self
+            .vision
+            .get(now, || (self.load_vision)().map(Mutex::new))?;
+        images
+            .iter()
+            .map(|path| {
+                let (rows, count) = {
+                    let mut graph = encoder.lock().map_err(|_| {
+                        EmbedError::Embed("the image encoder failed earlier".into())
+                    })?;
+                    vision::image_rows(graph.as_mut(), path, tokens)?
+                };
+                self.embed_media(
+                    &rows,
+                    count,
+                    (BOI_TOKEN_ID, IMAGE_TOKEN_ID, EOI_TOKEN_ID),
+                    IMAGE_FEATURES,
+                )
+            })
+            .collect()
     }
 
     fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if windows.is_empty() {
             return Ok(Vec::new());
         }
-        Err(Self::not_yet("sound"))
+        let now = Instant::now();
+        self.sweep(now);
+        let encoder = self
+            .audio
+            .get(now, || (self.load_audio)().map(Mutex::new))?;
+        windows
+            .iter()
+            .map(|window| {
+                let (rows, count) = {
+                    let mut graph = encoder.lock().map_err(|_| {
+                        EmbedError::Embed("the audio encoder failed earlier".into())
+                    })?;
+                    audio::window_rows(graph.as_mut(), window)?
+                };
+                self.embed_media(
+                    &rows,
+                    count,
+                    (BOA_TOKEN_ID, AUDIO_TOKEN_ID, EOA_TOKEN_ID),
+                    AUDIO_FEATURES,
+                )
+            })
+            .collect()
     }
 
     fn embed_pipelined(
@@ -369,5 +487,128 @@ mod tests {
             Err(EmbedError::Load(_))
         ));
         assert_eq!(core_ml.graph_path("model"), None);
+    }
+
+    /// A text graph that takes media: records each media run's ids and rows, and returns
+    /// a vector made from them (the first column of each row, then the placeholder
+    /// count), so tests can tell what went in.
+    /// One media run: its ids, the input its rows went to, and how many rows.
+    type MediaRun = (Vec<i64>, String, usize);
+
+    #[derive(Clone, Default)]
+    struct MediaGraph {
+        runs: Arc<Mutex<Vec<MediaRun>>>,
+    }
+
+    impl TextGraph for MediaGraph {
+        fn run(
+            &mut self,
+            _: &[i64],
+            _: &[i64],
+            rows: usize,
+            _: usize,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(vec![vec![1.0; DIM]; rows])
+        }
+
+        fn run_media(&mut self, ids: &[i64], media: MediaRows<'_>) -> Result<Vec<f32>, EmbedError> {
+            assert_eq!(media.rows.len(), media.count * FEATURE_WIDTH);
+            self.runs
+                .lock()
+                .unwrap()
+                .push((ids.to_vec(), media.input.to_string(), media.count));
+            let mut v = vec![0f32; DIM];
+            for (i, row) in media.rows.as_chunks::<FEATURE_WIDTH>().0.iter().enumerate() {
+                v[i % (DIM - 1)] += row[0] + 1.0;
+            }
+            v[DIM - 1] = media.count as f32;
+            Ok(v)
+        }
+    }
+
+    #[test]
+    fn pictures_and_sound_go_through_their_encoders_into_the_placeholders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let graph = MediaGraph::default();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counted = loads.clone();
+        let m = Model::from_parts(
+            Backend::Onnx(OnnxDtype::Q8),
+            tokens(),
+            Box::new(graph.clone()),
+            &OnnxOptions::default(),
+        )
+        .with_encoders(
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(vision::tests::StubVision::default()) as Box<dyn VisionGraph>)
+            }),
+            Box::new(|| Ok(Box::new(audio::tests::StubAudio::default()) as Box<dyn AudioGraph>)),
+        );
+        let dir = std::env::temp_dir().join(format!("margin-onnx-media-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (wide, tall) = (dir.join("wide.png"), dir.join("tall.png"));
+        vision::tests::write_test_png(&wide, 300, 200);
+        vision::tests::write_test_png(&tall, 100, 400);
+
+        let v = m
+            .embed_images(&[wide.clone(), tall.clone()], ImageTokens::Low)
+            .unwrap();
+        assert_eq!(v.len(), 2);
+        for x in &v {
+            assert!((x.iter().map(|a| a * a).sum::<f32>().sqrt() - 1.0).abs() < 1e-5);
+        }
+        assert_ne!(v[0], v[1]);
+        {
+            let runs = graph.runs.lock().unwrap();
+            let (ids, input, count) = &runs[0];
+            assert_eq!((input.as_str(), *count), (IMAGE_FEATURES, 60));
+            assert_eq!(&ids[..2], &[2, BOI_TOKEN_ID as i64]);
+            assert!(ids[2..2 + 60].iter().all(|i| *i == IMAGE_TOKEN_ID as i64));
+            assert_eq!(&ids[62..], &[EOI_TOKEN_ID as i64, 1]);
+        }
+        // The encoder stays loaded between calls, and is dropped once idle.
+        m.embed_images(std::slice::from_ref(&wide), ImageTokens::Medium)
+            .unwrap();
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert!(m.vision.is_loaded());
+        m.sweep(Instant::now() + ENCODER_IDLE + Duration::from_secs(1));
+        assert!(!m.vision.is_loaded());
+        m.embed_images(std::slice::from_ref(&wide), ImageTokens::High)
+            .unwrap();
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        // A broken picture is an error, not a vector.
+        let bad = dir.join("bad.png");
+        std::fs::write(&bad, "nope").unwrap();
+        assert!(m.embed_images(&[bad], ImageTokens::High).is_err());
+
+        // Sound: one run per window, 25 tokens a second.
+        let fixture = mel::tests::fixture();
+        let one_second = fixture.samples[..16_000].to_vec();
+        let v = m
+            .embed_audio(&[fixture.samples.clone(), one_second])
+            .unwrap();
+        assert_eq!(v.len(), 2);
+        let runs = graph.runs.lock().unwrap();
+        let audio: Vec<_> = runs.iter().filter(|r| r.1 == AUDIO_FEATURES).collect();
+        assert_eq!(audio.iter().map(|r| r.2).collect::<Vec<_>>(), vec![63, 25]);
+        let ids = &audio[1].0;
+        assert_eq!(&ids[..2], &[2, BOA_TOKEN_ID as i64]);
+        assert!(ids[2..27].iter().all(|i| *i == AUDIO_TOKEN_ID as i64));
+        assert_eq!(&ids[27..], &[EOA_TOKEN_ID as i64, 1]);
+        drop(runs);
+        assert!(m.embed_audio(&[vec![0.0; 50]]).is_err());
+        assert!(m.embed_audio(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_graph_without_media_inputs_refuses_media() {
+        let m = model(StubGraph::default()).with_encoders(
+            Box::new(|| Ok(Box::new(vision::tests::StubVision::default()) as Box<dyn VisionGraph>)),
+            Box::new(|| Ok(Box::new(audio::tests::StubAudio::default()) as Box<dyn AudioGraph>)),
+        );
+        let fixture = mel::tests::fixture();
+        let err = m.embed_audio(&[fixture.samples]).unwrap_err();
+        assert!(err.to_string().contains("takes no media"), "{err}");
     }
 }
