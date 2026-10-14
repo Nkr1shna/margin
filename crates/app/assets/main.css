@@ -286,6 +286,7 @@ body.resizing-sb * { user-select: none !important; }
 .menu button:hover, .menu button:focus-visible { background: var(--hover); }
 .menu button.danger { color: var(--danger); }
 .menu .sep { height: 1px; background: var(--line); margin: 4px 6px; }
+.menu .menu-note { margin: 4px 0 2px; padding: 6px 10px 4px; max-width: 260px; border-top: 1px solid var(--line); font-size: 12px; line-height: 17px; color: var(--fg-3); }
 .menu.right { right: 0; }
 
 /* modal */

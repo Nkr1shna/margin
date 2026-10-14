@@ -2,7 +2,9 @@
 //! sources, voice, render size, tools on the service Mac, and appearance.
 
 use dioxus::prelude::*;
-use margin_shared::{Device, EmbeddingModelState, Event, Settings, SettingsPatch, ToolStatus};
+use margin_shared::{
+    Device, EmbeddingModelState, Event, SOURCE_KINDS, Settings, SettingsPatch, ToolStatus,
+};
 
 use crate::config::{Appearance, normalize_service_url};
 use crate::sources::human_bytes;
@@ -663,7 +665,7 @@ fn SourcesSection() -> Element {
         section { class: "set-sec",
             h2 { "Embedding model" }
             p { class: "help",
-                "EmbeddingGemma 2 runs on the service Mac. It reads your documents, PDFs, images, audio and video, and finds the passages, pages, pictures and clips that outlines and lessons draw on."
+                "EmbeddingGemma 2 runs on the service Mac. It reads your sources ({SOURCE_KINDS}) and finds the passages, pages, pictures and clips that outlines and lessons draw on."
             }
             match (model, load.read().clone()) {
                 (Some(model), _) => rsx! {
@@ -924,7 +926,7 @@ fn ToolsSection() -> Element {
                     "Check again"
                 }
             }
-            p { class: "help", "Videos need ManimGX and the FluidAudio CLI on the service Mac. Margin never installs them for you." }
+            p { class: "help", "ManimGX renders videos. The FluidAudio CLI (fluidaudiocli) voices their narration and transcribes audio and video sources; without it, recordings are read without a transcript. Both run on the service Mac, and Margin never installs them for you." }
             match list {
                 None => rsx! { div { class: "skel", style: "width: 50%" } },
                 Some(Err(err)) => rsx! { ErrorNotice { message: err, on_retry: move |_| tools.restart() } },

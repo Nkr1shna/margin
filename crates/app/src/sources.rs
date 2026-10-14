@@ -462,6 +462,16 @@ pub fn status_text(status: &SourceStatus) -> (Tone, String) {
     }
 }
 
+/// What can be added as a source, and how big it can be: said by the composer's
+/// Sources menu and a topic's Sources dialog alike.
+pub fn kinds_text() -> String {
+    format!(
+        "Add {} files, or a whole folder. {}",
+        margin_shared::SOURCE_KINDS,
+        routes::source_limits_text()
+    )
+}
+
 /// "812 bytes", "5.1 KB", "2.3 MB", "640 MB", "1.2 GB" (1 KB = 1024 bytes, like the
 /// upload limits).
 pub fn human_bytes(bytes: u64) -> String {
@@ -748,6 +758,15 @@ mod tests {
         assert_eq!(
             missing.summary().as_deref(),
             Some("Added nothing. Skipped 1 file that couldn't be opened.")
+        );
+    }
+
+    #[test]
+    fn the_copy_lists_every_kind_and_the_limits() {
+        assert_eq!(
+            kinds_text(),
+            "Add text, code, PDFs, images, audio and video files, or a whole folder. \
+             Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
     }
 

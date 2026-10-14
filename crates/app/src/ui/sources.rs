@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use dioxus::prelude::*;
-use margin_shared::{EmbeddingModelState, Event, Id, Source, SourceKind};
+use margin_shared::{EmbeddingModelState, Event, Id, SOURCE_KINDS, Source, SourceKind};
 
 use crate::picker;
 use crate::sources::{Tone, Upload, UploadState, human_bytes, status_text};
@@ -329,7 +329,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                 class: "chip",
                 "aria-haspopup": "menu",
                 "aria-expanded": open.read().to_string(),
-                title: "Add files or a folder for the lessons to draw on",
+                title: "Add {SOURCE_KINDS} files, or a folder of them, for the lessons to draw on",
                 disabled: *picking.read(),
                 onclick: move |_| open.toggle(),
                 if *picking.read() {
@@ -353,6 +353,7 @@ pub fn AddSourcesMenu(on_note: EventHandler<Option<String>>) -> Element {
                         Icon { name: "folder" }
                         "Add folder…"
                     }
+                    p { class: "menu-note", {crate::sources::kinds_text()} }
                 }
             }
         }
@@ -762,7 +763,10 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                         Icon { name: "x" }
                     }
                 }
-                p { "Outlines and lessons in this topic draw on the passages, pages, pictures and clips of these files that matter most." }
+                p {
+                    "Outlines and lessons in this topic draw on the passages, pages, pictures and clips of these files that matter most."
+                    if !empty { " " {margin_shared::routes::source_limits_text()} }
+                }
                 if !empty {
                     EmbeddingNotice {}
                 }
@@ -782,7 +786,8 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                 div { class: "src-list",
                     if empty {
                         p { class: "faint",
-                            "No sources yet. Add documents, code, PDFs, images, audio or video, or a whole folder."
+                            "No sources yet. "
+                            {crate::sources::kinds_text()}
                         }
                     }
                     for (upload, tone, status) in lines {
