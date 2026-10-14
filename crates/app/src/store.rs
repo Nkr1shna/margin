@@ -318,6 +318,7 @@ mod tests {
 
     pub fn lesson(id: &str, topic_id: &str, position: i64, status: LessonStatus) -> Lesson {
         Lesson {
+            citations: Vec::new(),
             id: id.into(),
             topic_id: topic_id.into(),
             title: format!("Lesson {id}"),
@@ -361,6 +362,7 @@ mod tests {
 
     pub fn source(id: &str, topic_id: Option<&str>, name: &str, folder: Option<&str>) -> Source {
         Source {
+            media_url: None,
             id: id.into(),
             topic_id: topic_id.map(Into::into),
             name: name.into(),

@@ -28,6 +28,9 @@ pub fn kind_icon(kind: SourceKind) -> &'static str {
         SourceKind::Text => "note",
         SourceKind::Code => "code",
         SourceKind::Pdf => "pdf",
+        SourceKind::Image => "image",
+        SourceKind::Audio => "audio",
+        SourceKind::Video => "video",
     }
 }
 

@@ -269,6 +269,7 @@ pub async fn accept(
         for (i, l) in outline.lessons.iter().enumerate() {
             let row = StoredLesson {
                 lesson: Lesson {
+                    citations: Vec::new(),
                     id: new_id(),
                     topic_id: topic.id.clone(),
                     title: l.title.clone(),

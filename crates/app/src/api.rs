@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(in_topic.topic_id.as_deref(), Some("fourier"));
         assert!(api.library().await.unwrap().sources.contains(&in_topic));
         let err = api
-            .upload_source(b"x".to_vec(), "photo.png", None, None)
+            .upload_source(b"x".to_vec(), "archive.zip", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(400));

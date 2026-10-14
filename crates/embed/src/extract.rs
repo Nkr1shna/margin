@@ -10,6 +10,9 @@ use crate::{EmbedError, Extracted, Page, SourceKind};
 pub(crate) fn extract(path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
     match kind {
         SourceKind::Pdf => pdf(path),
+        SourceKind::Image | SourceKind::Audio | SourceKind::Video => Err(EmbedError::Extract(
+            "Images, audio and video aren't read yet.".into(),
+        )),
         SourceKind::Text | SourceKind::Code => {
             let bytes = std::fs::read(path).map_err(|e| EmbedError::Extract(e.to_string()))?;
             let text = normalize_newlines(&String::from_utf8_lossy(&bytes));

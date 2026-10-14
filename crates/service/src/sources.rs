@@ -140,6 +140,7 @@ pub async fn upload(
         )));
     }
     let source = Source {
+        media_url: None,
         id: id.clone(),
         topic_id: q.topic_id,
         name,

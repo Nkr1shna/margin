@@ -77,7 +77,12 @@ fn units(
         match kind {
             // Indentation matters in code; each line is a unit.
             SourceKind::Code => pieces.push((line, sep)),
-            SourceKind::Text | SourceKind::Pdf => {
+            // Transcripts of audio and video are prose too.
+            SourceKind::Text
+            | SourceKind::Pdf
+            | SourceKind::Image
+            | SourceKind::Audio
+            | SourceKind::Video => {
                 for (i, sentence) in sentences(line.trim_start()).into_iter().enumerate() {
                     pieces.push((sentence, if i == 0 { sep } else { Sep::Space }));
                 }

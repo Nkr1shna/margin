@@ -339,7 +339,7 @@ mod tests {
         dir.file("notes/ch1.md", 10);
         dir.file("notes/ch2.md", 10);
         dir.file("src/main.rs", 10);
-        dir.file("src/logo.png", 10);
+        dir.file("src/archive.zip", 10);
         dir.file(".hidden.md", 10);
         dir.file(".git/config.toml", 10);
         dir.file(".venv/lib.py", 10);
@@ -391,7 +391,7 @@ mod tests {
         let mb = 1024 * 1024;
         let paths: Vec<_> = (0..5)
             .map(|i| big.file(&format!("b{i}.txt"), 49 * mb))
-            .chain([big.file("huge.txt", 51 * mb), big.file("song.mp3", 1)])
+            .chain([big.file("huge.txt", 51 * mb), big.file("bundle.zip", 1)])
             .collect();
         let selection = select_files(paths);
         assert_eq!(selection.files.len(), 4);

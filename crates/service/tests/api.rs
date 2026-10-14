@@ -1535,6 +1535,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
     let lesson =
         |id: &str, pos: i64, status: LessonStatus, body: &str, prev: Option<&str>| StoredLesson {
             lesson: Lesson {
+                citations: Vec::new(),
                 id: id.into(),
                 topic_id: topic.id.clone(),
                 title: format!("L{pos}"),

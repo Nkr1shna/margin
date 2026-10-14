@@ -91,6 +91,9 @@ pub struct Lesson {
     pub status: LessonStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The sources the body cites with `[^n]` footnote references.
+    #[serde(default)]
+    pub citations: Vec<Citation>,
 }
 
 /// A note. Margin notes carry the lesson text they were taken from in `quote`.
@@ -306,6 +309,32 @@ pub struct Source {
     pub bytes: u64,
     pub status: SourceStatus,
     pub created_at: DateTime<Utc>,
+    /// Signed URL of the original file, for viewing it (images, PDFs, audio, video).
+    #[serde(default)]
+    pub media_url: Option<String>,
+}
+
+/// A numbered reference in a lesson to the source passage it drew on. The lesson body
+/// marks it with a Markdown footnote reference `[^n]`; the app lists the citations
+/// after the lesson and opens the source at `page` / `start_ms` when one is clicked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Citation {
+    /// 1-based, in order of first appearance in the body.
+    pub n: u32,
+    pub source_id: Id,
+    pub source_name: String,
+    pub kind: SourceKind,
+    /// PDF page (1-based).
+    pub page: Option<u32>,
+    /// Where in an audio or video source the passage is.
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    /// The passage text: a text chunk, a page's text, or the transcript of the clip.
+    /// Empty for a bare image.
+    pub excerpt: String,
+    /// Signed URL of a picture for it: the image itself, the rendered PDF page, or the
+    /// video frame.
+    pub image_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,13 +344,21 @@ pub enum SourceKind {
     Text,
     /// Source code, chunked along lines.
     Code,
-    /// Text from PDFKit; pages without text are read with Vision OCR.
+    /// Text from PDFKit (Vision OCR for pages without text), plus each page as an image.
     Pdf,
+    /// .png, .jpg, .heic, .webp, .gif, .tiff, .bmp: embedded with the image encoder.
+    Image,
+    /// .mp3, .m4a, .wav, .aiff, .flac, .caf: 10-second windows through the audio encoder,
+    /// plus a timestamped transcript (FluidAudio speech recognition).
+    Audio,
+    /// .mp4, .mov, .m4v: sampled frames through the image encoder and the soundtrack as
+    /// for audio.
+    Video,
 }
 
 impl SourceKind {
     /// The kind of source a file is, from its name; `None` for files Margin can't read
-    /// (images, archives, binaries, lock files…).
+    /// (archives, binaries, lock files…).
     pub fn for_name(name: &str) -> Option<SourceKind> {
         let file = name
             .rsplit(['/', '\\'])
@@ -346,8 +383,19 @@ impl SourceKind {
             "ex", "exs", "erl", "clj", "lua", "r", "jl", "dart", "zig", "nim", "sql", "sh", "bash",
             "zsh", "fish", "ps1", "css", "scss", "vue", "svelte", "proto", "graphql", "ipynb",
         ];
+        const IMAGE: &[&str] = &[
+            "png", "jpg", "jpeg", "heic", "heif", "webp", "gif", "tif", "tiff", "bmp",
+        ];
+        const AUDIO: &[&str] = &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "caf"];
+        const VIDEO: &[&str] = &["mp4", "mov", "m4v"];
         if ext == "pdf" {
             Some(SourceKind::Pdf)
+        } else if IMAGE.contains(&ext) {
+            Some(SourceKind::Image)
+        } else if AUDIO.contains(&ext) {
+            Some(SourceKind::Audio)
+        } else if VIDEO.contains(&ext) {
+            Some(SourceKind::Video)
         } else if TEXT.contains(&ext) {
             Some(SourceKind::Text)
         } else if CODE.contains(&ext) {
@@ -614,7 +662,10 @@ mod tests {
         assert_eq!(SourceKind::for_name("src/main.rs"), Some(SourceKind::Code));
         assert_eq!(SourceKind::for_name("paper.pdf"), Some(SourceKind::Pdf));
         assert_eq!(SourceKind::for_name("Makefile"), Some(SourceKind::Text));
-        assert_eq!(SourceKind::for_name("photo.png"), None);
+        assert_eq!(SourceKind::for_name("photo.HEIC"), Some(SourceKind::Image));
+        assert_eq!(SourceKind::for_name("talk.m4a"), Some(SourceKind::Audio));
+        assert_eq!(SourceKind::for_name("lecture.mov"), Some(SourceKind::Video));
+        assert_eq!(SourceKind::for_name("archive.zip"), None);
         assert_eq!(SourceKind::for_name("Cargo.lock"), None);
         assert_eq!(SourceKind::for_name("noextension"), None);
     }

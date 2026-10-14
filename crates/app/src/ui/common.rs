@@ -85,6 +85,14 @@ const ICONS: &[(&str, &str)] = &[
     ("back", r#"<path d="M14.5 6l-6 6 6 6"/>"#),
     ("forward", r#"<path d="M9.5 6l6 6-6 6"/>"#),
     (
+        "image",
+        r#"<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M4 17.5l5-4.5 4 3.5 2.5-2 4.5 4"/>"#,
+    ),
+    (
+        "audio",
+        r#"<path d="M9 18.5V6.5l10-2v12"/><circle cx="6.5" cy="18.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/>"#,
+    ),
+    (
         "user",
         r#"<circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5c1.2-3.3 3.8-5 7-5s5.8 1.7 7 5"/>"#,
     ),

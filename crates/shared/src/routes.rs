@@ -39,6 +39,7 @@
 //! | DELETE | /api/embedding                         |                    | EmbeddingModel      |
 //! | GET    | /api/events  (WebSocket upgrade)       |                    | Event frames        |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
+//! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
 pub const HEALTH: &str = "/health";
 pub const AUTH_START: &str = "/auth/start";

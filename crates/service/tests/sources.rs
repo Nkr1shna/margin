@@ -243,10 +243,10 @@ async fn unsupported_oversized_and_misfiled_uploads_are_rejected() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
 
-    let (status, err) = api_error(h.upload(&t, "photo.png", None, "x").await).await;
+    let (status, err) = api_error(h.upload(&t, "archive.zip", None, "x").await).await;
     assert_eq!(status, 400);
     assert_eq!(err.code, "unsupported_source");
-    assert!(err.message.contains("photo.png"), "{}", err.message);
+    assert!(err.message.contains("archive.zip"), "{}", err.message);
     let (status, err) = api_error(h.upload(&t, "Cargo.lock", None, "x").await).await;
     assert_eq!((status, err.code.as_str()), (400, "unsupported_source"));
     let (status, _) = api_error(h.upload(&t, "  ", None, "x").await).await;
@@ -717,6 +717,7 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     };
     store.put(db::TOPIC, "t1", &topic).await.unwrap();
     let source = |id: &str, topic_id: Option<&str>, status: SourceStatus, age_h: i64| Source {
+        media_url: None,
         id: id.into(),
         topic_id: topic_id.map(Into::into),
         name: format!("{id}.md"),

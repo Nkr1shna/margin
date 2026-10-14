@@ -169,6 +169,7 @@ fn sample_uploads(lib: &mut LibraryState) -> Vec<sources::Upload> {
     };
     let done = |mut upload: Upload, id: &str, status: SourceStatus, lib: &mut LibraryState| {
         let source = margin_shared::Source {
+            media_url: None,
             id: id.into(),
             topic_id: None,
             name: upload.name.clone(),

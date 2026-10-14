@@ -111,6 +111,7 @@ pub fn sample_library() -> Library {
         updated_at: ts(0),
     };
     let lesson = |id: &str, topic_id: &str, title: &str, position, status, body: &str| Lesson {
+        citations: Vec::new(),
         id: id.into(),
         topic_id: topic_id.into(),
         title: title.into(),
@@ -203,6 +204,7 @@ pub fn sample_library() -> Library {
         }],
         sources: vec![
             Source {
+                media_url: None,
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
                 name: "Oppenheim ch3.pdf".into(),
@@ -216,6 +218,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(30),
             },
             Source {
+                media_url: None,
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
                 name: "notes/gibbs.md".into(),
@@ -229,6 +232,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(31),
             },
             Source {
+                media_url: None,
                 id: "s3".into(),
                 topic_id: Some("fourier".into()),
                 name: "plot_series.py".into(),
@@ -1100,6 +1104,7 @@ async fn accept(
         let mut created = Vec::new();
         for (i, l) in req.outline.lessons.iter().enumerate() {
             let lesson = Lesson {
+                citations: Vec::new(),
                 id: s.id("lesson"),
                 topic_id: topic.id.clone(),
                 title: l.title.clone(),
@@ -1378,6 +1383,7 @@ async fn upload_source(
             return not_found();
         }
         let source = Source {
+            media_url: None,
             id: s.id("source"),
             topic_id: query.topic_id,
             name: query.name,
