@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+/// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
 
 pub mod fake;
@@ -144,13 +145,6 @@ pub struct Extracted {
 pub struct Page {
     pub number: Option<u32>,
     pub text: String,
-}
-
-/// The kind of source a file name is, or `None` if it isn't supported (binary files,
-/// images, archives…).
-pub fn kind_for_name(name: &str) -> Option<SourceKind> {
-    let _ = name;
-    todo!("margin-embed: kind_for_name")
 }
 
 /// Extracts text: UTF-8 (lossy) for text and code; PDFKit for PDFs, with Vision OCR for

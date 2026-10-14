@@ -319,6 +319,42 @@ pub enum SourceKind {
     Pdf,
 }
 
+impl SourceKind {
+    /// The kind of source a file is, from its name; `None` for files Margin can't read
+    /// (images, archives, binaries, lock files…).
+    pub fn for_name(name: &str) -> Option<SourceKind> {
+        let file = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+        if file.ends_with(".lock") || file == "package-lock.json" {
+            return None;
+        }
+        const NAMED: &[&str] = &["makefile", "dockerfile", "justfile", "readme", "license"];
+        if NAMED.contains(&file.as_str()) {
+            return Some(SourceKind::Text);
+        }
+        let ext = file.rsplit_once('.').map(|(_, e)| e)?;
+        const TEXT: &[&str] = &[
+            "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "bib", "csv", "tsv",
+            "html", "htm", "xml", "json", "yaml", "yml", "toml", "ini", "srt", "vtt",
+        ];
+        const CODE: &[&str] = &[
+            "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "kts",
+            "swift", "m", "mm", "c", "h", "cc", "cpp", "cxx", "hpp", "cs", "rb", "php", "scala",
+            "hs", "ml", "ex", "exs", "erl", "clj", "lua", "r", "jl", "dart", "zig", "nim",
+            "sql", "sh", "bash", "zsh", "fish", "ps1", "css", "scss", "vue", "svelte",
+            "proto", "graphql", "ipynb",
+        ];
+        if ext == "pdf" {
+            Some(SourceKind::Pdf)
+        } else if TEXT.contains(&ext) {
+            Some(SourceKind::Text)
+        } else if CODE.contains(&ext) {
+            Some(SourceKind::Code)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SourceStatus {
@@ -551,6 +587,17 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_kinds_from_names() {
+        assert_eq!(SourceKind::for_name("notes/Ch1.MD"), Some(SourceKind::Text));
+        assert_eq!(SourceKind::for_name("src/main.rs"), Some(SourceKind::Code));
+        assert_eq!(SourceKind::for_name("paper.pdf"), Some(SourceKind::Pdf));
+        assert_eq!(SourceKind::for_name("Makefile"), Some(SourceKind::Text));
+        assert_eq!(SourceKind::for_name("photo.png"), None);
+        assert_eq!(SourceKind::for_name("Cargo.lock"), None);
+        assert_eq!(SourceKind::for_name("noextension"), None);
+    }
 
     #[test]
     fn patch_fields_distinguish_unchanged_from_clear() {
