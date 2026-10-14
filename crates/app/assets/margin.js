@@ -25,8 +25,44 @@
         el.classList.add("katex-done");
         el.textContent = tex;
       }
+      if (el.classList.contains("math-display")) watchOverflow(el);
     }
   }
+
+  // Re-check a display formula when its typeset width changes (KaTeX's fonts load late)
+  // as well as on resize.
+  var overflowObserver = window.ResizeObserver ? new ResizeObserver(function (entries) {
+    for (var i = 0; i < entries.length; i++) {
+      var box = entries[i].target.closest(".math-display");
+      if (box) mathOverflow(box);
+    }
+  }) : null;
+  function watchOverflow(el) {
+    mathOverflow(el);
+    var inner = el.querySelector(".katex");
+    if (overflowObserver && inner) overflowObserver.observe(inner);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { mathOverflow(el); });
+  }
+
+  // A display formula wider than its box scrolls sideways; fade the edge it continues
+  // past so it doesn't look cut off. Updated on scroll and on resize.
+  function mathOverflow(el) {
+    var max = el.scrollWidth - el.clientWidth;
+    el.classList.toggle("more-right", max > 1 && el.scrollLeft < max - 1);
+    el.classList.toggle("more-left", max > 1 && el.scrollLeft > 1);
+  }
+  document.addEventListener("scroll", function (e) {
+    var t = e.target;
+    if (t && t.classList && t.classList.contains("math-display")) mathOverflow(t);
+  }, true);
+  var overflowTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(overflowTimer);
+    overflowTimer = setTimeout(function () {
+      var all = document.querySelectorAll(".math-display.katex-done");
+      for (var i = 0; i < all.length; i++) mathOverflow(all[i]);
+    }, 100);
+  });
 
   // Typesets the math in `node` itself and in its descendants.
   function renderMathNode(node) {
@@ -61,6 +97,14 @@
       }
       for (var j = old.length - 1; j >= fresh.length; j--) el.removeChild(old[j]);
       if (!window.katex) setTimeout(function () { renderMath(el); }, 50);
+      if (quoteMarks[id]) markQuotes(el, quoteMarks[id]);
+    },
+    // Mark each margin note's passage in #`id` ([{id, quote}]); kept across setHtml.
+    // Tapping a marked passage shows its note (#note-<id>).
+    markQuotes: function (id, notes) {
+      quoteMarks[id] = notes || [];
+      var el = document.getElementById(id);
+      if (el) markQuotes(el, quoteMarks[id]);
     },
     renderMath: function (id) {
       setTimeout(function () { renderMath(document.getElementById(id)); });
@@ -130,41 +174,54 @@
       if (sel) sel.removeAllRanges();
     },
     // Global shortcuts: Cmd/Ctrl+K opens search, Cmd/Ctrl+N opens Ask.
-    // Resizing the sidebar by its right edge. The width follows the pointer live (a CSS
-    // variable on .app); the final width is sent to the app to save. Double-click resets.
+    // Resizing the sidebar by its right edge, with a mouse, a finger or a pencil. The width
+    // follows the pointer live (a CSS variable on .app); the final width is sent to the
+    // app to save. A double click or double tap resets.
     watchSidebarResize: function (min, max, send) {
       if (window.MarginApp._stopResize) window.MarginApp._stopResize();
       function app() { return document.querySelector(".app"); }
+      var lastTap = 0;
       function onDown(e) {
         var handle = e.target.closest && e.target.closest(".sb-resize");
-        if (!handle || e.button !== 0) return;
+        if (!handle || (e.pointerType === "mouse" && e.button !== 0)) return;
         e.preventDefault();
+        if (e.pointerType !== "mouse") {
+          // Double tap (dblclick doesn't fire for touch everywhere).
+          if (e.timeStamp - lastTap < 350) { lastTap = 0; send(0); return; }
+          lastTap = e.timeStamp;
+        }
         var sb = handle.parentElement;
         var startX = e.clientX, startW = sb.getBoundingClientRect().width, width = startW;
+        var pid = e.pointerId;
+        try { handle.setPointerCapture(pid); } catch (err) { /* capture is optional */ }
         handle.classList.add("active");
         document.body.classList.add("resizing-sb");
         function onMove(ev) {
+          if (ev.pointerId !== pid) return;
           width = Math.round(Math.min(max, Math.max(min, startW + ev.clientX - startX)));
           var a = app();
           if (a) a.style.setProperty("--sb-w", width + "px");
         }
-        function onUp() {
-          document.removeEventListener("mousemove", onMove, true);
-          document.removeEventListener("mouseup", onUp, true);
+        function onUp(ev) {
+          if (ev.pointerId !== pid) return;
+          document.removeEventListener("pointermove", onMove, true);
+          document.removeEventListener("pointerup", onUp, true);
+          document.removeEventListener("pointercancel", onUp, true);
           handle.classList.remove("active");
           document.body.classList.remove("resizing-sb");
           if (width !== startW) send(width);
         }
-        document.addEventListener("mousemove", onMove, true);
-        document.addEventListener("mouseup", onUp, true);
+        document.addEventListener("pointermove", onMove, true);
+        document.addEventListener("pointerup", onUp, true);
+        document.addEventListener("pointercancel", onUp, true);
       }
       function onDbl(e) {
         if (e.target.closest && e.target.closest(".sb-resize")) send(0);
       }
-      document.addEventListener("mousedown", onDown, true);
+      document.addEventListener("pointerdown", onDown, true);
       document.addEventListener("dblclick", onDbl, true);
       window.MarginApp._stopResize = function () {
-        document.removeEventListener("mousedown", onDown, true);
+        document.removeEventListener("pointerdown", onDown, true);
         document.removeEventListener("dblclick", onDbl, true);
       };
     },
@@ -179,7 +236,7 @@
         }
         if (k === "k") { e.preventDefault(); send("search"); }
         else if (k === "n") { e.preventDefault(); send("ask"); }
-        else if (k === "\\") { e.preventDefault(); send("sidebar"); }
+        else if (k === "\\") { e.preventDefault(); send(drawerMode() ? "drawer" : "sidebar"); }
         else if (k === ",") { e.preventDefault(); send("settings"); }
         else if (k === "[") { e.preventDefault(); send("back"); }
         else if (k === "]") { e.preventDefault(); send("forward"); }
@@ -316,19 +373,214 @@
       current = t;
       timer = setTimeout(function () { show(t); }, delay);
     }
-    document.addEventListener("mouseover", function (e) { arm(target(e.target), 500); }, true);
+    // Only for a mouse or trackpad: a tap fires compatibility mouse events too, and a
+    // tooltip it raised would stay up with nothing to move off.
+    var lastPointer = "mouse";
+    document.addEventListener("pointerdown", function (e) { lastPointer = e.pointerType; }, true);
+    document.addEventListener("pointermove", function (e) { lastPointer = e.pointerType; }, true);
+    function finePointer() {
+      return lastPointer === "mouse" && !window.matchMedia("(hover: none)").matches;
+    }
+    document.addEventListener("mouseover", function (e) {
+      if (finePointer()) arm(target(e.target), 500);
+    }, true);
     document.addEventListener("mouseout", function (e) {
       if (current && !(e.relatedTarget && current.contains(e.relatedTarget))) hide();
     }, true);
     document.addEventListener("focusin", function (e) {
-      if (e.target.matches && e.target.matches(":focus-visible")) arm(target(e.target), 300);
+      if (finePointer() && e.target.matches && e.target.matches(":focus-visible")) arm(target(e.target), 300);
     }, true);
     document.addEventListener("focusout", hide, true);
-    ["mousedown", "keydown", "scroll", "wheel"].forEach(function (type) {
+    ["mousedown", "pointerdown", "touchstart", "keydown", "scroll", "wheel"].forEach(function (type) {
       document.addEventListener(type, hide, true);
     });
     window.addEventListener("blur", hide);
   })();
+
+  // Below 1024px the sidebar is a drawer (main.css); ⌘\ opens and closes it there.
+  function drawerMode() {
+    return window.matchMedia("(max-width: 1023px)").matches;
+  }
+
+  // Long press = right click: rows with a context menu ([data-long-press]) get it from a
+  // ~500 ms touch or pencil press that doesn't move. iOS fires no contextmenu for that;
+  // Android does, so a native one cancels ours (or is dropped if ours came first), and the
+  // tap that ends the press doesn't also activate the row.
+  (function longPress() {
+    var timer = null, start = null, firedAt = 0;
+    function cancel() { clearTimeout(timer); timer = null; start = null; }
+    document.addEventListener("pointerdown", function (e) {
+      cancel();
+      if (e.pointerType === "mouse") return;
+      var row = e.target.closest && e.target.closest("[data-long-press]");
+      if (!row) return;
+      start = { x: e.clientX, y: e.clientY, target: e.target };
+      timer = setTimeout(function () {
+        var s = start;
+        cancel();
+        if (!s || !document.body.contains(s.target)) return;
+        firedAt = Date.now();
+        s.target.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true, cancelable: true, clientX: s.x, clientY: s.y, button: 2,
+        }));
+      }, 500);
+    }, true);
+    document.addEventListener("pointermove", function (e) {
+      if (start && Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) > 10) cancel();
+    }, true);
+    ["pointerup", "pointercancel", "scroll"].forEach(function (type) {
+      document.addEventListener(type, cancel, true);
+    });
+    document.addEventListener("contextmenu", function (e) {
+      if (!e.isTrusted) return;
+      if (timer) { cancel(); return; }
+      if (Date.now() - firedAt < 1000) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    document.addEventListener("click", function (e) {
+      if (Date.now() - firedAt < 1000) { firedAt = 0; e.preventDefault(); e.stopPropagation(); }
+    }, true);
+  })();
+
+  // The on-screen keyboard's height over the layout viewport, as --kb on <html>, so
+  // bottom-pinned panels and dialog heights stay above it (iOS only shrinks the visual
+  // viewport for the keyboard; 100vh doesn't change).
+  (function keyboardInset() {
+    var vv = window.visualViewport;
+    if (!vv) return;
+    function update() {
+      var kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+      // Pinch zoom also shrinks the visual viewport; only count it at normal scale.
+      if (vv.scale > 1.01) kb = 0;
+      document.documentElement.style.setProperty("--kb", kb + "px");
+    }
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    update();
+  })();
+
+  // Margin-note passages: <mark class="qmark" data-note=id> around the quoted text in a
+  // lesson body, found in its text with whitespace collapsed (as the selection reported it).
+  var quoteMarks = {};
+  function unmark(root) {
+    var marks = root.querySelectorAll("mark.qmark");
+    for (var i = 0; i < marks.length; i++) {
+      var m = marks[i], parent = m.parentNode;
+      if (!parent) continue;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+      parent.normalize();
+    }
+  }
+  // The body's text, whitespace collapsed, with each character's text node and offset.
+  function flatText(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    var text = "", map = [], space = true, n;
+    while ((n = walker.nextNode())) {
+      var data = n.data;
+      for (var i = 0; i < data.length; i++) {
+        var c = data.charAt(i);
+        if (/\s/.test(c)) {
+          if (space) continue;
+          space = true;
+          text += " ";
+        } else {
+          space = false;
+          text += c;
+        }
+        map.push({ node: n, offset: i });
+      }
+    }
+    return { text: text, map: map };
+  }
+  function markOne(root, id, quote) {
+    quote = (quote || "").replace(/\s+/g, " ").trim();
+    if (!quote) return;
+    var flat = flatText(root);
+    var at = flat.text.indexOf(quote);
+    if (at < 0) return;
+    // Character ranges per text node, last node first so earlier offsets stay valid.
+    var runs = [];
+    for (var k = at; k < at + quote.length; k++) {
+      var p = flat.map[k], last = runs[runs.length - 1];
+      if (last && last.node === p.node) last.end = p.offset + 1;
+      else runs.push({ node: p.node, start: p.offset, end: p.offset + 1 });
+    }
+    for (var r = runs.length - 1; r >= 0; r--) {
+      var run = runs[r], node = run.node;
+      // Typeset math is drawn from many tiny spans; leave it unwrapped.
+      if (node.parentNode && node.parentNode.closest && node.parentNode.closest(".katex, .math")) continue;
+      if (!/\S/.test(node.data.slice(run.start, run.end))) continue;
+      var mid = node.splitText(run.start);
+      mid.splitText(run.end - run.start);
+      var mark = document.createElement("mark");
+      mark.className = "qmark";
+      mark.setAttribute("data-note", id);
+      mid.parentNode.insertBefore(mark, mid);
+      mark.appendChild(mid);
+    }
+  }
+  function markQuotes(root, notes) {
+    unmark(root);
+    for (var i = 0; i < notes.length; i++) markOne(root, notes[i].id, notes[i].quote);
+  }
+
+  var sheet = null;
+  function closeSheet() {
+    if (sheet && sheet.parentNode) sheet.parentNode.removeChild(sheet);
+    sheet = null;
+  }
+  function flash(note) {
+    note.classList.remove("flash");
+    void note.offsetWidth;
+    note.classList.add("flash");
+  }
+  function goToNote(note) {
+    closeSheet();
+    note.scrollIntoView({ block: "center", behavior: "smooth" });
+    flash(note);
+  }
+  document.addEventListener("click", function (e) {
+    if (sheet && !sheet.contains(e.target)) closeSheet();
+    var mark = e.target.closest && e.target.closest("mark.qmark");
+    if (!mark) return;
+    var sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    var note = document.getElementById("note-" + mark.getAttribute("data-note"));
+    if (!note) return;
+    var doc = mark.closest(".doc");
+    var beside = doc && note.getBoundingClientRect().left >= doc.getBoundingClientRect().right - 1;
+    if (beside) {
+      note.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      flash(note);
+      return;
+    }
+    // Notes under the text: show this one in a sheet, with a way to it.
+    sheet = document.createElement("div");
+    sheet.className = "qsheet";
+    sheet.setAttribute("role", "dialog");
+    sheet.setAttribute("aria-label", "Margin note");
+    var body = note.querySelector(".md");
+    if (body) sheet.appendChild(body.cloneNode(true));
+    var actions = document.createElement("div");
+    actions.className = "row-actions";
+    var close = document.createElement("button");
+    close.className = "btn btn-ghost btn-sm";
+    close.textContent = "Close";
+    close.addEventListener("click", closeSheet);
+    var go = document.createElement("button");
+    go.className = "btn btn-secondary btn-sm";
+    go.textContent = "Show in notes";
+    go.addEventListener("click", function () { goToNote(note); });
+    actions.appendChild(close);
+    actions.appendChild(go);
+    sheet.appendChild(actions);
+    document.body.appendChild(sheet);
+    go.focus();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (sheet && e.key === "Escape") closeSheet();
+  }, true);
+  window.addEventListener("popstate", closeSheet);
 
   function fallbackCopy(text) {
     var ta = document.createElement("textarea");

@@ -33,6 +33,15 @@ const MARGIN_JS: Asset = asset!("/assets/margin.js");
 const KATEX: Asset = asset!("/assets/katex", AssetOptions::folder());
 const FONTS: Asset = asset!("/assets/fonts", AssetOptions::folder());
 
+/// The page viewport. `viewport-fit=cover` runs the page under the notch and home
+/// indicator (main.css pads with the safe-area insets). On Android the soft keyboard
+/// resizes the page, so fixed panels and 100vh stay above it.
+#[cfg(target_os = "android")]
+const VIEWPORT: &str =
+    "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content";
+#[cfg(not(target_os = "android"))]
+const VIEWPORT: &str = "width=device-width, initial-scale=1, viewport-fit=cover";
+
 fn main() {
     #[cfg(feature = "desktop")]
     {
@@ -160,7 +169,7 @@ fn App() -> Element {
     let signed_in = ctx.session.read().is_some();
 
     rsx! {
-        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" }
+        document::Meta { name: "viewport", content: VIEWPORT }
         document::Style { {fonts} }
         document::Stylesheet { href: MAIN_CSS }
         if ui::common::UNIFIED_TITLE_BAR {

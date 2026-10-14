@@ -334,6 +334,7 @@ fn LessonNode(id: Id, title: String, dot: VideoDot, generating: bool) -> Element
             } else {
                 div {
                     class: "tree-row",
+                    "data-long-press": "true",
                     oncontextmenu: {
                         let mut open_menu = open_menu.clone();
                         move |e: MouseEvent| {
@@ -600,6 +601,7 @@ fn TopicNode(id: Id) -> Element {
             } else {
                 div {
                     class: "tree-row",
+                    "data-long-press": "true",
                     // Right-click opens the same menu as the ⋯ button.
                     oncontextmenu: {
                         let id = id.clone();
