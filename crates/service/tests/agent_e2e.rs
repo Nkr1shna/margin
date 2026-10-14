@@ -32,7 +32,9 @@ use margin_agent::RetryPolicy;
 use margin_service::db;
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY};
 use margin_service::state::{Author, StoredNote};
-use margin_service::turns::{CALL_INTERRUPTED, STOPPED, STOPPED_BY_RESTART};
+use margin_service::turns::{
+    CALL_INTERRUPTED, STOPPED, STOPPED_BY_RESTART, TITLE_MAX_OUTPUT_TOKENS,
+};
 use margin_shared::{
     Card, ChatDetail, ChatItem, ChatItemKind, ChatState, Decision, DeviceFrame, DeviceToolCall,
     DeviceToolOutput, DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus,
@@ -1536,7 +1538,7 @@ async fn a_rate_limited_turn_waits_then_the_model_titles_the_chat() {
             .is_none_or(|t| t.as_array().is_some_and(Vec::is_empty))
     );
     assert_eq!(title["reasoning"]["effort"], "low");
-    assert_eq!(title["max_output_tokens"], 30);
+    assert_eq!(title["max_output_tokens"], TITLE_MAX_OUTPUT_TOKENS);
     let data = title["input"]
         .as_array()
         .unwrap()

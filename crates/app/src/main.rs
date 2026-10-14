@@ -517,6 +517,20 @@ async fn load_chats(ctx: AppCtx, api: &Api) -> bool {
 /// foreground state while connected or waiting.
 const LIVE_TICK: Duration = Duration::from_millis(250);
 
+/// The devices again, with who is online now (`DeviceChanged` only says what changes
+/// while the socket is live). Settings shows the ones known before if this fails.
+async fn load_devices(ctx: AppCtx, api: &Api) {
+    match api.devices().await {
+        Ok(list) => {
+            let mut lib = ctx.lib;
+            lib.write().replace_devices(list);
+        }
+        Err(e) => {
+            ctx.failure(&e);
+        }
+    }
+}
+
 /// This device's own presence, which the service never reports to the device itself:
 /// online exactly while its socket is live.
 fn set_self_online(ctx: AppCtx, online: bool) {
@@ -579,6 +593,10 @@ async fn live_loop(ctx: AppCtx) {
                 if connected_before || *ctx.lib_status.peek() != LoadStatus::Loaded {
                     // Events may have been missed while disconnected.
                     load_library(ctx, &api).await;
+                }
+                if connected_before {
+                    // So was who came online or went offline meanwhile.
+                    load_devices(ctx, &api).await;
                 }
                 connected_before = true;
                 live.set(LiveStatus::Live);

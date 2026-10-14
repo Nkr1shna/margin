@@ -9,7 +9,7 @@ use margin_shared::{
 
 use crate::config::{Appearance, normalize_service_url};
 use crate::sources::human_bytes;
-use crate::state::use_app;
+use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
     ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js,
 };
@@ -371,6 +371,8 @@ fn AccountSection() -> Element {
     let mut error = use_signal(|| None::<String>);
 
     let me = app.session.read().as_ref().and_then(|s| s.me.clone());
+    // Presence comes from live events, and the list is fetched again on reconnecting.
+    let connected = *app.live.read() == LiveStatus::Live;
     // This device is the one signed in here (events don't say which is whose).
     let my_id = me.as_ref().map(|m| m.device.id.clone());
     let known: Vec<Device> = app
@@ -407,6 +409,9 @@ fn AccountSection() -> Element {
         section { class: "set-sec",
             h2 { "Devices" }
             p { class: "help", "Every signed-in device has its own key. Revoke one to sign it out. A device is online while Margin runs on it; the agent can only use it then." }
+            if !connected {
+                p { class: "help", "This device isn't connected to the service, so who is online may be out of date. It updates when the connection is back." }
+            }
             if let Some(err) = error.read().clone() {
                 ErrorNotice { message: err }
             }

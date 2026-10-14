@@ -278,6 +278,18 @@ fn ai_error_code(e: &AiError) -> &'static str {
     }
 }
 
+/// The `error_code` of a `response.failed` / `error` event by the code the model API
+/// gave it (context too long is handled before): rate limits and quota as
+/// `rate_limited`, a request the API refused (an invalid request or prompt, an image it
+/// can't use) as `bad_request`, anything else as `server_error`.
+fn stream_error_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some("rate_limit_exceeded" | "insufficient_quota") => error_code::RATE_LIMITED,
+        Some(c) if c.starts_with("invalid_") || c.contains("image") => error_code::BAD_REQUEST,
+        _ => error_code::SERVER_ERROR,
+    }
+}
+
 /// Why the loop waits before retrying, by the error's code, for the chat
 /// (`Chat.waiting.reason`).
 fn wait_reason(code: &str) -> &'static str {
@@ -721,7 +733,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                     let code = if too_long {
                         error_code::CONTEXT_TOO_LONG
                     } else {
-                        error_code::SERVER_ERROR
+                        stream_error_code(code.as_deref())
                     };
                     return self.abandon(open, &calls, message, true, code).await;
                 }
@@ -1421,6 +1433,27 @@ mod tests {
         assert_eq!(ai_error_code(&http(429)), error_code::RATE_LIMITED);
         assert_eq!(ai_error_code(&http(503)), error_code::SERVER_ERROR);
         assert_eq!(ai_error_code(&http(401)), error_code::BAD_REQUEST);
+        assert_eq!(
+            stream_error_code(Some("rate_limit_exceeded")),
+            error_code::RATE_LIMITED
+        );
+        assert_eq!(
+            stream_error_code(Some("insufficient_quota")),
+            error_code::RATE_LIMITED
+        );
+        assert_eq!(
+            stream_error_code(Some("invalid_prompt")),
+            error_code::BAD_REQUEST
+        );
+        assert_eq!(
+            stream_error_code(Some("image_too_large")),
+            error_code::BAD_REQUEST
+        );
+        assert_eq!(
+            stream_error_code(Some("server_error")),
+            error_code::SERVER_ERROR
+        );
+        assert_eq!(stream_error_code(None), error_code::SERVER_ERROR);
         assert_eq!(
             ai_error_code(&AiError::Network("x".into())),
             error_code::NETWORK

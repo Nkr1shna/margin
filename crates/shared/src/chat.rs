@@ -279,9 +279,10 @@ pub mod error_code {
     pub const NO_API_KEY: &str = "no_api_key";
     /// No model is set in Settings.
     pub const NO_MODEL: &str = "no_model";
-    /// 429 after every retry.
+    /// 429 after every retry, or a `failed`/`error` stream event coded
+    /// `rate_limit_exceeded` or `insufficient_quota`.
     pub const RATE_LIMITED: &str = "rate_limited";
-    /// 5xx after every retry, or a `failed`/`error` stream event.
+    /// 5xx after every retry, or a `failed`/`error` stream event with any other code.
     pub const SERVER_ERROR: &str = "server_error";
     /// The model API could not be reached, or the connection dropped.
     pub const NETWORK: &str = "network";
@@ -289,7 +290,8 @@ pub mod error_code {
     pub const CONTEXT_TOO_LONG: &str = "context_too_long";
     /// The answer was cut off (`Incomplete`).
     pub const INCOMPLETE: &str = "incomplete";
-    /// The model API refused the request (4xx other than 429).
+    /// The model API refused the request (4xx other than 429, or a `failed`/`error`
+    /// stream event coded as an invalid request, prompt or image).
     pub const BAD_REQUEST: &str = "bad_request";
     /// The service could not store the turn's items.
     pub const STORAGE: &str = "storage";

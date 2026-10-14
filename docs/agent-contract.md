@@ -84,7 +84,9 @@ Title (owner decision): set from the first message, its first line cut to
 `CHAT_TITLE_MAX` (60) characters (`title_by: FirstLine`; the app shows it in placeholder
 style). After the chat's first `Finished` turn, while `title_by` is still `FirstLine`,
 `turns` spawns a side task: one `ModelClient::stream` call, no tools, reasoning effort
-low, at most 30 output tokens, given the first user message and the final answer text
+low, at most `TITLE_MAX_OUTPUT_TOKENS` (1024) output tokens (reasoning tokens count
+toward the cap, so it leaves the model room to reason; the title is kept short by the
+instructions and the cut below), given the first user message and the final answer text
 ("at most 6 words, no quotes"); the reply, trimmed and cut to `CHAT_TITLE_MAX`, is
 stored with `title_by: Model` → `ChatChanged`. It is not a tool and is not stored as an
 item. If the call fails (or a `ScriptedModel` has no reply left), it logs and the

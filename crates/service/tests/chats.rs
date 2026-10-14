@@ -1163,7 +1163,7 @@ async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSi
             chat_id.into(),
             RunningTurn {
                 turn_id: turn_id.clone(),
-                abort: task.abort_handle(),
+                task,
                 decision: None,
                 started_at: now,
             },
@@ -2143,7 +2143,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
             chat.id.clone(),
             RunningTurn {
                 turn_id: "turn-1".into(),
-                abort: task.abort_handle(),
+                task,
                 decision: None,
                 started_at: now,
             },
@@ -2440,6 +2440,97 @@ async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
         vec![
             "call rename_topic (cancelled)".to_string(),
             "result failed: Stopped".to_string(),
+            format!("action: {STOPPED}"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(300);
+    let sink = fake_turn(&h, &chat.id, &mac_id).await;
+    open_call(&sink, "call_slow", "rename_topic").await;
+    h.state.turns.register_write(
+        &chat.id,
+        "call_slow",
+        tokio::spawn(std::future::pending::<ToolOutput>()),
+    );
+    // The client goes away while Stop waits for the change.
+    let request = {
+        let url = h.u(&format!("/api/chats/{}/stop", chat.id));
+        let http = h.http.clone();
+        let t = t.clone();
+        tokio::spawn(async move { http.post(url).bearer_auth(t).send().await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    request.abort();
+    let d = wait_chat(&h, &t, &chat.id, idle).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "call rename_topic (cancelled)".to_string(),
+            "result failed: Stopped".to_string(),
+            format!("action: {STOPPED}"),
+        ]
+    );
+    assert!(h.state.turns.stopping.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_finishes_a_write_the_loop_was_still_recording() {
+    let (h, t) = signed_in().await;
+    let mac_id = me(&h, &t).await.device.id;
+    let chat = create_chat(&h, &t, json!({})).await.chat;
+    let sink = fake_turn(&h, &chat.id, &mac_id).await;
+    open_call(&sink, "call_topic", "create_topic").await;
+    let mut out = ToolOutput::ok(r#"{"id":"t9","title":"Waves"}"#, "Created “Waves”");
+    out.cards.push(Card::Result(ResultCard {
+        target: ResultTarget::Topic {
+            topic_id: "t9".into(),
+        },
+        title: "Waves".into(),
+    }));
+    h.state.turns.register_write(&chat.id, "call_topic", {
+        let out = out.clone();
+        tokio::spawn(async move { out })
+    });
+    // The loop's `record` stored the result; Stop lands before the call is `Done` and
+    // before its card.
+    sink.add_item(
+        ItemStatus::Done,
+        ChatItemKind::ToolResult {
+            call_id: "call_topic".into(),
+            ok: true,
+            summary: out.summary.clone(),
+            output_bytes: out.output.len() as u64,
+        },
+        ItemRecord {
+            model_items: Some(vec![margin_agent::function_call_output(
+                "call_topic",
+                &out.output,
+            )]),
+            full_output: Some(out.output.clone()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let r = h
+        .post(&t, &format!("/api/chats/{}/stop", chat.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d = detail(&h, &t, &chat.id).await;
+    assert_eq!(
+        lines(&d),
+        vec![
+            "call create_topic".to_string(),
+            "result ok: Created “Waves”".to_string(),
+            "card result".to_string(),
             format!("action: {STOPPED}"),
         ]
     );

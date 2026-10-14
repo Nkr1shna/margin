@@ -20,7 +20,7 @@ use margin_shared::{
 };
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::chats::{self, StoredChatItem};
 use crate::error::{AppError, AppResult};
@@ -46,8 +46,10 @@ pub const WRITE_UNCONFIRMED: &str =
     "Stopped before this change was confirmed; check whether it took effect.";
 /// How long Stop waits, in all, for the changes the turn's Write tools started.
 pub const STOP_WRITE_WAIT: Duration = Duration::from_secs(15);
-/// Most output tokens of the call that writes a chat's title.
-pub const TITLE_MAX_OUTPUT_TOKENS: u32 = 30;
+/// Most output tokens of the call that writes a chat's title. Reasoning tokens count
+/// toward it, so it leaves room for the model's (low effort) reasoning; the title itself
+/// is kept short by the instructions and `model_title`.
+pub const TITLE_MAX_OUTPUT_TOKENS: u32 = 1024;
 /// Most characters of the first message, and of the answer, the title call is given.
 const TITLE_INPUT_MAX_CHARS: usize = 2000;
 /// What the title call is asked.
@@ -104,11 +106,13 @@ impl Turns {
         }
     }
 
-    /// Ends the chat's turn task, if one runs. Its items are left as they are.
-    pub fn abort(&self, chat_id: &str) {
-        if let Some(turn) = self.running.lock().unwrap().remove(chat_id) {
-            turn.abort.abort();
-        }
+    /// Ends the chat's turn task, if one runs, and returns it: it may still be inside a
+    /// poll on another thread, and is gone once it is awaited. Its items are left as
+    /// they are.
+    pub fn abort(&self, chat_id: &str) -> Option<JoinHandle<()>> {
+        let turn = self.running.lock().unwrap().remove(chat_id)?;
+        turn.task.abort();
+        Some(turn.task)
     }
 
     /// Registers a library change an agent tool runs to its end (`agent_tools::to_the_end`)
@@ -173,7 +177,7 @@ pub type Slot = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
 /// A turn's task.
 pub struct RunningTurn {
     pub turn_id: Id,
-    pub abort: AbortHandle,
+    pub task: JoinHandle<()>,
     /// Set while the turn waits on a confirmation card: (card item id, answer).
     pub decision: Option<(Id, oneshot::Sender<Decision>)>,
     /// When this run of the turn started (kept for `ChatState::Running` while it waits
@@ -372,7 +376,7 @@ fn spawn_locked(
         chat_id.to_string(),
         RunningTurn {
             turn_id: turn_id.to_string(),
-            abort: task.abort_handle(),
+            task,
             decision: None,
             started_at,
         },
@@ -660,8 +664,11 @@ async fn send_pending_locked(state: &AppState, chat: &mut Chat) {
 /// the owner.", sets `Idle` (no longer waiting), then sends the pending message, if any.
 /// 409 "not_running" if the chat isn't busy. A Stop while another is finishing the same
 /// turn answers the chat as it is.
+///
+/// Everything after the task is aborted runs as its own task, so a request dropped
+/// meanwhile (the client went away) can't leave the turn half stopped.
 pub async fn stop(state: &AppState, chat_id: &str, by_device: &str) -> AppResult<Chat> {
-    let (turn_id, writes) = {
+    let (turn_id, task) = {
         let _w = state.write_lock.lock().await;
         let chat = chats::chat(state, chat_id).await?;
         let Some(turn_id) = chat
@@ -684,10 +691,40 @@ pub async fn stop(state: &AppState, chat_id: &str, by_device: &str) -> AppResult
         {
             return Ok(chat);
         }
-        state.turns.abort(chat_id);
-        (turn_id, state.turns.take_writes(chat_id))
+        (turn_id, state.turns.abort(chat_id))
     };
-    let writes = await_writes(state, writes).await;
+    let rest = tokio::spawn(finish_stop(
+        state.clone(),
+        chat_id.to_string(),
+        turn_id,
+        by_device.to_string(),
+        task,
+    ));
+    rest.await.unwrap_or_else(|e| {
+        // `finish_stop` panicked: another Stop may try again.
+        state.turns.stopping.lock().unwrap().remove(chat_id);
+        Err(AppError::internal(format!("stopping a turn failed: {e}")))
+    })
+}
+
+/// Stop after the task was aborted: waits until it is gone (a poll under way when it was
+/// aborted can still register a write), takes and waits for the writes, then winds the
+/// turn up, sets `Idle`, sends the pending message and lets the chat be stopped again.
+async fn finish_stop(
+    state: AppState,
+    chat_id: Id,
+    turn_id: Id,
+    by_device: String,
+    task: Option<JoinHandle<()>>,
+) -> AppResult<Chat> {
+    let state = &state;
+    let chat_id = chat_id.as_str();
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+    // Nothing else registers for the chat now: its turn is gone and no other starts
+    // while it is busy.
+    let writes = await_writes(state, state.turns.take_writes(chat_id)).await;
     let _w = state.write_lock.lock().await;
     let stopped = async {
         let mut chat = chats::chat(state, chat_id).await?;
@@ -696,16 +733,7 @@ pub async fn stop(state: &AppState, chat_id: &str, by_device: &str) -> AppResult
         if !chat.state.is_busy() || chat.state.turn_id() != Some(turn_id.as_str()) {
             return Ok(chat);
         }
-        wind_up_locked(
-            state,
-            chat_id,
-            &turn_id,
-            Ending::Stop {
-                by_device: by_device.to_string(),
-            },
-            writes,
-        )
-        .await?;
+        wind_up_locked(state, chat_id, &turn_id, Ending::Stop { by_device }, writes).await?;
         chat.state = ChatState::Idle;
         chat.waiting = None;
         chats::save_chat_locked(state, &mut chat).await?;
@@ -869,8 +897,11 @@ enum Ending {
 /// Finishes what a stopped, interrupted or failed turn left behind, in this order: each
 /// unanswered call whose change was started (`writes`, by call id) gets its real result
 /// (`Some`: the `ToolResult`, the call `Done`, its cards) or, when it didn't finish in
-/// time (`None`), a failed `ToolResult` saying so; its other `InProgress` items become
-/// `Cancelled` (keeping the text streamed so far); every other unanswered call gets a
+/// time (`None`), a failed `ToolResult` saying so; a finished write the loop was still
+/// recording (its result stored, the call not yet `Done` or its cards not all added) is
+/// finished from its real result, without a second `ToolResult`; the turn's other
+/// `InProgress` items become `Cancelled` (keeping the text streamed so far); every other
+/// unanswered call gets a
 /// failed `ToolResult`; a pending confirmation is denied (Stop) or expired (restart,
 /// failure); then, for Stop and restart, the `Action` saying what happened. Call with
 /// `write_lock` held, after the task is gone.
@@ -916,6 +947,31 @@ async fn wind_up_locked(
                 };
                 add_result_locked(state, &row.item, out).await?;
             }
+        }
+    }
+    // A finished write whose result the loop stored but whose call it hadn't marked
+    // `Done`, or whose cards it hadn't all added, when the turn ended (Stop can land
+    // between the loop's `record` steps): finished from the real result.
+    for (call_id, out) in writes {
+        let Some(out) = out else { continue };
+        let Some(call) = rows.iter().position(
+            |r| matches!(&r.item.kind, ChatItemKind::ToolCall { call_id: c, .. } if *c == call_id),
+        ) else {
+            continue;
+        };
+        let have = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.item.kind,
+                    ChatItemKind::Card { call_id: c, card } if *c == call_id && !matches!(card, Card::Confirmation(_))
+                )
+            })
+            .count();
+        let cards: Vec<Card> = out.cards.into_iter().skip(have).collect();
+        let row = &mut rows[call];
+        if row.item.status == ItemStatus::InProgress || !cards.is_empty() {
+            finish_call_locked(state, row, cards).await?;
         }
     }
     // Recorded above; the steps below see them answered.
@@ -1061,12 +1117,25 @@ async fn record_result_locked(
     call: &mut StoredChatItem,
     mut out: ToolOutput,
 ) -> anyhow::Result<()> {
+    if !matches!(call.item.kind, ChatItemKind::ToolCall { .. }) {
+        return Ok(());
+    }
+    let cards = std::mem::take(&mut out.cards);
+    add_result_locked(state, &call.item, out).await?;
+    finish_call_locked(state, call, cards).await
+}
+
+/// Marks the call `call` (a `ToolCall` row) `Done` and adds one `Card` item per card.
+/// Call with `write_lock` held.
+async fn finish_call_locked(
+    state: &AppState,
+    call: &mut StoredChatItem,
+    cards: Vec<Card>,
+) -> anyhow::Result<()> {
     let ChatItemKind::ToolCall { call_id, .. } = &call.item.kind else {
         return Ok(());
     };
     let call_id = call_id.clone();
-    let cards = std::mem::take(&mut out.cards);
-    add_result_locked(state, &call.item, out).await?;
     let live = state.turns.live_text.lock().unwrap().remove(&call.item.id);
     if let Some(text) = live {
         set_streaming_text(&mut call.item.kind, text);
