@@ -24,9 +24,11 @@ pub const SETTINGS: &str = "settings";
 pub const SOURCE: &str = "source";
 /// Embedded pieces of sources (`sources::ChunkRow`).
 pub const CHUNK: &str = "chunk";
+/// Embedded pictures and sound of sources (`sources::MediaRow`).
+pub const MEDIA: &str = "media";
 
-const TABLES: [&str; 9] = [
-    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK,
+const TABLES: [&str; 10] = [
+    TOPIC, LESSON, NOTE, VIDEO, PROPOSAL, DEVICE, SETTINGS, SOURCE, CHUNK, MEDIA,
 ];
 
 #[derive(Clone)]

@@ -126,7 +126,7 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
         .list::<StoredLesson>(db::LESSON)
         .await?
         .into_iter()
-        .map(|l| l.lesson)
+        .map(|l| state.public_lesson(&l.lesson))
         .collect();
     sort_lessons(&mut lessons);
     let mut notes: Vec<Note> = state.store.list(db::NOTE).await?;
@@ -136,6 +136,7 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
     let videos = videos.iter().map(|v| state.public_video(v)).collect();
     let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
     sources.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let sources = sources.iter().map(|s| state.public_source(s)).collect();
     Ok(Json(Library {
         topics,
         lessons,
@@ -315,7 +316,7 @@ pub async fn patch_lesson(
         row.lesson
     };
     state.emit_lesson(&lesson);
-    Ok(Json(lesson))
+    Ok(Json(state.public_lesson(&lesson)))
 }
 
 pub async fn delete_lesson(

@@ -17,7 +17,10 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use margin_ai::{AiError, LessonContext, Passage, SceneRequest};
 use margin_embed::fake::FakeEmbedder;
-use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Page};
+use margin_embed::{
+    Chunk, EmbedError, Embedder, Extracted, ImageTokens, ModelFiles, Page, Picture, Transcript,
+    Word,
+};
 use margin_service::config::Config;
 use margin_service::db::Store;
 use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools};
@@ -114,6 +117,9 @@ pub struct FakeGenerator {
     pub lesson_requests: Mutex<Vec<LessonContext>>,
     /// Delay between lesson deltas.
     pub delta_delay_ms: AtomicU32,
+    /// When set, every lesson is this body (streamed in two halves) instead of the
+    /// default text.
+    pub lesson_body: Mutex<Option<String>>,
 }
 
 pub fn outline_for(req: &AskRequest) -> Outline {
@@ -170,14 +176,24 @@ impl Generator for FakeGenerator {
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
             let title = &ctx.outline[ctx.index].title;
-            let parts = [
-                format!("# {title}\n\n"),
-                format!(
-                    "This lesson of {} / {} ",
-                    ctx.subject_title, ctx.topic_title
-                ),
-                "explains the idea step by step.".to_string(),
-            ];
+            let custom = self.lesson_body.lock().unwrap().clone();
+            let parts = match custom {
+                Some(body) => {
+                    let half = body
+                        .char_indices()
+                        .nth(body.chars().count() / 2)
+                        .map_or(0, |(i, _)| i);
+                    vec![body[..half].to_string(), body[half..].to_string()]
+                }
+                None => vec![
+                    format!("# {title}\n\n"),
+                    format!(
+                        "This lesson of {} / {} ",
+                        ctx.subject_title, ctx.topic_title
+                    ),
+                    "explains the idea step by step.".to_string(),
+                ],
+            };
             let mut out = String::new();
             let delay = self.delta_delay_ms.load(Ordering::SeqCst).max(20);
             for p in &parts {
@@ -377,13 +393,51 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
 /// Text in a source that makes the fake extraction fail.
 pub const UNREADABLE: &str = "%UNREADABLE%";
 
+/// Starts every fake rendered page and video frame (the rest is its text, which
+/// `FakeEmbedder` embeds).
+pub const FAKE_PICTURE: &str = "PICTURE ";
+
 /// Model files from the fake Hugging Face, `FakeEmbedder` as the model, and simple
-/// extraction and chunking: a "PDF" is UTF-8 with pages separated by form feeds, and
-/// chunks are paragraphs.
+/// extraction and chunking, all on UTF-8 test files:
+/// - a "PDF" has pages separated by form feeds; each page is also "rendered" to
+///   `page-{n}.png` holding `FAKE_PICTURE` and its text;
+/// - an "image" is its own picture;
+/// - "audio" is the words it says, one a second;
+/// - a "video" has `frame: <what it shows>` lines (frames at 2.5 s, 7.5 s, …, written as
+///   `frame-{ms}.jpg`) and `say: <words>` lines (its soundtrack);
+/// - chunks are paragraphs, and the transcriber hears the words back (unless
+///   `no_transcriber` is set, as if `fluidaudiocli` weren't installed).
 #[derive(Default)]
 pub struct FakeSourceTools {
     pub loads: AtomicU32,
     pub extracts: AtomicU32,
+    pub transcribes: AtomicU32,
+    pub no_transcriber: AtomicBool,
+    /// What each fake sound says, by `sound_key`.
+    spoken: Mutex<std::collections::HashMap<u64, String>>,
+}
+
+/// Identifies fake sound by its samples.
+fn sound_key(samples: &[f32]) -> u64 {
+    samples.iter().fold(0xcbf29ce484222325u64, |h, s| {
+        (h ^ s.to_bits() as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+impl FakeSourceTools {
+    /// 16 kHz "sound" of `text`, one second per word, remembered for the transcriber.
+    fn speak(&self, text: &str) -> Vec<f32> {
+        let mut samples = Vec::new();
+        for word in text.split_whitespace() {
+            let level = (word.bytes().map(u32::from).sum::<u32>() % 1000) as f32 / 2000.0;
+            samples.extend(std::iter::repeat_n(level, 16_000));
+        }
+        self.spoken
+            .lock()
+            .unwrap()
+            .insert(sound_key(&samples), text.to_string());
+        samples
+    }
 }
 
 impl SourceTools for FakeSourceTools {
@@ -462,24 +516,107 @@ impl SourceTools for FakeSourceTools {
         Ok(Arc::new(FakeEmbedder))
     }
 
-    fn extract(&self, path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
+    fn extract(
+        &self,
+        path: &Path,
+        kind: SourceKind,
+        media_dir: &Path,
+    ) -> Result<Extracted, EmbedError> {
         self.extracts.fetch_add(1, Ordering::SeqCst);
         let text = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
         if text.contains(UNREADABLE) {
             return Err(EmbedError::Extract("the file is damaged".into()));
         }
-        let pages = match kind {
-            SourceKind::Pdf => text
-                .split('\x0c')
+        let picture = |path: PathBuf, page, at_ms, tokens| Picture {
+            path,
+            page,
+            at_ms,
+            tokens,
+        };
+        let mut doc = Extracted::default();
+        match kind {
+            SourceKind::Pdf => {
+                std::fs::create_dir_all(media_dir)?;
+                for (i, t) in text.split('\x0c').enumerate() {
+                    let n = i as u32 + 1;
+                    let file = media_dir.join(margin_embed::page_file(n));
+                    std::fs::write(&file, format!("{FAKE_PICTURE}{t}"))?;
+                    doc.pictures
+                        .push(picture(file, Some(n), None, ImageTokens::High));
+                    doc.pages.push(Page {
+                        number: Some(n),
+                        text: t.to_string(),
+                    });
+                }
+            }
+            SourceKind::Image => {
+                doc.pictures
+                    .push(picture(path.to_path_buf(), None, None, ImageTokens::High));
+            }
+            SourceKind::Audio => {
+                doc.sound = Some(self.speak(&text));
+                doc.duration_ms = Some(text.split_whitespace().count() as u64 * 1000);
+            }
+            SourceKind::Video => {
+                std::fs::create_dir_all(media_dir)?;
+                let mut said = String::new();
+                let mut frames = 0u64;
+                for line in text.lines() {
+                    if let Some(f) = line.strip_prefix("frame: ") {
+                        let ms = 2_500 + 5_000 * frames;
+                        let file = media_dir.join(margin_embed::frame_file(ms));
+                        std::fs::write(&file, format!("{FAKE_PICTURE}{f}"))?;
+                        doc.pictures
+                            .push(picture(file, None, Some(ms), ImageTokens::Medium));
+                        frames += 1;
+                    } else if let Some(s) = line.strip_prefix("say: ") {
+                        said.push_str(s);
+                        said.push(' ');
+                    }
+                }
+                if !said.trim().is_empty() {
+                    doc.sound = Some(self.speak(&said));
+                }
+                doc.duration_ms = Some(frames * 5_000);
+            }
+            SourceKind::Text | SourceKind::Code => doc.pages.push(Page { number: None, text }),
+        }
+        Ok(doc)
+    }
+
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        _work_dir: &Path,
+    ) -> Result<Option<Transcript>, EmbedError> {
+        self.transcribes.fetch_add(1, Ordering::SeqCst);
+        if self.no_transcriber.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let said = self
+            .spoken
+            .lock()
+            .unwrap()
+            .get(&sound_key(samples))
+            .cloned();
+        let Some(said) = said else {
+            return Err(EmbedError::Transcribe("the speech is unclear".into()));
+        };
+        Ok(Some(Transcript {
+            words: said
+                .split_whitespace()
                 .enumerate()
-                .map(|(i, t)| Page {
-                    number: Some(i as u32 + 1),
-                    text: t.to_string(),
+                .map(|(i, w)| Word {
+                    text: w.to_string(),
+                    start_ms: i as u64 * 1000,
+                    end_ms: i as u64 * 1000 + 800,
                 })
                 .collect(),
-            _ => vec![Page { number: None, text }],
-        };
-        Ok(Extracted { pages })
+        }))
+    }
+
+    fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {
+        Ok(("image/jpeg".into(), std::fs::read(path)?))
     }
 
     fn chunk(
@@ -502,6 +639,8 @@ impl SourceTools for FakeSourceTools {
                 chunks.push(Chunk {
                     text: para.to_string(),
                     page: page.number,
+                    start_ms: None,
+                    end_ms: None,
                 });
             }
         }
@@ -549,6 +688,10 @@ pub struct Setup {
     pub model_downloaded: bool,
     /// Files to put in the data folder before starting, by path inside it.
     pub files: Vec<(String, Vec<u8>)>,
+    /// A downloaded real model: when set, the service reads sources with the real
+    /// `EmbedTools` (Core ML, PDFKit, ImageIO, AVFoundation, fluidaudiocli) and this
+    /// model, linked into its data folder, instead of the fakes.
+    pub real_model: Option<PathBuf>,
 }
 
 impl Default for Setup {
@@ -558,6 +701,7 @@ impl Default for Setup {
             secrets: MemoryStore::new().with(GITHUB_CLIENT_SECRET, CLIENT_SECRET),
             model_downloaded: true,
             files: Vec::new(),
+            real_model: None,
         }
     }
 }
@@ -586,7 +730,11 @@ pub async fn start_with(setup: Setup) -> Harness {
         Some(s) => s,
         None => Store::memory().await.unwrap(),
     };
-    if setup.model_downloaded {
+    if let Some(real) = &setup.real_model {
+        let model = config.embedding_model_dir();
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(real, &model).unwrap();
+    } else if setup.model_downloaded {
         let model = config.embedding_model_dir();
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(model.join(MODEL_FILE), vec![0u8; MODEL_BYTES as usize]).unwrap();
@@ -607,7 +755,10 @@ pub async fn start_with(setup: Setup) -> Harness {
         secrets: secrets.clone(),
         generator: generator.clone(),
         renderer: renderer.clone(),
-        source_tools: source_tools.clone(),
+        source_tools: match setup.real_model {
+            Some(_) => Arc::new(margin_service::engines::EmbedTools),
+            None => source_tools.clone(),
+        },
         hf_base,
         allow_unsandboxed_render: true,
     })

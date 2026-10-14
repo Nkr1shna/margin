@@ -204,7 +204,8 @@ async fn uploads_are_read_embedded_and_listed() {
     assert_eq!(
         pdf.status,
         SourceStatus::Ready {
-            chunks: 3,
+            // Three paragraphs and two pages as pictures.
+            chunks: 5,
             pages: Some(2)
         }
     );
@@ -396,8 +397,19 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
         .last()
         .cloned()
         .unwrap();
-    // Every chunk of the two named sources (5 of them), best first, none of the third.
-    assert_eq!(passages.len(), 5, "{passages:?}");
+    // Every chunk of the two named sources (5 of them) and both pages of the PDF as
+    // pictures, best first, none of the third.
+    assert_eq!(passages.len(), 7, "{passages:?}");
+    let pictures: Vec<_> = passages.iter().filter(|p| p.image.is_some()).collect();
+    assert_eq!(pictures.len(), 2);
+    assert!(
+        pictures
+            .iter()
+            .all(|p| p.source == "dsp.pdf" && p.text.is_empty())
+    );
+    let mut pages: Vec<_> = pictures.iter().map(|p| p.page.unwrap()).collect();
+    pages.sort();
+    assert_eq!(pages, [1, 2]);
     assert!(passages.iter().any(|p| p.source == "notes/fourier.md"
         && p.page.is_none()
         && p.text.starts_with("The coefficient a_n is the projection")));
@@ -405,7 +417,10 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
         && p.page == Some(2)
         && p.text == "The Fourier coefficient formula for a periodic signal."));
     assert!(!passages.iter().any(|p| p.source == "bread.md"));
-    assert_eq!(passages.last().unwrap().text, "Intro page.");
+    assert_eq!(
+        passages.iter().rfind(|p| p.image.is_none()).unwrap().text,
+        "Intro page."
+    );
 
     // Accepting attaches the Ask's sources (and their chunks) to the new topic.
     let mut socket = h.socket(&t).await;
@@ -470,7 +485,7 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
         let requests = h.generator.lesson_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for ctx in requests.iter() {
-            assert_eq!(ctx.passages.len(), 5);
+            assert_eq!(ctx.passages.len(), 7);
             assert!(ctx.passages.iter().any(|p| p.source == "dsp.pdf"));
             assert!(!ctx.passages.iter().any(|p| p.source == "bread.md"));
         }
@@ -754,6 +769,8 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
         topic_id: Some("t1".into()),
         ord: 0,
         page: None,
+        start_ms: None,
+        end_ms: None,
         text: "stale".into(),
         vector: vec![0.0; margin_embed::DIM],
     };
