@@ -54,6 +54,16 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
                 "One of the sources isn't on the service any more. Add it again.",
             ));
         };
+        if source.workspace_id.is_some() {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unknown_source",
+                format!(
+                    "{} belongs to a folder; attach the folder to the chat instead.",
+                    source.name
+                ),
+            ));
+        }
         if source.topic_id.is_some() && source.topic_id != req.parent_topic_id {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
@@ -149,6 +159,7 @@ pub async fn propose_planned(
         proposal: proposal.clone(),
         plan,
         pipeline_hash: Some(state.pipeline.load_full().hash.clone()),
+        workspace_ids: workspaces,
     };
     let superseded = {
         let _w = state.write_lock.lock().await;
@@ -403,6 +414,7 @@ pub async fn accept_proposal(
                 author: Author::Agent,
                 prompt: None,
                 with_quiz: false,
+                workspace_ids: stored.workspace_ids.clone(),
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
@@ -475,6 +487,8 @@ pub struct NewLesson {
     pub minutes: u32,
     pub level: Level,
     pub with_quiz: bool,
+    /// The folders it draws on (the chat's, for `write_lesson`).
+    pub workspace_ids: Vec<Id>,
 }
 
 /// Appends a Queued lesson, written by the agent, to a topic and starts its job. With no
@@ -529,6 +543,7 @@ pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson
             author: Author::Agent,
             prompt,
             with_quiz: req.with_quiz,
+            workspace_ids: req.workspace_ids.clone(),
         };
         state.store.put(db::LESSON, &row.lesson.id, &row).await?;
         row.lesson
@@ -629,7 +644,7 @@ async fn lesson_context(
         &planned,
         (index == 0).then_some(prompt.trim()),
     );
-    let retrieved = lesson_passages(state, &row.lesson, &asked, query).await;
+    let retrieved = lesson_passages(state, &row.lesson, &asked, &row.workspace_ids, query).await;
     let passages = retrieval::for_writer(state, &retrieved).await;
 
     let ctx = LessonContext {
@@ -647,14 +662,15 @@ async fn lesson_context(
     Ok((ctx, proposal, retrieved))
 }
 
-/// A lesson's passages: retrieved from its topic and the sources its course was asked
-/// with (waiting for those still being read, up to `sources::SOURCE_WAIT`), packed to
+/// A lesson's passages: retrieved from its topic, the sources its course was asked with
+/// and the attached folders it draws on (waiting for those still being read, up to `sources::SOURCE_WAIT`), packed to
 /// the pipeline's budget against the writing model's window. When retrieval fails the
 /// lesson is written without passages (logged).
 async fn lesson_passages(
     state: &AppState,
     lesson: &Lesson,
     asked: &[Id],
+    workspace_ids: &[Id],
     plan: QueryPlan,
 ) -> Vec<Packed> {
     let result = async {
@@ -669,6 +685,10 @@ async fn lesson_passages(
         }];
         if !existing.is_empty() {
             scopes.push(Scope::Sources { ids: existing });
+        }
+        // The folders it draws on that are still there: their current stored passages.
+        for ws in crate::workspaces::by_ids(state, workspace_ids).await? {
+            scopes.push(Scope::Workspace { id: ws.id });
         }
         let scope = Scope::Union { scopes };
         retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
@@ -708,6 +728,10 @@ pub struct StoredProposal {
     pub plan: Option<CoursePlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_hash: Option<String>,
+    /// The folders attached to the chat when the course was proposed: its lessons
+    /// retrieve from them too (D7c).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_ids: Vec<Id>,
 }
 
 /// The planner's answer (`margin_ai::prompts`, `plan-v1`): the outline plus, per

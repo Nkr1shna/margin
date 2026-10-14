@@ -34,7 +34,7 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, context_api, embedding, events, ingest, library, media, retrieval, search,
+    ask, chats, context_api, embedding, events, folders, ingest, library, media, retrieval, search,
     settings, sources, trace, turns, uploads, video, workspaces,
 };
 use anyhow::Context;
@@ -135,6 +135,8 @@ impl Service {
             tracer: Tracer::new(),
             ingest_queue: IngestQueue::new(),
             retrieval_cache: RetrievalCache::new(retrieval::RETRIEVAL_CACHE_ENTRIES),
+            folder_sync_emits: Mutex::new(Default::default()),
+            sources_replaced: Mutex::new(Default::default()),
         });
 
         // Traces first, so recovery and the workers are traced.
@@ -267,6 +269,11 @@ pub fn router(state: AppState) -> Router {
             get(workspaces::list_workspaces).post(workspaces::create_workspace),
         )
         .route("/api/workspaces/{id}", delete(workspaces::delete_workspace))
+        .route(
+            "/api/workspaces/{id}/sync",
+            post(folders::sync).layer(folders::manifest_limit()),
+        )
+        .route("/api/workspaces/{id}/files", get(folders::files))
         .route(routes::PROJECTS, get(context_api::projects))
         .route(routes::CONTEXT_SEARCH, post(context_api::search))
         .route(
@@ -348,7 +355,9 @@ pub async fn recover(state: &AppState) -> anyhow::Result<Resume> {
     let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
     sources.sort_by_key(|s| s.created_at);
     for mut s in sources {
+        // A folder's files stay while the folder is attached (removing it deletes them).
         if s.topic_id.is_none()
+            && s.workspace_id.is_none()
             && !in_chats.contains(s.id.as_str())
             && now - s.created_at > sources::UNATTACHED_TTL
         {

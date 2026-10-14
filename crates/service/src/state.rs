@@ -85,6 +85,11 @@ pub struct StoredLesson {
     /// Whether a lesson with no proposal ends with a "Check yourself" quiz.
     #[serde(default)]
     pub with_quiz: bool,
+    /// The attached folders the lesson draws on (its proposal's, or the chat's folders
+    /// when the agent wrote it with `write_lesson`); retrieval covers those that still
+    /// exist, every time it is written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_ids: Vec<Id>,
 }
 
 /// Who wrote a note's or a lesson's text, for owner decision Q2: the agent changes its
@@ -243,6 +248,11 @@ pub struct App {
     /// Documents waiting to be indexed.
     pub ingest_queue: IngestQueue,
     pub retrieval_cache: RetrievalCache,
+    /// When each folder's `WorkspaceChanged` last went out (`folders::emit_changed`).
+    pub folder_sync_emits: Mutex<HashMap<Id, crate::folders::EmitSlot>>,
+    /// Folder sources replaced by a new upload while being read: the read in progress
+    /// leaves their status alone (the new copy is queued behind it).
+    pub sources_replaced: Mutex<HashSet<Id>>,
 }
 
 impl App {

@@ -983,10 +983,8 @@ async fn wind_up_locked(
             // The call stays unfinished: `Cancelled` below.
             None => {
                 let out = ToolOutput {
-                    ok: false,
-                    output: margin_agent::error_output(WRITE_UNCONFIRMED),
                     summary: "Stopped".into(),
-                    cards: Vec::new(),
+                    ..ToolOutput::error(WRITE_UNCONFIRMED)
                 };
                 add_result_locked(state, &row.item, out).await?;
             }

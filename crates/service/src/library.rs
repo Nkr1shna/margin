@@ -146,6 +146,8 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
     videos.sort_by_key(|v| v.video.created_at);
     let videos = videos.iter().map(|v| state.public_video(v)).collect();
     let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+    // A folder's files are listed with the folder (`routes::workspace_files`).
+    sources.retain(|s| s.workspace_id.is_none());
     sources.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     let sources = sources.iter().map(|s| state.public_source(s)).collect();
     Ok(Json(Library {

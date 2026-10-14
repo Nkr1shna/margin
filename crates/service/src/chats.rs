@@ -200,11 +200,18 @@ async fn check_sources(state: &AppState, mut ids: Vec<Id>) -> AppResult<Vec<Id>>
     let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     for id in &ids {
-        if state.store.get::<Source>(db::SOURCE, id).await?.is_none() {
+        let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 "unknown_source",
                 "One of the files isn't on the service any more. Add it again.",
+            ));
+        };
+        if source.workspace_id.is_some() {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unknown_source",
+                "That file belongs to a folder; attach the folder instead.",
             ));
         }
     }

@@ -1367,7 +1367,14 @@ async fn folder_files_are_folder_documents_searchable_from_their_folder() {
     margin_service::ingest::queue_source(&h.state, "f1")
         .await
         .unwrap();
-    wait_source(&h, &t, "f1", is_ready).await;
+    // A folder's files aren't in the library; read the row.
+    eventually(|| async {
+        let s: Source = h.state.store.get(db::SOURCE, "f1").await.unwrap()?;
+        matches!(s.status, SourceStatus::Ready { .. }).then_some(())
+    })
+    .await;
+    // …and they never are.
+    assert!(library(&h, &t).await.sources.iter().all(|s| s.id != "f1"));
     let doc = document(&h, "f1").await;
     assert_eq!(
         doc.origin,

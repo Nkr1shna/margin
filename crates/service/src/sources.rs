@@ -28,13 +28,19 @@ use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use chrono::Utc;
+use axum::Extension;
+use chrono::{DateTime, Utc};
 use margin_ai::{Image, Passage};
 use margin_embed::{Purpose, Transcript};
 use margin_shared::context::{ACCESS_COMPANY, Modality};
 use margin_shared::{
-    Citation, Event, Id, SOURCE_KINDS, Source, SourceKind, SourceStatus, TranscriptSegment, routes,
+    Citation, Event, FOLDER_FILE_TYPES_TEXT, FileStamp, Id, SOURCE_KINDS, Source, SourceKind,
+    SourceStatus, TranscriptSegment, Workspace, folder_file_type, routes,
 };
+
+use crate::auth::CurrentDevice;
+use crate::folders;
+use crate::state::DeviceRow;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -141,20 +147,35 @@ pub struct UploadQuery {
     pub name: String,
     pub folder: Option<String>,
     pub topic_id: Option<Id>,
+    /// A file of the calling device's attached folder (`name` is its path inside it).
+    #[serde(default)]
+    pub workspace_id: Option<Id>,
+    /// The file's modification time on the device (RFC 3339).
+    #[serde(default)]
+    pub modified: Option<DateTime<Utc>>,
 }
 
 /// An upload's file name, folder and topic, checked: a name Margin can read, and a topic
-/// that exists.
+/// that exists; or, for a folder's file, a path inside a folder the caller holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upload {
     pub name: String,
     pub folder: Option<String>,
     pub topic_id: Option<Id>,
     pub kind: SourceKind,
+    /// The attached folder the file belongs to.
+    #[serde(default)]
+    pub workspace: Option<Workspace>,
+    #[serde(default)]
+    pub modified: Option<DateTime<Utc>>,
 }
 
 impl Upload {
-    pub async fn check(state: &AppState, q: UploadQuery) -> AppResult<Upload> {
+    /// Checks an upload's query; `device` is the device sending it.
+    pub async fn check(state: &AppState, q: UploadQuery, device: &DeviceRow) -> AppResult<Upload> {
+        if let Some(workspace_id) = q.workspace_id.clone() {
+            return Self::check_folder_file(state, &workspace_id, q, device).await;
+        }
         let name: String = q.name.trim().chars().take(500).collect();
         if name.is_empty() {
             return Err(AppError::bad_request("Say what the file is called."));
@@ -178,16 +199,101 @@ impl Upload {
             folder,
             topic_id: q.topic_id,
             kind,
+            workspace: None,
+            modified: q.modified,
         })
     }
 
-    /// The largest file of its kind.
-    pub fn limit(&self) -> u64 {
-        routes::max_source_bytes(self.kind)
+    /// A file of an attached folder: the folder must exist (404) and be the caller's
+    /// (403 "not_yours"), no topic (400), a path inside the folder (400 "bad_path") of a
+    /// type folders take (400 "unsupported_source"). `folder` is the folder's name.
+    async fn check_folder_file(
+        state: &AppState,
+        workspace_id: &str,
+        q: UploadQuery,
+        device: &DeviceRow,
+    ) -> AppResult<Upload> {
+        let workspace: Workspace = state
+            .store
+            .get(db::WORKSPACE, workspace_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("folder"))?;
+        if workspace.device_id != device.id {
+            return Err(AppError::new(
+                StatusCode::FORBIDDEN,
+                "not_yours",
+                format!(
+                    "This folder is attached on {}; only that device sends its files.",
+                    workspace.device_name
+                ),
+            ));
+        }
+        if q.topic_id.is_some() {
+            return Err(AppError::bad_request(
+                "A folder's file can't be filed under a topic.",
+            ));
+        }
+        let Some(name) = folders::clean_path(&q.name) else {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_path",
+                folders::bad_path_text(&q.name),
+            ));
+        };
+        let Some(kind) = folder_file_type(&name) else {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_source",
+                format!("Margin doesn't take {name} from folders: only {FOLDER_FILE_TYPES_TEXT}."),
+            ));
+        };
+        Ok(Upload {
+            name,
+            folder: Some(workspace.name.clone()),
+            topic_id: None,
+            kind: kind.source_kind(),
+            workspace: Some(workspace),
+            modified: q.modified,
+        })
     }
 
-    /// 413 "too_large", naming its kind's limit.
+    /// The largest file of its kind; a folder's files have no limit (owner), only
+    /// `UPLOAD_PART_BYTES` bounds one request.
+    pub fn limit(&self) -> u64 {
+        match self.workspace {
+            Some(_) => u64::MAX,
+            None => routes::max_source_bytes(self.kind),
+        }
+    }
+
+    /// Whether this is a file of an attached folder.
+    pub fn is_folder_file(&self) -> bool {
+        self.workspace.is_some()
+    }
+
+    /// The most one request may carry: the kind's limit, and for a folder's file one
+    /// part (`UPLOAD_PART_BYTES`; bigger files go through `SOURCE_UPLOADS`).
+    pub fn request_limit(&self) -> u64 {
+        match self.workspace {
+            Some(_) => routes::UPLOAD_PART_BYTES,
+            None => self.limit(),
+        }
+    }
+
+    /// 413 "too_large", naming its kind's limit (or, for a folder's file, saying it
+    /// goes up in parts).
     pub fn too_large(&self) -> AppError {
+        if self.is_folder_file() {
+            return AppError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!(
+                    "{} is over {} MB: send it in parts (source uploads).",
+                    self.name,
+                    routes::UPLOAD_PART_BYTES / (1024 * 1024)
+                ),
+            );
+        }
         AppError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "too_large",
@@ -231,10 +337,16 @@ impl ReceiveError {
 }
 
 /// Streams `body` onto the end of `path` (created if missing) without holding it in
-/// memory, refusing more than `max` bytes of it. Returns how many bytes it added. On
-/// any failure the file is cut back to where it was.
-pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64, ReceiveError> {
+/// memory, refusing more than `max` bytes of it. Returns how many bytes it added and
+/// the SHA-256 (lower-case hex) of those bytes. On any failure the file is cut back to
+/// where it was.
+pub async fn receive(
+    body: Body,
+    path: &std::path::Path,
+    max: u64,
+) -> Result<(u64, String), ReceiveError> {
     use futures_util::StreamExt;
+    use sha2::Digest;
     use tokio::io::AsyncWriteExt;
 
     let mut file = tokio::fs::OpenOptions::new()
@@ -245,6 +357,7 @@ pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64
         .map_err(ReceiveError::Io)?;
     let start = file.metadata().await.map_err(ReceiveError::Io)?.len();
     let mut written = 0u64;
+    let mut hash = sha2::Sha256::new();
     let mut stream = body.into_data_stream();
     let result = async {
         while let Some(chunk) = stream.next().await {
@@ -254,10 +367,11 @@ pub async fn receive(body: Body, path: &std::path::Path, max: u64) -> Result<u64
                 drain(&mut stream).await;
                 return Err(ReceiveError::TooLarge);
             }
+            hash.update(&chunk);
             file.write_all(&chunk).await.map_err(ReceiveError::Io)?;
         }
         file.flush().await.map_err(ReceiveError::Io)?;
-        Ok(written)
+        Ok((written, hex::encode(hash.finalize())))
     }
     .await;
     if result.is_err() {
@@ -295,15 +409,16 @@ where
 
 pub async fn upload(
     State(state): State<AppState>,
+    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
     headers: HeaderMap,
     query: Result<Query<UploadQuery>, QueryRejection>,
     body: Body,
 ) -> AppResult<Json<Source>> {
     let Query(q) =
         query.map_err(|rej| AppError::new(rej.status(), "bad_request", rej.body_text()))?;
-    let upload = Upload::check(&state, q).await?;
+    let upload = Upload::check(&state, q, &device).await?;
     // Refused before a byte is read when the size is known up front.
-    if content_length(&headers).is_some_and(|n| n > upload.limit()) {
+    if content_length(&headers).is_some_and(|n| n > upload.request_limit()) {
         drain(&mut body.into_data_stream()).await;
         return Err(upload.too_large());
     }
@@ -314,21 +429,85 @@ pub async fn upload(
         .await
         .map_err(|e| AppError::internal(format!("couldn't create {}: {e}", dir.display())))?;
     let path = dir.join(FILE_NAME);
-    let bytes = match receive(body, &path, upload.limit()).await {
-        Ok(n) => n,
+    let (bytes, sha256) = match receive(body, &path, upload.request_limit()).await {
+        Ok(r) => r,
         Err(e) => {
             remove_dir(&dir).await;
             return Err(e.into_app_error(&upload, &path));
         }
     };
-    let source = create(&state, &id, upload, bytes).await?;
+    let source = create_or_replace(&state, &id, upload, bytes, sha256).await?;
     Ok(Json(source))
 }
 
+/// The SHA-256 (lower-case hex) of a file, read in pieces on a blocking thread.
+pub async fn hash_file(path: &std::path::Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use sha2::Digest;
+        use std::io::Read;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hash = sha2::Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
+        Ok(hex::encode(hash.finalize()))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Records the source whose file is now in `source_dir(id)` and queues it to be read.
-/// Removes the folder when the topic went away meanwhile. Returns the wire record.
-pub async fn create(state: &AppState, id: &str, upload: Upload, bytes: u64) -> AppResult<Source> {
+/// Removes the folder when the topic (or the attached folder) went away meanwhile.
+/// Returns the wire record.
+///
+/// A file of an attached folder whose path already has a source **replaces it in
+/// place**: the new file moves over the old one's, which keeps its id (so its document,
+/// unchanged passages and citations stay), its renders are dropped and it is read again;
+/// `source_dir(id)` is removed. `sha256` is what was received; the folder's row records
+/// it (`folders::record_received_locked`).
+pub async fn create_or_replace(
+    state: &AppState,
+    id: &str,
+    upload: Upload,
+    bytes: u64,
+    sha256: String,
+) -> AppResult<Source> {
     let dir = state.source_dir(id);
+    let workspace_id = upload.workspace.as_ref().map(|w| w.id.clone());
+    let source = {
+        let _w = state.write_lock.lock().await;
+        let result = match &workspace_id {
+            None => create_locked(state, id, upload, bytes).await,
+            Some(ws) => replace_locked(state, id, ws, upload, bytes, sha256).await,
+        };
+        match result {
+            Ok(s) => s,
+            Err(e) => {
+                remove_dir(&dir).await;
+                return Err(e);
+            }
+        }
+    };
+    state.emit_source(&source);
+    let _ = state.source_queue.send(source.id.clone());
+    if let Some(ws) = &workspace_id {
+        folders::refresh_sync_logged(state, ws).await;
+    }
+    Ok(state.public_source(&source))
+}
+
+/// A new topic or chat source. Call with the write lock held.
+async fn create_locked(state: &AppState, id: &str, upload: Upload, bytes: u64) -> AppResult<Source> {
+    // The topic may have been deleted while the file was being saved.
+    if let Some(topic_id) = &upload.topic_id {
+        library::topic(state, topic_id).await?;
+    }
     let source = Source {
         media_url: None,
         id: id.to_string(),
@@ -342,23 +521,104 @@ pub async fn create(state: &AppState, id: &str, upload: Upload, bytes: u64) -> A
         workspace_id: None,
         modified: None,
     };
-    {
-        let _w = state.write_lock.lock().await;
-        // The topic may have been deleted while the file was being saved.
-        if let Some(topic_id) = &source.topic_id
-            && let Err(e) = library::topic(state, topic_id).await
-        {
-            remove_dir(&dir).await;
-            return Err(e);
+    state.store.put(db::SOURCE, id, &source).await?;
+    Ok(source)
+}
+
+/// A folder's file: a new source, or the path's source with the new file moved over
+/// its own. Call with the write lock held; on `Err` the caller removes `source_dir(id)`.
+async fn replace_locked(
+    state: &AppState,
+    id: &str,
+    workspace_id: &str,
+    upload: Upload,
+    bytes: u64,
+    sha256: String,
+) -> AppResult<Source> {
+    // The folder may have been removed while the file was being saved.
+    let ws: Workspace = state
+        .store
+        .get(db::WORKSPACE, workspace_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("folder"))?;
+    let kind = folder_file_type(&upload.name).ok_or_else(|| {
+        AppError::internal(format!("{} passed the check but isn't a folder file", upload.name))
+    })?;
+    let stamp = FileStamp {
+        bytes,
+        modified: upload.modified,
+        sha256,
+    };
+    let existing = state
+        .store
+        .list_where::<Source>(db::SOURCE, "workspace_id", workspace_id)
+        .await?
+        .into_iter()
+        .find(|s| s.name == upload.name);
+    let source = match existing {
+        Some(mut old) => {
+            let old_dir = state.source_dir(&old.id);
+            let moved = async {
+                tokio::fs::create_dir_all(&old_dir).await?;
+                tokio::fs::rename(state.source_dir(id).join(FILE_NAME), old_dir.join(FILE_NAME))
+                    .await?;
+                // The link AVFoundation reads by is made again when it's read.
+                if let Some(link) = link_name(&old.name) {
+                    match tokio::fs::remove_file(old_dir.join(link)).await {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                        _ => {}
+                    }
+                }
+                std::io::Result::Ok(())
+            }
+            .await;
+            if let Err(e) = moved {
+                return Err(AppError::internal(format!(
+                    "couldn't replace {}: {e}",
+                    old_dir.display()
+                )));
+            }
+            if matches!(old.status, SourceStatus::Processing { .. }) {
+                // The read in progress finishes on the old copy and must not mark the
+                // new one read; it's queued behind it (its renders are redone then).
+                state
+                    .sources_replaced
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(old.id.clone());
+            } else {
+                remove_dir(&state.source_media_dir(&old.id)).await;
+            }
+            remove_dir(&state.source_dir(id)).await;
+            old.bytes = bytes;
+            old.modified = upload.modified;
+            old.kind = upload.kind;
+            old.folder = Some(ws.name.clone());
+            old.status = SourceStatus::Queued;
+            state.store.put(db::SOURCE, &old.id, &old).await?;
+            old
         }
-        if let Err(e) = state.store.put(db::SOURCE, id, &source).await {
-            remove_dir(&dir).await;
-            return Err(e.into());
+        None => {
+            let source = Source {
+                media_url: None,
+                id: id.to_string(),
+                topic_id: None,
+                name: upload.name,
+                folder: Some(ws.name.clone()),
+                kind: upload.kind,
+                bytes,
+                status: SourceStatus::Queued,
+                created_at: Utc::now(),
+                workspace_id: Some(workspace_id.to_string()),
+                modified: upload.modified,
+            };
+            state.store.put(db::SOURCE, id, &source).await?;
+            source
         }
-    }
-    state.emit_source(&source);
-    let _ = state.source_queue.send(id.to_string());
-    Ok(state.public_source(&source))
+    };
+    folders::record_received_locked(state, workspace_id, &source.name, kind, &source.id, stamp)
+        .await?;
+    Ok(source)
 }
 
 /// "Read again": queue a source to be read from the start, in place (same id, topic and
@@ -488,7 +748,8 @@ pub async fn attach_locked(
         let Some(mut source) = state.store.get::<Source>(db::SOURCE, id).await? else {
             continue;
         };
-        if source.topic_id.is_some() {
+        // A folder's files stay in their folder, never in a topic.
+        if source.topic_id.is_some() || source.workspace_id.is_some() {
             continue;
         }
         source.topic_id = Some(topic_id.to_string());

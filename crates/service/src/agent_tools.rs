@@ -42,7 +42,7 @@ use margin_shared::{
     AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
     NewTopic, Note, NotePatch, Outline, OutlineCard, OutlineChips, OutlineLesson, PassagesCard,
     Proposal, ProposalStatus, ResultCard, ResultTarget, SearchHit, Source, SourceStatus, Topic,
-    TopicPatch, VideoStatus,
+    TopicPatch, VideoStatus, Workspace, device::MAX_LISTED_ENTRIES,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -53,7 +53,7 @@ use crate::error::{AppError, AppResult};
 use crate::library::{self, sort_topics};
 use crate::pipeline::{Hit, Packed};
 use crate::state::{AppState, Author, StoredLesson, StoredVideo};
-use crate::{ask, db, retrieval, search, sources, video};
+use crate::{ask, db, folders, retrieval, search, sources, video};
 
 /// How long `search` waits for sources still being read before searching what
 /// is ready.
@@ -76,6 +76,8 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(DocumentOutlineTool(state.clone()))));
     r.register(Arc::new(Typed(ViewPicture(state.clone()))));
     r.register(Arc::new(Typed(ListSources(state.clone()))));
+    r.register(Arc::new(Typed(ListFiles(state.clone()))));
+    r.register(Arc::new(Typed(FindFiles(state.clone()))));
     r.register(Arc::new(Typed(CreateTopic(state.clone()))));
     r.register(Arc::new(Typed(RenameTopic(state.clone()))));
     r.register(Arc::new(Typed(MoveTopic(state.clone()))));
@@ -92,13 +94,21 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(DeleteTopic(state.clone()))));
     r.register(Arc::new(Typed(DeleteLesson(state.clone()))));
     r.register(Arc::new(Typed(DeleteNote(state.clone()))));
+    // Of the device tools: the app-control ones, and the one folder call that goes to a
+    // device (`sync_folder`); a folder's files are read on the service.
     for tool in margin_agent::device_tools() {
-        if margin_agent::APP_CONTROL_TOOLS.contains(&tool.name()) {
+        let name = tool.name();
+        let device_folder_call =
+            name == SYNC_FOLDER && margin_agent::FOLDER_TOOLS.contains(&name);
+        if margin_agent::APP_CONTROL_TOOLS.contains(&name) || device_folder_call {
             r.register(tool);
         }
     }
     r
 }
+
+/// The device tool that asks the device holding a folder to send what changed.
+pub const SYNC_FOLDER: &str = "sync_folder";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -649,6 +659,8 @@ pub const RETRIEVAL_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 pub const READ_PASSAGE_MAX_CHARS: usize = 6_000;
 /// Most characters of one `document_outline`.
 pub const OUTLINE_MAX_CHARS: usize = 2_000;
+/// Most names `search` lists as still being read (then "and N more").
+pub const STILL_BEING_READ_MAX: usize = 10;
 
 /// What a passage is, as the model names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -851,7 +863,12 @@ fn search_output(
             output["library"] = json!(lib);
         }
         if !unread.is_empty() {
-            output["still_being_read"] = json!(unread);
+            // A folder still being read can name hundreds of files.
+            let mut names: Vec<String> = unread.iter().take(STILL_BEING_READ_MAX).cloned().collect();
+            if unread.len() > STILL_BEING_READ_MAX {
+                names.push(format!("and {} more", unread.len() - STILL_BEING_READ_MAX));
+            }
+            output["still_being_read"] = json!(names);
         }
         if words_only {
             output["note"] = json!(
@@ -1159,7 +1176,7 @@ pub struct ViewPictureArgs {
 impl TypedTool for ViewPicture {
     type Args = ViewPictureArgs;
     const NAME: &'static str = "view_picture";
-    const DESCRIPTION: &'static str = "Show a document's stored picture (an image, or a PDF page) with what can be read in it, and show it to the owner as a card.";
+    const DESCRIPTION: &'static str = "Show a document's stored picture (an image, or a PDF page) with what can be read in it, and show it to the owner as a card. The picture itself is sent to you with the output.";
     const KIND: ToolKind = ToolKind::Read;
 
     fn label(&self, args: &Self::Args) -> String {
@@ -1216,14 +1233,62 @@ impl TypedTool for ViewPicture {
                 Some(n) => format!("Page {n} of {}", p.citation.source_name),
                 None => p.citation.source_name.clone(),
             };
-            ToolOutput::ok(output.to_string(), summary).with_card(Card::Passages(PassagesCard {
-                query: summary_query(&p.citation),
-                passages: vec![Citation {
-                    n: 1,
-                    ..p.citation.clone()
-                }],
-            }))
+            let out = ToolOutput::ok(output.to_string(), summary).with_card(Card::Passages(
+                PassagesCard {
+                    query: summary_query(&p.citation),
+                    passages: vec![Citation {
+                        n: 1,
+                        ..p.citation.clone()
+                    }],
+                },
+            ));
+            // The picture itself goes to the model with the output (D5b); without it the
+            // text and the card still stand.
+            match picture_for_model(state, &p.citation).await {
+                Some(image) => out.with_image(image),
+                None => out,
+            }
         })
+    }
+}
+
+/// The stored picture of a citation, as the model is shown it (`image_for_model`, at
+/// `WRITER_IMAGE_SIDE`). `None` (logged) when it can't be read.
+async fn picture_for_model(state: &AppState, c: &Citation) -> Option<margin_ai::Image> {
+    let file = c.image_url.as_deref()?;
+    let path = retrieval::picture_path(state, &c.source_id, &c.source_name, file);
+    let tools = state.source_tools.clone();
+    match tokio::task::spawn_blocking(move || tools.image_for_model(&path)).await {
+        Ok(Ok((media_type, data))) => Some(margin_ai::Image { media_type, data }),
+        Ok(Err(e)) => {
+            tracing::warn!("view_picture couldn't read {file} of {}: {e}", c.source_id);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("view_picture couldn't read {file} of {}: {e}", c.source_id);
+            None
+        }
+    }
+}
+
+/// `ToolOutput::with_image` until `margin_agent` has it (the 4-agent area adds
+/// `ToolOutput.images` and the inherent method, which takes precedence over this trait
+/// once merged; the integrator then deletes this shim). Without it a picture can't
+/// reach the model, so it is dropped here and the output keeps its text and card.
+#[allow(dead_code)]
+trait WithImageShim: Sized {
+    fn with_image(self, image: margin_ai::Image) -> Self;
+}
+
+#[allow(dead_code)]
+impl WithImageShim for ToolOutput {
+    fn with_image(self, image: margin_ai::Image) -> Self {
+        tracing::debug!(
+            "a {} picture of {} bytes isn't sent: this margin_agent has no ToolOutput.images",
+            image.media_type,
+            image.data.len()
+        );
+        self
     }
 }
 
@@ -1250,7 +1315,7 @@ pub struct ListSourcesArgs {
 impl TypedTool for ListSources {
     type Args = ListSourcesArgs;
     const NAME: &'static str = "list_sources";
-    const DESCRIPTION: &'static str = "List the owner's sources (uploaded files): id, name, kind, status, the topic it belongs to (null when it isn't in a topic) and whether it is attached to this chat. Optionally only a topic's.";
+    const DESCRIPTION: &'static str = "List the owner's sources (uploaded files; a folder's files are listed by list_files): id, name, kind, status, the topic it belongs to (null when it isn't in a topic) and whether it is attached to this chat. Optionally only a topic's.";
     const KIND: ToolKind = ToolKind::Read;
 
     fn label(&self, args: &Self::Args) -> String {
@@ -1270,6 +1335,7 @@ impl TypedTool for ListSources {
             }
             let loaded = async {
                 let mut all: Vec<Source> = state.store.list(db::SOURCE).await?;
+                all.retain(|s| s.workspace_id.is_none());
                 all.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
                 let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
                 let chat: Option<Chat> = state.store.get(db::CHAT, &ctx.chat_id).await?;
@@ -1307,6 +1373,280 @@ impl TypedTool for ListSources {
                 n => plural(n, "source", "sources"),
             };
             ToolOutput::ok(json!({ "sources": rows }).to_string(), summary)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// list_files, find_files: an attached folder as the service has it (D5a)
+// ---------------------------------------------------------------------------
+
+/// The attached folder `id` of this chat, or the output saying which are attached (the
+/// same words as `margin_agent`'s device folder tools).
+fn attached_workspace<'a>(ctx: &'a ToolContext, id: &str) -> Result<&'a Workspace, ToolOutput> {
+    if let Some(ws) = ctx.workspaces.iter().find(|w| w.id == id) {
+        return Ok(ws);
+    }
+    if ctx.workspaces.is_empty() {
+        return Err(ToolOutput::error(
+            "No folder is attached to this chat. The owner can attach one with Attach folder.",
+        ));
+    }
+    let attached: Vec<String> = ctx
+        .workspaces
+        .iter()
+        .map(|w| format!("“{}” ({})", w.name, w.id))
+        .collect();
+    Err(ToolOutput::error(format!(
+        "No folder attached to this chat has the workspace_id “{id}”. Attached: {}.",
+        attached.join(", ")
+    )))
+}
+
+/// The folder `path` names inside a folder ("" for its root), or the error output.
+fn folder_path(path: Option<&str>) -> Result<String, ToolOutput> {
+    let path = path.unwrap_or("");
+    match margin_shared::relative_components(path) {
+        Ok(parts) => Ok(parts.join("/")),
+        Err(_) => Err(ToolOutput::error(format!(
+            "“{path}” isn't a path inside the folder."
+        ))),
+    }
+}
+
+/// One file as `list_files` and `find_files` show it; `under` is the folder listed.
+fn file_json(f: &folders::FileView, under: &str, device: &str) -> Value {
+    let path = match under {
+        "" => f.row.path.as_str(),
+        u => f.row.path.strip_prefix(u).map_or(f.row.path.as_str(), |p| {
+            p.strip_prefix('/').unwrap_or(p)
+        }),
+    };
+    let mut v = json!({
+        "path": path,
+        "kind": f.row.kind,
+        "bytes": f.row.listed.bytes,
+        "modified": f.row.listed.modified,
+    });
+    match &f.source {
+        Some(s) => {
+            v["document_id"] = json!(s.id);
+            let mut status = match &s.status {
+                SourceStatus::Ready { warning: None, .. } => "read".to_string(),
+                SourceStatus::Ready {
+                    warning: Some(w), ..
+                } => format!("read, with a warning: {w}"),
+                SourceStatus::Failed { error } => format!("couldn't be read: {error}"),
+                other => source_status(other),
+            };
+            if f.row.received.as_ref() != Some(&f.row.listed) {
+                status.push_str(&format!(
+                    "; it changed on {device}, and the new copy is waiting to be sent"
+                ));
+            }
+            v["status"] = json!(status);
+            if let SourceStatus::Ready { pages: Some(p), .. } = &s.status {
+                v["pages"] = json!(p);
+            }
+        }
+        None => v["status"] = json!(format!("waiting to be sent from {device}")),
+    }
+    v
+}
+
+/// The folder's sync state as the listing tools show it.
+fn sync_json(state: &AppState, ws: &Workspace) -> Value {
+    json!({
+        "uploading": ws.sync.uploading,
+        "reading": ws.sync.reading,
+        "failed": ws.sync.failed,
+        "last_synced_at": ws.sync.last_synced_at,
+        "device": ws.device_name,
+        "online": state.devices.is_online(&ws.device_id),
+    })
+}
+
+/// The output of a listing tool, entries cut at `MAX_LISTED_ENTRIES` and then from the
+/// end until it fits `RETRIEVAL_OUTPUT_MAX_BYTES`.
+fn listing_output(
+    state: &AppState,
+    ws: &Workspace,
+    under: &str,
+    mut entries: Vec<Value>,
+    extra: Option<(&str, &str)>,
+) -> (String, bool) {
+    let mut truncated = entries.len() > MAX_LISTED_ENTRIES;
+    entries.truncate(MAX_LISTED_ENTRIES);
+    let build = |entries: &[Value], truncated: bool| {
+        let mut v = json!({
+            "folder": ws.name,
+            "path": under,
+            "entries": entries,
+            "truncated": truncated,
+            "sync": sync_json(state, ws),
+        });
+        if let Some((k, val)) = extra {
+            v[k] = json!(val);
+        }
+        v.to_string()
+    };
+    let mut text = build(&entries, truncated);
+    while text.len() > RETRIEVAL_OUTPUT_MAX_BYTES && !entries.is_empty() {
+        entries.pop();
+        truncated = true;
+        text = build(&entries, truncated);
+    }
+    (text, truncated)
+}
+
+/// `14 files and 2 folders`, `Nothing there`.
+fn listing_summary(files: usize, folders: usize) -> String {
+    match (files, folders) {
+        (0, 0) => "Nothing there".into(),
+        (f, 0) => plural(f, "file", "files"),
+        (0, d) => plural(d, "folder", "folders"),
+        (f, d) => format!(
+            "{} and {}",
+            plural(f, "file", "files"),
+            plural(d, "folder", "folders")
+        ),
+    }
+}
+
+pub struct ListFiles(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListFilesArgs {
+    /// The workspace_id of a folder attached to this chat.
+    pub workspace_id: String,
+    /// A folder inside it, relative to its root ("ch1/figures"); null or "" for the root.
+    pub path: Option<String>,
+}
+
+impl TypedTool for ListFiles {
+    type Args = ListFilesArgs;
+    const NAME: &'static str = "list_files";
+    const DESCRIPTION: &'static str = "List what is directly inside a folder of an attached folder as the service has it: its subfolders, and its text documents, PDFs and images (other kinds of file and hidden files are never there), each with its document_id for search, read_passage, document_outline and view_picture. Read-only.";
+    const KIND: ToolKind = ToolKind::Read;
+
+    fn label(&self, args: &Self::Args) -> String {
+        match args.path.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => format!("Listing {}", quoted(p)),
+            None => "Listing a folder".into(),
+        }
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let state = &self.0;
+            let ws = match attached_workspace(ctx, &args.workspace_id) {
+                Ok(ws) => ws,
+                Err(out) => return out,
+            };
+            let under = match folder_path(args.path.as_deref()) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
+            let ws = match state.store.get::<Workspace>(db::WORKSPACE, &ws.id).await {
+                Ok(Some(fresh)) => fresh,
+                Ok(None) => return ToolOutput::error("That folder was just removed."),
+                Err(e) => return internal(e),
+            };
+            let files = match folders::files_of(state, &ws.id).await {
+                Ok(f) => f,
+                Err(e) => return internal(e),
+            };
+            if !folders::has_folder(&files, &under) {
+                return ToolOutput::error(format!(
+                    "There's no folder “{under}” in “{}” (as the service has it). Use list_files without a path to see the top.",
+                    ws.name
+                ));
+            }
+            let entries = folders::listing(files, &under);
+            let n_files = entries
+                .iter()
+                .filter(|e| matches!(e, folders::Entry::File(_)))
+                .count();
+            let n_folders = entries.len() - n_files;
+            let rows: Vec<Value> = entries
+                .iter()
+                .map(|e| match e {
+                    folders::Entry::Folder { path, files } => {
+                        json!({ "path": path, "files": files })
+                    }
+                    folders::Entry::File(f) => file_json(f, &under, &ws.device_name),
+                })
+                .collect();
+            let (text, _) = listing_output(state, &ws, &under, rows, None);
+            ToolOutput::ok(text, listing_summary(n_files, n_folders))
+        })
+    }
+}
+
+pub struct FindFiles(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindFilesArgs {
+    /// The workspace_id of a folder attached to this chat.
+    pub workspace_id: String,
+    /// The folder to look under, relative to the root; null or "" for the whole folder.
+    pub path: Option<String>,
+    /// A glob matched against paths relative to `path`: `*` within a name, `**` across
+    /// folders, `?` one character; case-insensitive. E.g. "**/*.pdf".
+    pub pattern: String,
+}
+
+impl TypedTool for FindFiles {
+    type Args = FindFilesArgs;
+    const NAME: &'static str = "find_files";
+    const DESCRIPTION: &'static str = "Find files anywhere under a folder of an attached folder whose path matches a glob (`*` within a name, `**` across folders, `?` one character; case-insensitive). Read-only.";
+    const KIND: ToolKind = ToolKind::Read;
+
+    fn label(&self, args: &Self::Args) -> String {
+        format!("Finding {}", quoted(&args.pattern))
+    }
+
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let state = &self.0;
+            let ws = match attached_workspace(ctx, &args.workspace_id) {
+                Ok(ws) => ws,
+                Err(out) => return out,
+            };
+            let under = match folder_path(args.path.as_deref()) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
+            let ws = match state.store.get::<Workspace>(db::WORKSPACE, &ws.id).await {
+                Ok(Some(fresh)) => fresh,
+                Ok(None) => return ToolOutput::error("That folder was just removed."),
+                Err(e) => return internal(e),
+            };
+            let files = match folders::files_of(state, &ws.id).await {
+                Ok(f) => f,
+                Err(e) => return internal(e),
+            };
+            let found = match folders::find(files, &under, args.pattern.trim()) {
+                Ok(f) => f,
+                Err(message) => return ToolOutput::error(message),
+            };
+            let n = found.len();
+            let rows: Vec<Value> = found
+                .iter()
+                .map(|f| file_json(f, &under, &ws.device_name))
+                .collect();
+            let (text, _) = listing_output(
+                state,
+                &ws,
+                &under,
+                rows,
+                Some(("pattern", args.pattern.trim())),
+            );
+            let summary = match n {
+                0 => "No files match".to_string(),
+                n => plural(n, "file", "files"),
+            };
+            ToolOutput::ok(text, summary)
         })
     }
 }
@@ -1927,6 +2267,20 @@ impl TypedTool for ProposeCourse {
             let Some(outline) = &proposal.outline else {
                 return ToolOutput::error("The outline wasn't kept.");
             };
+            // The folders its lessons will also draw on: "notes (MacBook Pro)".
+            let draws_on: Vec<String> = match state
+                .store
+                .get::<ask::StoredProposal>(db::PROPOSAL, &proposal.id)
+                .await
+            {
+                Ok(Some(stored)) => crate::workspaces::by_ids(&state, &stored.workspace_ids)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|w| format!("{} ({})", w.name, w.device_name))
+                    .collect(),
+                _ => Vec::new(),
+            };
             let filed_under = match &proposal.request.parent_topic_id {
                 Some(parent) => {
                     let topics: Vec<Topic> = state.store.list(db::TOPIC).await.unwrap_or_default();
@@ -1946,6 +2300,7 @@ impl TypedTool for ProposeCourse {
                 "with_videos": req.with_videos,
                 "with_quiz": req.with_quiz,
                 "source_ids": req.source_ids,
+                "draws_on_folders": draws_on,
                 "next": "The owner sees the outline card. They can edit it and press Create lessons, or ask you to go ahead (then call accept_proposal with this proposal_id).",
             });
             let summary = format!(
@@ -2094,6 +2449,7 @@ impl TypedTool for WriteLesson {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let workspace_ids: Vec<String> = ctx.workspaces.iter().map(|w| w.id.clone()).collect();
         Box::pin(to_the_end(&self.0, ctx, async move {
             let req = ask::NewLesson {
                 topic_id: args.topic_id,
@@ -2102,6 +2458,8 @@ impl TypedTool for WriteLesson {
                 minutes: args.minutes,
                 level: args.level.into(),
                 with_quiz: args.with_quiz,
+                // It draws on the chat's folders too, as a course proposed here would.
+                workspace_ids,
             };
             let lesson = match ask::append_lesson(&state, req).await {
                 Ok(l) => l,
@@ -2341,6 +2699,12 @@ async fn attach_chat_files(
                     "There is no source {id}. Use list_sources to see the chat's files."
                 ))));
             };
+            if source.workspace_id.is_some() {
+                return Ok(Err(AppError::bad_request(format!(
+                    "{} belongs to an attached folder; a folder's files stay in the folder and are never filed under a topic.",
+                    quoted(&source.name)
+                ))));
+            }
             if !in_chat.contains(id) {
                 return Ok(Err(AppError::bad_request(format!(
                     "{} isn't attached to this chat; only the chat's files can be filed this way.",

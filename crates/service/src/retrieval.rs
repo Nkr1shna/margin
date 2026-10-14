@@ -1780,6 +1780,19 @@ pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>
             },
             None => (d.name.clone(), d.kind),
         };
+        // A folder's file is a source with the document's id: its media are served under
+        // it, and it reads as "folder/path".
+        if file.is_some()
+            && let Some(s) = store.get::<Source>(db::SOURCE, &d.id).await?
+        {
+            return Ok(Some(DocInfo {
+                document_id: d.id,
+                source_id: Some(s.id),
+                name: folder_file_name(s.folder.as_deref(), &s.name),
+                kind: s.kind,
+                file,
+            }));
+        }
         return Ok(Some(DocInfo {
             document_id: d.id,
             source_id,
@@ -1795,9 +1808,20 @@ pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>
             workspace_id,
             path: s.name.clone(),
         }),
-        name: s.name,
+        name: match &s.workspace_id {
+            Some(_) => folder_file_name(s.folder.as_deref(), &s.name),
+            None => s.name,
+        },
         kind: s.kind,
     }))
+}
+
+/// A folder file's name as citations and tools show it: "`folder`/`path`".
+pub fn folder_file_name(folder: Option<&str>, path: &str) -> String {
+    match folder.filter(|f| !f.is_empty()) {
+        Some(f) => format!("{f}/{path}"),
+        None => path.to_string(),
+    }
 }
 
 /// Fills each packed passage's citation with its document (name, kind, the source its

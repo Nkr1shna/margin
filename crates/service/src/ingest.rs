@@ -1273,6 +1273,8 @@ async fn set_status(
             None => None,
         };
         let source = match source_status {
+            // A folder file replaced while this read ran: the new copy waits, Queued.
+            Some(_) if was_replaced(state, id) => None,
             Some(st) => match state.store.get::<Source>(db::SOURCE, id).await? {
                 Some(mut s) => {
                     s.status = st;
@@ -1287,6 +1289,7 @@ async fn set_status(
     };
     if let Some(s) = &source {
         state.emit_source(s);
+        refresh_folder(state, s).await;
     }
     let Some(doc) = doc else {
         return Ok(false);
@@ -1295,6 +1298,28 @@ async fn set_status(
         state.emit(Event::DocumentChanged { document: doc });
     }
     Ok(true)
+}
+
+/// Whether the folder source `id` was replaced by a new upload while it was being read
+/// (`sources::create_or_replace`): the read finishing then leaves its status alone.
+fn was_replaced(state: &AppState, id: &str) -> bool {
+    state
+        .sources_replaced
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
+/// A folder source that is now read (or failed): its folder's counts change.
+async fn refresh_folder(state: &AppState, source: &Source) {
+    if let Some(ws) = &source.workspace_id
+        && matches!(
+            source.status,
+            SourceStatus::Ready { .. } | SourceStatus::Failed { .. }
+        )
+    {
+        crate::folders::refresh_sync_logged(state, ws).await;
+    }
 }
 
 /// Marks a document (and its source) failed with `error`.
@@ -1572,6 +1597,8 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         doc.updated_at = Utc::now();
         state.store.put(db::DOCUMENT, id, &doc).await?;
         let source = match state.store.get::<Source>(db::SOURCE, id).await? {
+            // Replaced meanwhile: the new copy is read next.
+            Some(_) if was_replaced(state, id) => None,
             Some(mut s) => {
                 s.status = SourceStatus::Ready {
                     chunks: passages,
@@ -1590,6 +1617,7 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
     }
     if let Some(s) = &source {
         state.emit_source(s);
+        refresh_folder(state, s).await;
     }
     state.emit(Event::DocumentChanged { document: doc });
     tracing::info!(
@@ -1677,6 +1705,12 @@ async fn run_job(state: &AppState, id: &str) -> anyhow::Result<()> {
     let Some(doc) = document(state, id).await? else {
         return Ok(());
     };
+    // The read a replacement waited behind is over (the worker runs one at a time).
+    state
+        .sources_replaced
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
     match state.store.get::<Source>(db::SOURCE, id).await? {
         Some(source) if source.status != SourceStatus::Queued => return Ok(()),
         Some(_) => {}
