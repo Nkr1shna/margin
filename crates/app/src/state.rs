@@ -49,6 +49,8 @@ pub struct AppCtx {
     /// The proposal shown on the Ask screen, kept while navigating elsewhere.
     pub ask_proposal: Signal<Option<Id>>,
     pub ask_prompt: Signal<String>,
+    /// The Settings dialog, open at this pane.
+    pub settings_open: Signal<Option<crate::ui::settings::SettingsPane>>,
 }
 
 pub fn use_app() -> AppCtx {

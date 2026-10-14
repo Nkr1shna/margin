@@ -85,6 +85,18 @@ const ICONS: &[(&str, &str)] = &[
     ("back", r#"<path d="M14.5 6l-6 6 6 6"/>"#),
     ("forward", r#"<path d="M9.5 6l6 6-6 6"/>"#),
     (
+        "user",
+        r#"<circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5c1.2-3.3 3.8-5 7-5s5.8 1.7 7 5"/>"#,
+    ),
+    (
+        "server",
+        r#"<rect x="4" y="4.5" width="16" height="6" rx="1.5"/><rect x="4" y="13.5" width="16" height="6" rx="1.5"/><path d="M7.5 7.5h.01M7.5 16.5h.01"/>"#,
+    ),
+    (
+        "wrench",
+        r#"<path d="M14.5 5.5a4 4 0 0 0 4.9 4.9l-8.6 8.6a2 2 0 0 1-2.8-2.8l8.6-8.6"/><path d="M14.5 5.5l2-2 1.5 2.5 2.5 1.5-2 2"/>"#,
+    ),
+    (
         "refresh",
         r#"<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4h-4"/>"#,
     ),
@@ -366,27 +378,26 @@ pub fn ConfirmDialog(
     }
 }
 
-/// An error notice with an optional "Open Settings" action (for `no_api_key` and similar).
+/// An error notice with an optional "Open Settings" action (for `no_api_key` and
+/// similar) that opens the given settings pane (a `SettingsPane` slug).
 #[component]
 pub fn ErrorNotice(
     message: String,
-    #[props(default)] settings_link: bool,
+    #[props(default)] settings_pane: Option<crate::ui::settings::SettingsPane>,
     #[props(default)] on_retry: Option<EventHandler<()>>,
 ) -> Element {
-    let nav = navigator();
+    let mut app = use_app();
     rsx! {
         div { class: "notice error", role: "alert",
             Icon { name: "alert" }
             div { class: "body",
                 span { "{message}" }
-                if settings_link || on_retry.is_some() {
+                if settings_pane.is_some() || on_retry.is_some() {
                     div { class: "row-actions",
-                        if settings_link {
+                        if let Some(pane) = settings_pane {
                             button {
                                 class: "btn btn-secondary btn-sm",
-                                onclick: move |_| {
-                                    nav.push(crate::routes::Route::SettingsPage {});
-                                },
+                                onclick: move |_| app.settings_open.set(Some(pane)),
                                 Icon { name: "gear" }
                                 "Open Settings"
                             }

@@ -94,6 +94,7 @@ fn Harness(props: HarnessProps) -> Element {
             collapsed: Signal::new(HashSet::new()),
             ask_proposal: Signal::new(None),
             ask_prompt: Signal::new(String::new()),
+            settings_open: Signal::new(None),
         }
     });
     if connect {

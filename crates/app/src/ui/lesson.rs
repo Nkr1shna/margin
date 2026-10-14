@@ -911,7 +911,13 @@ fn VideoView(lesson_id: Id) -> Element {
                 }
             }
             if let Some(err) = error.read().clone() {
-                ErrorNotice { message: err.message.clone(), settings_link: err.is_no_api_key() || err.code.contains("tool") }
+                ErrorNotice { message: err.message.clone(), settings_pane: if err.is_no_api_key() {
+                    Some(crate::ui::settings::SettingsPane::Ai)
+                } else if err.code.contains("tool") {
+                    Some(crate::ui::settings::SettingsPane::Tools)
+                } else {
+                    None
+                } }
             }
             match video {
                 None => rsx! {

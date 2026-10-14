@@ -10,6 +10,7 @@ use crate::store::VideoDot;
 use crate::ui::common::{
     BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, UNIFIED_TITLE_BAR,
 };
+use crate::ui::settings::SettingsPane;
 
 /// Which inline topic editor is open in the tree.
 #[derive(Clone, PartialEq, Debug)]
@@ -197,11 +198,9 @@ pub fn Sidebar() -> Element {
                 button {
                     class: "icon-btn",
                     "aria-label": "Settings",
-                    title: "Settings",
-                    "aria-current": matches!(route, Route::SettingsPage {}).to_string(),
-                    onclick: move |_| {
-                        nav.push(Route::SettingsPage {});
-                    },
+                    title: "Settings (⌘,)",
+                    "aria-current": app.settings_open.read().is_some().to_string(),
+                    onclick: move |_| app.settings_open.set(Some(SettingsPane::General)),
                     Icon { name: "gear" }
                 }
             }

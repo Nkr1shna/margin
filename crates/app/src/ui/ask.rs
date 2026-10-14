@@ -237,7 +237,7 @@ pub fn AskScreen() -> Element {
                     }
                 }
                 if let Some(err) = error.read().clone() {
-                    ErrorNotice { message: err.message.clone(), settings_link: err.is_no_api_key() }
+                    ErrorNotice { message: err.message.clone(), settings_pane: err.is_no_api_key().then_some(crate::ui::settings::SettingsPane::Ai) }
                 }
                 if let Some(p) = proposal {
                     ProposalView {
@@ -506,7 +506,7 @@ fn OutlineEditor(
             }
             if let Some(err) = accept_error {
                 div { style: "padding-top: 12px",
-                    ErrorNotice { message: err.message.clone(), settings_link: err.is_no_api_key() }
+                    ErrorNotice { message: err.message.clone(), settings_pane: err.is_no_api_key().then_some(crate::ui::settings::SettingsPane::Ai) }
                 }
             }
             div { class: "outline-f",

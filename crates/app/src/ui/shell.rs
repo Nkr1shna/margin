@@ -6,6 +6,7 @@ use crate::routes::Route;
 use crate::state::{LiveStatus, LoadStatus, use_app};
 use crate::ui::common::{Icon, js};
 use crate::ui::search::SearchPalette;
+use crate::ui::settings::{SettingsDialog, SettingsPane};
 use crate::ui::sidebar::Sidebar;
 
 #[component]
@@ -23,6 +24,7 @@ pub fn Shell() -> Element {
         while let Ok(message) = eval.recv::<String>().await {
             match message.as_str() {
                 "search" => app.search_open.set(true),
+                "settings" => app.settings_open.set(Some(SettingsPane::General)),
                 "back" => nav.go_back(),
                 "forward" => nav.go_forward(),
                 "sidebar" => {
@@ -100,6 +102,9 @@ pub fn Shell() -> Element {
                 }
                 Outlet::<Route> {}
             }
+        }
+        if app.settings_open.read().is_some() {
+            SettingsDialog {}
         }
         if *app.search_open.read() {
             SearchPalette {}

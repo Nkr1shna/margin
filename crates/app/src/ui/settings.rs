@@ -6,11 +6,58 @@ use margin_shared::{Device, Event, Settings, SettingsPatch, ToolStatus};
 
 use crate::config::{Appearance, normalize_service_url};
 use crate::state::use_app;
-use crate::ui::common::{ConfirmDialog, ErrorNotice, Icon, TopBar, ago, copy_to_clipboard, date};
+use crate::ui::common::{ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, js};
 
+/// The panes of the Settings dialog, in sidebar order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsPane {
+    General,
+    Account,
+    Service,
+    Ai,
+    Video,
+    Tools,
+}
+
+impl SettingsPane {
+    pub const ALL: [SettingsPane; 6] = [
+        SettingsPane::General,
+        SettingsPane::Account,
+        SettingsPane::Service,
+        SettingsPane::Ai,
+        SettingsPane::Video,
+        SettingsPane::Tools,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsPane::General => "General",
+            SettingsPane::Account => "Account",
+            SettingsPane::Service => "Service",
+            SettingsPane::Ai => "AI",
+            SettingsPane::Video => "Voice & video",
+            SettingsPane::Tools => "Tools",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            SettingsPane::General => "half",
+            SettingsPane::Account => "user",
+            SettingsPane::Service => "server",
+            SettingsPane::Ai => "spark",
+            SettingsPane::Video => "video",
+            SettingsPane::Tools => "wrench",
+        }
+    }
+}
+
+/// Settings, as a dialog over the app: panes on the left, the open pane on the right.
+/// Open it by setting `AppCtx::settings_open`; Esc or a click outside closes it.
 #[component]
-pub fn SettingsScreen() -> Element {
+pub fn SettingsDialog() -> Element {
     let mut app = use_app();
+    let pane = app.settings_open.read().unwrap_or(SettingsPane::General);
 
     // Load settings into the store (SettingsChanged events keep them current).
     let mut settings_error = use_signal(|| None::<String>);
@@ -25,36 +72,79 @@ pub fn SettingsScreen() -> Element {
         }
     });
     let settings = app.lib.read().settings.clone();
+    // Panes backed by the service's settings: their content, or the load state.
+    let service_settings =
+        |body: fn(Settings) -> Element| match (settings.clone(), settings_error.read().clone()) {
+            (Some(s), _) => body(s),
+            (None, Some(err)) => rsx! {
+                ErrorNotice { message: err, on_retry: move |_| settings_load.restart() }
+            },
+            (None, None) => rsx! {
+                div { class: "skel", style: "width: 60%; margin-top: 20px" }
+                div { class: "skel", style: "width: 40%" }
+            },
+        };
+
+    // Focus the dialog so Esc reaches it.
+    use_effect(|| {
+        let _ = js("document.getElementById('settings-dialog')?.focus();");
+    });
 
     rsx! {
-        TopBar { crumbs: vec!["Settings".to_string()] }
-        div { class: "scroll",
-            div { class: "settings",
-                h1 { "Settings" }
-                ServiceSection {}
-                AccountSection {}
-                match (settings, settings_error.read().clone()) {
-                    (Some(s), _) => rsx! {
-                        AiSection { settings: s.clone() }
-                        VoiceSection { settings: s.clone() }
-                        RenderSection { settings: s }
-                    },
-                    (None, Some(err)) => rsx! {
-                        section { class: "set-sec",
-                            h2 { "AI, voice and video" }
-                            ErrorNotice { message: err, on_retry: move |_| settings_load.restart() }
+        div {
+            class: "modal-scrim center",
+            onclick: move |_| app.settings_open.set(None),
+            div {
+                id: "settings-dialog",
+                class: "modal settings-modal",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-label": "Settings",
+                tabindex: "-1",
+                onclick: move |e| e.stop_propagation(),
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        app.settings_open.set(None);
+                    }
+                },
+                nav { class: "set-nav", "aria-label": "Settings",
+                    h2 { "Settings" }
+                    for p in SettingsPane::ALL {
+                        button {
+                            key: "{p:?}",
+                            class: "row",
+                            "aria-current": (p == pane).to_string(),
+                            onclick: move |_| app.settings_open.set(Some(p)),
+                            Icon { name: p.icon() }
+                            span { class: "grow", {p.label()} }
                         }
-                    },
-                    (None, None) => rsx! {
-                        section { class: "set-sec",
-                            h2 { "AI, voice and video" }
-                            div { class: "skel", style: "width: 60%" }
-                            div { class: "skel", style: "width: 40%" }
-                        }
-                    },
+                    }
                 }
-                ToolsSection {}
-                AppearanceSection {}
+                div { class: "set-body",
+                    div { class: "set-head",
+                        h1 { {pane.label()} }
+                        button {
+                            class: "icon-btn",
+                            "aria-label": "Close settings",
+                            title: "Close (Esc)",
+                            onclick: move |_| app.settings_open.set(None),
+                            Icon { name: "x" }
+                        }
+                    }
+                    div { class: "settings", key: "{pane:?}",
+                        match pane {
+                            SettingsPane::General => rsx! { AppearanceSection {} },
+                            SettingsPane::Account => rsx! { AccountSection {} },
+                            SettingsPane::Service => rsx! { ServiceSection {} },
+                            SettingsPane::Ai => service_settings(|s| rsx! { AiSection { settings: s } }),
+                            SettingsPane::Video => service_settings(|s| rsx! {
+                                VoiceSection { settings: s.clone() }
+                                RenderSection { settings: s }
+                            }),
+                            SettingsPane::Tools => rsx! { ToolsSection {} },
+                        }
+                    }
+                }
             }
         }
     }

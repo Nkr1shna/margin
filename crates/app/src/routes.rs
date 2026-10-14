@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use crate::ui::ask::AskScreen;
 use crate::ui::lesson::{LessonScreen, LessonView};
 use crate::ui::notes::NotesScreen;
-use crate::ui::settings::SettingsScreen;
 use crate::ui::shell::Shell;
 
 #[derive(Routable, Clone, PartialEq, Debug)]
@@ -27,8 +26,6 @@ pub enum Route {
         TopicNotes { topic_id: String },
         #[route("/note/:id")]
         NoteOpen { id: String },
-        #[route("/settings")]
-        SettingsPage {},
         #[route("/:..segments")]
         NotFound { segments: Vec<String> },
 }
@@ -81,11 +78,6 @@ fn TopicNotes(topic_id: String) -> Element {
 #[component]
 fn NoteOpen(id: String) -> Element {
     rsx! { NotesScreen { topic: None, selected: Some(id) } }
-}
-
-#[component]
-fn SettingsPage() -> Element {
-    rsx! { SettingsScreen {} }
 }
 
 #[component]

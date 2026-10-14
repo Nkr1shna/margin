@@ -138,6 +138,7 @@
         if (k === "k") { e.preventDefault(); send("search"); }
         else if (k === "n") { e.preventDefault(); send("ask"); }
         else if (k === "\\") { e.preventDefault(); send("sidebar"); }
+        else if (k === ",") { e.preventDefault(); send("settings"); }
         else if (k === "[") { e.preventDefault(); send("back"); }
         else if (k === "]") { e.preventDefault(); send("forward"); }
       }
