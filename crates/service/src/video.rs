@@ -11,6 +11,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use chrono::Utc;
 use margin_ai::{FailedScene, SceneRequest};
+use margin_shared::context::TraceKind;
+use margin_shared::pipeline::Route;
 use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus};
 use margin_video::{
     RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress, SandboxMode, Voice,
@@ -23,6 +25,7 @@ use crate::library::{self, video_for_lesson};
 use crate::state::{
     AppState, CAPTIONS_FILE, MP4_FILE, POSTER_FILE, STORYBOARD_FILE, StoredVideo, new_id,
 };
+use crate::trace::{self, SpanGuard};
 
 pub const LOG_LINES: usize = 200;
 /// Progress-only updates are saved and sent at most this often.
@@ -269,9 +272,28 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
     };
     let work_dir = state.video_dir(id);
     for attempt in 1..=2 {
+        let mut call = SpanGuard::new(
+            trace::model_call(
+                state,
+                id,
+                Route::Write,
+                &ai.model,
+                trace::provider_of(&ai.base_url),
+                SCENE_PROMPT_VERSION.to_string(),
+            ),
+            state,
+        );
+        call.row().job_id = Some(id.to_string());
+        call.row().step = Some(attempt);
         let code = match state.generator.write_scene(&ai, &request).await {
-            Ok(code) => code,
-            Err(e) => return fail(state, id, &e.to_string(), Some(log.text())).await,
+            Ok(code) => {
+                call.finish(true);
+                code
+            }
+            Err(e) => {
+                call.fail(trace::ai_error_code(&e));
+                return fail(state, id, &e.to_string(), Some(log.text())).await;
+            }
         };
         log.push(if attempt == 1 {
             "Scene written. Rendering…".into()
@@ -293,7 +315,16 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
             work_dir: work_dir.clone(),
             scene_code: code.clone(),
         };
+        let mut render = SpanGuard::new(state.tracer.span(TraceKind::JobStep, id), state);
+        render.row().job_id = Some(id.to_string());
+        render.row().tool = Some("render".into());
+        render.row().step = Some(attempt);
+        render.row().pipeline_hash = Some(state.pipeline.load().hash.clone());
         let (result, tail) = render_with_progress(state, id, &job, &config, log).await;
+        match &result {
+            Ok(_) => render.finish(true),
+            Err(e) => render.fail(render_error_code(e)),
+        }
         log = tail;
         match result {
             Ok(out) => return finish(state, id, &work_dir, out, log).await,
@@ -322,6 +353,21 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The scene prompt's version as traces record it: today's prompt, before R1-ai's
+/// constant-first `scene-v2` (which replaces this with `margin_ai`'s own version).
+const SCENE_PROMPT_VERSION: &str = "scene-v1";
+
+/// A render failure as a trace code (never its message).
+fn render_error_code(e: &RenderError) -> &'static str {
+    match e {
+        RenderError::ToolMissing(_) => "tool_missing",
+        RenderError::Scene { .. } => "scene_failed",
+        RenderError::Voice(_) => "voice_failed",
+        RenderError::Sandbox => "sandbox",
+        RenderError::Io(_) => "io",
+    }
 }
 
 async fn reset_dir(dir: &FsPath) -> anyhow::Result<()> {

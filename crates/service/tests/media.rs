@@ -816,3 +816,92 @@ async fn settled_slowly(h: &Harness, token: &str, id: &str) -> Source {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
+
+/// A video job is traced under its id: each scene call (`model_call`, route `write`,
+/// `job_id`, `step` = attempt) and each render (`job_step` `render`), a failed render
+/// with a code, never its message.
+#[tokio::test(flavor = "multi_thread")]
+async fn video_jobs_are_traced_under_their_id() {
+    use margin_shared::context::{TraceKind, TraceRow};
+    use margin_shared::pipeline::Route;
+    use margin_shared::{Video, VideoStatus};
+    use std::sync::atomic::Ordering;
+
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    h.configure_ai(&t).await;
+    // One scene failure: the model repairs it and the second render succeeds.
+    h.renderer.scene_failures.store(1, Ordering::SeqCst);
+    let p = h.propose(&t, &ask_request("traced videos", 1, false)).await;
+    assert_eq!(p.status, ProposalStatus::Ready);
+    let r = h
+        .post(&t, &format!("/api/proposals/{}/accept", p.id))
+        .json(&json!({"outline": p.outline.clone().unwrap()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let topic: Topic = r.json().await.unwrap();
+    let lesson = eventually(|| async {
+        library(&h, &t)
+            .await
+            .lessons
+            .into_iter()
+            .find(|l| l.topic_id == topic.id && l.status == LessonStatus::Ready)
+    })
+    .await;
+    let v: Video = h
+        .post(&t, &format!("/api/lessons/{}/video", lesson.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    eventually(|| async {
+        let v: Video = h
+            .get(&t, &format!("/api/videos/{}", v.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (v.status == VideoStatus::Ready).then_some(())
+    })
+    .await;
+
+    let r = h
+        .get(&t, routes::TRACES)
+        .query(&[("trace_id", v.id.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    let rows: Vec<TraceRow> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(!body.contains("NameError"), "no render message: {body}");
+    let scenes: Vec<&TraceRow> = rows
+        .iter()
+        .filter(|r| r.kind == TraceKind::ModelCall)
+        .collect();
+    assert_eq!(scenes.len(), 2, "{rows:#?}");
+    for (i, s) in scenes.iter().enumerate() {
+        assert!(s.ok);
+        assert_eq!(s.route, Some(Route::Write));
+        assert_eq!(s.job_id.as_deref(), Some(v.id.as_str()));
+        assert_eq!(s.step, Some(i as u32 + 1));
+        assert_eq!(s.prompt_version.as_deref(), Some("scene-v1"));
+        assert_eq!(s.model.as_deref(), Some("test-model"));
+        assert!(s.pipeline_hash.is_some());
+    }
+    let renders: Vec<(bool, Option<&str>)> = rows
+        .iter()
+        .filter(|r| r.kind == TraceKind::JobStep && r.tool.as_deref() == Some("render"))
+        .map(|r| (r.ok, r.error_code.as_deref()))
+        .collect();
+    assert_eq!(renders, [(false, Some("scene_failed")), (true, None)]);
+}
