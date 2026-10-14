@@ -457,7 +457,9 @@ mod tests {
         let fake = FakeService::start().await;
         let api = Api::with_token(&fake.url, crate::fake::TOKEN);
         let lib = api.library().await.unwrap();
-        assert_eq!(lib, sample_library());
+        let mut expected = sample_library();
+        crate::fake::rebase_media(&mut expected, |path| format!("{}{path}", fake.url));
+        assert_eq!(lib, expected);
         let me = api.me().await.unwrap();
         assert_eq!(me.github_login, "Nkr1shna");
         assert!(me.device.current);
@@ -615,6 +617,12 @@ mod tests {
         assert_eq!(source.kind, margin_shared::SourceKind::Text);
         assert_eq!(source.bytes, 18);
         assert_eq!(source.status, margin_shared::SourceStatus::Queued);
+        // Its original can be viewed at its signed URL.
+        let original = source.media_url.clone().expect("a media URL");
+        assert_eq!(
+            api.fetch_text(&original).await.unwrap(),
+            "# Gibbs & friends\n"
+        );
 
         let in_topic = api
             .upload_source(b"fn main() {}".to_vec(), "main.rs", None, Some("fourier"))
@@ -689,6 +697,53 @@ mod tests {
             removed.state,
             EmbeddingModelState::NotDownloaded { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn lessons_carry_their_citations() {
+        use margin_shared::SourceKind;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let lib = api.library().await.unwrap();
+        let lesson = lib.lessons.iter().find(|l| l.id == "l1").unwrap();
+        let kinds: Vec<(u32, SourceKind)> =
+            lesson.citations.iter().map(|c| (c.n, c.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, SourceKind::Pdf),
+                (2, SourceKind::Code),
+                (3, SourceKind::Image),
+                (4, SourceKind::Video),
+                (5, SourceKind::Text),
+                (6, SourceKind::Audio),
+                (7, SourceKind::Audio),
+            ]
+        );
+        let page = &lesson.citations[0];
+        assert_eq!(page.page, Some(3));
+        assert_eq!(
+            page.image_url.as_deref(),
+            Some(format!("{}/media/sources/s1/page-3.png?exp=1&sig=x", fake.url).as_str())
+        );
+        let clip = &lesson.citations[5];
+        assert_eq!((clip.start_ms, clip.end_ms), (Some(3_725), Some(8_560)));
+        let audio = lib.sources.iter().find(|s| s.id == clip.source_id).unwrap();
+        assert!(
+            audio
+                .media_url
+                .as_deref()
+                .is_some_and(|u| u.starts_with(&fake.url))
+        );
+        // Every marker in the body names a citation.
+        for c in &lesson.citations {
+            assert!(lesson.body_md.contains(&format!("[^{}]", c.n)), "[^{}]", c.n);
+        }
+        // Lessons written before citations existed decode with none.
+        let mut old = serde_json::to_value(lesson).unwrap();
+        old.as_object_mut().unwrap().remove("citations");
+        let old: margin_shared::Lesson = serde_json::from_value(old).unwrap();
+        assert!(old.citations.is_empty());
     }
 
     #[tokio::test]

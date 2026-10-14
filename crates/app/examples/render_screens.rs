@@ -11,6 +11,10 @@
 //! - `RENDER_SOURCES=<topic id>` opens that topic's Sources dialog.
 //! - `RENDER_UPLOADS=1` attaches sample files and a folder in the Ask composer.
 //! - `RENDER_EMBEDDING=missing|downloading|ready|failed` sets the embedding model's state.
+//! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n.
+//!
+//! The Read view's lesson body is filled in on load, and the sample sources' media are
+//! the files in `examples/sample-media`.
 //!
 //! Effects, futures and JS evals don't run in server-side rendering, so live parts
 //! (selection, settings fetched over HTTP) show their initial state. Test tooling only.
@@ -19,6 +23,8 @@
 
 #[path = "../src/api.rs"]
 mod api;
+#[path = "../src/citations.rs"]
+mod citations;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/fake.rs"]
@@ -63,8 +69,9 @@ fn Harness(props: HarnessProps) -> Element {
     let route = props.route.clone();
     use_context_provider(|| Rc::new(MemoryHistory::with_initial_path(route)) as Rc<dyn History>);
     let connect = props.route == "connect";
+    let viewer_lesson = lesson_in_route(&props.route);
     use_context_provider(move || {
-        let mut lib = LibraryState::from_library(fake::sample_library());
+        let mut lib = LibraryState::from_library(sample_library());
         lib.settings = Some(Settings {
             openai_base_url: "https://api.openai.com/v1".into(),
             openai_model: "gpt-5".into(),
@@ -80,7 +87,7 @@ fn Harness(props: HarnessProps) -> Element {
                 repo: fake::EMBEDDING_REPO.into(),
                 state: match state.as_str() {
                     "downloading" => EmbeddingModelState::Downloading {
-                        received: 251_000_000,
+                        received: 583_000_000,
                         total: fake::EMBEDDING_DOWNLOAD_BYTES,
                     },
                     "ready" => EmbeddingModelState::Ready {
@@ -137,6 +144,13 @@ fn Harness(props: HarnessProps) -> Element {
             ask_prompt: Signal::new(String::new()),
             uploads: Signal::new(uploads),
             settings_open: Signal::new(settings_open),
+            source_viewer: Signal::new(
+                std::env::var("RENDER_VIEWER")
+                    .ok()
+                    .and_then(|n| n.parse().ok())
+                    .zip(viewer_lesson)
+                    .map(|(n, lesson_id)| state::SourceViewer { lesson_id, n }),
+            ),
         }
     });
     let sources_topic = std::env::var("RENDER_SOURCES").ok();
@@ -216,6 +230,28 @@ fn file_url(p: &Path) -> String {
     format!("file://{}", p.display())
 }
 
+/// The fake library with its sample media as local files.
+fn sample_library() -> margin_shared::Library {
+    let mut library = fake::sample_library();
+    fake::rebase_media(&mut library, |path| {
+        let mut parts = path.split('?').next().unwrap_or(path).split('/').skip(3);
+        match (parts.next(), parts.next()) {
+            (Some(id), Some(file)) => fake::sample_media_file(id, file)
+                .map(|p| file_url(&p))
+                .unwrap_or_else(|| format!("http://127.0.0.1:9{path}")),
+            _ => path.to_string(),
+        }
+    });
+    library
+}
+
+/// The lesson a `/lesson/{id}…` route shows.
+fn lesson_in_route(route: &str) -> Option<String> {
+    route
+        .strip_prefix("/lesson/")
+        .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -223,6 +259,20 @@ async fn main() {
     let out = args.next().unwrap_or_else(|| "screen.html".into());
     let theme = args.next().unwrap_or_else(|| "light".into());
 
+    // The Read view puts the lesson body into the page from an effect, which server-side
+    // rendering doesn't run; the snapshot page does it on load instead.
+    let body_script = lesson_in_route(&route)
+        .filter(|_| route.matches('/').count() == 2)
+        .and_then(|id| {
+            let lesson = sample_library().lessons.into_iter().find(|l| l.id == id)?;
+            let html =
+                markdown::render_lesson(&lesson.body_md, &citations::ordered(&lesson.citations));
+            Some(format!(
+                "MarginApp.setHtml('lesson-body', {});",
+                serde_json::to_string(&html).unwrap()
+            ))
+        })
+        .unwrap_or_default();
     let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { route });
     dom.rebuild_in_place();
     let body = dioxus_ssr::render(&dom);
@@ -242,7 +292,7 @@ async fn main() {
 <script src="{kjs}"></script>
 <script src="{mjs}"></script>
 </head><body><div id="main">{body}</div>
-<script>window.addEventListener('load', function () {{ MarginApp.renderMathIn('.md'); }});</script>
+<script>window.addEventListener('load', function () {{ {body_script} MarginApp.renderMathIn('.md'); }});</script>
 </body></html>"#,
         f1 = file_url(&fonts.join("AlbertSans-wght.ttf")),
         f2 = file_url(&fonts.join("AlbertSans-Italic-wght.ttf")),
