@@ -4,7 +4,11 @@
 //!
 //! By phase (`docs/agent-contract.md`):
 //! - 1, Read: `search_library`, `list_topics`, `get_topic`, `read_lesson`, `read_note`,
-//!   `list_notes`, `search_sources` (passages card), `list_sources`.
+//!   `list_notes`, `list_sources`.
+//! - R1, retrieval (`docs/agent-rag-architecture.md` §2.8): `search` (hybrid retrieval,
+//!   default scope this chat's files and folders then its topic; passages card),
+//!   `read_passage`, `document_outline`, `view_picture`. Retrieval is
+//!   `retrieval::context_search`, the same path as `POST routes::CONTEXT_SEARCH`.
 //! - 2, Write: `create_topic`, `rename_topic`, `move_topic`, `edit_lesson_title`,
 //!   `create_note`, `append_to_note`, `replace_note_body` (confirms when the note is the
 //!   owner's own writing), `propose_course` (outline card), `accept_proposal` (result
@@ -31,11 +35,14 @@ use margin_agent::{
     BoxFuture, ConfirmationPrompt, ToolContext, ToolKind, ToolOutput, ToolRegistry, Typed,
     TypedTool,
 };
+use margin_shared::context::{self, ContextQuery, Modality, Scope};
+use margin_shared::pipeline::Route;
+use margin_shared::routes::{TOOL_OUTPUT_PASSAGE_CHARS, TOOL_READ_PASSAGES_MAX, TOOL_SEARCH_K_MAX};
 use margin_shared::{
     AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
     NewTopic, Note, NotePatch, Outline, OutlineCard, OutlineChips, OutlineLesson, PassagesCard,
-    Proposal, ProposalStatus, ResultCard, ResultTarget, Source, SourceStatus, Topic, TopicPatch,
-    VideoStatus,
+    Proposal, ProposalStatus, ResultCard, ResultTarget, SearchHit, Source, SourceStatus, Topic,
+    TopicPatch, VideoStatus,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -44,10 +51,11 @@ use tokio::sync::oneshot;
 
 use crate::error::{AppError, AppResult};
 use crate::library::{self, sort_topics};
+use crate::pipeline::{Hit, Packed};
 use crate::state::{AppState, Author, StoredLesson, StoredVideo};
-use crate::{ask, db, embedding, search, sources, video};
+use crate::{ask, db, retrieval, search, sources, video};
 
-/// How long `search_sources` waits for sources still being read before searching what
+/// How long `search` waits for sources still being read before searching what
 /// is ready.
 pub const SOURCE_SEARCH_WAIT: Duration = Duration::from_secs(15);
 
@@ -63,7 +71,10 @@ pub fn registry(state: &AppState) -> ToolRegistry {
     r.register(Arc::new(Typed(ReadLesson(state.clone()))));
     r.register(Arc::new(Typed(ReadNote(state.clone()))));
     r.register(Arc::new(Typed(ListNotes(state.clone()))));
-    r.register(Arc::new(Typed(SearchSources(state.clone()))));
+    r.register(Arc::new(Typed(Search(state.clone()))));
+    r.register(Arc::new(Typed(ReadPassage(state.clone()))));
+    r.register(Arc::new(Typed(DocumentOutlineTool(state.clone()))));
+    r.register(Arc::new(Typed(ViewPicture(state.clone()))));
     r.register(Arc::new(Typed(ListSources(state.clone()))));
     r.register(Arc::new(Typed(CreateTopic(state.clone()))));
     r.register(Arc::new(Typed(RenameTopic(state.clone()))));
@@ -239,8 +250,9 @@ pub struct SearchLibrary(pub AppState);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchLibraryArgs {
-    /// Words to look for in topic titles, lesson titles and bodies, and notes
-    /// (case-insensitive substring match, so prefer one or two distinctive words).
+    /// Words to look for in topic titles, lesson titles and bodies, and notes (found
+    /// by the words and their beginnings, then the whole query matched in one field,
+    /// case-insensitive; prefer one or two distinctive words).
     pub query: String,
 }
 
@@ -260,11 +272,10 @@ impl TypedTool for SearchLibrary {
             if query.is_empty() {
                 return ToolOutput::error("Give some words to search for.");
             }
-            let lib = match Snapshot::load(&self.0).await {
-                Ok(l) => l,
+            let hits = match search::find(&self.0.store, query).await {
+                Ok(h) => h,
                 Err(e) => return internal(e),
             };
-            let hits = search::run(query, &lib.topics, &lib.lessons, &lib.notes);
             let summary = match hits.len() {
                 0 => "No matches".to_string(),
                 n => plural(n, "match", "matches"),
@@ -629,30 +640,79 @@ impl TypedTool for ListNotes {
 }
 
 // ---------------------------------------------------------------------------
-// search_sources
+// The retrieval family: search, read_passage, document_outline, view_picture
 // ---------------------------------------------------------------------------
 
-pub struct SearchSources(pub AppState);
+/// Longest output of a retrieval tool, in bytes.
+pub const RETRIEVAL_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// Most characters one `read_passage` returns.
+pub const READ_PASSAGE_MAX_CHARS: usize = 6_000;
+/// Most characters of one `document_outline`.
+pub const OUTLINE_MAX_CHARS: usize = 2_000;
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchSourcesArgs {
-    /// What to look for, as a question or a few words; matched by meaning.
-    pub query: String,
-    /// Only the sources of this topic (and the topics under it); null to not limit by
-    /// topic.
-    pub topic_id: Option<String>,
-    /// Only these sources; null (or empty) to not limit by source.
-    pub source_ids: Option<Vec<String>>,
+/// What a passage is, as the model names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModalityArg {
+    /// Text: a chunk of a document, a page's text, a transcript passage.
+    Text,
+    /// An image or a PDF page as a picture.
+    Picture,
+    /// A frame of a video.
+    Frame,
+    /// A stretch of a recording.
+    Sound,
 }
 
-impl TypedTool for SearchSources {
-    type Args = SearchSourcesArgs;
-    const NAME: &'static str = "search_sources";
-    const DESCRIPTION: &'static str = "Find the passages of the owner's sources (uploaded files: text, code, PDFs, images, audio, video) most relevant to a query, best first (at most 8). Searches the given source_ids, else the topic's sources, else the files attached to this chat and every other source. Each passage has a number n, its source, page or time, and text; cite them by source name and page or time. The passages are shown to the owner as a card.";
+impl From<ModalityArg> for Modality {
+    fn from(m: ModalityArg) -> Self {
+        match m {
+            ModalityArg::Text => Modality::Text,
+            ModalityArg::Picture => Modality::Picture,
+            ModalityArg::Frame => Modality::Frame,
+            ModalityArg::Sound => Modality::Sound,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SearchScopeArg {
+    /// A topic: its sources and its subtopics'. Null to leave out.
+    pub topic_id: Option<String>,
+    /// These sources (ids from list_sources, get_topic or this chat's files). Null to
+    /// leave out.
+    pub source_ids: Option<Vec<String>>,
+    /// These folders attached to this chat. Null to leave out.
+    pub workspace_ids: Option<Vec<String>>,
+    /// The files and folders attached to this chat. Null or false to leave out.
+    pub chat_files: Option<bool>,
+    /// Also the owner's lessons and notes (matched by words, listed apart). Null or
+    /// false to leave out.
+    pub library: Option<bool>,
+}
+
+pub struct Search(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// What to look for, as a question or a few words; matched by meaning and by words.
+    pub query: String,
+    /// Where to look; null for this chat's files and folders and then its topic.
+    pub scope: Option<SearchScopeArg>,
+    /// Most passages to return, 1 to 12; null for 12.
+    pub k: Option<u32>,
+    /// Only these kinds of passage; null for all.
+    pub modalities: Option<Vec<ModalityArg>>,
+}
+
+impl TypedTool for Search {
+    type Args = SearchArgs;
+    const NAME: &'static str = "search";
+    const DESCRIPTION: &'static str = "Find the passages of the owner's documents (uploaded files and the files of attached folders: text, PDFs, images, audio, video) most relevant to a query, best first. By default it searches this chat's files and folders and then its topic; scope can name a topic, sources, folders, the chat's files, and add the owner's lessons and notes. Each passage has a number n, its document_id, source, section, page, lines or time, and text (cut to 1200 characters). Cite passages by source and page, lines or time. Use read_passage for more around a hit, document_outline for a document's sections, view_picture for a page or image. The passages are shown to the owner as a card.";
     const KIND: ToolKind = ToolKind::Read;
 
     fn label(&self, args: &Self::Args) -> String {
-        format!("Searching sources for {}", quoted(&args.query))
+        format!("Searching for {}", quoted(&args.query))
     }
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
@@ -662,128 +722,517 @@ impl TypedTool for SearchSources {
             if query.is_empty() {
                 return ToolOutput::error("Give something to search for.");
             }
-            let scope = match search_scope(state, ctx, &args).await {
-                Ok(Ok(ids)) => ids,
+            let scope_arg = args.scope.unwrap_or_default();
+            let library = scope_arg.library.unwrap_or(false);
+            let scope = match search_scope(state, ctx, &scope_arg).await {
+                Ok(Ok(scope)) => scope,
                 Ok(Err(out)) => return out,
                 Err(e) => return internal(e),
             };
-            if scope.is_empty() {
-                return ToolOutput::error(
-                    "There are no sources to search. The owner can attach files to this chat or add them to a topic.",
-                );
-            }
-            if !embedding::will_be_available(state).await {
-                return ToolOutput::error(
-                    "Searching sources needs the local embedding model, which isn't downloaded. The owner can download it in Settings → Sources.",
-                );
-            }
-            let found =
-                match sources::passages_within(state, &scope, &query, SOURCE_SEARCH_WAIT).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!("search_sources failed: {e:#}");
-                        return ToolOutput::error(format!("The sources couldn't be searched: {e}"));
-                    }
-                };
-            // Sources still not read after the wait, so the model can say so.
-            let mut unread = Vec::new();
-            for id in &scope {
-                if let Ok(Some(s)) = state.store.get::<Source>(db::SOURCE, id).await
-                    && sources::is_pending(&s.status)
-                {
-                    unread.push(s.name);
-                }
-            }
-            let mut citations = Vec::new();
-            let mut rows = Vec::new();
-            let mut from = HashSet::new();
-            for (i, r) in found.iter().enumerate() {
-                let n = i as u32 + 1;
-                from.insert(r.citation.source_id.clone());
-                rows.push(json!({
-                    "n": n,
-                    "source_id": r.citation.source_id,
-                    "source": r.citation.source_name,
-                    "page": r.citation.page,
-                    "start_ms": r.citation.start_ms,
-                    "end_ms": r.citation.end_ms,
-                    "text": r.passage.text,
-                    "picture": r.passage.image.is_some(),
-                }));
-                // `image_url` stays a bare media file name; chats sign it on the way out.
-                citations.push(Citation {
-                    n,
-                    ..r.citation.clone()
-                });
-            }
-            let summary = if rows.is_empty() {
-                "No passages found".to_string()
-            } else {
-                format!(
-                    "{} from {}",
-                    plural(rows.len(), "passage", "passages"),
-                    plural(from.len(), "source", "sources")
-                )
+            let resolved = match retrieval::resolve(&state.store, &scope).await {
+                Ok(r) => r,
+                Err(e) => match e.downcast_ref::<retrieval::BadScope>() {
+                    Some(bad) => return ToolOutput::error(bad.to_string()),
+                    None => return internal(e),
+                },
             };
-            let mut output = json!({ "query": query, "passages": rows });
-            if !unread.is_empty() {
-                output["still_being_read"] = json!(unread);
+            if resolved.is_empty() && !library {
+                return ToolOutput::error(
+                    "There are no sources to search. The owner can attach files or folders to this chat or add them to a topic.",
+                );
             }
-            let mut out = ToolOutput::ok(output.to_string(), summary);
-            if !citations.is_empty() {
-                out = out.with_card(Card::Passages(PassagesCard {
-                    query,
-                    passages: citations,
-                }));
-            }
-            out
+            let unread = match retrieval::wait_until_read(state, &scope, SOURCE_SEARCH_WAIT).await {
+                Ok(u) => u,
+                Err(e) => return internal(e),
+            };
+            let k = args
+                .k
+                .map_or(TOOL_SEARCH_K_MAX, |k| k as usize)
+                .clamp(1, TOOL_SEARCH_K_MAX);
+            let q = ContextQuery {
+                text: query.clone(),
+                scope,
+                modalities: args
+                    .modalities
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Modality::from)
+                    .collect(),
+                k: k as u32,
+                budget: None,
+                access: None,
+            };
+            let packed = if resolved.is_empty() {
+                Vec::new()
+            } else {
+                match retrieval::context_search(state, &q, Route::Chat, &ctx.turn_id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("search failed: {e:#}");
+                        return ToolOutput::error(format!(
+                            "The documents couldn't be searched: {e}"
+                        ));
+                    }
+                }
+            };
+            let lessons = if library {
+                match search::find(&state.store, &query).await {
+                    Ok(hits) => hits,
+                    Err(e) => return internal(e),
+                }
+            } else {
+                Vec::new()
+            };
+            let words_only = !crate::embedding::will_be_available(state).await;
+            search_output(&query, &packed, &lessons, &unread, words_only)
         })
     }
 }
 
-/// The sources `search_sources` looks in: the given ids, else the topic's (and its
-/// subtopics'), else the chat's files followed by every other source. `Ok(Err(..))` is
-/// an error output for the model.
+/// One passage as a retrieval tool shows it to the model.
+fn passage_json(n: u32, c: &Citation, hit: &context::Hit) -> Value {
+    json!({
+        "n": n,
+        "document_id": hit.document_id,
+        "source_id": c.source_id,
+        "source": c.source_name,
+        "section": hit.section_path,
+        "page": hit.page,
+        "start_line": hit.start_line,
+        "end_line": hit.end_line,
+        "start_ms": hit.start_ms,
+        "end_ms": hit.end_ms,
+        "modality": hit.modality,
+        "picture": c.image_url.is_some(),
+        "text": excerpt_keep_lines(&hit.text, TOOL_OUTPUT_PASSAGE_CHARS),
+        "score": (hit.score * 1000.0).round() / 1000.0,
+    })
+}
+
+/// The first `max` characters of `text`, "…" when cut.
+fn excerpt_keep_lines(text: &str, max: usize) -> String {
+    let t = text.trim();
+    let mut short: String = t.chars().take(max).collect();
+    if t.chars().count() > max {
+        short.push('…');
+    }
+    short
+}
+
+/// `search`'s output and card: the passages numbered from 1, cut so the output stays
+/// under `RETRIEVAL_OUTPUT_MAX_BYTES` (the last passages go first).
+fn search_output(
+    query: &str,
+    packed: &[Packed],
+    library: &[SearchHit],
+    unread: &[String],
+    words_only: bool,
+) -> ToolOutput {
+    let mut rows: Vec<Value> = Vec::new();
+    let mut citations: Vec<Citation> = Vec::new();
+    for (i, p) in packed.iter().enumerate() {
+        let n = i as u32 + 1;
+        let hit = retrieval::packed_hit(p);
+        rows.push(passage_json(n, &p.citation, &hit));
+        // `image_url` stays a bare media file name; chats sign it on the way out.
+        citations.push(Citation {
+            n,
+            ..p.citation.clone()
+        });
+    }
+    let lib: Vec<Value> = library
+        .iter()
+        .take(TOOL_SEARCH_K_MAX)
+        .map(|h| json!({"kind": h.kind, "id": h.id, "title": h.title, "where": h.context, "snippet": h.snippet}))
+        .collect();
+    let build = |rows: &[Value]| {
+        let mut output = json!({ "query": query, "passages": rows });
+        if !lib.is_empty() {
+            output["library"] = json!(lib);
+        }
+        if !unread.is_empty() {
+            output["still_being_read"] = json!(unread);
+        }
+        if words_only {
+            output["note"] = json!(
+                "Matched by words only: the local embedding model isn't downloaded (Settings → Sources)."
+            );
+        }
+        output.to_string()
+    };
+    let mut text = build(&rows);
+    while text.len() > RETRIEVAL_OUTPUT_MAX_BYTES && !rows.is_empty() {
+        rows.pop();
+        citations.pop();
+        text = build(&rows);
+    }
+    let documents: HashSet<&str> = citations.iter().map(|c| c.source_id.as_str()).collect();
+    let mut summary = if rows.is_empty() {
+        "No passages found".to_string()
+    } else {
+        format!(
+            "{} from {}",
+            plural(rows.len(), "passage", "passages"),
+            plural(documents.len(), "document", "documents")
+        )
+    };
+    if !lib.is_empty() {
+        summary.push_str(&format!(
+            " · {}",
+            plural(lib.len(), "library match", "library matches")
+        ));
+    }
+    let mut out = ToolOutput::ok(text, summary);
+    if !citations.is_empty() {
+        out = out.with_card(Card::Passages(PassagesCard {
+            query: query.to_string(),
+            passages: citations,
+        }));
+    }
+    out
+}
+
+/// The scope `search` looks in: what the arguments name, else (nothing named) this
+/// chat's files and folders and then its topic (owner Q1; never every source).
+/// `Ok(Err(..))` is an error output for the model.
 async fn search_scope(
     state: &AppState,
     ctx: &ToolContext,
-    args: &SearchSourcesArgs,
-) -> anyhow::Result<Result<Vec<String>, ToolOutput>> {
-    let mut all: Vec<Source> = state.store.list(db::SOURCE).await?;
-    all.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    if let Some(ids) = args.source_ids.as_ref().filter(|ids| !ids.is_empty()) {
-        let known: Vec<String> = ids
-            .iter()
-            .filter(|id| all.iter().any(|s| &s.id == *id))
-            .cloned()
-            .collect();
+    arg: &SearchScopeArg,
+) -> anyhow::Result<Result<Scope, ToolOutput>> {
+    let chat: Option<Chat> = state.store.get(db::CHAT, &ctx.chat_id).await?;
+    let mut scopes = Vec::new();
+    if let Some(topic_id) = &arg.topic_id {
+        if let Err(e) = library::topic(state, topic_id).await {
+            return Ok(Err(failed(e)));
+        }
+        scopes.push(Scope::Topic {
+            id: topic_id.clone(),
+        });
+    }
+    if let Some(ids) = arg.source_ids.as_ref().filter(|ids| !ids.is_empty()) {
+        let mut known = Vec::new();
+        for id in ids {
+            if state.store.get::<Source>(db::SOURCE, id).await?.is_some()
+                || state
+                    .store
+                    .get::<context::Document>(db::DOCUMENT, id)
+                    .await?
+                    .is_some()
+            {
+                known.push(id.clone());
+            }
+        }
         if known.is_empty() {
             return Ok(Err(ToolOutput::error(
                 "None of those sources exist. Use list_sources to see them.",
             )));
         }
-        return Ok(Ok(known));
+        scopes.push(Scope::Sources { ids: known });
     }
-    if let Some(topic_id) = &args.topic_id {
-        if let Err(e) = library::topic(state, topic_id).await {
-            return Ok(Err(failed(e)));
-        }
-        let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
-        let within = subtree(&topics, topic_id);
-        return Ok(Ok(all
-            .into_iter()
-            .filter(|s| s.topic_id.as_ref().is_some_and(|t| within.contains(t)))
-            .map(|s| s.id)
-            .collect()));
-    }
-    let chat: Option<Chat> = state.store.get(db::CHAT, &ctx.chat_id).await?;
-    let mut ids: Vec<String> = chat.map(|c| c.source_ids).unwrap_or_default();
-    for s in all {
-        if !ids.contains(&s.id) {
-            ids.push(s.id);
+    if let Some(ids) = arg.workspace_ids.as_ref().filter(|ids| !ids.is_empty()) {
+        let attached = chat
+            .as_ref()
+            .map(|c| c.workspace_ids.clone())
+            .unwrap_or_default();
+        for id in ids {
+            if !attached.contains(id) {
+                return Ok(Err(ToolOutput::error(format!(
+                    "The folder {id} isn't attached to this chat."
+                ))));
+            }
+            scopes.push(Scope::Workspace { id: id.clone() });
         }
     }
-    Ok(Ok(ids))
+    if arg.chat_files == Some(true) {
+        scopes.push(Scope::Chat {
+            id: ctx.chat_id.clone(),
+        });
+    }
+    if scopes.is_empty() {
+        let scope = match &chat {
+            Some(chat) => retrieval::chat_scope(&state.store, chat).await?,
+            None => Scope::Chat {
+                id: ctx.chat_id.clone(),
+            },
+        };
+        let nothing_attached = chat
+            .as_ref()
+            .is_none_or(|c| c.source_ids.is_empty() && c.workspace_ids.is_empty());
+        if matches!(scope, Scope::Chat { .. }) && nothing_attached && arg.library != Some(true) {
+            return Ok(Err(ToolOutput::error(
+                "There are no sources to search: nothing is attached to this chat and it has no topic yet. Name a topic or sources in scope, or the owner can attach files or folders.",
+            )));
+        }
+        return Ok(Ok(scope));
+    }
+    Ok(Ok(match scopes.len() {
+        1 => scopes.remove(0),
+        _ => Scope::Union { scopes },
+    }))
+}
+
+/// Whether `document_id` can be read: `Err` is the output saying why not.
+async fn readable(state: &AppState, document_id: &str) -> Result<(), ToolOutput> {
+    match retrieval::doc_state(&state.store, document_id).await {
+        Ok(retrieval::DocState::Ready) => Ok(()),
+        Ok(retrieval::DocState::NotReady) => Err(ToolOutput::error(
+            "That document is still being read. Try again in a moment.",
+        )),
+        Ok(retrieval::DocState::Unknown) => Err(ToolOutput::error(
+            "There is no such document. Use search or list_sources for document ids.",
+        )),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+pub struct ReadPassage(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadPassageArgs {
+    /// The document_id of a search hit.
+    pub document_id: String,
+    /// A PDF page to read; null to read by position.
+    pub page: Option<u32>,
+    /// The first passage position (ord) to read; null for the start.
+    pub from_ord: Option<u32>,
+    /// The last position to read (at most 3 after from_ord); null for from_ord + 3.
+    pub to_ord: Option<u32>,
+}
+
+impl TypedTool for ReadPassage {
+    type Args = ReadPassageArgs;
+    const NAME: &'static str = "read_passage";
+    const DESCRIPTION: &'static str = "Read more of a document around a search hit: up to 4 adjacent passages (about 6000 characters), by PDF page or by position (ord, from search hits or document_outline). Never the whole file: read the sections you need.";
+    const KIND: ToolKind = ToolKind::Read;
+
+    fn label(&self, args: &Self::Args) -> String {
+        match args.page {
+            Some(p) => format!("Reading page {p}"),
+            None => "Reading a passage".into(),
+        }
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let state = &self.0;
+            if let Err(out) = readable(state, &args.document_id).await {
+                return out;
+            }
+            let sel = match (args.page, args.from_ord) {
+                (Some(page), _) => retrieval::Selector::Page(page),
+                (None, from) => {
+                    let from = from.unwrap_or(0);
+                    retrieval::Selector::Ords {
+                        from,
+                        to: args
+                            .to_ord
+                            .unwrap_or(from + TOOL_READ_PASSAGES_MAX as u32 - 1),
+                    }
+                }
+            };
+            let rows = match retrieval::read_passages(
+                &state.store,
+                &args.document_id,
+                sel,
+                TOOL_READ_PASSAGES_MAX,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => return internal(e),
+            };
+            let info = retrieval::doc_info(&state.store, &args.document_id)
+                .await
+                .ok()
+                .flatten();
+            let mut left = READ_PASSAGE_MAX_CHARS;
+            let mut out_rows = Vec::new();
+            for r in &rows {
+                if left == 0 {
+                    break;
+                }
+                let text = excerpt_keep_lines(&r.text, left);
+                left = left.saturating_sub(text.chars().count());
+                out_rows.push(json!({
+                    "ord": r.ord,
+                    "section": r.section_path,
+                    "page": r.page,
+                    "start_line": r.start_line,
+                    "end_line": r.end_line,
+                    "start_ms": r.start_ms,
+                    "end_ms": r.end_ms,
+                    "text": text,
+                }));
+            }
+            let summary = match out_rows.len() {
+                0 => "Nothing there".to_string(),
+                n => plural(n, "passage", "passages"),
+            };
+            let output = json!({
+                "document_id": args.document_id,
+                "source": info.map(|i| i.name),
+                "passages": out_rows,
+            });
+            ToolOutput::ok(output.to_string(), summary)
+        })
+    }
+}
+
+pub struct DocumentOutlineTool(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DocumentArgs {
+    /// The document_id of a search hit.
+    pub document_id: String,
+}
+
+impl TypedTool for DocumentOutlineTool {
+    type Args = DocumentArgs;
+    const NAME: &'static str = "document_outline";
+    const DESCRIPTION: &'static str = "A document's sections (headings as paths like \"Chapter 2 > Fourier series\") with their positions (ord), pages and lines, so you can read_passage the ones you need.";
+    const KIND: ToolKind = ToolKind::Read;
+
+    fn label(&self, _args: &Self::Args) -> String {
+        "Reading a document's outline".into()
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let state = &self.0;
+            if let Err(out) = readable(state, &args.document_id).await {
+                return out;
+            }
+            let sections = match retrieval::document_outline(&state.store, &args.document_id).await
+            {
+                Ok(s) => s,
+                Err(e) => return internal(e),
+            };
+            let info = retrieval::doc_info(&state.store, &args.document_id)
+                .await
+                .ok()
+                .flatten();
+            let mut rows: Vec<Value> = sections
+                .iter()
+                .map(|s| {
+                    json!({
+                        "section": s.section_path,
+                        "from_ord": s.from_ord,
+                        "to_ord": s.to_ord,
+                        "pages": s.first_page.map(|f| [f, s.last_page.unwrap_or(f)]),
+                        "lines": s.start_line.map(|f| [f, s.end_line.unwrap_or(f)]),
+                    })
+                })
+                .collect();
+            let total = rows.len();
+            let build = |rows: &[Value]| {
+                let mut v = json!({
+                    "document_id": args.document_id,
+                    "source": info.as_ref().map(|i| i.name.clone()),
+                    "sections": rows,
+                });
+                if rows.len() < total {
+                    v["more_sections"] = json!(total - rows.len());
+                }
+                v.to_string()
+            };
+            let mut text = build(&rows);
+            while text.chars().count() > OUTLINE_MAX_CHARS && rows.len() > 1 {
+                rows.pop();
+                text = build(&rows);
+            }
+            ToolOutput::ok(text, plural(total, "section", "sections"))
+        })
+    }
+}
+
+pub struct ViewPicture(pub AppState);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ViewPictureArgs {
+    /// The document_id of a search hit.
+    pub document_id: String,
+    /// The PDF page to see; null for the document's picture (an image) or first page.
+    pub page: Option<u32>,
+}
+
+impl TypedTool for ViewPicture {
+    type Args = ViewPictureArgs;
+    const NAME: &'static str = "view_picture";
+    const DESCRIPTION: &'static str = "Show a document's stored picture (an image, or a PDF page) with what can be read in it, and show it to the owner as a card.";
+    const KIND: ToolKind = ToolKind::Read;
+
+    fn label(&self, args: &Self::Args) -> String {
+        match args.page {
+            Some(p) => format!("Looking at page {p}"),
+            None => "Looking at a picture".into(),
+        }
+    }
+
+    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let state = &self.0;
+            if let Err(out) = readable(state, &args.document_id).await {
+                return out;
+            }
+            let picture =
+                match retrieval::document_picture(&state.store, &args.document_id, args.page).await
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        return ToolOutput::error(match args.page {
+                            Some(p) => format!("That document has no picture of page {p}."),
+                            None => "That document has no picture.".to_string(),
+                        });
+                    }
+                    Err(e) => return internal(e),
+                };
+            let hit = Hit {
+                passage: picture,
+                score: 1.0,
+                dense_rank: None,
+                lex_rank: None,
+                rerank: None,
+                highlight: None,
+            };
+            let mut packed = vec![Packed {
+                text: hit.passage.text.clone(),
+                tokens: 0,
+                citation: crate::pipeline::hit_citation(&hit),
+                hits: vec![hit],
+            }];
+            if let Err(e) = retrieval::describe_packed(state, &mut packed).await {
+                return internal(e);
+            }
+            let p = &packed[0];
+            let output = json!({
+                "document_id": args.document_id,
+                "source": p.citation.source_name,
+                "page": p.citation.page,
+                "text_in_picture": excerpt_keep_lines(&p.text, TOOL_OUTPUT_PASSAGE_CHARS),
+                "shown_to_owner": true,
+            });
+            let summary = match p.citation.page {
+                Some(n) => format!("Page {n} of {}", p.citation.source_name),
+                None => p.citation.source_name.clone(),
+            };
+            ToolOutput::ok(output.to_string(), summary).with_card(Card::Passages(PassagesCard {
+                query: summary_query(&p.citation),
+                passages: vec![Citation {
+                    n: 1,
+                    ..p.citation.clone()
+                }],
+            }))
+        })
+    }
+}
+
+/// The card title of a picture shown by `view_picture`.
+fn summary_query(c: &Citation) -> String {
+    match c.page {
+        Some(n) => format!("{}, page {n}", c.source_name),
+        None => c.source_name.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1867,10 @@ pub struct ProposeCourseArgs {
     /// files): files not yet in a topic, or the parent topic's. Accepting the course
     /// files them under it. Empty for none.
     pub source_ids: Vec<String>,
+    /// Whether the service surveys the sources and this chat's folders and plans the
+    /// outline from what they cover (your lessons are its draft); null for yes when
+    /// there are sources or folders.
+    pub survey: Option<bool>,
 }
 
 impl TypedTool for ProposeCourse {
@@ -1456,10 +1909,12 @@ impl TypedTool for ProposeCourse {
                     })
                     .collect(),
             };
-            let proposal = match ask::propose(&state, &chat_id, request, outline).await {
-                Ok(p) => p,
-                Err(e) => return failed(e),
-            };
+            let survey = args.survey;
+            let proposal =
+                match ask::propose_planned(&state, &chat_id, request, outline, survey).await {
+                    Ok(p) => p,
+                    Err(e) => return failed(e),
+                };
             let Some(outline) = &proposal.outline else {
                 return ToolOutput::error("The outline wasn't kept.");
             };
@@ -2269,6 +2724,10 @@ mod tests {
             margin_agent::strict_schema::<WriteLessonArgs>(),
             margin_agent::strict_schema::<LessonArgs>(),
             margin_agent::strict_schema::<AttachSourcesArgs>(),
+            margin_agent::strict_schema::<SearchArgs>(),
+            margin_agent::strict_schema::<ReadPassageArgs>(),
+            margin_agent::strict_schema::<DocumentArgs>(),
+            margin_agent::strict_schema::<ViewPictureArgs>(),
         ] {
             margin_agent::check_strict_schema(&schema).unwrap_or_else(|e| panic!("{e}: {schema}"));
         }

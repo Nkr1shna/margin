@@ -1933,3 +1933,242 @@ async fn attach_sources_files_the_chats_files_under_a_topic() {
     assert_eq!(topic_of(a.id.clone()).await, Some(topic.id.clone()));
     assert_eq!(topic_of(b.id.clone()).await, Some(topic.id.clone()));
 }
+
+// ---------------------------------------------------------------------------
+// R1: lessons retrieve with the planner's questions, packed to the budget
+// ---------------------------------------------------------------------------
+
+mod lesson_retrieval {
+    use super::*;
+    use chrono::Utc;
+    use margin_embed::{Embedder, Purpose, fake::FakeEmbedder};
+    use margin_service::ask::{CoursePlan, PlannedLesson, StoredProposal};
+    use margin_service::db::PassageRow;
+    use margin_shared::{AskRequest, Outline, OutlineLesson};
+
+    fn passage(id: &str, scope: &str, ord: i64, text: &str) -> PassageRow {
+        PassageRow {
+            id: id.into(),
+            project_id: "my-library".into(),
+            document_id: "notes".into(),
+            origin: "agent".into(),
+            scope_ids: vec![scope.into()],
+            access: vec!["company".into()],
+            unit_id: format!("notes:{id}"),
+            modality: "text".into(),
+            ord,
+            page: None,
+            start_line: Some(ord * 5 + 1),
+            end_line: Some(ord * 5 + 4),
+            start_ms: None,
+            end_ms: None,
+            section_path: "Signals".into(),
+            text: text.into(),
+            file: None,
+            chunk_hash: format!("h-{id}"),
+            embedder: "fake".into(),
+            vector: FakeEmbedder
+                .embed(&[text.to_string()], Purpose::DOCUMENT)
+                .unwrap()
+                .remove(0),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lessons_use_the_plans_questions_and_the_budget() {
+        let (h, t) = signed_in().await;
+        let topic = new_topic(&h, &t, None, "Signals").await;
+        // Passages far apart (no merging), each about one thing.
+        let texts = [
+            "Gibbs ringing overshoots near a jump discontinuity by about nine percent.",
+            "Aliasing folds frequencies above Nyquist back into the band.",
+            "Convolution in time is multiplication in frequency.",
+            "Window functions trade main lobe width against side lobes.",
+        ];
+        let rows: Vec<PassageRow> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| passage(&format!("p{i}"), &topic.id, i as i64 * 10, text))
+            .collect();
+        h.state.store.insert_many(db::PASSAGE, &rows).await.unwrap();
+
+        // A stored plan whose question is the only way to the Gibbs passage.
+        let now = Utc::now();
+        let request = AskRequest {
+            prompt: "signals".into(),
+            lesson_count: 1,
+            level: Level::Intro,
+            with_videos: false,
+            with_quiz: false,
+            parent_topic_id: None,
+            source_ids: vec![],
+        };
+        let outline = Outline {
+            topic_title: "Signals".into(),
+            subject_title: "S".into(),
+            lessons: vec![OutlineLesson {
+                title: "Lesson one".into(),
+                summary: "Overview".into(),
+                minutes: 5,
+            }],
+        };
+        let proposal = Proposal {
+            id: "prop".into(),
+            request,
+            status: ProposalStatus::Accepted {
+                topic_id: topic.id.clone(),
+            },
+            outline: Some(outline),
+            created_at: now,
+            chat_id: None,
+        };
+        let stored = StoredProposal {
+            proposal,
+            plan: Some(CoursePlan {
+                topic_title: "Signals".into(),
+                subject_title: "S".into(),
+                lessons: vec![PlannedLesson {
+                    title: "Lesson one".into(),
+                    summary: "Overview".into(),
+                    minutes: 5,
+                    queries: vec!["Gibbs ringing overshoot near a jump".into()],
+                    must_cite: vec![],
+                }],
+            }),
+            pipeline_hash: None,
+        };
+        h.state
+            .store
+            .put(db::PROPOSAL, "prop", &stored)
+            .await
+            .unwrap();
+        // The stored row still reads as a plain proposal.
+        let plain: Proposal = h
+            .get(&t, "/api/proposals/prop")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(plain.id, "prop");
+        let lesson = StoredLesson {
+            lesson: Lesson {
+                citations: Vec::new(),
+                id: "l1".into(),
+                topic_id: topic.id.clone(),
+                title: "Lesson one".into(),
+                summary: "Overview".into(),
+                position: 0,
+                level: Level::Intro,
+                minutes: 5,
+                body_md: String::new(),
+                status: LessonStatus::Ready,
+                created_at: now,
+                updated_at: now,
+            },
+            proposal_id: Some("prop".into()),
+            previous_body: None,
+            previous_citations: None,
+            author: Author::Agent,
+            prompt: None,
+            with_quiz: false,
+        };
+        h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
+        *h.generator.lesson_body.lock().unwrap() = Some("Ringing.[^1]".into());
+
+        margin_service::ask::regenerate_lesson(&h.state, "l1")
+            .await
+            .unwrap();
+        let ctx =
+            eventually(|| async { h.generator.lesson_requests.lock().unwrap().first().cloned() })
+                .await;
+        assert!(
+            ctx.passages
+                .iter()
+                .any(|p| p.text.starts_with("Gibbs ringing")),
+            "{:?}",
+            ctx.passages
+        );
+        let ready = wait_lessons_ready(&h, &t, &topic.id).await;
+        let cited = &ready[0].citations;
+        assert_eq!(cited.len(), 1);
+        assert_eq!(cited[0].document_id.as_deref(), Some("notes"));
+        assert!(cited[0].start_line.is_some());
+
+        // A window that fits about one passage: the budget, not a fixed k, decides.
+        let one = texts[0].len().div_ceil(3) * 2 + 4;
+        let r = h
+            .patch(&t, "/api/settings")
+            .json(
+                &json!({"pipeline": {"packer": {"name": "mmr-v1", "params": {"window_tokens": one}},
+                                        "budget": {"min_score_pct": 0}}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        regenerate(&h).await;
+        let ctx = eventually(|| async {
+            let r = h.generator.lesson_requests.lock().unwrap();
+            (r.len() == 2).then(|| r[1].clone())
+        })
+        .await;
+        assert_eq!(ctx.passages.len(), 1, "{:?}", ctx.passages);
+        // With the default window every passage fits.
+        let r = h
+            .patch(&t, "/api/settings")
+            .json(&json!({"pipeline": {"budget": {"min_score_pct": 0}}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        regenerate(&h).await;
+        let ctx = eventually(|| async {
+            let r = h.generator.lesson_requests.lock().unwrap();
+            (r.len() == 3).then(|| r[2].clone())
+        })
+        .await;
+        assert!(ctx.passages.len() >= 2, "{:?}", ctx.passages);
+    }
+
+    /// Regenerates l1 once its last job has let go of it.
+    async fn regenerate(h: &Harness) {
+        eventually(|| async {
+            margin_service::ask::regenerate_lesson(&h.state, "l1")
+                .await
+                .ok()
+        })
+        .await;
+        eventually(|| async {
+            let l: StoredLesson = h.state.store.get(db::LESSON, "l1").await.unwrap().unwrap();
+            (l.lesson.status == LessonStatus::Ready).then_some(())
+        })
+        .await;
+    }
+
+    #[test]
+    fn plans_are_checked_against_the_draft() {
+        let lesson = |title: &str, queries: &[&str]| PlannedLesson {
+            title: title.into(),
+            summary: " s ".into(),
+            minutes: 5,
+            queries: queries.iter().map(|q| q.to_string()).collect(),
+            must_cite: vec![],
+        };
+        let plan = CoursePlan {
+            topic_title: "T".into(),
+            subject_title: "S".into(),
+            lessons: vec![
+                lesson(" A ", &["q", " Q ", "", "r", "s", "t"]),
+                lesson("B", &[]),
+            ],
+        };
+        assert!(plan.clone().checked(3).is_none());
+        let checked = plan.checked(2).unwrap();
+        assert_eq!(checked.lessons[0].title, "A");
+        assert_eq!(checked.lessons[0].queries, ["q", "r", "s"]);
+        assert_eq!(checked.lessons[1].queries, ["B: s"]);
+        assert_eq!(checked.outline().lessons[1].title, "B");
+    }
+}
