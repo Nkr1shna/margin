@@ -382,7 +382,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                     p { class: "lede", "{lesson.summary}" }
                 }
                 if let Some(v) = video.as_ref().filter(|v| v.status == VideoStatus::Ready) {
-                    VideoTeaser { video: v.clone(), lesson_id: lesson.id.clone(), title: lesson.title.clone() }
+                    VideoTeaser { video: v.clone(), title: lesson.title.clone() }
                 }
                 match status.clone() {
                     LessonStatus::Queued => rsx! {
@@ -463,27 +463,14 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
     }
 }
 
+/// The lesson's video on the Read view: it plays right here, above the text.
 #[component]
-fn VideoTeaser(video: Video, lesson_id: Id, title: String) -> Element {
-    let nav = navigator();
+fn VideoTeaser(video: Video, title: String) -> Element {
     let duration = video.duration_seconds.map(fmt_duration).unwrap_or_default();
     rsx! {
-        div { class: "video-block",
-            if let Some(media) = &video.media {
-                video { class: "teaser", src: "{media.mp4_url}", preload: "metadata", muted: true, "aria-label": "Video for {title}" }
-            }
-            div {
-                div { class: "vt", "{title}" }
-                div { class: "vs", b { "Video" } if !duration.is_empty() { "  {duration}" } }
-                div { class: "row-actions", style: "margin-top: 10px",
-                    button {
-                        class: "btn btn-primary btn-sm",
-                        onclick: move |_| { nav.push(Route::LessonVideo { id: lesson_id.clone() }); },
-                        Icon { name: "play" }
-                        "Watch"
-                    }
-                }
-            }
+        figure { class: "video-inline",
+            VideoPlayer { video: video.clone() }
+            figcaption { class: "vs", b { "Video" } "  {title}" if !duration.is_empty() { " · {duration}" } }
         }
     }
 }
@@ -932,8 +919,10 @@ fn VideoView(lesson_id: Id) -> Element {
     }
 }
 
+/// The lesson's video, playing in place with native controls and captions. Used inline
+/// on the Read view and on the Video view.
 #[component]
-fn VideoDetails(video: Video) -> Element {
+fn VideoPlayer(video: Video) -> Element {
     let app = use_app();
     let captions_url = video.media.as_ref().and_then(|m| m.captions_url.clone());
     // <track> needs WebVTT; the service writes SRT. Fetch, convert, and inline it.
@@ -968,6 +957,24 @@ fn VideoDetails(video: Video) -> Element {
         ));
     }));
 
+
+    let Some(media) = video.media.as_ref().filter(|_| ready) else {
+        return rsx! {};
+    };
+    rsx! {
+        video {
+            id: "{player_id}",
+            class: "player",
+            controls: true,
+            preload: "metadata",
+            src: "{media.mp4_url}",
+            "Your system can't play this video."
+        }
+    }
+}
+
+#[component]
+fn VideoDetails(video: Video) -> Element {
     let pipeline = pipeline_steps(&video.status);
 
     rsx! {
@@ -987,16 +994,7 @@ fn VideoDetails(video: Video) -> Element {
                 div { class: "body", "The video failed. {error}" }
             }
         }
-        if let (VideoStatus::Ready, Some(media)) = (&video.status, &video.media) {
-            video {
-                id: "{player_id}",
-                class: "player",
-                controls: true,
-                preload: "metadata",
-                src: "{media.mp4_url}",
-                "Your system can't play this video."
-            }
-        }
+        VideoPlayer { video: video.clone() }
         if let Some(code) = &video.scene_code {
             div { class: "panel-sec",
                 h3 { "Scene code" }

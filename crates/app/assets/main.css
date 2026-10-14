@@ -60,6 +60,12 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+/* Like a native app, chrome (sidebar, toolbars, buttons, labels) isn't selectable;
+   reading content and fields are. */
+body { -webkit-user-select: none; user-select: none; cursor: default; }
+.doc, .md, .quote, .mnote, .code, .log, input, textarea, [contenteditable] {
+  -webkit-user-select: text; user-select: text;
+}
 body {
   background: var(--win); color: var(--fg);
   font-family: var(--font-app); font-size: 14px; line-height: 1.5; letter-spacing: -0.005em;
@@ -263,10 +269,9 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .generating { display: inline-flex; align-items: center; gap: 8px; color: var(--fg-3); font-size: 14px; font-weight: 500; margin-top: 8px; }
 .next { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 36px; padding: 16px 18px; border-radius: 6px; background: var(--surface); }
 .next small { display: block; font-size: 14px; font-weight: 500; color: var(--fg-2); }
-.video-block { display: grid; grid-template-columns: 240px 1fr; gap: 20px; align-items: center; margin: 28px 0 8px; }
-.video-block video.teaser { width: 240px; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; background: var(--manim-bg); display: block; }
-.video-block .vt { font-size: 17px; }
-.video-block .vs { font-size: 14px; font-weight: 500; color: var(--fg-2); margin-top: 2px; }
+.video-inline { margin: 28px 0 8px; display: grid; gap: 8px; }
+.video-inline .vs { font-size: 14px; font-weight: 500; color: var(--fg-2); }
+.video-inline .vs b { font-weight: 500; color: var(--fg); }
 
 .margin-layout { display: grid; grid-template-columns: minmax(0, 660px) 260px; gap: 40px; justify-content: center; padding: 32px 40px 96px; }
 .margin-layout .doc { padding: 0; margin: 0; max-width: none; }
@@ -306,7 +311,7 @@ select.chip { appearance: none; -webkit-appearance: none; padding-right: 30px; b
 .pipeline span.fail { color: var(--danger); border-color: var(--danger); }
 .bar { height: 3px; border-radius: 2px; background: var(--surface-2); overflow: hidden; width: 160px; }
 .bar i { display: block; height: 100%; background: var(--accent); }
-.player { width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; background: var(--manim-bg); display: block; }
+.player { width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; background: var(--manim-bg); display: block; box-shadow: 0 0 0 1px var(--line); }
 .panel-sec { display: grid; gap: 10px; }
 .panel-sec h3 { margin: 0; font-size: 13px; font-weight: 500; color: var(--fg-2); }
 .code, .log { font-family: var(--font-mono); font-size: 12px; line-height: 1.65; background: var(--surface); border-radius: 6px; padding: 10px 12px; margin: 0; overflow: auto; color: var(--fg-2); white-space: pre; max-height: 420px; }
@@ -385,8 +390,6 @@ details.collapse > summary { cursor: pointer; font-size: 13px; font-weight: 500;
   .margin-layout { grid-template-columns: minmax(0, 1fr); gap: 24px; padding: 20px 16px 72px; }
   .margins { padding-top: 0 !important; border-top: 1px solid var(--line); padding: 20px 0 0 !important; }
   .add-note { position: fixed; left: 16px; right: 16px; bottom: 16px; top: auto !important; border: 0; border-radius: 12px; box-shadow: var(--pop-shadow); padding: 12px 14px; }
-  .video-block { grid-template-columns: 1fr; }
-  .video-block video.teaser { width: 100%; }
   .studio { padding: 16px 16px 48px; }
   .studio-head h1 { font-size: 22px; }
   .notes-wrap.has-selection .note-list { display: none; }
