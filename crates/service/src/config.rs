@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::secrets::{GITHUB_CLIENT_SECRET, SecretStore};
+use crate::secrets::{FileStore, GITHUB_CLIENT_SECRET, KeychainStore, SecretStore};
 
 pub const DEFAULT_PUBLIC_URL: &str = "https://margin.krishnanelloore.com";
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
@@ -39,6 +39,11 @@ pub struct Config {
     /// `deploy.sh` and `margin-eval` check it through `GET /api/version`.
     #[serde(default = "default_environment")]
     pub environment: String,
+    /// Where secrets live instead of the login Keychain: a 0600 TOML file of
+    /// `name = "value"` lines (`secrets::FileStore`). The dev and prod VMs set it to a file
+    /// on the persistent share, which the deploy jobs fill from GitHub Environment secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_file: Option<PathBuf>,
 }
 
 fn default_public_url() -> String {
@@ -92,6 +97,7 @@ impl Default for Config {
             github_api_url: default_github_api_url(),
             github_oauth_url: default_github_oauth_url(),
             environment: default_environment(),
+            secrets_file: None,
         }
     }
 }
@@ -160,6 +166,14 @@ impl Config {
         Ok(())
     }
 
+    /// The secret store this config names: its `secrets_file`, or the login Keychain.
+    pub fn secret_store(&self) -> std::sync::Arc<dyn SecretStore> {
+        match &self.secrets_file {
+            Some(path) => std::sync::Arc::new(FileStore::new(path)),
+            None => std::sync::Arc::new(KeychainStore),
+        }
+    }
+
     pub fn db_dir(&self) -> PathBuf {
         self.data_dir.join("db")
     }
@@ -185,15 +199,17 @@ impl Config {
 }
 
 /// `margin-service setup`: asks for the environment (dev or prod), the public URL, the
-/// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret in the Keychain and writes
-/// the config file.
-pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
+/// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret
+/// (in `secrets_file` when the config names one, else the Keychain) and writes the config file.
+pub fn run_setup(path: &Path) -> anyhow::Result<()> {
     let existing = if path.exists() {
         Config::load(path).ok()
     } else {
         None
     };
     let mut config = existing.clone().unwrap_or_default();
+    let store = config.secret_store();
+    let secrets: &dyn SecretStore = &*store;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
 
@@ -226,7 +242,10 @@ pub fn run_setup(path: &Path, secrets: &dyn SecretStore) -> anyhow::Result<()> {
         let secret = ask_hidden(&mut input, prompt)?;
         if !secret.is_empty() {
             secrets.set(GITHUB_CLIENT_SECRET, &secret)?;
-            println!("  Stored in the Keychain.");
+            match &config.secrets_file {
+                Some(path) => println!("  Stored in {}.", path.display()),
+                None => println!("  Stored in the Keychain."),
+            }
             break;
         }
         if has_secret {

@@ -60,6 +60,9 @@ jobs:
           github-token: ${{ github.token }}
       - name: Deploy to prod
         env:
+          # This environment's secrets; deploy.sh writes them to the share's secrets.toml.
+          MARGIN_SECRET_GITHUB_CLIENT_SECRET: ${{ secrets.MARGIN_GITHUB_CLIENT_SECRET }}
+          MARGIN_SECRET_OPENAI_API_KEY: ${{ secrets.MARGIN_OPENAI_API_KEY }}
           SHA: ${{ steps.dev.outputs.sha }}
         run: |
           [ "$(cat dist/BUILD_SHA)" = "$SHA" ] || { echo "::error::the artifact is stamped $(cat dist/BUILD_SHA), not $SHA"; exit 1; }

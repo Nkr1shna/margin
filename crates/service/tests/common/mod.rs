@@ -841,6 +841,7 @@ pub async fn start_with(setup: Setup) -> Harness {
         github_api_url: github.clone(),
         github_oauth_url: github,
         environment: "dev".into(),
+        secrets_file: None,
     };
     let store = match setup.store {
         Some(s) => s,

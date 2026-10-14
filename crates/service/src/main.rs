@@ -8,7 +8,6 @@ use anyhow::Context;
 use margin_service::config::{self, Config};
 use margin_service::db::Store;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
-use margin_service::secrets::KeychainStore;
 use margin_service::server::{Options, Service, shutdown_signal};
 use margin_service::{restore, version};
 
@@ -26,9 +25,7 @@ Config: $MARGIN_CONFIG, or ~/Library/Application Support/Margin/service.toml";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("setup") if args.len() == 1 => {
-            config::run_setup(&config::config_path(), &KeychainStore)
-        }
+        Some("setup") if args.len() == 1 => config::run_setup(&config::config_path()),
         Some("scrub-restored") if args.len() == 1 => scrub_restored(),
         Some("version" | "--version") if args.len() == 1 => {
             println!(
@@ -107,10 +104,11 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             config.public_url,
             config.environment
         );
+        let secrets = config.secret_store();
         let service = Service::start(Options {
             config,
             store,
-            secrets: Arc::new(KeychainStore),
+            secrets,
             generator: Arc::new(AiGenerator),
             renderer: Arc::new(VideoRenderer),
             source_tools: Arc::new(EmbedTools),

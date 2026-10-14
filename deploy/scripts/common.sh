@@ -140,3 +140,46 @@ check_config() {
     *) die "data_dir \"$data_dir\" in $config isn't on the persistent share $MARGIN_PERSIST_GUEST: refusing (it would be wiped when Orchard recreates the VM)" ;;
   esac
 }
+
+# Writes the secrets the deploy job passes in (MARGIN_SECRET_*, from the GitHub
+# Environment's secrets) into the share's secrets.toml, readable only by the owner, and
+# points service.toml's secrets_file at it. Orchard re-clones a VM on every restart,
+# which empties its Keychain; the share keeps the secrets, and the media signing key the
+# service generates there, across re-clones. Values never reach argv or the log.
+#   MARGIN_SECRET_GITHUB_CLIENT_SECRET -> github-client-secret
+#   MARGIN_SECRET_OPENAI_API_KEY       -> openai-api-key (optional; Settings can set it too)
+write_secrets() {
+  env_name="$1"
+  dir="$(host_persist_dir "$env_name")"
+  file="$dir/secrets.toml"
+  (
+    umask 077
+    [ -f "$file" ] || : > "$file"
+    chmod 600 "$file"
+    for pair in GITHUB_CLIENT_SECRET:github-client-secret OPENAI_API_KEY:openai-api-key; do
+      var="MARGIN_SECRET_${pair%%:*}"
+      name="${pair#*:}"
+      eval "value=\${$var:-}"
+      [ -n "$value" ] || continue
+      SECRET_NAME="$name" SECRET_VAR="$var" perl -e '
+        my ($file, $name) = ($ARGV[0], $ENV{SECRET_NAME});
+        my $v = $ENV{$ENV{SECRET_VAR}};
+        $v =~ s/\\/\\\\/g; $v =~ s/"/\\"/g;
+        open(my $in, "<", $file) or die "$file: $!";
+        my @lines = grep { !/^\Q$name\E\s*=/ } <$in>;
+        close($in);
+        push @lines, "$name = \"$v\"\n";
+        open(my $out, ">", "$file.part") or die "$file.part: $!";
+        print $out @lines;
+        close($out) or die;
+        rename("$file.part", $file) or die "$file: $!";
+      ' "$file"
+      echo "Wrote $name to $file."
+    done
+  )
+  config="$dir/service.toml"
+  if [ -f "$config" ] && ! grep -q '^secrets_file' "$config"; then
+    printf 'secrets_file = "%s/secrets.toml"\n' "$MARGIN_PERSIST_GUEST" >> "$config"
+    echo "Pointed $config at the share's secrets.toml."
+  fi
+}

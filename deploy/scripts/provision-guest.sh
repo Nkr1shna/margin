@@ -19,8 +19,8 @@
 # --startup-script prints the Orchard startup script that, on every (re)creation, names
 # the guest margin-<env> (so margin-<env>.local resolves) and authorizes the deploy key.
 #
-# What it can't do, and prints: Keychain secrets and `cloudflared tunnel login` need the
-# owner in the VM's own window (Screen Sharing), never over SSH.
+# What it can't do, and prints: `cloudflared tunnel login` needs the owner in the VM's own
+# window (Screen Sharing). Secrets come from the GitHub Environments through deploy.sh.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/common.sh"
@@ -48,6 +48,7 @@ bind = "127.0.0.1:8787"
 data_dir = "$p/data"
 github_client_id = ""
 allowed_github_login = "Nkr1shna"
+secrets_file = "$p/secrets.toml"
 EOF
     echo "Wrote a starter $config."
   fi
@@ -137,11 +138,10 @@ EOF
     todo="$todo
   - No binary on the share yet: the next deploy-dev run (or deploy.sh $env_name …) installs it"
   fi
-  if ! security find-generic-password -s com.krishnanelloore.margin -a github-client-secret >/dev/null 2>&1; then
+  if ! grep -q '^github-client-secret' "$p/secrets.toml" 2>/dev/null; then
     todo="$todo
-  - The Keychain has no github-client-secret (a recreated VM has an empty Keychain):
-    run margin-service setup in the VM's window, then sign in from the app and enter the
-    model keys in Settings again; click Always Allow on the first Keychain prompt"
+  - No github-client-secret in $p/secrets.toml yet: the next deploy writes it from the
+    GitHub Environment secret MARGIN_GITHUB_CLIENT_SECRET (gh secret set … --env $env_name)"
   fi
 
   echo "Provisioned $(vm_name "$env_name"): config, data and backups on $p (the Mac mini's disk)."
