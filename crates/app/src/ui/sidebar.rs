@@ -174,8 +174,8 @@ pub fn Sidebar() -> Element {
                 }
                 button {
                     class: "icon-btn",
-                    "aria-label": "Appearance: {appearance.label()}. Switch appearance",
-                    title: "Appearance: {appearance.label()}",
+                    "aria-label": "Appearance: {appearance.label()}. Switch to {appearance.next().label()}",
+                    title: "Appearance: {appearance.label()} (click for {appearance.next().label()})",
                     onclick: move |_| {
                         let _ = app.set_config(|c| c.appearance = c.appearance.next());
                     },
@@ -294,6 +294,18 @@ fn TopicNode(id: Id) -> Element {
     let has_children =
         !children.is_empty() || !lessons.is_empty() || note_count > 0 || adding_child;
 
+    let chev_class: &'static str = if has_children {
+        "chev"
+    } else {
+        "chev chev-off"
+    };
+    let toggle_label = if !has_children {
+        topic.title.clone()
+    } else if collapsed {
+        format!("Expand {}", topic.title)
+    } else {
+        format!("Collapse {}", topic.title)
+    };
     let toggle = {
         let id = id.clone();
         move |_| {
@@ -308,16 +320,18 @@ fn TopicNode(id: Id) -> Element {
         li {
             class: if collapsed { "collapsed" } else { "" },
             role: "treeitem",
-            "aria-expanded": (!collapsed).to_string(),
+            "aria-expanded": has_children.then_some(if collapsed { "false" } else { "true" }),
             if renaming {
                 TopicInput { parent: topic.parent_id.clone(), initial: topic.title.clone(), placeholder: "Topic name", rename: Some(id.clone()) }
             } else {
                 div { class: "tree-row",
                     button {
                         class: "row",
-                        "aria-label": if collapsed { "Expand {topic.title}" } else { "Collapse {topic.title}" },
+                        "aria-label": toggle_label,
                         onclick: toggle,
-                        Icon { name: "chev", class: "chev" }
+                        // An empty topic has nothing to expand: keep the chevron's space
+                        // so titles line up, but don't show it.
+                        Icon { name: "chev", class: chev_class }
                         span { class: "grow", "{topic.title}" }
                         if count > 0 {
                             span { class: "count", "{count}" }

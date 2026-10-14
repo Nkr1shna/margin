@@ -652,7 +652,6 @@ fn AppearanceSection() -> Element {
                         key: "{a.label()}",
                         role: "radio",
                         "aria-checked": (a == current).to_string(),
-                        "aria-selected": (a == current).to_string(),
                         onclick: move |_| {
                             if let Err(e) = app.set_config(|c| c.appearance = a) {
                                 error.set(Some(format!("Changed for now, but couldn't be saved: {e}")));
