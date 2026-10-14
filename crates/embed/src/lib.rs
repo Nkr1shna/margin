@@ -12,7 +12,10 @@ pub use margin_shared::SourceKind;
 
 mod chunk;
 mod download;
+mod extract;
 pub mod fake;
+#[cfg(target_os = "macos")]
+mod pdf;
 mod rank;
 
 /// Hugging Face repo the model is downloaded from.
@@ -152,8 +155,7 @@ pub struct Page {
 /// Extracts text: UTF-8 (lossy) for text and code; PDFKit for PDFs, with Vision OCR for
 /// pages that have no text layer. Blocking.
 pub fn extract(path: &Path, kind: SourceKind) -> Result<Extracted, EmbedError> {
-    let _ = (path, kind);
-    todo!("margin-embed: extract")
+    extract::extract(path, kind)
 }
 
 /// A piece of a source small enough to embed.
