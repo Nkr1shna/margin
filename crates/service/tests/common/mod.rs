@@ -508,6 +508,7 @@ pub fn ask_request(prompt: &str, n: u32, with_videos: bool) -> AskRequest {
         with_videos,
         with_quiz: true,
         parent_topic_id: None,
+        source_ids: vec![],
     }
 }
 

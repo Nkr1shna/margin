@@ -93,6 +93,10 @@ impl LibraryState {
                 self.proposals.insert(proposal.id.clone(), proposal);
             }
             Event::SettingsChanged { settings } => self.settings = Some(settings),
+            // Sources and the embedding model aren't shown yet.
+            Event::SourceChanged { .. }
+            | Event::SourceDeleted { .. }
+            | Event::EmbeddingModelChanged { .. } => {}
         }
     }
 
@@ -337,6 +341,7 @@ mod tests {
             ],
             notes: vec![note("n1", "f", Some("l1")), note("n2", "f", None)],
             videos: vec![video("v1", "l1", VideoStatus::Ready)],
+            sources: vec![],
         })
     }
 
@@ -492,6 +497,7 @@ mod tests {
                 with_videos: false,
                 with_quiz: true,
                 parent_topic_id: None,
+                source_ids: vec![],
             },
             status: ProposalStatus::Drafting,
             outline: None,
@@ -534,6 +540,7 @@ mod tests {
             lessons: vec![],
             notes: vec![],
             videos: vec![],
+            sources: vec![],
         });
         assert!(s.topics.is_empty());
         assert_eq!(s.server_version.as_deref(), Some("1"));

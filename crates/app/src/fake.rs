@@ -194,6 +194,7 @@ pub fn sample_library() -> Library {
             created_at: ts(0),
             updated_at: ts(0),
         }],
+        sources: vec![],
     }
 }
 

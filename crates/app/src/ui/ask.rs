@@ -106,6 +106,7 @@ pub fn AskScreen() -> Element {
         with_videos: *with_videos.peek(),
         with_quiz: *with_quiz.peek(),
         parent_topic_id: subject.peek().clone(),
+        source_ids: vec![],
     };
 
     let submit = move |req: AskRequest| {

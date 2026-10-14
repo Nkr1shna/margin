@@ -32,6 +32,11 @@
 //! | GET    | /api/tools                             |                    | Vec<ToolStatus>     |
 //! | GET    | /api/devices                           |                    | Vec<Device>         |
 //! | DELETE | /api/devices/{id}                      |                    | 204                 |
+//! | POST   | /api/sources?name&folder&topic_id      | file bytes         | Source (Queued)     |
+//! | DELETE | /api/sources/{id}                      |                    | 204 (chunks too)    |
+//! | GET    | /api/embedding                         |                    | EmbeddingModel      |
+//! | POST   | /api/embedding/download                |                    | EmbeddingModel      |
+//! | DELETE | /api/embedding                         |                    | EmbeddingModel      |
 //! | GET    | /api/events  (WebSocket upgrade)       |                    | Event frames        |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 
@@ -49,6 +54,14 @@ pub const SETTINGS: &str = "/api/settings";
 pub const TOOLS: &str = "/api/tools";
 pub const DEVICES: &str = "/api/devices";
 pub const EVENTS: &str = "/api/events";
+/// Upload: the body is the file's bytes (`application/octet-stream`, at most
+/// `MAX_SOURCE_BYTES`); `name` (required), `folder` and `topic_id` are query parameters.
+/// Without `topic_id` the source waits to be named in an `AskRequest.source_ids`.
+pub const SOURCES: &str = "/api/sources";
+pub const EMBEDDING: &str = "/api/embedding";
+pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
+/// Largest single source upload.
+pub const MAX_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
 
 pub fn topic(id: &str) -> String {
     format!("/api/topics/{id}")
@@ -73,6 +86,9 @@ pub fn proposal_accept(id: &str) -> String {
 }
 pub fn video(id: &str) -> String {
     format!("/api/videos/{id}")
+}
+pub fn source(id: &str) -> String {
+    format!("/api/sources/{id}")
 }
 pub fn device(id: &str) -> String {
     format!("/api/devices/{id}")

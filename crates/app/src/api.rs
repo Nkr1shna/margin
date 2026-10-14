@@ -467,6 +467,7 @@ mod tests {
             with_videos: true,
             with_quiz: true,
             parent_topic_id: None,
+            source_ids: vec![],
         };
         fake.state.lock().unwrap().has_api_key = false;
         let err = api.ask(&req).await.unwrap_err();

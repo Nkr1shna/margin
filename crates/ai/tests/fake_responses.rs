@@ -352,6 +352,7 @@ fn ask(lesson_count: u32) -> AskRequest {
         with_videos: false,
         with_quiz: true,
         parent_topic_id: None,
+        source_ids: vec![],
     }
 }
 

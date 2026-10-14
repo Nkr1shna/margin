@@ -25,6 +25,9 @@ Every decision below was made explicitly by the owner. Do not change one without
 | Tool install | The app shows whether `manimgx` and `fluidaudiocli` are found on the service Mac, with **install commands to copy** — it never runs installers. |
 | Scene code | AI-written scene code renders **automatically, sandboxed** (macOS `sandbox-exec`: no network, writes only in the video's folder). Elsewhere rendering is refused unless the service runs with `--allow-unsandboxed-render` (tests only). |
 | Playback | In-app `<video>` element (the Dioxus webview), streaming from the service's signed media URLs. |
+| Sources | Files and folders added **in the Ask composer**, uploaded from the app to the service and **kept with the resulting topic** (the topic menu's "Sources…" adds/removes later). Types: **text, code, PDF**. Used through **retrieval**: chunks embedded locally, the most relevant passages go into outline and lesson prompts. |
+| Embeddings | **EmbeddingGemma 2, Core ML** (`FluidInference/embeddinggemma-2-coreml`) run **inside the service** from Rust (`objc2-core-ml`, `tokenizers`); no helper process. **Never bundled**: downloaded from Hugging Face by a button in Settings. Text only for now (≤ 512 tokens per call). |
+| PDF text | Apple **PDFKit** (`objc2-pdf-kit`); pages without a text layer are rendered and read with **Vision OCR** (`objc2-vision`). |
 
 ## Layout
 
@@ -67,6 +70,24 @@ signatures (adding items is fine; changing existing ones requires updating every
   valid 6 hours, range requests supported.
 - Startup recovery: jobs left `Generating`/`Scripting`/`Voicing`/`Rendering` by a crash
   are marked `Failed { error: "Interrupted when the service stopped." }`.
+
+## Sources and embeddings
+
+- Crate `crates/embed` (macOS): `Embedder` (download from Hugging Face with progress,
+  compile the `.mlpackage` once, load with all compute units, `embed(texts, Purpose)`),
+  `extract` (text/code decode, PDFKit + Vision OCR), `chunk` (≤ 512 tokens with the Gemma
+  tokenizer, prose by paragraphs, code by lines, PDFs per page then split).
+- Preprocessing per the model card: prefix `title: none | text: ` (documents) or
+  `task: search result | query: ` (queries); tokenize with `tokenizer.json`, `<bos>`=2 …
+  `<eos>`=1; look up rows of `embeddings.bf16` (262144 × 512 bf16) × √512 → fp16; run the
+  smallest `embed_S` (32, 48, 64, 128, 256, 512) with `inputs_embeds` [1,S,512] and
+  `attention_mask` [1,S]; output `embedding` [1,768], L2-normalized.
+- Service: `POST /api/sources` stores the file under `data_dir/sources/{id}`, then a
+  background queue extracts, chunks and embeds (one source at a time; `Queued` while the
+  model isn't downloaded). Chunks (text, page, vector) live in SurrealDB. Retrieval for a
+  topic: cosine similarity over its chunks plus a boost for exact query words; the top 8
+  passages (with source name and page) go into the outline and each lesson prompt.
+- Model files: `data_dir/models/embeddinggemma-2/`. `GET/POST/DELETE /api/embedding`.
 
 ## App
 

@@ -176,6 +176,10 @@ pub struct AskRequest {
     pub with_quiz: bool,
     /// Subject to file the new topic under; `None` lets the model pick or create one.
     pub parent_topic_id: Option<Id>,
+    /// Uploaded sources (`Source.id`, not yet attached to a topic) the outline and the
+    /// lessons draw on. Accepting the proposal attaches them to the new topic.
+    #[serde(default)]
+    pub source_ids: Vec<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -277,6 +281,72 @@ pub struct Library {
     pub lessons: Vec<Lesson>,
     pub notes: Vec<Note>,
     pub videos: Vec<Video>,
+    #[serde(default)]
+    pub sources: Vec<Source>,
+}
+
+// ---------------------------------------------------------------------------
+// Sources: files the learner adds so lessons are grounded in them
+// ---------------------------------------------------------------------------
+
+/// A file uploaded as a source. The service extracts its text, cuts it into chunks of
+/// at most 512 tokens and embeds them with EmbeddingGemma 2; outlines and lessons in
+/// its topic get the passages most relevant to what they're writing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Source {
+    pub id: Id,
+    /// The topic it belongs to; `None` while it's only attached to an Ask in progress.
+    pub topic_id: Option<Id>,
+    /// File name, or the path inside the folder it was added with ("notes/ch1.md").
+    pub name: String,
+    /// The folder's name when it came from a folder, so the app can group it.
+    pub folder: Option<String>,
+    pub kind: SourceKind,
+    /// Size of the uploaded file.
+    pub bytes: u64,
+    pub status: SourceStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Prose: .md, .txt, .rst, .tex, .html, .csv, …
+    Text,
+    /// Source code, chunked along lines.
+    Code,
+    /// Text from PDFKit; pages without text are read with Vision OCR.
+    Pdf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SourceStatus {
+    /// Waiting to be read (or for the embedding model to be downloaded).
+    Queued,
+    /// Extracting text and embedding chunks; `done` of `total` chunks so far.
+    Processing { done: u32, total: u32 },
+    Ready { chunks: u32, pages: Option<u32> },
+    Failed { error: String },
+}
+
+/// The local embedding model (EmbeddingGemma 2, Core ML), downloaded on demand from
+/// Hugging Face into the service's data folder. Never bundled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingModel {
+    /// Hugging Face repo, "FluidInference/embeddinggemma-2-coreml".
+    pub repo: String,
+    pub state: EmbeddingModelState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EmbeddingModelState {
+    NotDownloaded { download_bytes: u64 },
+    Downloading { received: u64, total: u64 },
+    /// Downloaded; the first use compiles it for this Mac (a few seconds).
+    Ready { bytes: u64 },
+    Failed { error: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +527,15 @@ pub enum Event {
     },
     SettingsChanged {
         settings: Settings,
+    },
+    SourceChanged {
+        source: Source,
+    },
+    SourceDeleted {
+        id: Id,
+    },
+    EmbeddingModelChanged {
+        model: EmbeddingModel,
     },
 }
 

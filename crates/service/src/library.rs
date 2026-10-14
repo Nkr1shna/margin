@@ -138,6 +138,7 @@ pub async fn get_library(State(state): State<AppState>) -> AppResult<Json<Librar
         lessons,
         notes,
         videos,
+        sources: Vec::new(),
     }))
 }
 

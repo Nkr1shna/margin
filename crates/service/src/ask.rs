@@ -518,6 +518,7 @@ mod tests {
             with_videos: false,
             with_quiz: false,
             parent_topic_id: None,
+            source_ids: vec![],
         }
     }
 
