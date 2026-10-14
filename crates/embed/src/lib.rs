@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub use margin_shared::SourceKind;
 
 mod chunk;
+#[cfg(target_os = "macos")]
+mod coreml;
 mod download;
 mod extract;
 pub mod fake;
@@ -112,29 +114,24 @@ impl ModelFiles {
 
 /// EmbeddingGemma 2 on Core ML (Neural Engine where possible). macOS only.
 #[cfg(target_os = "macos")]
-pub struct CoreMlEmbedder {
-    _private: (),
-}
+pub struct CoreMlEmbedder(coreml::Model);
 
 #[cfg(target_os = "macos")]
 impl CoreMlEmbedder {
     /// Loads the tokenizer and token table and the Core ML text model, compiling the
     /// `.mlpackage` on first use (cached next to it). Blocking.
     pub fn load(files: &ModelFiles) -> Result<Self, EmbedError> {
-        let _ = files;
-        todo!("margin-embed: CoreMlEmbedder::load")
+        coreml::Model::load(files).map(CoreMlEmbedder)
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Embedder for CoreMlEmbedder {
     fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let _ = (texts, purpose);
-        todo!("margin-embed: CoreMlEmbedder::embed")
+        self.0.embed(texts, purpose)
     }
     fn count_tokens(&self, text: &str) -> usize {
-        let _ = text;
-        todo!("margin-embed: CoreMlEmbedder::count_tokens")
+        self.0.count_tokens(text)
     }
 }
 
