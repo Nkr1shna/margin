@@ -675,6 +675,9 @@ mod tests {
                 device_frames: Signal::new(None),
                 agent_commands: Signal::new(Default::default()),
                 foreground: Signal::new(true),
+                folders: Signal::new(Default::default()),
+                folder_sync: Signal::new(Default::default()),
+                ask_workspaces: Signal::new(Vec::new()),
             });
             let commands = props.commands.clone();
             use_hook(move || {

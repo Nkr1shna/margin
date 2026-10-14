@@ -51,6 +51,8 @@ pub struct FakeState {
     pub parts_received: u32,
     /// Fail the next this many parts with a 503, for tests of the retries.
     pub fail_parts: u32,
+    /// Take this long over each part, for tests that stop an upload half way.
+    pub part_delay: Option<Duration>,
     pub chats: Vec<Chat>,
     /// Each chat's transcript, in `seq` order.
     pub chat_items: HashMap<Id, Vec<ChatItem>>,
@@ -62,6 +64,14 @@ pub struct FakeState {
     /// pending message).
     pub chat_hang: bool,
     pub workspaces: Vec<Workspace>,
+    /// Files of attached folders, as sources (never in `library.sources`).
+    pub folder_sources: Vec<Source>,
+    /// Each folder's last manifest, by workspace, then path.
+    pub manifests: HashMap<Id, HashMap<String, FileStamp>>,
+    /// The stamp each folder source was uploaded with (bytes, modified, hash).
+    pub folder_stamps: HashMap<Id, FileStamp>,
+    /// Manifests received, for tests.
+    pub manifests_received: Vec<(Id, SyncManifest)>,
 }
 
 /// An upload in parts the fake is receiving.
@@ -70,6 +80,8 @@ pub struct PartUpload {
     pub name: String,
     pub folder: Option<String>,
     pub topic_id: Option<Id>,
+    pub workspace_id: Option<Id>,
+    pub modified: Option<DateTime<Utc>>,
     pub bytes: u64,
     pub data: Vec<u8>,
 }
@@ -523,12 +535,17 @@ impl FakeState {
             part_uploads: HashMap::new(),
             parts_received: 0,
             fail_parts: 0,
+            part_delay: None,
             chats: Vec::new(),
             chat_items: HashMap::new(),
             chat_outputs: HashMap::new(),
             chat_seq: 100,
             chat_hang: false,
             workspaces: Vec::new(),
+            folder_sources: Vec::new(),
+            manifests: HashMap::new(),
+            folder_stamps: HashMap::new(),
+            manifests_received: Vec::new(),
         };
         for (chat, items) in sample_chats() {
             for item in &items {
@@ -554,6 +571,57 @@ impl FakeState {
     fn id(&mut self, prefix: &str) -> Id {
         self.next_id += 1;
         format!("{prefix}-{}", self.next_id)
+    }
+
+    /// A source of the library or of a folder.
+    fn source_mut(&mut self, id: &str) -> Option<&mut Source> {
+        if let Some(i) = self.library.sources.iter().position(|s| s.id == id) {
+            return self.library.sources.get_mut(i);
+        }
+        self.folder_sources.iter_mut().find(|s| s.id == id)
+    }
+
+    /// A folder's counts again from its sources and its last manifest.
+    pub fn refresh_sync(&mut self, workspace_id: &str) -> Option<Workspace> {
+        let files: Vec<&Source> = self
+            .folder_sources
+            .iter()
+            .filter(|s| s.workspace_id.as_deref() == Some(workspace_id))
+            .collect();
+        let uploading = self.manifests.get(workspace_id).map_or(0, |m| {
+            m.iter()
+                .filter(|(path, stamp)| {
+                    !files
+                        .iter()
+                        .any(|s| &s.name == *path && self.folder_stamps.get(&s.id) == Some(*stamp))
+                })
+                .count() as u32
+        });
+        let sync = WorkspaceSync {
+            files: files.len() as u32,
+            bytes: files.iter().map(|s| s.bytes).sum(),
+            uploading,
+            reading: files
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.status,
+                        SourceStatus::Queued | SourceStatus::Processing { .. }
+                    )
+                })
+                .count() as u32,
+            failed: files
+                .iter()
+                .filter(|s| matches!(s.status, SourceStatus::Failed { .. }))
+                .count() as u32,
+            last_synced_at: None,
+        };
+        let ws = self.workspaces.iter_mut().find(|w| w.id == workspace_id)?;
+        ws.sync = WorkspaceSync {
+            last_synced_at: ws.sync.last_synced_at,
+            ..sync
+        };
+        Some(ws.clone())
     }
 }
 
@@ -683,6 +751,8 @@ pub fn router(fake: Fake) -> Router {
             "/api/workspaces/{id}",
             axum::routing::delete(delete_workspace),
         )
+        .route("/api/workspaces/{id}/sync", post(sync_workspace))
+        .route("/api/workspaces/{id}/files", get(workspace_files))
         .route("/api/events", get(events))
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
@@ -1742,6 +1812,8 @@ struct UploadQuery {
     name: String,
     folder: Option<String>,
     topic_id: Option<String>,
+    workspace_id: Option<String>,
+    modified: Option<DateTime<Utc>>,
 }
 
 async fn upload_source(
@@ -1764,6 +1836,9 @@ async fn upload_source(
 /// a size over its kind's limit, a topic that doesn't exist.
 #[allow(clippy::result_large_err)]
 fn check_upload(fake: &Fake, query: &UploadQuery, bytes: u64) -> Result<SourceKind, Response> {
+    if let Some(workspace_id) = &query.workspace_id {
+        return check_folder_upload(fake, query, workspace_id);
+    }
     let Some(kind) = SourceKind::for_name(&query.name) else {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1796,9 +1871,131 @@ fn check_upload(fake: &Fake, query: &UploadQuery, bytes: u64) -> Result<SourceKi
     Ok(kind)
 }
 
+/// A folder file's upload: the folder must exist and be this device's, no topic, a type
+/// folders take, a path inside the folder. No size limit.
+#[allow(clippy::result_large_err)]
+fn check_folder_upload(
+    fake: &Fake,
+    query: &UploadQuery,
+    workspace_id: &str,
+) -> Result<SourceKind, Response> {
+    let s = fake.state.lock().unwrap();
+    let Some(ws) = s.workspaces.iter().find(|w| w.id == workspace_id) else {
+        return Err(not_found());
+    };
+    if ws.device_id != s.current_device().0 {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "not_yours",
+            "Only the device holding this folder can send its files.",
+        ));
+    }
+    if query.topic_id.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "A folder's file belongs to no topic.",
+        ));
+    }
+    if margin_shared::relative_components(&query.name).is_err() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "bad_path",
+            &format!("{} isn't a path inside the folder.", query.name),
+        ));
+    }
+    match folder_file_type(&query.name) {
+        Some(t) => Ok(t.source_kind()),
+        None => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported",
+            &format!(
+                "{} isn't a kind of file Margin takes from folders.",
+                query.name
+            ),
+        )),
+    }
+}
+
+/// Records an uploaded folder file as a Queued source of its folder, replacing an
+/// earlier copy of the same path.
+fn add_folder_source(
+    fake: &Fake,
+    query: UploadQuery,
+    workspace_id: Id,
+    kind: SourceKind,
+    body: Vec<u8>,
+) -> Response {
+    let mut events = Vec::new();
+    let (source, process) = {
+        let mut s = fake.state.lock().unwrap();
+        let replaced: Vec<Id> = s
+            .folder_sources
+            .iter()
+            .filter(|src| {
+                src.workspace_id.as_deref() == Some(workspace_id.as_str()) && src.name == query.name
+            })
+            .map(|src| src.id.clone())
+            .collect();
+        s.folder_sources.retain(|src| !replaced.contains(&src.id));
+        for id in replaced {
+            s.folder_stamps.remove(&id);
+            s.source_files.remove(&id);
+            events.push(Event::SourceDeleted { id });
+        }
+        let folder = s
+            .workspaces
+            .iter()
+            .find(|w| w.id == workspace_id)
+            .map(|w| w.name.clone());
+        let id = s.id("source");
+        let source = Source {
+            media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
+            id,
+            topic_id: None,
+            name: query.name.clone(),
+            folder,
+            kind,
+            bytes: body.len() as u64,
+            status: SourceStatus::Queued,
+            created_at: Utc::now(),
+            workspace_id: Some(workspace_id.clone()),
+            modified: query.modified,
+        };
+        // The stamp the device announced for this path, if this is what it sent.
+        let announced = s
+            .manifests
+            .get(&workspace_id)
+            .and_then(|m| m.get(&query.name))
+            .filter(|st| st.bytes == source.bytes && st.modified == source.modified)
+            .cloned();
+        if let Some(stamp) = announced {
+            s.folder_stamps.insert(source.id.clone(), stamp);
+        }
+        s.source_files.insert(source.id.clone(), body);
+        s.folder_sources.push(source.clone());
+        events.push(Event::SourceChanged {
+            source: source.clone(),
+        });
+        if let Some(workspace) = s.refresh_sync(&workspace_id) {
+            events.push(Event::WorkspaceChanged { workspace });
+        }
+        let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
+        (source, s.simulate && ready)
+    };
+    publish_all(fake, events);
+    if process {
+        tokio::spawn(simulate_source(fake.clone(), source.id.clone()));
+    }
+    Json(source).into_response()
+}
+
 /// Records an uploaded file as a Queued source (read over a couple of seconds when
 /// simulating with the model downloaded).
 fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) -> Response {
+    if let Some(workspace_id) = query.workspace_id.clone() {
+        return add_folder_source(fake, query, workspace_id, kind, body);
+    }
     let (source, process) = {
         let mut s = fake.state.lock().unwrap();
         let id = s.id("source");
@@ -1813,7 +2010,7 @@ fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) 
             status: SourceStatus::Queued,
             created_at: Utc::now(),
             workspace_id: None,
-            modified: None,
+            modified: query.modified,
         };
         s.source_files.insert(source.id.clone(), body);
         s.library.sources.push(source.clone());
@@ -1837,6 +2034,8 @@ struct StartPartsQuery {
     name: String,
     folder: Option<String>,
     topic_id: Option<String>,
+    workspace_id: Option<String>,
+    modified: Option<DateTime<Utc>>,
     bytes: u64,
 }
 
@@ -1852,6 +2051,8 @@ async fn start_part_upload(
         name: q.name,
         folder: q.folder,
         topic_id: q.topic_id,
+        workspace_id: q.workspace_id,
+        modified: q.modified,
     };
     if let Err(r) = check_upload(&fake, &query, q.bytes) {
         return r;
@@ -1864,6 +2065,8 @@ async fn start_part_upload(
             name: query.name,
             folder: query.folder,
             topic_id: query.topic_id,
+            workspace_id: query.workspace_id,
+            modified: query.modified,
             bytes: q.bytes,
             data: Vec::new(),
         },
@@ -1910,6 +2113,10 @@ async fn put_part(
 ) -> Response {
     if let Err(r) = authorized(&headers) {
         return r;
+    }
+    let delay = fake.state.lock().unwrap().part_delay;
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
     }
     let mut s = fake.state.lock().unwrap();
     if s.fail_parts > 0 {
@@ -1965,6 +2172,8 @@ async fn finish_part_upload(
         name: upload.name,
         folder: upload.folder,
         topic_id: upload.topic_id,
+        workspace_id: upload.workspace_id,
+        modified: upload.modified,
     };
     match check_upload(&fake, &query, upload.bytes) {
         Ok(kind) => add_source(&fake, query, kind, upload.data),
@@ -1996,11 +2205,11 @@ async fn reprocess_source(
     if let Err(r) = authorized(&headers) {
         return r;
     }
-    let (source, process) = {
+    let (source, process, workspace) = {
         let mut s = fake.state.lock().unwrap();
         let ready = matches!(s.embedding, EmbeddingModelState::Ready { .. });
         let simulate = s.simulate;
-        let Some(src) = s.library.sources.iter_mut().find(|src| src.id == id) else {
+        let Some(src) = s.source_mut(&id) else {
             return not_found();
         };
         if matches!(
@@ -2014,7 +2223,9 @@ async fn reprocess_source(
             );
         }
         src.status = SourceStatus::Queued;
-        (src.clone(), simulate && ready)
+        let src = src.clone();
+        let workspace = src.workspace_id.as_deref().and_then(|w| s.refresh_sync(w));
+        (src, simulate && ready, workspace)
     };
     publish(
         &fake,
@@ -2022,6 +2233,9 @@ async fn reprocess_source(
             source: source.clone(),
         },
     );
+    if let Some(workspace) = workspace {
+        publish(&fake, Event::WorkspaceChanged { workspace });
+    }
     if process {
         tokio::spawn(simulate_source(fake.clone(), source.id.clone()));
     }
@@ -2092,9 +2306,13 @@ pub fn sample_transcript(source_id: &str) -> Vec<TranscriptSegment> {
 async fn simulate_source(fake: Fake, id: Id) {
     let set = |status: SourceStatus| {
         let mut s = fake.state.lock().unwrap();
-        let src = s.library.sources.iter_mut().find(|src| src.id == id)?;
+        let src = s.source_mut(&id)?;
         src.status = status;
-        Some(src.clone())
+        let src = src.clone();
+        if let Some(workspace) = src.workspace_id.as_deref().and_then(|w| s.refresh_sync(w)) {
+            publish(&fake, Event::WorkspaceChanged { workspace });
+        }
+        Some(src)
     };
     let total = 4;
     for done in 0..=total {
@@ -2108,10 +2326,8 @@ async fn simulate_source(fake: Fake, id: Id) {
         .state
         .lock()
         .unwrap()
-        .library
-        .sources
-        .iter()
-        .any(|src| src.id == id && src.kind == SourceKind::Pdf);
+        .source_mut(&id)
+        .is_some_and(|src| src.kind == SourceKind::Pdf);
     let status = SourceStatus::Ready {
         chunks: total,
         pages: pdf.then_some(2),
@@ -2132,9 +2348,10 @@ async fn delete_source(
     }
     {
         let mut s = fake.state.lock().unwrap();
-        let before = s.library.sources.len();
+        let before = s.library.sources.len() + s.folder_sources.len();
         s.library.sources.retain(|src| src.id != id);
-        if s.library.sources.len() == before {
+        s.folder_sources.retain(|src| src.id != id);
+        if s.library.sources.len() + s.folder_sources.len() == before {
             return not_found();
         }
     }
@@ -4716,16 +4933,313 @@ async fn delete_workspace(
     if let Err(r) = authorized(&headers) {
         return r;
     }
-    {
+    let gone: Vec<Id> = {
         let mut s = fake.state.lock().unwrap();
         let before = s.workspaces.len();
         s.workspaces.retain(|w| w.id != id);
         if s.workspaces.len() == before {
             return not_found();
         }
+        let gone: Vec<Id> = s
+            .folder_sources
+            .iter()
+            .filter(|src| src.workspace_id.as_deref() == Some(id.as_str()))
+            .map(|src| src.id.clone())
+            .collect();
+        s.folder_sources
+            .retain(|src| src.workspace_id.as_deref() != Some(id.as_str()));
+        s.manifests.remove(&id);
+        for chat in &mut s.chats {
+            chat.workspace_ids.retain(|w| *w != id);
+        }
+        gone
+    };
+    for source in gone {
+        publish(&fake, Event::SourceDeleted { id: source });
     }
     publish(&fake, Event::WorkspaceDeleted { id });
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Attached folders on two devices, in every sync state the screens show: `w1` “notes”
+/// on this Mac mid-sync with a file that couldn't be read, `w2` “Papers” on this Mac
+/// synced, `w3` “Photos” on the iPhone synced, `w4` “Scans” on the iPhone never synced.
+pub fn sample_workspaces() -> Vec<Workspace> {
+    let ws =
+        |id: &str, name: &str, device: (&str, &str), platform, location: &str, sync| Workspace {
+            id: id.into(),
+            name: name.into(),
+            device_id: device.0.into(),
+            device_name: device.1.into(),
+            platform,
+            location: location.into(),
+            created_at: ts(40),
+            sync,
+        };
+    let mac = ("d1", "test-mac");
+    let phone = ("d2", "iPhone");
+    vec![
+        ws(
+            "w1",
+            "notes",
+            mac,
+            Platform::Macos,
+            "~/Documents/notes",
+            WorkspaceSync {
+                files: 5,
+                bytes: 14_900_000,
+                uploading: 3,
+                reading: 1,
+                failed: 1,
+                last_synced_at: Some(ts(600)),
+            },
+        ),
+        ws(
+            "w2",
+            "Papers",
+            mac,
+            Platform::Macos,
+            "~/Papers",
+            WorkspaceSync {
+                files: 42,
+                bytes: 1_288_490_189,
+                last_synced_at: Some(ts(500)),
+                ..Default::default()
+            },
+        ),
+        ws(
+            "w3",
+            "Photos",
+            phone,
+            Platform::Ios,
+            "iCloud Drive/Photos",
+            WorkspaceSync {
+                files: 18,
+                bytes: 52_000_000,
+                last_synced_at: Some(ts(300)),
+                ..Default::default()
+            },
+        ),
+        ws(
+            "w4",
+            "Scans",
+            phone,
+            Platform::Ios,
+            "On My iPhone/Scans",
+            WorkspaceSync::default(),
+        ),
+    ]
+}
+
+/// The files of sample folder `w1` (“notes”), in every state.
+pub fn sample_folder_files() -> Vec<Source> {
+    let file = |id: &str, name: &str, kind, bytes, status| Source {
+        id: id.into(),
+        topic_id: None,
+        name: name.into(),
+        folder: Some("notes".into()),
+        kind,
+        bytes,
+        status,
+        created_at: ts(610),
+        media_url: Some(media_url(id, "original")),
+        workspace_id: Some("w1".into()),
+        modified: Some(ts(-86_400)),
+    };
+    let ready = |pages| SourceStatus::Ready {
+        chunks: 4,
+        pages,
+        warning: None,
+    };
+    vec![
+        file("f1", "ch1/intro.md", SourceKind::Text, 2_150, ready(None)),
+        file(
+            "f2",
+            "paper.pdf",
+            SourceKind::Pdf,
+            2_200_000,
+            ready(Some(12)),
+        ),
+        file("f3", "figure.png", SourceKind::Image, 348_000, ready(None)),
+        file(
+            "f4",
+            "scan.pdf",
+            SourceKind::Pdf,
+            8_400_000,
+            SourceStatus::Processing { done: 3, total: 20 },
+        ),
+        file(
+            "f5",
+            "old.pdf",
+            SourceKind::Pdf,
+            4_000_000,
+            SourceStatus::Failed {
+                error: "The PDF is encrypted.".into(),
+            },
+        ),
+    ]
+}
+
+/// Passages of sample folder `w1`'s files: a text passage, a PDF page and a picture (as
+/// `search_folder` and lessons cite them), and one of a file in a removed folder.
+pub fn sample_folder_citations() -> Vec<Citation> {
+    let cite = |n, source_id: &str, path: &str, workspace: &str, kind| Citation {
+        n,
+        source_id: source_id.into(),
+        source_name: format!("notes/{path}"),
+        kind,
+        page: None,
+        start_ms: None,
+        end_ms: None,
+        excerpt: String::new(),
+        image_url: None,
+        document_id: None,
+        start_line: None,
+        end_line: None,
+        file: Some(WorkspaceFile {
+            workspace_id: workspace.into(),
+            path: path.into(),
+        }),
+    };
+    vec![
+        Citation {
+            excerpt:
+                "A Fourier series rebuilds a periodic signal from harmonics of one base frequency."
+                    .into(),
+            ..cite(1, "f1", "ch1/intro.md", "w1", SourceKind::Text)
+        },
+        Citation {
+            page: Some(3),
+            excerpt: "Each coefficient is an inner product of the signal with one harmonic.".into(),
+            image_url: Some(media_url("s1", "page-3.png")),
+            ..cite(2, "f2", "paper.pdf", "w1", SourceKind::Pdf)
+        },
+        Citation {
+            image_url: Some(media_url("s4", "original")),
+            ..cite(3, "f3", "figure.png", "w1", SourceKind::Image)
+        },
+        Citation {
+            excerpt: "The overshoot near a jump stays at about 9%.".into(),
+            image_url: Some(media_url("gone", "page-1.png")),
+            ..cite(4, "g1", "old/gibbs.pdf", "w-removed", SourceKind::Pdf)
+        },
+    ]
+}
+
+/// `POST /api/workspaces/{id}/sync`: drops the folder's sources the manifest no longer
+/// lists (or whose stamp changed) and asks for every listed path it doesn't have.
+async fn sync_workspace(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(manifest): Json<SyncManifest>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (plan, events) = {
+        let mut s = fake.state.lock().unwrap();
+        let me = s.current_device().0;
+        let Some(ws) = s.workspaces.iter().find(|w| w.id == id) else {
+            return not_found();
+        };
+        if ws.device_id != me {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "not_yours",
+                "Only the device holding this folder can sync it.",
+            );
+        }
+        if let Some(bad) = manifest
+            .files
+            .iter()
+            .find(|f| margin_shared::relative_components(&f.path).is_err())
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_path",
+                &format!("{} isn't a path inside the folder.", bad.path),
+            );
+        }
+        s.manifests_received.push((id.clone(), manifest.clone()));
+        let listed: HashMap<String, FileStamp> = manifest
+            .files
+            .iter()
+            .filter(|f| folder_file_type(&f.path).is_some())
+            .map(|f| (f.path.clone(), f.stamp.clone()))
+            .collect();
+        let mut events = Vec::new();
+        let mut removed = 0;
+        let mut kept = 0;
+        let current: Vec<(Id, String)> = s
+            .folder_sources
+            .iter()
+            .filter(|src| src.workspace_id.as_deref() == Some(id.as_str()))
+            .map(|src| (src.id.clone(), src.name.clone()))
+            .collect();
+        let mut have = Vec::new();
+        for (source_id, name) in current {
+            let same = listed
+                .get(&name)
+                .is_some_and(|stamp| s.folder_stamps.get(&source_id) == Some(stamp));
+            if same {
+                kept += 1;
+                have.push(name);
+            } else {
+                removed += 1;
+                s.folder_sources.retain(|src| src.id != source_id);
+                s.folder_stamps.remove(&source_id);
+                s.source_files.remove(&source_id);
+                events.push(Event::SourceDeleted { id: source_id });
+            }
+        }
+        let mut upload: Vec<String> = listed
+            .keys()
+            .filter(|path| !have.contains(path))
+            .cloned()
+            .collect();
+        upload.sort();
+        s.manifests.insert(id.clone(), listed);
+        if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == id) {
+            ws.sync.last_synced_at = Some(Utc::now());
+        }
+        if let Some(workspace) = s.refresh_sync(&id) {
+            events.push(Event::WorkspaceChanged { workspace });
+        }
+        (
+            SyncPlan {
+                upload,
+                kept,
+                removed,
+            },
+            events,
+        )
+    };
+    publish_all(&fake, events);
+    Json(plan).into_response()
+}
+
+/// `GET /api/workspaces/{id}/files`: the folder's sources, newest first.
+async fn workspace_files(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    if !s.workspaces.iter().any(|w| w.id == id) {
+        return not_found();
+    }
+    let mut files: Vec<Source> = s
+        .folder_sources
+        .iter()
+        .filter(|src| src.workspace_id.as_deref() == Some(id.as_str()))
+        .cloned()
+        .collect();
+    files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
+    Json(files).into_response()
 }
 
 #[cfg(test)]

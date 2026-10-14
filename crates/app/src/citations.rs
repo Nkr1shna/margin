@@ -27,11 +27,15 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
-/// Where in its source a citation points: "p. 3", "1:05–1:20", "1:05"; `None` when the
-/// whole source is meant (an image, a text passage).
+/// Where in its source a citation points: "p. 3", "1:05–1:20", "1:05"; for a file of an
+/// attached folder without a page, its path in the folder; `None` when the whole source
+/// is meant (an image, a text passage).
 pub fn locator(c: &Citation) -> Option<String> {
     if let Some(page) = c.page {
         return Some(format!("p. {page}"));
+    }
+    if let Some(file) = &c.file {
+        return Some(file.path.clone());
     }
     match (c.start_ms, c.end_ms) {
         (Some(start), Some(end)) if end > start => Some(format!("{}–{}", clock(start), clock(end))),
@@ -39,6 +43,21 @@ pub fn locator(c: &Citation) -> Option<String> {
         _ => None,
     }
 }
+
+/// For a file of an attached folder: "In “notes” on MacBook Pro · ch1/intro.md" (from
+/// the folder, when it is still attached), else "In a folder that is no longer attached
+/// · ch1/intro.md". `None` for other citations.
+pub fn folder_line(c: &Citation, workspace: Option<&margin_shared::Workspace>) -> Option<String> {
+    let file = c.file.as_ref()?;
+    Some(match workspace {
+        Some(ws) => format!("In “{}” on {} · {}", ws.name, ws.device_name, file.path),
+        None => format!("In a folder that is no longer attached · {}", file.path),
+    })
+}
+
+/// What the viewer says when a folder file's picture or original no longer loads.
+pub const FOLDER_FILE_GONE: &str =
+    "This file is no longer in the folder; this is the passage as it was.";
 
 pub fn kind_label(kind: SourceKind) -> &'static str {
     match kind {
@@ -564,5 +583,37 @@ mod tests {
             whole_transcript(&all[0], &all, &[]),
             super::transcript(&all[0], &all)
         );
+    }
+
+    #[test]
+    fn folder_citations_say_where_the_file_is() {
+        use margin_shared::{Platform, Workspace, WorkspaceFile};
+        let mut c = cite(1, "f1", SourceKind::Text);
+        assert_eq!(folder_line(&c, None), None);
+        c.file = Some(WorkspaceFile {
+            workspace_id: "w1".into(),
+            path: "ch1/intro.md".into(),
+        });
+        assert_eq!(locator(&c).as_deref(), Some("ch1/intro.md"));
+        let ws = Workspace {
+            id: "w1".into(),
+            name: "notes".into(),
+            device_id: "d1".into(),
+            device_name: "MacBook Pro".into(),
+            platform: Platform::Macos,
+            location: "~/notes".into(),
+            created_at: chrono::Utc::now(),
+            sync: Default::default(),
+        };
+        assert_eq!(
+            folder_line(&c, Some(&ws)).as_deref(),
+            Some("In “notes” on MacBook Pro · ch1/intro.md")
+        );
+        assert_eq!(
+            folder_line(&c, None).as_deref(),
+            Some("In a folder that is no longer attached · ch1/intro.md")
+        );
+        c.page = Some(4);
+        assert_eq!(locator(&c).as_deref(), Some("p. 4"));
     }
 }

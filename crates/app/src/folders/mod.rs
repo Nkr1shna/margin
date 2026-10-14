@@ -145,6 +145,30 @@ pub fn forget(handle: &FolderHandle) {
     platform::forget(handle)
 }
 
+/// Handles `open` made again (a stale macOS or iOS bookmark), each with the one it
+/// replaces, waiting for the sync engine to save them (`take_resaved`).
+fn resaved_queue() -> &'static std::sync::Mutex<Vec<(FolderHandle, FolderHandle)>> {
+    static QUEUE: std::sync::OnceLock<std::sync::Mutex<Vec<(FolderHandle, FolderHandle)>>> =
+        std::sync::OnceLock::new();
+    QUEUE.get_or_init(Default::default)
+}
+
+/// The platform's `open` (4a, 4b) made a new handle for a folder it was given `old`
+/// for: the store replaces it after the open (`store::update_handle`). Any thread.
+#[allow(dead_code)] // 4a and 4b call it.
+pub fn resaved(old: FolderHandle, new: FolderHandle) {
+    resaved_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((old, new));
+}
+
+/// Every `(old, new)` pair `resaved` queued since the last call, oldest first. On every
+/// platform; Android never queues any.
+pub fn take_resaved() -> Vec<(FolderHandle, FolderHandle)> {
+    std::mem::take(&mut *resaved_queue().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,11 +208,11 @@ mod tests {
     #[test]
     fn unbuilt_platforms_say_so() {
         let handle = FolderHandle::AndroidTree { uri: "x".into() };
+        // Not a folder this platform can open: a message for the Folders pane, whatever
+        // the platform says (4a/4b/4c word it for themselves).
         let err = open(&handle).err().unwrap();
-        assert_eq!(
-            err.to_string(),
-            "Folders aren't built on this platform yet."
-        );
+        assert!(matches!(err, DirError::Revoked(_)), "{err:?}");
+        assert!(!err.to_string().is_empty());
         forget(&handle);
     }
 }

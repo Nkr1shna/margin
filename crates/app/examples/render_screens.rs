@@ -20,7 +20,11 @@
 //! - `RENDER_CONFIRM=pending|approved|denied|stopped|expired` adds a confirmation card to
 //!   chat `c1` (`pending`: the answer waits on it).
 //! - `RENDER_EMBEDDING=missing|downloading|ready|failed` sets the embedding model's state.
-//! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n.
+//! - `RENDER_VIEWER=<n>` opens the source viewer on the lesson's citation n;
+//!   `RENDER_VIEWER=folder` (or `folder-gone`) on a passage of a folder's PDF (or of a
+//!   file whose folder was removed).
+//! - The sample folders (two devices', every sync state) are always there: Settings →
+//!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
 //! - `RENDER_JS=<script>` runs a script once the page has loaded (scrolling, opening a
 //!   tooltip…), since effects don't run here.
@@ -159,6 +163,26 @@ fn Harness(props: HarnessProps) -> Element {
             _ => Vec::new(),
         };
         add_sample_cards(&mut lib);
+        lib.replace_workspaces(fake::sample_workspaces());
+        let mut folder_files = fake::sample_folder_files();
+        for f in &mut folder_files {
+            f.media_url = None;
+        }
+        lib.replace_folder_files("w1", folder_files);
+        if let Some(chat) = lib.chats.get_mut("c1") {
+            chat.workspace_ids = vec!["w1".into(), "w3".into(), "w4".into()];
+        }
+        let viewer = std::env::var("RENDER_VIEWER").ok();
+        let shown_folder = viewer.as_deref().and_then(|v| {
+            let n = match v {
+                "folder" => 1,
+                "folder-gone" => 3,
+                _ => return None,
+            };
+            let mut c = fake::sample_folder_citations()[n].clone();
+            c.image_url = c.image_url.as_deref().and_then(sample_media_url);
+            Some(c)
+        });
         let settings_open = std::env::var("RENDER_SETTINGS").ok().and_then(|name| {
             ui::settings::SettingsPane::ALL
                 .into_iter()
@@ -212,10 +236,35 @@ fn Harness(props: HarnessProps) -> Element {
                     .map(|id| (id.to_string(), fake::sample_transcript(id)))
                     .collect(),
             ),
-            shown_passage: Signal::new(None),
+            shown_passage: Signal::new(shown_folder),
             device_frames: Signal::new(None),
             agent_commands: Signal::new(Default::default()),
             foreground: Signal::new(true),
+            folders: Signal::new(folders::store::LocalFolders {
+                held: [
+                    ("w1".to_string(), folders::store::FolderStatus::Ok),
+                    (
+                        "w2".to_string(),
+                        folders::store::FolderStatus::Revoked(
+                            "macOS didn't let Margin read “Papers”.".into(),
+                        ),
+                    ),
+                ]
+                .into(),
+            }),
+            folder_sync: Signal::new(
+                [(
+                    "w1".to_string(),
+                    folders::sync::SyncState::Uploading {
+                        done: 2,
+                        total: 12,
+                        bytes_done: 41 * 1024 * 1024,
+                        bytes_total: 230 * 1024 * 1024,
+                    },
+                )]
+                .into(),
+            ),
+            ask_workspaces: Signal::new(Vec::new()),
         }
     });
     let sources_topic = std::env::var("RENDER_SOURCES").ok();

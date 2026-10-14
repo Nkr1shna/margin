@@ -8,9 +8,10 @@ mod commands;
 mod config;
 mod drafts;
 mod events;
-// Phase 4's contract: 4-core and 4a/4b/4c build on it; nothing calls it yet.
 #[cfg(test)]
 mod fake;
+// `StdDir` and some `DirError`s are used by the platforms' `open` (4a, 4b, 4c), which
+// aren't built on every platform yet.
 #[allow(dead_code)]
 mod folders;
 mod markdown;
@@ -86,6 +87,8 @@ const INDEX_HTML: &str = concat!(
 
 fn main() {
     picker::clear_staging();
+    // The folders this device holds, before anything syncs them.
+    folders::store::load();
     #[cfg(target_os = "ios")]
     scene::register();
     #[cfg(feature = "desktop")]
@@ -359,6 +362,39 @@ fn App() -> Element {
             device_frames: Signal::new(None),
             agent_commands: Signal::new(Default::default()),
             foreground: Signal::new(*state::foreground_changes().borrow()),
+            folders: Signal::new(folders::store::snapshot()),
+            folder_sync: Signal::new(Default::default()),
+            ask_workspaces: Signal::new(Vec::new()),
+        }
+    });
+
+    // The held folders and their syncs into `AppCtx::folders` and `folder_sync` (the
+    // store and the engine never touch a signal themselves).
+    use_future(move || async move {
+        let mut changes = folders::store::changes();
+        let mut held = ctx.folders;
+        loop {
+            changes.borrow_and_update();
+            let now = folders::store::snapshot();
+            if *held.peek() != now {
+                held.set(now);
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    use_future(move || async move {
+        let mut states = folders::sync::engine().states();
+        let mut shown = ctx.folder_sync;
+        loop {
+            let now = states.borrow_and_update().clone();
+            if *shown.peek() != now {
+                shown.set(now);
+            }
+            if states.changed().await.is_err() {
+                return;
+            }
         }
     });
 
@@ -469,6 +505,7 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             status.set(LoadStatus::Loaded);
             // Note edits an earlier run (or a failed save) left unsent.
             drafts::resume(ctx, api);
+            load_workspaces(ctx, api).await;
             load_chats(ctx, api).await;
             true
         }
@@ -484,6 +521,25 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
         }
     }
 }
+
+/// The attached folders of every device. A held folder the service no longer lists was
+/// removed while this device was away: it is let go (only after a list that loaded).
+async fn load_workspaces(ctx: AppCtx, api: &Api) {
+    match api.workspaces().await {
+        Ok(list) => {
+            let ids = list.iter().map(|w| w.id.clone()).collect();
+            let mut lib = ctx.lib;
+            lib.write().replace_workspaces(list);
+            folders::sync::prune_held(ids).await;
+        }
+        Err(e) => {
+            ctx.failure(&e);
+        }
+    }
+}
+
+/// How often the held folders are synced while the app runs.
+const FOLDER_SYNC_EVERY: Duration = Duration::from_secs(margin_shared::FOLDER_SYNC_INTERVAL_SECS);
 
 /// How long the live loop waits before asking for the chat list again after it failed.
 const CHATS_RETRY: Duration = Duration::from_secs(5);
@@ -577,12 +633,16 @@ async fn live_loop(ctx: AppCtx) {
     let mut reload_seen = *ctx.reload.peek();
     let runner = tools::Runner::new();
     let host = tools::AppHost(ctx);
+    let engine = folders::sync::engine();
+    engine.set_api(Some(api.clone()));
     load_library(ctx, &api).await;
     let mut chats_retry_at = tokio::time::Instant::now() + CHATS_RETRY;
     let mut attempt: u32 = 0;
     let mut connected_before = false;
     loop {
         if !*ctx.foreground.peek() {
+            // Uploads stop with the app (iOS, iPadOS, Android); parts resume later.
+            engine.pause();
             live.set(LiveStatus::Background);
             while !*ctx.foreground.peek() {
                 tokio::time::sleep(LIVE_TICK).await;
@@ -604,6 +664,11 @@ async fn live_loop(ctx: AppCtx) {
                 connected_before = true;
                 live.set(LiveStatus::Live);
                 set_self_online(ctx, true);
+                // Every held folder syncs once the socket is live (launch, reconnect,
+                // back in front), then every `FOLDER_SYNC_EVERY`.
+                engine.resume();
+                engine.sync_all();
+                let mut next_folder_sync = tokio::time::Instant::now() + FOLDER_SYNC_EVERY;
                 let (mut sender, mut frames) = socket.split();
                 // This connection's outgoing frames; device tools get the sender once
                 // the service said hello.
@@ -637,10 +702,15 @@ async fn live_loop(ctx: AppCtx) {
                         }
                         _ = tick.tick() => {
                             if !*ctx.foreground.peek() {
+                                engine.pause();
                                 events::close(&mut sender).await;
                                 break String::new();
                             }
                             set_self_online(ctx, true);
+                            if tokio::time::Instant::now() >= next_folder_sync {
+                                engine.sync_all();
+                                next_folder_sync = tokio::time::Instant::now() + FOLDER_SYNC_EVERY;
+                            }
                             let wanted = *ctx.reload.peek();
                             if wanted != reload_seen {
                                 reload_seen = wanted;

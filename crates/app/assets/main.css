@@ -719,6 +719,29 @@ details.collapse[open] > summary .chev { transform: none; }
 .device:last-child { border-bottom: 0; }
 .device .grow { white-space: normal; }
 .device small { display: block; color: var(--fg-3); font-size: 12.5px; }
+/* Folders (Settings → Folders, the chat's strip, the Attach menu, the viewer's line). */
+.folder-row { align-items: flex-start; }
+.folder-row > .ic { margin-top: 2px; color: var(--fg-2); }
+.folder-row .grow { display: grid; gap: 2px; min-width: 0; }
+.folder-row .grow > small { overflow-wrap: anywhere; }
+.folder-row .badge { justify-self: start; margin-top: 4px; white-space: normal; }
+.folder-row .row-actions { margin-top: 6px; }
+.device small.folder-live { display: flex; align-items: center; gap: 6px; color: var(--fg-2); }
+.device small.folder-live.bad, .badge.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.device small.folder-live.warn { color: var(--warn); }
+.folder-files { margin-top: 8px; display: grid; gap: 2px; }
+.folders-total { margin-top: 4px; }
+.viewer-folder { display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.viewer-folder .ic { flex: none; }
+.folder-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.folder-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 32px; padding: 2px 4px 2px 10px; border-radius: var(--r-pill); border: 1px solid var(--line-2); font-size: 13px; color: var(--fg-2); }
+.folder-chip > .ic { flex: none; }
+.folder-chip .folder-chip-text { min-width: 0; overflow-wrap: anywhere; }
+.folder-chip .folder-chip-text b { font-weight: 500; color: var(--fg); }
+.folder-chip.bad { border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.folder-chip .note-bad { color: var(--danger); }
+.menu .menu-label { padding: 6px 10px 2px; font-size: 12px; font-weight: 500; color: var(--fg-3); border-top: 1px solid var(--line); margin-top: 4px; }
+.menu button small { color: var(--fg-3); font-size: 12px; }
 .tool { display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--line); }
 .tool:last-child { border-bottom: 0; }
 .tool-h { display: flex; align-items: center; gap: 10px; }

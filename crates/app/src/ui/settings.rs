@@ -3,12 +3,13 @@
 
 use dioxus::prelude::*;
 use margin_shared::{
-    Device, EmbeddingModelState, Event, ReasoningEffort, SOURCE_KINDS, Settings, SettingsPatch,
-    ToolStatus,
+    Device, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id, ReasoningEffort, SOURCE_KINDS,
+    Settings, SettingsPatch, Source, ToolStatus, Workspace, WorkspaceSync,
 };
 
 use crate::config::{Appearance, normalize_service_url};
-use crate::sources::human_bytes;
+use crate::folders::sync::SyncState;
+use crate::sources::{human_bytes, status_text};
 use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
     ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js,
@@ -47,7 +48,9 @@ fn SaveLabel(busy: bool, #[props(default = "Save".to_string())] label: String) -
         }
     }
 }
-use crate::ui::sources::{Progress, download_embedding, refresh_embedding};
+use crate::ui::sources::{
+    Progress, ReadAgainButton, SourceLine, download_embedding, refresh_embedding,
+};
 
 /// The panes of the Settings dialog, in sidebar order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,17 +60,19 @@ pub enum SettingsPane {
     Service,
     Ai,
     Sources,
+    Folders,
     Video,
     Tools,
 }
 
 impl SettingsPane {
-    pub const ALL: [SettingsPane; 7] = [
+    pub const ALL: [SettingsPane; 8] = [
         SettingsPane::General,
         SettingsPane::Account,
         SettingsPane::Service,
         SettingsPane::Ai,
         SettingsPane::Sources,
+        SettingsPane::Folders,
         SettingsPane::Video,
         SettingsPane::Tools,
     ];
@@ -79,6 +84,7 @@ impl SettingsPane {
             SettingsPane::Service => "Service",
             SettingsPane::Ai => "AI",
             SettingsPane::Sources => "Sources",
+            SettingsPane::Folders => "Folders",
             SettingsPane::Video => "Voice & video",
             SettingsPane::Tools => "Tools",
         }
@@ -91,6 +97,7 @@ impl SettingsPane {
             SettingsPane::Service => "server",
             SettingsPane::Ai => "spark",
             SettingsPane::Sources => "clip",
+            SettingsPane::Folders => "folder",
             SettingsPane::Video => "video",
             SettingsPane::Tools => "wrench",
         }
@@ -212,6 +219,7 @@ pub fn SettingsDialog() -> Element {
                                 AgentSection { settings: s }
                             }),
                             SettingsPane::Sources => rsx! { SourcesSection {} },
+                            SettingsPane::Folders => rsx! { FoldersSection {} },
                             SettingsPane::Video => service_settings(|s| rsx! {
                                 VoiceSection { settings: s.clone() }
                                 RenderSection { settings: s }
@@ -918,6 +926,435 @@ fn SourcesSection() -> Element {
     }
 }
 
+/// What the Folders pane and the menus say about what a folder sync takes.
+pub fn folders_help() -> String {
+    format!(
+        "A folder's {FOLDER_FILE_TYPES_TEXT} are copied to your Margin service and read there (text, pages and pictures), so the agent can search inside them. Other files are left alone; nothing on your device is changed. Files are sent again when they change, and removed from the service when they're deleted or the folder is removed."
+    )
+}
+
+/// What this platform adds to the help ("macOS may ask once…").
+pub fn folders_platform_help() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("macOS may ask once before Margin reads Desktop, Documents or Downloads.")
+    } else if cfg!(target_os = "ios") {
+        Some(
+            "Files that iCloud hasn't downloaded to this device are downloaded as they're sent. Sending happens while Margin is open.",
+        )
+    } else if cfg!(target_os = "android") {
+        Some("Sending happens while Margin is open.")
+    } else {
+        None
+    }
+}
+
+fn plural(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// "12 files · 1.2 GB on the service".
+pub fn folder_size_text(sync: &WorkspaceSync) -> String {
+    format!(
+        "{} · {} on the service",
+        plural(sync.files as u64, "file", "files"),
+        human_bytes(sync.bytes)
+    )
+}
+
+/// The live line of a folder this device holds: what its sync is doing now, else what
+/// the service is doing with its files, else when it last synced.
+pub fn folder_sync_line(state: Option<&SyncState>, sync: &WorkspaceSync) -> String {
+    match state {
+        Some(SyncState::Scanning) => return "Scanning…".into(),
+        Some(SyncState::Uploading {
+            done,
+            total,
+            bytes_done,
+            bytes_total,
+        }) => {
+            return format!(
+                "Sending {} of {total} ({} of {})…",
+                (done + 1).min(*total),
+                human_bytes(*bytes_done),
+                human_bytes(*bytes_total)
+            );
+        }
+        Some(SyncState::Paused) => return "Paused — open Margin to continue".into(),
+        Some(SyncState::Failed(message)) => return message.clone(),
+        Some(SyncState::Idle { .. }) | None => {}
+    }
+    if sync.reading > 0 {
+        return format!("Reading {}…", plural(sync.reading as u64, "file", "files"));
+    }
+    let last = match state {
+        Some(SyncState::Idle { last }) => Some(*last).max(sync.last_synced_at),
+        _ => sync.last_synced_at,
+    };
+    match last {
+        Some(t) => format!("Synced {}", ago(&t)),
+        None => "Not synced yet".into(),
+    }
+}
+
+/// The line of another device's folder: when it last synced, or that it waits for that
+/// device.
+pub fn other_folder_line(ws: &Workspace, online: bool) -> String {
+    let presence = if online { "Online" } else { "Offline" };
+    let state = if ws.sync.uploading > 0 && !online {
+        "Paused".to_string()
+    } else if ws.sync.uploading > 0 {
+        format!(
+            "Sending {}",
+            plural(ws.sync.uploading as u64, "file", "files")
+        )
+    } else {
+        match ws.sync.last_synced_at {
+            Some(t) => format!("Synced {}", ago(&t)),
+            None => "Not synced yet".into(),
+        }
+    };
+    format!(
+        "{} · on {} · {} · {state} · {presence}",
+        ws.location,
+        ws.device_name,
+        plural(ws.sync.files as u64, "file", "files")
+    )
+}
+
+/// Settings → Folders: the folders this device holds (with their syncs, files and
+/// removal) and those of other devices.
+#[component]
+fn FoldersSection() -> Element {
+    let app = use_app();
+    // The list again (the store is current from events after), with who is online.
+    let mut load = use_resource(move || async move {
+        let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+        let list = api.workspaces().await.map_err(|e| app.failure(&e))?;
+        let ids = list.iter().map(|w| w.id.clone()).collect();
+        let mut lib = app.lib;
+        lib.write().replace_workspaces(list);
+        crate::folders::sync::prune_held(ids).await;
+        if let Ok(devices) = api.devices().await {
+            lib.write().replace_devices(devices);
+        }
+        Ok::<(), String>(())
+    });
+    let mut attaching = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+
+    let me = app
+        .session
+        .read()
+        .as_ref()
+        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let lib = app.lib.read();
+    let all: Vec<Workspace> = lib
+        .workspaces_in_order(me.as_deref())
+        .into_iter()
+        .cloned()
+        .collect();
+    let online: Vec<bool> = all
+        .iter()
+        .map(|w| {
+            Some(w.device_id.as_str()) == me.as_deref()
+                || lib.devices.get(&w.device_id).is_some_and(|d| d.online)
+        })
+        .collect();
+    drop(lib);
+    // Each folder, and whether its device is online.
+    type Listed = Vec<(Workspace, bool)>;
+    let (mine, others): (Listed, Listed) = all
+        .into_iter()
+        .zip(online)
+        .partition(|(w, _)| Some(w.device_id.as_str()) == me.as_deref());
+    let files: u64 = mine
+        .iter()
+        .chain(others.iter())
+        .map(|(w, _)| w.sync.files as u64)
+        .sum();
+    let bytes: u64 = mine
+        .iter()
+        .chain(others.iter())
+        .map(|(w, _)| w.sync.bytes)
+        .sum();
+    let any = !mine.is_empty() || !others.is_empty();
+    let loading = load.read().is_none() && !any;
+    let load_error = match load.read().as_ref() {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let attach = move |_| {
+        if *attaching.peek() {
+            return;
+        }
+        spawn(async move {
+            attaching.set(true);
+            match crate::folders::sync::attach(app).await {
+                Ok(_) => error.set(None),
+                Err(e) => error.set(Some(e)),
+            }
+            attaching.set(false);
+        });
+    };
+
+    rsx! {
+        section { class: "set-sec",
+            h2 { "This device" }
+            p { class: "help", {folders_help()} }
+            if let Some(more) = folders_platform_help() {
+                p { class: "help", "{more}" }
+            }
+            if let Some(err) = load_error {
+                ErrorNotice { message: err, on_retry: move |_| load.restart() }
+            }
+            if let Some(err) = error.read().clone() {
+                ErrorNotice { message: err }
+            }
+            if loading {
+                div { class: "skel", style: "width: 50%" }
+            } else if mine.is_empty() {
+                p { class: "faint", "No folder of this device is attached yet." }
+            }
+            div { role: "list", "aria-label": "Folders on this device",
+                for (ws, _) in mine {
+                    div { key: "{ws.id}", role: "listitem",
+                        HeldFolderRow { ws: ws.clone() }
+                    }
+                }
+            }
+            div { class: "row-actions",
+                button {
+                    class: "btn btn-primary btn-sm",
+                    disabled: *attaching.read(),
+                    onclick: attach,
+                    if *attaching.read() { span { class: "spinner" } } else { Icon { name: "folder" } }
+                    "Attach a folder…"
+                }
+            }
+        }
+        if !others.is_empty() {
+            section { class: "set-sec",
+                h2 { "Other devices" }
+                div { role: "list", "aria-label": "Folders on other devices",
+                    for (ws, online) in others {
+                        div { key: "{ws.id}", role: "listitem", class: "device folder-row",
+                            span {
+                                class: if online { "dot ok" } else { "dot" },
+                                title: if online { "Online" } else { "Offline" },
+                                "aria-hidden": "true",
+                            }
+                            Icon { name: "folder" }
+                            div { class: "grow",
+                                "{ws.name}"
+                                small { {other_folder_line(&ws, online)} }
+                                small { class: "faint", "Remove it on {ws.device_name}." }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if any {
+            p { class: "help folders-total",
+                "All folders: {plural(files, \"file\", \"files\")} · {human_bytes(bytes)} on the service."
+            }
+        }
+    }
+}
+
+/// A folder this device holds, in the Folders pane.
+#[component]
+fn HeldFolderRow(ws: Workspace) -> Element {
+    let app = use_app();
+    // Open again if its list was opened before this session.
+    let mut show_files = use_signal(|| app.lib.peek().folder_files.contains_key(&ws.id));
+    let mut confirm = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let state = app.folder_sync.read().get(&ws.id).cloned();
+    let held = app.folders.read().holds(&ws.id);
+    let revoked = app.folders.read().revoked(&ws.id).map(str::to_string);
+    let chats = app.lib.read().chats_with_workspace(&ws.id);
+    let line = folder_sync_line(state.as_ref(), &ws.sync);
+    let failed_line = matches!(state, Some(SyncState::Failed(_)));
+    let running = matches!(
+        state,
+        Some(SyncState::Scanning | SyncState::Uploading { .. })
+    );
+    let id = ws.id.clone();
+    let name = ws.name.clone();
+
+    rsx! {
+        div { class: "device folder-row",
+            Icon { name: "folder" }
+            div { class: "grow",
+                b { "{ws.name}" }
+                small { class: "mono", "{ws.location}" }
+                small { {folder_size_text(&ws.sync)} }
+                small {
+                    class: if failed_line { "folder-live bad" } else { "folder-live" },
+                    role: "status",
+                    if running { span { class: "spinner xs" } }
+                    "{line}"
+                }
+                if ws.sync.failed > 0 {
+                    small { class: "folder-live warn",
+                        {plural(ws.sync.failed as u64, "file couldn't be read", "files couldn't be read")}
+                        " · "
+                        button {
+                            class: "link-btn",
+                            onclick: move |_| show_files.set(true),
+                            "Show"
+                        }
+                    }
+                }
+                small { class: "faint",
+                    match chats {
+                        0 => "In no chat yet".to_string(),
+                        1 => "In 1 chat".to_string(),
+                        n => format!("In {n} chats"),
+                    }
+                }
+                if revoked.is_some() {
+                    span { class: "badge bad", title: revoked.clone().unwrap_or_default(), "No longer accessible — attach it again" }
+                } else if !held {
+                    span { class: "badge bad", "No access on this device — remove it" }
+                }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", "{err}" }
+                }
+                div { class: "row-actions",
+                    if held {
+                        button {
+                            class: "btn btn-secondary btn-sm",
+                            disabled: running,
+                            onclick: {
+                                let id = id.clone();
+                                move |_| crate::folders::sync::start(&id)
+                            },
+                            Icon { name: "refresh" }
+                            "Sync now"
+                        }
+                    }
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        "aria-expanded": show_files.read().to_string(),
+                        onclick: move |_| show_files.toggle(),
+                        "Files…"
+                    }
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        onclick: move |_| confirm.set(true),
+                        "Remove…"
+                    }
+                }
+                if *show_files.read() {
+                    FolderFiles { workspace_id: ws.id.clone() }
+                }
+            }
+        }
+        if *confirm.read() {
+            ConfirmDialog {
+                title: "Remove the folder “{name}”?",
+                message: "Its files are deleted from the Margin service and chats that had it attached lose it. Nothing on this device changes.",
+                confirm_label: "Remove",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm.set(false),
+                on_confirm: move |_| {
+                    let id = id.clone();
+                    async move {
+                        busy.set(true);
+                        match crate::folders::sync::remove(app, &id).await {
+                            Ok(()) => error.set(None),
+                            Err(e) => error.set(Some(e)),
+                        }
+                        busy.set(false);
+                        confirm.set(false);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A folder's files as the service has them, each with its status; those that couldn't
+/// be read can be read again.
+#[component]
+fn FolderFiles(workspace_id: Id) -> Element {
+    let app = use_app();
+    let ws = workspace_id.clone();
+    let mut load = use_resource(move || {
+        let ws = ws.clone();
+        async move {
+            let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+            let files = api
+                .workspace_files(&ws)
+                .await
+                .map_err(|e| app.failure(&e))?;
+            let mut lib = app.lib;
+            lib.write().replace_folder_files(&ws, files);
+            Ok::<(), String>(())
+        }
+    });
+    let mut error = use_signal(|| None::<String>);
+    let files: Option<Vec<Source>> = app
+        .lib
+        .read()
+        .folder_files_in(&workspace_id)
+        .map(|list| list.into_iter().cloned().collect());
+    let load_error = match load.read().as_ref() {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    rsx! {
+        div { class: "folder-files",
+            if let Some(err) = load_error {
+                ErrorNotice { message: err, on_retry: move |_| load.restart() }
+            }
+            if let Some(err) = error.read().clone() {
+                ErrorNotice { message: err }
+            }
+            match files {
+                None => rsx! { div { class: "skel", style: "width: 60%" } },
+                Some(files) if files.is_empty() => rsx! {
+                    p { class: "faint", "The service has none of this folder's files yet." }
+                },
+                Some(files) => rsx! {
+                    div { role: "list", "aria-label": "Files of the folder",
+                        for f in files {
+                            div { key: "{f.id}", role: "listitem",
+                                {
+                                    let (tone, status) = status_text(&f.status);
+                                    rsx! {
+                                        SourceLine {
+                                            kind: f.kind,
+                                            name: f.name.clone(),
+                                            bytes: f.bytes,
+                                            tone,
+                                            status,
+                                            if f.status.can_read_again() {
+                                                ReadAgainButton {
+                                                    id: f.id.clone(),
+                                                    name: f.name.clone(),
+                                                    on_error: move |e| error.set(Some(e)),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
 #[component]
 fn VoiceSection(settings: Settings) -> Element {
     let app = use_app();
@@ -1264,6 +1701,130 @@ fn AppearanceSection() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn folders_lib() -> crate::store::LibraryState {
+        let mut lib = crate::store::LibraryState::from_library(crate::fake::sample_library());
+        lib.replace_workspaces(crate::fake::sample_workspaces());
+        lib.replace_devices(crate::fake::FakeState::new().devices);
+        lib
+    }
+
+    #[test]
+    fn the_folders_pane_lists_this_devices_folders_and_the_others() {
+        use crate::folders::store::{FolderStatus, LocalFolders};
+        use crate::ui::test_render::{Extra, render_with};
+        let mut lib = folders_lib();
+        // A folder of this device the store doesn't hold.
+        let mut lost = lib.workspaces["w2"].clone();
+        lost.id = "w5".into();
+        lost.name = "Old notes".into();
+        lib.workspaces.insert("w5".into(), lost);
+        // A chat with notes attached; its file list was opened before.
+        lib.chats.insert(
+            "c9".into(),
+            margin_shared::Chat {
+                workspace_ids: vec!["w1".into()],
+                ..crate::fake::sample_chats()[0].0.clone()
+            },
+        );
+        lib.replace_folder_files("w1", crate::fake::sample_folder_files());
+        let extra = Extra {
+            folders: LocalFolders {
+                held: [
+                    ("w1".to_string(), FolderStatus::Ok),
+                    (
+                        "w2".to_string(),
+                        FolderStatus::Revoked("macOS didn't let Margin read “Papers”.".into()),
+                    ),
+                ]
+                .into(),
+            },
+            folder_sync: [(
+                "w1".to_string(),
+                SyncState::Uploading {
+                    done: 2,
+                    total: 12,
+                    bytes_done: 41 * 1024 * 1024,
+                    bytes_total: 230 * 1024 * 1024,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let html = render_with("/", lib, Some(SettingsPane::Folders), extra);
+        assert!(html.contains("<h2>This device</h2>"), "{html}");
+        assert!(html.contains("<h2>Other devices</h2>"));
+        assert!(html.contains("are copied to your Margin service and read there"));
+        assert!(html.contains("5 files · 14 MB on the service"));
+        assert!(html.contains("Sending 3 of 12 (41 MB of 230 MB)…"));
+        assert!(html.contains("1 file couldn&#39;t be read"), "{html}");
+        assert!(html.contains(">Show<"));
+        assert!(html.contains("In 1 chat"));
+        assert!(html.contains("No longer accessible — attach it again"));
+        assert!(html.contains("No access on this device — remove it"));
+        assert!(html.contains(">Sync now<"));
+        assert!(html.contains(">Files…<"));
+        assert!(html.contains(">Remove…<"));
+        assert!(html.contains(">Attach a folder…<"));
+        // The file list: each file with its status, Read again for the one that failed.
+        assert!(html.contains("ch1/intro.md"));
+        assert!(html.contains("Processing 3/20"));
+        assert!(html.contains("Failed: The PDF is encrypted."));
+        assert!(html.contains(r#"aria-label="Read old.pdf again""#));
+        // Other devices: where, on which device, synced or not, online or offline.
+        assert!(html.contains("iCloud Drive/Photos · on iPhone · 18 files · Synced"));
+        assert!(
+            html.contains("On My iPhone/Scans · on iPhone · 0 files · Not synced yet · Offline")
+        );
+        assert!(html.contains("Remove it on iPhone."));
+        assert!(html.contains("All folders: 107 files"));
+    }
+
+    #[test]
+    fn folder_lines_read_well() {
+        let sync = WorkspaceSync {
+            files: 1,
+            bytes: 2048,
+            ..Default::default()
+        };
+        assert_eq!(folder_size_text(&sync), "1 file · 2.0 KB on the service");
+        assert_eq!(folder_sync_line(None, &sync), "Not synced yet");
+        assert_eq!(
+            folder_sync_line(Some(&SyncState::Scanning), &sync),
+            "Scanning…"
+        );
+        assert_eq!(
+            folder_sync_line(Some(&SyncState::Paused), &sync),
+            "Paused — open Margin to continue"
+        );
+        assert_eq!(
+            folder_sync_line(
+                Some(&SyncState::Failed("Couldn't send “a.md”.".into())),
+                &sync
+            ),
+            "Couldn't send “a.md”."
+        );
+        let reading = WorkspaceSync {
+            reading: 4,
+            ..sync.clone()
+        };
+        assert_eq!(folder_sync_line(None, &reading), "Reading 4 files…");
+        let synced = WorkspaceSync {
+            last_synced_at: Some(Utc::now() - chrono::Duration::minutes(5)),
+            ..sync
+        };
+        assert_eq!(folder_sync_line(None, &synced), "Synced 5 min ago");
+        assert_eq!(
+            folder_sync_line(Some(&SyncState::Idle { last: Utc::now() }), &synced),
+            "Synced just now"
+        );
+        let mut ws = crate::fake::sample_workspaces()[0].clone();
+        assert!(other_folder_line(&ws, false).contains("· Paused · Offline"));
+        assert!(other_folder_line(&ws, true).contains("· Sending 3 files · Online"));
+        ws.sync.uploading = 0;
+        assert!(other_folder_line(&ws, true).contains("· Synced"));
+    }
 
     #[test]
     fn ai_pane_sets_the_chat_model_and_reasoning() {

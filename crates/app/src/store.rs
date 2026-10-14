@@ -38,6 +38,10 @@ pub struct LibraryState {
     pub stale_chats: BTreeSet<Id>,
     /// Attached folders of every device (`GET /api/workspaces`).
     pub workspaces: BTreeMap<Id, Workspace>,
+    /// A folder's files as the service has them (`GET /api/workspaces/{id}/files`), for
+    /// the folders whose list was opened this session; kept current by source events.
+    /// Folder files are never in `sources`.
+    pub folder_files: BTreeMap<Id, BTreeMap<Id, Source>>,
     /// Devices once fetched (`GET /api/devices`), with presence from `DeviceChanged`.
     pub devices: BTreeMap<Id, Device>,
 }
@@ -168,11 +172,21 @@ impl LibraryState {
                 self.proposals.insert(proposal.id.clone(), proposal);
             }
             Event::SettingsChanged { settings } => self.settings = Some(settings),
-            Event::SourceChanged { source } => {
-                self.sources.insert(source.id.clone(), source);
-            }
+            Event::SourceChanged { source } => match &source.workspace_id {
+                Some(workspace_id) => {
+                    if let Some(files) = self.folder_files.get_mut(workspace_id) {
+                        files.insert(source.id.clone(), source);
+                    }
+                }
+                None => {
+                    self.sources.insert(source.id.clone(), source);
+                }
+            },
             Event::SourceDeleted { id } => {
                 self.sources.remove(&id);
+                for files in self.folder_files.values_mut() {
+                    files.remove(&id);
+                }
             }
             Event::EmbeddingModelChanged { model } => self.embedding = Some(model),
             Event::ChatChanged { chat } => {
@@ -219,6 +233,7 @@ impl LibraryState {
             }
             Event::WorkspaceDeleted { id } => {
                 self.workspaces.remove(&id);
+                self.folder_files.remove(&id);
             }
             Event::DeviceChanged { mut device } => {
                 // `current` is per device; broadcasts always say false.
@@ -230,11 +245,59 @@ impl LibraryState {
             Event::DeviceDeleted { id } => {
                 self.devices.remove(&id);
                 self.workspaces.retain(|_, w| w.device_id != id);
+                let workspaces = &self.workspaces;
+                self.folder_files.retain(|w, _| workspaces.contains_key(w));
             }
             // Documents and traces are for agents and the eval runner; the app shows
             // neither (yet).
             Event::DocumentChanged { .. } | Event::Trace { .. } => {}
         }
+    }
+
+    /// The folders exactly as `GET /api/workspaces` lists them.
+    pub fn replace_workspaces(&mut self, workspaces: Vec<Workspace>) {
+        self.workspaces = workspaces.into_iter().map(|w| (w.id.clone(), w)).collect();
+        let workspaces = &self.workspaces;
+        self.folder_files.retain(|w, _| workspaces.contains_key(w));
+    }
+
+    /// A folder's files as `GET /api/workspaces/{id}/files` lists them.
+    pub fn replace_folder_files(&mut self, workspace_id: &str, files: Vec<Source>) {
+        self.folder_files.insert(
+            workspace_id.to_string(),
+            files.into_iter().map(|s| (s.id.clone(), s)).collect(),
+        );
+    }
+
+    /// A folder's files, by path.
+    pub fn folder_files_in(&self, workspace_id: &str) -> Option<Vec<&Source>> {
+        let files = self.folder_files.get(workspace_id)?;
+        let mut list: Vec<&Source> = files.values().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        Some(list)
+    }
+
+    /// Folders in the order the screens list them: this device's first, then by device
+    /// name and folder name.
+    pub fn workspaces_in_order(&self, my_device: Option<&str>) -> Vec<&Workspace> {
+        let mut list: Vec<&Workspace> = self.workspaces.values().collect();
+        list.sort_by(|a, b| {
+            let mine = |w: &Workspace| Some(w.device_id.as_str()) != my_device;
+            mine(a)
+                .cmp(&mine(b))
+                .then(a.device_name.cmp(&b.device_name))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then(a.id.cmp(&b.id))
+        });
+        list
+    }
+
+    /// Chats that have a folder attached.
+    pub fn chats_with_workspace(&self, workspace_id: &str) -> usize {
+        self.chats
+            .values()
+            .filter(|c| c.workspace_ids.iter().any(|w| w == workspace_id))
+            .count()
     }
 
     /// Devices as `GET /api/devices` lists them (this device marked `current`), over any
@@ -1263,6 +1326,60 @@ pub(crate) mod tests {
         );
         s.apply(Event::DeviceDeleted { id: "d1".into() });
         assert!(s.devices.is_empty() && s.workspaces.is_empty());
+
+        // Folder files live with their folder, never with the sources.
+        let ws = |id: &str, device: &str, name: &str| Workspace {
+            id: id.into(),
+            name: name.into(),
+            device_id: device.into(),
+            device_name: if device == "d1" {
+                "Mac".into()
+            } else {
+                "iPhone".into()
+            },
+            platform: margin_shared::Platform::Macos,
+            location: format!("~/{name}"),
+            created_at: ts(0),
+            sync: Default::default(),
+        };
+        s.replace_workspaces(vec![
+            ws("w2", "d2", "Photos"),
+            ws("w1", "d1", "notes"),
+            ws("w3", "d1", "Papers"),
+        ]);
+        let order: Vec<&str> = s
+            .workspaces_in_order(Some("d1"))
+            .iter()
+            .map(|w| w.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["w1", "w3", "w2"]);
+        let file = |id: &str, name: &str| Source {
+            workspace_id: Some("w1".into()),
+            ..source(id, None, name, Some("notes"))
+        };
+        // Not loaded: events about its files are ignored.
+        s.apply(Event::SourceChanged {
+            source: file("f1", "a.md"),
+        });
+        assert!(s.folder_files_in("w1").is_none() && !s.sources.contains_key("f1"));
+        s.replace_folder_files("w1", vec![file("f2", "b.pdf")]);
+        s.apply(Event::SourceChanged {
+            source: file("f1", "a.md"),
+        });
+        let names: Vec<&str> = s
+            .folder_files_in("w1")
+            .unwrap()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a.md", "b.pdf"]);
+        assert!(!s.sources.contains_key("f1"));
+        s.apply(Event::SourceDeleted { id: "f2".into() });
+        assert_eq!(s.folder_files_in("w1").unwrap().len(), 1);
+        s.apply(Event::WorkspaceDeleted { id: "w1".into() });
+        assert!(s.folder_files_in("w1").is_none());
+        s.replace_workspaces(vec![]);
+        assert!(s.workspaces.is_empty());
 
         // The service's list replaces what was known: a device revoked meanwhile goes.
         let phone = Device {

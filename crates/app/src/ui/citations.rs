@@ -2,7 +2,7 @@
 //! citation marker or a list entry opens, at the cited page, time, image or passage.
 
 use dioxus::prelude::*;
-use margin_shared::{Citation, Id, SourceKind};
+use margin_shared::{Citation, Id, SourceKind, WorkspaceFile};
 
 use crate::citations::{
     self, Segment, Viewer, kind_label, locator, neighbors, open_label, open_url, position,
@@ -161,11 +161,24 @@ pub fn CitationViewer(
         // What it cites changed under the viewer (a lesson regenerated or deleted).
         return rsx! {};
     };
-    let media_url = lib
-        .sources
-        .get(&c.source_id)
-        .and_then(|s| s.media_url.clone());
-    let source_gone = !lib.sources.contains_key(&c.source_id);
+    // A folder's files aren't among the sources; the folder's list has them once opened.
+    let source = lib.sources.get(&c.source_id).or_else(|| {
+        lib.folder_files
+            .values()
+            .find_map(|files| files.get(&c.source_id))
+    });
+    let media_url = source.and_then(|s| s.media_url.clone());
+    let source_gone = source.is_none() && c.file.is_none();
+    let folder_attached = c
+        .file
+        .as_ref()
+        .is_some_and(|f| lib.workspaces.contains_key(&f.workspace_id));
+    let folder_line = citations::folder_line(
+        &c,
+        c.file
+            .as_ref()
+            .and_then(|f| lib.workspaces.get(&f.workspace_id)),
+    );
     drop(lib);
 
     let lines = app
@@ -212,6 +225,12 @@ pub fn CitationViewer(
                     div { class: "grow",
                         h2 { id: "viewer-title", title: "{c.source_name}", "{c.source_name}" }
                         small { "{meta}" }
+                        if let Some(line) = folder_line {
+                            small { class: "viewer-folder",
+                                Icon { name: "folder" }
+                                "{line}"
+                            }
+                        }
                     }
                     if let Some(url) = open {
                         button {
@@ -241,6 +260,10 @@ pub fn CitationViewer(
                         view,
                         name: c.source_name.clone(),
                         source_gone,
+                        source_id: c.source_id.clone(),
+                        excerpt: c.excerpt.trim().to_string(),
+                        file: c.file.clone(),
+                        folder_attached,
                         on_media_error: move |_| refresh_media(app, retried),
                     }
                 }
@@ -268,13 +291,66 @@ pub fn CitationViewer(
     }
 }
 
+/// Whether a folder file is still among its folder's files on the service (a 404 for
+/// the folder means it was removed). Unsure (offline) counts as there.
+async fn folder_file_present(app: AppCtx, file: &WorkspaceFile, source_id: &str) -> bool {
+    let Some(api) = app.api() else { return true };
+    match api.workspace_files(&file.workspace_id).await {
+        Ok(files) => {
+            let present = files.iter().any(|f| f.id == source_id);
+            let mut lib = app.lib;
+            lib.write().replace_folder_files(&file.workspace_id, files);
+            present
+        }
+        Err(e) if e.status == Some(404) => false,
+        Err(_) => true,
+    }
+}
+
 #[component]
 fn ViewerContent(
     view: Viewer,
     name: String,
     source_gone: bool,
+    source_id: Id,
+    excerpt: String,
+    /// Set for a file of an attached folder.
+    file: Option<WorkspaceFile>,
+    /// Its folder is still attached (a removed folder's files are gone from the service).
+    folder_attached: bool,
     on_media_error: EventHandler<()>,
 ) -> Element {
+    let app = use_app();
+    // A folder file's picture stopped loading because the file left the folder (or the
+    // folder was removed): the passage as it was, and why.
+    let mut gone = use_signal(|| file.is_some() && !folder_attached);
+    let on_media_error = EventHandler::new(move |()| match file.clone() {
+        None => on_media_error.call(()),
+        Some(file) => {
+            let source_id = source_id.clone();
+            spawn(async move {
+                if folder_file_present(app, &file, &source_id).await {
+                    // Still there: the signed address expired.
+                    on_media_error.call(());
+                } else {
+                    gone.set(true);
+                }
+            });
+        }
+    });
+    if *gone.read() {
+        return rsx! {
+            div { class: "notice", role: "status",
+                Icon { name: "alert" }
+                div { class: "body", {citations::FOLDER_FILE_GONE} }
+            }
+            if excerpt.is_empty() {
+                p { class: "faint", "There's no passage to show for this citation." }
+            } else {
+                Passage { excerpt, code: false }
+            }
+        };
+    }
     let missing_media = if source_gone {
         "This source was removed from the topic, so only the cited passage is left."
     } else {
@@ -459,5 +535,59 @@ fn Transcript(segments: Vec<Segment>) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fake;
+    use crate::store::LibraryState;
+    use crate::ui::test_render::{Extra, render_with};
+
+    fn shown(n: usize, lib: LibraryState) -> String {
+        let extra = Extra {
+            shown_passage: Some(fake::sample_folder_citations()[n].clone()),
+            ..Default::default()
+        };
+        render_with("/", lib, None, extra)
+    }
+
+    fn lib() -> LibraryState {
+        let mut lib = LibraryState::from_library(fake::sample_library());
+        lib.replace_workspaces(fake::sample_workspaces());
+        lib
+    }
+
+    #[test]
+    fn folder_citations_open_with_where_the_file_is() {
+        // A text passage.
+        let html = shown(0, lib());
+        assert!(html.contains("notes/ch1/intro.md"), "{html}");
+        assert!(html.contains("In “notes” on test-mac · ch1/intro.md"));
+        assert!(html.contains("A Fourier series rebuilds a periodic signal"));
+        // A PDF page: its picture and its text.
+        let html = shown(1, lib());
+        assert!(html.contains("In “notes” on test-mac · paper.pdf"));
+        assert!(html.contains("Page 3"));
+        assert!(html.contains("page-3.png"));
+        assert!(html.contains("Each coefficient is an inner product"));
+        // A picture.
+        let html = shown(2, lib());
+        assert!(html.contains("In “notes” on test-mac · figure.png"));
+        assert!(html.contains(r#"class="viewer-figure""#));
+        assert!(!html.contains(crate::citations::FOLDER_FILE_GONE));
+    }
+
+    #[test]
+    fn a_file_of_a_removed_folder_shows_the_passage_as_it_was() {
+        let html = shown(3, lib());
+        assert!(
+            html.contains("In a folder that is no longer attached · old/gibbs.pdf"),
+            "{html}"
+        );
+        assert!(html.contains(crate::citations::FOLDER_FILE_GONE));
+        assert!(html.contains("The overshoot near a jump stays at about 9%."));
+        // Its picture isn't tried.
+        assert!(!html.contains("page-1.png"));
     }
 }
