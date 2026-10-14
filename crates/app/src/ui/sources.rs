@@ -1,12 +1,13 @@
 //! Sources in the app: adding files and folders (with the platform's picker, see
-//! `crate::picker`), the upload queue, rows with live status, a topic's Sources
-//! dialog, and the notice for the embedding model the service needs to read them.
+//! `crate::picker`), the upload queue, rows with live status, the files attached to a
+//! chat (and those its composer sends next), a topic's Sources dialog, and the notice for
+//! the embedding model the service needs to read them.
 
 use dioxus::prelude::*;
-use margin_shared::{EmbeddingModelState, Event, Id, Source, SourceKind};
+use margin_shared::{ChatPatch, EmbeddingModelState, Event, Id, Source, SourceKind};
 
 use crate::picker;
-use crate::sources::{Tone, Upload, UploadState, human_bytes, status_text};
+use crate::sources::{Destination, Tone, Upload, UploadState, human_bytes, status_text};
 use crate::state::{AppCtx, use_app};
 use crate::store::LibraryState;
 use crate::ui::common::{ConfirmDialog, Icon, js};
@@ -26,9 +27,9 @@ pub fn kind_icon(kind: SourceKind) -> &'static str {
     }
 }
 
-/// Pick files (or a folder), queue them for upload to `topic_id`, and say what was left
-/// out.
-pub async fn add_sources(app: AppCtx, topic_id: Id, folder: bool) -> Option<String> {
+/// Pick files (or a folder), queue them for upload to a topic or a chat's composer, and
+/// say what was left out.
+pub async fn add_sources(app: AppCtx, to: Destination, folder: bool) -> Option<String> {
     let selection = picker::pick(folder).await?;
     let mut note = selection.summary();
     if selection.files.is_empty() && note.is_none() {
@@ -42,7 +43,7 @@ pub async fn add_sources(app: AppCtx, topic_id: Id, folder: bool) -> Option<Stri
         selection
             .files
             .into_iter()
-            .map(|c| Upload::new(c, Some(topic_id.clone()))),
+            .map(|c| Upload::to(c, to.clone())),
     );
     pump(app);
     note
@@ -305,6 +306,292 @@ fn UploadActions(
     }
 }
 
+/// What a chat's composer sends with its next message: the files uploaded in it, and
+/// whether any is still uploading (sending waits for those).
+pub fn composer_files(uploads: &[Upload], chat_id: Option<&str>) -> (Vec<Id>, bool) {
+    let mine = || uploads.iter().filter(|u| u.in_composer(chat_id));
+    let ids = mine().filter_map(|u| u.source_id().cloned()).collect();
+    (ids, mine().any(Upload::pending))
+}
+
+/// The composer's files went with a message: they're the chat's now (`Chat.source_ids`),
+/// listed from the chat from here on.
+pub fn forget_sent(app: AppCtx, chat_id: Option<&str>, sent: &[Id]) {
+    let mut uploads = app.uploads;
+    uploads
+        .write()
+        .retain(|u| !(u.in_composer(chat_id) && u.source_id().is_some_and(|id| sent.contains(id))));
+}
+
+/// The chat composer's "Attach" chip: add files for the next message. Files only; a
+/// folder is attached as a workspace (read in place on the device that holds it), not
+/// uploaded. `above`: the composer is docked at the bottom, so the menu opens upwards.
+#[component]
+pub fn AddSourcesMenu(
+    chat_id: Option<Id>,
+    above: bool,
+    on_note: EventHandler<Option<String>>,
+) -> Element {
+    let app = use_app();
+    let mut open = use_signal(|| false);
+    let mut picking = use_signal(|| false);
+    let add = move |_| {
+        open.set(false);
+        if *picking.peek() {
+            return;
+        }
+        let to = Destination::Chat(chat_id.clone());
+        spawn(async move {
+            picking.set(true);
+            let note = add_sources(app, to, false).await;
+            picking.set(false);
+            on_note.call(note);
+        });
+    };
+    // Placed against the chip (the menu's own CSS is shared with the sidebar's menus).
+    let placement = if above {
+        "bottom: calc(100% + 4px); left: 0"
+    } else {
+        "top: calc(100% + 4px); left: 0"
+    };
+    rsx! {
+        div { style: "position: relative; display: inline-flex",
+            button {
+                class: "chip",
+                "aria-haspopup": "menu",
+                "aria-expanded": open.read().to_string(),
+                title: "Attach files for the answer to draw on",
+                disabled: *picking.read(),
+                onclick: move |_| open.toggle(),
+                if *picking.read() {
+                    span { class: "spinner" }
+                } else {
+                    Icon { name: "clip" }
+                }
+                "Attach"
+            }
+            if *open.read() {
+                div { class: "pop-scrim", onclick: move |_| open.set(false) }
+                div {
+                    class: "menu",
+                    style: placement,
+                    role: "menu",
+                    onkeydown: move |e: KeyboardEvent| if e.key() == Key::Escape { e.stop_propagation(); open.set(false) },
+                    button { role: "menuitem", onmounted: crate::ui::common::focus_on_mount, onclick: add,
+                        Icon { name: "file-add" }
+                        "Add files…"
+                    }
+                    p { class: "menu-note", {crate::sources::chat_files_text()} }
+                }
+            }
+        }
+    }
+}
+
+/// A file attached to a chat, waiting for the owner to confirm removing it.
+#[derive(Clone, PartialEq)]
+struct Detach {
+    source: Source,
+    /// The topic it also belongs to (it stays there), if any.
+    topic: Option<String>,
+}
+
+/// The files of a chat, under its composer: those attached to the chat (`Chat.source_ids`,
+/// each removable), then those the composer sends with the next message (uploading or
+/// uploaded; removing one deletes it). `chat_id` `None`: a new chat's composer.
+#[component]
+pub fn ChatAttachments(chat_id: Option<Id>) -> Element {
+    let app = use_app();
+    let mut error = use_signal(|| None::<String>);
+    let mut confirm = use_signal(|| None::<Detach>);
+    let mut busy = use_signal(|| false);
+
+    let lib = app.lib.read();
+    let attached: Vec<(Source, Option<String>)> = chat_id
+        .as_ref()
+        .and_then(|id| lib.chats.get(id))
+        .map(|chat| {
+            chat.source_ids
+                .iter()
+                .filter_map(|id| lib.sources.get(id))
+                .map(|s| {
+                    let topic = s
+                        .topic_id
+                        .as_ref()
+                        .and_then(|t| lib.topics.get(t))
+                        .map(|t| t.title.clone());
+                    (s.clone(), topic)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let lines: Vec<(Upload, Tone, String)> = app
+        .uploads
+        .read()
+        .iter()
+        .filter(|u| u.in_composer(chat_id.as_deref()))
+        .map(|u| {
+            let (tone, status) = upload_status(u, &lib);
+            (u.clone(), tone, status)
+        })
+        .collect();
+    drop(lib);
+    if attached.is_empty() && lines.is_empty() && error.read().is_none() {
+        return rsx! {};
+    }
+    let n = attached.len();
+    let attached_label = match n {
+        1 => "1 file attached to this chat".to_string(),
+        n => format!("{n} files attached to this chat"),
+    };
+
+    rsx! {
+        div { style: "display: grid; gap: 2px",
+            if !attached.is_empty() {
+                details { class: "collapse",
+                    summary {
+                        Icon { name: "chev", class: "chev" }
+                        Icon { name: "clip" }
+                        "{attached_label}"
+                    }
+                    div { role: "list", "aria-label": "Files attached to this chat",
+                        for (source, topic) in attached {
+                            div { key: "{source.id}", role: "listitem",
+                                AttachedLine {
+                                    source: source.clone(),
+                                    topic: topic.clone(),
+                                    on_error: move |e| error.set(Some(e)),
+                                    on_remove: move |_| confirm.set(Some(Detach { source: source.clone(), topic: topic.clone() })),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                div { role: "list", "aria-label": "Files to send with your message",
+                    for (upload, tone, status) in lines {
+                        div { key: "{upload.key}", role: "listitem",
+                            SourceLine {
+                                kind: upload.kind,
+                                name: upload.name.clone(),
+                                bytes: upload.bytes,
+                                tone,
+                                status,
+                                UploadActions {
+                                    upload: upload.clone(),
+                                    on_error: move |e| error.set(Some(e)),
+                                    on_remove: move |_| {
+                                        let key = upload.key;
+                                        spawn(async move {
+                                            if let Err(e) = remove(app, key).await {
+                                                error.set(Some(e));
+                                            }
+                                        });
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(err) = error.read().clone() {
+                div { class: "notice error", role: "alert",
+                    Icon { name: "alert" }
+                    div { class: "body", "{err}" }
+                    button { class: "icon-btn sm", "aria-label": "Dismiss", onclick: move |_| error.set(None), Icon { name: "x" } }
+                }
+            }
+        }
+        if let (Some(d), Some(chat_id)) = (confirm.read().clone(), chat_id.clone()) {
+            ConfirmDialog {
+                title: format!("Remove “{}” from this chat?", d.source.name),
+                message: match &d.topic {
+                    Some(t) => format!("The agent won't use it in this chat any more. It stays in the topic “{t}”."),
+                    None => "The file and the passages read from it are deleted from the service. This can't be undone.".to_string(),
+                },
+                confirm_label: "Remove",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm.set(None),
+                on_confirm: move |_| {
+                    let chat_id = chat_id.clone();
+                    let source_id = d.source.id.clone();
+                    async move {
+                        busy.set(true);
+                        match detach(app, &chat_id, &source_id).await {
+                            Ok(()) => error.set(None),
+                            Err(e) => error.set(Some(e)),
+                        }
+                        busy.set(false);
+                        confirm.set(None);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Take a file off a chat (`ChatPatch.source_ids` without it). The service deletes it
+/// unless a topic has it too.
+async fn detach(app: AppCtx, chat_id: &str, source_id: &str) -> Result<(), String> {
+    let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+    let Some(ids) = app
+        .lib
+        .peek()
+        .chats
+        .get(chat_id)
+        .map(|c| c.source_ids.clone())
+    else {
+        return Ok(());
+    };
+    let patch = ChatPatch {
+        source_ids: Some(ids.into_iter().filter(|id| id != source_id).collect()),
+        ..Default::default()
+    };
+    let chat = api
+        .patch_chat(chat_id, &patch)
+        .await
+        .map_err(|e| app.failure(&e))?;
+    let mut lib = app.lib;
+    lib.write().upsert_chat(chat);
+    Ok(())
+}
+
+/// A file attached to a chat: its status, Read again when it couldn't be read, and
+/// remove.
+#[component]
+fn AttachedLine(
+    source: Source,
+    topic: Option<String>,
+    on_remove: EventHandler<()>,
+    on_error: EventHandler<String>,
+) -> Element {
+    let (tone, mut status) = status_text(&source.status);
+    if let Some(t) = &topic {
+        status = format!("{status} · in “{t}”");
+    }
+    let label = source.name.clone();
+    rsx! {
+        SourceLine {
+            kind: source.kind,
+            name: label.clone(),
+            bytes: source.bytes,
+            tone,
+            status,
+            if source.status.can_read_again() {
+                ReadAgainButton { id: source.id.clone(), name: label.clone(), on_error }
+            }
+            button {
+                class: "icon-btn sm",
+                "aria-label": "Remove {label} from this chat",
+                title: "Remove from this chat…",
+                onclick: move |_| on_remove.call(()),
+                Icon { name: "x" }
+            }
+        }
+    }
+}
+
 /// Shown while the service's embedding model isn't ready: sources wait for it. Offers the
 /// download (with its progress) and the Sources settings.
 #[component]
@@ -479,7 +766,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
             }
             spawn(async move {
                 picking.set(true);
-                let added = add_sources(app, topic_id, folder).await;
+                let added = add_sources(app, Destination::Topic(topic_id), folder).await;
                 picking.set(false);
                 note.set(added);
             });

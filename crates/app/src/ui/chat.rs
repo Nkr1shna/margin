@@ -1,14 +1,17 @@
 //! Ask: chats with the agent. The transcript (the owner's messages, the answer streaming
 //! in as Markdown, reasoning summaries, tool calls with their output loaded on demand,
-//! inline cards, errors) and the composer (send, Stop, Continue or Retry, and the message
-//! waiting for the running answer). The agent runs on the service; every device shows
-//! the same transcript live from its events.
+//! inline cards, errors) and the composer (send with attached files, Stop, Continue or
+//! Retry, the message waiting for the running answer, the wait before a retry, and what
+//! the chat has spent). The agent runs on the service; every device shows the same
+//! transcript live from its events.
 
+use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
 use margin_shared::{
     AcceptProposal, Card, Chat, ChatItem, ChatItemKind, ChatState, ConfirmRequest,
     ConfirmationCard, Decision, Event, Id, ItemStatus, LessonStatus, NewChat, NewMessage,
-    PassagesCard, ProposalStatus, ResultCard, ResultTarget, VideoStatus,
+    PassagesCard, ProposalStatus, ResultCard, ResultTarget, Usage, VideoStatus, Waiting,
+    error_code,
 };
 
 use crate::api::ApiFailure;
@@ -18,11 +21,14 @@ use crate::routes::{Route, chat_title};
 use crate::state::{AppCtx, LoadStatus, use_app};
 use crate::ui::citations::CitationViewer;
 use crate::ui::common::{
-    ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, reveal_topic,
+    ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, reveal_topic, sentence,
 };
-use crate::ui::outline::{OutlineDraft, ProposalView, course_open_id};
+use crate::ui::outline::{OutlineDraft, ProposalView};
 use crate::ui::settings::SettingsPane;
-use crate::ui::sources::kind_icon;
+use crate::ui::sources::{
+    AddSourcesMenu, ChatAttachments, EmbeddingNotice, composer_files, forget_sent, kind_icon,
+    refresh_embedding,
+};
 
 /// The composer's text field, focused by Cmd+N (`ui::shell`).
 pub const PROMPT_ID: &str = "chat-prompt";
@@ -193,6 +199,77 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+/// A token count in a few characters: "940", "4.2k", "18k", "1.3M".
+pub fn tokens_text(n: u64) -> String {
+    match n {
+        n if n < 1000 => n.to_string(),
+        // Halves round up (1 250 → 1.3k).
+        n if n < 10_000 => format!("{:.1}k", (n as f64 / 100.0).round() / 10.0),
+        n if n < 1_000_000 => format!("{}k", (n as f64 / 1000.0).round() as u64),
+        n => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// What the chat has spent, for the footer under the composer, and in full for its
+/// tooltip; `None` before the first model call.
+pub fn usage_text(usage: &Usage) -> Option<(String, String)> {
+    if usage.model_calls == 0 {
+        return None;
+    }
+    let calls = match usage.model_calls {
+        1 => "1 model call".to_string(),
+        n => format!("{n} model calls"),
+    };
+    let short = format!(
+        "{} tokens in · {} out · {calls}",
+        tokens_text(usage.input_tokens),
+        tokens_text(usage.output_tokens)
+    );
+    let full = format!(
+        "This chat so far: {} input tokens ({} from the prompt cache), {} output tokens ({} \
+         of them reasoning), {calls}.",
+        usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens
+    );
+    Some((short, full))
+}
+
+/// When a turn waiting before a retry tries again, as a sentence: "Trying again in 42 s.",
+/// "… in 3 min, at 14:32.", "… at 09:05." (later today) or "… on Oct 15 at 09:05.".
+pub fn retry_when(until: &DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (*until - now).num_seconds();
+    let local = until.with_timezone(&Local);
+    let at = local.format("%H:%M");
+    if secs <= 0 {
+        "Trying again now…".to_string()
+    } else if secs < 90 {
+        format!("Trying again in {secs} s.")
+    } else if secs < 3600 {
+        format!("Trying again in {} min, at {at}.", (secs + 30) / 60)
+    } else if local.date_naive() == now.with_timezone(&Local).date_naive() {
+        format!("Trying again at {at}.")
+    } else {
+        format!("Trying again on {} at {at}.", local.format("%b %-d"))
+    }
+}
+
+/// The Settings pane that fixes an error the turn stopped on (`ChatItemKind::Error.code`):
+/// no API key, or no model.
+pub fn error_fix(code: Option<&str>) -> Option<SettingsPane> {
+    match code {
+        Some(error_code::NO_API_KEY | error_code::NO_MODEL) => Some(SettingsPane::Ai),
+        _ => None,
+    }
+}
+
+/// The id of a confirmation card, which "Answer the question above first" jumps to.
+fn confirm_card_id(item_id: &str) -> String {
+    let id: String = item_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("confirm-{id}")
+}
+
 /// Ask the service for the chat's transcript and merge it into the store (events for it
 /// apply from now on). `Err(true)` when the chat no longer exists.
 async fn fetch_chat(app: AppCtx, id: Id) -> Result<(), (bool, ApiFailure)> {
@@ -243,6 +320,8 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     // Stop, Continue or Retry in flight.
     let mut acting = use_signal(|| false);
     let mut act_error = use_signal(|| None::<ApiFailure>);
+    // What adding files left out ("Skipped 2 files Margin can't read").
+    let mut sources_note = use_signal(|| None::<String>);
 
     // Whether an API key is set, to say so before a message is sent rather than after
     // (SettingsChanged events keep it current).
@@ -305,11 +384,27 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
 
     let busy = chat.as_ref().is_some_and(|c| c.state.is_busy());
     let waiting = chat.as_ref().is_some_and(|c| c.pending.is_some());
+    // The files this composer sends with the next message.
+    let (has_files, uploading) = {
+        let uploads = app.uploads.read();
+        let any = uploads.iter().any(|u| u.in_composer(id.as_deref()));
+        (any, composer_files(&uploads, id.as_deref()).1)
+    };
+    // Files wait for the embedding model: say so when it isn't there (its events keep
+    // it current once fetched).
+    use_effect(use_reactive!(|has_files| {
+        if has_files && app.lib.peek().embedding.is_none() {
+            spawn(async move {
+                let _ = refresh_embedding(app).await;
+            });
+        }
+    }));
     let send = use_callback({
         let id = id.clone();
         move |()| {
             let text = draft.peek().trim().to_string();
-            if text.is_empty() || *sending.peek() || no_key || waiting {
+            let (source_ids, uploading) = composer_files(&app.uploads.peek(), id.as_deref());
+            if text.is_empty() || *sending.peek() || no_key || waiting || uploading {
                 return;
             }
             let id = id.clone();
@@ -319,7 +414,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 send_error.set(None);
                 let message = NewMessage {
                     text,
-                    source_ids: vec![],
+                    source_ids: source_ids.clone(),
                 };
                 let mut lib = app.lib;
                 match id {
@@ -338,6 +433,8 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                                 // more when the chat opens.
                                 l.stale_chats.insert(id.clone());
                                 drop(l);
+                                forget_sent(app, None, &source_ids);
+                                sources_note.set(None);
                                 draft.set(String::new());
                                 draft_rev += 1;
                                 sending.set(false);
@@ -358,6 +455,8 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                                 lib.upsert_chat_item(item);
                             }
                             drop(lib);
+                            forget_sent(app, Some(&id), &source_ids);
+                            sources_note.set(None);
                             draft.set(String::new());
                             draft_rev += 1;
                             let _ = js(&format!("MarginApp.chatToEnd('{LOG_ID}');"));
@@ -414,12 +513,21 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let is_sending = *sending.read();
     let stopping = *acting.read();
     let chat_open = id.is_some();
+    // The turn waits on a question the owner hasn't answered yet.
+    let asked = chat
+        .as_ref()
+        .is_some_and(|c| matches!(c.state, ChatState::WaitingForUser { .. }));
+    let attach_chat = id.clone();
     let composer = move |placeholder: &'static str| {
-        let can_send = !draft_empty && !is_sending && !no_key && !waiting;
+        let can_send = !draft_empty && !is_sending && !no_key && !waiting && !uploading;
         let send_title = if no_key {
             "Add an API key in Settings to ask"
         } else if waiting {
             "A message is already waiting for this answer to finish"
+        } else if uploading {
+            "Waiting for the files to upload"
+        } else if asked {
+            "Send once the question above is answered (Enter)"
         } else if busy {
             "Send when the answer finishes (Enter)"
         } else {
@@ -439,7 +547,25 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 stopping,
                 on_send: move |_| send.call(()),
                 on_stop: move |_| act.call(ChatAction::Stop),
+                AddSourcesMenu {
+                    chat_id: attach_chat.clone(),
+                    above: chat_open,
+                    on_note: move |note| sources_note.set(note),
+                }
             }
+        }
+    };
+    let files = rsx! {
+        ChatAttachments { chat_id: id.clone() }
+        if let Some(note) = sources_note.read().clone() {
+            div { class: "notice", role: "status",
+                Icon { name: "alert" }
+                div { class: "body", "{note}" }
+                button { class: "icon-btn sm", "aria-label": "Dismiss", onclick: move |_| sources_note.set(None), Icon { name: "x" } }
+            }
+        }
+        if has_files {
+            EmbeddingNotice {}
         }
     };
     let notices = rsx! {
@@ -472,13 +598,14 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
 
     // A new chat: the question first, as Ask always was.
     let Some(id) = id else {
-        let show_examples = empty_library && draft_empty;
+        let show_examples = empty_library && draft_empty && !has_files;
         return rsx! {
             TopBar { crumbs: vec!["New chat".to_string()] }
             div { class: "scroll",
                 div { class: "gen",
                     h1 { "What do you want to learn?" }
                     {composer("A topic, a question, or what you already know…")}
+                    {files}
                     if show_examples {
                         div { class: "examples", role: "group", "aria-label": "Example prompts",
                             for example in EXAMPLE_PROMPTS {
@@ -558,9 +685,17 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         }),
         _ => None,
     };
+    // The card of the question the answer waits on, for "Answer the question above first".
+    let asking_card = match &chat.state {
+        ChatState::WaitingForUser { item_id, .. } => Some(confirm_card_id(item_id)),
+        _ => None,
+    };
     let interrupted = matches!(chat.state, ChatState::Interrupted { .. });
     let pending = chat.pending.clone();
     let acting_now = *acting.read();
+    // Waiting before a retry (the model API asked it to slow down, or failed).
+    let retry_wait = chat.waiting.clone().filter(|_| busy);
+    let usage = usage_text(&chat.usage);
 
     rsx! {
         TopBar { crumbs: vec![title] }
@@ -581,7 +716,13 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 for row in rows {
                     ChatRow { key: "{row.key()}", row: row.clone(), chat: chat.clone(), on_retry: move |_| act.call(ChatAction::Continue) }
                 }
-                if running && !streaming {
+                if let Some(w) = retry_wait {
+                    WaitingBanner {
+                        waiting: w,
+                        stopping: acting_now,
+                        on_stop: move |_| act.call(ChatAction::Stop),
+                    }
+                } else if running && !streaming {
                     div { class: "chat-working", role: "status",
                         span { class: "spinner xs" }
                         "Working…"
@@ -623,8 +764,25 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 if let Some(p) = pending {
                     div { class: "pending", role: "status",
                         div { class: "grow",
-                            small { "Will send when the answer finishes" }
+                            small {
+                                "Will send when the answer finishes"
+                                match p.source_ids.len() {
+                                    0 => rsx! {},
+                                    1 => rsx! { " · with 1 file" },
+                                    n => rsx! { " · with {n} files" },
+                                }
+                            }
                             p { "{p.text}" }
+                            if let Some(card) = asking_card.clone() {
+                                button {
+                                    class: "btn btn-ghost btn-sm",
+                                    style: "justify-self: start; margin-left: -10px",
+                                    title: "Go to the question",
+                                    onclick: move |_| focus_first(&format!("#{card} .row-actions button")),
+                                    Icon { name: "up" }
+                                    "Answer the question above first"
+                                }
+                            }
                         }
                         button {
                             class: "icon-btn sm",
@@ -636,8 +794,53 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                         }
                     }
                 }
+                {files}
                 {notices}
                 {composer("Ask a follow-up…")}
+                if let Some((short, full)) = usage {
+                    p {
+                        class: "faint",
+                        style: "margin: 0; font-size: 12px; text-align: center",
+                        title: "{full}",
+                        span { class: "sr-only", "{full}" }
+                        span { "aria-hidden": "true", "{short}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The running turn waits before it retries a model call: why, until when (counting
+/// down), and Stop.
+#[component]
+fn WaitingBanner(waiting: Waiting, stopping: bool, on_stop: EventHandler<()>) -> Element {
+    let mut now = use_signal(Utc::now);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            now.set(Utc::now());
+        }
+    });
+    let when = retry_when(&waiting.until, *now.read());
+    rsx! {
+        div { class: "notice", role: "status",
+            Icon { name: "refresh" }
+            div { class: "body",
+                span {
+                    b { class: "notice-title", "Waiting to try again. " }
+                    "{sentence(&waiting.reason)} {when}"
+                }
+                div { class: "row-actions",
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        title: "Stop the answer",
+                        disabled: stopping,
+                        onclick: move |_| on_stop.call(()),
+                        if stopping { span { class: "spinner" } } else { Icon { name: "stop" } }
+                        "Stop"
+                    }
+                }
             }
         }
     }
@@ -651,8 +854,8 @@ enum ChatAction {
     DropPending,
 }
 
-/// The message field with Send, and Stop while an answer runs. Enter sends, Shift+Enter
-/// starts a new line.
+/// The message field with Send, and Stop while an answer runs; `children` go first in
+/// its row (the Attach chip). Enter sends, Shift+Enter starts a new line.
 #[component]
 fn Composer(
     draft: Signal<String>,
@@ -669,6 +872,7 @@ fn Composer(
     stopping: bool,
     on_send: EventHandler<()>,
     on_stop: EventHandler<()>,
+    children: Element,
 ) -> Element {
     rsx! {
         div { class: "composer",
@@ -695,6 +899,7 @@ fn Composer(
                 }
             }
             div { class: "composer-row",
+                {children}
                 if busy {
                     button {
                         class: "btn btn-secondary btn-sm stop",
@@ -754,13 +959,15 @@ fn ChatRow(row: Row, chat: Chat, on_retry: EventHandler<()>) -> Element {
             rsx! { p { class: "chat-action", "{text}" } }
         }
         Row::Error { item, retry } => {
-            let ChatItemKind::Error { message, .. } = &item.kind else {
+            let ChatItemKind::Error { message, code, .. } = &item.kind else {
                 return rsx! {};
             };
+            // No key or no model: Settings fixes it (Retry then goes on).
+            let settings_pane = error_fix(code.as_deref());
             if retry {
-                rsx! { ErrorNotice { message: message.clone(), on_retry: move |_| on_retry.call(()) } }
+                rsx! { ErrorNotice { message: message.clone(), settings_pane, on_retry: move |_| on_retry.call(()) } }
             } else {
-                rsx! { ErrorNotice { message: message.clone() } }
+                rsx! { ErrorNotice { message: message.clone(), settings_pane } }
             }
         }
     }
@@ -1082,6 +1289,56 @@ fn PassagesView(item_id: Id, card: PassagesCard) -> Element {
     }
 }
 
+/// What a lesson a tool wrote (or is writing) is doing, for its result card.
+pub fn lesson_result_state(status: &LessonStatus) -> &'static str {
+    match status {
+        LessonStatus::Queued => "Waiting to be written",
+        LessonStatus::Generating => "Writing…",
+        LessonStatus::Ready => "Ready",
+        LessonStatus::Failed { .. } => "Couldn't be written",
+    }
+}
+
+/// Where a lesson's video stands, for a video result card: each stage of the pipeline as
+/// the lesson's Video view says it.
+pub fn video_result_state(status: Option<&VideoStatus>) -> String {
+    match status {
+        None => "No video yet".to_string(),
+        Some(VideoStatus::Queued) => "Waiting to render".to_string(),
+        Some(VideoStatus::Scripting) => "Writing the scene…".to_string(),
+        Some(VideoStatus::Voicing { done, total }) => format!("Voicing {done} of {total}…"),
+        Some(VideoStatus::Rendering { progress: Some(p) }) => {
+            format!("Rendering {:.0}%…", p * 100.0)
+        }
+        Some(VideoStatus::Rendering { progress: None }) => "Rendering…".to_string(),
+        Some(VideoStatus::Ready) => "Ready".to_string(),
+        // The lesson's Video view has the error and its log.
+        Some(VideoStatus::Failed { .. }) => "Failed".to_string(),
+    }
+}
+
+/// The status dot of a result card whose target does work in the background (lessons
+/// and videos); `None` for topics and notes.
+fn result_tone(target: &ResultTarget, lib: &crate::store::LibraryState) -> Option<&'static str> {
+    match target {
+        ResultTarget::Lesson { lesson_id } => lib.lessons.get(lesson_id).map(|l| match l.status {
+            LessonStatus::Queued => "dot",
+            LessonStatus::Generating => "dot run",
+            LessonStatus::Ready => "dot ok",
+            LessonStatus::Failed { .. } => "dot bad",
+        }),
+        ResultTarget::Video { lesson_id } => {
+            Some(match lib.video_for_lesson(lesson_id).map(|v| &v.status) {
+                None | Some(VideoStatus::Queued) => "dot",
+                Some(VideoStatus::Ready) => "dot ok",
+                Some(VideoStatus::Failed { .. }) => "dot bad",
+                Some(_) => "dot run",
+            })
+        }
+        ResultTarget::Topic { .. } | ResultTarget::Note { .. } => None,
+    }
+}
+
 /// Something a tool made or started, as it is now in the library.
 #[component]
 fn ResultView(card: ResultCard) -> Element {
@@ -1107,15 +1364,7 @@ fn ResultView(card: ResultCard) -> Element {
                 (
                     "Lesson",
                     lesson.map(|l| l.title.clone()),
-                    lesson.map(|l| {
-                        match &l.status {
-                            LessonStatus::Queued => "Waiting to be written",
-                            LessonStatus::Generating => "Writing…",
-                            LessonStatus::Ready => "Ready",
-                            LessonStatus::Failed { .. } => "Couldn't be written",
-                        }
-                        .to_string()
-                    }),
+                    lesson.map(|l| lesson_result_state(&l.status).to_string()),
                     lesson.map(|l| Route::LessonRead { id: l.id.clone() }),
                 )
             }
@@ -1125,16 +1374,7 @@ fn ResultView(card: ResultCard) -> Element {
                 (
                     "Video",
                     lesson.map(|l| l.title.clone()),
-                    lesson.map(|_| {
-                        match video.map(|v| &v.status) {
-                            None => "Not made",
-                            Some(VideoStatus::Queued) => "Waiting to render",
-                            Some(VideoStatus::Ready) => "Ready",
-                            Some(VideoStatus::Failed { .. }) => "Failed",
-                            Some(_) => "Rendering…",
-                        }
-                        .to_string()
-                    }),
+                    lesson.map(|_| video_result_state(video.map(|v| &v.status))),
                     lesson.map(|l| Route::LessonVideo { id: l.id.clone() }),
                 )
             }
@@ -1148,8 +1388,13 @@ fn ResultView(card: ResultCard) -> Element {
                 )
             }
         };
+    // Work under way (a lesson being written, a video being made) shows a pulsing dot;
+    // done, a filled one; failed, a red one.
+    let tone = result_tone(&card.target, &lib);
     drop(lib);
     let exists = title.is_some();
+    // Before the library is here, a missing record isn't known to be deleted.
+    let loaded = *app.lib_status.read() == LoadStatus::Loaded;
     let shown = title.unwrap_or_else(|| card.title.clone());
     let topic_id = match &card.target {
         ResultTarget::Topic { topic_id } if exists => Some(topic_id.clone()),
@@ -1165,12 +1410,19 @@ fn ResultView(card: ResultCard) -> Element {
             } }
             div { class: "grow",
                 b { "{shown}" }
-                small {
-                    "{kind}"
-                    if exists {
-                        if let Some(s) = state { " · {s}" }
-                    } else {
-                        " · Deleted"
+                small { style: "display: flex; align-items: center; gap: 6px",
+                    if let (true, Some(dot)) = (exists, tone) {
+                        span { class: "{dot}", "aria-hidden": "true" }
+                    }
+                    span {
+                        "{kind}"
+                        if exists {
+                            if let Some(s) = state { " · {s}" }
+                        } else if loaded {
+                            " · Deleted"
+                        } else {
+                            " · Loading…"
+                        }
                     }
                 }
             }
@@ -1340,6 +1592,7 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
     };
     rsx! {
         section {
+            id: confirm_card_id(&item.id),
             class: if waiting { "chat-card confirm-card waiting" } else { "chat-card confirm-card" },
             role: "group",
             "aria-label": "{card.title}",
@@ -1390,10 +1643,13 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
 }
 
 /// A proposed course outline: the outline editor with its chips and Create lessons, and
-/// once created (here or on another device), the course with links to it.
+/// once created (here or on another device), the course with links to it. Create
+/// lessons here opens the course's first lesson. A newer outline in the chat leaves
+/// this one inactive.
 #[component]
 fn OutlineView(proposal_id: Id) -> Element {
     let app = use_app();
+    let nav = navigator();
     // Edits not yet created survive a look elsewhere (`AppCtx::outline_drafts`); else the
     // outline as proposed, when it's here and ready.
     let initial = app
@@ -1539,10 +1795,13 @@ fn OutlineView(proposal_id: Id) -> Element {
                                 let mut collapsed = app.collapsed;
                                 collapsed.write().remove(&topic.id);
                                 announce(&format!("Created the course {}.", topic.title));
-                                // The Create lessons button is gone with the editor:
-                                // the focus goes on to the course.
-                                let open = serde_json::to_string(&format!("#{}", course_open_id(&topic.id))).unwrap_or_default();
-                                let _ = js(&format!("MarginApp.focus({open});"));
+                                // Off to the course's first lesson (owner decision); the
+                                // chat keeps the card, now showing the course.
+                                let first = lib.peek().first_lesson_in(&topic.id).map(|l| l.id.clone());
+                                match first {
+                                    Some(id) => nav.push(Route::LessonRead { id }),
+                                    None => nav.push(Route::TopicNotes { topic_id: topic.id.clone() }),
+                                };
                             }
                             // Created on another device meanwhile, or no longer
                             // creatable: show the outline as it is now.
@@ -2126,6 +2385,237 @@ mod tests {
         let html = render_route("/chat/c1", lib);
         assert!(
             html.contains("The course “Control theory” was created, and has since been deleted.")
+        );
+    }
+
+    #[test]
+    fn create_lessons_is_offered_only_on_the_newest_outline() {
+        let html = render_route(
+            "/chat/c1",
+            with_outline_card(ProposalStatus::Superseded { by: "p2".into() }),
+        );
+        assert!(
+            html.contains("A newer outline replaced this one."),
+            "{html}"
+        );
+        // Shown as it was proposed, with nothing to press.
+        assert!(html.contains("Feedback loops"));
+        assert!(!html.contains(">Create lessons<"));
+        assert!(!html.contains(">Edit outline<"));
+    }
+
+    #[test]
+    fn usage_and_its_footer() {
+        assert_eq!(tokens_text(940), "940");
+        assert_eq!(tokens_text(4_210), "4.2k");
+        assert_eq!(tokens_text(18_400), "18k");
+        assert_eq!(tokens_text(1_340_000), "1.3M");
+        assert_eq!(usage_text(&Usage::default()), None);
+        let (short, full) = usage_text(&Usage {
+            input_tokens: 18_400,
+            cached_input_tokens: 12_000,
+            output_tokens: 1_250,
+            reasoning_tokens: 640,
+            model_calls: 1,
+        })
+        .unwrap();
+        assert_eq!(short, "18k tokens in · 1.3k out · 1 model call");
+        assert!(full.contains("12000 from the prompt cache"), "{full}");
+        // The sample chat has spent some; the footer says how much.
+        let html = render_route("/chat/c1", sample());
+        assert!(
+            html.contains("18k tokens in · 1.3k out · 4 model calls"),
+            "{html}"
+        );
+        // A new chat has spent nothing.
+        assert!(!render_route("/", sample()).contains("tokens in"));
+    }
+
+    #[test]
+    fn retries_say_when() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 14, 9, 0, 0).unwrap();
+        let at = |secs: i64| now + chrono::Duration::seconds(secs);
+        assert_eq!(retry_when(&at(-3), now), "Trying again now…");
+        assert_eq!(retry_when(&at(42), now), "Trying again in 42 s.");
+        let local = |t: DateTime<Utc>| t.with_timezone(&Local).format("%H:%M").to_string();
+        assert_eq!(
+            retry_when(&at(180), now),
+            format!("Trying again in 3 min, at {}.", local(at(180)))
+        );
+        let tomorrow = at(2 * 86_400);
+        assert!(retry_when(&tomorrow, now).starts_with("Trying again on "));
+    }
+
+    #[test]
+    fn a_turn_waiting_to_retry_says_why_and_offers_stop() {
+        let mut lib = sample();
+        let chat = lib.chats.get_mut("c1").unwrap();
+        chat.state = ChatState::Running {
+            turn_id: "t9".into(),
+            device_id: "d1".into(),
+            started_at: Utc::now(),
+        };
+        chat.waiting = Some(Waiting {
+            until: Utc::now() + chrono::Duration::seconds(30),
+            reason: "The model API asked Margin to slow down.".into(),
+        });
+        let html = render_route("/chat/c1", lib.clone());
+        assert!(html.contains("Waiting to try again."), "{html}");
+        assert!(html.contains("The model API asked Margin to slow down."));
+        assert!(html.contains("Trying again in "));
+        assert!(!html.contains("Working…"));
+        // Its own Stop, and the composer's.
+        assert_eq!(html.matches(">Stop<").count(), 2, "{html}");
+        // An idle chat isn't waiting, whatever a stale copy says.
+        lib.chats.get_mut("c1").unwrap().state = ChatState::Idle;
+        assert!(!render_route("/chat/c1", lib).contains("Waiting to try again."));
+    }
+
+    #[test]
+    fn missing_key_or_model_errors_open_settings() {
+        assert_eq!(error_fix(Some("no_api_key")), Some(SettingsPane::Ai));
+        assert_eq!(error_fix(Some("no_model")), Some(SettingsPane::Ai));
+        assert_eq!(error_fix(Some("rate_limited")), None);
+        assert_eq!(error_fix(None), None);
+        let mut lib = sample();
+        lib.chats.get_mut("c1").unwrap().state = ChatState::Failed {
+            turn_id: "t2".into(),
+            error: "No model".into(),
+        };
+        let mut failure = error("e9", 30, true);
+        failure.turn_id = "t2".into();
+        failure.kind = ChatItemKind::Error {
+            message: "Choose a model in Settings first.".into(),
+            retryable: true,
+            code: Some("no_model".into()),
+        };
+        lib.chat_items.get_mut("c1").unwrap().push(failure);
+        let html = render_route("/chat/c1", lib);
+        assert!(html.contains("Choose a model in Settings first."));
+        assert!(html.contains("Open Settings"), "{html}");
+        assert!(html.contains("Try again"));
+    }
+
+    #[test]
+    fn a_message_waiting_on_a_question_points_at_it() {
+        let mut lib = sample();
+        lib.chat_items
+            .get_mut("c1")
+            .unwrap()
+            .push(confirmation("q", 70, Decision::Pending));
+        let chat = lib.chats.get_mut("c1").unwrap();
+        chat.state = ChatState::WaitingForUser {
+            turn_id: "t1".into(),
+            device_id: "d1".into(),
+            item_id: "q".into(),
+        };
+        chat.pending = Some(margin_shared::PendingMessage {
+            text: "Then summarise it".into(),
+            source_ids: vec!["s1".into(), "s2".into()],
+            device_id: "d1".into(),
+            created_at: Utc::now(),
+        });
+        let html = render_route("/chat/c1", lib.clone());
+        assert!(html.contains("Answer the question above first"), "{html}");
+        assert!(html.contains("Will send when the answer finishes · with 2 files"));
+        assert!(html.contains(r#"id="confirm-q""#));
+        // Without a pending message, Send says the message waits for the answer too.
+        lib.chats.get_mut("c1").unwrap().pending = None;
+        let html = render_route("/chat/c1", lib);
+        assert!(!html.contains("Answer the question above first"));
+        assert!(html.contains("Send once the question above is answered (Enter)"));
+    }
+
+    #[test]
+    fn the_composer_attaches_files_and_lists_the_chats() {
+        let mut lib = sample();
+        // A file attached to the chat, still being read.
+        lib.sources.insert(
+            "s-chat".into(),
+            margin_shared::Source {
+                id: "s-chat".into(),
+                topic_id: None,
+                name: "gibbs.pdf".into(),
+                folder: None,
+                kind: margin_shared::SourceKind::Pdf,
+                bytes: 2_048,
+                status: margin_shared::SourceStatus::Processing { done: 1, total: 4 },
+                created_at: Utc::now(),
+                media_url: None,
+            },
+        );
+        lib.chats.get_mut("c1").unwrap().source_ids = vec!["s-chat".into(), "gone".into()];
+        let html = render_route("/chat/c1", lib);
+        assert!(html.contains(">Attach<"), "{html}");
+        assert!(html.contains(r#"aria-haspopup="menu""#));
+        // Only files that are still there are listed.
+        assert!(html.contains("1 file attached to this chat"), "{html}");
+        assert!(html.contains("gibbs.pdf"));
+        assert!(html.contains("Processing 1/4"));
+        assert!(html.contains(r#"aria-label="Remove gibbs.pdf from this chat""#));
+        // A new chat's composer can attach files too.
+        assert!(render_route("/", sample()).contains(">Attach<"));
+    }
+
+    #[test]
+    fn lesson_and_video_cards_follow_their_jobs() {
+        let mut lib = sample();
+        lib.lessons.get_mut("l1").unwrap().status = LessonStatus::Generating;
+        lib.upsert_video(margin_shared::Video {
+            id: "v9".into(),
+            lesson_id: "l1".into(),
+            status: VideoStatus::Voicing { done: 1, total: 3 },
+            scene_code: None,
+            log: String::new(),
+            duration_seconds: None,
+            media: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let items = lib.chat_items.get_mut("c1").unwrap();
+        for (id, seq, target) in [
+            (
+                "k-lesson",
+                80,
+                ResultTarget::Lesson {
+                    lesson_id: "l1".into(),
+                },
+            ),
+            (
+                "k-video",
+                81,
+                ResultTarget::Video {
+                    lesson_id: "l1".into(),
+                },
+            ),
+        ] {
+            items.push(item(
+                id,
+                seq,
+                ItemStatus::Done,
+                ChatItemKind::Card {
+                    call_id: format!("call_{id}"),
+                    card: Card::Result(ResultCard {
+                        target,
+                        title: "Why sums of sines?".into(),
+                    }),
+                },
+            ));
+        }
+        let html = render_route("/chat/c1", lib);
+        assert!(html.contains("Lesson · Writing…"), "{html}");
+        assert!(html.contains("Video · Voicing 1 of 3…"));
+        assert!(html.contains(r#"class="dot run""#));
+        assert_eq!(video_result_state(None), "No video yet");
+        assert_eq!(
+            video_result_state(Some(&VideoStatus::Rendering {
+                progress: Some(0.42)
+            })),
+            "Rendering 42%…"
+        );
+        assert_eq!(
+            lesson_result_state(&LessonStatus::Queued),
+            "Waiting to be written"
         );
     }
 

@@ -350,13 +350,27 @@ fn walk<T: Tree>(tree: &T, dir: &T::Node, prefix: &str, selection: &mut Selectio
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
+/// Where added files go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// A topic's sources (its Sources dialog).
+    Topic(Id),
+    /// The files a chat's composer sends with its next message: that chat's composer, or
+    /// a new chat's (`None`). They belong to no topic; the message attaches them to the
+    /// chat.
+    Chat(Option<Id>),
+}
+
 /// A file on its way to the service.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Upload {
     /// Local identity, unique in this run of the app.
     pub key: u64,
-    /// The topic it's added to; `None` for a file not attached to one.
+    /// The topic it's added to; `None` for a file added in a chat's composer.
     pub topic_id: Option<Id>,
+    /// For a file added in a chat's composer: the chat (`None` for a new chat's composer,
+    /// and for a topic's file).
+    pub chat_id: Option<Id>,
     pub path: PathBuf,
     pub name: String,
     pub folder: Option<String>,
@@ -377,10 +391,23 @@ pub enum UploadState {
 }
 
 impl Upload {
+    /// A file for topic `topic_id`, or (`None`) for a new chat's composer.
     pub fn new(candidate: Candidate, topic_id: Option<Id>) -> Self {
+        Self::to(
+            candidate,
+            topic_id.map_or(Destination::Chat(None), Destination::Topic),
+        )
+    }
+
+    pub fn to(candidate: Candidate, to: Destination) -> Self {
+        let (topic_id, chat_id) = match to {
+            Destination::Topic(id) => (Some(id), None),
+            Destination::Chat(chat) => (None, chat),
+        };
         Self {
             key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
             topic_id,
+            chat_id,
             path: candidate.path,
             name: candidate.name,
             folder: candidate.folder,
@@ -388,6 +415,19 @@ impl Upload {
             bytes: candidate.bytes,
             sent: 0,
             state: UploadState::Waiting,
+        }
+    }
+
+    /// Whether it was added in the composer of chat `chat_id` (`None`: a new chat's).
+    pub fn in_composer(&self, chat_id: Option<&str>) -> bool {
+        self.topic_id.is_none() && self.chat_id.as_deref() == chat_id
+    }
+
+    /// The source it became, once uploaded.
+    pub fn source_id(&self) -> Option<&Id> {
+        match &self.state {
+            UploadState::Done(source) => Some(&source.id),
+            _ => None,
         }
     }
 
@@ -467,6 +507,16 @@ pub fn status_text(status: &SourceStatus) -> (Tone, String) {
 pub fn kinds_text() -> String {
     format!(
         "Add {} files, or a whole folder. {}",
+        margin_shared::SOURCE_KINDS,
+        routes::source_limits_text()
+    )
+}
+
+/// What can be attached to a chat (files only: a folder is attached as a workspace, read
+/// in place), and how big it can be: said by the chat composer's Files menu.
+pub fn chat_files_text() -> String {
+    format!(
+        "Attach {} files for the answer to draw on. {}",
         margin_shared::SOURCE_KINDS,
         routes::source_limits_text()
     )
@@ -774,6 +824,33 @@ mod tests {
             "Add text, code, PDFs, images, audio and video files, or a whole folder. \
              Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
+        assert_eq!(
+            chat_files_text(),
+            "Attach text, code, PDFs, images, audio and video files for the answer to draw \
+             on. Audio and video files can be up to 500 MB each; other files up to 50 MB."
+        );
+    }
+
+    #[test]
+    fn uploads_know_whose_composer_they_are_in() {
+        let candidate = || Candidate {
+            path: PathBuf::from("/tmp/a.md"),
+            name: "a.md".into(),
+            folder: None,
+            kind: SourceKind::Text,
+            bytes: 3,
+        };
+        let topic = Upload::new(candidate(), Some("t1".into()));
+        assert_eq!(topic.topic_id.as_deref(), Some("t1"));
+        assert!(!topic.in_composer(None));
+        let new_chat = Upload::new(candidate(), None);
+        assert!(new_chat.in_composer(None));
+        assert!(!new_chat.in_composer(Some("c1")));
+        let chat = Upload::to(candidate(), Destination::Chat(Some("c1".into())));
+        assert!(chat.in_composer(Some("c1")));
+        assert!(!chat.in_composer(None));
+        assert_ne!(chat.key, new_chat.key);
+        assert_eq!(chat.source_id(), None);
     }
 
     #[test]
