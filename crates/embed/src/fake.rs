@@ -375,7 +375,7 @@ impl Recording {
 
 /// Wraps a real embedder and records every answer it gives (vectors and token counts),
 /// for `margin-eval record-embeddings`: run the chunker and the golden queries through a
-/// `Recorder` around the Core ML embedder, then `recording().save(..)`.
+/// `Recorder` around the ONNX embedder, then `recording().save(..)`.
 pub struct Recorder<E: Embedder> {
     inner: E,
     recording: std::sync::Mutex<Recording>,
@@ -635,10 +635,8 @@ mod tests {
         values.extend((0..2_000).map(|i| 1.0 + i as f32 * 2f32.powi(-11) / 2.0));
         for x in values {
             let ours = f32_to_f16(x);
-            #[cfg(target_os = "macos")]
             assert_eq!(ours, half::f16::from_f32(x).to_bits(), "{x}");
             let back = f16_to_f32(ours);
-            #[cfg(target_os = "macos")]
             assert_eq!(
                 back.to_bits(),
                 half::f16::from_bits(ours).to_f32().to_bits(),
@@ -757,7 +755,10 @@ mod tests {
             onnx.embedder_version()
         );
         assert!(RecordedEmbedder::for_backend(q8.clone(), onnx).is_ok());
-        assert!(RecordedEmbedder::for_backend(q8, crate::Backend::CoreMl).is_err());
+        assert!(
+            RecordedEmbedder::for_backend(q8, crate::Backend::Onnx(crate::OnnxDtype::Fp32))
+                .is_err()
+        );
         let mut merged = Recording::new();
         assert!(merged.merge(old).is_err());
         merged.merge(recording.clone()).unwrap();

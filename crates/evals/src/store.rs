@@ -1,5 +1,5 @@
 //! The runner's own database (§3.4): a SurrealDB file in its own folder
-//! (`~/Library/Application Support/Margin/evals/db` by default, never the service's
+//! (`/var/lib/margin/evals/db` by default, never the service's
 //! database), with `eval_run` records and `eval_result:[run_id, at, item, metric, judge]`
 //! rows: the same time-series id pattern as the service's traces, so a run's results
 //! are one record-range scan.
@@ -14,7 +14,7 @@ pub const EVAL_RUN: &str = "eval_run";
 pub const EVAL_RESULT: &str = "eval_result";
 
 /// The runner's data folder: `MARGIN_EVAL_DATA`, or `evals/` beside the service's
-/// data under Application Support.
+/// data (`/var/lib/margin`).
 pub fn default_data_dir() -> PathBuf {
     match std::env::var_os("MARGIN_EVAL_DATA") {
         Some(p) if !p.is_empty() => PathBuf::from(p),

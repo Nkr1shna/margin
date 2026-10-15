@@ -1,9 +1,9 @@
-//! The local embedding model (EmbeddingGemma 2 on the configured backend: Core ML or
-//! ONNX Runtime, `service.toml`'s `embedder`): `GET/POST/DELETE
-//! /api/embedding`. Never bundled: downloaded from Hugging Face when the owner asks,
-//! loaded on first use, and dropped when deleted. The speech model (Parakeet, where
-//! the service transcribes with one: `POST/DELETE /api/embedding/speech`) is handled the
-//! same way, and the re-index after the embedder changed reports its progress here.
+//! The local embedding model (EmbeddingGemma 2 on ONNX Runtime, in the format
+//! `service.toml`'s `embedder` names): `GET/POST/DELETE /api/embedding`. Never bundled:
+//! downloaded from Hugging Face when the owner asks, loaded on first use, and dropped
+//! when deleted. The speech model (Parakeet: `POST/DELETE /api/embedding/speech`) is
+//! handled the same way, and the re-index after the embedder changed reports its
+//! progress here.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -295,8 +295,8 @@ pub async fn delete_model(State(state): State<AppState>) -> AppResult<Json<Embed
 }
 
 /// Starts downloading the speech model in the background. Asking again while it
-/// downloads, or once it's downloaded, changes nothing. 409 "no_speech_model" where an
-/// installed program transcribes instead.
+/// downloads, or once it's downloaded, changes nothing. 409 "no_speech_model" when the
+/// source tools have no speech model (a test fake).
 pub async fn start_speech_download(
     State(state): State<AppState>,
 ) -> AppResult<Json<EmbeddingModel>> {
@@ -637,7 +637,7 @@ fn no_speech_model(state: &AppState) -> AppResult<()> {
     if state.source_tools.speech_model().is_none() {
         return Err(AppError::conflict(
             "no_speech_model",
-            "This service transcribes with an installed program (Settings → Tools), not a model it downloads.",
+            "This service has no speech model to download.",
         ));
     }
     Ok(())

@@ -1,10 +1,9 @@
 //! Finds the tools the service runs, with the commands that install them when they are
 //! missing (Settings → Tools). Nothing here runs an installer.
 //!
-//! - macOS: `manimgx` (renders videos) and `fluidaudiocli` (narration and transcripts).
-//! - Linux (`docs/plan-linux-service.md` §2.3–2.10): `manimgx`, `margin-tts` (narration),
-//!   `tesseract` (OCR), `ffmpeg`/`ffprobe` (audio and video), `bwrap` (the scene sandbox)
-//!   and the pdfium library (PDF text and pages).
+//! The service runs on Linux (`docs/plan-linux-service.md` §2.3–2.10): `manimgx` (renders
+//! videos), `margin-tts` (narration), `tesseract` (OCR), `ffmpeg`/`ffprobe` (audio and
+//! video), `bwrap` (the scene sandbox) and the pdfium library (PDF text and pages).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,8 +14,7 @@ use crate::bubblewrap::{BWRAP, INSTALL_COMMAND as BWRAP_INSTALL, USERNS_SETUP, f
 use crate::{MARGIN_TTS, MARGIN_TTS_SCRIPT};
 
 pub(crate) const MANIMGX: &str = "manimgx";
-pub(crate) const FLUIDAUDIOCLI: &str = "fluidaudiocli";
-/// Linux tool names, as the Tools rows show them.
+/// Tool names, as the Tools rows show them.
 pub const TESSERACT: &str = "tesseract";
 pub const FFMPEG: &str = "ffmpeg";
 pub const FFPROBE: &str = "ffprobe";
@@ -24,8 +22,6 @@ pub const PDFIUM: &str = "pdfium";
 /// The library file pdfium-render binds.
 pub const PDFIUM_LIBRARY: &str = "libpdfium.so";
 
-/// The FluidAudio release the install commands build.
-const FLUIDAUDIO_TAG: &str = "v0.17.7";
 /// The pdfium-binaries release the install commands fetch (BSD-3-Clause).
 const PDFIUM_RELEASE: &str = "chromium/8100";
 
@@ -42,54 +38,6 @@ pub struct ReaderTools {
 }
 
 pub(crate) async fn detect_tools(readers: Option<ReaderTools>) -> Vec<ToolStatus> {
-    if cfg!(target_os = "macos") {
-        macos_tools().await
-    } else {
-        linux_tools(readers).await
-    }
-}
-
-async fn macos_tools() -> Vec<ToolStatus> {
-    let fluid = find_executable(FLUIDAUDIOCLI);
-    let fluid_install = if fluid.is_some() {
-        Vec::new()
-    } else {
-        let mut cmds = Vec::new();
-        if !command_line_tools_installed().await {
-            cmds.push("xcode-select --install".to_string());
-        }
-        let checkout_exists =
-            home().is_some_and(|h| h.join("Developer/FluidAudio/Package.swift").is_file());
-        if !checkout_exists {
-            cmds.push(format!(
-                "git clone --depth 1 --branch {FLUIDAUDIO_TAG} https://github.com/FluidInference/FluidAudio.git ~/Developer/FluidAudio"
-            ));
-        }
-        cmds.push(
-            "cd ~/Developer/FluidAudio && swift build -c release --product fluidaudiocli"
-                .to_string(),
-        );
-        cmds.push(
-            "mkdir -p ~/.local/bin && cp ~/Developer/FluidAudio/.build/release/fluidaudiocli ~/.local/bin/".to_string(),
-        );
-        cmds
-    };
-
-    vec![
-        manimgx_row().await,
-        ToolStatus {
-            name: FLUIDAUDIOCLI.to_string(),
-            found: fluid.is_some(),
-            path: fluid.map(|p| p.display().to_string()),
-            // fluidaudiocli has no version flag (FluidAudioCLI.swift handles only
-            // commands and help), so the version is unknown.
-            version: None,
-            install_commands: fluid_install,
-        },
-    ]
-}
-
-async fn linux_tools(readers: Option<ReaderTools>) -> Vec<ToolStatus> {
     let uv = find_executable("uv").is_some();
     let tts = find_executable(MARGIN_TTS);
     let readers = readers.unwrap_or_else(|| ReaderTools {
@@ -162,7 +110,7 @@ fn margin_tts_script() -> Option<&'static str> {
     Some(MARGIN_TTS_SCRIPT)
 }
 
-/// The narration voice on Linux (Kyutai's pocket-tts behind `margin-tts`, §2.7): a uv
+/// The narration voice (Kyutai's pocket-tts behind `margin-tts`, §2.7): a uv
 /// script (its `#!/usr/bin/env -S uv run` line fetches pocket-tts on first use) written
 /// to `~/.local/bin/margin-tts`.
 pub(crate) fn margin_tts_row(
@@ -315,8 +263,8 @@ fn home() -> Option<PathBuf> {
 }
 
 /// The directories searched: `$PATH`, then `~/.local/bin` (where `uv tool install` and
-/// the FluidAudio install commands put their tools, and which a service started by
-/// launchd or systemd usually lacks on its PATH).
+/// the `margin-tts` install commands put their tools, and which a service started by
+/// systemd usually lacks on its PATH).
 fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -381,18 +329,6 @@ fn parse_version(stdout: &str, name: &str) -> Option<String> {
         version.split_whitespace().next().unwrap_or("")
     };
     (!version.is_empty()).then(|| version.to_string())
-}
-
-/// Whether Apple's command line tools (needed by `swift build`) are installed.
-async fn command_line_tools_installed() -> bool {
-    let run = tokio::process::Command::new("/usr/bin/xcode-select")
-        .arg("-p")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .status();
-    matches!(tokio::time::timeout(Duration::from_secs(10), run).await, Ok(Ok(s)) if s.success())
 }
 
 #[cfg(test)]
@@ -496,19 +432,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn this_os_lists_its_tools() {
+    async fn every_tool_is_listed() {
         let names: Vec<String> = detect_tools(None)
             .await
             .into_iter()
             .map(|t| t.name)
             .collect();
-        if cfg!(target_os = "macos") {
-            assert_eq!(names, [MANIMGX, FLUIDAUDIOCLI]);
-        } else {
-            assert_eq!(
-                names,
-                [MANIMGX, MARGIN_TTS, TESSERACT, FFMPEG, BWRAP, PDFIUM]
-            );
-        }
+        assert_eq!(
+            names,
+            [MANIMGX, MARGIN_TTS, TESSERACT, FFMPEG, BWRAP, PDFIUM]
+        );
     }
 }

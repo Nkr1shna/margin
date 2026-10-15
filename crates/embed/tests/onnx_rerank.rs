@@ -9,9 +9,7 @@
 //! `docs/plan-linux-service.md` §3; `bge-reranker-base` needs ~1.3 GB and is reported,
 //! not failed: it is an opt-in variant) and the milliseconds per pair, printed into the
 //! test log. Run with
-//! `MARGIN_REAL_MODEL=1 cargo test -p margin-embed --features onnx --test onnx_rerank --
-//! --nocapture` (no `--features` on Linux).
-#![cfg(any(target_os = "linux", feature = "onnx"))]
+//! `MARGIN_REAL_MODEL=1 cargo test -p margin-embed --test onnx_rerank -- --nocapture`.
 
 use std::path::PathBuf;
 use std::time::Instant;

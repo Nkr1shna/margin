@@ -1,10 +1,9 @@
 //! The real things the opt-in runner uses, and only the runner: the OpenAI Responses
 //! and Claude Messages clients with the owner's keys from the service's secret store
-//! (the Keychain on a Mac, the secrets file on Linux), the real embedder of either
-//! backend (Core ML on a Mac, ONNX Runtime on Linux or a Mac built with `onnx`), and the
-//! platform's readers (PDFKit/Vision on a Mac, pdfium/tesseract on Linux). Nothing here
-//! runs in tests or CI: [`guard`] refuses when `CI` (or `MARGIN_EVAL_NO_LIVE`) is set,
-//! and every test drives these clients against local fakes, never a provider.
+//! (its secrets file), the real embedder (ONNX Runtime), and the readers
+//! (pdfium/tesseract). Nothing here runs in tests or CI: [`guard`] refuses when `CI` (or
+//! `MARGIN_EVAL_NO_LIVE`) is set, and every test drives these clients against local
+//! fakes, never a provider.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,9 +25,8 @@ pub const ANTHROPIC_KEY: &str = margin_service::secrets::ANTHROPIC_API_KEY;
 
 /// Picks the embedding backend for a run: `MARGIN_EVAL_EMBEDDER` when set; else the
 /// variant's `embedder` stage when the command runs one (`variant_embedder`); else the
-/// service config's `embedder`. An unknown name, a stage that isn't a backend
-/// (`recorded`, `fake`) or a backend this build can't run is an error that says what to
-/// use instead.
+/// service config's `embedder`. An unknown name or a stage that isn't a backend
+/// (`recorded`, `fake`) is an error that says where it came from.
 pub fn live_backend(
     env: &dyn Fn(&str) -> Option<String>,
     variant_embedder: Option<&str>,
@@ -44,19 +42,12 @@ pub fn live_backend(
             ),
         },
     };
-    let backend: Backend = name
-        .parse()
-        .with_context(|| format!("{from} doesn't name an embedding backend"))?;
-    anyhow::ensure!(
-        backend.is_built(),
-        "{from} is {backend}, which this build of margin-eval can't run (here: {}; build \
-         with `--features margin-embed/onnx` for the ONNX backends on macOS)",
-        Backend::default()
-    );
-    Ok(backend)
+    name.parse()
+        .with_context(|| format!("{from} doesn't name an embedding backend"))
 }
 
-/// The service's config, or its defaults when there is none (a Mac that only runs evals).
+/// The service's config, or its defaults when there is none (a machine that only runs
+/// evals).
 pub fn service_config() -> anyhow::Result<margin_service::config::Config> {
     let path = margin_service::config::config_path();
     if path.exists() {
@@ -73,44 +64,32 @@ pub fn secret_store(
     config.secret_store()
 }
 
-/// The readers `extract_corpus` uses on this OS, as the extraction records them.
+/// The readers `extract_corpus` uses, as the extraction records them.
+pub const READER: &str = "pdfium+tesseract";
+
+/// The readers `extract_corpus` uses (`READER`).
 pub fn reader_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "pdfkit+vision"
-    } else {
-        "pdfium+tesseract"
-    }
+    READER
 }
 
-/// Where the corpus as `reader` read it lives under `evals/`: the Mac readers' at the
-/// original `recorded/extracted.json` (`EXTRACTED_FILE`), others' beside it
-/// (`recorded/extracted-pdfium+tesseract.json`): another OCR engine cuts other chunks.
+/// Where the corpus as `reader` read it lives under `evals/`: the service's readers'
+/// (`READER`) at `recorded/extracted.json` (`EXTRACTED_FILE`), any other's beside it
+/// (`recorded/extracted-{reader}.json`): another OCR engine cuts other chunks.
 pub fn extraction_file(reader: &str) -> PathBuf {
-    if reader == "pdfkit+vision" {
+    if reader == READER {
         PathBuf::from(crate::corpus::EXTRACTED_FILE)
     } else {
         PathBuf::from(format!("recorded/extracted-{reader}.json"))
     }
 }
 
-/// The OS the run is on, for the extraction's record: `macOS 26.1` or the Linux
-/// distribution's name (`Ubuntu 24.04.3 LTS`).
+/// The OS the run is on, for the extraction's record: the Linux distribution's name
+/// (`Ubuntu 24.04.3 LTS`), else the OS's.
 pub fn os_version() -> String {
-    if cfg!(target_os = "macos") {
-        let v = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "?".into());
-        format!("macOS {v}")
-    } else {
-        std::fs::read_to_string("/etc/os-release")
-            .ok()
-            .and_then(|t| os_release_name(&t))
-            .unwrap_or_else(|| std::env::consts::OS.to_string())
-    }
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|t| os_release_name(&t))
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
 /// `PRETTY_NAME` (else `NAME` and `VERSION_ID`) from `/etc/os-release`.
@@ -131,17 +110,19 @@ pub fn os_release_name(text: &str) -> Option<String> {
     })
 }
 
-/// Where a backend's recorded vectors live under `evals/`: Core ML's at the original
-/// `recorded/embeddings.bin` (`EMBEDDINGS_FILE`), every other backend's beside it,
-/// named by its version (`recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin`),
-/// so recording one never overwrites another.
+/// Where a backend's recorded vectors live under `evals/`: the default backend's (ONNX
+/// 8-bit, the baseline) at `recorded/embeddings.bin` (`EMBEDDINGS_FILE`), every other
+/// backend's beside it, named by its version
+/// (`recorded/embeddings-embeddinggemma-2-onnx-fp32+title-prefix-v1.bin`), so recording
+/// one never overwrites another.
 pub fn recording_file(backend: Backend) -> PathBuf {
-    match backend {
-        Backend::CoreMl => PathBuf::from(crate::recorded::EMBEDDINGS_FILE),
-        b => PathBuf::from(format!(
+    if backend == Backend::default() {
+        PathBuf::from(crate::recorded::EMBEDDINGS_FILE)
+    } else {
+        PathBuf::from(format!(
             "recorded/embeddings-{}.bin",
-            b.embedder_version().replace('/', "+")
-        )),
+            backend.embedder_version().replace('/', "+")
+        ))
     }
 }
 
@@ -595,8 +576,8 @@ impl crate::recorded::Vectors for LiveVectors {
     }
 }
 
-/// Reads every PDF and image of the corpus with the real readers (PDFKit and Vision OCR
-/// on a Mac, pdfium and tesseract on Linux), rendering PDF pages under `media`.
+/// Reads every PDF and image of the corpus with the real readers (pdfium and
+/// tesseract), rendering PDF pages under `media`.
 pub fn extract_corpus(
     corpus: &Path,
     docs: &[crate::corpus::CorpusDoc],
@@ -664,32 +645,32 @@ mod tests {
         // The config's, when nothing else says.
         assert_eq!(live_backend(&none, None, here.name()).unwrap(), here);
         // The variant's stage wins over the config.
-        let r = live_backend(&none, Some("onnx-q8"), "coreml");
-        assert_eq!(r.is_ok(), Backend::Onnx(OnnxDtype::Q8).is_built());
+        assert_eq!(
+            live_backend(&none, Some("onnx-fp32"), "onnx-q8").unwrap(),
+            Backend::Onnx(OnnxDtype::Fp32)
+        );
         // The environment wins over both.
         let env = |k: &str| (k == "MARGIN_EVAL_EMBEDDER").then(|| here.name().to_string());
         assert_eq!(live_backend(&env, Some("tf"), "tf").unwrap(), here);
-        // Not a backend, or not built here: said plainly.
-        let err = live_backend(&none, Some("recorded"), "coreml")
+        // Not a backend (Core ML's is gone): said plainly.
+        let err = live_backend(&none, Some("recorded"), "onnx-q8")
             .unwrap_err()
             .to_string();
         assert!(err.contains("variant's [embedder]"), "{err}");
-        for b in Backend::ALL.into_iter().filter(|b| !b.is_built()) {
-            let err = live_backend(&none, None, b.name()).unwrap_err().to_string();
-            assert!(err.contains("can't run"), "{err}");
-        }
+        let err = live_backend(&none, None, "coreml").unwrap_err().to_string();
+        assert!(err.contains("service config's embedder"), "{err}");
     }
 
     #[test]
     fn recordings_and_model_folders_are_per_backend() {
         use margin_embed::OnnxDtype;
         assert_eq!(
-            recording_file(Backend::CoreMl),
+            recording_file(Backend::Onnx(OnnxDtype::Q8)),
             PathBuf::from(crate::recorded::EMBEDDINGS_FILE)
         );
         assert_eq!(
-            recording_file(Backend::Onnx(OnnxDtype::Q8)),
-            PathBuf::from("recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin")
+            recording_file(Backend::Onnx(OnnxDtype::Fp32)),
+            PathBuf::from("recorded/embeddings-embeddinggemma-2-onnx-fp32+title-prefix-v1.bin")
         );
         let c = margin_service::config::Config {
             data_dir: PathBuf::from("/srv/data"),
@@ -701,14 +682,17 @@ mod tests {
             PathBuf::from("/srv/data/models/embeddinggemma-2-onnx-q8")
         );
         let env = |k: &str| (k == "MARGIN_EMBED_MODEL_DIR").then(|| "/m".to_string());
-        assert_eq!(model_dir(&env, &c, Backend::CoreMl), PathBuf::from("/m"));
         assert_eq!(
-            extraction_file("pdfkit+vision"),
-            PathBuf::from(crate::corpus::EXTRACTED_FILE)
+            model_dir(&env, &c, Backend::Onnx(OnnxDtype::Fp16)),
+            PathBuf::from("/m")
         );
         assert_eq!(
             extraction_file("pdfium+tesseract"),
-            PathBuf::from("recorded/extracted-pdfium+tesseract.json")
+            PathBuf::from(crate::corpus::EXTRACTED_FILE)
+        );
+        assert_eq!(
+            extraction_file("other+ocr"),
+            PathBuf::from("recorded/extracted-other+ocr.json")
         );
     }
 
@@ -727,14 +711,7 @@ mod tests {
         );
         assert_eq!(os_release_name(""), None);
         assert!(!os_version().is_empty());
-        assert_eq!(
-            reader_name(),
-            if cfg!(target_os = "macos") {
-                "pdfkit+vision"
-            } else {
-                "pdfium+tesseract"
-            }
-        );
+        assert_eq!(reader_name(), "pdfium+tesseract");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The text path: prompts and tokens as the Core ML embedder makes them (`<bos>`, the
+//! The text path: prompts and tokens as the model card makes them (`<bos>`, the
 //! prefixed text's first `MAX_TOKENS - 2` tokens, `<eos>`), then real batches: inputs
 //! sorted by length, packed up to `batch_tokens` padded tokens per run, right-padded
 //! with mask 0, and handed back in the caller's order.

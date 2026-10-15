@@ -9,7 +9,8 @@ on:
     branches: [dev, release]
     # Only merges that change what the service is built from (margin-service and its
     # workspace dependencies, per `cargo metadata`), or how it is deployed. App-only
-    # merges go to apps.yml alone.
+    # merges go to apps.yml alone. release-snapshot.sh mirrors this list (service_paths):
+    # a dev commit outside it has no smoke-dev status of its own and takes its parent's.
     paths:
       - "crates/service/**"
       - "crates/agent/**"

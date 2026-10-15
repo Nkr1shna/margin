@@ -1,5 +1,5 @@
 //! Recorded embeddings: the real EmbeddingGemma vectors of every corpus chunk, corpus
-//! picture and golden query, recorded once on the service Mac by `margin-eval
+//! picture and golden query, recorded once on the service by `margin-eval
 //! record-embeddings` and replayed in CI so recall@k there is real, not bag of words
 //! (`docs/agent-rag-architecture.md` §3.1).
 //!
@@ -25,12 +25,12 @@ use margin_embed::{Embedder, ImageTokens, Picture, Purpose};
 use crate::corpus::CorpusDoc;
 
 /// The embedder and prompt-prefix version the eval index is built with: EmbeddingGemma
-/// 2 on Core ML with the document title prefix of §2.1 (the baseline recording's; the
-/// ONNX backends have their own, `margin_embed::Backend::embedder_version`).
-/// Stamped on every passage row, eval run and recording; `compare` refuses to compare
-/// runs across versions unless told to.
+/// 2 on the default backend (ONNX 8-bit) with the document title prefix of §2.1 (the
+/// baseline recording's; the other ONNX formats have their own,
+/// `margin_embed::Backend::embedder_version`). Stamped on every passage row, eval run and
+/// recording; `compare` refuses to compare runs across versions unless told to.
 pub fn embedder_version() -> &'static str {
-    margin_embed::embedder_version(margin_embed::Backend::CoreMl)
+    margin_embed::embedder_version(margin_embed::Backend::default())
 }
 
 /// `evals/recorded/embeddings.bin`.
@@ -66,7 +66,7 @@ pub trait Vectors: Send + Sync {
 pub fn load(path: &Path) -> anyhow::Result<Recording> {
     Recording::load(path).with_context(|| {
         format!(
-            "couldn't read {} (run `margin-eval record-embeddings` on the service Mac)",
+            "couldn't read {} (run `margin-eval record-embeddings` on the service)",
             path.display()
         )
     })

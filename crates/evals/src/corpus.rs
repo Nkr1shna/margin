@@ -2,8 +2,8 @@
 //! (the folder tree through the same allow-list devices apply), what was read from
 //! each, and a hash of the whole corpus that keys eval runs.
 //!
-//! What a PDF or an image *reads as* comes from PDFKit and Vision on the owner's Mac,
-//! which neither CI nor another macOS version reproduces byte for byte, so
+//! What a PDF or an image *reads as* comes from pdfium and tesseract on the service,
+//! which CI (without the real tools) doesn't reproduce byte for byte, so
 //! `margin-eval record-embeddings` records the extraction next to the vectors
 //! (`evals/recorded/extracted.json`) and CI replays it. Text documents are read from
 //! the file itself.
@@ -148,7 +148,7 @@ pub struct PictureRef {
 /// The extraction of every PDF and image of the corpus.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Extraction {
-    /// What read them ("pdfkit+vision on macOS 27.2"), or "fixture" for
+    /// What read them ("pdfium+tesseract on Ubuntu 24.04.3 LTS"), or "fixture" for
     /// `Extraction::fixture`.
     pub reader: String,
     pub documents: BTreeMap<String, ExtractedDoc>,
@@ -161,7 +161,7 @@ impl Extraction {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
             format!(
-                "couldn't read {} (run `margin-eval record-embeddings` on the service Mac)",
+                "couldn't read {} (run `margin-eval record-embeddings` on the service)",
                 path.display()
             )
         })?;

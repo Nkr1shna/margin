@@ -61,7 +61,7 @@ impl std::fmt::Debug for Credential {
 }
 
 /// Where and how to call one provider, built by the service per call from Settings and
-/// the Keychain. Its `Debug` prints no credential.
+/// its secrets. Its `Debug` prints no credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub provider: ProviderKind,

@@ -226,7 +226,7 @@ async fn version_reports_the_build_and_environment_without_a_token() {
     assert_eq!(v.sha, margin_service::version::BUILD_SHA);
     assert_eq!(v.version, env!("CARGO_PKG_VERSION"));
     assert!(v.started_at <= chrono::Utc::now());
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "linux") {
         assert!(v.rss_bytes.is_some_and(|b| b > 0));
     }
 }
@@ -914,7 +914,7 @@ async fn settings_switch_the_pipeline_by_name() {
         .json()
         .await
         .unwrap();
-    // The service stamps its own embedder (Core ML on macOS, ONNX elsewhere).
+    // The service stamps its own embedder (ONNX).
     let mut expected = PipelineConfig::default();
     expected.embedder.name = margin_embed::Backend::default().name().into();
     assert_eq!(s.pipeline, expected);
@@ -1433,12 +1433,8 @@ async fn missing_tools_fail_the_video() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
-    // The narration tool this OS installs (`video::voice_tool`).
-    let voice = if cfg!(target_os = "macos") {
-        "fluidaudiocli"
-    } else {
-        "margin-tts"
-    };
+    // The narration tool (`video::voice_tool`).
+    let voice = "margin-tts";
     h.renderer.missing.lock().unwrap().insert(voice.into());
     let (topic, _) = create_lessons(&h, &t, "x", 1, false).await;
     let lesson = wait_lessons_ready(&h, &t, &topic.id).await.remove(0);

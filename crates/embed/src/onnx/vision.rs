@@ -4,8 +4,8 @@
 //!
 //! 1. Decode upright, RGB (alpha dropped), and resize with bicubic filtering to the
 //!    largest aspect-preserving size whose sides are multiples of 48 px (patch 16 ×
-//!    pooling 3) with at most `9 × tokens` patches (`target_size`; the same rule
-//!    `vision.rs` checked against Hugging Face for the Core ML encoder).
+//!    pooling 3) with at most `9 × tokens` patches (`target_size`, checked against
+//!    Hugging Face).
 //! 2. Rescale to [0, 1] (no mean/std normalisation) and cut into 16 × 16 patches, row by
 //!    row, each patch's values in (row, column, channel) order: `pixel_values`
 //!    `[max_patches, 768]`, zero past the real patches.
@@ -20,9 +20,8 @@
 //! `image_features`); a batch axis is added when the graph has one. The real-model test
 //! `real_model_embeds_corpus_pictures_and_speech` (`tests/corpus.rs`) checks them on the real export.
 //!
-//! On Linux (and macOS with `linux-readers`) the picture is decoded with `image` and
-//! resized with Catmull-Rom (bicubic, as PIL's `BICUBIC`); on macOS otherwise with
-//! ImageIO, drawn at the target size by Core Graphics.
+//! The picture is decoded with `image` and resized with Catmull-Rom (bicubic, as PIL's
+//! `BICUBIC`).
 //!
 //! Validation against the Hugging Face processor, as far as it went here (2026-10-14):
 //! the resize rule, the patch order, the (column, row) positions with −1 padding, the
@@ -159,7 +158,6 @@ pub(crate) fn patchify(
 }
 
 /// The picture at `path`, upright, resized for `patches` patches: RGB bytes and the size.
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 pub(crate) fn pixels(path: &Path, patches: usize) -> Result<(Vec<u8>, usize, usize), EmbedError> {
     let image = crate::image_linux::load(path)?;
     let (w, h) = target_size(
@@ -181,31 +179,6 @@ pub(crate) fn pixels(path: &Path, patches: usize) -> Result<(Vec<u8>, usize, usi
         )
     };
     Ok((resized.into_raw(), w, h))
-}
-
-/// The picture at `path`, upright, drawn for `patches` patches by ImageIO.
-#[cfg(all(target_os = "macos", not(feature = "linux-readers")))]
-pub(crate) fn pixels(path: &Path, patches: usize) -> Result<(Vec<u8>, usize, usize), EmbedError> {
-    /// Larger pictures are scaled down while decoding; every budget is far smaller.
-    const DECODE_MAX_SIDE: usize = 4096;
-    let image = crate::image::load(path, Some(DECODE_MAX_SIDE))?;
-    let (width, height) = crate::image::size(&image);
-    let (w, h) = target_size(width, height, patches, PATCH, POOLING)?;
-    let rgba = crate::image::rgba(&image, w, h)?;
-    let rgb = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|p| [p[0], p[1], p[2]])
-        .collect();
-    Ok((rgb, w, h))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", feature = "linux-readers")))]
-pub(crate) fn pixels(_path: &Path, _patches: usize) -> Result<(Vec<u8>, usize, usize), EmbedError> {
-    Err(EmbedError::Extract(
-        "reading images needs macOS or Linux".into(),
-    ))
 }
 
 /// The encoder: patches in, `patches.tokens()` rows of `FEATURE_WIDTH` out (row-major).

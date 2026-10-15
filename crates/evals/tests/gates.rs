@@ -1,6 +1,6 @@
 //! The CI regression gate (`docs/agent-rag-architecture.md` §3.3, §6.4 e2e 7):
 //! `cargo test -p margin-evals`. Recorded fixtures and in-memory SurrealDB with the
-//! service's real indexes only; no model API, no Hugging Face, no Core ML model.
+//! service's real indexes only; no model API, no Hugging Face, no real embedding model.
 
 use margin_evals::Gates;
 use margin_evals::ci::run_gates;
@@ -13,13 +13,13 @@ use margin_evals::runner::{Env, Paths};
 /// The real pipeline over the recorded corpus against the committed baseline (§6.4
 /// e2e 7). Everything it runs is on the branch (`sections-v2`, `hybrid-rrf`/`rrf`/
 /// `mmr-v1`, `pack_budget`, the `lesson-v2` prompts); what is missing are the owner's
-/// recordings, made by hand on the service Mac and committed: `margin-eval
+/// recordings, made by hand on the service and committed: `margin-eval
 /// record-embeddings` (`evals/recorded/{embeddings.bin,extracted.json}`), `margin-eval
 /// record-generations` (`evals/recorded/generations/lesson-v2/…`) and `margin-eval run
 /// --suite retrieval --variant baseline --write-baseline` (`evals/baseline.json`).
 /// Remove the `ignore` in the commit that adds them.
 #[tokio::test]
-#[ignore = "waits for the owner's recorded embeddings and baseline (margin-eval record-embeddings, record-generations, run --write-baseline on the service Mac); see the doc comment"]
+#[ignore = "waits for the owner's recorded embeddings and baseline (margin-eval record-embeddings, record-generations, run --write-baseline on the service); see the doc comment"]
 async fn ci_gates_on_the_recorded_corpus() {
     let evals = evals_dir();
     let vectors = RecordedVectors::open(&evals.join(EMBEDDINGS_FILE)).unwrap();

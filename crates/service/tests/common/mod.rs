@@ -579,13 +579,8 @@ impl Renderer for FakeRenderer {
     fn detect_tools(&self) -> BoxFuture<'_, Vec<ToolStatus>> {
         Box::pin(async move {
             let missing = self.missing.lock().unwrap().clone();
-            // Each OS's narration tool, as Settings → Tools lists it there.
-            let voice = if cfg!(target_os = "macos") {
-                "fluidaudiocli"
-            } else {
-                "margin-tts"
-            };
-            ["manimgx", voice]
+            // The narration tool, as Settings → Tools lists it.
+            ["manimgx", "margin-tts"]
                 .into_iter()
                 .map(|name| {
                     let found = !missing.contains(name);
@@ -688,7 +683,7 @@ pub struct FakeHf {
 }
 
 fn model_path() -> String {
-    format!("/{}/resolve/main/{MODEL_FILE}", margin_embed::REPO)
+    format!("/{}/resolve/main/{MODEL_FILE}", margin_embed::ONNX_REPO)
 }
 
 /// The fake reranker repo's files: what `RerankerModel::files` needs, plus one the
@@ -759,7 +754,6 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
     let reranker = margin_embed::RerankerModel::DEFAULT;
     let hf = Arc::new(FakeHf::default());
     let app = Router::new()
-        .route(&format!("/api/models/{}", margin_embed::REPO), get(size))
         .route(
             &format!("/api/models/{}", margin_embed::ONNX_REPO),
             get(size),
@@ -804,7 +798,7 @@ pub const FAKE_PICTURE: &str = "PICTURE ";
 /// - a "video" has `frame: <what it shows>` lines (frames at 2.5 s, 7.5 s, …, written as
 ///   `frame-{ms}.jpg`) and `say: <words>` lines (its soundtrack);
 /// - chunks are paragraphs, and the transcriber hears the words back (unless
-///   `no_transcriber` is set, as if `fluidaudiocli` weren't installed).
+///   `no_transcriber` is set, as if the speech model weren't downloaded).
 #[derive(Default)]
 pub struct FakeSourceTools {
     pub loads: AtomicU32,
@@ -1103,14 +1097,6 @@ impl SourceTools for FakeSourceTools {
         }))
     }
 
-    fn no_transcriber(&self) -> String {
-        if self.has_speech_model.load(Ordering::SeqCst) {
-            "the speech model isn't downloaded (Settings → Sources downloads it)".into()
-        } else {
-            "fluidaudiocli isn't installed on the service (Settings → Tools shows how to install it)".into()
-        }
-    }
-
     fn speech_model(&self) -> Option<&dyn SpeechModel> {
         self.has_speech_model
             .load(Ordering::SeqCst)
@@ -1247,12 +1233,11 @@ pub struct Setup {
     /// Files to put in the data folder before starting, by path inside it.
     pub files: Vec<(String, Vec<u8>)>,
     /// A downloaded real model: when set, the service reads sources with the real
-    /// `EmbedTools` (Core ML, PDFKit, ImageIO, AVFoundation, fluidaudiocli) and this
-    /// model, linked into its data folder, instead of the fakes.
+    /// `EmbedTools` (ONNX, pdfium, `image`, tesseract, ffmpeg, Parakeet) and this model,
+    /// linked into its data folder, instead of the fakes.
     pub real_model: Option<PathBuf>,
-    /// The embedder backend to configure; `None` = this OS's default (Core ML on macOS,
-    /// ONNX elsewhere). The fake Hugging Face serves the Core ML repo's one-file layout,
-    /// so download tests pin `"coreml"` to run the same on every OS.
+    /// The embedder backend to configure; `None` = the default (ONNX 8-bit). The fake
+    /// Hugging Face serves a one-file model for any backend.
     pub embedder: Option<&'static str>,
 }
 

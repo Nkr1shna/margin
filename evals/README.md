@@ -7,11 +7,11 @@ here, and read the service's trace rows from outside.
 Two ways they run:
 
 - **CI** (`cargo test -p margin-evals`): fakes and recorded fixtures only. No model API,
-  no Hugging Face, no Core ML model, no running service. Gates compare against
+  no Hugging Face, no real embedding model, no running service. Gates compare against
   `baseline.json` with the thresholds in `gates.toml`.
 - **By hand** (`margin-eval`, the opt-in runner): real models with the owner's keys from
-  the service Mac's Keychain, the real EmbeddingGemma embedder, and its own database
-  folder (`~/Library/Application Support/Margin/evals`, or `--data`). It never opens the
+  the service's secrets file, the real EmbeddingGemma embedder (ONNX), and its own database
+  folder (`/var/lib/margin/evals`, or `--data`). It never opens the
   running service's database; it reads cost, latency and cache numbers from the
   service's traces over `GET /api/traces` (or an exported JSONL). It refuses to run when
   `CI` (or `MARGIN_EVAL_NO_LIVE`) is set.
@@ -31,7 +31,7 @@ Two ways they run:
 | `variants/*.toml` | Pipeline configurations, the same shape as `Settings.pipeline`. `baseline` is the shipped default. |
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
 | `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window. The service is `--service-url` (dev; prod is refused). |
-| `recorded/extracted.json` | What PDFKit/Vision read from each PDF and image (CI replays it; another macOS can't reproduce OCR byte for byte). |
+| `recorded/extracted.json` | What pdfium/tesseract read from each PDF and image (CI replays it; OCR isn't reproduced byte for byte elsewhere). |
 | `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
@@ -44,7 +44,7 @@ canary sets (10 trivial questions to reject, 5 serious ones to keep, 20 delibera
 lessons) are R1-ai's, in `margin_ai::evals`; the runner uses them through
 `crates/evals/src/ai_judge.rs`.
 
-## First run on the service Mac (before R1 is called done)
+## First run on the service (before R1 is called done)
 
 ```sh
 cargo run -p margin-evals --bin margin-eval -- record-embeddings

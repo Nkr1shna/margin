@@ -1,8 +1,7 @@
 //! Speech to text in-process with NVIDIA Parakeet TDT 0.6B v3 on ONNX Runtime
-//! (`parakeet-rs`, the same `ort` the ONNX embedder runs on): the Linux sibling of
-//! `transcript.rs`, which runs the same model family through `fluidaudiocli` on the Mac
-//! (`docs/plan-linux-service.md` §2.6). It gives the same `Transcript` (words with their
-//! start and end times), so `Transcript::chunks` and `lines` work unchanged.
+//! (`parakeet-rs`, the same `ort` the ONNX embedder runs on; `docs/plan-linux-service.md`
+//! §2.6). It gives a `Transcript` (`transcript.rs`: words with their start and end
+//! times), which `Transcript::chunks` and `lines` cut up.
 //!
 //! The model is `istupakov/parakeet-tdt-0.6b-v3-onnx` (CC-BY-4.0, NVIDIA's weights
 //! exported to ONNX), pinned to one revision, downloaded to
@@ -970,7 +969,7 @@ mod tests {
 
     /// The real model on real speech: needs `MARGIN_REAL_MODEL_TESTS=1`, a finished
     /// download in `MARGIN_PARAKEET_DIR` (int8), and a speech synthesizer to make the
-    /// audio (`say` on macOS, `espeak-ng` on Linux).
+    /// audio (`espeak-ng`).
     #[test]
     fn real_model_transcribes_speech() {
         if !crate::real_model_tests() {
@@ -985,19 +984,11 @@ mod tests {
         let wav = work.join("speech.wav");
         let text = "Photosynthesis turns light energy into chemical energy. \
                     The Fourier series decomposes a periodic signal into sines and cosines.";
-        let made = if cfg!(target_os = "macos") {
-            std::process::Command::new("say")
-                .args(["--file-format=WAVE", "--data-format=LEI16@16000", "-o"])
-                .arg(&wav)
-                .arg(text)
-                .status()
-        } else {
-            std::process::Command::new("espeak-ng")
-                .arg("-w")
-                .arg(&wav)
-                .arg(text)
-                .status()
-        };
+        let made = std::process::Command::new("espeak-ng")
+            .arg("-w")
+            .arg(&wav)
+            .arg(text)
+            .status();
         if !made.is_ok_and(|s| s.success()) {
             eprintln!("skipping: no speech synthesizer");
             return;

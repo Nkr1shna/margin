@@ -459,7 +459,7 @@ async fn without_a_transcriber_recordings_are_ready_with_a_warning_and_read_agai
             warning: Some(warning),
             ..
         } => {
-            assert!(warning.contains("fluidaudiocli"), "{warning}");
+            assert!(warning.contains("speech model"), "{warning}");
             assert!(warning.contains("wasn't transcribed"), "{warning}");
         }
         other => panic!("expected Ready with a warning, got {other:?}"),
@@ -731,12 +731,13 @@ async fn a_failed_regeneration_keeps_the_old_citations() {
     );
 }
 
-/// The real pipeline, when the model and the test media are on this Mac (see
-/// margin-embed's real-model tests): `MARGIN_EMBED_MODEL_DIR` or
-/// `~/Library/Caches/margin-embed-test/model`, and `MARGIN_EMBED_MEDIA_DIR` or
-/// `~/Library/Caches/margin-embed-test/media`. Transcription needs `fluidaudiocli`.
+/// The real pipeline, when the models and the test media are on this machine (see
+/// margin-embed's real-model tests): the ONNX 8-bit model in `MARGIN_EMBED_MODEL_DIR` or
+/// `~/.cache/margin-embed-test/onnx-q8`, the int8 speech model in `MARGIN_PARAKEET_DIR`,
+/// and the media in `MARGIN_EMBED_MEDIA_DIR` or `~/.cache/margin-embed-test/media`.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_media_end_to_end_when_the_model_is_here() {
+    use margin_embed::transcript_parakeet::{SpeechDtype, SpeechModelFiles};
     if std::env::var("MARGIN_REAL_MODEL_TESTS").map_or(true, |v| v != "1") {
         eprintln!("skipping: real-model tests need MARGIN_REAL_MODEL_TESTS=1");
         return;
@@ -744,23 +745,32 @@ async fn real_media_end_to_end_when_the_model_is_here() {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
     let model = std::env::var_os("MARGIN_EMBED_MODEL_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home.join("Library/Caches/margin-embed-test/model"));
+        .unwrap_or_else(|| home.join(".cache/margin-embed-test/onnx-q8"));
     let media = std::env::var_os("MARGIN_EMBED_MEDIA_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home.join("Library/Caches/margin-embed-test/media"));
+        .unwrap_or_else(|| home.join(".cache/margin-embed-test/media"));
     if !margin_embed::ModelFiles::new(&model).is_complete() || !media.join("lecture.mp4").exists() {
         eprintln!("skipping: no real model or test media");
         return;
     }
-    if margin_embed::find_fluidaudiocli().is_none() {
-        eprintln!("skipping: fluidaudiocli isn't installed");
+    let Some(speech) = std::env::var_os("MARGIN_PARAKEET_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|d| SpeechModelFiles::new(d, SpeechDtype::Int8).is_complete())
+    else {
+        eprintln!("skipping: no speech model in MARGIN_PARAKEET_DIR");
         return;
-    }
+    };
     let h = start_with(Setup {
         real_model: Some(model),
         ..Default::default()
     })
     .await;
+    // The speech model, where the service looks for it (it loads on first use).
+    std::os::unix::fs::symlink(
+        &speech,
+        h.data_dir.join("models").join(SpeechDtype::Int8.dir_name()),
+    )
+    .unwrap();
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
     let read = |name: &str| std::fs::read(media.join(name)).unwrap();
