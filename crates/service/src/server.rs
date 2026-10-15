@@ -133,6 +133,7 @@ impl Service {
             download_http,
             model_files,
             embedder: tokio::sync::Mutex::new(None),
+            embedder_load: tokio::sync::Mutex::new(()),
             model_job: Mutex::new(ModelJob::Idle),
             model_download_bytes: Mutex::new(None),
             speech_job: Mutex::new(ModelJob::Idle),

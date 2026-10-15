@@ -28,6 +28,7 @@ use crate::error::{ApiJson, AppError, AppResult};
 use crate::people::PersonRow;
 use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentPrincipal, Principal, RequireAdmin};
 use crate::state::{AppState, Audience};
+use margin_shared::sync::Locked;
 
 /// Longest group name.
 pub const GROUP_NAME_MAX: usize = 80;
@@ -105,20 +106,19 @@ impl Expansions {
     }
 
     pub fn get(&self, person_id: &str) -> Option<Arc<Expansion>> {
-        self.map.lock().unwrap().get(person_id).cloned()
+        self.map.locked().get(person_id).cloned()
     }
 
     pub fn insert(&self, expansion: Arc<Expansion>) {
         self.map
-            .lock()
-            .unwrap()
+            .locked()
             .insert(expansion.person_id.clone(), expansion);
     }
 
     /// Caches `expansion` unless an `invalidate_all` happened since `generation` was
     /// read (it was computed from rows that may have changed meanwhile).
     pub fn insert_if_current(&self, generation: u64, expansion: Arc<Expansion>) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.locked();
         if *self.generation.borrow() == generation {
             map.insert(expansion.person_id.clone(), expansion);
         }
@@ -128,7 +128,7 @@ impl Expansions {
     /// released.
     pub fn invalidate_all(&self) {
         // Bumped under the map's lock, so `insert_if_current` sees clear-and-bump as one.
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.locked();
         map.clear();
         self.generation.send_modify(|g| *g += 1);
     }

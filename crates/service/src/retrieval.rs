@@ -9,10 +9,6 @@
 //! documents (and sources) it covers; a passage matches when `scope_ids CONTAINSANY
 //! keys OR document_id IN keys`. `Scope::Library` is the whole project.
 //!
-//! Until the one-pass migration (`ingest::PASSAGES_MIGRATION`) is recorded, sources that
-//! have no passages yet are searched from their old `chunk`/`media` rows (the brute
-//! cosine of before, §2.2 "Migration"), so retrieval keeps working during the pass.
-//!
 //! Budgets are configuration: `PipelineConfig.budget` resolved against the route's
 //! model window (`pack_budget`), never a literal token cap.
 
@@ -26,7 +22,7 @@ use chrono::Utc;
 use margin_embed::Purpose;
 use margin_shared::Provider;
 use margin_shared::context::{
-    ACCESS_COMPANY, Document, Modality, Origin, Project, RetrievalLegs, Scope, TraceKind, TraceRow,
+    Document, Modality, Origin, Project, RetrievalLegs, Scope, TraceKind, TraceRow,
 };
 use margin_shared::pipeline::{Budget, RetrievalPurpose, Route};
 use margin_shared::routes::{
@@ -47,8 +43,8 @@ use crate::pipeline::{
     Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Reader, Registry, RerankRequest,
     RetrievalCtx, Retriever, RewriteRequest, StageCtor, hit_citation, with_retrieval,
 };
-use crate::sources::{ChunkRow, MediaKind, MediaRow};
 use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
+use margin_shared::sync::Locked;
 
 /// The query strings one job retrieves with (§2.3 step 1): the lesson title and
 /// summary, the summary alone, the planner's sub-questions, the learner's prompt for
@@ -511,15 +507,6 @@ fn reads_source(reader: &Reader, s: &Source) -> bool {
         s.access.clone()
     };
     reader.allows(&access, &s.deny)
-}
-
-/// Whether `reader` may read the rows from before `passages-v1` (`chunk`, `media`) of the
-/// source `id`: they carry no audience, so the source row decides.
-async fn reads_legacy(store: &Store, reader: &Reader, id: &str) -> anyhow::Result<bool> {
-    Ok(store
-        .get::<Source>(db::SOURCE, id)
-        .await?
-        .is_some_and(|s| reads_source(reader, &s)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,7 +1499,7 @@ impl RetrievalCache {
     }
 
     pub fn get(&self, key: &str) -> Option<Arc<Vec<Packed>>> {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.locked();
         let e = entries.get_mut(key)?;
         e.used = tick();
         Some(e.packed.clone())
@@ -1526,7 +1513,7 @@ impl RetrievalCache {
             .iter()
             .flat_map(|p| p.hits.iter().map(|h| h.passage.document_id.clone()))
             .collect();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.locked();
         if !entries.contains_key(&key) && entries.len() >= self.capacity {
             let oldest = entries
                 .iter()
@@ -1549,14 +1536,13 @@ impl RetrievalCache {
     /// Drops every entry that read `document_id`.
     pub fn invalidate(&self, document_id: &str) {
         self.entries
-            .lock()
-            .unwrap()
+            .locked()
             .retain(|_, e| !e.documents.contains(document_id));
     }
 
     /// Entries kept now.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.locked().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1622,19 +1608,6 @@ pub fn register(reg: &mut Registry) {
     );
 }
 
-/// A source's rows in the old `chunk`/`media` tables, while they exist (the migration
-/// to `passage` removes them; reading a removed table is an error).
-async fn legacy_rows<T: serde::de::DeserializeOwned>(
-    store: &Store,
-    table: &'static str,
-    source_id: &str,
-) -> anyhow::Result<Vec<T>> {
-    if !store.table_exists(table).await? {
-        return Ok(Vec::new());
-    }
-    store.list_where(table, "source_id", source_id).await
-}
-
 /// Records a trace row through `AppState.tracer`.
 pub(crate) fn record_trace(state: &AppState, row: TraceRow) {
     state.tracer.record(row);
@@ -1665,7 +1638,6 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         return Ok(Vec::new());
     }
 
-    let legacy = legacy_sources(state, &resolved).await?;
     let embedder = crate::embedding::embedder(state).await.ok().flatten();
     let key = cache_key(
         req,
@@ -1673,9 +1645,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         embedder.as_ref().map(|e| e.version().to_string()),
         &index_generation(&state.store).await?,
     );
-    if legacy.is_empty()
-        && let Some(hit) = state.retrieval_cache.get(&key)
-    {
+    if let Some(hit) = state.retrieval_cache.get(&key) {
         row.cache_hit = Some(true);
         fill_packed_trace(&mut row, &hit);
         row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1761,13 +1731,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
             images_max: budget.images_max,
             diversity: budget.diversity,
         };
-        let mut leg = pipeline.retriever.search(&q).await?;
-        if !legacy.is_empty() {
-            leg.extend(legacy_hits(state, &legacy, &q, &req.reader).await?);
-            leg.sort_by(|a, b| b.score.total_cmp(&a.score));
-            leg.truncate(fusion_cfg.k_fused);
-        }
-        legs.push(leg);
+        legs.push(pipeline.retriever.search(&q).await?);
     }
     let search_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
@@ -1814,9 +1778,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     });
     row.cache_hit = Some(false);
     fill_packed_trace(&mut row, &packed);
-    if legacy.is_empty() {
-        state.retrieval_cache.insert(key, Arc::new(packed.clone()));
-    }
+    state.retrieval_cache.insert(key, Arc::new(packed.clone()));
     row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     record_trace(state, row);
     Ok(packed)
@@ -1884,170 +1846,6 @@ fn fill_packed_trace(row: &mut TraceRow, packed: &[Packed]) {
             .filter(|p| p.citation.image_url.is_some())
             .count() as u32,
     );
-}
-
-// ---------------------------------------------------------------------------
-// Old rows, until the migration is recorded
-// ---------------------------------------------------------------------------
-
-/// The Ready sources in scope that have no passages yet, while the migration hasn't
-/// been recorded.
-async fn legacy_sources(state: &AppState, resolved: &Resolved) -> anyhow::Result<Vec<Source>> {
-    if resolved.source_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let settings = state.settings_row().await?;
-    if settings
-        .migrations
-        .iter()
-        .any(|m| m == crate::ingest::PASSAGES_MIGRATION)
-    {
-        return Ok(Vec::new());
-    }
-    #[derive(Deserialize)]
-    struct Count {
-        n: u64,
-    }
-    let mut out = Vec::new();
-    let docs: Vec<Document> = state.store.list(db::DOCUMENT).await?;
-    for id in &resolved.source_ids {
-        let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
-            continue;
-        };
-        if !matches!(source.status, SourceStatus::Ready { .. }) {
-            continue;
-        }
-        let mut keys = vec![id.clone()];
-        keys.extend(
-            docs.iter()
-                .filter(|d| matches!(&d.origin, Origin::Source { source_id } if source_id == id))
-                .map(|d| d.id.clone()),
-        );
-        let n: Vec<Count> = state
-            .store
-            .query_rows(
-                "RETURN { n: count(SELECT id FROM passage WHERE document_id IN $keys) };",
-                vec![("keys", json!(keys))],
-            )
-            .await?;
-        if n.first().map_or(0, |c| c.n) == 0 {
-            out.push(source);
-        }
-    }
-    Ok(out)
-}
-
-fn legacy_row(
-    source_id: &str,
-    modality: Modality,
-    ord: u32,
-    (page, start_ms, end_ms): (Option<u32>, Option<u64>, Option<u64>),
-    text: &str,
-    file: Option<String>,
-    vector: &[f32],
-) -> PassageRow {
-    PassageRow {
-        id: format!("{source_id}:{}:{ord}", modality.as_str()),
-        project_id: String::new(),
-        document_id: source_id.to_string(),
-        origin: "source".into(),
-        scope_ids: Vec::new(),
-        access: vec![ACCESS_COMPANY.to_string()],
-        deny: Vec::new(),
-        unit_id: match page {
-            Some(p) => format!("{source_id}:page:{p}"),
-            None => format!("{source_id}:{}:{ord}", modality.as_str()),
-        },
-        modality: modality.as_str().into(),
-        ord: ord as i64,
-        page: page.map(i64::from),
-        start_line: None,
-        end_line: None,
-        start_ms: start_ms.map(|v| v as i64),
-        end_ms: end_ms.map(|v| v as i64),
-        section_path: String::new(),
-        text: text.to_string(),
-        file,
-        chunk_hash: String::new(),
-        embedder: String::new(),
-        vector: vector.to_vec(),
-    }
-}
-
-/// The old rows of `sources` ranked by cosine against the query (the ranking of
-/// before; it needs the query's vector).
-async fn legacy_hits(
-    state: &AppState,
-    sources: &[Source],
-    q: &Query,
-    reader: &Reader,
-) -> anyhow::Result<Vec<Hit>> {
-    if q.vector.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut rows = Vec::new();
-    // Rows from before `passages-v1` carry no audience: only their source's owner reads
-    // them (legacy rows exist only until that migration finishes).
-    for s in sources.iter().filter(|s| reads_source(reader, s)) {
-        let chunks: Vec<ChunkRow> = legacy_rows(&state.store, db::CHUNK, &s.id).await?;
-        rows.extend(chunks.iter().map(|c| {
-            legacy_row(
-                &s.id,
-                Modality::Text,
-                c.ord,
-                (c.page, c.start_ms, c.end_ms),
-                &c.text,
-                None,
-                &c.vector,
-            )
-        }));
-        let media: Vec<MediaRow> = legacy_rows(&state.store, db::MEDIA, &s.id).await?;
-        rows.extend(media.iter().filter_map(|m| {
-            let modality = match m.kind {
-                MediaKind::Image | MediaKind::Page => Modality::Picture,
-                MediaKind::Frame => Modality::Frame,
-                // A sound window without a transcript has nothing a writer can read.
-                MediaKind::Audio if m.text.trim().is_empty() => return None,
-                MediaKind::Audio => Modality::Sound,
-            };
-            Some(legacy_row(
-                &s.id,
-                modality,
-                m.ord,
-                (m.page, m.start_ms, m.end_ms),
-                &m.text,
-                m.file.clone(),
-                &m.vector,
-            ))
-        }));
-    }
-    let wanted = |m: &str| q.modalities.is_empty() || q.modalities.iter().any(|x| x.as_str() == m);
-    let tools = state.source_tools.clone();
-    let query_vec = q.vector.clone();
-    let query_text = q.text.clone();
-    let k = q.k;
-    let rows: Vec<PassageRow> = rows.into_iter().filter(|r| wanted(&r.modality)).collect();
-    let hits = tokio::task::spawn_blocking(move || {
-        let mut hits: Vec<Hit> = rows
-            .into_iter()
-            .map(|passage| Hit {
-                score: tools.score(&query_vec, &query_text, &passage.vector, &passage.text),
-                passage,
-                dense_rank: None,
-                lex_rank: None,
-                rerank: None,
-                highlight: None,
-            })
-            .collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-        hits.truncate(k);
-        for (i, h) in hits.iter_mut().enumerate() {
-            h.dense_rank = Some(i as u32);
-        }
-        hits
-    })
-    .await?;
-    Ok(hits)
 }
 
 // ---------------------------------------------------------------------------
@@ -2227,7 +2025,7 @@ async fn text_picture(
     }
     let mut binds = reader.binds();
     binds.push(("d", json!(passage.document_id)));
-    let mut frames: Vec<(i64, String)> = state
+    let frames: Vec<(i64, String)> = state
         .store
         .query_rows::<Frame>(
             &format!(
@@ -2241,14 +2039,6 @@ async fn text_picture(
         .into_iter()
         .filter_map(|f| Some((f.start_ms?, f.file?)))
         .collect();
-    if frames.is_empty() {
-        let media: Vec<MediaRow> = legacy_rows(&state.store, db::MEDIA, source_id).await?;
-        frames = media
-            .into_iter()
-            .filter(|m| m.kind == MediaKind::Frame)
-            .filter_map(|m| Some((m.start_ms? as i64, m.file?)))
-            .collect();
-    }
     Ok(frames
         .into_iter()
         .min_by_key(|(at, _)| at.abs_diff(middle))
@@ -2493,8 +2283,7 @@ pub enum Selector {
     Ords { from: u32, to: u32 },
 }
 
-/// The text passages `sel` names, in order, at most `max`; a source not yet moved to
-/// passages is read from its old chunks.
+/// The text passages `sel` names, in order, at most `max`.
 pub async fn read_passages(
     store: &Store,
     reader: &Reader,
@@ -2502,37 +2291,12 @@ pub async fn read_passages(
     sel: Selector,
     max: usize,
 ) -> anyhow::Result<Vec<PassageRow>> {
-    let rows = match sel {
-        Selector::Page(page) => passages_on_page(store, reader, document_id, page, max).await?,
+    match sel {
+        Selector::Page(page) => passages_on_page(store, reader, document_id, page, max).await,
         Selector::Ords { from, to } => {
-            passages_by_ord(store, reader, document_id, from, to, max).await?
+            passages_by_ord(store, reader, document_id, from, to, max).await
         }
-    };
-    if !rows.is_empty() || !reads_legacy(store, reader, document_id).await? {
-        return Ok(rows);
     }
-    let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
-    chunks.sort_by_key(|c| c.ord);
-    let mut rows: Vec<PassageRow> = chunks
-        .iter()
-        .filter(|c| match sel {
-            Selector::Page(p) => c.page == Some(p),
-            Selector::Ords { from, to } => c.ord >= from && c.ord <= to.max(from),
-        })
-        .map(|c| {
-            legacy_row(
-                document_id,
-                Modality::Text,
-                c.ord,
-                (c.page, c.start_ms, c.end_ms),
-                &c.text,
-                None,
-                &c.vector,
-            )
-        })
-        .collect();
-    rows.truncate(max);
-    Ok(rows)
 }
 
 /// `retrieve` for a context query (the agent's `search` tool and `POST
@@ -2647,7 +2411,7 @@ pub async fn document_outline(
     }
     let mut binds = reader.binds();
     binds.push(("d", json!(document_id)));
-    let mut rows: Vec<Loc> = store
+    let rows: Vec<Loc> = store
         .query_rows(
             &format!(
                 "SELECT ord, section_path, page, start_line, end_line FROM passage \
@@ -2657,21 +2421,6 @@ pub async fn document_outline(
             binds,
         )
         .await?;
-    if rows.is_empty() && reads_legacy(store, reader, document_id).await? {
-        // A source not yet moved to passages: its old chunks (pages, no sections).
-        let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
-        chunks.sort_by_key(|c| c.ord);
-        rows = chunks
-            .into_iter()
-            .map(|c| Loc {
-                ord: c.ord as i64,
-                section_path: String::new(),
-                page: c.page.map(i64::from),
-                start_line: None,
-                end_line: None,
-            })
-            .collect();
-    }
     let mut out: Vec<margin_shared::context::OutlineSection> = Vec::new();
     let min_opt = |a: Option<u32>, b: Option<u32>| match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -2730,30 +2479,7 @@ pub async fn document_picture(
         Reader::sql()
     );
     let rows: Vec<PassageRow> = store.query_rows(&sql, binds).await?;
-    if let Some(row) = rows.into_iter().next() {
-        return Ok(Some(row));
-    }
-    if !reads_legacy(store, reader, document_id).await? {
-        return Ok(None);
-    }
-    // A source not yet moved to passages: its old picture rows.
-    let media: Vec<MediaRow> = legacy_rows(store, db::MEDIA, document_id).await?;
-    Ok(media
-        .into_iter()
-        .filter(|m| matches!(m.kind, MediaKind::Image | MediaKind::Page))
-        .filter(|m| page.is_none() || m.page == page)
-        .min_by_key(|m| m.ord)
-        .map(|m| {
-            legacy_row(
-                document_id,
-                Modality::Picture,
-                m.ord,
-                (m.page, m.start_ms, m.end_ms),
-                &m.text,
-                m.file.clone(),
-                &m.vector,
-            )
-        }))
+    Ok(rows.into_iter().next())
 }
 
 #[cfg(test)]

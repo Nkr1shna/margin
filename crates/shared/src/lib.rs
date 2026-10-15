@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod principal;
 pub mod providers;
 pub mod routes;
+pub mod sync;
 pub mod text;
 
 pub use audience::*;

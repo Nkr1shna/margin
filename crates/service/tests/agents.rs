@@ -4,8 +4,6 @@
 
 mod common;
 
-use std::time::Duration;
-
 use chrono::Utc;
 use common::*;
 use margin_service::db;
@@ -515,7 +513,7 @@ async fn an_agents_documents_belong_to_its_owner() {
     assert_eq!(replaced.owner.as_deref(), Some("bob"));
 
     // The agent deletes its owner's document (once it is read).
-    for _ in 0..200 {
+    eventually(|| async {
         let d: Document = h
             .state
             .store
@@ -523,14 +521,13 @@ async fn an_agents_documents_belong_to_its_owner() {
             .await
             .unwrap()
             .unwrap();
-        if matches!(
+        matches!(
             d.status,
             margin_shared::context::DocumentStatus::Ready { .. }
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        )
+        .then_some(())
+    })
+    .await;
     let r = h
         .delete(&token, &format!("/api/context/documents/{}", doc.id))
         .send()

@@ -26,6 +26,7 @@ use crate::state::{
     list_visible, new_id, readable,
 };
 use crate::{db, ingest, sources};
+use margin_shared::sync::Locked;
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -514,7 +515,7 @@ pub async fn remove_lesson(state: &AppState, p: &Principal, id: &str) -> AppResu
 async fn delete_lesson_locked(state: &AppState, row: &StoredLesson) -> AppResult<Vec<Emitted>> {
     let lesson_id = row.lesson.id.as_str();
     let mut events = Vec::new();
-    if let Some(job) = state.lesson_jobs.lock().unwrap().remove(lesson_id) {
+    if let Some(job) = state.lesson_jobs.locked().remove(lesson_id) {
         job.abort();
     }
     if let Some(video) = video_for_lesson(state, lesson_id).await? {
@@ -544,7 +545,7 @@ async fn delete_lesson_locked(state: &AppState, row: &StoredLesson) -> AppResult
 /// Stops a running render of the video, removes its folder and its row.
 async fn delete_video_locked(state: &AppState, video_id: &str) -> AppResult<Event> {
     {
-        let mut current = state.render_job.lock().unwrap();
+        let mut current = state.render_job.locked();
         if current.as_ref().is_some_and(|(id, _)| id == video_id)
             && let Some((_, handle)) = current.take()
         {

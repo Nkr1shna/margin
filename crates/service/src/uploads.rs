@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentDevice, CurrentPrincipal, Principal};
 use crate::sources::{self, FILE_NAME, Upload, UploadQuery, content_length, receive, remove_dir};
 use crate::state::{AppState, new_id};
+use margin_shared::sync::Locked;
 
 const META_FILE: &str = "upload.json";
 /// Unfinished uploads older than this are deleted at startup.
@@ -99,7 +100,7 @@ struct Busy<'a> {
 
 impl<'a> Busy<'a> {
     fn claim(state: &'a AppState, id: &str) -> AppResult<Self> {
-        let mut busy = state.uploads_busy.lock().unwrap_or_else(|e| e.into_inner());
+        let mut busy = state.uploads_busy.locked();
         if !busy.insert(id.to_string()) {
             return Err(AppError::conflict(
                 "upload_busy",
@@ -115,11 +116,7 @@ impl<'a> Busy<'a> {
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        self.state
-            .uploads_busy
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        self.state.uploads_busy.locked().remove(&self.id);
     }
 }
 

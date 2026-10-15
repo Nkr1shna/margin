@@ -33,6 +33,7 @@ use crate::error::{ApiJson, AppError, AppResult};
 use crate::principal::{CurrentDevice, CurrentPrincipal, Principal};
 use crate::sources;
 use crate::state::{AppState, Emitted, can_read, readable};
+use margin_shared::sync::Locked;
 
 /// `WorkspaceChanged` for a folder's counts goes out at most this often (one deferred
 /// emit carries what changed meanwhile).
@@ -479,10 +480,7 @@ pub struct EmitSlot {
 pub fn emit_changed(state: &AppState, ws: Workspace) {
     let now = Instant::now();
     let wait = {
-        let mut slots = state
-            .folder_sync_emits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slots = state.folder_sync_emits.locked();
         match slots.get_mut(&ws.id) {
             Some(slot) if slot.deferred => return,
             Some(slot) if now.duration_since(slot.last) < SYNC_EMIT_INTERVAL => {
@@ -513,17 +511,13 @@ pub fn emit_changed(state: &AppState, ws: Workspace) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(wait).await;
-        state
-            .folder_sync_emits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                ws.id.clone(),
-                EmitSlot {
-                    last: Instant::now(),
-                    deferred: false,
-                },
-            );
+        state.folder_sync_emits.locked().insert(
+            ws.id.clone(),
+            EmitSlot {
+                last: Instant::now(),
+                deferred: false,
+            },
+        );
         match state.store.get::<Workspace>(db::WORKSPACE, &ws.id).await {
             Ok(Some(now)) => state.emit_owned(
                 &now,
@@ -551,11 +545,7 @@ pub async fn delete_files_locked(
         .store
         .delete_where(db::FOLDER_FILE, "workspace_id", workspace_id)
         .await?;
-    state
-        .folder_sync_emits
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(workspace_id);
+    state.folder_sync_emits.locked().remove(workspace_id);
     Ok(events)
 }
 

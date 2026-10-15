@@ -14,9 +14,8 @@
 //!   timestamped passages.
 //!
 //! This file keeps upload, delete, attach and "Read again", and the passages lessons
-//! and the agent get today (`passages`), read from the `passage` rows of the sources (or
-//! a source's old `chunk`/`media` rows until the migration has moved it), until
-//! `retrieval.rs` takes over.
+//! and the agent get today (`passages`), read from the `passage` rows of the sources,
+//! until `retrieval.rs` takes over.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -50,6 +49,7 @@ use crate::error::{AppError, AppResult};
 use crate::ingest;
 use crate::library;
 use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
+use margin_shared::sync::Locked;
 
 /// The uploaded file's name inside its folder; the original name is kept in the row.
 pub const FILE_NAME: &str = "file";
@@ -65,61 +65,6 @@ pub const SOURCE_WAIT: Duration = Duration::from_secs(10 * 60);
 /// Uploads never attached to a topic (an Ask that wasn't sent) are deleted at startup
 /// once they're this old.
 pub const UNATTACHED_TTL: chrono::Duration = chrono::Duration::hours(24);
-
-/// One embedded piece of a source, as stores written before the `passage` table kept
-/// it (table `chunk`). Read only until the migration has moved every source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkRow {
-    pub source_id: Id,
-    /// The source's topic, kept in step with it.
-    pub topic_id: Option<Id>,
-    /// Position in the source, from 0.
-    pub ord: u32,
-    pub page: Option<u32>,
-    /// Where in a recording a transcript passage is.
-    #[serde(default)]
-    pub start_ms: Option<u64>,
-    #[serde(default)]
-    pub end_ms: Option<u64>,
-    pub text: String,
-    pub vector: Vec<f32>,
-}
-
-/// What a `MediaRow` is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaKind {
-    /// An image source itself.
-    Image,
-    /// A rendered PDF page.
-    Page,
-    /// A video frame.
-    Frame,
-    /// A 10-second window of sound.
-    Audio,
-}
-
-/// One embedded picture or stretch of sound of a source, as stores written before the
-/// `passage` table kept it (table `media`). Read only until the migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaRow {
-    pub source_id: Id,
-    /// The source's topic, kept in step with it.
-    pub topic_id: Option<Id>,
-    /// Position among the source's media, from 0.
-    pub ord: u32,
-    pub kind: MediaKind,
-    /// The picture, by the name the source media route serves: "original", "page-3.png",
-    /// "frame-2500.jpg". None for sound.
-    pub file: Option<String>,
-    pub page: Option<u32>,
-    /// A frame's time (with no end), or a sound window's stretch.
-    pub start_ms: Option<u64>,
-    pub end_ms: Option<u64>,
-    /// What was said meanwhile (empty without a transcript).
-    pub text: String,
-    pub vector: Vec<f32>,
-}
 
 pub fn is_pending(status: &SourceStatus) -> bool {
     matches!(
@@ -622,11 +567,7 @@ async fn replace_locked(
             if matches!(old.status, SourceStatus::Processing { .. }) {
                 // The read in progress finishes on the old copy and must not mark the
                 // new one read; it's queued behind it (its renders are redone then).
-                state
-                    .sources_replaced
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(old.id.clone());
+                state.sources_replaced.locked().insert(old.id.clone());
             } else {
                 remove_dir(&state.source_media_dir(&old.id)).await;
             }
@@ -716,7 +657,9 @@ pub async fn transcript(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(AppError::internal(format!("{}: {e}", path.display()))),
     }
-    let mut timed: Vec<(u64, u64, i64, String)> = candidates(&state, &id)
+    let mut timed: Vec<(u64, u64, i64, String)> = state
+        .store
+        .passages_of(&id)
         .await?
         .into_iter()
         .filter(|r| r.modality == Modality::Text.as_str())
@@ -758,7 +701,6 @@ pub async fn delete_source(
 /// to whoever could read the source.
 pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Emitted> {
     let row: Option<Source> = state.store.get(db::SOURCE, id).await?;
-    delete_old_rows(state, id).await?;
     ingest::delete_document_locked(state, id).await?;
     state.store.delete(db::SOURCE, id).await?;
     remove_dir(&state.source_dir(id)).await;
@@ -768,21 +710,6 @@ pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Emitted
         // Gone already: nobody can be told more than that it is gone.
         None => Emitted::paths(&[], event),
     })
-}
-
-/// Whether the `chunk`/`media` tables of a store from before the `passage` table are
-/// still there (until the migration removes them).
-pub async fn has_old_rows(state: &AppState) -> anyhow::Result<bool> {
-    Ok(state.store.table_exists(db::CHUNK).await? && state.store.table_exists(db::MEDIA).await?)
-}
-
-/// Deletes a source's `chunk`/`media` rows, while those tables exist.
-pub(crate) async fn delete_old_rows(state: &AppState, id: &str) -> anyhow::Result<()> {
-    if has_old_rows(state).await? {
-        state.store.delete_where(db::CHUNK, "source_id", id).await?;
-        state.store.delete_where(db::MEDIA, "source_id", id).await?;
-    }
-    Ok(())
 }
 
 pub(crate) async fn remove_dir(dir: &std::path::Path) {
@@ -998,90 +925,6 @@ pub async fn passages_within(
     retrieve(state, source_ids, query, wait).await
 }
 
-/// A source's passages: its `passage` rows (the document index), or the `chunk`/`media`
-/// rows of a store the migration hasn't moved it out of yet, as passages.
-pub async fn candidates(state: &AppState, source_id: &str) -> anyhow::Result<Vec<PassageRow>> {
-    let rows = state.store.passages_of(source_id).await?;
-    if !rows.is_empty() || !has_old_rows(state).await? {
-        return Ok(rows);
-    }
-    let chunks: Vec<ChunkRow> = state
-        .store
-        .list_where(db::CHUNK, "source_id", source_id)
-        .await?;
-    let media: Vec<MediaRow> = state
-        .store
-        .list_where(db::MEDIA, "source_id", source_id)
-        .await?;
-    let mut rows: Vec<PassageRow> = chunks.into_iter().map(old_chunk_passage).collect();
-    let offset = rows.len() as i64;
-    rows.extend(media.into_iter().map(|m| old_media_passage(m, offset)));
-    // They carry the source's audience, as its passages will (L2 D2); a source that is
-    // gone, nobody's.
-    let (access, deny) = match state.store.get::<Source>(db::SOURCE, source_id).await? {
-        Some(s) => (s.audience(), s.deny().to_vec()),
-        None => (Vec::new(), Vec::new()),
-    };
-    for r in &mut rows {
-        r.access = access.clone();
-        r.deny = deny.clone();
-    }
-    Ok(rows)
-}
-
-fn old_passage(source_id: &str, modality: Modality, ord: i64, text: String) -> PassageRow {
-    PassageRow {
-        id: format!("{source_id}:old:{ord}"),
-        project_id: String::new(),
-        document_id: source_id.to_string(),
-        origin: "source".into(),
-        scope_ids: Vec::new(),
-        // Stamped from the source row by `candidates`.
-        access: Vec::new(),
-        deny: Vec::new(),
-        unit_id: format!("{source_id}:old:{ord}"),
-        modality: modality.as_str().into(),
-        ord,
-        page: None,
-        start_line: None,
-        end_line: None,
-        start_ms: None,
-        end_ms: None,
-        section_path: String::new(),
-        text,
-        file: None,
-        chunk_hash: String::new(),
-        embedder: String::new(),
-        vector: Vec::new(),
-    }
-}
-
-fn old_chunk_passage(c: ChunkRow) -> PassageRow {
-    PassageRow {
-        page: c.page.map(i64::from),
-        start_ms: c.start_ms.map(|v| v as i64),
-        end_ms: c.end_ms.map(|v| v as i64),
-        vector: c.vector,
-        ..old_passage(&c.source_id, Modality::Text, c.ord as i64, c.text)
-    }
-}
-
-fn old_media_passage(m: MediaRow, offset: i64) -> PassageRow {
-    let modality = match m.kind {
-        MediaKind::Image | MediaKind::Page => Modality::Picture,
-        MediaKind::Frame => Modality::Frame,
-        MediaKind::Audio => Modality::Sound,
-    };
-    PassageRow {
-        page: m.page.map(i64::from),
-        start_ms: m.start_ms.map(|v| v as i64),
-        end_ms: m.end_ms.map(|v| v as i64),
-        file: m.file,
-        vector: m.vector,
-        ..old_passage(&m.source_id, modality, offset + m.ord as i64, m.text)
-    }
-}
-
 /// The stretch of a recording a passage covers, when it is read as text (a transcript
 /// passage or a sound window).
 fn spoken_range(p: &PassageRow) -> Option<(u64, u64)> {
@@ -1134,7 +977,7 @@ async fn retrieve(
 
     let mut rows: Vec<PassageRow> = Vec::new();
     for s in &ready {
-        rows.extend(candidates(state, &s.id).await?);
+        rows.extend(state.store.passages_of(&s.id).await?);
     }
     let tools = state.source_tools.clone();
     let query = query.to_string();

@@ -39,6 +39,7 @@ use chrono::{DateTime, Utc};
 use margin_ai::{
     AiError, MODEL_WINDOW_FALLBACK, ModelInfo, ModelWindow, ProviderConfig, ProviderKind,
 };
+use margin_shared::sync::Locked;
 pub use margin_shared::{CHATGPT_CALLBACK_PATH, CHATGPT_CALLBACK_PORT};
 use margin_shared::{
     CLAUDE_LISTED_MODELS, ChatGptAccount, ChatGptComplete, ChatGptStart, ChatGptStartRequest,
@@ -188,24 +189,24 @@ impl Providers {
     }
 
     pub fn endpoints(&self) -> Endpoints {
-        self.endpoints.lock().unwrap().clone()
+        self.endpoints.locked().clone()
     }
 
     pub fn set_endpoints(&self, endpoints: Endpoints) {
-        *self.endpoints.lock().unwrap() = endpoints;
+        *self.endpoints.locked() = endpoints;
         self.forget_models();
     }
 
     /// How long a started ChatGPT sign-in may be completed (tests shorten it).
     pub fn set_sign_in_wait(&self, wait: Duration) {
-        *self.sign_in_wait.lock().unwrap() = wait;
+        *self.sign_in_wait.locked() = wait;
     }
 
     /// The flow, with a waiting sign-in that ran out of time turned `Failed` (its
     /// secrets dropped).
     fn flow(&self) -> std::sync::MutexGuard<'_, Flow> {
-        let wait = *self.sign_in_wait.lock().unwrap();
-        let mut flow = self.flow.lock().unwrap();
+        let wait = *self.sign_in_wait.locked();
+        let mut flow = self.flow.locked();
         if matches!(&*flow, Flow::Waiting(p) if p.started.elapsed() >= wait) {
             tracing::info!("a ChatGPT sign-in wasn't finished in time");
             *flow = Flow::Failed(format!(
@@ -219,7 +220,7 @@ impl Providers {
     /// Drops every cached model list: the next `model_for` fetches again. Called
     /// whenever the settings or a credential change (`SettingsChanged`).
     pub fn forget_models(&self) {
-        self.models.lock().unwrap().clear();
+        self.models.locked().clear();
     }
 
     /// The model list cached for `provider`, when one was fetched.
@@ -233,7 +234,7 @@ impl Providers {
     }
 
     fn remember_models(&self, provider: Provider, models: Arc<Vec<ModelInfo>>, ok: bool) {
-        self.models.lock().unwrap().insert(
+        self.models.locked().insert(
             provider,
             CachedModels {
                 models,
@@ -246,7 +247,7 @@ impl Providers {
     /// Logs a model whose window isn't known, once per model.
     fn warn_window(&self, provider: Provider, model: &str) {
         let key = format!("{provider}/{model}");
-        if self.warned.lock().unwrap().insert(key) {
+        if self.warned.locked().insert(key) {
             tracing::warn!(
                 %provider, %model,
                 "the model's context window isn't known; using {} input / {} output tokens",
@@ -291,7 +292,7 @@ pub async fn window(state: &App, config: &ProviderConfig, model: &str) -> ModelW
 /// last fetch failed more than `MODELS_RETRY` ago). Empty when it can't be fetched.
 async fn cached_list(state: &App, config: &ProviderConfig) -> Arc<Vec<ModelInfo>> {
     {
-        let cache = state.providers.models.lock().unwrap();
+        let cache = state.providers.models.locked();
         if let Some(c) = cache.get(&config.provider)
             && (c.ok || c.fetched.elapsed() < MODELS_RETRY)
         {
@@ -748,7 +749,7 @@ pub async fn chatgpt_start(
     }
     let authorize_url = url.to_string();
 
-    *state.providers.flow.lock().unwrap() = Flow::Waiting(Box::new(Pending {
+    *state.providers.flow.locked() = Flow::Waiting(Box::new(Pending {
         authorize_url: authorize_url.clone(),
         state: flow_state.clone(),
         nonce,
@@ -767,7 +768,7 @@ pub async fn chatgpt_start(
 
 /// Sets the flow's outcome, unless a sign-out or another sign-in replaced it meanwhile.
 fn set_flow(app: &App, flow_state: &str, next: Flow) {
-    let mut flow = app.providers.flow.lock().unwrap();
+    let mut flow = app.providers.flow.locked();
     if flow.state() == Some(flow_state) {
         *flow = next;
     }
@@ -988,7 +989,7 @@ async fn complete(
     // Under the refresh lock and only while this sign-in is still the one in progress:
     // a sign-out or a newer sign-in that came meanwhile wins.
     let _one = app.providers.refresh.lock().await;
-    let current = app.providers.flow.lock().unwrap().state() == Some(pending.state.as_str());
+    let current = app.providers.flow.locked().state() == Some(pending.state.as_str());
     if !current {
         return Err("The sign-in was cancelled or replaced by a newer one.".into());
     }
@@ -1094,7 +1095,7 @@ pub async fn chatgpt_sign_out(
     State(state): State<AppState>,
     _admin: RequireAdmin,
 ) -> AppResult<StatusCode> {
-    *state.providers.flow.lock().unwrap() = Flow::Idle;
+    *state.providers.flow.locked() = Flow::Idle;
     let _one = state.providers.refresh.lock().await;
     let tokens = load_tokens(&state).await?;
     if let Some(refresh) = &tokens.refresh_token {

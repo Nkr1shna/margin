@@ -2,8 +2,7 @@
 //! §2.7): extract → chunk → hash → diff against the stored passages (kept, new, gone)
 //! → embed only what is new, pipelined → `insert_many` (≤ `db::INSERT_MANY_MAX` rows per
 //! statement, the write lock per statement) → bump the document's generation →
-//! `Event::DocumentChanged`. Also the one-pass migration of the old `chunk`/`media`
-//! rows at first start (owner Q11).
+//! `Event::DocumentChanged`.
 //!
 //! Every passage carries its document's `access` paths (copied here at ingest), so
 //! retrieval can pre-filter by access inside the index query.
@@ -55,10 +54,7 @@ use crate::state::{
     AppState, Audience, Emitted, Owned, Ownership, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson,
     new_id, sha256_hex,
 };
-
-/// The migration that moves sources from `chunk`/`media` to `passage`, by its name in
-/// `SettingsRow.migrations`.
-pub const PASSAGES_MIGRATION: &str = "passages-v1";
+use margin_shared::sync::Locked;
 
 /// The embedding model and how its document inputs are prefixed
 /// (`margin_embed::EMBEDDER_VERSION`: EmbeddingGemma 2 with `title: {section path or
@@ -75,9 +71,9 @@ pub const DOCUMENTS_DIR: &str = "documents";
 /// Progress is saved and sent at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
-/// What a source whose file is gone says after the migration couldn't read it again.
+/// What a document whose file is gone says when it is read again.
 pub const FILE_GONE: &str = "Its file is missing on the service, so it couldn't be read \
-     into the new search index. Read it again once the file is back, or upload it again.";
+     into the search index. Read it again once the file is back, or upload it again.";
 
 /// Something to (re)index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +137,7 @@ impl IngestQueue {
         let _ = self.tx.send(job);
     }
 
-    /// Asks the worker to try the migration again (the embedding model just arrived).
+    /// Asks the worker to try the re-embed again (the embedding model just arrived).
     pub fn kick(&self) {
         self.push(IngestJob {
             document_id: Id::new(),
@@ -150,7 +146,7 @@ impl IngestQueue {
 
     /// The receiving end, for the worker; `None` once taken.
     pub fn take_receiver(&self) -> Option<mpsc::UnboundedReceiver<IngestJob>> {
-        self.rx.lock().ok()?.take()
+        self.rx.locked().take()
     }
 }
 
@@ -1560,11 +1556,7 @@ async fn set_status(
 /// Whether the folder source `id` was replaced by a new upload while it was being read
 /// (`sources::create_or_replace`): the read finishing then leaves its status alone.
 fn was_replaced(state: &AppState, id: &str) -> bool {
-    state
-        .sources_replaced
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(id)
+    state.sources_replaced.locked().contains(id)
 }
 
 /// A folder source that is now read (or failed): its folder's counts change.
@@ -1917,10 +1909,10 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
 }
 
 // ---------------------------------------------------------------------------
-// The worker and the migration
+// The worker and the re-embed
 // ---------------------------------------------------------------------------
 
-/// The worker that drains `IngestQueue`: first the migration (when not done yet), then
+/// The worker that drains `IngestQueue`: first the re-embed (when not done yet), then
 /// one document at a time, chat and topic files ahead of folder files.
 pub async fn run_worker(state: AppState) {
     let Some(mut rx) = state.ingest_queue.take_receiver() else {
@@ -1928,9 +1920,6 @@ pub async fn run_worker(state: AppState) {
     };
     if let Err(e) = library::default_project(&state).await {
         tracing::error!("couldn't create the default project: {e:#}");
-    }
-    if let Err(e) = migrate(&state).await {
-        tracing::error!("the move to the passage index failed: {e:#}");
     }
     if let Err(e) = reembed(&state).await {
         tracing::error!("the re-embed with the new embedder failed: {e:#}");
@@ -1957,9 +1946,6 @@ pub async fn run_worker(state: AppState) {
             }
         };
         if id.is_empty() {
-            if let Err(e) = migrate(&state).await {
-                tracing::error!("the move to the passage index failed: {e:#}");
-            }
             if let Err(e) = reembed(&state).await {
                 tracing::error!("the re-embed with the new embedder failed: {e:#}");
             }
@@ -1971,7 +1957,7 @@ pub async fn run_worker(state: AppState) {
     }
 }
 
-/// The next job: a migration request first, then anything that isn't a folder file,
+/// The next job: a re-embed request first, then anything that isn't a folder file,
 /// then folder files in order.
 async fn next_job(state: &AppState, pending: &mut VecDeque<Id>) -> anyhow::Result<Option<Id>> {
     if let Some(i) = pending.iter().position(String::is_empty) {
@@ -1999,11 +1985,7 @@ async fn run_job(state: &AppState, id: &str) -> anyhow::Result<()> {
         return Ok(());
     };
     // The read a replacement waited behind is over (the worker runs one at a time).
-    state
-        .sources_replaced
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(id);
+    state.sources_replaced.locked().remove(id);
     match state.store.get::<Source>(db::SOURCE, id).await? {
         Some(source) if source.status != SourceStatus::Queued => return Ok(()),
         Some(_) => {}
@@ -2019,7 +2001,7 @@ async fn run_job(state: &AppState, id: &str) -> anyhow::Result<()> {
 }
 
 /// Queues every document that waits to be read and isn't a source (sources are queued
-/// by `sources::enqueue_queued`), and asks for the migration again. Called once the
+/// by `sources::enqueue_queued`), and asks for the re-embed again. Called once the
 /// embedding model is downloaded.
 pub async fn enqueue_waiting(state: &AppState) -> anyhow::Result<()> {
     let docs: Vec<Document> = state.store.list(db::DOCUMENT).await?;
@@ -2035,75 +2017,6 @@ pub async fn enqueue_waiting(state: &AppState) -> anyhow::Result<()> {
         }
     }
     state.ingest_queue.kick();
-    Ok(())
-}
-
-async fn migration_done(state: &AppState) -> anyhow::Result<bool> {
-    Ok(state
-        .settings_row()
-        .await?
-        .migrations
-        .iter()
-        .any(|m| m == PASSAGES_MIGRATION))
-}
-
-/// Re-ingests every Ready source into `passage` rows in one pass, oldest first, then
-/// drops `chunk`/`media` and records `PASSAGES_MIGRATION` (§2.2 "Migration").
-///
-/// Needs the embedding model: without it the pass waits (sources keep their old rows,
-/// which retrieval falls back to) and runs once the download finishes. A source whose
-/// file is gone is marked Failed (`FILE_GONE`) and the owner can read it again.
-pub async fn migrate(state: &AppState) -> anyhow::Result<()> {
-    if migration_done(state).await? {
-        return Ok(());
-    }
-    let mut sources: Vec<Source> = state.store.list(db::SOURCE).await?;
-    sources.sort_by_key(|s| s.created_at);
-    let mut todo = Vec::new();
-    for s in sources {
-        if matches!(s.status, SourceStatus::Ready { .. })
-            && !state.store.has_passages(&s.id).await?
-        {
-            todo.push(s);
-        }
-    }
-    if !todo.is_empty() {
-        match embedding::embedder(state).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::info!(
-                    "{} source(s) wait for the embedding model to move to the passage index",
-                    todo.len()
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        }
-        tracing::info!("moving {} source(s) to the passage index", todo.len());
-        let project = library::default_project(state).await?;
-        for s in todo {
-            {
-                let _w = state.write_lock.lock().await;
-                let Some(source) = state.store.get::<Source>(db::SOURCE, &s.id).await? else {
-                    continue;
-                };
-                source_document_locked(state, &project.id, &source).await?;
-            }
-            if let Err(e) = ingest(state, &s.id).await {
-                tracing::warn!("source {} couldn't be moved: {e:#}", s.id);
-            }
-            sources::delete_old_rows(state, &s.id).await?;
-        }
-    }
-    state.store.remove_table(db::CHUNK).await?;
-    state.store.remove_table(db::MEDIA).await?;
-    let _w = state.write_lock.lock().await;
-    let mut row = state.settings_row().await?;
-    if !row.migrations.iter().any(|m| m == PASSAGES_MIGRATION) {
-        row.migrations.push(PASSAGES_MIGRATION.to_string());
-        state.store.put(db::SETTINGS, SETTINGS_ID, &row).await?;
-    }
-    tracing::info!("every source is in the passage index");
     Ok(())
 }
 

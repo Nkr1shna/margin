@@ -586,6 +586,10 @@ async fn check_store(store: &Store, dir: &Path) -> anyhow::Result<DataCheck> {
             }
         }
     }
+    let old = unconverted_rows(store, &tables, &check.migrations).await?;
+    if old > 0 {
+        check.problems.push(unconverted_problem(old));
+    }
     Ok(check)
 }
 
@@ -799,6 +803,62 @@ pub fn migration_label() -> String {
     format!("before-schema-{}", db::SCHEMA_VERSION)
 }
 
+/// The mark a store gets once its sources moved from `chunk`/`media` to `passage`
+/// (`SettingsRow.migrations`). The conversion left with the build after ad6a5e69; a
+/// store without the mark and with old rows refuses to start.
+pub const PASSAGES_MIGRATION: &str = "passages-v1";
+
+/// The tables of sources' vectors before the `passage` table. Old builds defined them on
+/// every store, so their rows count, not their presence.
+const OLD_TABLES: [&str; 2] = ["chunk", "media"];
+
+/// Rows in `OLD_TABLES` of a store that never recorded `PASSAGES_MIGRATION`: 0 for every
+/// converted or new store.
+async fn unconverted_rows(
+    store: &Store,
+    tables: &[String],
+    migrations: &[String],
+) -> anyhow::Result<u64> {
+    if migrations.iter().any(|m| m == PASSAGES_MIGRATION) {
+        return Ok(0);
+    }
+    #[derive(Deserialize)]
+    struct Count {
+        count: u64,
+    }
+    let mut n = 0;
+    for t in OLD_TABLES.iter().filter(|t| tables.iter().any(|x| x == *t)) {
+        let rows: Vec<Count> = store
+            .query_rows(&format!("SELECT count() FROM {t} GROUP ALL"), vec![])
+            .await?;
+        n += rows.first().map_or(0, |c| c.count);
+    }
+    Ok(n)
+}
+
+fn unconverted_problem(n: u64) -> String {
+    format!("{n} old chunk/media rows, never converted")
+}
+
+/// Refuses a store whose sources were never moved to `passage`: this build no longer
+/// reads the old rows, so it would search as if they were gone.
+async fn refuse_unconverted(store: &Store) -> anyhow::Result<()> {
+    let migrations = store
+        .get::<serde_json::Value>(db::SETTINGS, crate::state::SETTINGS_ID)
+        .await?
+        .and_then(|s| serde_json::from_value::<Vec<String>>(s.get("migrations")?.clone()).ok())
+        .unwrap_or_default();
+    let n = unconverted_rows(store, &store.table_names().await?, &migrations).await?;
+    anyhow::ensure!(
+        n == 0,
+        "this data has {}, which this build can't read. Start the previous release \
+         (dev ad6a5e69) once with the embedding model downloaded, wait for its log line \
+         \"every source is in the passage index\", then start this build",
+        unconverted_problem(n)
+    );
+    Ok(())
+}
+
 /// Opens the configured database behind the schema guard: reads the stored schema
 /// version without defining or migrating anything; refuses data a newer build wrote;
 /// backs up data an older build wrote (`backup`, label `before-schema-<n>`) before this
@@ -851,6 +911,7 @@ pub async fn open_guarded(config: &Config) -> anyhow::Result<(Store, Option<Path
         }
     };
     let store = Store::open(&db_dir).await?;
+    refuse_unconverted(&store).await?;
     store.record_schema_version().await?;
     Ok((store, backup))
 }
@@ -950,7 +1011,7 @@ mod data_tests {
     async fn seed(data: &Path) {
         let store = Store::open(&data.join("db")).await.unwrap();
         let settings = crate::state::SettingsRow {
-            migrations: vec!["passages-v1".into()],
+            migrations: vec![PASSAGES_MIGRATION.into()],
             ..Default::default()
         };
         store
@@ -1084,7 +1145,7 @@ mod data_tests {
 
         let check = check_data(&data).await.unwrap();
         assert_eq!(check.problems, Vec::<String>::new());
-        assert_eq!(check.migrations, vec!["passages-v1".to_string()]);
+        assert_eq!(check.migrations, vec![PASSAGES_MIGRATION.to_string()]);
         assert_eq!(check.schema_version, db::SCHEMA_VERSION);
         assert_eq!(check.count(db::SOURCE), 2);
         assert_eq!(check.count(db::DOCUMENT), 3);
@@ -1155,6 +1216,96 @@ mod data_tests {
         );
     }
 
+    /// A store with the old tables, one `chunk` row or none, marked converted or not.
+    async fn old_store(marked: bool, rows: bool) -> Store {
+        let store = Store::memory().await.unwrap();
+        if marked {
+            let settings = crate::state::SettingsRow {
+                migrations: vec![PASSAGES_MIGRATION.into()],
+                ..Default::default()
+            };
+            store
+                .put(db::SETTINGS, crate::state::SETTINGS_ID, &settings)
+                .await
+                .unwrap();
+        }
+        let _: Vec<serde_json::Value> = store
+            .query_rows(
+                "DEFINE TABLE chunk SCHEMALESS; DEFINE TABLE media SCHEMALESS",
+                vec![],
+            )
+            .await
+            .unwrap();
+        if rows {
+            store
+                .put(
+                    "chunk",
+                    "s-0",
+                    &serde_json::json!({"source_id": "s", "text": "old"}),
+                )
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn a_store_with_unconverted_rows_refuses_to_start() {
+        let err = refuse_unconverted(&old_store(false, true).await)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1 old chunk/media rows, never converted"),
+            "{err}"
+        );
+        assert!(err.contains("ad6a5e69"), "{err}");
+        // Converted, or never had any: it starts.
+        refuse_unconverted(&old_store(true, true).await)
+            .await
+            .unwrap();
+        refuse_unconverted(&old_store(false, false).await)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_data_reports_unconverted_rows() {
+        let root = root();
+        let data = root.0.join("data");
+        seed(&data).await;
+        let db_dir = data.join("db");
+        {
+            let store = Store::open(&db_dir).await.unwrap();
+            store
+                .put(
+                    db::SETTINGS,
+                    crate::state::SETTINGS_ID,
+                    &crate::state::SettingsRow::default(),
+                )
+                .await
+                .unwrap();
+            let _: Vec<serde_json::Value> = store
+                .query_rows("DEFINE TABLE media SCHEMALESS", vec![])
+                .await
+                .unwrap();
+            store
+                .put("media", "s-m0", &serde_json::json!({"source_id": "s"}))
+                .await
+                .unwrap();
+        }
+        wait_released(&db_dir).await.unwrap();
+        let check = check_data(&data).await.unwrap();
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|p| p == "1 old chunk/media rows, never converted"),
+            "{:?}",
+            check.problems
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn check_data_refuses_a_folder_without_a_database() {
         let root = root();
@@ -1184,7 +1335,15 @@ mod data_tests {
             std::fs::create_dir_all(root.0.join(format!("backups/2000-01-0{n}-000000/data")))
                 .unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Names are to the second: wait until one made now sorts after the first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backup_name(chrono::Local::now(), None) <= name {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clock stood still"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let second = backup_data(&data, None, 2).await.unwrap();
         assert_eq!(entries(&root.0.join(BACKUPS_DIR)), vec![first, second]);
     }

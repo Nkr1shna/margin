@@ -179,7 +179,7 @@ pub struct SettingsRow {
     pub pipeline: PipelineConfig,
     #[serde(default = "trace_retention_days")]
     pub trace_retention_days: u32,
-    /// One-time data migrations already done, by name (e.g. "passages-v1"), so each
+    /// One-time data migrations already done, by name (e.g. "people-v1"), so each
     /// runs once.
     #[serde(default)]
     pub migrations: Vec<String>,
@@ -321,8 +321,12 @@ pub struct App {
     /// For model downloads: no overall time limit, only for stalls.
     pub download_http: reqwest::Client,
     pub model_files: ModelFiles,
-    /// The embedding model, loaded on first use once downloaded.
+    /// The embedding model, loaded on first use once downloaded. Held only to read or
+    /// swap the slot, never across a load (`embedder_load`).
     pub embedder: tokio::sync::Mutex<Option<Arc<dyn Embedder>>>,
+    /// Held while the embedding model loads (`embedding::embedder`) or is deleted, so
+    /// one load runs at a time and a delete never races one.
+    pub embedder_load: tokio::sync::Mutex<()>,
     /// A download in progress or the last one's failure (on-disk state is checked live).
     pub model_job: Mutex<ModelJob>,
     /// Bytes a download fetches, once Hugging Face has told us.

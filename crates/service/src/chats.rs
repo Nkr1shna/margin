@@ -31,6 +31,7 @@ use crate::state::{
 use crate::turns::{self, Start};
 use crate::{db, ingest, sources, workspaces};
 use margin_shared::context::LibraryKind;
+use margin_shared::sync::Locked;
 
 /// Longest message accepted, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
@@ -79,7 +80,7 @@ pub async fn chat_row(state: &AppState, id: &str) -> AppResult<Chat> {
 /// `save_chat_locked` (read from the store on first use). Empty (nobody) once the chat
 /// is gone.
 pub async fn chat_audience(state: &AppState, chat_id: &str) -> anyhow::Result<Vec<String>> {
-    if let Some(a) = state.turns.audiences.lock().unwrap().get(chat_id) {
+    if let Some(a) = state.turns.audiences.locked().get(chat_id) {
         return Ok(a.clone());
     }
     let Some(chat) = state.store.get::<Chat>(db::CHAT, chat_id).await? else {
@@ -89,8 +90,7 @@ pub async fn chat_audience(state: &AppState, chat_id: &str) -> anyhow::Result<Ve
     state
         .turns
         .audiences
-        .lock()
-        .unwrap()
+        .locked()
         .insert(chat_id.to_string(), audience.clone());
     Ok(audience)
 }
@@ -101,8 +101,7 @@ pub fn cached_audience(state: &AppState, chat_id: &str) -> Vec<String> {
     state
         .turns
         .audiences
-        .lock()
-        .unwrap()
+        .locked()
         .get(chat_id)
         .cloned()
         .unwrap_or_default()
@@ -156,8 +155,7 @@ pub async fn save_chat_locked(state: &AppState, chat: &mut Chat) -> anyhow::Resu
     state
         .turns
         .audiences
-        .lock()
-        .unwrap()
+        .locked()
         .insert(chat.id.clone(), chat.audience());
     if changed {
         state.emit_owned(&*chat, Event::ChatChanged { chat: chat.clone() });
@@ -201,7 +199,7 @@ pub fn public_item(state: &AppState, item: &ChatItem) -> ChatItem {
 /// The next `seq` for an item of `chat_id`. Call with `write_lock` held: the counter is
 /// read from the store once per chat and then kept in memory.
 pub async fn next_seq_locked(state: &AppState, chat_id: &str) -> anyhow::Result<u64> {
-    let known = state.turns.seqs.lock().unwrap().get(chat_id).copied();
+    let known = state.turns.seqs.locked().get(chat_id).copied();
     let last = match known {
         Some(last) => last,
         None => items(state, chat_id)
@@ -211,12 +209,7 @@ pub async fn next_seq_locked(state: &AppState, chat_id: &str) -> anyhow::Result<
             .unwrap_or(0),
     };
     let next = last + 1;
-    state
-        .turns
-        .seqs
-        .lock()
-        .unwrap()
-        .insert(chat_id.to_string(), next);
+    state.turns.seqs.locked().insert(chat_id.to_string(), next);
     Ok(next)
 }
 
@@ -463,7 +456,7 @@ pub async fn get_chat(
         .map(|r| public_item(&state, &r.item))
         .collect();
     // In-progress text lives in memory until the item is done.
-    let live = state.turns.live_text.lock().unwrap();
+    let live = state.turns.live_text.locked();
     for item in &mut items {
         if item.status != margin_shared::ItemStatus::InProgress {
             continue;
@@ -570,7 +563,7 @@ pub async fn delete_chat(
         state.turns.abort(&id);
         {
             let rows = items(&state, &id).await?;
-            let mut live = state.turns.live_text.lock().unwrap();
+            let mut live = state.turns.live_text.locked();
             for r in rows {
                 live.remove(&r.item.id);
             }

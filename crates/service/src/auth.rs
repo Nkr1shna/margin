@@ -22,6 +22,7 @@ use crate::people::{self, Admission};
 use crate::principal::{CurrentPrincipal, PrincipalKind, device_required};
 use crate::secrets::GITHUB_CLIENT_SECRET;
 use crate::state::{AppState, DeviceRow, new_id, random_token, sha256_hex};
+use margin_shared::sync::Locked;
 
 pub const LOGIN_TTL_MINUTES: i64 = 10;
 const LAST_SEEN_INTERVAL_SECONDS: i64 = 60;
@@ -59,11 +60,7 @@ pub enum LoginPhase {
 /// Drops logins past their expiry.
 pub fn purge_expired_logins(state: &AppState) {
     let now = Utc::now();
-    state
-        .logins
-        .lock()
-        .unwrap()
-        .retain(|_, l| l.expires_at > now);
+    state.logins.locked().retain(|_, l| l.expires_at > now);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +102,7 @@ impl RateLimiter {
         per_minute: u32,
     ) -> Result<(), StdDuration> {
         let now = Instant::now();
-        let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.windows.locked();
         let entry = map.entry((route, client)).or_insert((now, 0));
         if now.duration_since(entry.0) >= WINDOW {
             *entry = (now, 0);
@@ -121,8 +118,7 @@ impl RateLimiter {
     pub fn purge(&self) {
         let now = Instant::now();
         self.windows
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .locked()
             .retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
     }
 }
@@ -314,7 +310,7 @@ pub async fn start(
     .map_err(|e| AppError::internal(format!("bad github_oauth_url: {e}")))?
     .to_string();
 
-    state.logins.lock().unwrap().insert(
+    state.logins.locked().insert(
         login_id.clone(),
         Login {
             device_name,
@@ -339,7 +335,7 @@ pub async fn poll(
 ) -> AppResult<Json<LoginState>> {
     let now = Utc::now();
     let collected = {
-        let mut logins = state.logins.lock().unwrap();
+        let mut logins = state.logins.locked();
         let Some(login) = logins.get_mut(&req.login_id) else {
             return Ok(Json(LoginState::Expired));
         };
@@ -509,7 +505,7 @@ async fn callback_outcome(state: &AppState, q: CallbackQuery) -> Outcome {
         return Outcome::Expired;
     };
     {
-        let mut logins = state.logins.lock().unwrap();
+        let mut logins = state.logins.locked();
         let Some(login) = logins.get_mut(&login_id) else {
             return Outcome::Expired;
         };
@@ -562,7 +558,7 @@ async fn callback_outcome(state: &AppState, q: CallbackQuery) -> Outcome {
         LoginPhase::Denied { reason } => Outcome::Denied(reason.clone()),
         _ => Outcome::Expired,
     };
-    if let Some(login) = state.logins.lock().unwrap().get_mut(&login_id) {
+    if let Some(login) = state.logins.locked().get_mut(&login_id) {
         login.phase = phase;
     }
     outcome
