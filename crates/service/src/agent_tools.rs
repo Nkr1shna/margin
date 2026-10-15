@@ -52,8 +52,9 @@ use tokio::sync::oneshot;
 use crate::error::{AppError, AppResult};
 use crate::library::{self, sort_topics};
 use crate::pipeline::{Hit, Packed};
-use crate::state::{AppState, Author, StoredLesson, StoredVideo};
-use crate::{ask, db, folders, retrieval, search, sources, video};
+use crate::principal::Principal;
+use crate::state::{AppState, Author, StoredLesson, StoredVideo, can_read, list_visible};
+use crate::{ask, db, folders, retrieval, search, sources, turns, video};
 
 /// How long `search` waits for sources still being read before searching what
 /// is ready.
@@ -116,6 +117,25 @@ pub const SYNC_FOLDER: &str = "sync_folder";
 /// A failed lookup as the model reads it.
 fn failed(e: AppError) -> ToolOutput {
     ToolOutput::error(e.message)
+}
+
+/// The principal a tool acts as (L1 D6): the chat's owner, with their access now. The
+/// tools read and write through the same `&Principal` functions as the routes, so a tool
+/// sees only what the chat's owner may read and changes only what they own.
+async fn acting(state: &AppState, ctx: &ToolContext) -> Result<Arc<Principal>, ToolOutput> {
+    turns::chat_principal(state, &ctx.chat_id)
+        .await
+        .map_err(failed)
+}
+
+/// `acting`, returning the tool's error output from the enclosing future.
+macro_rules! acting {
+    ($state:expr, $ctx:expr) => {
+        match acting($state, $ctx).await {
+            Ok(p) => p,
+            Err(out) => return out,
+        }
+    };
 }
 
 fn internal(e: anyhow::Error) -> ToolOutput {
@@ -207,7 +227,7 @@ fn source_status(status: &SourceStatus) -> String {
     }
 }
 
-/// The library at the moment of the call.
+/// The library at the moment of the call, as the chat's owner may read it.
 struct Snapshot {
     topics: Vec<Topic>,
     lessons: Vec<StoredLesson>,
@@ -215,10 +235,10 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    async fn load(state: &AppState) -> anyhow::Result<Self> {
-        let mut topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
+    async fn load(state: &AppState, who: &Principal) -> anyhow::Result<Self> {
+        let mut topics: Vec<Topic> = list_visible(&state.store, db::TOPIC, who).await?;
         sort_topics(&mut topics);
-        let mut lessons: Vec<StoredLesson> = state.store.list(db::LESSON).await?;
+        let mut lessons: Vec<StoredLesson> = list_visible(&state.store, db::LESSON, who).await?;
         lessons.sort_by(|a, b| {
             a.lesson
                 .topic_id
@@ -226,7 +246,7 @@ impl Snapshot {
                 .then(a.lesson.position.cmp(&b.lesson.position))
                 .then(a.lesson.created_at.cmp(&b.lesson.created_at))
         });
-        let mut notes: Vec<Note> = state.store.list(db::NOTE).await?;
+        let mut notes: Vec<Note> = list_visible(&state.store, db::NOTE, who).await?;
         notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
         Ok(Self {
             topics,
@@ -275,13 +295,14 @@ impl TypedTool for SearchLibrary {
         format!("Searching the library for {}", quoted(&args.query))
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let query = args.query.trim();
             if query.is_empty() {
                 return ToolOutput::error("Give some words to search for.");
             }
-            let hits = match search::find(&self.0.store, query).await {
+            let hits = match search::find(&self.0.store, &who, query).await {
                 Ok(h) => h,
                 Err(e) => return internal(e),
             };
@@ -311,9 +332,10 @@ impl TypedTool for ListTopics {
         "Listing the topics".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, _args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, _args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
-            let lib = match Snapshot::load(&self.0).await {
+            let who = acting!(&self.0, ctx);
+            let lib = match Snapshot::load(&self.0, &who).await {
                 Ok(l) => l,
                 Err(e) => return internal(e),
             };
@@ -387,20 +409,22 @@ impl TypedTool for GetTopic {
         "Opening a topic".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
-            let topic = match library::topic(state, &args.topic_id).await {
+            let topic = match library::topic(state, &who, &args.topic_id).await {
                 Ok(t) => t,
                 Err(e) => return failed(e),
             };
             let result = async {
-                let lib = Snapshot::load(state).await?;
+                let lib = Snapshot::load(state, &who).await?;
                 let videos: Vec<StoredVideo> = state.store.list(db::VIDEO).await?;
                 let mut topic_sources: Vec<Source> = state
                     .store
                     .list_where(db::SOURCE, "topic_id", &topic.id)
                     .await?;
+                topic_sources.retain(|s| can_read(&who, s));
                 topic_sources.sort_by_key(|s| s.created_at);
                 anyhow::Ok((lib, videos, topic_sources))
             };
@@ -490,14 +514,15 @@ impl TypedTool for ReadLesson {
         "Reading a lesson".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
-            let row = match library::lesson(state, &args.lesson_id).await {
+            let row = match library::lesson(state, &who, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
-            let topics: Vec<Topic> = match state.store.list(db::TOPIC).await {
+            let topics: Vec<Topic> = match list_visible(&state.store, db::TOPIC, &who).await {
                 Ok(t) => t,
                 Err(e) => return internal(e),
             };
@@ -554,14 +579,15 @@ impl TypedTool for ReadNote {
         "Reading a note".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
-            let note = match library::note(state, &args.note_id).await {
+            let note = match library::note(state, &who, &args.note_id).await {
                 Ok(n) => n,
                 Err(e) => return failed(e),
             };
-            let lib = match Snapshot::load(state).await {
+            let lib = match Snapshot::load(state, &who).await {
                 Ok(l) => l,
                 Err(e) => return internal(e),
             };
@@ -611,15 +637,16 @@ impl TypedTool for ListNotes {
         }
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
             if let Some(t) = &args.topic_id
-                && let Err(e) = library::topic(state, t).await
+                && let Err(e) = library::topic(state, &who, t).await
             {
                 return failed(e);
             }
-            let lib = match Snapshot::load(state).await {
+            let lib = match Snapshot::load(state, &who).await {
                 Ok(l) => l,
                 Err(e) => return internal(e),
             };
@@ -728,6 +755,7 @@ impl TypedTool for Search {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
             let query = args.query.trim().to_string();
             if query.is_empty() {
@@ -735,7 +763,7 @@ impl TypedTool for Search {
             }
             let scope_arg = args.scope.unwrap_or_default();
             let library = scope_arg.library.unwrap_or(false);
-            let scope = match search_scope(state, ctx, &scope_arg).await {
+            let scope = match search_scope(state, &who, ctx, &scope_arg).await {
                 Ok(Ok(scope)) => scope,
                 Ok(Err(out)) => return out,
                 Err(e) => return internal(e),
@@ -771,7 +799,8 @@ impl TypedTool for Search {
                     .collect(),
                 k: k as u32,
                 budget: None,
-                access: None,
+                // The chat owner's access (L1; L2 enforces it inside the index).
+                access: Some(who.paths.clone()),
             };
             let packed = if resolved.is_empty() {
                 Vec::new()
@@ -804,7 +833,7 @@ impl TypedTool for Search {
                 }
             };
             let lessons = if library {
-                match search::find(&state.store, &query).await {
+                match search::find(&state.store, &who, &query).await {
                     Ok(hits) => hits,
                     Err(e) => return internal(e),
                 }
@@ -931,13 +960,14 @@ fn search_output(
 /// `Ok(Err(..))` is an error output for the model.
 async fn search_scope(
     state: &AppState,
+    who: &Principal,
     ctx: &ToolContext,
     arg: &SearchScopeArg,
 ) -> anyhow::Result<Result<Scope, ToolOutput>> {
     let chat: Option<Chat> = state.store.get(db::CHAT, &ctx.chat_id).await?;
     let mut scopes = Vec::new();
     if let Some(topic_id) = &arg.topic_id {
-        if let Err(e) = library::topic(state, topic_id).await {
+        if let Err(e) = library::topic(state, who, topic_id).await {
             return Ok(Err(failed(e)));
         }
         scopes.push(Scope::Topic {
@@ -947,7 +977,12 @@ async fn search_scope(
     if let Some(ids) = arg.source_ids.as_ref().filter(|ids| !ids.is_empty()) {
         let mut known = Vec::new();
         for id in ids {
-            if state.store.get::<Source>(db::SOURCE, id).await?.is_some()
+            // A source the chat's owner can't read doesn't exist for this chat.
+            let source = state.store.get::<Source>(db::SOURCE, id).await?;
+            if source.as_ref().is_some_and(|s| !can_read(who, s)) {
+                continue;
+            }
+            if source.is_some()
                 || state
                     .store
                     .get::<context::Document>(db::DOCUMENT, id)
@@ -1323,17 +1358,18 @@ impl TypedTool for ListSources {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
+            let who = acting!(&self.0, ctx);
             let state = &self.0;
             if let Some(t) = &args.topic_id
-                && let Err(e) = library::topic(state, t).await
+                && let Err(e) = library::topic(state, &who, t).await
             {
                 return failed(e);
             }
             let loaded = async {
-                let mut all: Vec<Source> = state.store.list(db::SOURCE).await?;
+                let mut all: Vec<Source> = list_visible(&state.store, db::SOURCE, &who).await?;
                 all.retain(|s| s.workspace_id.is_none());
                 all.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-                let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
+                let topics: Vec<Topic> = list_visible(&state.store, db::TOPIC, &who).await?;
                 let chat: Option<Chat> = state.store.get(db::CHAT, &ctx.chat_id).await?;
                 anyhow::Ok((all, topics, chat))
             };
@@ -1781,12 +1817,17 @@ impl TypedTool for CreateTopic {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let req = NewTopic {
                 parent_id: args.parent_id,
                 title: args.title,
             };
-            let topic = match library::new_topic(&state, req).await {
+            let topic = match library::new_topic(&state, &who, req).await {
                 Ok(t) => t,
                 Err(e) => return failed(e),
             };
@@ -1835,8 +1876,13 @@ impl TypedTool for RenameTopic {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let before = match library::topic(&state, &args.topic_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let before = match library::topic(&state, &who, &args.topic_id).await {
                 Ok(t) => t,
                 Err(e) => return failed(e),
             };
@@ -1844,7 +1890,7 @@ impl TypedTool for RenameTopic {
                 title: Some(args.title),
                 ..TopicPatch::default()
             };
-            let topic = match library::update_topic(&state, &args.topic_id, patch).await {
+            let topic = match library::update_topic(&state, &who, &args.topic_id, patch).await {
                 Ok(t) => t,
                 Err(e) => return failed(e),
             };
@@ -1892,10 +1938,17 @@ impl TypedTool for MoveTopic {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let index = args.position.map(|p| p as usize);
             let topic =
-                match library::place_topic(&state, &args.topic_id, args.parent_id, index).await {
+                match library::place_topic(&state, &who, &args.topic_id, args.parent_id, index)
+                    .await
+                {
                     Ok(t) => t,
                     Err(e) => return failed(e),
                 };
@@ -1950,8 +2003,13 @@ impl TypedTool for EditLessonTitle {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let before = match library::lesson(&state, &args.lesson_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let before = match library::lesson(&state, &who, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
@@ -1960,7 +2018,9 @@ impl TypedTool for EditLessonTitle {
                 ..LessonPatch::default()
             };
             let lesson =
-                match library::update_lesson(&state, &args.lesson_id, patch, Author::Agent).await {
+                match library::update_lesson(&state, &who, &args.lesson_id, patch, Author::Agent)
+                    .await
+                {
                     Ok(l) => l,
                     Err(e) => return failed(e),
                 };
@@ -2007,7 +2067,12 @@ impl TypedTool for CreateNote {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let title = match library::clean_title(&args.title, "note") {
                 Ok(t) => t,
                 Err(e) => return failed(e),
@@ -2019,7 +2084,7 @@ impl TypedTool for CreateNote {
                 body_md: args.body_md,
                 quote: None,
             };
-            let note = match library::new_note(&state, req, Author::Agent).await {
+            let note = match library::new_note(&state, &who, req, Author::Agent).await {
                 Ok(n) => n,
                 Err(e) => return failed(e),
             };
@@ -2067,12 +2132,17 @@ impl TypedTool for AppendToNote {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let text = args.text.trim();
             if text.is_empty() {
                 return ToolOutput::error("Give some text to add.");
             }
-            let note = match library::append_to_note(&state, &args.note_id, text).await {
+            let note = match library::append_to_note(&state, &who, &args.note_id, text).await {
                 Ok(n) => n,
                 Err(e) => return failed(e),
             };
@@ -2113,11 +2183,12 @@ impl TypedTool for ReplaceNoteBody {
 
     fn confirmation<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
         args: &'a Self::Args,
     ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
         Box::pin(async move {
-            let row = library::stored_note(&self.0, &args.note_id)
+            let who = acting(&self.0, ctx).await.map_err(|o| o.output)?;
+            let row = library::stored_note(&self.0, &who, &args.note_id)
                 .await
                 .map_err(|e| e.message)?;
             // An empty body has none of the owner's writing to overwrite.
@@ -2142,12 +2213,18 @@ impl TypedTool for ReplaceNoteBody {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let patch = NotePatch {
                 title: None,
                 body_md: Some(args.body_md),
             };
-            let note = match library::update_note(&state, &args.note_id, patch, Author::Agent).await
+            let note = match library::update_note(&state, &who, &args.note_id, patch, Author::Agent)
+                .await
             {
                 Ok(n) => n,
                 Err(e) => return failed(e),
@@ -2226,6 +2303,10 @@ impl TypedTool for ProposeCourse {
         let chat_id = ctx.chat_id.clone();
         let turn_id = ctx.turn_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let request = AskRequest {
                 prompt: args.prompt,
                 lesson_count: args.lessons.len() as u32,
@@ -2251,6 +2332,7 @@ impl TypedTool for ProposeCourse {
             let survey = args.survey;
             let proposal = match ask::propose_planned(
                 &state,
+                &who,
                 &chat_id,
                 request,
                 outline,
@@ -2281,7 +2363,9 @@ impl TypedTool for ProposeCourse {
             };
             let filed_under = match &proposal.request.parent_topic_id {
                 Some(parent) => {
-                    let topics: Vec<Topic> = state.store.list(db::TOPIC).await.unwrap_or_default();
+                    let topics: Vec<Topic> = list_visible(&state.store, db::TOPIC, &who)
+                        .await
+                        .unwrap_or_default();
                     let by_id: HashMap<&str, &Topic> =
                         topics.iter().map(|t| (t.id.as_str(), t)).collect();
                     topic_path(&by_id, parent)
@@ -2339,6 +2423,10 @@ impl TypedTool for AcceptProposalTool {
         let state = self.0.clone();
         let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let proposal: Option<Proposal> =
                 match state.store.get(db::PROPOSAL, &args.proposal_id).await {
                     Ok(p) => p,
@@ -2364,10 +2452,11 @@ impl TypedTool for AcceptProposalTool {
                 outline,
                 chips: OutlineChips::default(),
             };
-            let (topic, accepted) = match ask::accept_proposal(&state, &proposal.id, req).await {
-                Ok(t) => t,
-                Err(e) => return failed(e),
-            };
+            let (topic, accepted) =
+                match ask::accept_proposal(&state, &who, &proposal.id, req).await {
+                    Ok(t) => t,
+                    Err(e) => return failed(e),
+                };
             let lessons: Vec<Value> = match library::topic_lessons(&state, &topic.id).await {
                 Ok(rows) => rows
                     .iter()
@@ -2448,7 +2537,12 @@ impl TypedTool for WriteLesson {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         let workspace_ids: Vec<String> = ctx.workspaces.iter().map(|w| w.id.clone()).collect();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
             let req = ask::NewLesson {
                 topic_id: args.topic_id,
                 title: args.title,
@@ -2459,7 +2553,7 @@ impl TypedTool for WriteLesson {
                 // It draws on the chat's folders too, as a course proposed here would.
                 workspace_ids,
             };
-            let lesson = match ask::append_lesson(&state, req).await {
+            let lesson = match ask::append_lesson(&state, &who, req).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
@@ -2503,11 +2597,12 @@ impl TypedTool for RegenerateLesson {
 
     fn confirmation<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
         args: &'a Self::Args,
     ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
         Box::pin(async move {
-            let row = library::lesson(&self.0, &args.lesson_id)
+            let who = acting(&self.0, ctx).await.map_err(|o| o.output)?;
+            let row = library::lesson(&self.0, &who, &args.lesson_id)
                 .await
                 .map_err(|e| e.message)?;
             // An empty body has none of the owner's edits to lose.
@@ -2524,8 +2619,13 @@ impl TypedTool for RegenerateLesson {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let lesson = match ask::regenerate_lesson(&state, &args.lesson_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let lesson = match ask::regenerate_lesson(&state, &who, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
@@ -2567,8 +2667,13 @@ impl TypedTool for MakeVideo {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let row = match library::lesson(&state, &args.lesson_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let row = match library::lesson(&state, &who, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
@@ -2650,7 +2755,12 @@ impl TypedTool for AttachSources {
         let state = self.0.clone();
         let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            match attach_chat_files(&state, &chat_id, &args.source_ids, &args.topic_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            match attach_chat_files(&state, &who, &chat_id, &args.source_ids, &args.topic_id).await
+            {
                 Ok(Ok(out)) => out,
                 Ok(Err(e)) => failed(e),
                 Err(e) => internal(e),
@@ -2664,6 +2774,7 @@ impl TypedTool for AttachSources {
 /// emits after releasing it. `Ok(Err(..))` is a refusal the model reads; nothing moved.
 async fn attach_chat_files(
     state: &AppState,
+    who: &Principal,
     chat_id: &str,
     source_ids: &[String],
     topic_id: &str,
@@ -2681,7 +2792,8 @@ async fn attach_chat_files(
     }
     let (topic, moved, already, events) = {
         let _w = state.write_lock.lock().await;
-        let topic = match library::topic(state, topic_id).await {
+        // Filing under a topic changes it: it must be the chat owner's own.
+        let topic = match library::own_topic(state, who, topic_id).await {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };
@@ -2721,12 +2833,10 @@ async fn attach_chat_files(
             }
         }
         let move_ids: Vec<String> = moved.iter().map(|s| s.id.clone()).collect();
-        let events = sources::attach_locked(state, &move_ids, &topic.id).await?;
+        let events = sources::attach_locked(state, &move_ids, &topic).await?;
         (topic, moved, already, events)
     };
-    for e in events {
-        state.emit(e);
-    }
+    state.emit_all(events);
     let names = |list: &[Source]| -> Vec<Value> {
         list.iter()
             .map(|s| json!({ "id": s.id, "name": s.name }))
@@ -2765,14 +2875,14 @@ struct TopicContents {
 }
 
 impl TopicContents {
-    async fn load(state: &AppState, topic_id: &str) -> Result<Self, String> {
-        let topic = library::topic(state, topic_id)
+    async fn load(state: &AppState, who: &Principal, topic_id: &str) -> Result<Self, String> {
+        let topic = library::topic(state, who, topic_id)
             .await
             .map_err(|e| e.message)?;
         let counted = async {
-            let lib = Snapshot::load(state).await?;
+            let lib = Snapshot::load(state, who).await?;
             let videos: Vec<StoredVideo> = state.store.list(db::VIDEO).await?;
-            let all_sources: Vec<Source> = state.store.list(db::SOURCE).await?;
+            let all_sources: Vec<Source> = list_visible(&state.store, db::SOURCE, who).await?;
             let within = subtree(&lib.topics, topic_id);
             let lesson_ids: HashSet<&str> = lib
                 .lessons
@@ -2838,11 +2948,12 @@ impl TypedTool for DeleteTopic {
 
     fn confirmation<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
         args: &'a Self::Args,
     ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
         Box::pin(async move {
-            let contents = TopicContents::load(&self.0, &args.topic_id).await?;
+            let who = acting(&self.0, ctx).await.map_err(|o| o.output)?;
+            let contents = TopicContents::load(&self.0, &who, &args.topic_id).await?;
             let parts = contents.parts();
             let detail = if parts.is_empty() {
                 "It's empty.".to_string()
@@ -2859,12 +2970,17 @@ impl TypedTool for DeleteTopic {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let contents = match TopicContents::load(&state, &args.topic_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let contents = match TopicContents::load(&state, &who, &args.topic_id).await {
                 Ok(c) => c,
                 Err(message) => return ToolOutput::error(message),
             };
-            if let Err(e) = library::remove_topic(&state, &args.topic_id).await {
+            if let Err(e) = library::remove_topic(&state, &who, &args.topic_id).await {
                 return failed(e);
             }
             let output = json!({
@@ -2901,12 +3017,13 @@ impl TypedTool for DeleteLesson {
 
     fn confirmation<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
         args: &'a Self::Args,
     ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
         Box::pin(async move {
+            let who = acting(&self.0, ctx).await.map_err(|o| o.output)?;
             let state = &self.0;
-            let row = library::lesson(state, &args.lesson_id)
+            let row = library::lesson(state, &who, &args.lesson_id)
                 .await
                 .map_err(|e| e.message)?;
             let counted = async {
@@ -2943,12 +3060,17 @@ impl TypedTool for DeleteLesson {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let row = match library::lesson(&state, &args.lesson_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let row = match library::lesson(&state, &who, &args.lesson_id).await {
                 Ok(l) => l,
                 Err(e) => return failed(e),
             };
-            if let Err(e) = library::remove_lesson(&state, &args.lesson_id).await {
+            if let Err(e) = library::remove_lesson(&state, &who, &args.lesson_id).await {
                 return failed(e);
             }
             let output = json!({
@@ -2980,11 +3102,12 @@ impl TypedTool for DeleteNote {
 
     fn confirmation<'a>(
         &'a self,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
         args: &'a Self::Args,
     ) -> BoxFuture<'a, Result<Option<ConfirmationPrompt>, String>> {
         Box::pin(async move {
-            let row = library::stored_note(&self.0, &args.note_id)
+            let who = acting(&self.0, ctx).await.map_err(|o| o.output)?;
+            let row = library::stored_note(&self.0, &who, &args.note_id)
                 .await
                 .map_err(|e| e.message)?;
             let who = match row.author {
@@ -3006,12 +3129,17 @@ impl TypedTool for DeleteNote {
 
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
+        let chat_id = ctx.chat_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let note = match library::note(&state, &args.note_id).await {
+            let who = match crate::turns::chat_principal(&state, &chat_id).await {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let note = match library::note(&state, &who, &args.note_id).await {
                 Ok(n) => n,
                 Err(e) => return failed(e),
             };
-            if let Err(e) = library::remove_note(&state, &args.note_id).await {
+            if let Err(e) = library::remove_note(&state, &who, &args.note_id).await {
                 return failed(e);
             }
             let title = note_title(&note).to_string();
@@ -3032,6 +3160,9 @@ mod tests {
 
     fn t(id: &str, parent: Option<&str>) -> Topic {
         Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(Into::into),
             title: id.to_uppercase(),

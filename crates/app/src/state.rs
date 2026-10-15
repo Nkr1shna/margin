@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use dioxus::prelude::*;
 use margin_shared::{
-    Citation, DeviceFrame, DeviceToolCall, DeviceToolResult, Id, Me, TranscriptSegment,
+    Citation, DeviceFrame, DeviceToolCall, DeviceToolResult, Id, Me, Person, TranscriptSegment,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -95,6 +95,18 @@ pub struct AppCtx {
     pub ask_workspaces: Signal<Vec<Id>>,
 }
 
+/// What the sign-in screen says after the service refused this device's token: the
+/// service's own sentence when it gave a reason (a disabled person), else that the device
+/// was signed out.
+pub fn signed_out_reason(failure: &ApiFailure) -> String {
+    if failure.status == Some(401) && failure.code != "unauthorized" && !failure.message.is_empty()
+    {
+        failure.message.clone()
+    } else {
+        "This device was signed out by the service. Sign in again.".into()
+    }
+}
+
 /// An app-control tool call for the shell to run, and where its answer goes.
 #[derive(Debug)]
 pub struct AgentCommand {
@@ -151,11 +163,38 @@ impl AppCtx {
     /// Returns the message to show.
     pub fn failure(&self, failure: &ApiFailure) -> String {
         if failure.is_unauthorized() {
-            self.forget_session(Some(
-                "This device was signed out by the service. Sign in again.".into(),
-            ));
+            self.forget_session(Some(signed_out_reason(failure)));
         }
         failure.message.clone()
+    }
+
+    /// The signed-in person (from `GET /api/me`), once known. Reading it subscribes.
+    pub fn person(&self) -> Option<Person> {
+        self.session
+            .read()
+            .as_ref()
+            .and_then(|s| s.me.as_ref())
+            .and_then(|m| m.person.clone())
+    }
+
+    /// Whether the signed-in person is an organisation admin (or the owner). Before the
+    /// person is known (or from a service before L1) the controls show as they always did.
+    pub fn is_admin(&self) -> bool {
+        self.person().is_none_or(|p| p.org_role.is_admin())
+    }
+
+    /// Change the signed-in person as the session holds them (their own row came back
+    /// from a request, or an event changed it).
+    pub fn update_person(&self, update: impl FnOnce(&mut Person)) {
+        let mut session = self.session;
+        if let Some(person) = session
+            .write()
+            .as_mut()
+            .and_then(|s| s.me.as_mut())
+            .and_then(|m| m.person.as_mut())
+        {
+            update(person);
+        }
     }
 
     /// Drop the local token and session without calling the service.
@@ -185,8 +224,14 @@ impl AppCtx {
         let session = self.session.peek().clone();
         if let Some(session) = session {
             let device = match &session.me {
-                Some(me) => Some(me.device.id.clone()),
-                None => session.api.me().await.ok().map(|me| me.device.id),
+                Some(me) => me.device.as_ref().map(|d| d.id.clone()),
+                None => session
+                    .api
+                    .me()
+                    .await
+                    .ok()
+                    .and_then(|me| me.device)
+                    .map(|d| d.id),
             };
             if let Some(device) = device {
                 let _ = session.api.revoke_device(&device).await;

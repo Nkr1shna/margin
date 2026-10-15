@@ -777,6 +777,45 @@ details.collapse[open] > summary .chev { transform: none; }
 .tool-h { display: flex; align-items: center; gap: 10px; }
 .tool-h b { font-weight: 500; font-family: var(--font-mono); font-size: 13.5px; }
 .key-saved { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* Settings → Organisation and Account: people, invitations, groups, agents (L1). */
+.org-list { display: grid; }
+.org-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.org-row:last-child { border-bottom: 0; }
+.org-row > .avatar { margin-top: 2px; }
+.org-row .grow { display: grid; gap: 4px; min-width: 0; white-space: normal; }
+.org-row small { color: var(--fg-3); font-size: 12.5px; overflow-wrap: anywhere; }
+.org-title { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 14px; }
+.org-title b { font-weight: 500; overflow-wrap: anywhere; }
+.org-actions { justify-content: flex-end; flex: none; max-width: 55%; }
+.org-reason { max-width: 260px; text-align: right; }
+.org-row .grow > .row-actions { justify-content: flex-start; margin-top: 4px; }
+.org-accepted summary { cursor: pointer; font-size: 13.5px; color: var(--fg-2); padding: 4px 0; }
+.org-devices { display: grid; }
+.org-who { margin: 8px 0 0; font-size: 13px; font-weight: 500; color: var(--fg-2); }
+.org-dialog { width: min(520px, 100%); max-height: calc(100vh - 96px - var(--kb)); overflow: auto; }
+.org-form { display: grid; gap: 14px; }
+.seg.seg-wrap { display: flex; flex-wrap: wrap; border-radius: 16px; justify-self: start; }
+.check-tree { margin: 0; padding: 0; border: 0; display: grid; gap: 2px; min-width: 0; }
+.check-tree > legend { padding: 0; margin-bottom: 6px; font-size: 13px; font-weight: 500; color: var(--fg-2); }
+.check-row { display: flex; align-items: center; gap: 8px; min-height: 32px; font-size: 14px; flex-wrap: wrap; }
+.check-row input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
+.check-row .check-label { overflow-wrap: anywhere; }
+.check-row small { font-size: 12.5px; }
+.check-row.struck .check-label { text-decoration: line-through; color: var(--fg-3); }
+.token-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.token-line .input { flex: 1; min-width: 0; -webkit-user-select: text; user-select: text; }
+.token-command { flex: 1; min-width: 0; padding: 8px 10px; border-radius: var(--r-ctl); background: var(--surface); font-size: 12.5px; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+/* The sidebar's account row opens Settings → Account. */
+.sb-account { display: flex; align-items: center; gap: 8px; min-width: 0; border: 0; background: none; padding: 4px 6px; margin-left: -6px; border-radius: var(--r-ctl); text-align: left; }
+.sb-account:hover { background: var(--hover); }
+.sb-account-name { font-size: 13px; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+@media (max-width: 719px) {
+  /* Phones: a row's actions go under it, full width. */
+  .org-row { flex-wrap: wrap; }
+  .org-row .org-actions { max-width: none; flex: 1 0 100%; justify-content: flex-start; }
+  .org-row .org-reason { text-align: left; max-width: none; }
+  .token-line { flex-wrap: wrap; }
+}
 
 /* ---------- below 1024px: the sidebar becomes a drawer ---------- */
 /* Tablets in portrait, split view and small windows get the whole width for the lesson;

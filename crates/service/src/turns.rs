@@ -31,7 +31,8 @@ use tokio::task::JoinHandle;
 
 use crate::chats::{self, StoredChatItem};
 use crate::error::{AppError, AppResult};
-use crate::state::{AppState, DeviceRow};
+use crate::principal::Principal;
+use crate::state::{AppState, DeviceRow, Owned};
 use crate::trace::{self, SpanGuard, TraceSpan, TracedStream};
 use crate::{agent_tools, db, workspaces};
 
@@ -99,6 +100,9 @@ pub struct Turns {
     /// `(provider, base_url)`s that rejected server-side compaction since the service
     /// started (D3): their turns condense locally.
     pub no_server_compaction: Mutex<HashSet<(Provider, String)>>,
+    /// chat id → who hears about its items (the chat's audience, L1 D8), kept by
+    /// `chats::save_chat_locked` so streaming deltas need no store read.
+    pub audiences: Mutex<HashMap<Id, Vec<String>>>,
 }
 
 impl Turns {
@@ -115,6 +119,7 @@ impl Turns {
             title_model: Mutex::new(None),
             titled: Mutex::new(HashSet::new()),
             no_server_compaction: Mutex::new(HashSet::new()),
+            audiences: Mutex::new(HashMap::new()),
         }
     }
 
@@ -171,6 +176,7 @@ impl Turns {
         self.seqs.lock().unwrap().remove(chat_id);
         self.writes.lock().unwrap().remove(chat_id);
         self.titled.lock().unwrap().remove(chat_id);
+        self.audiences.lock().unwrap().remove(chat_id);
     }
 
     /// Whether `turn_id` is the chat's running turn.
@@ -250,11 +256,7 @@ pub async fn start_locked(
                 if !chat.source_ids.contains(id) {
                     chat.source_ids.push(id.clone());
                     // Searchable from this chat (an already read file's passages).
-                    if let Some(event) =
-                        crate::ingest::add_scope_locked(state, id, &chat.id).await?
-                    {
-                        state.emit(event);
-                    }
+                    state.emit_all(crate::ingest::add_scope_locked(state, id, &chat.id).await?);
                 }
             }
             let turn_id = crate::state::new_id();
@@ -421,14 +423,32 @@ struct Early {
 /// effort; history from `margin_agent::replay_input`), runs the turn, then sets
 /// `Idle` (finished) or `Failed`, and sends the pending message, if any, as the next
 /// turn.
+///
+/// The whole run happens inside `trace::with_principal(<chat owner>)`, so every trace
+/// row it records (model calls, retrieval, tools) names who the turn worked for.
 pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
+    let actor = chat_actor(&state, &chat_id).await;
+    trace::with_principal(
+        actor.clone(),
+        run_as(state, chat_id, turn_id, origin, actor),
+    )
+    .await;
+}
+
+async fn run_as(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef, actor: String) {
     // The turn's own row: recorded when the run ends, or as `cancelled` when Stop
     // aborts the task.
     let mut turn_row = SpanGuard::new(
-        TurnTrace::new(&state, &chat_id, &turn_id, None).span(TraceKind::Turn),
+        TurnTrace::new(&state, &chat_id, &turn_id, None, &actor).span(TraceKind::Turn),
         &state,
     );
-    let trace = TurnTrace::new(&state, &chat_id, &turn_id, Some(turn_row.row().id.clone()));
+    let trace = TurnTrace::new(
+        &state,
+        &chat_id,
+        &turn_id,
+        Some(turn_row.row().id.clone()),
+        &actor,
+    );
     let permit = state.turns.slots.clone().acquire_owned().await.ok();
     let slot: Slot = Arc::new(Mutex::new(permit));
     let result = AssertUnwindSafe(run_turn(
@@ -481,6 +501,23 @@ pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
     }
 }
 
+/// Who a chat's turns run for: `person/<owner>` (L1: chats belong to people; an agent
+/// token can't reach the chat routes). The bootstrap owner's for a chat that is gone.
+pub async fn chat_actor(state: &AppState, chat_id: &str) -> String {
+    let owner = match state.store.get::<Chat>(db::CHAT, chat_id).await {
+        Ok(Some(chat)) => chat.owner_id().to_string(),
+        _ => crate::principal::BOOTSTRAP_PERSON_ID.to_string(),
+    };
+    margin_shared::person_id(&owner)
+}
+
+/// The principal a chat's turn and its tools act as: the chat's owner, with their
+/// access now (their expansion is read again for every call).
+pub async fn chat_principal(state: &AppState, chat_id: &str) -> AppResult<Arc<Principal>> {
+    let chat = chats::chat_row(state, chat_id).await?;
+    crate::state::person_principal(state, chat.owner_id()).await
+}
+
 /// Everything but the bookkeeping: config, history, tools, `margin_agent::run_turn`.
 async fn run_turn(
     state: &AppState,
@@ -507,6 +544,18 @@ async fn run_turn(
             code: error_code::INTERRUPTED,
         });
     };
+    // The turn runs as the chat's owner (D6, D9): their access and their own settings.
+    let principal = crate::state::person_principal(state, chat.owner_id())
+        .await
+        .map_err(|e| {
+            tracing::error!(chat = %chat_id, "couldn't read the chat owner: {}", e.message);
+            Early {
+                message: "The person this chat belongs to can't be read. Check the service's log."
+                    .into(),
+                retryable: true,
+                code: error_code::STORAGE,
+            }
+        })?;
     // A missing key or model ends the turn like a failed model call. The chat's
     // provider, on its chat slot (`pipeline.routes.chat` when set).
     let choice = state
@@ -532,7 +581,7 @@ async fn run_turn(
         })
         .collect();
     let history = margin_agent::replay::history(chat.provider, &replay);
-    let workspaces = workspaces::by_ids(state, &chat.workspace_ids)
+    let workspaces = workspaces::visible_by_ids(state, &principal, &chat.workspace_ids)
         .await
         .map_err(internal)?;
     let tools = traced_tools(&agent_tools::registry(state), trace);
@@ -582,8 +631,15 @@ async fn run_turn(
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
         origin_device: origin,
+        // Who the turn runs for: the chat owner's principal id.
+        actor: principal.id.clone(),
         provider: chat.provider,
-        reasoning_effort: settings.reasoning_effort,
+        // The person's own effort, else the organisation's (D9).
+        reasoning_effort: principal
+            .person
+            .settings
+            .reasoning_effort
+            .unwrap_or(settings.reasoning_effort),
         history,
         workspaces,
     };
@@ -864,10 +920,16 @@ async fn send_pending_locked(state: &AppState, chat: &mut Chat) {
 ///
 /// Everything after the task is aborted runs as its own task, so a request dropped
 /// meanwhile (the client went away) can't leave the turn half stopped.
-pub async fn stop(state: &AppState, chat_id: &str, by_device: &str) -> AppResult<Chat> {
+pub async fn stop(
+    state: &AppState,
+    p: &Principal,
+    chat_id: &str,
+    by_device: &str,
+) -> AppResult<Chat> {
     let (turn_id, task) = {
         let _w = state.write_lock.lock().await;
-        let chat = chats::chat(state, chat_id).await?;
+        // Anyone in the chat's audience may stop it (D6).
+        let chat = chats::chat(state, p, chat_id).await?;
         let Some(turn_id) = chat
             .state
             .is_busy()
@@ -924,7 +986,7 @@ async fn finish_stop(
     let writes = await_writes(state, state.turns.take_writes(chat_id)).await;
     let _w = state.write_lock.lock().await;
     let stopped = async {
-        let mut chat = chats::chat(state, chat_id).await?;
+        let mut chat = chats::chat_row(state, chat_id).await?;
         // Nothing else ends a busy turn meanwhile: its task is gone and a delete removes
         // the chat. Checked anyway, so nothing is finished twice.
         if !chat.state.is_busy() || chat.state.turn_id() != Some(turn_id.as_str()) {
@@ -943,10 +1005,11 @@ async fn finish_stop(
     stopped
 }
 
-/// Continue an `Interrupted` or `Failed` turn. 409 "cannot_continue" otherwise.
-pub async fn resume(state: &AppState, chat_id: &str) -> AppResult<Chat> {
+/// Continue an `Interrupted` or `Failed` turn, by anyone in the chat's audience (D6).
+/// 409 "cannot_continue" otherwise.
+pub async fn resume(state: &AppState, p: &Principal, chat_id: &str) -> AppResult<Chat> {
     let _w = state.write_lock.lock().await;
-    let mut chat = chats::chat(state, chat_id).await?;
+    let mut chat = chats::chat(state, p, chat_id).await?;
     if !chat.state.can_continue() {
         return Err(cannot_continue());
     }
@@ -955,17 +1018,20 @@ pub async fn resume(state: &AppState, chat_id: &str) -> AppResult<Chat> {
 }
 
 /// Answers the confirmation card `item_id`: stores the decision on the card, sets the
-/// chat `Running`, wakes the waiting turn. 409 "not_waiting" if that card isn't the one
-/// the turn waits on.
+/// chat `Running`, wakes the waiting turn. Only the chat's owner answers (403
+/// `not_owner`; the change runs with their access). 409 "not_waiting" if that card isn't
+/// the one the turn waits on.
 pub async fn decide(
     state: &AppState,
+    p: &Principal,
     chat_id: &str,
     item_id: &str,
     approve: bool,
     by_device: &str,
 ) -> AppResult<Chat> {
     let _w = state.write_lock.lock().await;
-    let mut chat = chats::chat(state, chat_id).await?;
+    let mut chat = chats::chat(state, p, chat_id).await?;
+    crate::state::check_owner(p, &chat)?;
     let not_waiting = || {
         AppError::conflict(
             "not_waiting",
@@ -1603,12 +1669,17 @@ impl TurnSink for ServiceSink {
             so_far.push_str(text);
             offset
         };
-        self.state.emit(margin_shared::Event::ChatItemDelta {
-            chat_id: self.chat_id.clone(),
-            item_id: item.id.clone(),
-            offset,
-            text: text.to_string(),
-        });
+        // The item was saved (and the chat's audience cached) before it streams.
+        let audience = chats::cached_audience(&self.state, &self.chat_id);
+        self.state.emit_all([crate::state::Emitted::paths(
+            &audience,
+            margin_shared::Event::ChatItemDelta {
+                chat_id: self.chat_id.clone(),
+                item_id: item.id.clone(),
+                offset,
+                text: text.to_string(),
+            },
+        )]);
     }
 
     fn update_item<'a>(
@@ -1783,11 +1854,11 @@ fn spawn_title(state: &AppState, chat_id: &str, turn_id: &str) {
     {
         return;
     }
-    tokio::spawn(write_title(
-        state.clone(),
-        chat_id.to_string(),
-        turn_id.to_string(),
-    ));
+    let (state, chat_id, turn_id) = (state.clone(), chat_id.to_string(), turn_id.to_string());
+    tokio::spawn(async move {
+        let actor = chat_actor(&state, &chat_id).await;
+        trace::with_principal(actor, write_title(state, chat_id, turn_id)).await;
+    });
 }
 
 /// One plain text call on the default provider's small slot (at most
@@ -1863,7 +1934,13 @@ async fn ask_title(
     };
     let model = TracedText {
         inner,
-        trace: TurnTrace::new(state, chat_id, turn_id, None),
+        trace: TurnTrace::new(
+            state,
+            chat_id,
+            turn_id,
+            None,
+            &chat_actor(state, chat_id).await,
+        ),
         model: small.model.clone(),
         provider: small.config.provider.as_str(),
         purpose: "title",
@@ -1914,16 +1991,25 @@ pub struct TurnTrace {
     /// The turn row's id, for its model and tool calls.
     parent: Option<String>,
     pipeline_hash: String,
+    /// Who the turn runs for (`person/<id>`): every row's `actor` and `principal`.
+    actor: String,
 }
 
 impl TurnTrace {
-    pub fn new(state: &AppState, chat_id: &str, turn_id: &str, parent: Option<String>) -> Self {
+    pub fn new(
+        state: &AppState,
+        chat_id: &str,
+        turn_id: &str,
+        parent: Option<String>,
+        actor: &str,
+    ) -> Self {
         Self {
             state: state.clone(),
             chat_id: chat_id.to_string(),
             turn_id: turn_id.to_string(),
             parent,
             pipeline_hash: state.pipeline.load().hash.clone(),
+            actor: actor.to_string(),
         }
     }
 
@@ -1934,7 +2020,8 @@ impl TurnTrace {
         span.row.turn_id = Some(self.turn_id.clone());
         span.row.parent_id = self.parent.clone();
         span.row.pipeline_hash = Some(self.pipeline_hash.clone());
-        span.row.actor = Some("owner".into());
+        span.row.actor = Some(self.actor.clone());
+        span.row.principal = Some(self.actor.clone());
         span
     }
 }

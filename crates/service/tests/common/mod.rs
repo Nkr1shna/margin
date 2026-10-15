@@ -51,6 +51,8 @@ pub const CLIENT_ID: &str = "test-client-id";
 pub const CLIENT_SECRET: &str = "test-client-secret";
 pub const OWNER_CODE: &str = "code-owner";
 pub const OTHER_CODE: &str = "code-other";
+/// GitHub login `bob-dev` (id 3): a second person once invited (L1).
+pub const BOB_CODE: &str = "code-bob";
 pub const API_KEY: &str = "sk-test-very-secret-key";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +77,9 @@ pub async fn start_fake_github() -> String {
             Some(OTHER_CODE) => Json(
                 json!({"access_token": "gho_other", "token_type": "bearer", "scope": "read:user"}),
             ),
+            Some(BOB_CODE) => Json(
+                json!({"access_token": "gho_bob", "token_type": "bearer", "scope": "read:user"}),
+            ),
             _ => Json(
                 json!({"error": "bad_verification_code", "error_description": "The code passed is incorrect or expired."}),
             ),
@@ -94,6 +99,10 @@ pub async fn start_fake_github() -> String {
             "Bearer gho_other" => (
                 axum::http::StatusCode::OK,
                 Json(json!({"login": "someone-else", "id": 2})),
+            ),
+            "Bearer gho_bob" => (
+                axum::http::StatusCode::OK,
+                Json(json!({"login": "bob-dev", "id": 3})),
             ),
             _ => (
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -1259,15 +1268,43 @@ impl Harness {
         r.json().await.unwrap()
     }
 
-    /// Full sign-in; returns a device token.
+    /// Full sign-in as the owner; returns a device token.
     pub async fn sign_in(&self, device: &str) -> String {
+        self.sign_in_as(OWNER_CODE, device).await
+    }
+
+    /// Full sign-in with the fake GitHub's `code` (`OWNER_CODE`, `BOB_CODE`, …); returns
+    /// a device token. Panics unless the login is admitted.
+    pub async fn sign_in_as(&self, code: &str, device: &str) -> String {
         let s = self.start_login(device).await;
-        let r = self.callback(OWNER_CODE, &Self::state_param(&s)).await;
+        let r = self.callback(code, &Self::state_param(&s)).await;
         assert_eq!(r.status(), 200);
         match self.poll(&s).await {
             LoginState::Approved { token, .. } => token,
             other => panic!("expected approval, got {other:?}"),
         }
+    }
+
+    /// `POST /api/invitations` as `admin_token`; panics unless it succeeds.
+    pub async fn invite(
+        &self,
+        admin_token: &str,
+        github_login: &str,
+        role: margin_shared::OrgRole,
+        groups: &[&str],
+    ) -> margin_shared::Invitation {
+        let r = self
+            .post(admin_token, "/api/invitations")
+            .json(&margin_shared::NewInvitation {
+                github_login: github_login.into(),
+                role,
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        r.json().await.unwrap()
     }
 
     pub fn get(&self, token: &str, path: &str) -> reqwest::RequestBuilder {

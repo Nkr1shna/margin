@@ -2,10 +2,15 @@
 //! device (`DirectedFrame`: tool requests and cancels) and the device's answers
 //! (`DeviceFrame::ToolResult`, handed to `devices::DeviceHub::deliver`). While a socket
 //! is open its device counts as online (`Event::DeviceChanged`).
+//!
+//! Each socket sends only the events its principal may see (`Audience::allows`, L1 D8).
+//! The principal is the one `require_principal` built at upgrade, rebuilt whenever the
+//! expansions are invalidated (`groups::Expansions::watch`), so a person removed from a
+//! group stops receiving that group's events without reconnecting.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Extension;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -15,16 +20,18 @@ use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::auth::{self, CurrentDevice};
-use crate::db;
-use crate::state::{AppState, DeviceRow};
+use crate::auth;
+use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentDevice, CurrentPrincipal, Principal};
+use crate::state::{AppState, Audience, DeviceRow, Emitted};
+use crate::{db, groups};
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// "Try again later": the client fell behind and should reload.
 const CLOSE_LAGGED: u16 = 1013;
 
 /// `?traces=1`: also send `Event::Trace` for `model_call` and `retrieval` rows as they
-/// are written (nothing is pushed by default).
+/// are written (nothing is pushed by default). Admins only: anyone else's socket opens
+/// without them (owner Q6).
 #[derive(Debug, Default, Deserialize)]
 pub struct EventsQuery {
     #[serde(default)]
@@ -33,12 +40,13 @@ pub struct EventsQuery {
 
 pub async fn events(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentPrincipal(principal): CurrentPrincipal,
+    CurrentDevice(device): CurrentDevice,
     Query(q): Query<EventsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let traces = matches!(q.traces.as_deref(), Some("1" | "true"));
-    ws.on_upgrade(move |socket| run(state, device.id, traces, socket))
+    ws.on_upgrade(move |socket| run(state, device.id, principal, traces, socket))
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
@@ -52,15 +60,24 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 
 /// What one socket listens to.
 struct Feeds {
-    events: broadcast::Receiver<Event>,
+    events: broadcast::Receiver<Emitted>,
     revocations: broadcast::Receiver<Id>,
     shutdown: watch::Receiver<bool>,
     directed: mpsc::UnboundedReceiver<DirectedFrame>,
-    /// Trace rows, when the socket asked for them.
+    /// Trace rows, when the socket asked for them (sent while the principal is an
+    /// admin).
     traces: Option<broadcast::Receiver<TraceRow>>,
+    /// Changes whenever expansions are invalidated: the principal is rebuilt.
+    access: watch::Receiver<u64>,
 }
 
-async fn run(state: AppState, device_id: String, traces: bool, mut socket: WebSocket) {
+async fn run(
+    state: AppState,
+    device_id: String,
+    principal: Arc<Principal>,
+    traces: bool,
+    mut socket: WebSocket,
+) {
     let revocations = state.revocations.subscribe();
     let shutdown = state.shutdown.clone();
     // A revoke that landed between authenticating and subscribing.
@@ -72,6 +89,11 @@ async fn run(state: AppState, device_id: String, traces: bool, mut socket: WebSo
         return;
     }
 
+    // Watch before subscribing, so a change in between still rebuilds the principal.
+    let access = state.expansions.watch();
+    // Read the access once more after watching: a change since `require_principal`
+    // built the principal is then never missed.
+    let principal = Arc::new(re_expand(&state, &principal).await);
     // Other devices hear that this one came online; it knows that itself.
     let (conn, directed, came_online) = state.devices.register(&device_id);
     if came_online {
@@ -84,26 +106,72 @@ async fn run(state: AppState, device_id: String, traces: bool, mut socket: WebSo
         revocations,
         shutdown,
         directed,
-        traces: traces.then(|| state.tracer.subscribe()),
+        traces: (traces && principal.is_admin()).then(|| state.tracer.subscribe()),
+        access,
     };
-    serve(&state, &device_id, &mut socket, feeds).await;
+    serve(&state, &device_id, principal, &mut socket, feeds).await;
     if state.devices.unregister(&device_id, conn) {
         emit_presence(&state, &device_id).await;
     }
 }
 
-/// `DeviceChanged` with the device's presence now (nothing for a revoked device).
+/// `DeviceChanged` with the device's presence now (nothing for a revoked device), to
+/// its person's devices and the admins.
 async fn emit_presence(state: &AppState, device_id: &str) {
     if let Ok(Some(row)) = state.store.get::<DeviceRow>(db::DEVICE, device_id).await {
-        state.emit(Event::DeviceChanged {
-            device: auth::to_device(&row, "", state.devices.is_online(device_id)),
-        });
+        state.emit_to(
+            device_audience(&row),
+            Event::DeviceChanged {
+                device: auth::to_device(&row, "", state.devices.is_online(device_id)),
+            },
+        );
     }
+}
+
+/// Who hears about a device (`DeviceChanged`, `DeviceDeleted`): its person and the
+/// admins.
+pub fn device_audience(row: &DeviceRow) -> Audience {
+    Audience::PersonOrAdmins(
+        row.person_id
+            .clone()
+            .unwrap_or_else(|| BOOTSTRAP_PERSON_ID.to_string()),
+    )
+}
+
+/// `principal` with its expansion read again (memberships or role changed). Only a
+/// person holds a socket. When the expansion can't be read the socket keeps nothing
+/// but the person's own id until the next change: it fails closed.
+pub async fn re_expand(state: &AppState, principal: &Principal) -> Principal {
+    let mut p = principal.clone();
+    match groups::expansion(state, &principal.person_id).await {
+        Ok(e) => {
+            p.paths = e.paths.clone();
+            p.deny_ids = e.deny_ids.clone();
+            p.org_role = e.org_role;
+        }
+        Err(e) => {
+            tracing::warn!(
+                person = %principal.person_id,
+                "couldn't re-read a socket's access: {}",
+                e.message
+            );
+            p.paths = vec![principal.id.clone()];
+            p.deny_ids = p.paths.clone();
+            p.org_role = margin_shared::OrgRole::Member;
+        }
+    }
+    p
 }
 
 /// The socket's life once registered: Hello, then events and directed frames out and
 /// tool results in, until it closes.
-async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut feeds: Feeds) {
+async fn serve(
+    state: &AppState,
+    device_id: &str,
+    mut principal: Arc<Principal>,
+    socket: &mut WebSocket,
+    mut feeds: Feeds,
+) {
     let hello = Event::Hello {
         server_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -116,8 +184,11 @@ async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut fe
     loop {
         tokio::select! {
             ev = feeds.events.recv() => match ev {
+                // A filtered-out event is still consumed, so lag accounting is as before.
                 Ok(ev) => {
-                    if send_json(socket, &ev).await.is_err() {
+                    if ev.audience.allows(&principal)
+                        && send_json(socket, &ev.event).await.is_err()
+                    {
                         return;
                     }
                 }
@@ -131,9 +202,20 @@ async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut fe
                     return;
                 }
             },
+            changed = feeds.access.changed() => {
+                // The sender lives as long as the service.
+                if changed.is_err() {
+                    return;
+                }
+                feeds.access.mark_unchanged();
+                principal = Arc::new(re_expand(state, &principal).await);
+            }
             row = next_trace(&mut feeds.traces) => match row {
                 Ok(row) => {
-                    if send_json(socket, &Event::Trace { row: Box::new(row) }).await.is_err() {
+                    // Traces are for admins (a demoted admin's socket stops getting them).
+                    if principal.is_admin()
+                        && send_json(socket, &Event::Trace { row: Box::new(row) }).await.is_err()
+                    {
                         return;
                     }
                 }

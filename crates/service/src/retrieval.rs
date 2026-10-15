@@ -2151,7 +2151,7 @@ pub async fn wait_until_read(
         }
         let changed = async {
             loop {
-                match events.recv().await {
+                match events.recv().await.map(|e| e.event) {
                     Ok(
                         Event::SourceChanged { .. }
                         | Event::SourceDeleted { .. }

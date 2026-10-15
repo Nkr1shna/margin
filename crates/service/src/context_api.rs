@@ -1,16 +1,26 @@
 //! The context API for agents (`docs/agent-rag-architecture.md` §2.12): the same
-//! retrieval, outline and passage reads as Margin's own agent tools, over HTTP behind
-//! the device token (a per-agent token with a project scope later), plus ingest of an
-//! agent's document and the change feed. The MCP adapter is a thin layer over these.
+//! retrieval, outline and passage reads as Margin's own agent tools, over HTTP, plus
+//! ingest of an agent's document and the change feed. The MCP adapter is a thin layer
+//! over these.
 //!
 //! Every handler calls the function the agent's tool calls (`retrieval::context_search`,
 //! `retrieval::document_outline`, `retrieval::read_passages`): one retrieval path for
 //! Margin's agent, external agents and the GUI.
+//!
+//! Who calls (L1, `docs/l1-brief.md` D6, D7): a device token (the person; an
+//! `x-margin-agent` header names the agent for the trace rows, `agent:<name>`) or an
+//! agent's `mga_` token (the agent: `agent/<id>`, the header ignored). A search reads
+//! the caller's access paths; a caller-supplied `access` must be a subset of them (400
+//! `bad_access`). An ingested document belongs to the caller's person (an agent's: its
+//! owner) and only that person deletes or replaces it. Every trace row a request records
+//! names its principal. Outline and passages by document id are not filtered in L1
+//! (closed by L2).
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
+use margin_shared::access_code;
 use margin_shared::context::{
     AGENT_HEADER, ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
     Origin, Project, TraceKind, TraceRow, VIA_MCP, is_agent_name,
@@ -21,8 +31,10 @@ use serde::Deserialize;
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::principal::{CurrentPrincipal, Principal};
 use crate::retrieval::{self, BadScope, DocState};
 use crate::state::{AppState, new_id};
+use crate::{agents, trace};
 
 /// The project every scope resolves inside until there is more than one.
 pub const DEFAULT_PROJECT_NAME: &str = "My library";
@@ -35,6 +47,14 @@ fn not_ready() -> AppError {
     AppError::conflict(
         "not_ready",
         "That document is still being read. Try again in a moment.",
+    )
+}
+
+fn not_owner() -> AppError {
+    AppError::new(
+        StatusCode::FORBIDDEN,
+        access_code::NOT_OWNER,
+        "That document belongs to someone else; only they can change or delete it.",
     )
 }
 
@@ -55,9 +75,16 @@ pub async fn projects(State(state): State<AppState>) -> AppResult<Json<Vec<Proje
     Ok(Json(projects))
 }
 
-/// The agent `margin-mcp` names in `AGENT_HEADER`, as the trace rows' caller; `None`
-/// without the header (or with a name that isn't one).
-fn caller(headers: &HeaderMap) -> Option<retrieval::Caller> {
+/// Who the trace rows say called: an agent token is its agent (`agent/<id>`, whatever
+/// the header says); a device token names its agent in `AGENT_HEADER` (`agent:<name>`),
+/// or is the app's own call (`None`).
+fn caller(p: &Principal, headers: &HeaderMap) -> Option<retrieval::Caller> {
+    if p.is_agent() {
+        return Some(retrieval::Caller {
+            actor: p.id.clone(),
+            via: VIA_MCP.to_string(),
+        });
+    }
     let name = headers.get(AGENT_HEADER)?.to_str().ok()?.trim();
     is_agent_name(name).then(|| retrieval::Caller {
         actor: format!("agent:{name}"),
@@ -65,11 +92,32 @@ fn caller(headers: &HeaderMap) -> Option<retrieval::Caller> {
     })
 }
 
+/// The access paths a query reads: the caller's whole set, or the subset it asked for
+/// (400 `bad_access` naming the first path it may not read).
+pub fn query_access(p: &Principal, asked: Option<Vec<String>>) -> AppResult<Vec<String>> {
+    match asked {
+        None => Ok(p.paths.clone()),
+        Some(asked) => {
+            if let Some(bad) = asked.iter().find(|a| !p.paths.contains(a)) {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    access_code::BAD_ACCESS,
+                    format!(
+                        "You can't read {bad}. Leave out `access` to search everything you can read."
+                    ),
+                ));
+            }
+            Ok(asked)
+        }
+    }
+}
+
 /// `POST routes::CONTEXT_SEARCH`.
 pub async fn search(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     headers: HeaderMap,
-    ApiJson(q): ApiJson<ContextQuery>,
+    ApiJson(mut q): ApiJson<ContextQuery>,
 ) -> AppResult<Json<Vec<Hit>>> {
     if q.text.trim().is_empty() {
         return Err(AppError::bad_request("Give something to search for."));
@@ -77,9 +125,20 @@ pub async fn search(
     if q.k == 0 {
         return Err(AppError::bad_request("k must be at least 1."));
     }
-    match retrieval::context_search(&state, &q, Route::Chat, None, &new_id(), caller(&headers))
-        .await
-    {
+    q.access = Some(query_access(&p, q.access.take())?);
+    let found = trace::with_principal(
+        p.id.clone(),
+        retrieval::context_search(
+            &state,
+            &q,
+            Route::Chat,
+            None,
+            &new_id(),
+            caller(&p, &headers),
+        ),
+    )
+    .await;
+    match found {
         Ok(packed) => Ok(Json(packed.iter().map(retrieval::packed_hit).collect())),
         Err(e) => match e.downcast_ref::<BadScope>() {
             Some(bad) => Err(bad_scope(bad.to_string())),
@@ -110,6 +169,7 @@ pub struct PassagesQuery {
 /// `GET routes::context_document_passages(id)?from&to`.
 pub async fn passages(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<PassagesQuery>,
@@ -130,10 +190,11 @@ pub async fn passages(
     )
     .await?;
     // An agent reading after a search: an implicit relevance mark for the eval feed.
-    if let Some(c) = caller(&headers) {
+    if let Some(c) = caller(&p, &headers) {
         let mut row = TraceRow::new(TraceKind::ToolCall, new_id(), Utc::now());
         row.trace_id = new_id();
         c.stamp(&mut row);
+        row.principal = Some(p.id.clone());
         row.tool = Some("read_passages".into());
         row.document_id = Some(id.clone());
         row.read_range = Some([q.from, q.to]);
@@ -148,22 +209,52 @@ pub async fn passages(
     ))
 }
 
+/// The document an agent's ingest of `name` would replace.
+async fn existing_agent_document(
+    state: &AppState,
+    origin: &Origin,
+    name: &str,
+) -> AppResult<Option<Document>> {
+    let found: Vec<Document> = state
+        .store
+        .query_rows(
+            "SELECT VALUE doc FROM document WHERE doc.origin = $origin AND doc.name = $name",
+            vec![
+                (
+                    "origin",
+                    serde_json::to_value(origin).map_err(AppError::internal)?,
+                ),
+                ("name", serde_json::json!(name)),
+            ],
+        )
+        .await?;
+    Ok(found.into_iter().next())
+}
+
 /// `POST routes::CONTEXT_INGEST`: `ingest::ingest_text` (the same agent and name
-/// replaces that document's text; the diff keeps unchanged passages), `actor:
-/// agent:<name>`.
+/// replaces that document's text; the diff keeps unchanged passages). On a device token
+/// the origin's name is the agent's and `actor` is `agent:<name>`; on an agent token the
+/// origin is that agent's name and `actor` is `agent/<id>`. Either way the document's
+/// `owner` is the caller's person, and someone else's document isn't replaced (403
+/// `not_owner`).
 pub async fn ingest(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     ApiJson(doc): ApiJson<ContextIngest>,
 ) -> AppResult<Json<Document>> {
-    let agent = match &doc.origin {
-        Origin::Agent { name } if !name.trim().is_empty() => name.trim().to_string(),
-        _ => {
-            return Err(AppError::new(
-                StatusCode::BAD_REQUEST,
-                "bad_origin",
-                "Documents added through the context API come from an agent: origin {\"origin\": \"agent\", \"name\": …}.",
-            ));
-        }
+    let agent = match agents::agent_of(&state, &p).await? {
+        Some(agent) => agent.name,
+        None if p.is_agent() => return Err(AppError::unauthorized()),
+        None => match &doc.origin {
+            Origin::Agent { name } if !name.trim().is_empty() => name.trim().to_string(),
+            _ => {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "bad_origin",
+                    "Documents added through the context API come from an agent: origin {\"origin\": \"agent\", \"name\": …}.",
+                ));
+            }
+        },
     };
     if doc.name.trim().is_empty() {
         return Err(AppError::bad_request("Give the document a name."));
@@ -175,7 +266,20 @@ pub async fn ingest(
         origin: Origin::Agent { name: agent },
         ..doc
     };
-    Ok(Json(crate::ingest::ingest_text(&state, &req).await?))
+    if let Some(existing) = existing_agent_document(&state, &req.origin, req.name.trim()).await?
+        && existing.owner.as_ref().is_some_and(|o| o != &p.person_id)
+    {
+        return Err(not_owner());
+    }
+    // Whose it is, and (on an agent token) which agent wrote it: written in the same
+    // write as the document, so no reader sees it without its owner.
+    let actor = p.is_agent().then(|| p.id.clone());
+    let written = trace::with_principal(
+        p.id.clone(),
+        crate::ingest::ingest_text_as(&state, &req, Some(&p.person_id), actor.as_deref()),
+    )
+    .await?;
+    Ok(Json(written))
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,9 +311,10 @@ pub async fn changes(
 /// `DELETE routes::context_document(id)`: an agent's document and its passages go, and
 /// the change feed lists it as deleted. 404 unknown; 403 `forbidden` for a document
 /// that isn't an agent's (sources, folder files and library items are deleted where
-/// they live).
+/// they live); 403 `not_owner` for another person's.
 pub async fn delete_document(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     let _w = state.write_lock.lock().await;
@@ -223,6 +328,85 @@ pub async fn delete_document(
             "Only documents an agent added can be deleted here.",
         ));
     }
-    crate::ingest::delete_document_locked(&state, &id).await?;
+    if doc.owner.as_ref().is_some_and(|o| o != &p.person_id) {
+        return Err(not_owner());
+    }
+    trace::with_principal(
+        p.id.clone(),
+        crate::ingest::delete_document_locked(&state, &id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::principal::PrincipalKind;
+    use margin_shared::{OrgRole, Person, PersonSettings, PersonState};
+
+    fn principal(kind: PrincipalKind, paths: &[&str]) -> Principal {
+        Principal {
+            id: match &kind {
+                PrincipalKind::Agent { agent_id, .. } => format!("agent/{agent_id}"),
+                PrincipalKind::Person => "person/p".into(),
+            },
+            kind,
+            person_id: "p".into(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            deny_ids: vec![],
+            org_role: OrgRole::Member,
+            device: None,
+            person: Person {
+                id: "p".into(),
+                github_login: "p".into(),
+                github_id: None,
+                handle: "pp".into(),
+                name: "P".into(),
+                avatar_url: None,
+                org_role: OrgRole::Member,
+                state: PersonState::Active,
+                groups: vec![],
+                settings: PersonSettings::default(),
+                created_at: Utc::now(),
+            },
+        }
+    }
+
+    #[test]
+    fn access_is_the_callers_or_a_subset() {
+        let p = principal(PrincipalKind::Person, &["company", "person/p"]);
+        assert_eq!(query_access(&p, None).unwrap(), vec!["company", "person/p"]);
+        assert_eq!(
+            query_access(&p, Some(vec!["person/p".into()])).unwrap(),
+            vec!["person/p"]
+        );
+        for bad in ["company/finance", "person/q"] {
+            let e = query_access(&p, Some(vec!["company".into(), bad.into()])).unwrap_err();
+            assert_eq!((e.status, e.code), (StatusCode::BAD_REQUEST, "bad_access"));
+            assert!(e.message.contains(bad));
+        }
+    }
+
+    #[test]
+    fn an_agent_token_is_its_agent_whatever_the_header_says() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AGENT_HEADER, "claude-code".parse().unwrap());
+        let agent = principal(
+            PrincipalKind::Agent {
+                owner_id: "p".into(),
+                agent_id: "a1".into(),
+            },
+            &["company"],
+        );
+        let c = caller(&agent, &headers).unwrap();
+        assert_eq!((c.actor.as_str(), c.via.as_str()), ("agent/a1", VIA_MCP));
+        assert!(caller(&agent, &HeaderMap::new()).is_some());
+        let person = principal(PrincipalKind::Person, &["company"]);
+        assert_eq!(
+            caller(&person, &headers).unwrap().actor,
+            "agent:claude-code"
+        );
+        assert!(caller(&person, &HeaderMap::new()).is_none());
+    }
 }

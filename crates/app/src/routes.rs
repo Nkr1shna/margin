@@ -253,6 +253,9 @@ mod tests {
         lib.lessons
             .insert("l1".into(), lesson("l1", "f", 0, LessonStatus::Ready));
         let chat = |title: &str| margin_shared::Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "c1".into(),
             title: title.into(),
             title_by: Default::default(),

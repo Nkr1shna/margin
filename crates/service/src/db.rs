@@ -67,8 +67,18 @@ const OLD_TABLES: [&str; 2] = [CHUNK, MEDIA];
 /// rows, so the hourly and daily numbers outlive them (R1-trace).
 pub const TRACE_HOURLY_KEPT: &str = "trace_hourly_kept";
 pub const TRACE_DAILY_KEPT: &str = "trace_daily_kept";
+/// Everyone who may sign in (`people::PersonRow`, L1).
+pub const PERSON: &str = "person";
+/// Groups (`groups::GroupRow`), keyed by path.
+pub const GROUP: &str = "group";
+/// Direct memberships (`groups::MembershipRow`): `person_id`, `group_path`, `source`.
+pub const MEMBERSHIP: &str = "membership";
+/// Agents (`agents::AgentRow`) and their hashed tokens.
+pub const AGENT: &str = "agent";
+/// Invitations by GitHub login (`invitations::InvitationRow`).
+pub const INVITATION: &str = "invitation";
 
-const TABLES: [&str; 17] = [
+const TABLES: [&str; 22] = [
     TOPIC,
     LESSON,
     NOTE,
@@ -86,6 +96,11 @@ const TABLES: [&str; 17] = [
     DOCUMENT_DELETED,
     TRACE_HOURLY_KEPT,
     TRACE_DAILY_KEPT,
+    PERSON,
+    GROUP,
+    MEMBERSHIP,
+    AGENT,
+    INVITATION,
 ];
 
 /// The `passage` and `trace` tables and their plain indexes. Idempotent (`IF NOT
@@ -98,6 +113,23 @@ DEFINE INDEX IF NOT EXISTS document_generation ON document FIELDS doc.generation
 DEFINE INDEX IF NOT EXISTS document_deleted_generation ON document_deleted FIELDS doc.generation;
 DEFINE INDEX IF NOT EXISTS folder_file_workspace ON folder_file FIELDS doc.workspace_id;
 DEFINE INDEX IF NOT EXISTS source_workspace ON source FIELDS doc.workspace_id;
+
+DEFINE INDEX IF NOT EXISTS person_login      ON person FIELDS doc.login_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS person_handle     ON person FIELDS doc.handle UNIQUE;
+DEFINE INDEX IF NOT EXISTS agent_token       ON agent FIELDS doc.token_hash;
+DEFINE INDEX IF NOT EXISTS agent_owner       ON agent FIELDS doc.owner_id;
+DEFINE INDEX IF NOT EXISTS device_person     ON device FIELDS doc.person_id;
+DEFINE INDEX IF NOT EXISTS membership_person ON membership FIELDS doc.person_id;
+DEFINE INDEX IF NOT EXISTS membership_group  ON membership FIELDS doc.group_path;
+DEFINE INDEX IF NOT EXISTS invitation_login  ON invitation FIELDS doc.login_key;
+DEFINE INDEX IF NOT EXISTS topic_access      ON topic FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS lesson_access     ON lesson FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS note_access       ON note FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS chat_access       ON chat FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS source_access     ON source FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS workspace_access  ON workspace FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS proposal_access   ON proposal FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS document_owner    ON document FIELDS doc.owner;
 
 DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
@@ -138,6 +170,7 @@ DEFINE FIELD IF NOT EXISTS turn_id        ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS job_id         ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS document_id    ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS actor          ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS principal      ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS pipeline_hash  ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS prompt_version ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS route          ON trace TYPE option<string>;
@@ -960,6 +993,43 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// The L1 tables (`group` is a SurrealQL keyword: `docs/l1-brief.md` §6) are
+    /// defined, written, listed and filtered like the others, and the unique login
+    /// index refuses a second person with the same login.
+    #[tokio::test]
+    async fn principal_tables_round_trip() {
+        let s = Store::memory().await.unwrap();
+        for table in [PERSON, GROUP, MEMBERSHIP, AGENT, INVITATION] {
+            assert!(s.list::<serde_json::Value>(table).await.unwrap().is_empty());
+        }
+        let group = serde_json::json!({"path": "company/eng", "name": "Engineering"});
+        s.put(GROUP, "company/eng", &group).await.unwrap();
+        assert_eq!(
+            s.get::<serde_json::Value>(GROUP, "company/eng")
+                .await
+                .unwrap(),
+            Some(group.clone())
+        );
+        assert_eq!(
+            s.list::<serde_json::Value>(GROUP).await.unwrap(),
+            vec![group.clone()]
+        );
+        assert_eq!(
+            s.list_where::<serde_json::Value>(GROUP, "name", "Engineering")
+                .await
+                .unwrap(),
+            vec![group]
+        );
+        s.delete(GROUP, "company/eng").await.unwrap();
+        assert!(s.list::<serde_json::Value>(GROUP).await.unwrap().is_empty());
+
+        let p1 = serde_json::json!({"id": "p1", "login_key": "bob", "handle": "bob"});
+        let p2 = serde_json::json!({"id": "p2", "login_key": "bob", "handle": "bob-2"});
+        s.put(PERSON, "p1", &p1).await.unwrap();
+        assert!(s.put(PERSON, "p2", &p2).await.is_err());
+        assert_eq!(s.list::<serde_json::Value>(PERSON).await.unwrap(), vec![p1]);
     }
 
     #[tokio::test]

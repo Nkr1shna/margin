@@ -37,6 +37,7 @@ use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 
 use crate::error::{AppError, AppResult};
+use crate::principal::RequireAdmin;
 use crate::secrets::CHATGPT_TOKENS;
 use crate::state::{App, AppState, random_token};
 
@@ -645,8 +646,12 @@ fn pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-/// `POST /api/providers/chatgpt/start`.
-pub async fn chatgpt_start(State(state): State<AppState>) -> AppResult<Json<ChatGptStart>> {
+/// `POST /api/providers/chatgpt/start`. The ChatGPT sign-in is the organisation's
+/// (one set of provider credentials, plan §3): admins only (403 `admin_required`).
+pub async fn chatgpt_start(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<ChatGptStart>> {
     let endpoints = state.providers.endpoints();
     let mut tokens = load_tokens(&state).await?;
     if tokens.ext_agent_host_id.is_empty() {
@@ -984,8 +989,12 @@ async fn validate_id_token(
 }
 
 /// `GET /api/providers/chatgpt`. A sign-in that failed while valid tokens are kept is
-/// `SignedIn` with the failure as `last_error`.
-pub async fn chatgpt_status(State(state): State<AppState>) -> AppResult<Json<ChatGptStatus>> {
+/// `SignedIn` with the failure as `last_error`. Admins only: while a sign-in waits, the
+/// answer carries the authorize URL that completes it.
+pub async fn chatgpt_status(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<ChatGptStatus>> {
     let (waiting, failed) = match &*state.providers.flow.lock().unwrap() {
         Flow::Waiting { authorize_url, .. } => (Some(authorize_url.clone()), None),
         Flow::Failed(message) => (None, Some(message.clone())),
@@ -1005,8 +1014,11 @@ pub async fn chatgpt_status(State(state): State<AppState>) -> AppResult<Json<Cha
 }
 
 /// `DELETE /api/providers/chatgpt`: revokes the refresh token (best effort) and
-/// forgets the tokens; a sign-in in progress is cancelled.
-pub async fn chatgpt_sign_out(State(state): State<AppState>) -> AppResult<StatusCode> {
+/// forgets the tokens; a sign-in in progress is cancelled. Admins only.
+pub async fn chatgpt_sign_out(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<StatusCode> {
     if let Flow::Waiting { task, .. } =
         std::mem::replace(&mut *state.providers.flow.lock().unwrap(), Flow::Idle)
     {

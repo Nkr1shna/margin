@@ -156,6 +156,9 @@ async fn put_topic(s: &Store, id: &str, parent: Option<&str>) {
         db::TOPIC,
         id,
         &Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(str::to_string),
             title: id.into(),
@@ -173,6 +176,9 @@ async fn put_source(s: &Store, id: &str, topic: Option<&str>, workspace: Option<
         db::SOURCE,
         id,
         &Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: topic.map(str::to_string),
             name: format!("{id}.md"),
@@ -452,6 +458,7 @@ async fn scopes_resolve_to_keys_and_unknown_ids_are_bad() {
     .await
     .unwrap();
     let doc = Document {
+        owner: None,
         id: "doc-s1".into(),
         project_id: DEFAULT_PROJECT_ID.into(),
         origin: Origin::Source {
