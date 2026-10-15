@@ -28,6 +28,7 @@ mod extract;
 pub mod fake;
 mod image_linux;
 mod ocr_tesseract;
+pub mod office;
 pub mod onnx;
 mod pdf_pdfium;
 mod rank;
