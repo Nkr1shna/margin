@@ -159,7 +159,7 @@ Manual, before R2 is called done (recorded in the integration commit message): o
 
 ### 6. Eval gates and the A/B plan
 
-**Nothing ships as default on being built.** The order, all by hand with `margin-eval` on the dev service (`--service-url https://devmargin.krishnanelloore.com`), after the owner's pending `record-embeddings` + baseline (`docs/later.md` "Waiting on the owner"):
+**Nothing ships as default on being built.** The order, all by hand with `margin-eval` on the dev service (`--service-url https://devmargin.krishnanelloore.com`), after the owner's pending `record-embeddings` + baseline (Linear ENG-24):
 
 ```sh
 margin-eval record-rewrites --variant rewrite-small      # one Small call per golden query/lesson plan, recorded

@@ -40,5 +40,4 @@ deploys prod and tags the release. `main` is unused. What shipped when:
 ## Where to read next
 
 - [Linear project](https://linear.app/krishnanellooremargin/project/margin-fc714ebf8f0b): the roadmap, what's in flight and next.
-- `docs/later.md`: slices and ideas with no Linear issue yet.
 - `docs/HANDOFF.md`: the build log and the docs to read first.
