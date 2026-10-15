@@ -32,9 +32,9 @@ use margin_shared::{
     ApiError, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatState, Citation,
     ConfirmationCard, Decision, Device, DeviceFrame, DeviceRef, DeviceToolCall, DeviceToolOutput,
     DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus, Level, Me,
-    MessageSent, Note, PendingMessage, ReasoningEffort, ResultCard, ResultTarget, Settings, Source,
-    SourceKind, SourceStatus, TitleSource, ToolOutputText, Topic, Usage, Waiting, Workspace,
-    error_code,
+    MessageSent, Note, PendingMessage, Provider, ReasoningEffort, ResultCard, ResultTarget,
+    Settings, Source, SourceKind, SourceStatus, TitleSource, ToolOutputText, Topic, Usage, Waiting,
+    Workspace, error_code,
 };
 use serde_json::{Value, json};
 
@@ -1199,6 +1199,7 @@ async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSi
         chat_id: chat_id.into(),
         turn_id,
         slot: Arc::new(std::sync::Mutex::new(permit)),
+        model: None,
     })
 }
 
@@ -2179,6 +2180,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         chat_id: chat.id.clone(),
         turn_id: "turn-1".into(),
         slot: Default::default(),
+        model: None,
     };
     let mut sock = h.socket(&t).await;
     let item = sink
@@ -2659,18 +2661,24 @@ async fn the_model_titles_a_chat_after_its_first_answer() {
     assert_eq!(d.chat.usage.model_calls, 2, "the title call counts");
     assert_eq!(d.items.len(), 2, "not an item");
 
-    let reqs = h.generator.titles.requests();
-    assert_eq!(reqs.len(), 1);
-    let req = &reqs[0];
-    assert!(req.tools.is_empty());
-    assert_eq!(req.max_output_tokens, Some(TITLE_MAX_OUTPUT_TOKENS));
+    // A plain text call on the default provider's small slot.
+    let calls = h.generator.text_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.opts.route, Route::Small);
+    assert_eq!(call.opts.max_output_tokens, Some(TITLE_MAX_OUTPUT_TOKENS));
+    assert_eq!(call.opts.cache_key.as_deref(), Some(d.chat.id.as_str()));
     assert_eq!(
-        req.reasoning.as_ref().map(|r| r.effort),
-        Some(ReasoningEffort::Low)
+        (call.provider, call.model.as_str()),
+        (Provider::OpenAi, "test-model")
     );
-    let input = serde_json::to_string(&req.input).unwrap();
-    assert!(input.contains("Teach me Fourier series"), "{input}");
-    assert!(input.contains("sums of waves"), "{input}");
+    assert!(call.instructions.starts_with("Write a title for this chat"));
+    assert!(
+        call.input.contains("Teach me Fourier series"),
+        "{}",
+        call.input
+    );
+    assert!(call.input.contains("sums of waves"), "{}", call.input);
     assert_eq!(
         h.generator.agent.requests().len(),
         1,
@@ -2684,7 +2692,7 @@ async fn the_model_titles_a_chat_after_its_first_answer() {
     assert_eq!(send(&h, &t, &d.chat.id, "more").await.status(), 200);
     wait_chat(&h, &t, &d.chat.id, |d| idle(d) && d.items.len() == 4).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h.generator.titles.requests().len(), 1);
+    assert_eq!(h.generator.text_calls.lock().unwrap().len(), 1);
 
     // The owner's name sticks.
     let renamed: Chat = h
@@ -2711,7 +2719,8 @@ async fn a_title_that_fails_or_comes_after_a_rename_changes_nothing() {
         .push(Scripted::Events(text_reply(&["Hi!"])));
     let a = ask(&h, &t, "Hello there").await.chat;
     wait_chat(&h, &t, &a.id, idle).await;
-    eventually(|| async { (h.generator.titles.requests().len() == 1).then_some(()) }).await;
+    eventually(|| async { (h.generator.text_calls.lock().unwrap().len() == 1).then_some(()) })
+        .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let d = detail(&h, &t, &a.id).await;
     assert_eq!(

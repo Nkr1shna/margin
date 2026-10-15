@@ -18,8 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
 use margin_ai::{
-    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, ProviderConfig,
-    SceneRequest, TextModel,
+    AiError, CallOptions, CoursePlan, Generated, InputPart, LessonContext, ModelInfo, PlanRequest,
+    ProviderConfig, RouteModels, SceneRequest, TextModel, TextOutput,
 };
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
@@ -35,6 +35,7 @@ use margin_service::pipeline::{Chunker, ChunkerCfg};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::server::{Options, Service};
 use margin_service::state::AppState;
+use margin_shared::Provider;
 use margin_shared::{
     AskRequest, Card, ChatDetail, ChatItemKind, ChatState, DeviceFrame, DirectedFrame, Event,
     Level, LoginState, Outline, OutlineLesson, Proposal, ServerFrame, SourceKind, StartLogin,
@@ -143,6 +144,145 @@ pub struct FakeGenerator {
     pub plan_reply: Mutex<Option<CoursePlan>>,
     /// The call options of every lesson and scene request.
     pub call_options: Mutex<Vec<CallOptions>>,
+    /// The choice (provider, model, window) of every lesson, scene and plan call.
+    pub choices: Mutex<Vec<ModelChoice>>,
+    /// Every plain text call made on `titles` (title calls, the loop's condense
+    /// summaries), with the model its route resolved to.
+    pub text_calls: Arc<Mutex<Vec<TextCall>>>,
+    /// The provider of every agent client asked for, in order.
+    pub agent_providers: Mutex<Vec<Provider>>,
+    /// What `list_models` answers, per provider (`None`: an error).
+    pub model_lists: Mutex<std::collections::HashMap<Provider, Option<Vec<ModelInfo>>>>,
+    /// How many times a provider's models were listed.
+    pub list_calls: Arc<AtomicUsize>,
+    /// When set, lessons are written by the real `AiGenerator` (point the provider at a
+    /// fake server).
+    pub jobs_over_http: AtomicBool,
+}
+
+/// A plain text call a test model got.
+#[derive(Debug, Clone)]
+pub struct TextCall {
+    pub provider: Provider,
+    pub model: String,
+    pub instructions: String,
+    pub input: String,
+    pub opts: CallOptions,
+}
+
+/// The fake Claude models: Opus, Sonnet and Haiku 5.5 with the windows the fake
+/// advertises (D13: from the list, not a table).
+pub fn claude_model_list() -> Vec<ModelInfo> {
+    [
+        ("claude-haiku-5-5", 200_000, 64_000),
+        ("claude-opus-5-5", 500_000, 64_000),
+        ("claude-sonnet-5-5", 400_000, 64_000),
+    ]
+    .into_iter()
+    .map(|(id, input, output)| ModelInfo {
+        id: id.into(),
+        display_name: Some(id.replace('-', " ")),
+        context_window: Some(input),
+        max_output_tokens: Some(output),
+    })
+    .collect()
+}
+
+/// The fake Claude key.
+pub const CLAUDE_KEY: &str = "sk-ant-test-secret";
+
+/// A scripted model that records its plain text calls with the model of their route.
+pub struct RecordingText {
+    pub inner: Arc<ScriptedModel>,
+    pub provider: Provider,
+    pub models: RouteModels,
+    pub calls: Arc<Mutex<Vec<TextCall>>>,
+}
+
+impl TextModel for RecordingText {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> margin_ai::model::BoxFuture<'a, Result<TextOutput, AiError>> {
+        let text = input
+            .iter()
+            .filter_map(|p| match p {
+                InputPart::Text(t) => Some(t.as_str()),
+                InputPart::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.calls.lock().unwrap().push(TextCall {
+            provider: self.provider,
+            model: self.models.get(opts.route).to_string(),
+            instructions: instructions.to_string(),
+            input: text,
+            opts: opts.clone(),
+        });
+        self.inner.stream_parts(instructions, input, opts, on_delta)
+    }
+}
+
+/// A provider client with a model list of its own (the scripted model lists none).
+pub struct Listed {
+    pub inner: Arc<dyn ModelClient>,
+    pub kind: Provider,
+    pub list: Option<Vec<ModelInfo>>,
+    /// Counts the `list_models` calls.
+    pub calls: Arc<AtomicUsize>,
+}
+
+impl ModelClient for Listed {
+    fn kind(&self) -> Provider {
+        self.kind
+    }
+    fn stream(
+        &self,
+        req: margin_ai::ModelRequest,
+    ) -> margin_ai::model::BoxFuture<'_, Result<margin_ai::ModelStream, AiError>> {
+        self.inner.stream(req)
+    }
+    fn list_models(&self) -> margin_ai::model::BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
+        let list = self.list.clone();
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            list.ok_or(AiError::Http {
+                status: 503,
+                message: "the fake lists nothing".into(),
+                retry_after: None,
+                code: None,
+            })
+        })
+    }
+}
+
+impl FakeGenerator {
+    /// The credential a test gives `config`'s provider.
+    fn check_credential(config: &ProviderConfig) {
+        match config.provider {
+            Provider::OpenAi => assert_eq!(config.credential.secret(), API_KEY),
+            Provider::Claude => assert_eq!(config.credential.secret(), CLAUDE_KEY),
+            Provider::ChatGpt => assert!(matches!(
+                config.credential,
+                margin_ai::Credential::Bearer(_)
+            )),
+        }
+    }
+
+    fn list_for(&self, provider: Provider) -> Option<Vec<ModelInfo>> {
+        self.model_lists
+            .lock()
+            .unwrap()
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider {
+                Provider::Claude => Some(claude_model_list()),
+                _ => Some(Vec::new()),
+            })
+    }
 }
 
 /// The usage every fake generation call reports.
@@ -174,13 +314,20 @@ pub fn outline_for(req: &AskRequest) -> Outline {
 impl Generator for FakeGenerator {
     fn write_lesson<'a>(
         &'a self,
-        _m: &'a ModelChoice,
+        m: &'a ModelChoice,
         ctx: &'a LessonContext,
         opts: &'a CallOptions,
         mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
             self.lesson_requests.lock().unwrap().push(ctx.clone());
+            self.choices.lock().unwrap().push(m.clone());
+            if self.jobs_over_http.load(Ordering::SeqCst) {
+                self.call_options.lock().unwrap().push(opts.clone());
+                return margin_service::engines::AiGenerator
+                    .write_lesson(m, ctx, opts, on_delta)
+                    .await;
+            }
             self.call_options.lock().unwrap().push(opts.clone());
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
@@ -223,12 +370,13 @@ impl Generator for FakeGenerator {
 
     fn write_scene<'a>(
         &'a self,
-        _m: &'a ModelChoice,
+        m: &'a ModelChoice,
         req: &'a SceneRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
             self.scene_requests.lock().unwrap().push(req.clone());
+            self.choices.lock().unwrap().push(m.clone());
             self.call_options.lock().unwrap().push(opts.clone());
             let n = self.scene_requests.lock().unwrap().len();
             Ok(Generated {
@@ -251,13 +399,11 @@ impl Generator for FakeGenerator {
                 .lock()
                 .unwrap()
                 .push((req.clone(), opts.clone()));
+            self.choices.lock().unwrap().push(m.clone());
             if self.agent_over_http.load(Ordering::SeqCst) {
-                let client = margin_ai::ResponsesClient::new(
-                    m.config.base_url.clone(),
-                    m.config.credential.secret(),
-                    m.model.clone(),
-                );
-                return margin_ai::plan_course(&client, req, opts).await;
+                return margin_service::engines::AiGenerator
+                    .plan_course(m, req, opts)
+                    .await;
             }
             let reply = self.plan_reply.lock().unwrap().clone();
             match reply {
@@ -271,19 +417,44 @@ impl Generator for FakeGenerator {
     }
 
     fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn ModelClient> {
-        assert_eq!(config.credential.secret(), API_KEY);
+        Self::check_credential(config);
+        self.agent_providers.lock().unwrap().push(config.provider);
         if self.agent_over_http.load(Ordering::SeqCst) {
-            return Arc::new(margin_ai::ResponsesClient::from_config(config));
+            return match config.provider {
+                Provider::Claude => Arc::new(margin_ai::ClaudeClient::new(
+                    config.base_url.clone(),
+                    config.credential.secret(),
+                    config.models.clone(),
+                )),
+                _ => Arc::new(margin_ai::ResponsesClient::from_config(config)),
+            };
         }
-        self.agent.on_models(config.models.clone())
+        Arc::new(Listed {
+            inner: self.agent.on_models(config.models.clone()),
+            kind: config.provider,
+            list: self.list_for(config.provider),
+            calls: self.list_calls.clone(),
+        })
     }
 
     fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel> {
-        assert_eq!(config.credential.secret(), API_KEY);
+        Self::check_credential(config);
         if self.agent_over_http.load(Ordering::SeqCst) {
-            return Arc::new(margin_ai::ResponsesClient::from_config(config));
+            return match config.provider {
+                Provider::Claude => Arc::new(margin_ai::ClaudeClient::new(
+                    config.base_url.clone(),
+                    config.credential.secret(),
+                    config.models.clone(),
+                )),
+                _ => Arc::new(margin_ai::ResponsesClient::from_config(config)),
+            };
         }
-        self.titles.clone()
+        Arc::new(RecordingText {
+            inner: self.titles.clone(),
+            provider: config.provider,
+            models: config.models.clone(),
+            calls: self.text_calls.clone(),
+        })
     }
 }
 
@@ -985,8 +1156,14 @@ pub async fn start_with(setup: Setup) -> Harness {
     .unwrap();
     let state = service.state.clone();
     let titles = generator.titles.clone();
+    let calls = generator.text_calls.clone();
     *state.turns.title_model.lock().unwrap() = Some(Arc::new(move |config: &ProviderConfig| {
-        titles.on_models(config.models.clone())
+        Arc::new(RecordingText {
+            inner: titles.clone(),
+            provider: config.provider,
+            models: config.models.clone(),
+            calls: calls.clone(),
+        }) as Arc<dyn TextModel>
     }));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -1110,11 +1287,15 @@ impl Harness {
         self.http.put(self.u(path)).bearer_auth(token)
     }
 
-    /// Stores an API key and a model.
+    /// Stores an OpenAI API key and `test-model` in each of its slots.
     pub async fn configure_ai(&self, token: &str) {
         let r = self
             .patch(token, "/api/settings")
-            .json(&json!({"openai_api_key": API_KEY, "openai_model": "test-model"}))
+            .json(&json!({
+                "openai_api_key": API_KEY,
+                "openai_model": "test-model",
+                "openai_models": {"chat": "test-model", "write": "test-model", "small": "test-model"},
+            }))
             .send()
             .await
             .unwrap();

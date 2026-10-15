@@ -62,8 +62,9 @@ async fn turns_use_the_chat_route_and_titles_the_small_one() {
     .await;
     let turn = h.generator.agent.requests();
     assert_eq!(turn[0].model.as_deref(), Some("chat-model"));
-    let title = h.generator.titles.requests();
-    assert_eq!(title[0].model.as_deref(), Some("small-model"));
+    // The title is a plain text call on the small route.
+    let title = h.generator.text_calls.lock().unwrap().clone();
+    assert_eq!(title[0].model, "small-model");
 }
 
 #[tokio::test(flavor = "multi_thread")]

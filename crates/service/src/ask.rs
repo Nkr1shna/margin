@@ -280,7 +280,7 @@ async fn record_course_created(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![margin_agent::action_input(&text)],
+            model_items: vec![crate::turns::wire::action(chat.provider, &text)],
             full_output: None,
         },
     )
@@ -662,6 +662,39 @@ async fn lesson_context(
     Ok((ctx, proposal, retrieved))
 }
 
+/// The window a writing job's passages are a share of (D13): the packer's
+/// `window_tokens` param when the pipeline sets one (an eval variant pins it), else the
+/// input window of the default provider's writing model (`model_for(Write)`, from the
+/// provider's model list or `margin_ai::windows`, the logged fallback otherwise).
+pub async fn write_window(state: &AppState) -> anyhow::Result<usize> {
+    let pinned = state
+        .pipeline
+        .load_full()
+        .config
+        .packer
+        .params
+        .get("window_tokens")
+        .and_then(serde_json::Value::as_u64);
+    if let Some(w) = pinned {
+        return Ok(w as usize);
+    }
+    let m = state
+        .model_for(Route::Write, None)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    Ok(m.window.input as usize)
+}
+
+/// The options of a writing call: the `Write` route, the prompt's cache key
+/// (`"{job}:{version}"`), the length of its constant block (the Claude client's cache
+/// breakpoint) and its version for the trace.
+fn write_options(prompt: &margin_ai::Prompt) -> CallOptions {
+    CallOptions::new(Route::Write)
+        .with_cache_key(prompt.cache_key())
+        .with_cache_prefix_len(prompt.constant.len())
+        .with_prompt_version(prompt.version)
+}
+
 /// A lesson's passages: retrieved from its topic, the sources its course was asked with
 /// and the attached folders it draws on (waiting for those still being read, up to `sources::SOURCE_WAIT`), packed to
 /// the pipeline's budget against the writing model's window. When retrieval fails the
@@ -700,7 +733,7 @@ async fn lesson_passages(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            window_tokens: write_window(state).await?,
             trace_id: lesson.id.clone(),
             caller: None,
         };
@@ -814,7 +847,7 @@ pub async fn survey(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            window_tokens: write_window(state).await?,
             trace_id: trace_id.to_string(),
             caller: None,
         },
@@ -851,7 +884,7 @@ pub async fn plan_course(
         .model_for(Route::Write, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
-    let opts = CallOptions::new(Route::Write);
+    let opts = write_options(&margin_ai::prompts::plan(&req));
     let mut call = SpanGuard::new(
         trace::model_call(
             state,
@@ -934,7 +967,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
             });
         })
     };
-    let opts = CallOptions::new(Route::Write);
+    let opts = write_options(&margin_ai::prompts::lesson(&ctx));
     let mut call = SpanGuard::new(
         trace::model_call(
             state,

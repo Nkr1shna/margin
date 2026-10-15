@@ -9,21 +9,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt;
 use margin_agent::{
     BoxFuture, ConfirmationPrompt, ItemRecord, MessageContext, ModelClient, ReplayItem,
     RetryPolicy, SinkError, TOOL_OUTPUT_MAX_BYTES, Tool, ToolContext, ToolKind, ToolOutput,
     ToolRegistry, TurnDeps, TurnInput, TurnOutcome, TurnSink,
 };
 use margin_ai::{
-    AiError, CallOptions, Delta, ItemView, ModelEvent, ModelInfo, ModelRequest, ModelStream,
-    ProviderConfig, ProviderKind, ToolChoice, WebTools,
+    AiError, CallOptions, InputPart, ModelInfo, ModelRequest, ModelStream, ProviderConfig,
+    ProviderKind, TextModel, TextOutput,
 };
 use margin_shared::context::TraceKind;
 use margin_shared::pipeline::Route;
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
-    PendingMessage, ReasoningEffort, Source, TitleSource, Usage, Waiting, error_code,
+    PendingMessage, Provider, Source, TitleSource, Usage, Waiting, error_code,
 };
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -66,6 +66,145 @@ const TITLE_INSTRUCTIONS: &str = "Write a title for this chat between the owner 
 /// A library change a Write tool started: `(call_id, its task)` (`Turns::register_write`).
 pub type StartedWrite = (String, JoinHandle<ToolOutput>);
 
+/// The model items the service itself stores, in the chat's provider's wire shape
+/// (`docs/agent-providers-brief.md` D4): Responses items on OpenAI and ChatGPT, one
+/// `{"role", "block"}` content block per entry on Claude. A chat never holds another
+/// provider's items.
+///
+/// Same names and signatures as area P-agent's provider-aware `margin_agent::replay`
+/// functions (`history`, `unanswered`, `call_output`, `cancelled_output`,
+/// `output_text`, `action`, `user_message`): once those are merged this module goes and
+/// its callers use `margin_agent::replay::` instead.
+pub mod wire {
+    use margin_agent::{MessageContext, ReplayItem};
+    use margin_shared::{ChatItem, Provider};
+    use serde_json::{Value, json};
+
+    fn block(role: &str, block: Value) -> Value {
+        json!({"role": role, "block": block})
+    }
+
+    /// A user message: the context part, then the owner's words.
+    pub fn user_message(provider: Provider, text: &str, ctx: &MessageContext) -> Vec<Value> {
+        let items = margin_agent::user_message_input(text, ctx);
+        if provider != Provider::Claude {
+            return items;
+        }
+        // The same parts, as Claude text blocks (the context text is the agent's).
+        items
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .filter_map(|part| part["text"].as_str().map(str::to_string))
+            .map(|t| block("user", json!({"type": "text", "text": t})))
+            .collect()
+    }
+
+    /// The model's record of an `Action` (a stop, a course created, a restart).
+    pub fn action(provider: Provider, text: &str) -> Value {
+        match provider {
+            Provider::Claude => margin_agent::replay::claude::action_note(text),
+            Provider::OpenAi | Provider::ChatGpt => margin_agent::action_input(text),
+        }
+    }
+
+    /// A Margin tool's output for `call_id`.
+    pub fn call_output(provider: Provider, call_id: &str, output: &str, ok: bool) -> Value {
+        match provider {
+            Provider::Claude => block(
+                "user",
+                json!({"type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": !ok}),
+            ),
+            Provider::OpenAi | Provider::ChatGpt => {
+                margin_agent::function_call_output(call_id, output)
+            }
+        }
+    }
+
+    /// The output of a call cut short by Stop.
+    pub fn cancelled_output(provider: Provider, call_id: &str) -> Value {
+        match provider {
+            Provider::Claude => margin_agent::replay::claude::cancelled_call_output(call_id),
+            Provider::OpenAi | Provider::ChatGpt => margin_agent::cancelled_call_output(call_id),
+        }
+    }
+
+    /// The text a stored tool output carries (what the model was told).
+    pub fn output_text(item: &Value) -> String {
+        let text = item
+            .get("output")
+            .or_else(|| item.pointer("/block/content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        match text {
+            Value::String(s) => s,
+            Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Margin's calls without an output yet, and the item each belongs to.
+    pub fn unanswered(provider: Provider, items: &[ReplayItem<'_>]) -> Vec<(String, ChatItem)> {
+        let calls = match provider {
+            Provider::Claude => margin_agent::replay::claude::unanswered_calls(items),
+            Provider::OpenAi | Provider::ChatGpt => margin_agent::unanswered_calls(items),
+        };
+        calls
+            .into_iter()
+            .map(|(id, item)| (id, item.clone()))
+            .collect()
+    }
+
+    /// The input that continues the chat.
+    pub fn history(provider: Provider, items: &[ReplayItem<'_>]) -> Vec<Value> {
+        match provider {
+            Provider::Claude => margin_agent::replay::claude::messages(items),
+            Provider::OpenAi | Provider::ChatGpt => margin_agent::replay_input(items),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn claude_items_are_role_and_block() {
+            let out = call_output(Provider::Claude, "toolu_1", "{\"error\":\"x\"}", false);
+            assert_eq!(out["role"], "user");
+            assert_eq!(out["block"]["type"], "tool_result");
+            assert_eq!(out["block"]["tool_use_id"], "toolu_1");
+            assert_eq!(out["block"]["is_error"], true);
+            assert_eq!(output_text(&out), "{\"error\":\"x\"}");
+            let openai = call_output(Provider::OpenAi, "c1", "done", true);
+            assert_eq!(openai["type"], "function_call_output");
+            assert_eq!(output_text(&openai), "done");
+        }
+
+        #[test]
+        fn a_claude_user_message_is_two_text_blocks() {
+            let ctx = MessageContext {
+                device: margin_shared::DeviceRef {
+                    device_id: "d1".into(),
+                    name: "Mac".into(),
+                },
+                now: chrono::Utc::now(),
+                workspaces: Vec::new(),
+                sources: Vec::new(),
+            };
+            let blocks = user_message(Provider::Claude, "Hello", &ctx);
+            assert_eq!(blocks.len(), 2);
+            assert!(
+                blocks
+                    .iter()
+                    .all(|b| b["role"] == "user" && b["block"]["type"] == "text")
+            );
+            assert_eq!(blocks[1]["block"]["text"], "Hello");
+            let openai = user_message(Provider::OpenAi, "Hello", &ctx);
+            assert_eq!(openai[0]["role"], "user");
+            assert!(openai[0]["content"].is_array());
+        }
+    }
+}
+
 /// Running turns, one per chat at most. Lives in `App`.
 pub struct Turns {
     pub running: Mutex<HashMap<Id, RunningTurn>>,
@@ -96,6 +235,9 @@ pub struct Turns {
     /// Chats whose title call was made since the service started: one per chat, while
     /// its title is still the first line.
     pub titled: Mutex<HashSet<Id>>,
+    /// `(provider, base_url)`s that rejected server-side compaction since the service
+    /// started (D3): their turns condense locally.
+    pub no_server_compaction: Mutex<HashSet<(Provider, String)>>,
 }
 
 impl Turns {
@@ -111,7 +253,16 @@ impl Turns {
             stopping: Mutex::new(HashSet::new()),
             title_model: Mutex::new(None),
             titled: Mutex::new(HashSet::new()),
+            no_server_compaction: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Whether `provider` at `base_url` rejected server-side compaction.
+    pub fn rejects_compaction(&self, provider: Provider, base_url: &str) -> bool {
+        self.no_server_compaction
+            .lock()
+            .unwrap()
+            .contains(&(provider, base_url.to_string()))
     }
 
     /// Ends the chat's turn task, if one runs, and returns it: it may still be inside a
@@ -247,7 +398,7 @@ pub async fn start_locked(
             }
             let turn_id = crate::state::new_id();
             let ctx = message_context(state, chat, &device, now).await?;
-            let model_items = margin_agent::user_message_input(&text, &ctx);
+            let model_items = wire::user_message(chat.provider, &text, &ctx);
             let title = chats::title_from(&text);
             let item = chats::new_item_locked(
                 state,
@@ -519,7 +670,7 @@ async fn run_turn(
             model_items: &r.model_items,
         })
         .collect();
-    let history = margin_agent::replay_input(&replay);
+    let history = wire::history(chat.provider, &replay);
     let workspaces = workspaces::by_ids(state, &chat.workspace_ids)
         .await
         .map_err(internal)?;
@@ -530,24 +681,32 @@ async fn run_turn(
     if config.models.small.trim().is_empty() {
         config.models.small = choice.model.clone();
     }
+    let client = agent_client(state, &config);
     let mut model = TracedModel::new(
-        state.generator.agent_model(&config),
+        client,
         trace.clone(),
         &choice.model,
         choice.config.provider.as_str(),
         None,
     );
-    // Condensing the history is a small task: the default provider's small slot.
-    if let Some(small) = small_route(state).await {
+    // Condensing the history is a small task: the default provider's small slot, when
+    // that provider is the chat's (a condense request is in the chat's wire shape).
+    if let Some(small) = small_route(state, chat.provider).await {
         model = model.with_small(small);
     }
-    // The small text model (`TurnDeps.small`): the default provider's.
-    let small_text = state.generator.text_model(&config);
+    // The small text model (`TurnDeps.small`, the loop's condense summary): the default
+    // provider's small slot, else the chat's own config.
+    let small_text = small_text_model(state, &config, trace).await;
     let sink = ServiceSink {
         state: state.clone(),
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
         slot,
+        model: Some(SinkModel {
+            provider: choice.config.provider,
+            base_url: choice.config.base_url.clone(),
+            window: choice.window,
+        }),
     };
     let retry = *state.turns.retry.lock().unwrap();
     let deps = TurnDeps {
@@ -573,20 +732,111 @@ async fn run_turn(
     Ok(outcome)
 }
 
-/// The small-tasks route (titles, condensing): `model_for(Route::Small, None)`, i.e. the
-/// default provider's small slot (`pipeline.routes.small` when set). `None` (logged) when
-/// it can't be configured; the caller then stays on the turn's model.
-async fn small_route(state: &AppState) -> Option<SmallRoute> {
+/// The small-tasks route of the loop's condense calls: `model_for(Route::Small, None)`,
+/// i.e. the default provider's small slot (`pipeline.routes.small` when set), when that
+/// provider is the chat's. `None` (logged when it can't be configured) keeps the turn's
+/// model.
+async fn small_route(state: &AppState, chat_provider: Provider) -> Option<SmallRoute> {
     match state.model_for(Route::Small, None).await {
-        Ok(m) => Some(SmallRoute {
-            client: state.generator.agent_model(&m.config),
+        Ok(m) if m.config.provider == chat_provider => Some(SmallRoute {
+            client: agent_client(state, &m.config),
             provider: m.config.provider.as_str(),
             model: m.model,
         }),
+        Ok(_) => None,
         Err(e) => {
             tracing::warn!("the small-tasks model isn't configured: {}", e.message);
             None
         }
+    }
+}
+
+/// `TurnDeps.small`: the default provider's text model on its small slot, traced as
+/// `route: small` calls; the chat's own config when the default can't be configured.
+async fn small_text_model(
+    state: &AppState,
+    chat_config: &ProviderConfig,
+    trace: &TurnTrace,
+) -> Arc<dyn TextModel> {
+    let (config, model) = match state.model_for(Route::Small, None).await {
+        Ok(m) => (m.config, m.model),
+        Err(e) => {
+            tracing::warn!("the small-tasks model isn't configured: {}", e.message);
+            (chat_config.clone(), chat_config.models.small.clone())
+        }
+    };
+    Arc::new(TracedText {
+        inner: state.generator.text_model(&config),
+        trace: trace.clone(),
+        model,
+        provider: config.provider.as_str(),
+        purpose: "condense",
+    })
+}
+
+/// The agent client of `config`; on ChatGPT, one that refreshes the plan token once and
+/// calls again when the API refuses it (D7).
+pub fn agent_client(state: &AppState, config: &ProviderConfig) -> Arc<dyn ModelClient> {
+    let inner = state.generator.agent_model(config);
+    if config.provider != Provider::ChatGpt {
+        return inner;
+    }
+    Arc::new(ChatGptRetry {
+        state: state.clone(),
+        config: config.clone(),
+        inner: Mutex::new(inner),
+    })
+}
+
+/// The ChatGPT error a refreshed token cures.
+fn invalid_plan_token(e: &AiError) -> bool {
+    matches!(e, AiError::Http { status: 401, .. })
+        && e.code()
+            .is_none_or(|c| c == "subscription_sharing_invalid_user")
+}
+
+/// `agent_client` on ChatGPT.
+struct ChatGptRetry {
+    state: AppState,
+    config: ProviderConfig,
+    inner: Mutex<Arc<dyn ModelClient>>,
+}
+
+impl ModelClient for ChatGptRetry {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::ChatGpt
+    }
+
+    fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
+        Box::pin(async move {
+            let client = self.inner.lock().unwrap().clone();
+            match client.stream(req.clone()).await {
+                Err(e) if invalid_plan_token(&e) => {
+                    tracing::info!("ChatGPT refused the plan token; refreshing it once");
+                    let token =
+                        match crate::providers::chatgpt_access_token(&self.state, true).await {
+                            Ok(t) => t,
+                            Err(refresh) => {
+                                tracing::warn!("couldn't refresh: {}", refresh.message);
+                                return Err(e);
+                            }
+                        };
+                    let mut config = self.config.clone();
+                    config.credential = margin_ai::Credential::Bearer(token);
+                    let fresh = self.state.generator.agent_model(&config);
+                    *self.inner.lock().unwrap() = fresh.clone();
+                    fresh.stream(req).await
+                }
+                other => other,
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
+        Box::pin(async move {
+            let client = self.inner.lock().unwrap().clone();
+            client.list_models().await
+        })
     }
 }
 
@@ -986,6 +1236,21 @@ enum Ending {
 /// failed `ToolResult`; a pending confirmation is denied (Stop) or expired (restart,
 /// failure); then, for Stop and restart, the `Action` saying what happened. Call with
 /// `write_lock` held, after the task is gone.
+/// The provider's hosted web tools (D3, D8).
+pub fn is_web_tool(name: &str) -> bool {
+    matches!(name, "web_search" | "web_fetch")
+}
+
+/// The provider a chat runs on (OpenAI for a chat that is gone: nothing is stored then).
+async fn chat_provider(state: &AppState, chat_id: &str) -> anyhow::Result<Provider> {
+    Ok(state
+        .store
+        .get::<Chat>(db::CHAT, chat_id)
+        .await?
+        .map(|c| c.provider)
+        .unwrap_or_default())
+}
+
 async fn wind_up_locked(
     state: &AppState,
     chat_id: &str,
@@ -993,6 +1258,7 @@ async fn wind_up_locked(
     ending: Ending,
     mut writes: HashMap<String, Option<ToolOutput>>,
 ) -> anyhow::Result<()> {
+    let provider = chat_provider(state, chat_id).await?;
     let mut rows = chats::items(state, chat_id).await?;
     let now = Utc::now();
 
@@ -1004,7 +1270,7 @@ async fn wind_up_locked(
                 model_items: &r.model_items,
             })
             .collect();
-        margin_agent::unanswered_calls(&replay)
+        wire::unanswered(provider, &replay)
             .into_iter()
             .filter_map(|(call_id, _)| writes.remove(&call_id).map(|out| (call_id, out)))
             .collect()
@@ -1017,14 +1283,14 @@ async fn wind_up_locked(
         };
         let row = &mut rows[call];
         match out {
-            Some(out) => record_result_locked(state, row, out).await?,
+            Some(out) => record_result_locked(state, provider, row, out).await?,
             // The call stays unfinished: `Cancelled` below.
             None => {
                 let out = ToolOutput {
                     summary: "Stopped".into(),
                     ..ToolOutput::error(WRITE_UNCONFIRMED)
                 };
-                add_result_locked(state, &row.item, out).await?;
+                add_result_locked(state, provider, &row.item, out).await?;
             }
         }
     }
@@ -1068,6 +1334,34 @@ async fn wind_up_locked(
         row.item.status = ItemStatus::Cancelled;
         row.item.updated_at = now;
         chats::save_item_locked(state, &row).await?;
+        // A hosted web search or fetch still open is the provider's call, not Margin's:
+        // its row gets a `Cancelled` result and no model item (replay drops the block).
+        if let ChatItemKind::ToolCall { call_id, name, .. } = &row.item.kind
+            && is_web_tool(name)
+        {
+            let item = chats::new_item_locked(
+                state,
+                chat_id,
+                turn_id,
+                ItemStatus::Done,
+                ChatItemKind::ToolResult {
+                    call_id: call_id.clone(),
+                    ok: false,
+                    summary: "Cancelled".into(),
+                    output_bytes: 0,
+                },
+            )
+            .await?;
+            chats::save_item_locked(
+                state,
+                &StoredChatItem {
+                    item,
+                    model_items: Vec::new(),
+                    full_output: None,
+                },
+            )
+            .await?;
+        }
     }
 
     // Calls waiting on a confirmation card that nobody answered.
@@ -1095,9 +1389,9 @@ async fn wind_up_locked(
             model_items: &r.model_items,
         })
         .collect();
-    for (call_id, call) in margin_agent::unanswered_calls(&replay) {
+    for (call_id, call) in wire::unanswered(provider, &replay) {
         let (model_item, summary) = match &ending {
-            Ending::Stop { .. } => (margin_agent::cancelled_call_output(&call_id), "Cancelled"),
+            Ending::Stop { .. } => (wire::cancelled_output(provider, &call_id), "Cancelled"),
             Ending::Restart => {
                 let why = if asked.contains(&call_id.as_str()) {
                     CONFIRMATION_EXPIRED
@@ -1105,7 +1399,7 @@ async fn wind_up_locked(
                     CALL_INTERRUPTED
                 };
                 (
-                    margin_agent::function_call_output(&call_id, &margin_agent::error_output(why)),
+                    wire::call_output(provider, &call_id, &margin_agent::error_output(why), false),
                     "Interrupted",
                 )
             }
@@ -1116,16 +1410,12 @@ async fn wind_up_locked(
                     CALL_FAILED
                 };
                 (
-                    margin_agent::function_call_output(&call_id, &margin_agent::error_output(why)),
+                    wire::call_output(provider, &call_id, &margin_agent::error_output(why), false),
                     "Not run",
                 )
             }
         };
-        let output = model_item
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let output = wire::output_text(&model_item);
         let item = chats::new_item_locked(
             state,
             chat_id,
@@ -1181,7 +1471,7 @@ async fn wind_up_locked(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![margin_agent::action_input(text)],
+            model_items: vec![wire::action(provider, text)],
             full_output: None,
         },
     )
@@ -1193,6 +1483,7 @@ async fn wind_up_locked(
 /// `write_lock` held.
 async fn record_result_locked(
     state: &AppState,
+    provider: Provider,
     call: &mut StoredChatItem,
     mut out: ToolOutput,
 ) -> anyhow::Result<()> {
@@ -1200,7 +1491,7 @@ async fn record_result_locked(
         return Ok(());
     }
     let cards = std::mem::take(&mut out.cards);
-    add_result_locked(state, &call.item, out).await?;
+    add_result_locked(state, provider, &call.item, out).await?;
     finish_call_locked(state, call, cards).await
 }
 
@@ -1251,6 +1542,7 @@ async fn finish_call_locked(
 /// `TOOL_OUTPUT_MAX_BYTES`, as the model will see it). Call with `write_lock` held.
 async fn add_result_locked(
     state: &AppState,
+    provider: Provider,
     call: &ChatItem,
     out: ToolOutput,
 ) -> anyhow::Result<()> {
@@ -1258,6 +1550,7 @@ async fn add_result_locked(
         return Ok(());
     };
     let output = margin_agent::truncate_output(&out.output, TOOL_OUTPUT_MAX_BYTES);
+    let ok = out.ok;
     let item = chats::new_item_locked(
         state,
         &call.chat_id,
@@ -1275,7 +1568,7 @@ async fn add_result_locked(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![margin_agent::function_call_output(call_id, &output)],
+            model_items: vec![wire::call_output(provider, call_id, &output, ok)],
             full_output: Some(output),
         },
     )
@@ -1300,6 +1593,57 @@ pub struct ServiceSink {
     pub turn_id: Id,
     /// The turn's slot, let go while it waits on a confirmation.
     pub slot: Slot,
+    /// The chat model the turn runs on (for the window and compaction memory hooks).
+    pub model: Option<SinkModel>,
+}
+
+/// What `ServiceSink` knows of the turn's model.
+#[derive(Debug, Clone)]
+pub struct SinkModel {
+    pub provider: Provider,
+    pub base_url: String,
+    pub window: margin_ai::ModelWindow,
+}
+
+/// The `TurnSink` hooks of area P-agent's sink (`model_window`, `server_compaction`,
+/// `compaction_rejected`, `model_called`). They are inherent methods until P-agent's
+/// `TurnSink` (with these defaulted methods) is merged; then this block's methods move
+/// into `impl TurnSink for ServiceSink` unchanged.
+impl ServiceSink {
+    /// The chat model's window (`ModelChoice.window`, D13).
+    pub fn model_window(&self) -> Option<margin_ai::ModelWindow> {
+        self.model.as_ref().map(|m| m.window)
+    }
+
+    /// False once this provider and base URL rejected server-side compaction.
+    pub fn server_compaction(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_none_or(|m| !self.state.turns.rejects_compaction(m.provider, &m.base_url))
+    }
+
+    /// Remembers, for the process, that the provider and base URL reject compaction.
+    pub fn compaction_rejected(&self) {
+        if let Some(m) = &self.model {
+            tracing::info!(provider = %m.provider, "server-side compaction rejected; condensing locally from now on");
+            self.state
+                .turns
+                .no_server_compaction
+                .lock()
+                .unwrap()
+                .insert((m.provider, m.base_url.clone()));
+        }
+    }
+
+    /// One agent step ended. Its trace row is written by `TracedModel`'s stream (model,
+    /// stop reason and usage from the terminal event), so this only logs.
+    pub fn model_called(&self, step: u32, model: &str, stop_reason: &str, usage: &Usage) {
+        tracing::debug!(
+            chat = %self.chat_id, step, %model, %stop_reason,
+            input = usage.input_tokens, output = usage.output_tokens,
+            "model call ended"
+        );
+    }
 }
 
 impl ServiceSink {
@@ -1571,7 +1915,8 @@ fn spawn_title(state: &AppState, chat_id: &str, turn_id: &str) {
     ));
 }
 
-/// One model call, no tools, low effort, at most `TITLE_MAX_OUTPUT_TOKENS`, given the
+/// One plain text call on the default provider's small slot (at most
+/// `TITLE_MAX_OUTPUT_TOKENS`, except on ChatGPT, which takes no cap), given the
 /// chat's first message and the answer of `turn_id`; the reply (`model_title`) becomes
 /// the title with `title_by: Model` unless the owner renamed the chat meanwhile. Its
 /// usage counts in the chat's. If the call fails the first-line title stays.
@@ -1632,62 +1977,41 @@ async fn ask_title(
         })
         .unwrap_or_default();
     let override_model = state.turns.title_model.lock().unwrap().clone();
-    // A title is a small task: the default provider's small slot.
+    // A title is a small task: the default provider's small slot, as a plain text call.
     let small = state
         .model_for(Route::Small, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
-    let model = match override_model {
+    let inner = match override_model {
         Some(make) => make(&small.config),
-        None => state.generator.agent_model(&small.config),
+        None => state.generator.text_model(&small.config),
     };
-    let model = TracedModel::new(
-        model,
-        TurnTrace::new(state, chat_id, turn_id, None),
-        &small.model,
-        small.config.provider.as_str(),
-        Some(Purpose::Title),
-    );
+    let model = TracedText {
+        inner,
+        trace: TurnTrace::new(state, chat_id, turn_id, None),
+        model: small.model.clone(),
+        provider: small.config.provider.as_str(),
+        purpose: "title",
+    };
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
-    let request = ModelRequest {
-        opts: CallOptions::new(Route::Small)
-            .with_cache_key(chat_id)
-            .with_max_output_tokens(TITLE_MAX_OUTPUT_TOKENS),
-        system: TITLE_INSTRUCTIONS.to_string(),
-        history: vec![json!({"role": "user", "content": [{"type": "input_text", "text": data}]})],
-        tools: Vec::new(),
-        tool_choice: ToolChoice::Auto,
-        web: WebTools::default(),
-        effort: ReasoningEffort::Low,
-        compaction: None,
-        parallel_tool_calls: false,
-    };
-    let mut stream = model.stream(request).await?;
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event? {
-            ModelEvent::Delta {
-                delta: Delta::Text(delta),
-                ..
-            } => text.push_str(&delta),
-            ModelEvent::Done { item, .. } => {
-                if let ItemView::Text { text: done, .. } = item.view {
-                    text = done;
-                }
-            }
-            ModelEvent::Completed { usage, .. } => {
-                return Ok((model_title(&text), Some(usage)));
-            }
-            // Cut off: a half title is worse than the first line.
-            ModelEvent::Incomplete { usage, .. } => return Ok((None, Some(usage))),
-            ModelEvent::Failed { message, .. } => {
-                anyhow::bail!("the title call failed: {message}");
-            }
-            _ => {}
-        }
+    let mut opts = CallOptions::new(Route::Small)
+        .with_cache_key(chat_id)
+        .with_prompt_version(trace::prompt_version("title", TITLE_INSTRUCTIONS));
+    // A ChatGPT plan token takes no output cap; the instructions keep the title short.
+    if small.config.provider != Provider::ChatGpt {
+        opts = opts.with_max_output_tokens(TITLE_MAX_OUTPUT_TOKENS);
     }
-    anyhow::bail!("the title call ended without finishing")
+    let input = [InputPart::Text(data)];
+    match model
+        .stream_parts(TITLE_INSTRUCTIONS, &input, &opts, Box::new(|_| {}))
+        .await
+    {
+        Ok(out) => Ok((model_title(&out.text), Some(out.usage))),
+        // Cut off: a half title is worse than the first line.
+        Err(AiError::Incomplete(_)) => Ok((None, None)),
+        Err(e) => Err(anyhow::anyhow!("the title call failed: {e}")),
+    }
 }
 
 /// A title from the model's reply: its first line without quotes or an ending period,
@@ -1740,8 +2064,70 @@ impl TurnTrace {
     }
 }
 
-/// Makes the title client from the small-tasks config (`Turns::title_model`).
-pub type TitleModel = Arc<dyn Fn(&ProviderConfig) -> Arc<dyn ModelClient> + Send + Sync>;
+/// Makes the title's text model from the small-tasks config (`Turns::title_model`).
+pub type TitleModel = Arc<dyn Fn(&ProviderConfig) -> Arc<dyn TextModel> + Send + Sync>;
+
+/// A plain text call of a turn (the title, the loop's condense summary), recording a
+/// `model_call` row: `route: small`, the provider and model, the prompt version (the
+/// options', else a hash of the fixed instructions), the usage and what the provider
+/// answered with.
+pub struct TracedText {
+    pub inner: Arc<dyn TextModel>,
+    pub trace: TurnTrace,
+    pub model: String,
+    pub provider: &'static str,
+    /// "title" or "condense", for the prompt version when the options carry none.
+    pub purpose: &'static str,
+}
+
+impl TextModel for TracedText {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let mut span = SpanGuard::new(self.trace.span(TraceKind::ModelCall), &self.trace.state);
+            {
+                let row = span.row();
+                row.route = Some(opts.route);
+                row.model = Some(self.model.clone());
+                row.provider = Some(self.provider.to_string());
+                row.prompt_version = Some(
+                    opts.prompt_version
+                        .clone()
+                        .unwrap_or_else(|| trace::prompt_version(self.purpose, instructions)),
+                );
+            }
+            match self
+                .inner
+                .stream_parts(instructions, input, opts, on_delta)
+                .await
+            {
+                Ok(out) => {
+                    let row = span.row();
+                    if !out.model.is_empty() {
+                        row.model = Some(out.model.clone());
+                    }
+                    row.usage = Some(trace::trace_usage(&out.usage));
+                    row.stop_reason = Some(if out.stop_reason.is_empty() {
+                        "completed".into()
+                    } else {
+                        out.stop_reason.clone()
+                    });
+                    span.finish(true);
+                    Ok(out)
+                }
+                Err(e) => {
+                    span.fail(trace::ai_error_code(&e));
+                    Err(e)
+                }
+            }
+        })
+    }
+}
 
 /// Which side call a traced model makes when it isn't an agent step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
