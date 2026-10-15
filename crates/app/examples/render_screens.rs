@@ -158,7 +158,7 @@ fn Harness(props: HarnessProps) -> Element {
         }
         lib.settings = Some(Settings {
             openai_base_url: "https://api.openai.com/v1".into(),
-            openai_model: "gpt-5".into(),
+            openai_model: margin_shared::OPENAI_DEFAULT_MODEL.into(),
             has_api_key: true,
             voice: None,
             render_width: 1920,
@@ -169,7 +169,7 @@ fn Harness(props: HarnessProps) -> Element {
             pipeline: Default::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
             default_provider: Default::default(),
-            openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+            openai_models: margin_shared::RouteModels::openai_default(),
             chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
             claude_models: margin_shared::RouteModels::claude_default(),
             has_claude_api_key: false,

@@ -40,6 +40,9 @@ pub struct FakeState {
     pub polls: u32,
     pub token_collected: bool,
     pub has_api_key: bool,
+    /// The default provider an admin picked; `None` = the first configured one, as on
+    /// the service (`FakeState::sync_settings`).
+    pub default_provider_picked: Option<Provider>,
     pub library: Library,
     pub proposals: HashMap<Id, Proposal>,
     pub settings: Settings,
@@ -591,7 +594,7 @@ pub fn sample_library() -> Library {
 fn default_settings() -> Settings {
     Settings {
         openai_base_url: "https://api.openai.com/v1".into(),
-        openai_model: "gpt-5".into(),
+        openai_model: margin_shared::OPENAI_DEFAULT_MODEL.into(),
         has_api_key: true,
         voice: None,
         render_width: 1920,
@@ -602,7 +605,7 @@ fn default_settings() -> Settings {
         pipeline: Default::default(),
         trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
         default_provider: Default::default(),
-        openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+        openai_models: margin_shared::RouteModels::openai_default(),
         chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
         claude_models: margin_shared::RouteModels::claude_default(),
         has_claude_api_key: false,
@@ -620,6 +623,7 @@ impl FakeState {
             polls: 0,
             token_collected: false,
             has_api_key: true,
+            default_provider_picked: None,
             library: sample_library(),
             proposals: HashMap::new(),
             settings: default_settings(),
@@ -1951,10 +1955,9 @@ async fn get_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response 
     if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
-    let s = fake.state.lock().unwrap();
-    let mut settings = s.settings.clone();
-    settings.has_api_key = s.has_api_key;
-    Json(settings).into_response()
+    let mut s = fake.state.lock().unwrap();
+    s.sync_settings();
+    Json(s.settings.clone()).into_response()
 }
 
 async fn patch_settings(
@@ -2044,7 +2047,7 @@ async fn patch_settings(
                 .unwrap_or_else(|| s.settings.openai_model.clone());
         }
         if let Some(v) = req.default_provider {
-            s.settings.default_provider = v;
+            s.default_provider_picked = Some(v);
         }
         let trimmed = |m: RouteModels| RouteModels {
             chat: m.chat.trim().into(),
@@ -2065,7 +2068,7 @@ async fn patch_settings(
         if let Some(key) = req.anthropic_api_key {
             s.settings.has_claude_api_key = !key.trim().is_empty();
         }
-        s.settings.has_api_key = s.has_api_key;
+        s.sync_settings();
         s.settings.clone()
     };
     publish(
@@ -2386,7 +2389,7 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
                         account,
                         last_error: None,
                     };
-                    s.settings.has_api_key = s.has_api_key;
+                    s.sync_settings();
                     changed = Some(s.settings.clone());
                 }
                 // As the service: a failed attempt while signed in keeps the account.
@@ -2444,7 +2447,7 @@ async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Respo
         s.chatgpt = ChatGptStatus::SignedOut;
         s.chatgpt_finish = None;
         let was = s.settings.chatgpt.take();
-        s.settings.has_api_key = s.has_api_key;
+        s.sync_settings();
         was.map(|_| s.settings.clone())
     };
     if let Some(settings) = settings {
@@ -6910,6 +6913,15 @@ fn public(person: &Person) -> Person {
 }
 
 impl FakeState {
+    /// `settings` as the service serves them: the OpenAI key flag, and the default
+    /// provider (the one picked, else the first configured one).
+    pub fn sync_settings(&mut self) {
+        self.settings.has_api_key = self.has_api_key;
+        self.settings.default_provider = self
+            .default_provider_picked
+            .unwrap_or_else(|| self.settings.first_configured());
+    }
+
     pub fn person(&self, id: &str) -> Option<&Person> {
         self.people.iter().find(|p| p.id == id)
     }

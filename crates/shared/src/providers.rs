@@ -91,9 +91,44 @@ impl RouteModels {
         }
     }
 
+    /// OpenAI's shipped slots: GPT-6.1 Sol for chats and writing, GPT-6 Luna for small
+    /// tasks.
+    pub fn openai_default() -> Self {
+        Self {
+            chat: OPENAI_DEFAULT_MODEL.into(),
+            write: OPENAI_DEFAULT_MODEL.into(),
+            small: OPENAI_SMALL_MODEL.into(),
+        }
+    }
+
+    /// `provider`'s shipped slots.
+    pub fn default_for(provider: Provider) -> Self {
+        match provider {
+            Provider::OpenAi => Self::openai_default(),
+            Provider::ChatGpt => Self::chatgpt_default(),
+            Provider::Claude => Self::claude_default(),
+        }
+    }
+
+    /// These slots with each blank one set to `provider`'s shipped default, so no slot
+    /// is ever served empty.
+    pub fn or_defaults(mut self, provider: Provider) -> Self {
+        let defaults = Self::default_for(provider);
+        for route in Route::ALL {
+            if self.get(route).trim().is_empty() {
+                self.set(route, defaults.get(route));
+            }
+        }
+        self
+    }
+
     /// OpenAI's slots for settings that predate them: chats on `agent_model` (else
     /// `openai_model`), writing on `openai_model`, small tasks on `OPENAI_SMALL_MODEL`.
+    /// An `openai_model` never picked (empty) is `OPENAI_DEFAULT_MODEL`.
     pub fn openai_from(openai_model: &str, agent_model: Option<&str>) -> Self {
+        let openai_model = Some(openai_model.trim())
+            .filter(|m| !m.is_empty())
+            .unwrap_or(OPENAI_DEFAULT_MODEL);
         let agent = agent_model.map(str::trim).filter(|m| !m.is_empty());
         Self {
             chat: agent.unwrap_or(openai_model).to_string(),
@@ -119,6 +154,9 @@ pub const CLAUDE_SMALL_MODEL: &str = "claude-haiku-5-5";
 /// The Claude models Settings lists first, in order.
 pub const CLAUDE_LISTED_MODELS: [&str; 3] =
     ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+/// OpenAI's default model for chats and writing: the GPT-6 family's balanced model
+/// (`docs/agent-architecture.md`), the same one ChatGPT defaults to.
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6.1-sol";
 /// OpenAI's default small-tasks model (the rag doc's Small default).
 pub const OPENAI_SMALL_MODEL: &str = "gpt-6-luna";
 /// ChatGPT's default model until the owner picks from the account's list.
@@ -154,7 +192,7 @@ pub struct ChatGptAccount {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ChatGptStatus {
     SignedOut,
-    /// A sign-in was started; `authorize_url` must be opened on the Mac that runs the
+    /// A sign-in was started; `authorize_url` must be opened on the machine that runs the
     /// service (the OAuth callback is a loopback URL there).
     Waiting {
         authorize_url: String,

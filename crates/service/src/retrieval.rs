@@ -1417,7 +1417,7 @@ pub async fn route_window(
             );
             let provider = match provider {
                 Some(p) => p,
-                None => state.settings_row().await?.default_provider,
+                None => state.default_provider().await?,
             };
             (provider, margin_ai::MODEL_WINDOW_FALLBACK)
         }

@@ -1047,7 +1047,7 @@ fn ApiKeyField(provider: Provider, has_key: bool) -> Element {
                         button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                     }
                 }
-                p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its secret store (the Keychain on a Mac, a private file on Linux), never on this device. It is never shown again." }
+                p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its private secret store, never on this device. It is never shown again." }
             } else {
                 div { class: "key-saved",
                     Icon { name: "check" }
@@ -1251,7 +1251,7 @@ async fn poll_chatgpt(app: crate::state::AppCtx, mut polling: Signal<bool>) {
     polling.set(false);
 }
 
-/// ChatGPT: "Continue with ChatGPT" (the sign-in runs on the service's Mac), its state,
+/// ChatGPT: "Continue with ChatGPT" (the sign-in runs on the service's machine), its state,
 /// sign out, and the three slots from the account's models.
 #[component]
 fn ChatGptSection(settings: Settings) -> Element {
@@ -1324,7 +1324,7 @@ fn ChatGptSection(settings: Settings) -> Element {
                         }
                     }
                     p { class: "faint", style: "margin: 0; font-size: 13px",
-                        "You finish signing in in a browser on the Mac that runs Margin's service. Margin never sees your password, and no token is kept on this device."
+                        "You finish signing in in a browser on the machine that runs Margin's service. Margin never sees your password, and no token is kept on this device."
                     }
                 },
                 ChatGptStatus::Waiting { authorize_url } => rsx! {
@@ -1336,7 +1336,7 @@ fn ChatGptSection(settings: Settings) -> Element {
                         if OPENS_SIGN_IN_HERE {
                             "The sign-in opened in your browser. If the service runs on another Mac, open this link on that Mac instead:"
                         } else {
-                            "Open this link on the Mac that runs Margin's service:"
+                            "Open this link on the machine that runs Margin's service:"
                         }
                     }
                     div { class: "copy-wrap",
@@ -3522,7 +3522,7 @@ mod tests {
         lib.settings = Some(settings);
         let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
         assert!(html.contains("Model for chats"), "{html}");
-        assert!(html.contains(r#"value="gpt-5""#));
+        assert!(html.contains(r#"value="gpt-6.1-sol""#));
         for e in ReasoningEffort::ALL {
             assert!(html.contains(effort_label(e)));
         }
@@ -3533,6 +3533,35 @@ mod tests {
         let mut lib = LibraryState::from_library(crate::fake::sample_library());
         lib.settings = Some(settings);
         crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai))
+    }
+
+    #[test]
+    fn a_new_install_shows_every_providers_default_models() {
+        let mut fake = crate::fake::FakeState::new();
+        fake.has_api_key = false;
+        fake.sync_settings();
+        assert_eq!(fake.settings.default_provider, Provider::OpenAi);
+        let html = ai_pane(fake.settings.clone());
+        for p in Provider::ALL {
+            let slots = RouteModels::default_for(p);
+            for route in Route::ALL {
+                let id = format!("ai-slot-{}-{}", p.as_str(), route.as_str());
+                let at = html.find(&format!(r#"id="{id}""#)).expect(&id);
+                let input = &html[html[..at].rfind("<input").unwrap()..];
+                let input = &input[..input.find('>').unwrap()];
+                assert!(
+                    input.contains(&format!(r#"value="{}""#, slots.get(route))),
+                    "{id}: {input}"
+                );
+            }
+        }
+        assert!(html.contains(r#"value="gpt-6.1-sol""#));
+        assert!(html.contains(r#"value="gpt-6-luna""#));
+        assert!(html.contains(r#"value="claude-opus-5-5""#));
+        assert!(html.contains(r#"value="claude-haiku-5-5""#));
+        // The key is on the service, which says so without naming a Mac's Keychain.
+        assert!(html.contains("kept in its private secret store, never on this device"));
+        assert!(!html.contains("Keychain"));
     }
 
     #[test]
@@ -3678,8 +3707,11 @@ mod tests {
         // Windows beside known models; the fallback named for the others.
         assert!(html.contains(">1M context<"), "{html}");
         assert!(html.contains(">window unknown, using 200k<"));
-        // gpt-5 (OpenAI's writing slot here) has no window in the list.
-        assert_eq!(settings.openai_models.write, "gpt-5");
+        // OpenAI's writing slot is the shipped default.
+        assert_eq!(
+            settings.openai_models.write,
+            margin_shared::OPENAI_DEFAULT_MODEL
+        );
         // The variant's route override, read-only under Claude's writing slot only.
         assert_eq!(
             html.matches("Overridden by the pipeline variant: ").count(),
@@ -3773,8 +3805,8 @@ mod tests {
         // Signed out (as the settings say before the status arrives).
         let html = pane(None, false);
         assert!(html.contains(">Continue with ChatGPT<"));
-        assert!(html.contains("in a browser on the Mac that runs Margin&#39;s service"));
-        // Waiting: the link, to open on the service's Mac, with Copy and Cancel.
+        assert!(html.contains("in a browser on the machine that runs Margin&#39;s service"));
+        // Waiting: the link, to open on the service's machine, with Copy and Cancel.
         let url = "https://auth.openai.com/api/accounts/authorize?state=st-1";
         let html = pane(
             Some(ChatGptStatus::Waiting {
@@ -3792,7 +3824,7 @@ mod tests {
         if OPENS_SIGN_IN_HERE {
             assert!(html.contains(">Open in browser<"));
         } else {
-            assert!(html.contains("Open this link on the Mac that runs Margin&#39;s service:"));
+            assert!(html.contains("Open this link on the machine that runs Margin&#39;s service:"));
         }
         // Signed in: the account, when, Sign out; the slots on the account's models.
         let html = pane(None, true);
