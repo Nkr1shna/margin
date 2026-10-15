@@ -9,8 +9,9 @@
 #   workflow_dispatch     -> on dev with "dev" / on release with "prod": publishes as above;
 #                            otherwise workflow artifacts only
 #
-# A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
-# the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
+# Each build is pinned to the service named by MARGIN_DEFAULT_SERVICE_URL at build time
+# (docs/plan-deploy.md §10): its sign-in screen has no service picker. Only a developer
+# build, made without that variable, asks for an address. Desktop: a .dmg of the bundled
 # Margin.app (Margin Dev.app for dev: its own name, bundle id, settings and Keychain
 # entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight
 # wait on the Apple Developer account, owner question 7). Android: the APK, skipped while
@@ -33,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Which service a fresh install starts on"
+        description: "Which service the app is built for (pinned)"
         required: true
         default: prod
         type: choice
@@ -145,7 +146,12 @@ jobs:
           [ "$id" = "$MARGIN_APP_ID" ] || { echo "::error::$app is $id, expected $MARGIN_APP_ID"; exit 1; }
           codesign --force --deep --sign - "$app"
           mkdir -p dist
-          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$app" -ov -format UDZO \
+          # The disk image holds the app and a link to /Applications, so installing is a
+          # drag from one to the other, in a styled window (deploy/dmg: background, icon
+          # positions, no toolbar). dmgbuild writes the window's .DS_Store directly, so it
+          # needs no Finder session on the runner.
+          command -v uvx >/dev/null || { echo "::error::uvx not on PATH (brew install uv); it runs dmgbuild"; exit 1; }
+          uvx dmgbuild==1.6.7 -s deploy/dmg/settings.py -D app="$app" "$MARGIN_APP_NAME" \
             "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
       - name: Android build
         run: |

@@ -1,11 +1,8 @@
 //! Fetching the model's files from Hugging Face in one download with one progress
-//! total. Which files depends on the backend (`Backend`, its `Manifest` below):
-//!
-//! - Core ML (`REPO`): the text model, the vision and audio encoders (every file inside
-//!   each `.mlpackage`, whatever the package holds) and the tables they read.
-//! - ONNX (`ONNX_REPO`): the tokenizer, `config.json`, the processor configs, and the
-//!   three graphs (`onnx/model`, `onnx/vision_encoder`, `onnx/audio_encoder`) in one
-//!   format (`OnnxDtype`), each with its external data file(s).
+//! total: from `ONNX_REPO`, the tokenizer, `config.json`, the processor configs, and the
+//! three graphs (`onnx/model`, `onnx/vision_encoder`, `onnx/audio_encoder`) in the
+//! backend's format (`OnnxDtype`, its `Manifest` below), each with its external data
+//! file(s).
 //!
 //! The file list comes from the repo's tree API; anything else in the repo (README, other
 //! formats, …) is skipped. Each file streams into `{path}.part` and is renamed when its
@@ -19,24 +16,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use crate::{Backend, EmbedError, OnnxDtype};
-
-/// The Core ML package the text functions live in.
-pub(crate) const TEXT_PACKAGE: &str = "EmbeddingGemma2Text.mlpackage";
-/// The image encoder (`vision_70` / `vision_140` / `vision_280`).
-pub(crate) const VISION_PACKAGE: &str = "EmbeddingGemma2Vision.mlpackage";
-/// The audio encoder.
-pub(crate) const AUDIO_PACKAGE: &str = "EmbeddingGemma2Audio.mlpackage";
-/// Every package a download fetches.
-pub(crate) const PACKAGES: &[&str] = &[TEXT_PACKAGE, VISION_PACKAGE, AUDIO_PACKAGE];
-/// The vision encoder's patch position tables.
-pub(crate) const POSITION_TABLE: &str = "position_embeddings.f16";
-/// Top-level files the Core ML model reads besides the packages.
-const TOP_FILES: &[&str] = &[
-    "config.json",
-    "tokenizer.json",
-    "embeddings.bf16",
-    POSITION_TABLE,
-];
 
 /// The ONNX export's graphs: the text model (which also takes the encoders' feature
 /// rows), the image encoder and the audio encoder.
@@ -65,19 +44,6 @@ fn is_graph_file(path: &str, graph: &str, dtype: OnnxDtype) -> bool {
             .is_some_and(|rest| rest == "_data" || rest.starts_with("_data_"))
 }
 
-/// Where a package is kept compiled: `X.mlpackage` → `X.mlmodelc`.
-pub(crate) fn compiled_name(package: &str) -> String {
-    format!("{}.mlmodelc", package.trim_end_matches(".mlpackage"))
-}
-
-/// The package a repo file belongs to.
-fn package_of(path: &str) -> Option<&'static str> {
-    PACKAGES.iter().copied().find(|p| {
-        path.strip_prefix(p)
-            .is_some_and(|rest| rest.starts_with('/'))
-    })
-}
-
 /// Which repo files a backend downloads and which it can't do without.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Manifest(pub Backend);
@@ -87,46 +53,28 @@ impl Manifest {
         self.0.repo()
     }
 
+    fn dtype(self) -> OnnxDtype {
+        let Backend::Onnx(dtype) = self.0;
+        dtype
+    }
+
     /// Whether a download fetches `path`.
     fn wanted(self, path: &str) -> bool {
-        match self.0 {
-            Backend::CoreMl => TOP_FILES.contains(&path) || package_of(path).is_some(),
-            Backend::Onnx(dtype) => {
-                ONNX_TOP_FILES.contains(&path)
-                    || ONNX_OPTIONAL_FILES.contains(&path)
-                    || ONNX_GRAPHS.iter().any(|g| is_graph_file(path, g, dtype))
-            }
-        }
+        ONNX_TOP_FILES.contains(&path)
+            || ONNX_OPTIONAL_FILES.contains(&path)
+            || ONNX_GRAPHS
+                .iter()
+                .any(|g| is_graph_file(path, g, self.dtype()))
     }
 
-    /// The first required file (or package) `files` lacks.
+    /// The first required file `files` lacks.
     fn missing(self, files: &[RemoteFile]) -> Option<String> {
         let listed = |name: &str| files.iter().any(|f| f.path == name);
-        match self.0 {
-            Backend::CoreMl => TOP_FILES
-                .iter()
-                .find(|f| !listed(f))
-                .map(|f| f.to_string())
-                .or_else(|| {
-                    PACKAGES
-                        .iter()
-                        .find(|p| !files.iter().any(|f| package_of(&f.path) == Some(**p)))
-                        .map(|p| p.to_string())
-                }),
-            Backend::Onnx(dtype) => ONNX_TOP_FILES
-                .iter()
-                .map(|f| f.to_string())
-                .chain(ONNX_GRAPHS.iter().map(|g| onnx_graph(g, dtype)))
-                .find(|f| !listed(f)),
-        }
-    }
-
-    /// The compiled copy a new file makes stale (Core ML packages only).
-    fn compiled_of(self, path: &str) -> Option<&'static str> {
-        match self.0 {
-            Backend::CoreMl => package_of(path),
-            Backend::Onnx(_) => None,
-        }
+        ONNX_TOP_FILES
+            .iter()
+            .map(|f| f.to_string())
+            .chain(ONNX_GRAPHS.iter().map(|g| onnx_graph(g, self.dtype())))
+            .find(|f| !listed(f))
     }
 }
 
@@ -199,7 +147,6 @@ pub(crate) async fn download(
     remove_if_exists(&dir.join(MANIFEST)).await?;
 
     let mut received = 0u64;
-    let mut fetched: Vec<&str> = Vec::new();
     progress(received, total);
     for file in &files {
         let target = file_path(dir, &file.path)?;
@@ -239,17 +186,8 @@ pub(crate) async fn download(
         }
         received = start + written;
         tokio::fs::rename(&partial, &target).await?;
-        if let Some(package) = manifest.compiled_of(&file.path)
-            && !fetched.contains(&package)
-        {
-            fetched.push(package);
-        }
     }
 
-    // New package files need a new compile.
-    for package in fetched {
-        remove_if_exists(&dir.join(compiled_name(package))).await?;
-    }
     let manifest = dir.join(MANIFEST);
     let partial = part_path(&manifest);
     let json =
@@ -304,7 +242,7 @@ pub(crate) fn is_complete(dir: &Path, manifest: Manifest) -> bool {
         })
 }
 
-/// Bytes of everything under `dir` (files and the compiled model).
+/// Bytes of everything under `dir`.
 pub(crate) fn size_on_disk(dir: &Path) -> u64 {
     fn walk(dir: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -371,7 +309,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
 
-    use crate::{ModelFiles, ONNX_REPO, REPO};
+    use crate::{ModelFiles, ONNX_REPO};
 
     use super::*;
 
@@ -387,54 +325,10 @@ mod tests {
         name: &'static str,
     }
 
-    fn fake_files() -> Vec<(String, Vec<u8>)> {
-        [
-            ("config.json", b"{\"hidden_size\": 512}".to_vec()),
-            ("tokenizer.json", vec![b't'; 3000]),
-            ("embeddings.bf16", vec![7u8; 100_000]),
-            ("README.md", b"# card".to_vec()),
-            (
-                "EmbeddingGemma2Text.mlpackage/Manifest.json",
-                b"{}".to_vec(),
-            ),
-            (
-                "EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/model.mlmodel",
-                vec![1u8; 5000],
-            ),
-            (
-                "EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
-                vec![2u8; 70_000],
-            ),
-            (
-                "EmbeddingGemma2Audio.mlpackage/Manifest.json",
-                b"{}".to_vec(),
-            ),
-            (
-                "EmbeddingGemma2Audio.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
-                vec![4u8; 40_000],
-            ),
-            (
-                "EmbeddingGemma2Vision.mlpackage/Manifest.json",
-                b"{}".to_vec(),
-            ),
-            (
-                "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
-                vec![5u8; 30_000],
-            ),
-            ("position_embeddings.f16", vec![3u8; 900]),
-            // Not part of the model: skipped, even though its name starts like a package's.
-            ("EmbeddingGemma2Text.mlpackage.zip", vec![9u8; 10]),
-        ]
-        .into_iter()
-        .map(|(p, b)| (p.to_string(), b))
-        .collect()
-    }
-
     async fn serve(repo: Arc<Repo>) -> String {
         async fn tree(State(repo): State<Arc<Repo>>) -> axum::Json<serde_json::Value> {
-            let mut entries = vec![
-                serde_json::json!({"type": "directory", "path": "EmbeddingGemma2Text.mlpackage", "size": 0}),
-            ];
+            let mut entries =
+                vec![serde_json::json!({"type": "directory", "path": "onnx", "size": 0})];
             entries.extend(repo.files.iter().map(|(path, bytes)| {
                 serde_json::json!({"type": "file", "path": path, "size": bytes.len()})
             }));
@@ -467,115 +361,14 @@ mod tests {
         dir
     }
 
-    fn wanted(path: &str) -> bool {
-        TOP_FILES.contains(&path) || package_of(path).is_some()
-    }
-
-    /// Bytes of every model part: text, vision, audio and the tables.
-    fn model_bytes() -> u64 {
-        fake_files()
-            .iter()
-            .filter(|(p, _)| wanted(p))
-            .map(|(_, b)| b.len() as u64)
-            .sum()
-    }
-
-    #[test]
-    fn files_belong_to_packages_by_folder() {
-        assert_eq!(
-            package_of("EmbeddingGemma2Vision.mlpackage/Manifest.json"),
-            Some(VISION_PACKAGE)
-        );
-        assert_eq!(package_of("EmbeddingGemma2Text.mlpackage.zip"), None);
-        assert_eq!(package_of("README.md"), None);
-        assert_eq!(
-            compiled_name(AUDIO_PACKAGE),
-            "EmbeddingGemma2Audio.mlmodelc"
-        );
-        assert_eq!(compiled_name(TEXT_PACKAGE), "EmbeddingGemma2Text.mlmodelc");
-    }
-
-    #[tokio::test]
-    async fn downloads_every_model_part_with_one_progress_total() {
-        let repo = Arc::new(Repo {
-            files: fake_files(),
-            missing: vec![],
-            fetches: 0.into(),
-            name: REPO,
-        });
-        let base = serve(repo.clone()).await;
-        let client = reqwest::Client::new();
-        let files = ModelFiles::new(temp_dir("download"));
-
-        assert_eq!(
-            ModelFiles::remote_size(&client, &base).await.unwrap(),
-            model_bytes()
-        );
-        assert!(!files.is_complete());
-
-        let seen = Mutex::new(Vec::new());
-        files
-            .download(&client, &base, &|received, total| {
-                seen.lock().unwrap().push((received, total))
-            })
-            .await
-            .unwrap();
-        let seen = seen.into_inner().unwrap();
-        assert_eq!(seen.first(), Some(&(0, model_bytes())));
-        assert_eq!(seen.last(), Some(&(model_bytes(), model_bytes())));
-        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
-
-        assert!(files.is_complete());
-        let parts = fake_files().iter().filter(|(p, _)| wanted(p)).count();
-        assert_eq!(parts, 11);
-        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts);
-        for (path, bytes) in fake_files() {
-            let on_disk = std::fs::read(files.dir.join(&path)).ok();
-            if wanted(&path) {
-                assert_eq!(on_disk.as_ref(), Some(&bytes), "{path}");
-            } else {
-                assert_eq!(on_disk, None, "{path} should be skipped");
-            }
-        }
-        assert!(files.size_on_disk() >= model_bytes());
-
-        // A missing file makes it incomplete; downloading again fetches only that file,
-        // and drops the compiled copy of the package it belongs to (only that one).
-        for package in PACKAGES {
-            std::fs::create_dir_all(files.dir.join(compiled_name(package))).unwrap();
-        }
-        let weights = "EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin";
-        std::fs::remove_file(files.dir.join(weights)).unwrap();
-        assert!(!files.is_complete());
-        files.download(&client, &base, &|_, _| {}).await.unwrap();
-        assert!(files.is_complete());
-        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts + 1);
-        assert!(!files.dir.join(compiled_name(VISION_PACKAGE)).exists());
-        assert!(files.dir.join(compiled_name(TEXT_PACKAGE)).exists());
-        assert!(files.dir.join(compiled_name(AUDIO_PACKAGE)).exists());
-
-        // A text-only download from before the encoders were added isn't complete.
-        std::fs::remove_dir_all(files.dir.join(AUDIO_PACKAGE)).unwrap();
-        assert!(!files.is_complete());
-        files.download(&client, &base, &|_, _| {}).await.unwrap();
-        assert!(files.is_complete());
-        assert_eq!(repo.fetches.load(Ordering::SeqCst), parts + 3);
-
-        files.remove().unwrap();
-        assert!(!files.dir.exists());
-        assert!(!files.is_complete());
-        assert_eq!(files.size_on_disk(), 0);
-        files.remove().unwrap();
-    }
-
     #[tokio::test]
     async fn a_failed_download_is_never_complete() {
-        let weights = "EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/weights/weight.bin";
+        let weights = "onnx/model_quantized.onnx_data";
         let repo = Arc::new(Repo {
-            files: fake_files(),
+            files: fake_onnx_files(),
             missing: vec![weights.to_string()],
             fetches: 0.into(),
-            name: REPO,
+            name: ONNX_REPO,
         });
         let base = serve(repo).await;
         let files = ModelFiles::new(temp_dir("failed"));
@@ -591,8 +384,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_repo_without_the_text_model_is_an_error() {
-        let files: Vec<_> = fake_files()
+    async fn a_repo_without_the_tokenizer_is_an_error() {
+        let files: Vec<_> = fake_onnx_files()
             .into_iter()
             .filter(|(p, _)| p != "tokenizer.json")
             .collect();
@@ -600,36 +393,19 @@ mod tests {
             files,
             missing: vec![],
             fetches: 0.into(),
-            name: REPO,
+            name: ONNX_REPO,
         });
         let base = serve(repo).await;
-        let err = ModelFiles::remote_size(&reqwest::Client::new(), &base)
+        let err = ModelFiles::new(temp_dir("no-tokenizer"))
+            .remote_bytes(&reqwest::Client::new(), &base)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("tokenizer.json"), "{err}");
-
-        // Every encoder is required too.
-        let files: Vec<_> = fake_files()
-            .into_iter()
-            .filter(|(p, _)| package_of(p) != Some(AUDIO_PACKAGE))
-            .collect();
-        let repo = Arc::new(Repo {
-            files,
-            missing: vec![],
-            fetches: 0.into(),
-            name: REPO,
-        });
-        let base = serve(repo).await;
-        let err = ModelFiles::remote_size(&reqwest::Client::new(), &base)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains(AUDIO_PACKAGE), "{err}");
     }
 
     /// Downloads the real model from Hugging Face when `MARGIN_EMBED_DOWNLOAD_TO` names a
-    /// folder (e.g. `~/Library/Caches/margin-embed-test/model` for the Core ML tests), for
-    /// the backend `MARGIN_EMBED_BACKEND` names (`coreml` when unset; `onnx-q8` for the
-    /// ONNX tests' `~/Library/Caches/margin-embed-test/onnx-q8`).
+    /// folder (e.g. `~/.cache/margin-embed-test/onnx-q8` for the ONNX tests), for the
+    /// backend `MARGIN_EMBED_BACKEND` names (the default, `onnx-q8`, when unset).
     #[tokio::test]
     async fn real_download_when_asked() {
         let Some(dir) = std::env::var_os("MARGIN_EMBED_DOWNLOAD_TO") else {
@@ -638,7 +414,7 @@ mod tests {
         };
         let backend = std::env::var("MARGIN_EMBED_BACKEND")
             .ok()
-            .map_or(Backend::CoreMl, |name| name.parse().unwrap());
+            .map_or(Backend::default(), |name| name.parse().unwrap());
         let client = reqwest::Client::new();
         let files = ModelFiles::with_backend(PathBuf::from(dir), backend);
         let total = files.remote_bytes(&client, crate::HF_BASE).await.unwrap();
@@ -714,8 +490,6 @@ mod tests {
         assert!(!fp32.wanted("onnx/model.onnx.bak"));
         assert!(!fp32.wanted("onnx/model_quantized.onnx"));
         assert!(!fp32.wanted("onnx/model_fp16.onnx_data"));
-        assert!(!Manifest(Backend::CoreMl).wanted("onnx/model.onnx"));
-        assert_eq!(q8.compiled_of("onnx/model_quantized.onnx"), None);
     }
 
     #[tokio::test]
@@ -758,14 +532,13 @@ mod tests {
             }
         }
         assert_eq!(
-            files.graph_path("model").unwrap(),
+            files.graph_path("model"),
             files.dir.join("onnx/model_quantized.onnx")
         );
-        // The same folder doesn't count as another format's download, nor as Core ML's.
+        // The same folder doesn't count as another format's download.
         assert!(
             !ModelFiles::with_backend(&files.dir, Backend::Onnx(OnnxDtype::Fp32)).is_complete()
         );
-        assert!(!ModelFiles::new(&files.dir).is_complete());
         // A missing data file makes it incomplete again.
         std::fs::remove_file(files.dir.join("onnx/vision_encoder_quantized.onnx_data")).unwrap();
         assert!(!files.is_complete());

@@ -15,8 +15,8 @@
 # ///
 """margin-tts: one narration line to a WAV with Kyutai's Pocket TTS, on the CPU.
 
-Margin's lesson renderer runs this off the Mac, where `fluidaudiocli tts --backend
-pocket` (the same model on Core ML) isn't available (docs/plan-linux-service.md §2.7):
+Margin's lesson renderer runs this on the Linux service (docs/plan-linux-service.md
+§2.7):
 
     margin-tts --text "A line." --output line.wav [--voice alba] [--language english]
 

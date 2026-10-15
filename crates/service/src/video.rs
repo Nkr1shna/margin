@@ -216,17 +216,10 @@ fn tool_path(t: &ToolStatus) -> PathBuf {
     PathBuf::from(t.path.clone().unwrap_or_else(|| t.name.clone()))
 }
 
-/// The program that voices narration: `fluidaudiocli` (Core ML, macOS) or `margin-tts`
-/// (Kyutai's pocket-tts on the CPU, Linux), whichever Settings → Tools found, the
-/// FluidAudio one first. `Err` names the one this OS installs when neither is there.
+/// The program that voices narration: `margin-tts` (Kyutai's pocket-tts on the CPU), when
+/// Settings → Tools found it. `Err` names it when it isn't there.
 pub fn voice_tool(tools: &[ToolStatus]) -> Result<&ToolStatus, &'static str> {
-    tool(tools, "fluidaudiocli")
-        .or_else(|| tool(tools, "margin-tts"))
-        .ok_or(if cfg!(target_os = "macos") {
-            "fluidaudiocli"
-        } else {
-            "margin-tts"
-        })
+    tool(tools, margin_video::MARGIN_TTS).ok_or(margin_video::MARGIN_TTS)
 }
 
 /// pocket-tts voices whose licence is non-commercial only: never used for a video.
@@ -243,15 +236,14 @@ pub fn voice_refused(voice: &str) -> Option<String> {
     })
 }
 
-/// Scene code renders under this OS's sandbox (`SandboxMode::native()`: macOS
-/// `sandbox-exec`, Linux bubblewrap) unless the service was started with
-/// `--allow-unsandboxed-render` (development and tests only). Where that sandbox can't
-/// run, `margin_video` refuses with `RenderError::Sandbox`.
+/// Scene code renders under bubblewrap unless the service was started with
+/// `--allow-unsandboxed-render` (development and tests only). Where bubblewrap can't run
+/// (off Linux, without `bwrap`), `margin_video` refuses with `RenderError::Sandbox`.
 pub fn sandbox_mode(allow_unsandboxed: bool) -> SandboxMode {
     if allow_unsandboxed {
         SandboxMode::Unsandboxed
     } else {
-        SandboxMode::native()
+        SandboxMode::LinuxBubblewrap
     }
 }
 
@@ -280,7 +272,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         )
         .await;
     };
-    let fluidaudio = match voice_tool(&tools) {
+    let tts = match voice_tool(&tools) {
         Ok(t) => t,
         Err(missing) => {
             return fail(
@@ -303,7 +295,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
     let config = RenderConfig {
         manimgx: tool_path(manimgx),
         voice: Voice::PocketTts {
-            cli: tool_path(fluidaudio),
+            cli: tool_path(tts),
             voice: settings.voice.clone(),
         },
         sandbox: sandbox_mode(state.allow_unsandboxed_render),
@@ -627,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn narration_uses_whichever_voice_tool_is_there() {
+    fn narration_uses_margin_tts() {
         let t = |name: &str, found| ToolStatus {
             name: name.into(),
             found,
@@ -635,19 +627,10 @@ mod tests {
             version: None,
             install_commands: Vec::new(),
         };
-        let both = [t("margin-tts", true), t("fluidaudiocli", true)];
-        assert_eq!(voice_tool(&both).unwrap().name, "fluidaudiocli");
-        let linux = [t("fluidaudiocli", false), t("margin-tts", true)];
-        assert_eq!(voice_tool(&linux).unwrap().name, "margin-tts");
+        let found = [t("manimgx", true), t("margin-tts", true)];
+        assert_eq!(voice_tool(&found).unwrap().name, "margin-tts");
         let none = [t("margin-tts", false)];
-        assert_eq!(
-            voice_tool(&none).unwrap_err(),
-            if cfg!(target_os = "macos") {
-                "fluidaudiocli"
-            } else {
-                "margin-tts"
-            }
-        );
+        assert_eq!(voice_tool(&none).unwrap_err(), "margin-tts");
         assert!(
             voice_refused(" Cosette ")
                 .unwrap()
@@ -660,13 +643,6 @@ mod tests {
     #[test]
     fn unsandboxed_only_with_the_flag() {
         assert_eq!(sandbox_mode(true), SandboxMode::Unsandboxed);
-        assert_eq!(
-            sandbox_mode(false),
-            if cfg!(target_os = "linux") {
-                SandboxMode::LinuxBubblewrap
-            } else {
-                SandboxMode::MacosSandboxExec
-            }
-        );
+        assert_eq!(sandbox_mode(false), SandboxMode::LinuxBubblewrap);
     }
 }

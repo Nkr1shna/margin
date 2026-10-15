@@ -4,7 +4,7 @@ The one place to see what's built, what's in flight and what's next. Update it i
 
 **Product:** a "Live context" app for a company's projects: humans through a voice-first GUI, agents through context, with learning (courses, lessons, quizzes) built in. Margin is a startup and the vision moves, so designs stay pluggable and every RAG/prompt/model change is measured by evals.
 
-**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR into `dev` (deploys `devmargin.krishnanelloore.com`). Prod ships by a PR from `dev` into `release` (deploys `margin.krishnanelloore.com`). `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
+**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
 
 Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting on the owner
 
@@ -18,23 +18,24 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Dogfooding**: `margin-mcp` (Claude Code reads and writes Margin), session summaries saved automatically | `docs/plan-dogfood.md` |
 | ✅ | **Deploy**: dev and prod on the Mac mini (Tart/Orchard), Cloudflare tunnels, CI per platform (Linux runner `margin-ci`, macOS for the app), CD per product, local Linux check | `docs/plan-deploy.md` |
 | ✅ | **Linux service**: ONNX EmbeddingGemma, pdfium, tesseract, ffmpeg, Parakeet, pocket-tts, bubblewrap, file secrets, systemd guests | `docs/plan-linux-service.md` |
+| ✅ | **macOS service leftovers removed** (Core ML, PDFKit/Vision/ImageIO/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd): Linux is the only service platform; the apps stay on Mac, iPhone, Android. Core ML-era passages are re-embedded by the one-pass re-embed | `docs/plan-linux-service.md` §0 |
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
+| ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
 
 ## In progress
 
 | | Item | Notes |
 |---|---|---|
-| 🟡 | **Remove the macOS service leftovers** (Core ML, PDFKit/Vision/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd) | Linux is the only service platform; the apps stay on Mac, iPhone, Android |
+| | Nothing right now | |
 
 ## Next (in order)
 
 | | Item | Plan | Notes |
 |---|---|---|---|
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| 🟡 | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/l1-brief.md`, `docs/plan-live-context.md` | Fixes events going to every device; a second *untrusted* account waits for L2 |
-| ⏳ | **R2 — rerank and query rewriting**, eval-gated | `docs/agent-rag-architecture.md` §4 | |
+| ⏳ | **R2 — rerank, query rewriting, prompt-version tracking**, eval-gated | `docs/r2-brief.md` (from `docs/agent-rag-architecture.md` §4) | Cross-encoder built as a variant (ONNX on the CPU), promoted only by the eval |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
-| ⏳ | **Phase 5 — hardening** | `docs/agent-architecture.md` §2.10 | iOS background continuation for folders |
+| ⏳ | **Phase 5 — hardening** | `docs/phase5-brief.md` | iOS background continuation for folders, prompt-injection tests, job retries, backups/drills, alerts from traces, security review, performance budgets |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
 | ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
 | ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |

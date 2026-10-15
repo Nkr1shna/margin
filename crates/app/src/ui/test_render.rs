@@ -34,10 +34,12 @@ pub struct Extra {
     pub folder_sync: BTreeMap<Id, SyncState>,
     pub ask_workspaces: Vec<Id>,
     pub shown_passage: Option<Citation>,
-    /// Signed out at this configured service URL: the sign-in screen renders instead.
+    /// Signed out at this saved service URL: the sign-in screen renders instead.
     pub connect: Option<Option<String>>,
     /// Who is signed in; `None`: the fake's owner on `d1` (`fake::sample_me(TOKEN)`).
     pub me: Option<Me>,
+    /// The sign-in screen's build: pinned to this service, or a developer build (`None`).
+    pub pinned: Option<String>,
 }
 
 #[allow(non_snake_case)]
@@ -88,7 +90,8 @@ fn Harness(props: HarnessProps) -> Element {
         ask_workspaces: Signal::new(extra.ask_workspaces),
     });
     if !signed_in {
-        return rsx! { crate::ui::signin::ConnectScreen {} };
+        let pinned = extra.pinned.clone();
+        return rsx! { crate::ui::signin::ConnectScreen { pinned } };
     }
     rsx! { Router::<Route> {} }
 }
@@ -123,14 +126,16 @@ pub fn render_with(
     dioxus_ssr::render(&dom)
 }
 
-/// The sign-in screen's HTML for a device whose saved service URL is `service_url`.
-pub fn render_connect(service_url: Option<&str>) -> String {
+/// The sign-in screen's HTML for a device whose saved service URL is `service_url`, in
+/// a build pinned to `pinned` (or a developer build, `None`).
+pub fn render_connect(service_url: Option<&str>, pinned: Option<&str>) -> String {
     render_with(
         "/",
         LibraryState::default(),
         None,
         Extra {
             connect: Some(service_url.map(String::from)),
+            pinned: pinned.map(String::from),
             ..Extra::default()
         },
     )

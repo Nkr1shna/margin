@@ -10,7 +10,7 @@
 //!   most 120), through the image encoder, each with its text (a page's text layer or
 //!   OCR, an image's OCR, what was said around a frame);
 //! - sound: 10-second windows of an audio file or a video's soundtrack, through the
-//!   audio encoder, plus a transcript (FluidAudio speech recognition) cut into
+//!   audio encoder, plus a transcript (Parakeet speech recognition) cut into
 //!   timestamped passages.
 //!
 //! This file keeps upload, delete, attach and "Read again", and the passages lessons
@@ -603,7 +603,7 @@ async fn replace_locked(
                     old_dir.join(FILE_NAME),
                 )
                 .await?;
-                // The link AVFoundation reads by is made again when it's read.
+                // The named link the readers open is made again when it's read.
                 if let Some(link) = link_name(&old.name) {
                     match tokio::fs::remove_file(old_dir.join(link)).await {
                         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -895,8 +895,8 @@ pub(crate) fn ocr_warning(kind: SourceKind, why: &str) -> String {
 }
 
 /// The uploaded file under a name with the original's extension (`input.m4a`, a link to
-/// `file`): AVFoundation picks the container format by extension and won't open an
-/// audio or video file without one. `file` itself when the name has no extension.
+/// `file`): the readers take the extension as a hint to the format. `file` itself when
+/// the name has no extension.
 pub(crate) async fn named_link(dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
     let Some(link) = link_name(name).map(|n| dir.join(n)) else {
         return Ok(dir.join(FILE_NAME));

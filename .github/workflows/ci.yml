@@ -1,5 +1,5 @@
 # Tests on fakes only (docs/plan-deploy.md §4): in-memory SurrealDB, fake GitHub and
-# model servers. Never reaches a VM, the Keychain's secrets or a model API.
+# model servers. Never reaches a VM, the service's secrets or a model API.
 # Runs on the Mac mini's runner (labels below; the host's other runner, `clusterbar`,
 # serves another repository). Pull requests from forks never run here: a self-hosted
 # runner holds the deploy key.
@@ -74,8 +74,8 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: sh deploy/ci/linux-ci.sh
 
-  # The app (desktop, iOS) on the Mac host runner. (The service is a Linux build; its macOS
-  # backends are no longer checked here.)
+  # The app (desktop, iOS) on the Mac host runner. (The service is a Linux build, checked
+  # above.)
   macos:
     name: macOS
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository

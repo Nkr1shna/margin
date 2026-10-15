@@ -9,7 +9,9 @@ use dioxus::prelude::*;
 use margin_shared::{LoginState, StartLogin};
 
 use crate::api::Api;
-use crate::config::{PRESETS, normalize_service_url, preset_for};
+use crate::config::{
+    APP_NAME, LOCAL_SERVICE_URL, PINNED_SERVICE_URL, normalize_service_url, service_host,
+};
 use crate::secrets;
 use crate::state::{Session, use_app};
 use crate::ui::common::{BrandMark, DragRegion, Icon, focus_first, open_external};
@@ -48,20 +50,21 @@ fn device_name() -> String {
     }
 }
 
+/// The first screen. A release build is pinned to its service (`PINNED_SERVICE_URL`), so
+/// it only signs in; a developer build asks for the service's address first. `pinned`
+/// is the build's unless a render test passes one.
 #[component]
-pub fn ConnectScreen() -> Element {
+pub fn ConnectScreen(
+    #[props(default = PINNED_SERVICE_URL.map(String::from))] pinned: Option<String>,
+) -> Element {
     let mut app = use_app();
-    let mut url = use_signal(|| app.service_url());
-    // Which service: one of `PRESETS`, or `None` for an address typed in (Custom).
-    let mut preset = use_signal(|| preset_for(&url.peek()));
-    // The last address typed for Custom, restored when Custom is picked again.
-    let mut custom_url = use_signal(|| {
-        let u = url.peek().clone();
-        if preset_for(&u).is_some() {
-            String::new()
-        } else {
-            u
-        }
+    // The pinned service; else the address this device signed in to before, or the local
+    // service (`LocalConfig::service_url`, without the build's own pinning).
+    let mut url = use_signal(|| {
+        pinned
+            .clone()
+            .or_else(|| app.config.peek().service_url.clone())
+            .unwrap_or_else(|| LOCAL_SERVICE_URL.to_string())
     });
     // Bumped when the address is rewritten by code (normalized), to remount the field.
     let mut url_rev = use_signal(|| 0u64);
@@ -87,9 +90,6 @@ pub fn ConnectScreen() -> Element {
         if *url.peek() != base {
             url.set(base.clone());
             url_rev += 1;
-        }
-        if preset.peek().is_none() {
-            custom_url.set(base.clone());
         }
         app.signed_out_reason.set(None);
         let handle = spawn(async move {
@@ -146,22 +146,7 @@ pub fn ConnectScreen() -> Element {
     );
     let reason = app.signed_out_reason.read().clone();
     let url_invalid = url_error.read().is_some();
-    let chosen = *preset.read();
-    let mut choose = move |choice: Option<usize>| {
-        if *preset.peek() == choice {
-            return;
-        }
-        preset.set(choice);
-        url_error.set(None);
-        match choice {
-            Some(i) => url.set(PRESETS[i].1.to_string()),
-            None => {
-                url.set(custom_url.peek().clone());
-                url_rev += 1;
-                focus_first("#service-url");
-            }
-        }
-    };
+    let pinned_host = pinned.as_deref().map(service_host).map(String::from);
 
     rsx! {
         div { class: "connect",
@@ -169,78 +154,63 @@ pub fn ConnectScreen() -> Element {
             div { class: "connect-card",
                 div { class: "connect-head",
                     BrandMark {}
-                    "Margin"
+                    "{APP_NAME}"
                 }
-                h1 { "Connect to your Margin service" }
-                p { "Margin keeps your library on your own Mac. Pick your Margin service, or enter its address, then sign in with GitHub to give this device its own key." }
+                if let Some(host) = pinned_host {
+                    h1 { "Sign in to {APP_NAME}" }
+                    p {
+                        "Your library lives on the {APP_NAME} service, not on this device. Sign in with GitHub to give this device its own key."
+                    }
+                    div { class: "field",
+                        span { class: "label", "Service" }
+                        span { class: "mono", id: "service-host", "{host}" }
+                    }
+                } else {
+                    h1 { "Connect to a Margin service" }
+                    p {
+                        "This is a developer build, so it can reach any Margin service. Enter the address of the one you're running (on this machine, by default), then sign in with GitHub to give this device its own key."
+                    }
+                }
                 if let Some(reason) = reason {
                     div { class: "notice", role: "status",
                         Icon { name: "alert" }
                         div { class: "body", "{reason}" }
                     }
                 }
-                form {
-                    class: "field",
-                    onsubmit: move |e| {
-                        e.prevent_default();
-                        if !busy {
-                            start();
-                        }
-                    },
-                    span { class: "label", id: "service-choice-label", "Service" }
-                    div { class: "seg", role: "radiogroup", "aria-labelledby": "service-choice-label",
-                        for (i, (name, _)) in PRESETS.iter().enumerate() {
-                            button {
-                                key: "{name}",
-                                r#type: "button",
-                                role: "radio",
+                if pinned.is_none() {
+                    form {
+                        class: "field",
+                        onsubmit: move |e| {
+                            e.prevent_default();
+                            if !busy {
+                                start();
+                            }
+                        },
+                        label { r#for: "service-url", "Service address" }
+                        for rev in std::iter::once(url_rev()) {
+                            input {
+                                key: "{rev}",
+                                id: "service-url",
+                                class: "input",
+                                r#type: "url",
+                                inputmode: "url",
+                                autocomplete: "url",
+                                spellcheck: false,
                                 disabled: busy,
-                                "aria-checked": (chosen == Some(i)).to_string(),
-                                // One tab stop; the arrow keys move between options (margin.js).
-                                tabindex: if chosen == Some(i) { "0" } else { "-1" },
-                                onclick: move |_| choose(Some(i)),
-                                "{name}"
+                                "aria-invalid": url_invalid.to_string(),
+                                "aria-describedby": url_invalid.then_some("service-url-err"),
+                                initial_value: "{url}",
+                                // Clearly an example, not a value already filled in.
+                                placeholder: "e.g. {LOCAL_SERVICE_URL}",
+                                oninput: move |e| {
+                                    url_error.set(None);
+                                    url.set(e.value());
+                                },
                             }
                         }
-                        button {
-                            r#type: "button",
-                            role: "radio",
-                            disabled: busy,
-                            "aria-checked": chosen.is_none().to_string(),
-                            tabindex: if chosen.is_none() { "0" } else { "-1" },
-                            onclick: move |_| choose(None),
-                            "Custom"
+                        if let Some(err) = url_error.read().clone() {
+                            span { id: "service-url-err", class: "field-error", role: "alert", "{err}" }
                         }
-                    }
-                    if let Some(i) = chosen {
-                        span { class: "faint", style: "font-size: 13px", "{PRESETS[i].1}" }
-                    } else {
-                    label { r#for: "service-url", "Service address" }
-                    for rev in std::iter::once(url_rev()) {
-                    input {
-                        key: "{rev}",
-                        id: "service-url",
-                        class: "input",
-                        r#type: "url",
-                        inputmode: "url",
-                        autocomplete: "url",
-                        spellcheck: false,
-                        disabled: busy,
-                        "aria-invalid": url_invalid.to_string(),
-                        "aria-describedby": url_invalid.then_some("service-url-err"),
-                        initial_value: "{url}",
-                        // Clearly an example, not a value already filled in.
-                        placeholder: "e.g. margin.example.com",
-                        oninput: move |e| {
-                            url_error.set(None);
-                            custom_url.set(e.value());
-                            url.set(e.value());
-                        },
-                    }
-                    }
-                    if let Some(err) = url_error.read().clone() {
-                        span { id: "service-url-err", class: "field-error", role: "alert", "{err}" }
-                    }
                     }
                 }
                 match current {
@@ -365,37 +335,50 @@ mod tests {
     use crate::ui::test_render::render_connect;
 
     #[test]
-    fn a_preset_address_selects_its_preset() {
-        let html = render_connect(Some("https://devmargin.krishnanelloore.com"));
-        assert!(html.contains(r#"role="radiogroup""#), "{html}");
+    fn a_pinned_build_only_signs_in_to_its_service() {
+        // Whatever an older install saved, the build's service is the one shown.
+        let html = render_connect(
+            Some("http://127.0.0.1:8787"),
+            Some("https://devmargin.krishnanelloore.com"),
+        );
+        let title = format!("Sign in to {}</h1>", crate::config::APP_NAME);
+        assert!(html.contains(&title), "{html}");
         assert!(
-            html.contains(r#"aria-checked="true" tabindex="0">Dev</button>"#),
+            html.contains(r#"id="service-host">devmargin.krishnanelloore.com</span>"#),
             "{html}"
         );
-        assert!(html.contains(">https://devmargin.krishnanelloore.com</span>"));
-        // The address field is only for Custom.
-        assert!(!html.contains(r#"id="service-url""#));
+        assert!(html.contains(">Sign in with GitHub</button>"), "{html}");
+        // No picker, no address field, no stale copy.
+        assert!(!html.contains(r#"role="radiogroup""#), "{html}");
+        assert!(!html.contains("Custom"), "{html}");
+        assert!(!html.contains(r#"id="service-url""#), "{html}");
+        assert!(!html.contains("127.0.0.1"), "{html}");
+        assert!(!html.contains("your own Mac"), "{html}");
     }
 
     #[test]
-    fn a_fresh_install_starts_on_the_default_service() {
-        let html = render_connect(None);
-        if option_env!("MARGIN_DEFAULT_SERVICE_URL").is_none() {
-            assert!(
-                html.contains(r#"aria-checked="true" tabindex="0">Prod</button>"#),
-                "{html}"
-            );
-        }
+    fn a_developer_build_asks_for_the_address_starting_local() {
+        let html = render_connect(None, None);
+        assert!(html.contains("Connect to a Margin service</h1>"), "{html}");
+        assert!(html.contains(r#"id="service-url""#), "{html}");
+        assert!(
+            html.contains(r#"initial_value="http://localhost:8787""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"role="radiogroup""#), "{html}");
+        assert!(html.contains(">Sign in with GitHub</button>"), "{html}");
     }
 
     #[test]
-    fn another_address_is_custom_with_the_field() {
-        let html = render_connect(Some("http://127.0.0.1:8787"));
+    fn a_developer_build_remembers_the_address_it_signed_in_to() {
+        let html = render_connect(Some("https://margin.example.net"), None);
         assert!(
-            html.contains(r#"aria-checked="true" tabindex="0">Custom</button>"#),
+            html.contains(r#"initial_value="https://margin.example.net""#),
             "{html}"
         );
-        assert!(html.contains(r#"id="service-url""#));
-        assert!(html.contains("http://127.0.0.1:8787"));
+        assert!(
+            !html.contains(r#"initial_value="http://localhost"#),
+            "{html}"
+        );
     }
 }

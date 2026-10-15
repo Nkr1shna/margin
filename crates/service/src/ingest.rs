@@ -1642,7 +1642,7 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         item.row.scope_ids = scope.clone();
         item.row.access = doc.access.clone();
         item.row.project_id = doc.project_id.clone();
-        // The backend that embeds them (`Embedder::version`), not the Core ML constant.
+        // The backend that embeds them (`Embedder::version`), not the default constant.
         item.row.embedder = embedder.version().to_string();
     }
     let passages = items.len() as u32;

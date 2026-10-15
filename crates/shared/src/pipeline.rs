@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 /// `hash()`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineConfig {
-    /// The embedding backend (`docs/plan-linux-service.md` §2.11): `"coreml"`,
-    /// `"onnx-q8"`, `"onnx-fp32"`, `"onnx-fp16"`, or the test stand-ins `"recorded"` and
-    /// `"fake"`. Left out of the JSON (and so of `hash()`) while it is `"coreml"`, so
+    /// The embedding backend (`docs/plan-linux-service.md` §2.11): `"onnx-q8"`,
+    /// `"onnx-fp32"`, `"onnx-fp16"`, or the test stand-ins `"recorded"` and `"fake"`; the
+    /// default, `"coreml"` (`DEFAULT_EMBEDDER`), is the Mac service's backend, kept only
+    /// as a name. Left out of the JSON (and so of `hash()`) while it is the default, so
     /// every hash stored before it existed keeps its meaning.
     #[serde(
         default = "default_embedder",
@@ -136,7 +137,9 @@ fn is_default_embedder(cfg: &StageCfg) -> bool {
     *cfg == default_embedder()
 }
 /// The `embedder` stage a config without one names: the backend every pipeline ran on
-/// before the stage existed.
+/// before the stage existed (Core ML, on the Mac service). No service runs it any more
+/// (the service stamps its own ONNX backend); the name stays so stored hashes keep their
+/// meaning.
 pub const DEFAULT_EMBEDDER: &str = "coreml";
 fn default_chunker() -> StageCfg {
     StageCfg::named("sections-v2")

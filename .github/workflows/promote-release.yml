@@ -1,0 +1,238 @@
+# Ships a verified dev snapshot to prod (docs/plan-deploy.md §4a). `dev` is always
+# shippable, so a release is "dev as of commit X", never a hand-picked set of PRs.
+#
+# Run by hand (Actions → promote-release → Run workflow), `sha` empty or a dev commit:
+#   promote: picks the snapshot (deploy/scripts/release-snapshot.sh): `sha`, or the newest
+#   dev commit whose smoke-dev passed (a docs- or app-only commit takes the nearest service
+#   commit's result); refuses, naming the commit, when that commit's
+#   smoke-dev failed or never ran. Creates branch promote/<short-sha> AT that commit and
+#   opens a PR into release listing the dev PRs it brings (since the last dev commit release
+#   has, `git merge-base origin/release origin/dev`).
+# Merging that PR — with a merge commit, never a squash — makes release exactly that dev
+# commit, and the push to release deploys prod. Then:
+#   released: checks release's files equal that dev commit (a squash merge or a direct push
+#   fails here, untagged), tags it release-<date>-<short-sha> (the tag message records the
+#   dev sha and the PRs), labels the PRs `shipped`, and opens a PR into dev that regenerates
+#   docs/RELEASES.md from the tags (deploy/scripts/releases-ledger.sh).
+#
+# Token: the optional repository secret PROMOTE_TOKEN (a fine-grained token on this
+# repository with Contents, Pull requests and Workflows read/write) is used when set: its
+# PRs trigger CI like the owner's. Without it the job's GITHUB_TOKEN is used: PRs it opens
+# trigger no workflows, so the job dispatches ci.yml on the branch itself (the same
+# `Linux`/`macOS` checks).
+name: promote-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "dev commit to release (empty: the newest dev commit whose smoke-dev passed)"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [release]
+
+permissions: {}
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.event_name == 'workflow_dispatch'
+    # Git and gh only, on the Linux runner VM (margin-ci), like build-service.
+    runs-on: [self-hosted, Linux, ARM64, margin]
+    timeout-minutes: 15
+    permissions:
+      contents: write       # create the promote/<sha> branch
+      pull-requests: write  # open the PR into release; read a commit's PRs
+      statuses: read        # smoke-dev's commit status
+      actions: write        # dispatch CI on the branch
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
+      SHA_INPUT: ${{ inputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Choose the dev snapshot and open the release PR
+        run: |
+          set -euo pipefail
+          case "$SHA_INPUT" in
+            "") ;;
+            *[!0-9a-f]*) echo "::error::sha must be a hex commit id, got: $SHA_INPUT"; exit 1 ;;
+          esac
+          s=deploy/scripts/release-snapshot.sh
+          base="$(sh "$s" base origin/release origin/dev)"
+          if ! snapshot="$(sh "$s" select "$base" origin/dev "$SHA_INPUT" 2> "$RUNNER_TEMP/select.log")"; then
+            cat "$RUNNER_TEMP/select.log"
+            { echo "### Release refused"; echo; echo '```'; cat "$RUNNER_TEMP/select.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$(tail -n 1 "$RUNNER_TEMP/select.log")"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/select.log"
+          short="${snapshot:0:7}"
+          sh "$s" prs "$base" "$snapshot" > "$RUNNER_TEMP/prs.tsv"
+          sh "$s" notes "$RUNNER_TEMP/prs.tsv" > "$RUNNER_TEMP/notes.md"
+          count="$(awk -F '\t' '$1 != "-"' "$RUNNER_TEMP/prs.tsv" | wc -l | tr -d ' ')"
+
+          # The branch is the snapshot itself: no new commit, nothing cherry-picked.
+          branch="promote/$short"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" -f sha="$snapshot" -F force=true > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$snapshot" > /dev/null
+          fi
+
+          {
+            echo "<!-- promote-snapshot: $snapshot base: $base -->"
+            echo "Releases **dev at \`$short\`** to prod: dev exactly as it was at that commit (the service in it passed smoke-dev), which is everything merged into dev after \`${base:0:7}\`, the last dev commit release has."
+            echo
+            echo "> [!IMPORTANT]"
+            echo "> Merge with **Create a merge commit**, never *Squash and merge*: release must contain this exact dev commit. A squashed release is caught after the push (prod still deploys it, but it isn't tagged, and the next release's PR list would be wrong)."
+            echo
+            echo "### PRs in this release ($count)"
+            echo
+            cat "$RUNNER_TEMP/notes.md"
+            echo
+            echo "Merging deploys prod. promote-release then tags the release \`release-<date>-$short\`, labels these PRs \`shipped\` and opens a PR into dev that regenerates \`docs/RELEASES.md\`."
+            echo
+            echo "_Opened by [promote-release run $GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)._"
+          } > "$RUNNER_TEMP/body.md"
+          title="Release dev@$short ($count PRs)"
+          url="$(gh pr list --repo "$GITHUB_REPOSITORY" --base release --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$url" ]; then
+            gh pr edit "$url" --title "$title" --body-file "$RUNNER_TEMP/body.md" > /dev/null
+            echo "Updated $url"
+          else
+            url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base release --head "$branch" \
+              --title "$title" --body-file "$RUNNER_TEMP/body.md")"
+            echo "Opened $url"
+          fi
+          { echo "### [$title]($url)"; echo; cat "$RUNNER_TEMP/notes.md"; } >> "$GITHUB_STEP_SUMMARY"
+
+          # A PR opened with GITHUB_TOKEN triggers no CI; run it on the branch.
+          if [ "$HAS_PROMOTE_TOKEN" != true ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+            echo "Dispatched CI on $branch."
+          fi
+
+  released:
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, Linux, ARM64, margin]
+    timeout-minutes: 10
+    permissions:
+      contents: write       # the release tag; the ledger branch
+      pull-requests: write  # read a commit's PRs; comment; open the ledger PR
+      issues: write         # label PRs `shipped`
+      actions: write        # dispatch CI on the ledger branch
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
+      BEFORE: ${{ github.event.before }}
+    steps:
+      # The scripts and the ledger live on dev; release is reached as $GITHUB_SHA.
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+
+      - name: Check and tag the release
+        id: tag
+        run: |
+          set -euo pipefail
+          s=deploy/scripts/release-snapshot.sh
+          if git tag --points-at "$GITHUB_SHA" | grep -q '^release-'; then
+            echo "::notice::$GITHUB_SHA is already tagged; nothing to do."
+            exit 0
+          fi
+          base="$(sh "$s" base "$GITHUB_SHA" origin/dev)"
+          if ! sh "$s" verify "$base" "$GITHUB_SHA" 2> "$RUNNER_TEMP/verify.log"; then
+            { echo "### Release not tagged"; echo; cat "$RUNNER_TEMP/verify.log"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$(cat "$RUNNER_TEMP/verify.log")"
+            exit 1
+          fi
+          # The dev commit release had before this push.
+          if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            prev="$(sh "$s" base "$BEFORE" origin/dev)"
+          else
+            last="$(git for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' 'refs/tags/release-*')"
+            [ -n "$last" ] || { echo "::error::can't tell what release had before $GITHUB_SHA"; exit 1; }
+            prev="$(git for-each-ref --format='%(contents)' "refs/tags/$last" | sed -n 's/^dev-sha: *//p' | head -n 1)"
+          fi
+          if [ "$prev" = "$base" ]; then
+            echo "::notice::release still holds dev $base; no new dev commits, nothing to tag."
+            exit 0
+          fi
+          sh "$s" prs "$prev" "$base" > "$RUNNER_TEMP/prs.tsv"
+          sh "$s" notes "$RUNNER_TEMP/prs.tsv" > "$RUNNER_TEMP/notes.md"
+          tag="release-$(date -u +%F)-${base:0:7}"
+          {
+            echo "Release $tag"
+            echo
+            echo "dev-sha: $base"
+            echo "previous-dev-sha: $prev"
+            echo "released: $(date -u +%F)"
+            echo "release-commit: $GITHUB_SHA"
+            echo "PRs:"
+            cat "$RUNNER_TEMP/notes.md"
+          } > "$RUNNER_TEMP/tag.txt"
+          obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$tag" -f message="$(cat "$RUNNER_TEMP/tag.txt")" \
+            -f object="$GITHUB_SHA" -f type=commit --jq .sha)"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$obj" > /dev/null
+          echo "Tagged $tag."
+          { echo "### $tag"; echo; echo "dev \`${base:0:7}\` (since \`${prev:0:7}\`)"; echo; cat "$RUNNER_TEMP/notes.md"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prs=$(awk -F '\t' '$1 != "-" { print $1 }' "$RUNNER_TEMP/prs.tsv" | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Label the released PRs shipped
+        if: steps.tag.outputs.tag != ''
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PRS: ${{ steps.tag.outputs.prs }}
+        run: |
+          set -euo pipefail
+          for pr in $PRS; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" -f "labels[]=shipped" > /dev/null
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "Shipped to prod in \`$TAG\` (release commit ${GITHUB_SHA:0:7})."
+            echo "#$pr labelled shipped."
+          done
+
+      # The ledger lives on dev, which takes changes only by PR.
+      - name: Regenerate docs/RELEASES.md (PR into dev)
+        if: steps.tag.outputs.tag != ''
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch -q --tags origin
+          sh deploy/scripts/releases-ledger.sh > docs/RELEASES.md
+          if git diff --quiet -- docs/RELEASES.md; then
+            echo "docs/RELEASES.md is already current."
+            exit 0
+          fi
+          branch="ledger/$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -B "$branch"
+          git commit -q -m "RELEASES.md: record $TAG" -- docs/RELEASES.md
+          git push -q -f origin "$branch"
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --base dev --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing" ]; then
+            echo "Updated $existing"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base dev --head "$branch" \
+              --title "RELEASES.md: record $TAG" \
+              --body "Regenerated by promote-release after \`$TAG\` was released (deploy/scripts/releases-ledger.sh). Docs only."
+          fi
+          if [ "$HAS_PROMOTE_TOKEN" != true ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+            echo "Dispatched CI on $branch."
+          fi

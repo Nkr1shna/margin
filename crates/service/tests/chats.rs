@@ -2855,7 +2855,7 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
 
     let calls: Vec<&TraceRow> = of(TraceKind::ModelCall).collect();
     assert_eq!(calls.len(), 3, "two steps and the title: {calls:#?}");
-    // The service stamps its own embedder (Core ML on macOS, ONNX elsewhere).
+    // The service stamps its own embedder (ONNX).
     let mut pipeline = PipelineConfig::default();
     pipeline.embedder.name = margin_embed::Backend::default().name().into();
     let pipeline = pipeline.hash();
