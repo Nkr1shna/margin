@@ -44,7 +44,7 @@ features = ["cli"]
 
 # The Android data directory comes from the app Context (JNI); Dioxus mobile initializes ndk-context.
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "=0.21.1"
+jni = "=0.22.4"
 ndk-context = "=0.1.1"
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
