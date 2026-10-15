@@ -1,0 +1,59 @@
+# Restore drill of dev (docs/phase5-brief.md D5, docs/plan-deploy.md §5): restores the
+# newest checked dev backup (or the one named) into dev with deploy/scripts/restore-drill.sh
+# and checks that it serves. By hand only (workflow_dispatch), monthly per the deploy
+# runbook. Only ever reaches margin-dev: MARGIN_DEPLOY_ONLY=dev makes the script refuse
+# anything else, and the script itself takes no other environment. The drill signs in to
+# dev afresh: the GitHub URL to open is printed in the log and the job summary, and the
+# job waits up to 10 minutes for it. The report is in the job summary and in dev's share
+# (backups/drills/<date-time>.txt).
+name: restore-drill
+
+on:
+  workflow_dispatch:
+    inputs:
+      backup:
+        description: "dev backup folder name (empty: the newest checked one)"
+        required: false
+        type: string
+        default: ""
+      hard_stop:
+        description: "also stop the service hard under an ingest, then check /health and a search"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never alongside a dev deploy: both stop and start dev's service.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  drill:
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    environment:
+      name: dev
+      url: https://devmargin.krishnanelloore.com
+    timeout-minutes: 60
+    env:
+      MARGIN_DEPLOY_ONLY: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Restore drill
+        env:
+          BACKUP: ${{ inputs.backup }}
+          HARD_STOP: ${{ inputs.hard_stop }}
+        run: |
+          case "$BACKUP" in
+            "") ;;
+            *[!A-Za-z0-9._-]*) echo "::error::not a backup folder name: $BACKUP"; exit 1 ;;
+          esac
+          set -- dev
+          [ -n "$BACKUP" ] && set -- "$@" "$BACKUP"
+          [ "$HARD_STOP" = true ] && set -- "$@" --hard-stop
+          sh deploy/scripts/restore-drill.sh "$@"

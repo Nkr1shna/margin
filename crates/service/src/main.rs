@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use margin_service::config::{self, Config};
-use margin_service::db::Store;
 use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
@@ -131,7 +130,16 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         #[cfg(any(target_os = "linux", feature = "linux-readers"))]
         margin_embed::set_tools_dir(config.data_dir.join("tools"));
         let source_tools = Arc::new(EmbedTools::new(&config.models_dir()));
-        let store = Store::open(&config.db_dir()).await?;
+        // Refuses data a newer build wrote; backs up data an older one wrote before
+        // this build migrates it (`restore::open_guarded`).
+        let (store, backup) = restore::open_guarded(&config).await?;
+        if let Some(dir) = backup {
+            tracing::info!(
+                "backed up the data before migrating it to schema {}: {}",
+                margin_service::db::SCHEMA_VERSION,
+                dir.display()
+            );
+        }
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
             .with_context(|| format!("couldn't listen on {}", config.bind))?;
@@ -190,7 +198,7 @@ fn scrub_restored() -> anyhow::Result<()> {
     runtime.block_on(async {
         let config = Config::load(&config::config_path())?;
         restore::check_environment(&config)?;
-        let store = Store::open(&config.db_dir())
+        let (store, _) = restore::open_guarded(&config)
             .await
             .context("couldn't open the database; stop the service first")?;
         for done in restore::scrub(&store).await? {
@@ -200,7 +208,8 @@ fn scrub_restored() -> anyhow::Result<()> {
     })
 }
 
-/// Checks a data folder on a copy and prints the verdict; fails on any problem.
+/// Checks a data folder on a copy and prints the report (`count <table> <n>` lines,
+/// the problems, a last one-line verdict); fails on any problem. Needs no config.
 fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -208,21 +217,19 @@ fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
         .build()?;
     runtime.block_on(async {
         let check = restore::check_data(dir).await?;
-        for problem in &check.problems {
-            eprintln!("{problem}");
-        }
+        print!("{}", check.report(dir));
         anyhow::ensure!(
             check.problems.is_empty(),
             "{} has {} problem(s)",
             dir.display(),
             check.problems.len()
         );
-        println!("{} is sound", dir.display());
         Ok(())
     })
 }
 
-/// Backs up the configured data folder.
+/// Backs up the configured data folder (the service must be stopped) and checks the
+/// copy; prints `BACKUP=<folder>` last, like `backup-margin.sh`.
 fn backup(label: Option<&str>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -231,7 +238,8 @@ fn backup(label: Option<&str>) -> anyhow::Result<()> {
     runtime.block_on(async {
         let config = Config::load(&config::config_path())?;
         let dir = restore::backup(&config, label).await?;
-        println!("{}", dir.display());
+        println!("Backed up and checked {}.", config.data_dir.display());
+        println!("BACKUP={}", dir.display());
         Ok(())
     })
 }
