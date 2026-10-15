@@ -1,0 +1,147 @@
+# Smoke test of devmargin after each dev deploy (docs/plan-deploy.md §4a). Runs when
+# deploy-dev succeeds (or by hand with a deploy-dev run id), checks the public URL without
+# signing in, and comments the result on every PR the deploy brought to dev: the squash
+# commits between the previous dev deploy and this one. A pass means dev is up with that
+# build; the owner then tries the change on devmargin and labels the PR `verified-on-dev`.
+# Uses no secrets and prints only status codes and the public /api/version fields.
+name: smoke-dev
+
+on:
+  workflow_run:
+    workflows: [deploy-dev]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      deploy_run_id:
+        description: "deploy-dev run id whose deploy to check"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-dev
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    # The Mac host runner, like deploy-dev; it only needs curl, jq, git and gh.
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      URL: https://devmargin.krishnanelloore.com
+      DEPLOY_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_run_id || github.event.workflow_run.id }}
+    steps:
+      # The sha deploy-dev installed is in its artifact's name (deployed-dev-<sha>); the
+      # previous successful deploy's artifact gives where the range of new PRs starts.
+      - name: Which build was deployed
+        id: deployed
+        run: |
+          case "$DEPLOY_RUN_ID" in *[!0-9]*|"") echo "::error::not a run id: $DEPLOY_RUN_ID"; exit 1 ;; esac
+          deployed_sha() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
+              --jq '.artifacts[].name | select(startswith("deployed-dev-")) | ltrimstr("deployed-dev-")' | head -n 1
+          }
+          sha="$(deployed_sha "$DEPLOY_RUN_ID")"
+          [ -n "$sha" ] || { echo "::error::run $DEPLOY_RUN_ID has no deployed-dev-<sha> artifact"; exit 1; }
+          prev_run="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/deploy-dev.yml/runs" \
+            -f status=success -f per_page=30 \
+            --jq "[.workflow_runs[] | select(.id < $DEPLOY_RUN_ID) | .id] | first // empty")"
+          prev=""
+          [ -z "$prev_run" ] || prev="$(deployed_sha "$prev_run" || true)"
+          echo "Deployed $sha (previous dev deploy: ${prev:-unknown})."
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test devmargin
+        id: smoke
+        env:
+          SHA: ${{ steps.deployed.outputs.sha }}
+        run: |
+          report="$RUNNER_TEMP/smoke.md"
+          : > "$report"
+          ok=true
+          check() { # description, expected status, actual status[, detail]
+            if [ "$2" = "$3" ]; then
+              echo "| ✅ | $1 | $3 | ${4:-} |" >> "$report"
+            else
+              echo "| ❌ | $1 | $3 (expected $2) | ${4:-} |" >> "$report"
+              ok=false
+            fi
+          }
+          status() { curl -sS -o "$RUNNER_TEMP/body" -w '%{http_code}' -m 15 "$@" || true; }
+
+          # The deploy already waited for /health; allow a minute for the tunnel.
+          for _ in $(seq 1 12); do
+            [ "$(status "$URL/health")" = 200 ] && break
+            sleep 5
+          done
+          code="$(status "$URL/health")"
+          check "GET /health" 200 "$code" "body: $(head -c 20 "$RUNNER_TEMP/body" | tr -d '\n|')"
+
+          code="$(status "$URL/api/version")"
+          got_sha="$(jq -r '.sha // empty' "$RUNNER_TEMP/body" 2>/dev/null || true)"
+          got_env="$(jq -r '.environment // empty' "$RUNNER_TEMP/body" 2>/dev/null || true)"
+          check "GET /api/version" 200 "$code" "sha \`${got_sha:-?}\`, environment \`${got_env:-?}\`"
+          [ "$got_sha" = "$SHA" ] && r=match || r=mismatch
+          check "/api/version sha is the deployed build" match "$r" "expected \`$SHA\`"
+          [ "$got_env" = dev ] && r=dev || r="${got_env:-none}"
+          check "/api/version environment" dev "$r"
+
+          # Signed-out requests to protected routes must be refused, never served.
+          for path in /api/me /api/library /api/chats /api/settings /api/devices /api/workspaces; do
+            check "GET $path without a token" 401 "$(status "$URL$path")"
+          done
+          check "GET /api/me with a made-up token" 401 \
+            "$(status -H "Authorization: Bearer smoke-test-not-a-token" "$URL/api/me")"
+
+          { echo "| | Check | Status | Detail |"; echo "|---|---|---|---|"; cat "$report"; } > "$report.full"
+          cat "$report.full" >> "$GITHUB_STEP_SUMMARY"
+          cat "$report.full"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Comment on the PRs this deploy brought to dev
+        env:
+          SHA: ${{ steps.deployed.outputs.sha }}
+          PREV: ${{ steps.deployed.outputs.prev }}
+          OK: ${{ steps.smoke.outputs.ok }}
+        run: |
+          if [ -n "$PREV" ] && git merge-base --is-ancestor "$PREV" "$SHA" 2>/dev/null; then
+            commits="$(git rev-list --first-parent "$PREV..$SHA")"
+          else
+            commits="$SHA"
+          fi
+          prs="$(for c in $commits; do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$c/pulls" --jq '.[] | select(.base.ref == "dev" and .merged_at != null) | .number'
+          done | sort -un)"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$OK" = true ]; then
+            head="✅ **Dev smoke test passed** on $URL for \`${SHA:0:7}\`, which includes this PR."
+            next="Try the change on devmargin; when it works, add the \`verified-on-dev\` label so promote-release can ship it."
+          else
+            head="❌ **Dev smoke test failed** on $URL for \`${SHA:0:7}\`, which includes this PR."
+            next="Dev is unhealthy at this build; see the run before verifying anything."
+          fi
+          for pr in $prs; do
+            { echo "$head"; echo; cat "$RUNNER_TEMP/smoke.md.full"; echo; echo "$next ([run]($run_url))"; } > "$RUNNER_TEMP/comment.md"
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/comment.md"
+            echo "Commented on #$pr."
+          done
+          [ -n "$prs" ] || echo "No merged dev PRs found for $commits."
+          [ "$OK" = true ] || { echo "::error::dev smoke test failed"; exit 1; }
