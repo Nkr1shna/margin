@@ -57,7 +57,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking Linux." || echo "Nothing for Linux in this PR; passing."
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
@@ -121,7 +121,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking macOS." || echo "Nothing for macOS in this PR; passing."
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
