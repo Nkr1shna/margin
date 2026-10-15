@@ -12,7 +12,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   build-essential clang lld libclang-dev pkg-config \
   libc++-dev libc++abi-dev libc++1 libc++abi1 \
-  libheif-dev libheif1 \
+  libheif-dev libheif1 zlib1g-dev \
   tesseract-ocr tesseract-ocr-eng ffmpeg bubblewrap \
   python3 ca-certificates curl git jq unzip zstd rsync gnupg
 

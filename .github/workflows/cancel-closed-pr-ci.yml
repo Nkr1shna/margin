@@ -1,8 +1,8 @@
-# When a pull request is merged or closed, cancels its CI (`test`) runs still queued or
+# When a pull request is merged or closed, cancels its CI runs (ci.yml) still queued or
 # running, so the single self-hosted runner moves on to the merge's CD. Runs on a
 # GitHub-hosted runner so it never waits behind the very job it cancels.
-# (A new push to an open PR already cancels the previous run: test.yml's concurrency.)
-name: cancel-closed-pr-ci
+# (A new push to an open PR already cancels the previous run: ci.yml's concurrency.)
+name: CI cleanup
 
 on:
   pull_request:
@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   cancel:
+    name: Cancel CI of the closed PR
     # Same-repository PRs only (fork PRs get a read-only token and need approval anyway).
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -21,9 +22,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
     steps:
-      - name: Cancel the PR's unfinished test runs
+      - name: Cancel the PR's unfinished CI runs
         run: |
-          ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?event=pull_request&per_page=100" \
+          ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&per_page=100" \
             --jq "[.workflow_runs[] | select(.status != \"completed\") | select(any(.pull_requests[]?; .number == $PR)) | .id] | .[]")"
           if [ -z "$ids" ]; then
             echo "No unfinished CI for PR #$PR."

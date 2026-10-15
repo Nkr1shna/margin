@@ -3,7 +3,7 @@
 # Runs on the Mac mini's runner (labels below; the host's other runner, `clusterbar`,
 # serves another repository). Pull requests from forks never run here: a self-hosted
 # runner holds the deploy key.
-name: test
+name: CI
 
 on:
   # CI runs when a PR is opened or updated (the required `test` check); merging into dev or
@@ -16,13 +16,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: test-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
   # Linux build now (docs/plan-linux-service.md).
   linux:
+    name: Linux
     # Same-repository pull requests only; never code from a fork on a self-hosted runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, margin]
@@ -55,6 +56,7 @@ jobs:
   # The app (desktop, iOS) on the Mac host runner, and a check that the macOS backends of
   # the service still build (the owner's Mac stays a full dev/eval box, plan Q8).
   macos:
+    name: macOS
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, margin]
     timeout-minutes: 90
@@ -83,18 +85,3 @@ jobs:
         run: cargo check -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
       - name: macOS service still builds
         run: cargo check -p margin-service
-
-  # The required check (repository ruleset): passes only when both platforms passed. A
-  # skipped job (a fork's PR) fails it.
-  test:
-    if: always()
-    needs: [linux, macos]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Both platforms passed
-        env:
-          LINUX: ${{ needs.linux.result }}
-          MACOS: ${{ needs.macos.result }}
-        run: |
-          echo "linux: $LINUX, macos: $MACOS"
-          [ "$LINUX" = success ] && [ "$MACOS" = success ]
