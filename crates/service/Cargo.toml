@@ -45,7 +45,7 @@ arc-swap = "=1.9.2"
 ulid = "=3.0.0"
 # The ChatGPT sign-in's id_token check (RS256 against the auth server's JWKS): the
 # version and crypto backend surrealdb already builds.
-jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 [dev-dependencies]
 tokio-tungstenite = "=0.30.0"
