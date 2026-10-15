@@ -6,11 +6,16 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use margin_ai::{
-    AiError, CallOptions, ClaudeClient, CoursePlan, Generated, LessonContext, ModelWindow,
-    PlanRequest, Provider, ProviderConfig, ProviderKind, ResponsesClient, SceneRequest, TextModel,
+    AiError, Backoff, CallOptions, ClaudeClient, CoursePlan, Generated, InputPart, JsonFormat,
+    LessonContext, ModelWindow, PlanRequest, Provider, ProviderConfig, ProviderKind,
+    ResponsesClient, Retrying, SceneRequest, TextModel, TextOutput,
 };
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
+use margin_shared::Waiting;
+use margin_shared::context::TraceRow;
 use margin_shared::{SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 
@@ -68,8 +73,9 @@ pub trait Generator: Send + Sync + 'static {
     /// config's slot for the request's route).
     fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn Provider>;
 
-    /// The provider's plain text model (titles, condense summaries; lessons, scenes and
-    /// the planner once they move onto it).
+    /// The provider's plain text model, unretried: callers wrap it in
+    /// `margin_ai::Retrying` (titles, condense summaries) or [`job_model`] (lessons,
+    /// scenes, the planner).
     fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel>;
 }
 
@@ -96,7 +102,8 @@ impl Generator for AiGenerator {
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
-            margin_ai::write_lesson_with(&*self.text_model(&m.config), ctx, opts, on_delta).await
+            let model = job_model(self.text_model(&m.config));
+            margin_ai::write_lesson_with(&model, ctx, opts, on_delta).await
         })
     }
 
@@ -107,7 +114,8 @@ impl Generator for AiGenerator {
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
         Box::pin(async move {
-            margin_ai::write_scene_with(&*self.text_model(&m.config), req, opts).await
+            let model = job_model(self.text_model(&m.config));
+            margin_ai::write_scene_with(&model, req, opts).await
         })
     }
 
@@ -117,9 +125,10 @@ impl Generator for AiGenerator {
         req: &'a PlanRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
-        Box::pin(
-            async move { margin_ai::plan_course(&*self.text_model(&m.config), req, opts).await },
-        )
+        Box::pin(async move {
+            let model = job_model(self.text_model(&m.config));
+            margin_ai::plan_course(&model, req, opts).await
+        })
     }
 
     fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn Provider> {
@@ -146,6 +155,183 @@ fn claude_client(config: &ProviderConfig) -> ClaudeClient {
         config.base_url.clone(),
         config.credential.secret(),
         config.models.clone(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Job calls' retries (`docs/phase5-brief.md` D4)
+// ---------------------------------------------------------------------------
+
+/// Where a job shows a wait before a retry (`Some`) and its end (`None`).
+pub type JobWait = Arc<dyn Fn(Option<Waiting>) + Send + Sync>;
+
+/// Records a failed attempt that is being retried: its error code and how long it
+/// took (a `model_call` row of its own; the call's last attempt is the caller's row).
+pub type FailedAttempt = Arc<dyn Fn(&'static str, Duration) + Send + Sync>;
+
+/// How the model calls of the job running on this task are retried and where their
+/// waits and failed attempts go. Jobs run their `Generator` call inside
+/// [`JobCalls::run`]; `AiGenerator` wraps its text model with [`job_model`], which
+/// reads it. Outside a job, calls are retried with the default policy, silently.
+#[derive(Clone)]
+pub struct JobCalls {
+    pub backoff: Backoff,
+    pub on_wait: JobWait,
+    pub on_failed: FailedAttempt,
+}
+
+tokio::task_local! {
+    static JOB_CALLS: JobCalls;
+}
+
+impl JobCalls {
+    /// Retries as `backoff` says, showing nothing and tracing nothing.
+    pub fn silent(backoff: Backoff) -> Self {
+        Self {
+            backoff,
+            on_wait: Arc::new(|_| {}),
+            on_failed: Arc::new(|_, _| {}),
+        }
+    }
+
+    /// Runs `job` with these settings for the model calls it makes.
+    pub async fn run<F: Future>(self, job: F) -> F::Output {
+        JOB_CALLS.scope(self, job).await
+    }
+
+    /// The settings of the job running on this task, else silent defaults.
+    fn current() -> Self {
+        JOB_CALLS
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| Self::silent(Backoff::default()))
+    }
+}
+
+/// `model` with its calls retried as the job running on this task says
+/// ([`JobCalls`]): a call failing before any delta (429 other than the limits waiting
+/// doesn't cure, 5xx incl. 529, network) is retried after the pause the API asked for
+/// (uncapped) or the computed backoff, each wait shown where the job is seen and each
+/// failed attempt traced.
+pub fn job_model(model: Arc<dyn TextModel>) -> Retrying<Attempts> {
+    let calls = JobCalls::current();
+    let last = Arc::new(std::sync::Mutex::new(None));
+    let inner = Attempts {
+        inner: model,
+        last: last.clone(),
+    };
+    let (on_wait, on_failed) = (calls.on_wait, calls.on_failed);
+    Retrying::new(
+        inner,
+        calls.backoff,
+        Box::new(move |wait| {
+            // A wait starts: the attempt before it failed and is retried.
+            if wait.is_some()
+                && let Some((code, took)) = last.lock().unwrap_or_else(|e| e.into_inner()).take()
+            {
+                on_failed(code, took);
+            }
+            on_wait(wait);
+        }),
+    )
+}
+
+/// A text model that remembers its last failed call (error code, duration) for
+/// [`job_model`]'s trace row of a retried attempt.
+pub struct Attempts {
+    inner: Arc<dyn TextModel>,
+    last: Arc<std::sync::Mutex<Option<(&'static str, Duration)>>>,
+}
+
+impl Attempts {
+    fn note<T>(&self, started: Instant, result: &Result<T, AiError>) {
+        if let Err(e) = result {
+            *self.last.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((crate::trace::ai_error_code(e), started.elapsed()));
+        }
+    }
+}
+
+impl TextModel for Attempts {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> margin_ai::model::BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = self
+                .inner
+                .stream_parts(instructions, input, opts, on_delta)
+                .await;
+            self.note(started, &result);
+            result
+        })
+    }
+
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
+    ) -> margin_ai::model::BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = self
+                .inner
+                .stream_json(instructions, input, format, opts)
+                .await;
+            self.note(started, &result);
+            result
+        })
+    }
+}
+
+/// Records each retried attempt as a `model_call` row like `template` (the call's own
+/// row: route, model, provider, prompt version, job or chat), failed with its code.
+pub fn failed_attempts(state: &crate::state::AppState, template: TraceRow) -> FailedAttempt {
+    let state = state.clone();
+    Arc::new(move |code, took| {
+        let mut row = template.clone();
+        row.id = crate::trace::new_row_id();
+        row.at = chrono::Utc::now()
+            - chrono::TimeDelta::from_std(took).unwrap_or(chrono::TimeDelta::zero());
+        row.duration_ms = took.as_secs_f64() * 1000.0;
+        row.ok = false;
+        row.error_code = Some(code.to_string());
+        row.usage = None;
+        row.stop_reason = None;
+        state.tracer.record(row);
+    })
+}
+
+/// A [`JobWait`] that hands each report, in order, to `show` on a task of its own (so
+/// it can take the write lock); the task ends with the job's last report.
+pub fn ordered_waits<F, Fut>(show: F) -> JobWait
+where
+    F: Fn(Option<Waiting>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(wait) = rx.recv().await {
+            show(wait).await;
+        }
+    });
+    Arc::new(move |wait| {
+        let _ = tx.send(wait);
+    })
+}
+
+/// A wait in words for a job's progress text: "Waiting for the model until 14:03 UTC.
+/// The model API asked Margin to slow down."
+pub fn waiting_line(wait: &Waiting) -> String {
+    format!(
+        "Waiting for the model until {} UTC. {}",
+        wait.until.format("%H:%M"),
+        wait.reason
     )
 }
 

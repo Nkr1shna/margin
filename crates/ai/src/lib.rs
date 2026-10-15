@@ -123,6 +123,16 @@ impl AiError {
             _ => None,
         }
     }
+
+    /// Why a retry of this failure waits, in a short sentence for the owner
+    /// (`Waiting.reason`; the agent loop's words for the same causes).
+    pub fn wait_reason(&self) -> &'static str {
+        match self {
+            AiError::Http { status: 429, .. } => "The model API asked Margin to slow down.",
+            AiError::Network(_) => "Margin couldn't reach the model API.",
+            _ => "The model API had a problem.",
+        }
+    }
 }
 
 /// How long to wait for a TCP + TLS connection.
@@ -356,7 +366,15 @@ impl ResponsesClient {
         let mut state = StreamState::default();
         let mut bytes = resp.bytes_stream();
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(network)?;
+            // reqwest reports a body cut mid-chunk as a decode error; it is the
+            // connection that failed (and a retry may succeed), not the content.
+            let chunk = chunk.map_err(|e| {
+                if e.is_decode() || e.is_body() {
+                    AiError::Network(format!("the connection broke: {}", error_chain(&e)))
+                } else {
+                    network(e)
+                }
+            })?;
             for event in parser.push(&chunk) {
                 if let Some(done) = state.handle(&event, &mut on_delta)? {
                     return Ok(done);

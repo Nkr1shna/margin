@@ -258,25 +258,129 @@ impl<M: TextModel> Retrying<M> {
     }
 }
 
+impl<M: TextModel> Retrying<M> {
+    /// The pause before the next attempt after `err` (`attempt` retries made so far),
+    /// waited with `on_wait` told until when and why; `None` (no wait) when `err` isn't
+    /// worth retrying or the retries are used up.
+    async fn wait(&self, attempt: u32, err: &AiError) -> Option<()> {
+        /// Reports the wait's end, also when the call is dropped mid-wait (a stopped
+        /// job).
+        struct Ends<'a>(&'a OnWait);
+        impl Drop for Ends<'_> {
+            fn drop(&mut self) {
+                (self.0)(None);
+            }
+        }
+        let pause = self.backoff.delay(attempt, err)?;
+        tracing::info!(attempt, ?pause, error = %err, "retrying the model call");
+        (self.on_wait)(Some(waiting(pause, err)));
+        let _ends = Ends(&self.on_wait);
+        tokio::time::sleep(pause).await;
+        Some(())
+    }
+}
+
+/// The wait of `pause` from now after `err`. A pause past a century shows as a
+/// century (a date can't name the end of `Duration::MAX`).
+fn waiting(pause: Duration, err: &AiError) -> margin_shared::Waiting {
+    const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    let now = std::time::SystemTime::now();
+    let until = now.checked_add(pause.min(CENTURY)).unwrap_or(now);
+    margin_shared::Waiting {
+        until: until.into(),
+        reason: err.wait_reason().to_string(),
+    }
+}
+
 impl<M: TextModel> TextModel for Retrying<M> {
+    /// Retries while no text has reached `on_delta`: once the caller has shown output,
+    /// starting over would repeat it, so a later failure is returned as it is.
     fn stream_parts<'a>(
         &'a self,
-        _instructions: &'a str,
-        _input: &'a [InputPart],
-        _opts: &'a CallOptions,
-        _on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
-        unimplemented!("P5, 5-retry")
+        use std::sync::atomic::{AtomicBool, Ordering};
+        Box::pin(async move {
+            let on_delta = std::sync::Mutex::new(on_delta);
+            let mut attempt = 0;
+            loop {
+                let started = AtomicBool::new(false);
+                let forward = |delta: &str| {
+                    if !delta.is_empty() {
+                        started.store(true, Ordering::Relaxed);
+                    }
+                    let mut on_delta = on_delta.lock().unwrap_or_else(|e| e.into_inner());
+                    on_delta(delta);
+                };
+                let err = match self
+                    .inner
+                    .stream_parts(instructions, input, opts, Box::new(forward))
+                    .await
+                {
+                    Ok(out) => return Ok(out),
+                    Err(e) if started.load(Ordering::Relaxed) => return Err(e),
+                    Err(e) => e,
+                };
+                if self.wait(attempt, &err).await.is_none() {
+                    return Err(err);
+                }
+                attempt += 1;
+            }
+        })
+    }
+
+    /// Retries every retryable failure: a structured answer shows nothing until it is
+    /// complete.
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let mut attempt = 0;
+            loop {
+                let err = match self
+                    .inner
+                    .stream_json(instructions, input, format, opts)
+                    .await
+                {
+                    Ok(out) => return Ok(out),
+                    Err(e) => e,
+                };
+                if self.wait(attempt, &err).await.is_none() {
+                    return Err(err);
+                }
+                attempt += 1;
+            }
+        })
+    }
+}
+
+/// A shared text model is a text model (the service hands out `Arc<dyn TextModel>`).
+impl<T: TextModel + ?Sized> TextModel for std::sync::Arc<T> {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        (**self).stream_parts(instructions, input, opts, on_delta)
     }
 
     fn stream_json<'a>(
         &'a self,
-        _instructions: &'a str,
-        _input: &'a [InputPart],
-        _format: &'a JsonFormat,
-        _opts: &'a CallOptions,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
-        unimplemented!("P5, 5-retry")
+        (**self).stream_json(instructions, input, format, opts)
     }
 }
 
