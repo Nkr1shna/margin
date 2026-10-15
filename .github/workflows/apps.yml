@@ -30,6 +30,7 @@ on:
       - "crates/shared/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deploy/dmg/**"
       - ".github/workflows/apps.yml"
   workflow_dispatch:
     inputs:
