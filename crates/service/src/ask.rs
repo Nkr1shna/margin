@@ -1224,7 +1224,16 @@ async fn derive_audience(
                 );
                 let d =
                     audience::derive_lesson(state, &row, &audience::audience_of(&topic)).await?;
-                audience::apply_lesson_locked(state, &mut row, d).await?
+                let same = d.audience.access == row.lesson.access
+                    && d.audience.deny == row.lesson.deny
+                    && d.narrowed == row.lesson.audience_narrowed;
+                if same {
+                    // Nobody's view of it changes: what it drew on is the service's.
+                    state.store.put(db::LESSON, lesson_id, &row).await?;
+                    Vec::new()
+                } else {
+                    audience::apply_lesson_locked(state, &mut row, d).await?
+                }
             }
             None => Vec::new(),
         };
