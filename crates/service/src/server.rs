@@ -203,6 +203,9 @@ impl Service {
 }
 
 pub fn router(state: AppState) -> Router {
+    // A route's rate limit (`docs/agent-contract.md` §7); a device's sits inside
+    // `require_device`, so it counts per device.
+    let limit = |l: auth::Limit| middleware::from_fn_with_state((state.clone(), l), auth::limit);
     let api = Router::new()
         .route(routes::ME, get(auth::me))
         .route(routes::LIBRARY, get(library::get_library))
@@ -247,12 +250,17 @@ pub fn router(state: AppState) -> Router {
         // Upload bodies are streamed to disk, each against its kind's limit.
         .route(
             routes::SOURCES,
-            post(sources::upload).layer(DefaultBodyLimit::disable()),
+            post(sources::upload)
+                .layer(DefaultBodyLimit::disable())
+                .layer(limit(auth::SOURCES_LIMIT)),
         )
         .route("/api/sources/{id}", delete(sources::delete_source))
         .route("/api/sources/{id}/reprocess", post(sources::reprocess))
         .route("/api/sources/{id}/transcript", get(sources::transcript))
-        .route(routes::SOURCE_UPLOADS, post(uploads::start))
+        .route(
+            routes::SOURCE_UPLOADS,
+            post(uploads::start).layer(limit(auth::SOURCES_LIMIT)),
+        )
         .route(
             "/api/source-uploads/{id}",
             get(uploads::get)
@@ -281,7 +289,10 @@ pub fn router(state: AppState) -> Router {
                 .patch(chats::patch_chat)
                 .delete(chats::delete_chat),
         )
-        .route("/api/chats/{id}/messages", post(chats::post_message))
+        .route(
+            "/api/chats/{id}/messages",
+            post(chats::post_message).layer(limit(auth::MESSAGES_LIMIT)),
+        )
         .route("/api/chats/{id}/pending", delete(chats::cancel_pending))
         .route("/api/chats/{id}/stop", post(chats::stop))
         .route("/api/chats/{id}/continue", post(chats::continue_turn))
@@ -301,7 +312,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/workspaces/{id}/files", get(folders::files))
         .route(routes::PROJECTS, get(context_api::projects))
-        .route(routes::CONTEXT_SEARCH, post(context_api::search))
+        .route(
+            routes::CONTEXT_SEARCH,
+            post(context_api::search).layer(limit(auth::CONTEXT_SEARCH_LIMIT)),
+        )
         .route(
             "/api/context/documents/{id}",
             delete(context_api::delete_document),
@@ -318,7 +332,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             routes::CONTEXT_INGEST,
             post(context_api::ingest)
-                .layer(DefaultBodyLimit::max(routes::CONTEXT_INGEST_MAX_BYTES)),
+                .layer(DefaultBodyLimit::max(routes::CONTEXT_INGEST_MAX_BYTES))
+                .layer(limit(auth::CONTEXT_INGEST_LIMIT)),
         )
         .route(routes::CONTEXT_CHANGES, get(context_api::changes))
         .route(routes::TRACES, get(trace::list_traces))
@@ -337,8 +352,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route(routes::HEALTH, get(|| async { "ok" }))
         .route(routes::VERSION, get(version::get_version))
-        .route(routes::AUTH_START, post(auth::start))
-        .route(routes::AUTH_POLL, post(auth::poll))
+        .route(
+            routes::AUTH_START,
+            post(auth::start).layer(limit(auth::START_LIMIT)),
+        )
+        .route(
+            routes::AUTH_POLL,
+            post(auth::poll).layer(limit(auth::POLL_LIMIT)),
+        )
         .route(routes::AUTH_GITHUB_CALLBACK, get(auth::github_callback))
         .route("/media/videos/{id}/{file}", get(media::serve))
         .route("/media/sources/{id}/{file}", get(media::serve_source))

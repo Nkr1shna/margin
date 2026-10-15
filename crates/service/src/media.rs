@@ -103,12 +103,18 @@ async fn serve_inner(
             header::CONTENT_TYPE,
             HeaderValue::from_static(content_type(file)),
         );
-        res.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=3600"),
-        );
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, cache_control(exp));
     }
     Ok(res)
+}
+
+/// `private, max-age=<seconds the signed link has left>`: a cache never keeps a file
+/// longer than its link works (`docs/phase5-brief.md` D7).
+pub fn cache_control(exp: i64) -> HeaderValue {
+    let left = (exp - chrono::Utc::now().timestamp()).max(0);
+    HeaderValue::from_str(&format!("private, max-age={left}"))
+        .unwrap_or_else(|_| HeaderValue::from_static("private, no-store"))
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +241,7 @@ async fn serve_source_inner(
     if res.status().is_success() {
         let headers = res.headers_mut();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=3600"),
-        );
+        headers.insert(header::CACHE_CONTROL, cache_control(exp));
         headers.insert(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),

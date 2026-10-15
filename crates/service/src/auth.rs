@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
@@ -22,8 +22,6 @@ use crate::secrets::GITHUB_CLIENT_SECRET;
 use crate::state::{AppState, DeviceRow, new_id, random_token, sha256_hex};
 
 pub const LOGIN_TTL_MINUTES: i64 = 10;
-const START_LIMIT_PER_MINUTE: u32 = 10;
-const POLL_LIMIT_PER_MINUTE: u32 = 90;
 const LAST_SEEN_INTERVAL_SECONDS: i64 = 60;
 
 // ---------------------------------------------------------------------------
@@ -67,34 +65,173 @@ pub fn purge_expired_logins(state: &AppState) {
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-/// (window start, requests in it) per (route, client IP).
-type Windows = HashMap<(&'static str, IpAddr), (Instant, u32)>;
+/// Who a limit counts: the client's IP (sign-in, before there is a device) or the
+/// signed-in device (`docs/agent-contract.md` §7).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Client {
+    Ip(IpAddr),
+    Device(String),
+}
 
-/// Fixed one-minute windows per (route, client IP).
+/// (window start, requests in it) per (route, client).
+type Windows = HashMap<(&'static str, Client), (Instant, u32)>;
+
+const WINDOW: StdDuration = StdDuration::from_secs(60);
+
+/// Fixed one-minute windows per (route, client).
 #[derive(Default)]
 pub struct RateLimiter {
     windows: Mutex<Windows>,
 }
 
 impl RateLimiter {
+    /// Counts one request; `false` when it is over `per_minute` in this window.
     pub fn check(&self, route: &'static str, ip: IpAddr, per_minute: u32) -> bool {
+        self.admit(route, Client::Ip(ip), per_minute).is_ok()
+    }
+
+    /// Counts one request; over the limit, `Err` holds how long until the window ends.
+    pub fn admit(
+        &self,
+        route: &'static str,
+        client: Client,
+        per_minute: u32,
+    ) -> Result<(), StdDuration> {
         let now = Instant::now();
-        let mut map = self.windows.lock().unwrap();
-        let entry = map.entry((route, ip)).or_insert((now, 0));
-        if now.duration_since(entry.0) >= StdDuration::from_secs(60) {
+        let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry((route, client)).or_insert((now, 0));
+        if now.duration_since(entry.0) >= WINDOW {
             *entry = (now, 0);
         }
-        entry.1 += 1;
-        entry.1 <= per_minute
+        entry.1 = entry.1.saturating_add(1);
+        if entry.1 <= per_minute {
+            Ok(())
+        } else {
+            Err(WINDOW.saturating_sub(now.duration_since(entry.0)))
+        }
     }
 
     pub fn purge(&self) {
         let now = Instant::now();
         self.windows
             .lock()
-            .unwrap()
-            .retain(|_, (start, _)| now.duration_since(*start) < StdDuration::from_secs(60));
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
     }
+}
+
+/// 429 `rate_limited` with `Retry-After` (whole seconds, at least 1) until the window ends.
+pub fn rate_limited(retry_after: StdDuration) -> Response {
+    let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+    let mut res = AppError::rate_limited().into_response();
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(secs.max(1)));
+    res
+}
+
+/// What a route's limit counts by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum By {
+    Ip,
+    Device,
+}
+
+/// One route's limit (`server::router` puts it on the route through `limit`).
+#[derive(Debug, Clone, Copy)]
+pub struct Limit {
+    pub route: &'static str,
+    pub per_minute: u32,
+    pub by: By,
+    /// Folder files (`?workspace_id=`) don't count: a device sends a folder's files one
+    /// after another on every sync, as many as the folder has (`docs/agent-contract.md` §7).
+    pub skip_folder_files: bool,
+}
+
+/// `POST /auth/start`, per IP.
+pub const START_LIMIT: Limit = Limit {
+    route: "start",
+    per_minute: 10,
+    by: By::Ip,
+    skip_folder_files: false,
+};
+/// `POST /auth/poll`, per IP.
+pub const POLL_LIMIT: Limit = Limit {
+    route: "poll",
+    per_minute: 90,
+    by: By::Ip,
+    skip_folder_files: false,
+};
+/// `POST /api/chats/{id}/messages`, per device.
+pub const MESSAGES_LIMIT: Limit = Limit {
+    route: "messages",
+    per_minute: 30,
+    by: By::Device,
+    skip_folder_files: false,
+};
+/// `POST /api/context/search`, per device.
+pub const CONTEXT_SEARCH_LIMIT: Limit = Limit {
+    route: "context-search",
+    per_minute: 120,
+    by: By::Device,
+    skip_folder_files: false,
+};
+/// `POST /api/context/ingest`, per device (`margin-mcp ingest-dir` waits out the
+/// `Retry-After`, so 200 files take under four minutes).
+pub const CONTEXT_INGEST_LIMIT: Limit = Limit {
+    route: "context-ingest",
+    per_minute: 60,
+    by: By::Device,
+    skip_folder_files: false,
+};
+/// `POST /api/sources` and `POST /api/source-uploads` together, per device; a folder's
+/// files aren't counted.
+pub const SOURCES_LIMIT: Limit = Limit {
+    route: "sources",
+    per_minute: 60,
+    by: By::Device,
+    skip_folder_files: true,
+};
+
+/// Middleware: counts the request against `limit` and answers 429 `rate_limited` with
+/// `Retry-After` over it. A device limit sits inside `require_device` (it reads
+/// `CurrentDevice`).
+pub async fn limit(
+    State((state, limit)): State<(AppState, Limit)>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if limit.skip_folder_files && is_folder_file(req.uri().query()) {
+        return next.run(req).await;
+    }
+    let client = match limit.by {
+        By::Ip => {
+            let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
+                return AppError::internal("no peer address on the request").into_response();
+            };
+            Client::Ip(client_ip(*peer, req.headers()))
+        }
+        By::Device => match req.extensions().get::<CurrentDevice>() {
+            Some(CurrentDevice(device)) => Client::Device(device.id.clone()),
+            None => return AppError::unauthorized().into_response(),
+        },
+    };
+    match state.limiter.admit(limit.route, client, limit.per_minute) {
+        Ok(()) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::info!(route = limit.route, "rate limited");
+            rate_limited(retry_after)
+        }
+    }
+}
+
+/// Whether a query string names a folder (`workspace_id`): a folder's file.
+fn is_folder_file(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
+        q.split('&').any(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            k == "workspace_id" && !v.is_empty()
+        })
+    })
 }
 
 /// The client's IP. Behind cloudflared every connection comes from loopback, so for
@@ -115,18 +252,11 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
 // /auth/start, /auth/poll
 // ---------------------------------------------------------------------------
 
+/// `POST /auth/start` (limited per IP by `START_LIMIT`).
 pub async fn start(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     ApiJson(req): ApiJson<StartLoginRequest>,
 ) -> AppResult<Json<StartLogin>> {
-    if !state
-        .limiter
-        .check("start", client_ip(peer, &headers), START_LIMIT_PER_MINUTE)
-    {
-        return Err(AppError::rate_limited());
-    }
     let device_name = req.device_name.trim();
     if device_name.is_empty() {
         return Err(AppError::bad_request("Give this device a name."));
@@ -170,18 +300,11 @@ pub async fn start(
     }))
 }
 
+/// `POST /auth/poll` (limited per IP by `POLL_LIMIT`).
 pub async fn poll(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     ApiJson(req): ApiJson<PollLoginRequest>,
 ) -> AppResult<Json<LoginState>> {
-    if !state
-        .limiter
-        .check("poll", client_ip(peer, &headers), POLL_LIMIT_PER_MINUTE)
-    {
-        return Err(AppError::rate_limited());
-    }
     let now = Utc::now();
     let collected = {
         let mut logins = state.logins.lock().unwrap();
@@ -249,6 +372,31 @@ enum Outcome {
     Denied(String),
     Expired,
     InProgress,
+    /// The sign-in already completed; this is a replay.
+    Used,
+}
+
+/// The callback page's stylesheet: the only thing its CSP lets in (by hash).
+const PAGE_STYLE: &str = r#"
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #0d0d0d; --muted: #5d5d5d; --line: #e5e5e5; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0d0d0d; --fg: #f3f3f3; --muted: #a3a3a3; --line: #2a2a2a; } }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; }
+  main { max-width: 28rem; margin: 1rem; padding: 2rem; border: 1px solid var(--line); border-radius: 12px; }
+  h1 { font-size: 1.25rem; margin: 0 0 .5rem; }
+  p { margin: 0; color: var(--muted); }
+"#;
+
+/// `Content-Security-Policy` of the callback page (the only HTML the service serves):
+/// nothing loads, runs, frames it or is submitted from it; its one stylesheet is
+/// allowed by its hash.
+pub fn page_csp() -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(PAGE_STYLE));
+    format!(
+        "default-src 'none'; style-src 'sha256-{hash}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
 }
 
 pub async fn github_callback(
@@ -274,15 +422,26 @@ pub async fn github_callback(
             "Signing in",
             "This sign-in is already being completed. Return to the app.".to_string(),
         ),
+        Outcome::Used => (
+            StatusCode::GONE,
+            "Sign-in already used",
+            "This sign-in link was already used. Return to the app, or start again from it."
+                .to_string(),
+        ),
     };
     let mut res = (status, Html(page(title, &body))).into_response();
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    res.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'unsafe-inline'"
-            .parse()
-            .unwrap(),
+    let headers = res.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(csp) = HeaderValue::from_str(&page_csp()) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
     );
     res
 }
@@ -303,7 +462,9 @@ async fn callback_outcome(state: &AppState, q: CallbackQuery) -> Outcome {
         match &login.phase {
             LoginPhase::Pending => {}
             LoginPhase::Exchanging => return Outcome::InProgress,
-            LoginPhase::Approved { .. } | LoginPhase::Collected => return Outcome::SignedIn,
+            // The `state` is single-use: a replayed callback (with this or any other
+            // `code`) is refused and never reaches GitHub or changes the login.
+            LoginPhase::Approved { .. } | LoginPhase::Collected => return Outcome::Used,
             LoginPhase::Denied { reason } => return Outcome::Denied(reason.clone()),
         }
         login.phase = LoginPhase::Exchanging;
@@ -453,21 +614,14 @@ fn page(title: &str, message: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} · Margin</title>
-<style>
-  :root {{ color-scheme: light dark; --bg: #ffffff; --fg: #0d0d0d; --muted: #5d5d5d; --line: #e5e5e5; }}
-  @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0d0d0d; --fg: #f3f3f3; --muted: #a3a3a3; --line: #2a2a2a; }} }}
-  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg);
-         font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; }}
-  main {{ max-width: 28rem; margin: 1rem; padding: 2rem; border: 1px solid var(--line); border-radius: 12px; }}
-  h1 {{ font-size: 1.25rem; margin: 0 0 .5rem; }}
-  p {{ margin: 0; color: var(--muted); }}
-</style>
+<style>{style}</style>
 </head>
 <body><main><h1>{title}</h1><p>{message}</p></main></body>
 </html>
 "#,
         title = escape_html(title),
         message = escape_html(message),
+        style = PAGE_STYLE,
     )
 }
 
@@ -627,7 +781,58 @@ mod tests {
     }
 
     #[test]
+    fn device_limits_count_per_device_and_say_when_to_retry() {
+        let l = RateLimiter::default();
+        let a = Client::Device("a".into());
+        for _ in 0..30 {
+            assert!(l.admit("messages", a.clone(), 30).is_ok());
+        }
+        let wait = l.admit("messages", a.clone(), 30).unwrap_err();
+        assert!(
+            wait > StdDuration::from_secs(50) && wait <= WINDOW,
+            "{wait:?}"
+        );
+        // Another device, and another route of the same device, have their own windows.
+        assert!(l.admit("messages", Client::Device("b".into()), 30).is_ok());
+        assert!(l.admit("context-search", a, 30).is_ok());
+        let res = rate_limited(StdDuration::from_millis(1_500));
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.headers()[header::RETRY_AFTER], "2");
+        assert_eq!(
+            rate_limited(StdDuration::ZERO).headers()[header::RETRY_AFTER],
+            "1"
+        );
+    }
+
+    #[test]
+    fn folder_files_are_told_apart_by_their_query() {
+        assert!(is_folder_file(Some("workspace_id=w1&name=a.md")));
+        assert!(is_folder_file(Some("name=a.md&workspace_id=w1")));
+        assert!(!is_folder_file(Some("name=a.md&workspace_id=")));
+        assert!(!is_folder_file(Some("name=a.md&topic_id=t")));
+        assert!(!is_folder_file(Some("xworkspace_id=w1")));
+        assert!(!is_folder_file(None));
+    }
+
+    #[test]
     fn pages_escape_text() {
         assert!(page("t", "<script>").contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn the_page_csp_allows_only_its_own_stylesheet() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let html = page("t", "m");
+        let start = html.find("<style>").unwrap() + "<style>".len();
+        let end = html.find("</style>").unwrap();
+        let hash = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(&html[start..end]));
+        let csp = page_csp();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        assert!(csp.contains(&format!("style-src 'sha256-{hash}'")), "{csp}");
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!html.contains("<script"));
     }
 }

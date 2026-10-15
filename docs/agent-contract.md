@@ -668,7 +668,10 @@ test at its boundary:
 | `GET /api/traces` | paged by the server (500 rows a read) | `trace::PAGE` |
 | Condense summary | 8 000 characters | `routes::CONDENSE_SUMMARY_MAX_CHARS` |
 | Alert job tick | 60 s | `routes::ALERT_TICK_SECS` |
-| Per-device rate limits (5-security) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min; 429 `rate_limited` with `Retry-After` (`margin-mcp` waits it out) | `auth::RateLimiter` |
+| Per-device rate limits (5-security) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min together (a folder's files, `?workspace_id=`, aren't counted: a sync sends every file of the folder); 429 `rate_limited` with `Retry-After` in seconds until the minute's window ends (`margin-mcp` waits it out); sign-in per IP: start 10/min, poll 90/min, same answer | `auth::{MESSAGES_LIMIT, CONTEXT_SEARCH_LIMIT, CONTEXT_INGEST_LIMIT, SOURCES_LIMIT, START_LIMIT, POLL_LIMIT}` through `auth::limit` |
+| Signed media links | 6 h; `Cache-Control: private, max-age=<seconds left on the link>` | `state::MEDIA_URL_TTL_SECONDS`, `media::cache_control` |
+| Sign-in callback page | `Content-Security-Policy: default-src 'none'` (its one stylesheet by hash), `Referrer-Policy: no-referrer`, `no-store`; a replayed callback is refused (410) | `auth::page_csp` |
+| CORS | none: no route sets `Access-Control-*` (native apps and `margin-mcp` only) | — |
 
 ## 8. Tests each owner adds
 
