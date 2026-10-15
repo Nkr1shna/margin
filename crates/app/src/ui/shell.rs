@@ -121,7 +121,7 @@ pub fn Shell() -> Element {
     // the top. Pages reuse the same scroll element, so its offset would otherwise carry over.
     // A chat starts at its end instead (`MarginApp.followChat`).
     use_effect(use_reactive!(|route| {
-        let _ = route;
+        crate::diagnostics::set_screen(&route.to_string());
         app.drawer_open.set(false);
         document::eval(
             "requestAnimationFrame(function () { document.querySelectorAll('.main .scroll:not(.chat-scroll)').forEach(function (e) { e.scrollTop = 0; }); });",

@@ -111,13 +111,13 @@ fn present(
 /// the folder can't be kept (the reason is logged).
 pub async fn pick_folder() -> Option<FolderPick> {
     let Some(mtm) = MainThreadMarker::new() else {
-        eprintln!("the folder picker can only be shown from the main thread");
+        tracing::warn!("the folder picker can only be shown from the main thread");
         return None;
     };
     // SAFETY: a UTType constant from UniformTypeIdentifiers, always initialized.
     let kind = unsafe { UTTypeFolder };
     let Some((delegate, reply)) = present(mtm, kind, false) else {
-        eprintln!("couldn't find a view controller to show the folder picker over");
+        tracing::warn!("couldn't find a view controller to show the folder picker over");
         return None;
     };
     let urls = reply.await.unwrap_or_default();
@@ -126,7 +126,7 @@ pub async fn pick_folder() -> Option<FolderPick> {
     match keep_folder(&url) {
         Ok(pick) => Some(pick),
         Err(error) => {
-            eprintln!("couldn't keep the picked folder: {error}");
+            tracing::warn!("couldn't keep the picked folder: {error}");
             None
         }
     }
@@ -267,13 +267,13 @@ fn location_of(path: &str, device: &str) -> String {
 
 pub async fn pick_files() -> Option<Selection> {
     let Some(mtm) = MainThreadMarker::new() else {
-        eprintln!("the document picker can only be shown from the main thread");
+        tracing::warn!("the document picker can only be shown from the main thread");
         return None;
     };
     // SAFETY: a UTType constant from UniformTypeIdentifiers, always initialized.
     let kind = unsafe { UTTypeData };
     let Some((delegate, reply)) = present(mtm, kind, true) else {
-        eprintln!("couldn't find a view controller to show the document picker over");
+        tracing::warn!("couldn't find a view controller to show the document picker over");
         return None;
     };
     let urls = reply.await.unwrap_or_default();

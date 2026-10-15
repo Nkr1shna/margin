@@ -200,7 +200,10 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                     renaming.set(false);
                                 } else if e.key() == Key::Enter {
                                     e.prevent_default();
-                                    save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await;
+                                    // Read in a statement of its own: a guard held across the
+                                    // save would make the next keystroke's `set` panic.
+                                    let title = rename_value.peek().clone();
+                                    save_title(app, id, title, renaming, action_error, rename_busy).await;
                                 }
                             }
                         }
@@ -213,7 +216,8 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                         let id = id.clone();
                         move |_| {
                             let id = id.clone();
-                            async move { save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await }
+                            let title = rename_value.peek().clone();
+                            async move { save_title(app, id, title, renaming, action_error, rename_busy).await }
                         }
                     },
                     if *rename_busy.read() {

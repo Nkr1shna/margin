@@ -7,6 +7,7 @@ mod chrome;
 mod citations;
 mod commands;
 mod config;
+mod diagnostics;
 mod drafts;
 mod events;
 #[cfg(test)]
@@ -88,6 +89,8 @@ const INDEX_HTML: &str = concat!(
 );
 
 fn main() {
+    // First, so a panic anywhere after leaves a report (src/diagnostics.rs).
+    diagnostics::init();
     picker::clear_staging();
     // The folders this device holds, before anything syncs them.
     folders::store::load();
@@ -312,7 +315,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
         })
         .and_then(|_| menu.append_items(&[&app, &file, &edit, &view, &go, &window]));
     if let Err(error) = built {
-        eprintln!("couldn't build the menu bar: {error}");
+        tracing::warn!("couldn't build the menu bar: {error}");
     }
     menu
 }
@@ -473,6 +476,11 @@ fn App() -> Element {
          @font-face {{ font-family: 'Albert Sans'; font-style: italic; font-weight: 100 900; font-display: swap; src: url('{FONTS}/AlbertSans-Italic-wght.ttf') format('truetype'); }}"
     );
     let signed_in = ctx.session.read().is_some();
+    if !signed_in {
+        diagnostics::set_screen("sign-in");
+    }
+    // A panic that quit the app last time (src/diagnostics.rs), shown once.
+    let last_crash = use_hook(diagnostics::take_last_crash);
 
     rsx! {
         if cfg!(debug_assertions) {
@@ -493,6 +501,7 @@ fn App() -> Element {
             document::Title { "Sign in — Margin" }
             ui::signin::ConnectScreen {}
         }
+        ui::crash::CrashNoticeHost { report: last_crash }
     }
 }
 

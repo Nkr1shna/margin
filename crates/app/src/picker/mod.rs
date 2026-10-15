@@ -73,7 +73,7 @@ fn new_staging_dir() -> Option<PathBuf> {
     match std::fs::create_dir_all(&dir) {
         Ok(()) => Some(dir),
         Err(error) => {
-            eprintln!("couldn't create {}: {error}", dir.display());
+            tracing::warn!("couldn't create {}: {error}", dir.display());
             None
         }
     }
