@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::pipeline::{Fusion, StageDeps};
+use margin_shared::context::ACCESS_COMPANY;
 use margin_shared::pipeline::{PipelineConfig, StageCfg};
 
 /// A reader of `company` (every seeded row's audience) with no denials.

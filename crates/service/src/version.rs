@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
+use margin_shared::sync::Locked;
 
 /// The commit the binary was built from: `MARGIN_BUILD_SHA` at compile time
 /// (`build-service.yml` sets it), `"unknown"` for a local build.
@@ -70,11 +71,7 @@ pub fn info(environment: &str) -> VersionInfo {
 
 pub async fn get_version(State(state): State<AppState>) -> Json<VersionInfo> {
     let mut v = info(&state.config.environment);
-    (v.alerts_active, v.alerts_since) = state
-        .alerts
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .summary();
+    (v.alerts_active, v.alerts_since) = state.alerts.locked().summary();
     Json(v)
 }
 

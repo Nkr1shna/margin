@@ -46,6 +46,7 @@ use crate::db::{self, Store};
 use crate::error::{AppError, AppResult};
 use crate::principal::RequireAdmin;
 use crate::state::AppState;
+use margin_shared::sync::Locked;
 
 tokio::task_local! {
     /// The principal id the current task works for (`with_principal`).
@@ -242,7 +243,7 @@ impl Tracer {
 
     /// The receiving end, for the writer task; `None` once taken.
     pub fn take_receiver(&self) -> Option<mpsc::Receiver<TraceRow>> {
-        self.rx.lock().ok()?.take()
+        self.rx.locked().take()
     }
 
     /// Replaces the price table (rows recorded from now on use it).
@@ -337,22 +338,22 @@ pub struct AttemptClock {
 impl AttemptClock {
     /// A retried attempt begins now: the call's row is timed from here.
     pub fn retry_started(&self) {
-        *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        *self.retried_at.locked() = Some(Instant::now());
     }
 
     /// The latest attempt's call to the provider took `took`.
     pub fn provider_took(&self, took: Duration) {
-        *self.provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(took);
+        *self.provider.locked() = Some(took);
     }
 
     /// Restarts `span`'s timer at the latest retry and sets its `provider_ms`.
     fn apply(&self, span: &mut TraceSpan) {
-        if let Some(at) = *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(at) = *self.retried_at.locked() {
             span.started = at;
             span.row.at =
                 Utc::now() - chrono::TimeDelta::from_std(at.elapsed()).unwrap_or_default();
         }
-        if let Some(took) = *self.provider.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(took) = *self.provider.locked() {
             span.row.provider_ms = Some(took.as_secs_f64() * 1000.0);
         }
     }

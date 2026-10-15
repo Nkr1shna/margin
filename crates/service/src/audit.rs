@@ -51,6 +51,7 @@ use crate::pipeline::Reader;
 use crate::principal::{Principal, PrincipalKind, RequireAdmin};
 use crate::state::{AppState, DeviceRow, Owned, can_read};
 use crate::trace::id_time;
+use margin_shared::sync::Locked;
 
 /// The table audit rows are stored in.
 pub const AUDIT: &str = "audit";
@@ -313,7 +314,7 @@ pub async fn flush(state: &AppState, wait: Duration) -> bool {
 /// once at startup; later calls do nothing.
 pub fn start(state: &AppState) {
     let auditor = &state.tracer.audit;
-    let Some(rx) = auditor.rx.lock().ok().and_then(|mut r| r.take()) else {
+    let Some(rx) = auditor.rx.locked().take() else {
         return;
     };
     // The exports read counts as queued work, so a read right after start sees it.

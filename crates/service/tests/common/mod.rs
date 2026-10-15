@@ -827,6 +827,8 @@ pub struct FakeSourceTools {
     pub no_ocr: AtomicBool,
     /// Cross-encoders opened (`load_reranker`, R2).
     pub reranker_loads: AtomicU32,
+    /// How long `load` takes, in milliseconds (a slow model load).
+    pub load_ms: AtomicU64,
 }
 
 /// A speech model of `FAKE_SPEECH_BYTES` "downloaded" in two progress steps, kept in
@@ -986,6 +988,7 @@ impl SourceTools for FakeSourceTools {
             "load is only called once downloaded"
         );
         self.loads.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(self.load_ms.load(Ordering::SeqCst)));
         Ok(Arc::new(FakeEmbedder))
     }
 

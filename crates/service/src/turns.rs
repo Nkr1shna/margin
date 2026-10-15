@@ -35,6 +35,7 @@ use crate::principal::Principal;
 use crate::state::{AppState, DeviceRow, Owned};
 use crate::trace::{self, SpanGuard, TraceSpan, TracedStream};
 use crate::{agent_tools, db, workspaces};
+use margin_shared::sync::Locked;
 
 /// The `Action` added when the owner stops a turn.
 pub const STOPPED: &str = "Stopped by the owner.";
@@ -130,8 +131,7 @@ impl Turns {
     /// Whether `provider` at `base_url` rejected server-side compaction.
     pub fn rejects_compaction(&self, provider: Provider, base_url: &str) -> bool {
         self.no_server_compaction
-            .lock()
-            .unwrap()
+            .locked()
             .contains(&(provider, base_url.to_string()))
     }
 
@@ -139,7 +139,7 @@ impl Turns {
     /// poll on another thread, and is gone once it is awaited. Its items are left as
     /// they are.
     pub fn abort(&self, chat_id: &str) -> Option<JoinHandle<()>> {
-        let turn = self.running.lock().unwrap().remove(chat_id)?;
+        let turn = self.running.locked().remove(chat_id)?;
         turn.task.abort();
         Some(turn.task)
     }
@@ -157,8 +157,7 @@ impl Turns {
     /// nothing stays registered past the turn.
     pub fn register_write(&self, chat_id: &str, call_id: &str, write: JoinHandle<ToolOutput>) {
         self.writes
-            .lock()
-            .unwrap()
+            .locked()
             .entry(chat_id.to_string())
             .or_default()
             .push((call_id.to_string(), write));
@@ -167,27 +166,22 @@ impl Turns {
     /// Removes and returns the chat's registered writes as `(call_id, handle)`, in the
     /// order they were registered. Empty when none are registered.
     pub fn take_writes(&self, chat_id: &str) -> Vec<(String, JoinHandle<ToolOutput>)> {
-        self.writes
-            .lock()
-            .unwrap()
-            .remove(chat_id)
-            .unwrap_or_default()
+        self.writes.locked().remove(chat_id).unwrap_or_default()
     }
 
     /// Forgets what is kept in memory for a deleted chat. Changes its tools started
     /// carry on.
     pub fn forget_chat(&self, chat_id: &str) {
-        self.seqs.lock().unwrap().remove(chat_id);
-        self.writes.lock().unwrap().remove(chat_id);
-        self.titled.lock().unwrap().remove(chat_id);
-        self.audiences.lock().unwrap().remove(chat_id);
+        self.seqs.locked().remove(chat_id);
+        self.writes.locked().remove(chat_id);
+        self.titled.locked().remove(chat_id);
+        self.audiences.locked().remove(chat_id);
     }
 
     /// Whether `turn_id` is the chat's running turn.
     fn is_current(&self, chat_id: &str, turn_id: &str) -> bool {
         self.running
-            .lock()
-            .unwrap()
+            .locked()
             .get(chat_id)
             .is_some_and(|t| t.turn_id == turn_id)
     }
@@ -404,7 +398,7 @@ fn spawn_locked(
         turn_id.to_string(),
         origin,
     ));
-    state.turns.running.lock().unwrap().insert(
+    state.turns.running.locked().insert(
         chat_id.to_string(),
         RunningTurn {
             turn_id: turn_id.to_string(),
@@ -465,8 +459,8 @@ async fn run_as(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef, ac
     ))
     .catch_unwind()
     .await;
-    drop(slot.lock().unwrap().take());
-    state.turns.compactions.lock().unwrap().remove(&turn_id);
+    drop(slot.locked().take());
+    state.turns.compactions.locked().remove(&turn_id);
     let (outcome, early) = match result {
         Ok(Ok(outcome)) => (outcome, None),
         Ok(Err(early)) => (
@@ -623,7 +617,7 @@ async fn run_turn(
             window: choice.window,
         }),
     };
-    let retry = *state.turns.retry.lock().unwrap();
+    let retry = *state.turns.retry.locked();
     let deps = TurnDeps {
         model: &model,
         small: small_text.as_ref(),
@@ -739,7 +733,7 @@ impl ModelClient for ChatGptRetry {
 
     fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
         Box::pin(async move {
-            let (client, used) = self.inner.lock().unwrap().clone();
+            let (client, used) = self.inner.locked().clone();
             match client.stream(req.clone()).await {
                 Err(e) if invalid_plan_token(&e) => {
                     tracing::info!("ChatGPT refused the plan token; refreshing it once");
@@ -758,7 +752,7 @@ impl ModelClient for ChatGptRetry {
                     let mut config = self.config.clone();
                     config.credential = margin_ai::Credential::Bearer(token.clone());
                     let fresh = self.state.generator.agent_model(&config);
-                    *self.inner.lock().unwrap() = (fresh.clone(), token);
+                    *self.inner.locked() = (fresh.clone(), token);
                     fresh.stream(req).await
                 }
                 other => other,
@@ -768,7 +762,7 @@ impl ModelClient for ChatGptRetry {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
         Box::pin(async move {
-            let client = self.inner.lock().unwrap().0.clone();
+            let client = self.inner.locked().0.clone();
             client.list_models().await
         })
     }
@@ -791,7 +785,7 @@ async fn finish(
     if !state.turns.is_current(chat_id, turn_id) {
         return Ok(());
     }
-    state.turns.running.lock().unwrap().remove(chat_id);
+    state.turns.running.locked().remove(chat_id);
     // The loop waited for every change it started unless it failed in the middle; then
     // those that finished are recorded with their real results.
     let writes = finished_writes(state.turns.take_writes(chat_id));
@@ -869,7 +863,7 @@ async fn await_writes(
     state: &AppState,
     writes: Vec<(String, JoinHandle<ToolOutput>)>,
 ) -> HashMap<String, Option<ToolOutput>> {
-    let wait = *state.turns.stop_wait.lock().unwrap();
+    let wait = *state.turns.stop_wait.locked();
     let deadline = tokio::time::Instant::now() + wait;
     let mut out = HashMap::new();
     for (call_id, handle) in writes {
@@ -953,13 +947,7 @@ pub async fn stop(
                 "Nothing is being answered in this chat.",
             ));
         };
-        if !state
-            .turns
-            .stopping
-            .lock()
-            .unwrap()
-            .insert(chat_id.to_string())
-        {
+        if !state.turns.stopping.locked().insert(chat_id.to_string()) {
             return Ok(chat);
         }
         (turn_id, state.turns.abort(chat_id))
@@ -973,7 +961,7 @@ pub async fn stop(
     ));
     rest.await.unwrap_or_else(|e| {
         // `finish_stop` panicked: another Stop may try again.
-        state.turns.stopping.lock().unwrap().remove(chat_id);
+        state.turns.stopping.locked().remove(chat_id);
         Err(AppError::internal(format!("stopping a turn failed: {e}")))
     })
 }
@@ -1013,7 +1001,7 @@ async fn finish_stop(
     }
     .await;
     // Still under `write_lock`: a Stop of the pending message's turn waits for it.
-    state.turns.stopping.lock().unwrap().remove(chat_id);
+    state.turns.stopping.locked().remove(chat_id);
     stopped
 }
 
@@ -1059,7 +1047,7 @@ pub async fn decide(
         _ => return Err(not_waiting()),
     };
     let (answer, started_at) = {
-        let mut running = state.turns.running.lock().unwrap();
+        let mut running = state.turns.running.locked();
         let Some(turn) = running.get_mut(chat_id).filter(|t| t.turn_id == turn_id) else {
             return Err(not_waiting());
         };
@@ -1271,7 +1259,7 @@ async fn wind_up_locked(
             continue;
         }
         let mut row = row.clone();
-        let live = state.turns.live_text.lock().unwrap().remove(&row.item.id);
+        let live = state.turns.live_text.locked().remove(&row.item.id);
         if let Some(text) = live {
             set_streaming_text(&mut row.item.kind, text);
         }
@@ -1463,7 +1451,7 @@ async fn finish_call_locked(
         return Ok(());
     };
     let call_id = call_id.clone();
-    let live = state.turns.live_text.lock().unwrap().remove(&call.item.id);
+    let live = state.turns.live_text.locked().remove(&call.item.id);
     if let Some(text) = live {
         set_streaming_text(&mut call.item.kind, text);
     }
@@ -1595,8 +1583,7 @@ impl TurnSink for ServiceSink {
             self.state
                 .turns
                 .no_server_compaction
-                .lock()
-                .unwrap()
+                .locked()
                 .insert((m.provider, m.base_url.clone()));
         }
     }
@@ -1640,8 +1627,7 @@ impl TurnSink for ServiceSink {
                 state
                     .turns
                     .live_text
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .insert(item.id.clone(), text.to_string());
             }
             let stored = StoredChatItem {
@@ -1664,7 +1650,7 @@ impl TurnSink for ServiceSink {
             return;
         }
         let offset = {
-            let mut live = self.state.turns.live_text.lock().unwrap();
+            let mut live = self.state.turns.live_text.locked();
             // A stopped or deleted turn's task can still be inside a poll; its items
             // are already finished. Checked under the `live_text` lock: Stop ends the
             // turn before it takes that lock to clear the item's text.
@@ -1722,7 +1708,7 @@ impl TurnSink for ServiceSink {
                 row.full_output = Some(full_output);
             }
             {
-                let mut live = state.turns.live_text.lock().unwrap();
+                let mut live = state.turns.live_text.locked();
                 match (row.item.status, row.item.kind.streaming_text()) {
                     (ItemStatus::InProgress, Some(text)) => {
                         live.insert(row.item.id.clone(), text.to_string());
@@ -1780,7 +1766,7 @@ impl TurnSink for ServiceSink {
                 };
                 let (tx, rx) = oneshot::channel();
                 {
-                    let mut running = state.turns.running.lock().unwrap();
+                    let mut running = state.turns.running.locked();
                     let Some(turn) = running
                         .get_mut(&self.chat_id)
                         .filter(|t| t.turn_id == self.turn_id)
@@ -1800,10 +1786,10 @@ impl TurnSink for ServiceSink {
                 rx
             };
             // Parked: other chats' turns may run meanwhile.
-            drop(self.slot.lock().unwrap().take());
+            drop(self.slot.locked().take());
             let decision = answer.await.map_err(|_| self.stopped())?;
             let permit = state.turns.slots.clone().acquire_owned().await.ok();
-            *self.slot.lock().unwrap() = permit;
+            *self.slot.locked() = permit;
             Ok(decision)
         })
     }
@@ -1831,8 +1817,7 @@ impl TurnSink for ServiceSink {
         self.state
             .turns
             .compactions
-            .lock()
-            .unwrap()
+            .locked()
             .entry(self.turn_id.clone())
             .or_default()
             .insert(step, kind);
@@ -1872,13 +1857,7 @@ impl ServiceSink {
 /// Starts the call that writes the chat's title after its first finished turn `turn_id`,
 /// once per chat while the service runs (see `write_title`).
 fn spawn_title(state: &AppState, chat_id: &str, turn_id: &str) {
-    if !state
-        .turns
-        .titled
-        .lock()
-        .unwrap()
-        .insert(chat_id.to_string())
-    {
+    if !state.turns.titled.locked().insert(chat_id.to_string()) {
         return;
     }
     let (state, chat_id, turn_id) = (state.clone(), chat_id.to_string(), turn_id.to_string());
@@ -1949,7 +1928,7 @@ async fn ask_title(
             _ => None,
         })
         .unwrap_or_default();
-    let override_model = state.turns.title_model.lock().unwrap().clone();
+    let override_model = state.turns.title_model.locked().clone();
     // A title is a small task: the default provider's small slot, as a plain text call.
     let small = state
         .model_for(Route::Small, None)
@@ -2052,7 +2031,7 @@ impl TurnTrace {
     /// The compaction the loop reported for step `step` of this turn, taken for its
     /// `model_call` row (`Turns.compactions`).
     fn take_compaction(&self, step: u32) -> Option<Compaction> {
-        let mut all = self.state.turns.compactions.lock().unwrap();
+        let mut all = self.state.turns.compactions.locked();
         let steps = all.get_mut(&self.turn_id)?;
         let kind = steps.remove(&step);
         if steps.is_empty() {

@@ -26,6 +26,7 @@ use crate::db::Store;
 use crate::error::AppResult;
 use crate::state::AppState;
 use crate::trace::{self, Tracer};
+use margin_shared::sync::Locked;
 
 /// The alerts kept in `App.alerts`: those active now and the last rises and clears.
 #[derive(Debug, Clone, Default)]
@@ -387,7 +388,7 @@ pub async fn tick(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<Vec<Al
     };
     let counter = state.http_errors.load(std::sync::atomic::Ordering::Relaxed);
     let events = {
-        let mut alerts = state.alerts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alerts = state.alerts.locked();
         let http_5xx = alerts.http_5xx_in_window(now, window(cfg), counter);
         let m = Measures {
             kinds,
@@ -510,8 +511,7 @@ pub async fn run(state: AppState) {
         let window = window(&state.config.alerts);
         state
             .alerts
-            .lock()
-            .unwrap()
+            .locked()
             .http_5xx_in_window(Utc::now(), window, counter);
     }
     loop {
@@ -527,12 +527,7 @@ pub async fn run(state: AppState) {
 
 /// The alerts active now.
 pub fn active(state: &AppState) -> Vec<Alert> {
-    state
-        .alerts
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .active
-        .clone()
+    state.alerts.locked().active.clone()
 }
 
 /// `GET routes::ALERTS`: the active alerts and the last rises and clears, newest first.
@@ -541,7 +536,7 @@ pub async fn get_alerts(
     State(state): State<AppState>,
     _admin: crate::principal::RequireAdmin,
 ) -> AppResult<Json<AlertList>> {
-    let alerts = state.alerts.lock().unwrap_or_else(|e| e.into_inner());
+    let alerts = state.alerts.locked();
     Ok(Json(AlertList {
         active: alerts.active.clone(),
         recent: alerts.recent.iter().rev().cloned().collect(),

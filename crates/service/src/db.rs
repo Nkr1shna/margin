@@ -29,10 +29,6 @@ pub const PROPOSAL: &str = "proposal";
 pub const DEVICE: &str = "device";
 pub const SETTINGS: &str = "settings";
 pub const SOURCE: &str = "source";
-/// Embedded pieces of sources (`sources::ChunkRow`).
-pub const CHUNK: &str = "chunk";
-/// Embedded pictures and sound of sources (`sources::MediaRow`).
-pub const MEDIA: &str = "media";
 /// Chats with the agent (`margin_shared::Chat`).
 pub const CHAT: &str = "chat";
 /// Chat transcripts (`chats::StoredChatItem`), with `chat_id`.
@@ -63,10 +59,6 @@ pub const SCHEMA_VERSION: u32 = 2;
 
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
-
-/// The tables of sources' vectors before the `passage` table: defined until the one-pass
-/// migration (`ingest::migrate`) removes them for good (`Store::remove_table`).
-const OLD_TABLES: [&str; 2] = [CHUNK, MEDIA];
 
 /// Rollup sums `trace::apply_retention` copies out of the views before it deletes raw
 /// rows, so the hourly and daily numbers outlive them (R1-trace).
@@ -477,7 +469,6 @@ impl Store {
             .check()
             .context("couldn't define tables")?;
         let store = Self { db };
-        store.define_old_tables().await?;
         store.apply_fields().await?;
         store.apply_indexes().await?;
         store
@@ -488,31 +479,6 @@ impl Store {
             .check()
             .context("couldn't define the library indexes")?;
         Ok(store)
-    }
-
-    /// Defines `chunk` and `media` unless `remove_table` retired them: a store from
-    /// before the `passage` table, or a new one, has them until the migration is done
-    /// (reading a table that doesn't exist is an error).
-    async fn define_old_tables(&self) -> anyhow::Result<()> {
-        let retired = self.retired().await?;
-        for t in OLD_TABLES {
-            if !retired.iter().any(|r| r == t) {
-                self.db
-                    .query(format!("DEFINE TABLE IF NOT EXISTS {t} SCHEMALESS"))
-                    .await?
-                    .check()
-                    .with_context(|| format!("couldn't define {t}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Tables `remove_table` removed for good.
-    async fn retired(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .get::<Vec<String>>(SCHEMA_META, "retired")
-            .await?
-            .unwrap_or_default())
     }
 
     /// Runs `FIELDS` when its text differs from the last one applied.
@@ -863,17 +829,6 @@ impl Store {
         .await
     }
 
-    /// Whether a document has any passage.
-    pub async fn has_passages(&self, document_id: &str) -> anyhow::Result<bool> {
-        let rows: Vec<serde_json::Value> = self
-            .query_rows(
-                "SELECT id FROM passage WHERE document_id = $d LIMIT 1",
-                vec![("d", serde_json::json!(document_id))],
-            )
-            .await?;
-        Ok(!rows.is_empty())
-    }
-
     /// Deletes up to `INSERT_MANY_MAX` passages of a document by their ids.
     pub async fn delete_passages(&self, document_id: &str, ids: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -1073,23 +1028,6 @@ impl Store {
             .and_then(|t| t.get(table))
             .is_some())
     }
-
-    /// Removes a table and its records for good: an old table (`chunk`, `media`) isn't
-    /// defined again at the next start. Reading a removed table is an error; callers
-    /// check `table_exists` first.
-    pub async fn remove_table(&self, table: &'static str) -> anyhow::Result<()> {
-        let mut retired = self.retired().await?;
-        if !retired.iter().any(|r| r == table) {
-            retired.push(table.to_string());
-            self.put(SCHEMA_META, "retired", &retired).await?;
-        }
-        self.db
-            .query(format!("REMOVE TABLE IF EXISTS {table}"))
-            .await?
-            .check()
-            .with_context(|| format!("couldn't remove the table {table}"))?;
-        Ok(())
-    }
 }
 
 /// Whether an `INFO FOR …` result lists `name` under `section`.
@@ -1272,23 +1210,23 @@ mod tests {
             f: Some(0.25),
             status: serde_json::json!(null),
         };
-        s.put(CHUNK, "a", &row("a", "x")).await.unwrap();
-        s.put(CHUNK, "b", &row("b", "x")).await.unwrap();
-        s.put(CHUNK, "c", &row("c", "y")).await.unwrap();
-        s.set_where(CHUNK, "parent_id", "x", "status", &"moved")
+        s.put(TOPIC, "a", &row("a", "x")).await.unwrap();
+        s.put(TOPIC, "b", &row("b", "x")).await.unwrap();
+        s.put(TOPIC, "c", &row("c", "y")).await.unwrap();
+        s.set_where(TOPIC, "parent_id", "x", "status", &"moved")
             .await
             .unwrap();
-        let moved: Vec<Row> = s.list_where(CHUNK, "parent_id", "x").await.unwrap();
+        let moved: Vec<Row> = s.list_where(TOPIC, "parent_id", "x").await.unwrap();
         assert_eq!(moved.len(), 2);
         assert!(
             moved
                 .iter()
                 .all(|r| r.status == "moved" && r.f == Some(0.25))
         );
-        let c: Row = s.get(CHUNK, "c").await.unwrap().unwrap();
+        let c: Row = s.get(TOPIC, "c").await.unwrap().unwrap();
         assert!(c.status.is_null());
-        s.delete_where(CHUNK, "parent_id", "x").await.unwrap();
-        let left: Vec<Row> = s.list(CHUNK).await.unwrap();
+        s.delete_where(TOPIC, "parent_id", "x").await.unwrap();
+        let left: Vec<Row> = s.list(TOPIC).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "c");
     }
@@ -1747,8 +1685,8 @@ mod tests {
             rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
         );
-        assert!(s.has_passages("d2").await.unwrap());
-        assert!(!s.has_passages("d9").await.unwrap());
+        assert!(!s.passages_of("d2").await.unwrap().is_empty());
+        assert!(s.passages_of("d9").await.unwrap().is_empty());
         // The document index serves the read.
         let plan: Vec<serde_json::Value> = s
             .query_rows(
@@ -1786,10 +1724,10 @@ mod tests {
         assert_eq!(s.passages_of("d1").await.unwrap().len(), 1);
         // Only the named document's passages go.
         s.delete_passages("d1", &["c".to_string()]).await.unwrap();
-        assert!(s.has_passages("d2").await.unwrap());
+        assert!(!s.passages_of("d2").await.unwrap().is_empty());
         s.delete_document_passages("d1").await.unwrap();
         assert!(s.passages_of("d1").await.unwrap().is_empty());
-        assert!(s.has_passages("d2").await.unwrap());
+        assert!(!s.passages_of("d2").await.unwrap().is_empty());
     }
 
     /// The first node of an `EXPLAIN` plan whose operator is `op` (depth first).
@@ -1983,28 +1921,5 @@ mod tests {
         // No document row: the passages are re-stamped, no generation is taken.
         assert_eq!(s.set_document_audience("d2", &[], &[]).await.unwrap(), None);
         assert!(s.passages_of("d2").await.unwrap()[0].access.is_empty());
-    }
-
-    #[tokio::test]
-    async fn old_tables_stay_removed_once_removed() {
-        let s = Store::memory().await.unwrap();
-        assert!(s.table_exists(CHUNK).await.unwrap() && s.table_exists(MEDIA).await.unwrap());
-        s.put(CHUNK, "x", &serde_json::json!({"source_id": "s"}))
-            .await
-            .unwrap();
-        s.remove_table(CHUNK).await.unwrap();
-        assert!(!s.table_exists(CHUNK).await.unwrap());
-        // Reading it now is an error, which is why callers ask first.
-        assert!(
-            s.list_where::<serde_json::Value>(CHUNK, "source_id", "s")
-                .await
-                .is_err()
-        );
-        // The next start doesn't define it again; the other old table is still there.
-        s.define_old_tables().await.unwrap();
-        assert!(!s.table_exists(CHUNK).await.unwrap());
-        assert!(s.table_exists(MEDIA).await.unwrap());
-        s.remove_table(CHUNK).await.unwrap();
-        assert_eq!(s.retired().await.unwrap(), [CHUNK]);
     }
 }

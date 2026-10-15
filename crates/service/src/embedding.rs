@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::principal::RequireAdmin;
 use crate::state::AppState;
 use crate::{ingest, rerank, sources};
+use margin_shared::sync::Locked;
 
 /// Download progress is sent at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -50,7 +51,7 @@ async fn on_disk(state: &AppState) -> (bool, u64) {
 /// Bytes a download fetches: asked of Hugging Face once, then remembered. 0 while it
 /// can't be reached.
 async fn download_bytes(state: &AppState) -> u64 {
-    if let Some(bytes) = *state.model_download_bytes.lock().unwrap() {
+    if let Some(bytes) = *state.model_download_bytes.locked() {
         return bytes;
     }
     match state
@@ -59,7 +60,7 @@ async fn download_bytes(state: &AppState) -> u64 {
         .await
     {
         Ok(bytes) => {
-            *state.model_download_bytes.lock().unwrap() = Some(bytes);
+            *state.model_download_bytes.locked() = Some(bytes);
             bytes
         }
         Err(e) => {
@@ -71,17 +72,14 @@ async fn download_bytes(state: &AppState) -> u64 {
 
 /// Whether the model is downloaded or downloading, so queued sources will get read.
 pub async fn will_be_available(state: &AppState) -> bool {
-    if matches!(
-        *state.model_job.lock().unwrap(),
-        ModelJob::Downloading { .. }
-    ) {
+    if matches!(*state.model_job.locked(), ModelJob::Downloading { .. }) {
         return true;
     }
     on_disk(state).await.0
 }
 
 pub async fn model(state: &AppState) -> EmbeddingModel {
-    let job = state.model_job.lock().unwrap().clone();
+    let job = state.model_job.locked().clone();
     let model_state = match job {
         ModelJob::Downloading { received, total } => {
             EmbeddingModelState::Downloading { received, total }
@@ -99,16 +97,16 @@ pub async fn model(state: &AppState) -> EmbeddingModel {
         state: model_state,
         speech: speech(state).await,
         reranker: Some(reranker(state).await),
-        reindex: *state.reindex.lock().unwrap(),
+        reindex: *state.reindex.locked(),
     };
-    *state.last_model.lock().unwrap() = Some(model.clone());
+    *state.last_model.locked() = Some(model.clone());
     model
 }
 
 /// The speech model's part, when the service downloads one.
 async fn speech(state: &AppState) -> Option<SpeechModel> {
     let repo = state.source_tools.speech_model()?.repo();
-    let job = state.speech_job.lock().unwrap().clone();
+    let job = state.speech_job.locked().clone();
     let speech_state = match job {
         ModelJob::Downloading { received, total } => {
             EmbeddingModelState::Downloading { received, total }
@@ -140,7 +138,7 @@ async fn speech_on_disk(state: &AppState) -> (bool, u64) {
 
 /// Bytes the speech model's download fetches: asked once, then remembered.
 async fn speech_download_bytes(state: &AppState) -> u64 {
-    if let Some(bytes) = *state.speech_download_bytes.lock().unwrap() {
+    if let Some(bytes) = *state.speech_download_bytes.locked() {
         return bytes;
     }
     let Some(speech) = state.source_tools.speech_model() else {
@@ -148,7 +146,7 @@ async fn speech_download_bytes(state: &AppState) -> u64 {
     };
     match speech.remote_size(&state.http, &state.hf_base).await {
         Ok(bytes) => {
-            *state.speech_download_bytes.lock().unwrap() = Some(bytes);
+            *state.speech_download_bytes.locked() = Some(bytes);
             bytes
         }
         Err(e) => {
@@ -168,7 +166,7 @@ fn emit_model(state: &AppState, model: &EmbeddingModel) {
 /// without asking the disk or Hugging Face again.
 fn emit_changed(state: &AppState, change: impl FnOnce(&mut EmbeddingModel)) {
     let model = {
-        let mut last = state.last_model.lock().unwrap();
+        let mut last = state.last_model.locked();
         let Some(model) = last.as_mut() else {
             return;
         };
@@ -180,8 +178,8 @@ fn emit_changed(state: &AppState, change: impl FnOnce(&mut EmbeddingModel)) {
 
 /// Sends the re-index's progress (`None` once it is done).
 pub async fn set_reindex(state: &AppState, progress: Option<margin_shared::ReindexProgress>) {
-    *state.reindex.lock().unwrap() = progress;
-    if state.last_model.lock().unwrap().is_some() {
+    *state.reindex.locked() = progress;
+    if state.last_model.locked().is_some() {
         emit_changed(state, |m| m.reindex = progress);
     } else {
         emit_model(state, &model(state).await);
@@ -202,15 +200,12 @@ pub async fn start_download(
     let started = {
         // Serializes with deleting the model.
         let _w = state.write_lock.lock().await;
-        let downloading = matches!(
-            *state.model_job.lock().unwrap(),
-            ModelJob::Downloading { .. }
-        );
+        let downloading = matches!(*state.model_job.locked(), ModelJob::Downloading { .. });
         if downloading || on_disk(&state).await.0 {
             false
         } else {
-            let total = state.model_download_bytes.lock().unwrap().unwrap_or(0);
-            *state.model_job.lock().unwrap() = ModelJob::Downloading { received: 0, total };
+            let total = state.model_download_bytes.locked().unwrap_or(0);
+            *state.model_job.locked() = ModelJob::Downloading { received: 0, total };
             true
         }
     };
@@ -226,13 +221,13 @@ async fn run_download(state: AppState) {
     let last_sent = Mutex::new(Instant::now());
     let progress = |received: u64, total: u64| {
         {
-            let mut job = state.model_job.lock().unwrap();
+            let mut job = state.model_job.locked();
             if !matches!(*job, ModelJob::Downloading { .. }) {
                 return;
             }
             *job = ModelJob::Downloading { received, total };
         }
-        let mut last = last_sent.lock().unwrap();
+        let mut last = last_sent.locked();
         if last.elapsed() < PROGRESS_INTERVAL {
             return;
         }
@@ -250,7 +245,7 @@ async fn run_download(state: AppState) {
             &progress,
         )
         .await;
-    *state.model_job.lock().unwrap() = match &result {
+    *state.model_job.locked() = match &result {
         Ok(()) => ModelJob::Idle,
         Err(e) => {
             tracing::warn!("embedding model download failed: {e}");
@@ -279,15 +274,13 @@ pub async fn delete_model(
 ) -> AppResult<Json<EmbeddingModel>> {
     {
         let _w = state.write_lock.lock().await;
-        if matches!(
-            *state.model_job.lock().unwrap(),
-            ModelJob::Downloading { .. }
-        ) {
+        if matches!(*state.model_job.locked(), ModelJob::Downloading { .. }) {
             return Err(AppError::conflict(
                 "model_downloading",
                 "The model is still downloading. Delete it once the download finishes.",
             ));
         }
+        let _load = state.embedder_load.lock().await;
         state.embedder.lock().await.take();
         let tools = state.source_tools.clone();
         let files = state.model_files.clone();
@@ -295,7 +288,7 @@ pub async fn delete_model(
             .await
             .map_err(AppError::internal)?
             .map_err(AppError::internal)?;
-        *state.model_job.lock().unwrap() = ModelJob::Idle;
+        *state.model_job.locked() = ModelJob::Idle;
     }
     let current = model(&state).await;
     emit_model(&state, &current);
@@ -312,15 +305,12 @@ pub async fn start_speech_download(
     no_speech_model(&state)?;
     let started = {
         let _w = state.write_lock.lock().await;
-        let downloading = matches!(
-            *state.speech_job.lock().unwrap(),
-            ModelJob::Downloading { .. }
-        );
+        let downloading = matches!(*state.speech_job.locked(), ModelJob::Downloading { .. });
         if downloading || speech_on_disk(&state).await.0 {
             false
         } else {
-            let total = state.speech_download_bytes.lock().unwrap().unwrap_or(0);
-            *state.speech_job.lock().unwrap() = ModelJob::Downloading { received: 0, total };
+            let total = state.speech_download_bytes.locked().unwrap_or(0);
+            *state.speech_job.locked() = ModelJob::Downloading { received: 0, total };
             true
         }
     };
@@ -347,10 +337,7 @@ pub struct RerankerJobs {
 }
 
 fn reranker_jobs(state: &AppState) -> std::sync::MutexGuard<'_, RerankerJobs> {
-    state
-        .reranker_jobs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    state.reranker_jobs.locked()
 }
 
 fn reranker_job(state: &AppState, files: &RerankerFiles) -> ModelJob {
@@ -505,7 +492,7 @@ async fn model_showing(state: &AppState, model: RerankerModel) -> EmbeddingModel
     let mut current = self::model(state).await;
     if current.reranker.as_ref().map(|r| r.name.as_str()) != Some(model.name()) {
         current.reranker = Some(reranker_state(state, model).await);
-        *state.last_model.lock().unwrap() = Some(current.clone());
+        *state.last_model.locked() = Some(current.clone());
     }
     current
 }
@@ -581,7 +568,7 @@ async fn run_reranker_download(state: AppState, files: RerankerFiles) {
             return;
         }
         set_reranker_job(&state, &files, ModelJob::Downloading { received, total });
-        let mut last = last_sent.lock().unwrap();
+        let mut last = last_sent.locked();
         if last.elapsed() < PROGRESS_INTERVAL {
             return;
         }
@@ -660,13 +647,13 @@ async fn run_speech_download(state: AppState) {
     let last_sent = Mutex::new(Instant::now());
     let progress = |received: u64, total: u64| {
         {
-            let mut job = state.speech_job.lock().unwrap();
+            let mut job = state.speech_job.locked();
             if !matches!(*job, ModelJob::Downloading { .. }) {
                 return;
             }
             *job = ModelJob::Downloading { received, total };
         }
-        let mut last = last_sent.lock().unwrap();
+        let mut last = last_sent.locked();
         if last.elapsed() < PROGRESS_INTERVAL {
             return;
         }
@@ -685,7 +672,7 @@ async fn run_speech_download(state: AppState) {
         }
         None => Ok(()),
     };
-    *state.speech_job.lock().unwrap() = match &result {
+    *state.speech_job.locked() = match &result {
         Ok(()) => ModelJob::Idle,
         Err(e) => {
             tracing::warn!("speech model download failed: {e}");
@@ -706,10 +693,7 @@ pub async fn delete_speech(
     no_speech_model(&state)?;
     {
         let _w = state.write_lock.lock().await;
-        if matches!(
-            *state.speech_job.lock().unwrap(),
-            ModelJob::Downloading { .. }
-        ) {
+        if matches!(*state.speech_job.locked(), ModelJob::Downloading { .. }) {
             return Err(AppError::conflict(
                 "model_downloading",
                 "The speech model is still downloading. Delete it once the download finishes.",
@@ -723,7 +707,7 @@ pub async fn delete_speech(
         .await
         .map_err(AppError::internal)?
         .map_err(AppError::internal)?;
-        *state.speech_job.lock().unwrap() = ModelJob::Idle;
+        *state.speech_job.locked() = ModelJob::Idle;
     }
     let current = model(&state).await;
     emit_model(&state, &current);
@@ -733,14 +717,15 @@ pub async fn delete_speech(
 /// The embedding model, loaded on first use (compiling it the first time takes a few
 /// seconds). `None` while it isn't downloaded.
 pub async fn embedder(state: &AppState) -> Result<Option<Arc<dyn Embedder>>, EmbedError> {
-    let mut slot = state.embedder.lock().await;
-    if let Some(e) = slot.as_ref() {
-        return Ok(Some(e.clone()));
+    if let Some(e) = state.embedder.lock().await.clone() {
+        return Ok(Some(e));
     }
-    if matches!(
-        *state.model_job.lock().unwrap(),
-        ModelJob::Downloading { .. }
-    ) {
+    let _load = state.embedder_load.lock().await;
+    // Another caller may have loaded it while this one waited.
+    if let Some(e) = state.embedder.lock().await.clone() {
+        return Ok(Some(e));
+    }
+    if matches!(*state.model_job.locked(), ModelJob::Downloading { .. }) {
         return Ok(None);
     }
     let tools = state.source_tools.clone();
@@ -756,6 +741,6 @@ pub async fn embedder(state: &AppState) -> Result<Option<Arc<dyn Embedder>>, Emb
     if loaded.is_some() {
         tracing::info!("embedding model loaded");
     }
-    slot.clone_from(&loaded);
+    state.embedder.lock().await.clone_from(&loaded);
     Ok(loaded)
 }
