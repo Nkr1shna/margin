@@ -11,18 +11,20 @@ pub mod chat;
 pub mod context;
 pub mod device;
 pub mod pipeline;
+pub mod principal;
 pub mod providers;
 pub mod routes;
 pub mod text;
 
 pub use chat::*;
 pub use device::*;
+pub use principal::*;
 pub use providers::*;
 
 /// Serde for `Option<Option<T>>` patch fields: a missing field is `None` (unchanged),
 /// `null` is `Some(None)` (clear), and a value is `Some(Some(v))`. Use with
 /// `#[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]`.
-mod double_option {
+pub(crate) mod double_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<T: Serialize, S: Serializer>(
@@ -59,6 +61,17 @@ pub struct Topic {
     pub title: String,
     /// Sort order among siblings, ascending.
     pub position: i64,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -99,6 +112,17 @@ pub struct Lesson {
     /// when the lesson was generated with a quiz.
     pub body_md: String,
     pub status: LessonStatus,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The sources the body cites with `[^n]` footnote references.
@@ -116,6 +140,17 @@ pub struct Note {
     pub body_md: String,
     /// The selected lesson text this note annotates, if it is a margin note.
     pub quote: Option<String>,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -240,6 +275,17 @@ pub struct Proposal {
     pub request: AskRequest,
     pub status: ProposalStatus,
     pub outline: Option<Outline>,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     /// The chat whose `propose_course` call made it; accepting it records an
     /// `ChatItemKind::Action` there so the agent knows the course exists.
@@ -332,6 +378,17 @@ pub struct Source {
     /// Size of the uploaded file.
     pub bytes: u64,
     pub status: SourceStatus,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     /// Signed URL of the original file, for viewing it (images, PDFs, audio, video).
     #[serde(default)]
@@ -850,6 +907,9 @@ pub struct Device {
     /// and can answer device tools.
     #[serde(default)]
     pub online: bool,
+    /// The person the device signed in as (L1); `None` from a service before L1.
+    #[serde(default)]
+    pub person_id: Option<Id>,
 }
 
 // ---------------------------------------------------------------------------
@@ -900,8 +960,18 @@ pub enum LoginState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Me {
+    /// The person's GitHub login (an agent token: its owner's).
     pub github_login: String,
-    pub device: Device,
+    /// The calling device; `None` for an agent token.
+    #[serde(default)]
+    pub device: Option<Device>,
+    /// The signed-in person (an agent token: its owner, without `settings`). `None` from
+    /// a service before L1.
+    #[serde(default)]
+    pub person: Option<Person>,
+    /// The agent, for an agent token.
+    #[serde(default)]
+    pub agent: Option<Agent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,9 +1075,44 @@ pub enum Event {
     DocumentChanged {
         document: context::Document,
     },
-    /// A trace row, sent only to sockets that subscribed with `?traces=1`.
+    /// A trace row, sent only to sockets that subscribed with `?traces=1` (admins only).
     Trace {
         row: Box<context::TraceRow>,
+    },
+    /// A person was invited in, edited, enabled or disabled (L1). Carries the whole
+    /// person; `settings` only to the person themself.
+    PersonChanged {
+        person: Person,
+    },
+    /// A group was created or renamed.
+    GroupChanged {
+        group: Group,
+    },
+    GroupDeleted {
+        path: String,
+    },
+    /// A person's direct memberships were replaced.
+    MembershipChanged {
+        person_id: Id,
+        groups: Vec<String>,
+    },
+    /// An agent was created or changed (to its owner and admins).
+    AgentChanged {
+        agent: Agent,
+    },
+    AgentDeleted {
+        id: Id,
+    },
+    /// An invitation was made, accepted or revoked (to admins).
+    InvitationChanged {
+        invitation: Invitation,
+    },
+    InvitationDeleted {
+        id: Id,
+    },
+    /// What `person_id` may read changed (memberships, role): reload the library.
+    AccessChanged {
+        person_id: Id,
     },
 }
 

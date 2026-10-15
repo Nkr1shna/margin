@@ -14,8 +14,9 @@ use margin_shared::pipeline::PipelineConfig;
 use margin_shared::pipeline::Route;
 use margin_shared::{
     Citation, Event, Id, Lesson, Note, Proposal, Provider, ReasoningEffort, RouteModels, Settings,
-    Source, Topic, Video, VideoMedia, VideoStatus, error_code,
+    Source, Topic, Video, VideoMedia, VideoStatus, error_code, person_id,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
@@ -30,6 +31,7 @@ use crate::engines::{Generator, ModelChoice, Renderer, SourceTools};
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestQueue;
 use crate::pipeline::{Pipeline, Registry};
+use crate::principal::{BOOTSTRAP_PERSON_ID, Principal, PrincipalKind};
 use crate::retrieval::RetrievalCache;
 use crate::secrets::{ANTHROPIC_API_KEY, OPENAI_API_KEY, SecretStore};
 use crate::trace::Tracer;
@@ -144,6 +146,9 @@ pub struct DeviceRow {
     pub github_login: String,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// The person the device signed in as; `None` only before `people-v1`.
+    #[serde(default)]
+    pub person_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -289,7 +294,9 @@ pub struct App {
     pub allow_unsandboxed_render: bool,
     pub http: reqwest::Client,
     pub media_key: Vec<u8>,
-    pub events: broadcast::Sender<Event>,
+    /// Events with their audience; each socket sends what its principal may see
+    /// (`Audience::allows`).
+    pub events: broadcast::Sender<Emitted>,
     /// Device ids revoked; open sockets for them close.
     pub revocations: broadcast::Sender<Id>,
     pub shutdown: watch::Receiver<bool>,
@@ -352,42 +359,189 @@ pub struct App {
     /// HTTP answers with a 5xx status since start (`server::log_requests`), for the
     /// alert job's `http_5xx` count.
     pub http_errors: AtomicU64,
+    /// Each person's expanded read set, cleared whole after any person, group,
+    /// membership or agent write (`groups::Expansions::invalidate_all`).
+    pub expansions: crate::groups::Expansions,
+    /// Where groups and memberships come from: `access::Manual` in L1 (L6 adds GitHub
+    /// organisations).
+    pub access_sources: Vec<Arc<dyn crate::access::AccessSource>>,
+}
+
+/// Who may receive an event (`docs/l1-brief.md` D8). The wire `Event` carries none of
+/// this; `events::serve` filters on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Audience {
+    /// Everyone signed in: `Hello`, `SettingsChanged`, `EmbeddingModelChanged`,
+    /// `PersonChanged`, `GroupChanged`, `GroupDeleted`, `MembershipChanged` (a directory,
+    /// no content).
+    Everyone,
+    /// Organisation admins (and the owner).
+    Admins,
+    /// One person (by person id), on every device.
+    Person(Id),
+    /// One person, and the admins.
+    PersonOrAdmins(Id),
+    /// Whoever's expanded read set meets these paths (a row's `access`).
+    Paths(Vec<String>),
+}
+
+impl Audience {
+    pub fn allows(&self, p: &Principal) -> bool {
+        match self {
+            Audience::Everyone => true,
+            Audience::Admins => p.org_role.is_admin(),
+            Audience::Person(id) => &p.person_id == id,
+            Audience::PersonOrAdmins(id) => &p.person_id == id || p.org_role.is_admin(),
+            Audience::Paths(paths) => paths.iter().any(|path| p.paths.contains(path)),
+        }
+    }
+}
+
+/// An event on its way to the sockets.
+#[derive(Debug, Clone)]
+pub struct Emitted {
+    pub audience: Audience,
+    pub event: Event,
+}
+
+impl Emitted {
+    /// A row's event, to whoever may read the row (its effective access).
+    pub fn row(row: &impl Owned, event: Event) -> Self {
+        Self {
+            audience: Audience::Paths(row.audience()),
+            event,
+        }
+    }
+
+    /// An event for whoever may read rows with `access`. An empty `access` reaches
+    /// nobody (fails closed).
+    pub fn paths(access: &[String], event: Event) -> Self {
+        Self {
+            audience: Audience::Paths(access.to_vec()),
+            event,
+        }
+    }
+}
+
+/// Where `App::emit` sends an event that isn't a directory event (a mistake: logged).
+/// Device and invitation events go to the admins, who may see them anyway; anything
+/// else may carry someone's content (owner Q3: admins don't read it) and reaches
+/// nobody.
+pub fn fallback_audience(event: &Event) -> Audience {
+    match event {
+        Event::DeviceChanged { .. }
+        | Event::DeviceDeleted { .. }
+        | Event::InvitationChanged { .. }
+        | Event::InvitationDeleted { .. }
+        | Event::AgentChanged { .. }
+        | Event::AgentDeleted { .. } => Audience::Admins,
+        Event::AccessChanged { person_id } => Audience::Person(person_id.clone()),
+        _ => Audience::Paths(Vec::new()),
+    }
+}
+
+/// Whether `event` goes to everyone signed in through `App::emit`: the directory
+/// events, which carry no content (D8). Every other event names its audience.
+pub fn is_directory_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Hello { .. }
+            | Event::SettingsChanged { .. }
+            | Event::EmbeddingModelChanged { .. }
+            | Event::PersonChanged { .. }
+            | Event::GroupChanged { .. }
+            | Event::GroupDeleted { .. }
+            | Event::MembershipChanged { .. }
+    )
 }
 
 impl App {
-    pub fn emit(&self, event: Event) {
+    /// An event for `audience`.
+    pub fn emit_to(&self, audience: Audience, event: Event) {
         // No receivers is fine: nobody is connected.
-        let _ = self.events.send(event);
+        let _ = self.events.send(Emitted { audience, event });
+    }
+
+    /// An event for everyone: only the directory events (`is_directory_event`). Any
+    /// other event sent this way fails closed (`fallback_audience`) and the service
+    /// logs the mistake, so an emit site that forgot its audience never reaches every
+    /// member.
+    pub fn emit(&self, event: Event) {
+        if is_directory_event(&event) {
+            self.emit_to(Audience::Everyone, event);
+        } else {
+            tracing::error!(
+                ?event,
+                "an event was emitted without an audience; sent to its fallback audience"
+            );
+            self.emit_to(fallback_audience(&event), event);
+        }
+    }
+
+    /// A row's event, to whoever may read the row (`access` must not be empty; empty
+    /// reaches nobody).
+    pub fn emit_row(&self, access: &[String], event: Event) {
+        debug_assert!(!access.is_empty(), "a row's access is never empty");
+        let e = Emitted::paths(access, event);
+        self.emit_to(e.audience, e.event);
+    }
+
+    /// `row`'s event, to whoever may read it (`Owned::audience`).
+    pub fn emit_owned(&self, row: &impl Owned, event: Event) {
+        self.emit_to(Audience::Paths(row.audience()), event);
+    }
+
+    /// Events collected under the write lock, each with its audience.
+    pub fn emit_all(&self, events: impl IntoIterator<Item = Emitted>) {
+        for e in events {
+            self.emit_to(e.audience, e.event);
+        }
     }
 
     pub fn emit_topic(&self, topic: &Topic) {
-        self.emit(Event::TopicChanged {
-            topic: topic.clone(),
-        });
+        self.emit_owned(
+            topic,
+            Event::TopicChanged {
+                topic: topic.clone(),
+            },
+        );
     }
 
     pub fn emit_lesson(&self, lesson: &Lesson) {
-        self.emit(Event::LessonChanged {
-            lesson: self.public_lesson(lesson),
-        });
+        self.emit_owned(
+            lesson,
+            Event::LessonChanged {
+                lesson: self.public_lesson(lesson),
+            },
+        );
     }
 
     pub fn emit_proposal(&self, proposal: &Proposal) {
-        self.emit(Event::ProposalChanged {
-            proposal: proposal.clone(),
-        });
+        self.emit_owned(
+            proposal,
+            Event::ProposalChanged {
+                proposal: proposal.clone(),
+            },
+        );
     }
 
-    pub fn emit_video(&self, video: &StoredVideo) {
-        self.emit(Event::VideoChanged {
-            video: self.public_video(video),
-        });
+    /// A video's event goes to whoever may read its lesson.
+    pub fn emit_video(&self, video: &StoredVideo, lesson: &Lesson) {
+        self.emit_owned(
+            lesson,
+            Event::VideoChanged {
+                video: self.public_video(video),
+            },
+        );
     }
 
     pub fn emit_source(&self, source: &Source) {
-        self.emit(Event::SourceChanged {
-            source: self.public_source(source),
-        });
+        self.emit_owned(
+            source,
+            Event::SourceChanged {
+                source: self.public_source(source),
+            },
+        );
     }
 
     pub fn video_dir(&self, video_id: &str) -> PathBuf {
@@ -685,6 +839,252 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ownership and access (L1, `docs/l1-brief.md` D6)
+// ---------------------------------------------------------------------------
+
+/// A library row with an owner and an audience: `topic`, `lesson`, `note`, `chat`,
+/// `source`, `workspace`, `proposal`.
+pub trait Owned {
+    /// The person whose row it is; `None` only before `people-v1`.
+    fn owner(&self) -> Option<&str>;
+    /// Who may read it, as stored.
+    fn access(&self) -> &[String];
+    /// Who is refused even when `access` admits them (evaluated from L2).
+    fn deny(&self) -> &[String];
+    /// Who may read it: `access`, or, read empty, private to its owner (defence in
+    /// depth: L1 never writes an empty one). A row from before `people-v1` (no owner) is
+    /// the bootstrap owner's, the only person there can be then.
+    fn audience(&self) -> Vec<String> {
+        effective_access(self.owner(), self.access())
+    }
+    /// The owner, the bootstrap owner for a row from before `people-v1`.
+    fn owner_id(&self) -> &str {
+        self.owner().unwrap_or(BOOTSTRAP_PERSON_ID)
+    }
+}
+
+macro_rules! owned {
+    ($($t:ty),*) => {$(
+        impl Owned for $t {
+            fn owner(&self) -> Option<&str> {
+                self.owner.as_deref()
+            }
+            fn access(&self) -> &[String] {
+                &self.access
+            }
+            fn deny(&self) -> &[String] {
+                &self.deny
+            }
+        }
+    )*};
+}
+owned!(
+    Topic,
+    Lesson,
+    Note,
+    Proposal,
+    Source,
+    margin_shared::Chat,
+    margin_shared::Workspace
+);
+
+impl Owned for StoredLesson {
+    fn owner(&self) -> Option<&str> {
+        self.lesson.owner()
+    }
+    fn access(&self) -> &[String] {
+        self.lesson.access()
+    }
+    fn deny(&self) -> &[String] {
+        self.lesson.deny()
+    }
+}
+
+impl Owned for StoredNote {
+    fn owner(&self) -> Option<&str> {
+        self.note.owner()
+    }
+    fn access(&self) -> &[String] {
+        self.note.access()
+    }
+    fn deny(&self) -> &[String] {
+        self.note.deny()
+    }
+}
+
+/// `access`, or `[person/<owner>]` when it is empty (see `Owned::audience`).
+pub fn effective_access(owner: Option<&str>, access: &[String]) -> Vec<String> {
+    if access.is_empty() {
+        vec![person_id(owner.unwrap_or(BOOTSTRAP_PERSON_ID))]
+    } else {
+        access.to_vec()
+    }
+}
+
+/// What a new row is stamped with (D6): its owner, who may read it, who is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ownership {
+    pub owner: Id,
+    pub access: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Ownership {
+    /// A new row of `p`'s, private to its person: an agent's rows belong to its owner.
+    pub fn private(p: &Principal) -> Self {
+        Self::private_to(&p.person_id)
+    }
+
+    /// A new row private to `person`.
+    pub fn private_to(person: &str) -> Self {
+        Self {
+            owner: person.to_string(),
+            access: vec![person_id(person)],
+            deny: Vec::new(),
+        }
+    }
+
+    /// A row filed under `parent` (a lesson, note or source under a topic, a source in
+    /// a folder): the parent's owner, access and deny, so the parent is the unit of
+    /// audience.
+    pub fn of(parent: &(impl Owned + ?Sized)) -> Self {
+        Self {
+            owner: parent.owner_id().to_string(),
+            access: parent.audience(),
+            deny: parent.deny().to_vec(),
+        }
+    }
+}
+
+/// Whether `p` may read `row` (its audience meets `p`'s expanded paths). `deny` is
+/// written and read back but not evaluated until L2.
+pub fn can_read(p: &Principal, row: &(impl Owned + ?Sized)) -> bool {
+    row.audience().iter().any(|a| p.paths.contains(a))
+}
+
+/// `row` when `p` may read it, else 404 `what` (never 403: a row outside the caller's
+/// access doesn't exist for them).
+pub fn readable<T: Owned>(p: &Principal, row: Option<T>, what: &str) -> AppResult<T> {
+    match row {
+        Some(r) if can_read(p, &r) => Ok(r),
+        _ => Err(AppError::not_found(what)),
+    }
+}
+
+/// 403 `not_owner` unless `p`'s person owns `row`. Admins are not exempt (owner Q3).
+pub fn check_owner(p: &Principal, row: &(impl Owned + ?Sized)) -> AppResult<()> {
+    if row.owner_id() == p.person_id {
+        Ok(())
+    } else {
+        Err(not_owner())
+    }
+}
+
+pub fn not_owner() -> AppError {
+    AppError::new(
+        StatusCode::FORBIDDEN,
+        margin_shared::access_code::NOT_OWNER,
+        "Only its owner can change this.",
+    )
+}
+
+/// The SurrealQL condition a list query adds for the principal (`access_binds`): rows
+/// whose `access` meets `$paths` (the `<table>_access` indexes), and rows read with an
+/// empty `access` that are the caller's own (`Owned::audience`). `can_read` is applied
+/// to the result as well.
+pub const ACCESS_WHERE: &str = "(doc.access CONTAINSANY $paths \
+     OR (array::len(doc.access ?? []) = 0 AND (doc.owner ?? $bootstrap) = $person))";
+
+/// The parameters `ACCESS_WHERE` reads.
+pub fn access_binds(p: &Principal) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("paths", serde_json::json!(p.paths)),
+        ("person", serde_json::json!(p.person_id)),
+        ("bootstrap", serde_json::json!(BOOTSTRAP_PERSON_ID)),
+    ]
+}
+
+/// Every row of `table` `p` may read. `table` is one of `db`'s constants.
+pub async fn list_visible<T: DeserializeOwned + Owned>(
+    store: &Store,
+    table: &'static str,
+    p: &Principal,
+) -> anyhow::Result<Vec<T>> {
+    let sql = format!("SELECT VALUE doc FROM {table} WHERE {ACCESS_WHERE}");
+    let mut rows: Vec<T> = store.query_rows(&sql, access_binds(p)).await?;
+    rows.retain(|r| can_read(p, r));
+    Ok(rows)
+}
+
+/// The principal of `person` acting for themself (a chat's owner while their turn runs,
+/// a job writing their rows): their stored person and expansion. The bootstrap owner
+/// (before `people-v1`) has no row.
+pub async fn person_principal(state: &AppState, person: &str) -> AppResult<Arc<Principal>> {
+    let row: Option<crate::people::PersonRow> = state.store.get(db::PERSON, person).await?;
+    let person_row = match row {
+        Some(r) => r.person,
+        None if person == BOOTSTRAP_PERSON_ID => {
+            let login = state.config.allowed_github_login.clone();
+            margin_shared::Person {
+                id: BOOTSTRAP_PERSON_ID.into(),
+                handle: margin_shared::handle_for_login(&login),
+                name: login.clone(),
+                github_login: login,
+                github_id: None,
+                avatar_url: None,
+                org_role: margin_shared::OrgRole::Owner,
+                state: margin_shared::PersonState::Active,
+                groups: Vec::new(),
+                settings: margin_shared::PersonSettings::default(),
+                created_at: Utc::now(),
+            }
+        }
+        None => return Err(AppError::not_found("person")),
+    };
+    let expansion = crate::groups::expansion(state, person).await?;
+    Ok(Arc::new(Principal {
+        kind: PrincipalKind::Person,
+        person_id: person.to_string(),
+        id: person_id(person),
+        paths: expansion.paths.clone(),
+        deny_ids: expansion.deny_ids.clone(),
+        org_role: expansion.org_role,
+        device: None,
+        person: person_row,
+    }))
+}
+
+/// A person principal for unit tests: `person` with `role`, reading `company` and their
+/// own `person/<id>`.
+#[cfg(test)]
+pub(crate) fn test_principal(person: &str, role: margin_shared::OrgRole) -> Principal {
+    let mut paths = vec![margin_shared::ROOT_GROUP.to_string(), person_id(person)];
+    paths.sort();
+    Principal {
+        kind: PrincipalKind::Person,
+        person_id: person.to_string(),
+        id: person_id(person),
+        deny_ids: paths.clone(),
+        paths,
+        org_role: role,
+        device: None,
+        person: margin_shared::Person {
+            id: person.into(),
+            handle: person.into(),
+            name: person.into(),
+            github_login: person.into(),
+            github_id: None,
+            avatar_url: None,
+            org_role: role,
+            state: margin_shared::PersonState::Active,
+            groups: Vec::new(),
+            settings: margin_shared::PersonSettings::default(),
+            created_at: Utc::now(),
+        },
+    }
+}
+
 /// 32 random bytes, base64url without padding.
 pub fn random_token() -> String {
     use base64::Engine;
@@ -701,4 +1101,66 @@ pub fn sha256_hex(text: &str) -> String {
 
 pub fn new_id() -> Id {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    use margin_shared::OrgRole;
+
+    fn topic(owner: Option<&str>, access: &[&str]) -> Topic {
+        Topic {
+            id: "t".into(),
+            parent_id: None,
+            title: "T".into(),
+            position: 0,
+            owner: owner.map(Into::into),
+            access: access.iter().map(|a| a.to_string()).collect(),
+            deny: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn rows_are_private_to_their_owner_unless_shared() {
+        let alice = test_principal("alice", OrgRole::Owner);
+        let bob = test_principal("bob", OrgRole::Member);
+        let mine = topic(Some("alice"), &["person/alice"]);
+        assert!(can_read(&alice, &mine) && !can_read(&bob, &mine));
+        assert!(check_owner(&alice, &mine).is_ok());
+        assert_eq!(check_owner(&bob, &mine).unwrap_err().code, "not_owner");
+        // Read empty: private to the owner (defence in depth).
+        let empty = topic(Some("alice"), &[]);
+        assert_eq!(empty.audience(), ["person/alice"]);
+        assert!(!can_read(&bob, &empty));
+        // From before `people-v1`: the bootstrap owner's.
+        let legacy = topic(None, &[]);
+        let boot = test_principal(BOOTSTRAP_PERSON_ID, OrgRole::Owner);
+        assert!(can_read(&boot, &legacy) && !can_read(&alice, &legacy));
+        // Shared with the company: everyone reads it, only its owner changes it.
+        let shared = topic(Some("alice"), &["company"]);
+        assert!(can_read(&bob, &shared) && check_owner(&bob, &shared).is_err());
+        // A row filed under it copies its owner and access.
+        let own = Ownership::of(&shared);
+        assert_eq!(own.owner, "alice");
+        assert_eq!(own.access, ["company"]);
+        assert_eq!(Ownership::private(&bob).access, ["person/bob"]);
+    }
+
+    #[test]
+    fn only_directory_events_go_to_everyone() {
+        assert!(is_directory_event(&Event::GroupDeleted {
+            path: "company/x".into()
+        }));
+        let note = Event::NoteDeleted { id: "n".into() };
+        assert!(!is_directory_event(&note));
+        // Content without an audience reaches nobody; device events the admins.
+        assert_eq!(fallback_audience(&note), Audience::Paths(Vec::new()));
+        assert_eq!(
+            fallback_audience(&Event::DeviceDeleted { id: "d".into() }),
+            Audience::Admins
+        );
+        assert!(!Audience::Paths(Vec::new()).allows(&test_principal("a", OrgRole::Owner)));
+    }
 }

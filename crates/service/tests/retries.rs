@@ -210,8 +210,13 @@ async fn new_lesson(h: &Harness, t: &str) -> Lesson {
         .json()
         .await
         .unwrap();
+    let owner = margin_service::principal::principal_for_device_token(&h.state, t)
+        .await
+        .unwrap()
+        .expect("the owner's device token");
     append_lesson(
         &h.state,
+        &owner,
         NewLesson {
             topic_id: topic.id,
             title: "Coefficients".into(),
@@ -267,10 +272,13 @@ async fn model_calls(h: &Harness, t: &str, trace_id: &str, n: usize) -> Vec<Trac
 }
 
 /// The bodies the lesson was shown with, in order (`LessonChanged`).
-fn shown_bodies(events: &mut tokio::sync::broadcast::Receiver<Event>, id: &str) -> Vec<String> {
+fn shown_bodies(
+    events: &mut tokio::sync::broadcast::Receiver<margin_service::state::Emitted>,
+    id: &str,
+) -> Vec<String> {
     let mut bodies = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        if let Event::LessonChanged { lesson } = event
+    while let Ok(emitted) = events.try_recv() {
+        if let Event::LessonChanged { lesson } = emitted.event
             && lesson.id == id
         {
             bodies.push(lesson.body_md);

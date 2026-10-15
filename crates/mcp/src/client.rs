@@ -10,7 +10,8 @@ use margin_shared::context::{
     DocumentOutline, Hit,
 };
 use margin_shared::{
-    ApiError, LoginState, PollLoginRequest, StartLogin, StartLoginRequest, routes,
+    AGENT_TOKEN_PREFIX, ApiError, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
+    routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -76,6 +77,42 @@ impl Client {
         }
     }
 
+    /// Whether the client signs in with an `mga_` agent token.
+    pub fn is_agent(&self) -> bool {
+        self.token
+            .as_deref()
+            .is_some_and(|t| t.starts_with(AGENT_TOKEN_PREFIX))
+    }
+
+    async fn json<T: DeserializeOwned>(
+        &self,
+        resp: reqwest::Result<Response>,
+    ) -> anyhow::Result<T> {
+        let resp = checked(resp, self.is_agent()).await?;
+        let bytes = resp.bytes().await.context("Margin's answer was cut off")?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("Margin's answer didn't parse: {e}"))
+    }
+
+    /// `GET routes::ME`: who the token signs in as (a device's person, or an agent and
+    /// its owner).
+    pub async fn me(&self) -> Result<Me, CallError> {
+        let resp = checked(
+            self.send(self.request(Method::GET, routes::ME)).await,
+            self.is_agent(),
+        )
+        .await?;
+        let bytes = resp.bytes().await.map_err(|e| CallError {
+            status: None,
+            code: "unreachable".into(),
+            message: format!("Margin's answer was cut off: {e}"),
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| CallError {
+            status: Some(StatusCode::OK),
+            code: "bad_answer".into(),
+            message: format!("Margin's answer didn't parse: {e}"),
+        })
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         // Names the agent, so the service's trace rows of its searches and reads say
         // `actor: agent:claude-code`, `via: mcp` (the dogfood eval feed).
@@ -94,13 +131,13 @@ impl Client {
         let req = self
             .request(Method::POST, routes::CONTEXT_SEARCH)
             .json(query);
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::context_document_outline(id)`.
     pub async fn outline(&self, document_id: &str) -> anyhow::Result<DocumentOutline> {
         let req = self.request(Method::GET, &routes::context_document_outline(document_id));
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::context_document_passages(id)?from&to` (inclusive `ord`s).
@@ -113,13 +150,13 @@ impl Client {
         let req = self
             .request(Method::GET, &routes::context_document_passages(document_id))
             .query(&[("from", from), ("to", to)]);
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// `POST routes::CONTEXT_INGEST`.
     pub async fn ingest(&self, doc: &ContextIngest) -> anyhow::Result<Document> {
         let req = self.request(Method::POST, routes::CONTEXT_INGEST).json(doc);
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::CONTEXT_CHANGES?since`.
@@ -127,7 +164,7 @@ impl Client {
         let req = self
             .request(Method::GET, routes::CONTEXT_CHANGES)
             .query(&[("since", since), ("limit", limit as u64)]);
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// Every change after `since`, page by page (`CHANGES_PAGE_MAX` at a time), as one.
@@ -161,7 +198,7 @@ impl Client {
         let resp = self
             .send(self.request(Method::DELETE, &context_document(document_id)))
             .await;
-        match checked(resp).await {
+        match checked(resp, self.is_agent()).await {
             Ok(_) => Ok(()),
             Err(e) if e.status == Some(StatusCode::NOT_FOUND) && e.code == "not_found" => Ok(()),
             Err(e) => Err(e.into()),
@@ -175,7 +212,7 @@ impl Client {
             .json(&StartLoginRequest {
                 device_name: device_name.into(),
             });
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 
     /// `POST routes::AUTH_POLL`.
@@ -186,7 +223,7 @@ impl Client {
                 login_id: login.login_id.clone(),
                 poll_secret: login.poll_secret.clone(),
             });
-        json(self.send(req).await).await
+        self.json(self.send(req).await).await
     }
 }
 
@@ -269,7 +306,7 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
-async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError> {
+async fn checked(resp: reqwest::Result<Response>, agent: bool) -> Result<Response, CallError> {
     let resp = resp.map_err(|e| CallError {
         status: None,
         code: "unreachable".into(),
@@ -291,7 +328,14 @@ async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError>
             },
         ),
     };
-    let message = if status == StatusCode::UNAUTHORIZED {
+    let message = if status == StatusCode::UNAUTHORIZED && agent {
+        format!(
+            "{message} (the agent token was revoked or rotated, or the agent or its owner is \
+             disabled: mint a new token in Settings → Organisation → Agents and run \
+             `margin-mcp token <token>`, or `margin-mcp token --forget` to use \
+             `margin-mcp login` instead)"
+        )
+    } else if status == StatusCode::UNAUTHORIZED {
         format!("{message} (sign in again with `margin-mcp login`)")
     } else {
         message
@@ -301,12 +345,6 @@ async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError>
         code,
         message,
     })
-}
-
-async fn json<T: DeserializeOwned>(resp: reqwest::Result<Response>) -> anyhow::Result<T> {
-    let resp = checked(resp).await?;
-    let bytes = resp.bytes().await.context("Margin's answer was cut off")?;
-    serde_json::from_slice(&bytes).map_err(|e| anyhow!("Margin's answer didn't parse: {e}"))
 }
 
 #[cfg(test)]

@@ -62,6 +62,9 @@ pub struct TurnInput {
     pub turn_id: Id,
     /// The device whose message started the turn.
     pub origin_device: DeviceRef,
+    /// Who the turn runs for: `"person/<id>"` or `"agent/<id>"` (`margin_shared::principal`).
+    /// Stamped on trace rows and `Action` items by the service (L1).
+    pub actor: String,
     /// The provider the chat runs on (`Chat.provider`); `deps.model` is its client. The
     /// model is the client's chat slot: nothing here overrides it.
     pub provider: Provider,

@@ -241,6 +241,7 @@ pub async fn run_task<M: ModelClient + margin_ai::TextModel>(
             chat_id: format!("eval-{}", task.id),
             turn_id: "turn".into(),
             origin_device: device,
+            actor: margin_shared::person_id("eval"),
             provider: model.kind(),
             reasoning_effort: ReasoningEffort::Medium,
             history,

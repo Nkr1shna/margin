@@ -409,6 +409,7 @@ mod tests {
     /// A fake service: two documents, the agent's traces, passages by range.
     async fn fake_service() -> String {
         let doc = |id: &str, name: &str, g: u64| Document {
+            owner: None,
             id: id.into(),
             project_id: "p".into(),
             origin: Origin::Agent {

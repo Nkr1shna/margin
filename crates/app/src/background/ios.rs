@@ -228,7 +228,13 @@ fn launched(task: NonNull<BGTask>) {
                 &NSString::from_str(&held.subtitle),
             );
         }
-        held.running = Some(task.clone());
+        // A task launched for an earlier request that `end` didn't see (ended and
+        // started again before the system ran it): completed, never dropped
+        // uncompleted (the system may kill the app for that).
+        if let Some(earlier) = held.running.replace(task.clone()) {
+            // SAFETY: completing the earlier live task once.
+            unsafe { earlier.setTaskCompletedWithSuccess(true) };
+        }
         true
     });
     if keep {

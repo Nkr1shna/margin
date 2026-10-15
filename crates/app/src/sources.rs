@@ -330,7 +330,7 @@ pub enum UploadState {
     Waiting,
     Uploading,
     /// Uploaded; the service's record at upload time (the store has the live one).
-    Done(Source),
+    Done(Box<Source>),
     Failed(String),
 }
 

@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::pipeline::Pipeline;
+use crate::principal::RequireAdmin;
 use crate::secrets::{ANTHROPIC_API_KEY, OPENAI_API_KEY};
 use crate::state::{App, AppState, SETTINGS_ID};
 
@@ -26,8 +27,11 @@ fn check_dimension(name: &str, v: u32) -> AppResult<()> {
     Ok(())
 }
 
+/// `PATCH /api/settings`: organisation admins only (403 `admin_required`); everyone
+/// reads them (`GET`, no secrets in them), so members can pick a configured provider.
 pub async fn patch_settings(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     ApiJson(patch): ApiJson<SettingsPatch>,
 ) -> AppResult<Json<Settings>> {
     {

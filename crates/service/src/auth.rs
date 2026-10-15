@@ -5,11 +5,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 
+use axum::Json;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
-use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
 use margin_shared::{
     Device, Event, Id, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
@@ -18,6 +18,8 @@ use serde::Deserialize;
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::people::{self, Admission};
+use crate::principal::{CurrentPrincipal, PrincipalKind, device_required};
 use crate::secrets::GITHUB_CLIENT_SECRET;
 use crate::state::{AppState, DeviceRow, new_id, random_token, sha256_hex};
 
@@ -42,7 +44,10 @@ pub enum LoginPhase {
     /// The callback is talking to GitHub.
     Exchanging,
     Approved {
+        person_id: Id,
         github_login: String,
+        /// The person's handle, for the sign-in page.
+        handle: String,
     },
     Denied {
         reason: String,
@@ -65,12 +70,14 @@ pub fn purge_expired_logins(state: &AppState) {
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-/// Who a limit counts: the client's IP (sign-in, before there is a device) or the
-/// signed-in device (`docs/agent-contract.md` §7).
+/// Who a limit counts: the client's IP (sign-in, before there is a principal) or the
+/// signed-in principal, a person on any of their devices or an agent
+/// (`docs/agent-contract.md` §7).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Client {
     Ip(IpAddr),
-    Device(String),
+    /// A `PrincipalId` (`person/<id>` or `agent/<id>`).
+    Principal(String),
 }
 
 /// (window start, requests in it) per (route, client).
@@ -133,7 +140,7 @@ pub fn rate_limited(retry_after: StdDuration) -> Response {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum By {
     Ip,
-    Device,
+    Principal,
 }
 
 /// One route's limit (`server::router` puts it on the route through `limit`).
@@ -161,40 +168,41 @@ pub const POLL_LIMIT: Limit = Limit {
     by: By::Ip,
     skip_folder_files: false,
 };
-/// `POST /api/chats/{id}/messages`, per device.
+/// `POST /api/chats/{id}/messages`, per principal.
 pub const MESSAGES_LIMIT: Limit = Limit {
     route: "messages",
     per_minute: 30,
-    by: By::Device,
+    by: By::Principal,
     skip_folder_files: false,
 };
-/// `POST /api/context/search`, per device.
+/// `POST /api/context/search`, per principal.
 pub const CONTEXT_SEARCH_LIMIT: Limit = Limit {
     route: "context-search",
     per_minute: 120,
-    by: By::Device,
+    by: By::Principal,
     skip_folder_files: false,
 };
-/// `POST /api/context/ingest`, per device (`margin-mcp ingest-dir` waits out the
+/// `POST /api/context/ingest`, per principal (`margin-mcp ingest-dir` waits out the
 /// `Retry-After`, so 200 files take under four minutes).
 pub const CONTEXT_INGEST_LIMIT: Limit = Limit {
     route: "context-ingest",
     per_minute: 60,
-    by: By::Device,
+    by: By::Principal,
     skip_folder_files: false,
 };
-/// `POST /api/sources` and `POST /api/source-uploads` together, per device; a folder's
+/// `POST /api/sources` and `POST /api/source-uploads` together, per principal; a folder's
 /// files aren't counted.
 pub const SOURCES_LIMIT: Limit = Limit {
     route: "sources",
     per_minute: 60,
-    by: By::Device,
+    by: By::Principal,
     skip_folder_files: true,
 };
 
 /// Middleware: counts the request against `limit` and answers 429 `rate_limited` with
-/// `Retry-After` over it. A device limit sits inside `require_device` (it reads
-/// `CurrentDevice`).
+/// `Retry-After` over it. A principal limit sits inside `principal::require_principal`
+/// (it reads `CurrentPrincipal`: a person's devices share one window, an agent has
+/// its own).
 pub async fn limit(
     State((state, limit)): State<(AppState, Limit)>,
     req: Request,
@@ -210,8 +218,8 @@ pub async fn limit(
             };
             Client::Ip(client_ip(*peer, req.headers()))
         }
-        By::Device => match req.extensions().get::<CurrentDevice>() {
-            Some(CurrentDevice(device)) => Client::Device(device.id.clone()),
+        By::Principal => match req.extensions().get::<CurrentPrincipal>() {
+            Some(CurrentPrincipal(p)) => Client::Principal(p.id.clone()),
             None => return AppError::unauthorized().into_response(),
         },
     };
@@ -335,8 +343,16 @@ pub async fn poll(
                 }));
             }
             LoginPhase::Collected => return Ok(Json(LoginState::Expired)),
-            LoginPhase::Approved { github_login } => {
-                let out = (github_login.clone(), login.device_name.clone());
+            LoginPhase::Approved {
+                person_id,
+                github_login,
+                ..
+            } => {
+                let out = (
+                    person_id.clone(),
+                    github_login.clone(),
+                    login.device_name.clone(),
+                );
                 login.phase = LoginPhase::Collected;
                 out
             }
@@ -344,9 +360,10 @@ pub async fn poll(
     };
 
     // Mint the device token now, so it is handed out exactly once.
-    let (github_login, device_name) = collected;
+    let (person_id, github_login, device_name) = collected;
     let token = random_token();
     let device = DeviceRow {
+        person_id: Some(person_id),
         id: new_id(),
         name: device_name,
         token_hash: sha256_hex(&token),
@@ -377,7 +394,8 @@ pub struct CallbackQuery {
 }
 
 enum Outcome {
-    SignedIn,
+    /// With the person's handle when it is known.
+    SignedIn(Option<String>),
     Denied(String),
     Expired,
     InProgress,
@@ -414,10 +432,13 @@ pub async fn github_callback(
 ) -> Response {
     let outcome = callback_outcome(&state, q).await;
     let (status, title, body) = match outcome {
-        Outcome::SignedIn => (
+        Outcome::SignedIn(handle) => (
             StatusCode::OK,
             "Signed in",
-            "Signed in to Margin. You can return to the app.".to_string(),
+            match handle {
+                Some(h) => format!("Signed in to Margin as @{h}. You can return to the app."),
+                None => "Signed in to Margin. You can return to the app.".to_string(),
+            },
         ),
         Outcome::Denied(reason) => (StatusCode::FORBIDDEN, "Sign-in denied", reason),
         Outcome::Expired => (
@@ -486,22 +507,30 @@ async fn callback_outcome(state: &AppState, q: CallbackQuery) -> Outcome {
         (None, Some(code)) => github_login_for_code(state, &code).await,
     };
     let phase = match result {
-        Ok(login) if login.eq_ignore_ascii_case(&state.config.allowed_github_login) => {
-            tracing::info!("GitHub sign-in approved");
-            LoginPhase::Approved {
-                github_login: login,
+        Ok(user) => match people::admit(state, &user.login, user.id).await {
+            Ok(Admission::Person(person) | Admission::Invited(person)) => {
+                tracing::info!(person = %person.id, "GitHub sign-in approved");
+                LoginPhase::Approved {
+                    person_id: person.id,
+                    github_login: user.login,
+                    handle: person.handle,
+                }
             }
-        }
-        Ok(login) => {
-            tracing::warn!("GitHub sign-in denied for a login that isn't allowed");
-            LoginPhase::Denied {
-                reason: format!("The GitHub account @{login} isn't allowed to use this Margin."),
+            Ok(Admission::Denied(reason)) => {
+                tracing::warn!("GitHub sign-in denied");
+                LoginPhase::Denied { reason }
             }
-        }
+            Err(e) => {
+                tracing::error!("couldn't admit a GitHub sign-in: {}", e.message);
+                LoginPhase::Denied {
+                    reason: "The service couldn't check who may sign in. Try again.".into(),
+                }
+            }
+        },
         Err(reason) => LoginPhase::Denied { reason },
     };
     let outcome = match &phase {
-        LoginPhase::Approved { .. } => Outcome::SignedIn,
+        LoginPhase::Approved { handle, .. } => Outcome::SignedIn(Some(handle.clone())),
         LoginPhase::Denied { reason } => Outcome::Denied(reason.clone()),
         _ => Outcome::Expired,
     };
@@ -518,13 +547,16 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// Who signed in, as GitHub's `/user` says.
+#[derive(Debug, Deserialize)]
 struct GithubUser {
     login: String,
+    /// GitHub's numeric id: stays with the account when its login is renamed.
+    id: u64,
 }
 
 /// Exchanges the OAuth code and asks GitHub who signed in. Errors are user-facing text.
-async fn github_login_for_code(state: &AppState, code: &str) -> Result<String, String> {
+async fn github_login_for_code(state: &AppState, code: &str) -> Result<GithubUser, String> {
     let config = &state.config;
     let secret = match state.secret_get(GITHUB_CLIENT_SECRET).await {
         Ok(Some(s)) => s,
@@ -604,7 +636,7 @@ async fn github_login_for_code(state: &AppState, code: &str) -> Result<String, S
         .json()
         .await
         .map_err(|_| "GitHub's answer couldn't be read. Try again.".to_string())?;
-    Ok(user.login)
+    Ok(user)
 }
 
 fn escape_html(s: &str) -> String {
@@ -638,37 +670,12 @@ fn page(title: &str, message: &str) -> String {
 // Bearer guard for /api
 // ---------------------------------------------------------------------------
 
-/// The device making an `/api` request.
-#[derive(Clone)]
-pub struct CurrentDevice(pub DeviceRow);
+/// The calling device, as `principal::CurrentDevice` extracts it from the principal.
+pub use crate::principal::CurrentDevice;
 
-pub async fn require_device(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        })
-        .map(|t| t.trim().to_string());
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return AppError::unauthorized().into_response();
-    };
-    let device = match device_for_token(&state, &token).await {
-        Ok(Some(d)) => d,
-        Ok(None) => return AppError::unauthorized().into_response(),
-        Err(e) => return e.into_response(),
-    };
-    req.extensions_mut().insert(CurrentDevice(device));
-    next.run(req).await
-}
-
-async fn device_for_token(state: &AppState, token: &str) -> AppResult<Option<DeviceRow>> {
+/// The device a device token belongs to (touching `last_seen_at` at most every
+/// `LAST_SEEN_INTERVAL_SECONDS`); `principal::require_principal` builds on it.
+pub async fn device_for_token(state: &AppState, token: &str) -> AppResult<Option<DeviceRow>> {
     let hash = sha256_hex(token);
     let found: Vec<DeviceRow> = state
         .store
@@ -704,24 +711,67 @@ pub fn to_device(row: &DeviceRow, current_id: &str, online: bool) -> Device {
         last_seen_at: row.last_seen_at,
         current: row.id == current_id,
         online,
+        person_id: row.person_id.clone(),
     }
 }
 
+/// `GET /api/me`: the person (with groups and their own settings) and the device; for
+/// an agent token the agent and its owner (without settings), no device.
 pub async fn me(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
-) -> Json<Me> {
-    Json(Me {
-        github_login: device.github_login.clone(),
-        device: to_device(&device, &device.id, state.devices.is_online(&device.id)),
-    })
+    CurrentPrincipal(p): CurrentPrincipal,
+) -> AppResult<Json<Me>> {
+    let row = people::person_row(&state, &p.person_id).await?;
+    match &p.kind {
+        PrincipalKind::Person => {
+            let device = p.device.as_ref().ok_or_else(device_required)?;
+            let person = match &row {
+                Some(row) => people::public_person(&state, row, true).await?,
+                // Only before `people-v1`: the synthesised bootstrap owner.
+                None => p.person.clone(),
+            };
+            Ok(Json(Me {
+                github_login: device.github_login.clone(),
+                device: Some(to_device(
+                    device,
+                    &device.id,
+                    state.devices.is_online(&device.id),
+                )),
+                person: Some(person),
+                agent: None,
+            }))
+        }
+        PrincipalKind::Agent { .. } => {
+            let row = row.ok_or_else(AppError::unauthorized)?;
+            // The stored token info already holds only its prefix, never the token.
+            let agent = crate::agents::agent_of(&state, &p)
+                .await?
+                .ok_or_else(AppError::unauthorized)?;
+            Ok(Json(Me {
+                github_login: row.person.github_login.clone(),
+                device: None,
+                person: Some(people::public_person(&state, &row, false).await?),
+                agent: Some(agent),
+            }))
+        }
+    }
 }
 
+/// `GET /api/devices`: the caller's devices; an admin's call lists everyone's (each with
+/// `person_id`, so the app can group them).
 pub async fn list_devices(
     State(state): State<AppState>,
-    Extension(CurrentDevice(me)): Extension<CurrentDevice>,
+    CurrentPrincipal(p): CurrentPrincipal,
+    CurrentDevice(me): CurrentDevice,
 ) -> AppResult<Json<Vec<Device>>> {
-    let mut rows: Vec<DeviceRow> = state.store.list(db::DEVICE).await?;
+    let mut rows: Vec<DeviceRow> = if p.is_admin() {
+        state.store.list(db::DEVICE).await?
+    } else {
+        state
+            .store
+            .list_where(db::DEVICE, "person_id", &p.person_id)
+            .await?
+    };
     rows.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -734,29 +784,64 @@ pub async fn list_devices(
     ))
 }
 
+/// `DELETE /api/devices/{id}`: the caller's own device, or any device for an admin
+/// (404 otherwise, so the id isn't confirmed to exist).
 pub async fn revoke_device(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
-    {
+    let row = {
         let _w = state.write_lock.lock().await;
-        if state
-            .store
-            .get::<DeviceRow>(db::DEVICE, &id)
-            .await?
-            .is_none()
-        {
-            return Err(AppError::not_found("device"));
-        }
-        state.store.delete(db::DEVICE, &id).await?;
-        // Its folders can't be read any more.
-        crate::workspaces::delete_for_device_locked(&state, &id).await?;
-    }
-    let _ = state.revocations.send(id.clone());
-    state.devices.forget_device(&id);
-    state.emit(Event::DeviceDeleted { id: id.clone() });
-    tracing::info!(device = %id, "device revoked");
+        let row = match state.store.get::<DeviceRow>(db::DEVICE, &id).await? {
+            Some(row) if p.is_admin() || row.person_id.as_deref() == Some(p.person_id.as_str()) => {
+                row
+            }
+            _ => return Err(AppError::not_found("device")),
+        };
+        delete_device_locked(&state, &id).await?;
+        row
+    };
+    after_revoke(&state, &row);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a device and its folders (they can't be read any more). Call under the write
+/// lock, then `after_revoke`.
+async fn delete_device_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
+    state.store.delete(db::DEVICE, id).await?;
+    crate::workspaces::delete_for_device_locked(state, id).await
+}
+
+/// Closes a revoked device's sockets and says it's gone.
+fn after_revoke(state: &AppState, row: &DeviceRow) {
+    let _ = state.revocations.send(row.id.clone());
+    state.devices.forget_device(&row.id);
+    state.emit_to(
+        crate::events::device_audience(row),
+        Event::DeviceDeleted { id: row.id.clone() },
+    );
+    tracing::info!(device = %row.id, "device revoked");
+}
+
+/// Revokes every device of a person (disabling them, D3): sockets close, rows and their
+/// folders go.
+pub async fn revoke_person_devices(state: &AppState, person_id: &str) -> AppResult<()> {
+    let rows = {
+        let _w = state.write_lock.lock().await;
+        let rows: Vec<DeviceRow> = state
+            .store
+            .list_where(db::DEVICE, "person_id", person_id)
+            .await?;
+        for row in &rows {
+            delete_device_locked(state, &row.id).await?;
+        }
+        rows
+    };
+    for row in &rows {
+        after_revoke(state, row);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -800,9 +885,9 @@ mod tests {
     }
 
     #[test]
-    fn device_limits_count_per_device_and_say_when_to_retry() {
+    fn principal_limits_count_per_principal_and_say_when_to_retry() {
         let l = RateLimiter::default();
-        let a = Client::Device("a".into());
+        let a = Client::Principal("person/a".into());
         for _ in 0..30 {
             assert!(l.admit("messages", a.clone(), 30).is_ok());
         }
@@ -811,8 +896,11 @@ mod tests {
             wait > StdDuration::from_secs(50) && wait <= WINDOW,
             "{wait:?}"
         );
-        // Another device, and another route of the same device, have their own windows.
-        assert!(l.admit("messages", Client::Device("b".into()), 30).is_ok());
+        // Another principal, and another route of the same one, have their own windows.
+        assert!(
+            l.admit("messages", Client::Principal("agent/b".into()), 30)
+                .is_ok()
+        );
         assert!(l.admit("context-search", a, 30).is_ok());
         let res = rate_limited(StdDuration::from_millis(1_500));
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);

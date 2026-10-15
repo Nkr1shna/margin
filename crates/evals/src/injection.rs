@@ -573,6 +573,7 @@ pub async fn run_prompt(
             chat_id: format!("eval-injection-{}", prompt.id),
             turn_id: "turn".into(),
             origin_device: device,
+            actor: margin_shared::person_id("eval"),
             provider: contender.chat.kind(),
             reasoning_effort: ReasoningEffort::Medium,
             history,

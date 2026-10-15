@@ -103,8 +103,11 @@ unchanged, runs every `golden/retrieval.jsonl` query over `POST /api/context/sea
 question as a chat turn (step overhead `duration_ms − provider_ms`, cached share from
 step 2, the title's tokens) and asks for a one-lesson course, accepting its outline cut
 to one lesson. It deletes what it made (documents, chat, topics) at the end; the trace
-rows stay. It calls the service's configured models: run it against dev by hand after a
-deploy that touches ingest, retrieval or the loop. Numbers are reported, never gated.
+rows stay. **It calls the service's configured models, not fakes: one real agent turn
+and one real lesson on the provider dev is set up with (their tokens are the cost), and
+its `Scope::Library` searches read the library the token can read.** Run it against dev
+by hand after a deploy that touches ingest, retrieval or the loop (the prod URL is
+refused). Numbers are reported, never gated.
 
 ## Cost per provider
 

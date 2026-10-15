@@ -529,6 +529,9 @@ fn registry(tools: Vec<FakeTool>) -> ToolRegistry {
 
 fn workspace() -> Workspace {
     Workspace {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "w1".into(),
         name: "margin".into(),
         device_id: "mac".into(),
@@ -549,6 +552,7 @@ fn input(history: Vec<Value>) -> TurnInput {
             device_id: "phone".into(),
             name: "iPhone".into(),
         },
+        actor: "person/p1".into(),
         provider: Provider::OpenAi,
         reasoning_effort: ReasoningEffort::High,
         history,

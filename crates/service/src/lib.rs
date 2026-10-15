@@ -2,7 +2,9 @@
 //! GitHub sign-in, background generation jobs, a live event socket and signed media.
 //! See `PLAN.md` ("Service") and `margin_shared::routes`.
 
+pub mod access;
 pub mod agent_tools;
+pub mod agents;
 pub mod alerts;
 pub mod ask;
 pub mod auth;
@@ -16,10 +18,14 @@ pub mod engines;
 pub mod error;
 pub mod events;
 pub mod folders;
+pub mod groups;
 pub mod ingest;
+pub mod invitations;
 pub mod library;
 pub mod media;
+pub mod people;
 pub mod pipeline;
+pub mod principal;
 pub mod providers;
 pub mod restore;
 pub mod retrieval;

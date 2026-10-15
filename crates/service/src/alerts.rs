@@ -536,7 +536,11 @@ pub fn active(state: &AppState) -> Vec<Alert> {
 }
 
 /// `GET routes::ALERTS`: the active alerts and the last rises and clears, newest first.
-pub async fn get_alerts(State(state): State<AppState>) -> AppResult<Json<AlertList>> {
+/// Admins only, like the traces they come from (L1).
+pub async fn get_alerts(
+    State(state): State<AppState>,
+    _admin: crate::principal::RequireAdmin,
+) -> AppResult<Json<AlertList>> {
     let alerts = state.alerts.lock().unwrap_or_else(|e| e.into_inner());
     Ok(Json(AlertList {
         active: alerts.active.clone(),

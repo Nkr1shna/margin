@@ -186,8 +186,12 @@ pub struct Coordinator {
     work: Arc<dyn Work>,
     /// A task was started and hasn't ended.
     running: bool,
-    /// The system refused this stretch of work; not asked again until it ends.
+    /// The system refused this stretch of work; not asked again until it ends or the
+    /// app comes back to the front (a refusal as the owner left: `foreground` lags a
+    /// tick).
     refused: bool,
+    /// The last `Inputs::foreground` seen.
+    in_front: bool,
     /// What the running task last showed.
     shown: Option<Want>,
 }
@@ -198,6 +202,7 @@ impl Coordinator {
             work,
             running: false,
             refused: false,
+            in_front: false,
             shown: None,
         }
     }
@@ -209,13 +214,20 @@ impl Coordinator {
     }
 
     pub fn observe(&mut self, inputs: Inputs) {
-        // In the background with no task running on the system: it expired or the owner
-        // ended it. Phase 4's behaviour applies (the live loop pauses the engine); a new
-        // task starts when the app is in front again and work is still wanted.
-        if self.running && !inputs.foreground && !inputs.continued {
+        // No task running on the system any more: it expired or the owner ended it (in
+        // the system's UI, also while Margin is in front). Phase 4's behaviour applies
+        // (the live loop pauses the engine); a new task starts when the app is in front
+        // and work is still wanted. `start` sets `continued` before it returns, so a
+        // task just started is never taken for one that ended.
+        if self.running && !inputs.continued {
             self.running = false;
             self.shown = None;
         }
+        // Back in front: a refusal from before (as the owner left, say) is asked again.
+        if inputs.foreground && !self.in_front {
+            self.refused = false;
+        }
+        self.in_front = inputs.foreground;
         match inputs.want {
             None => {
                 self.refused = false;
@@ -331,6 +343,9 @@ mod tests {
                 (
                     id.to_string(),
                     Workspace {
+                        access: Vec::new(),
+                        deny: Vec::new(),
+                        owner: None,
                         id: id.to_string(),
                         name: name.to_string(),
                         device_id: "d".into(),
@@ -348,6 +363,9 @@ mod tests {
 
     fn chat(id: &str, state: ChatState, folders: &[&str]) -> Chat {
         Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             title: format!("Chat {id}"),
             title_by: TitleSource::default(),
@@ -569,6 +587,40 @@ mod tests {
         c.observe(inputs(true, false, None));
         c.observe(inputs(true, false, want("Sending “notes”", 1)));
         assert!(matches!(work.take()[0], Call::Start(_)));
+    }
+
+    /// A refusal as the owner leaves (the foreground input lags a tick) is asked again
+    /// when they come back with the work still running.
+    #[test]
+    fn a_refusal_is_retried_when_the_app_comes_back_in_front() {
+        let work = Arc::new(FakeWork::default());
+        *work.refuse.lock().unwrap() = true;
+        let mut c = Coordinator::new(work.clone());
+        c.observe(inputs(true, false, want("Sending “notes”", 1)));
+        *work.refuse.lock().unwrap() = false;
+        c.observe(inputs(false, false, want("Sending “notes”", 2)));
+        assert!(work.take().is_empty());
+        c.observe(inputs(true, false, want("Sending “notes”", 3)));
+        assert!(matches!(work.take()[0], Call::Start(_)));
+        assert!(c.running());
+    }
+
+    /// The owner ends the task from the system's UI while Margin is in front: the
+    /// coordinator notices (no update goes to a task that is gone) and starts a new one
+    /// while the work is still wanted in front.
+    #[test]
+    fn a_task_ended_in_front_is_noticed() {
+        let work = Arc::new(FakeWork::default());
+        let mut c = Coordinator::new(work.clone());
+        c.observe(inputs(true, false, want("Sending “notes”", 1)));
+        c.observe(inputs(true, true, want("Sending “notes”", 2)));
+        work.take();
+        // Ended on the system (`set_continued(false)`), still in front.
+        c.observe(inputs(true, false, want("Sending “notes”", 3)));
+        let calls = work.take();
+        assert!(matches!(calls[0], Call::Start(_)), "{calls:?}");
+        assert!(!calls.iter().any(|c| matches!(c, Call::End)), "{calls:?}");
+        assert!(c.running());
     }
 
     #[test]

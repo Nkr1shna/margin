@@ -823,6 +823,9 @@ mod data_tests {
 
     fn source(id: &str, ready: bool, workspace: Option<&str>) -> Source {
         Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: None,
             name: format!("{id}.md"),
@@ -847,6 +850,7 @@ mod data_tests {
 
     fn document(id: &str, origin: Origin) -> Document {
         Document {
+            owner: None,
             id: id.into(),
             project_id: "p".into(),
             origin,

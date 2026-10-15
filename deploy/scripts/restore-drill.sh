@@ -68,6 +68,7 @@ chmod 700 "$work"
 trap 'rm -rf "$work"' EXIT
 
 failed=0
+swapped=0
 log() {
   echo "$*"
   echo "$*" >> "$report"
@@ -82,6 +83,11 @@ check() {
   fi
 }
 finish() {
+  if [ "$failed" != 0 ] && [ "$swapped" = 1 ]; then
+    # Dev is on the restored data, maybe stopped: start it, and say how to go back.
+    guest_ssh dev "sudo systemctl start $MARGIN_SERVICE_UNIT.service" || log "dev couldn't be started; start it by hand: sudo systemctl start $MARGIN_SERVICE_UNIT in the guest"
+    log "Dev runs on the restored data. To put its previous data back: stop the service in the guest, mv $dev_dir/data $dev_dir/data.drill-$stamp, mv $dev_dir/data.before-drill-$stamp $dev_dir/data, start the service."
+  fi
   if [ "$failed" = 0 ]; then log "RESULT pass"; else log "RESULT fail"; fi
   echo "Report: $report"
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo '```'; cat "$report"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -128,6 +134,9 @@ guest_ssh dev "sudo systemctl stop $MARGIN_SERVICE_UNIT.service; MARGIN_CONFIG='
 [ -d "$dev_dir/data" ] && mv "$dev_dir/data" "$dev_dir/data.before-drill-$stamp"
 mv "$dev_dir/data.restoring" "$dev_dir/data"
 log "Restored. Dev's previous data is in $dev_dir/data.before-drill-$stamp and the pre-drill backup."
+# From here on dev runs on the restored data: on any failure, start it anyway and say
+# how to put the previous data back.
+swapped=1
 guest_ssh dev "MARGIN_CONFIG='$cfg' '$guest_bin/margin-service' scrub-restored && sudo systemctl start $MARGIN_SERVICE_UNIT.service" \
   || { log "FAIL scrub-restored or start"; failed=1; finish; }
 

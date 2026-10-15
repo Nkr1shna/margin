@@ -219,6 +219,9 @@ mod tests {
             },
             workspaces: vec![(
                 Workspace {
+                    access: Vec::new(),
+                    deny: Vec::new(),
+                    owner: None,
                     id: "w1".into(),
                     name: "margin".into(),
                     device_id: "d2".into(),
@@ -232,6 +235,9 @@ mod tests {
                 false,
             )],
             sources: vec![Source {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: "s1".into(),
                 topic_id: None,
                 name: "notes.pdf".into(),

@@ -52,6 +52,27 @@ the model call sites of `ask.rs`, `tests/{chats,agent_e2e,api,media}.rs` and
 `examples/render_screens.rs`, `assets/`; **P-evals** `crates/evals/**` but the price
 types, and `evals/README.md`.
 
+**L1 (accounts and principals; `docs/l1-brief.md` §3).** Frozen after L1's first commit
+and changed only through the orchestrator: `crates/shared` (all of it), `server.rs` (a
+route an area needs that isn't there is reported), and the seams below. Merge order:
+L1-auth → L1-groups → L1-events → L1-mcp → L1-app.
+
+| Area | Owns (exclusively) |
+|---|---|
+| **L1-auth** | `crates/service/src/{auth,principal,people,invitations}.rs`, `tests/{auth,api}.rs`, `tests/common/mod.rs` |
+| **L1-groups** | `crates/service/src/{groups,agents,access,context_api,trace}.rs`, `tests/{groups,agents}.rs` |
+| **L1-events** | `crates/service/src/{events,state,chats,library,turns,ask,search,sources,uploads,folders,workspaces,agent_tools,ingest,settings,video,embedding}.rs`, `tests/{events,chats,courses,sources,folders,media,r1_e2e,agent_e2e,claude_e2e,providers,routes}.rs` |
+| **L1-mcp** | `crates/mcp/**` |
+| **L1-app** | `crates/app/**` |
+
+Seams: `principal::require_principal` calls `agents::principal_for_token(state, token) ->
+AppResult<Option<Arc<Principal>>>` (stub `Ok(None)`) and `groups::expansion(state,
+person_id) -> AppResult<Arc<Expansion>>` (stub: `[company, person/<id>]` with the stored
+role); L1-auth and L1-groups emit only through `App::{emit, emit_to, emit_row}` and add
+no field to `App` (`expansions`, `access_sources` are there); `Harness::sign_in_as(code,
+device)` and `BOB_CODE` (`bob-dev`) are in `tests/common/mod.rs`. Handlers of the new
+routes are `unimplemented!("L1, <area>")` until their area lands.
+
 `crates/shared` is the contract and is changed only through the orchestrator. It already
 contains everything below; `crates/video` and `crates/embed` are untouched.
 
@@ -66,7 +87,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **2 Courses through the agent** | — | Confirmation parking (`wait_for_decision`), Write/Destructive ordering | Write and Destructive tools, `propose_course` + `accept_proposal`, `decide`, `AcceptProposal.chips`, `Proposal.chat_id` + Action on accept, Q2 provenance; remove `POST /api/ask` and the proposal job | Outline card (the existing outline editor with chips, Create lessons), result cards, confirmation cards (Approve/Deny from any device); remove the old Ask composer and `Api::ask` |
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
 | **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files` (service `Read` tools over the folder's rows and sources) and `sync_folder` (the one device tool); a folder's text is searched with R1's `search` scoped to the workspace | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
-| **5 Hardening** (`docs/phase5-brief.md`) | 5-retry: `Backoff` the one retry policy (`Retry-After` uncapped + 0–1 s jitter), `Retrying<M: TextModel>` for every job call with waits reported through `on_wait` | 5-agent: the normaliser on every tool output in `Turn::record`, injection tests (outputs keep their frame, no URL-taking tool, destructive tools confirm), `TurnSink::compaction` markers, compaction/condense replays across restart and Continue, the condense summary cap | 5-guard: `text::for_model` at every edge (tool outputs, packed passages, device answers, context-API ingests, web titles, stored names and titles) and the injection suite; 5-retry: every `text_model` wrapped, waits shown on lessons/videos/proposals; 5-security: per-device rate limits, no CORS, callback CSP, media `Cache-Control`, the §7 limits pinned; 5-data: `check-data`, `backup`, the schema-version guard, restore drill; 5-ops: alerts from traces (`GET /api/alerts`, journald, `/api/version` counts, webhook), `p95_ms`, `provider_ms`, `margin-eval alerts`/`perf` | 5-ios: `BGContinuedProcessingTask` (iOS 26) while a held folder syncs or a chat reading one runs (`state::active = foreground ‖ continued`, `background::Coordinator`) |
+| **5 Hardening** (`docs/phase5-brief.md`) | 5-retry: `Backoff` the one retry policy (`Retry-After` uncapped + 0–1 s jitter), `Retrying<M: TextModel>` for every job call with waits reported through `on_wait` | 5-agent: the normaliser on every tool output in `Turn::record`, injection tests (outputs keep their frame, no URL-taking tool, destructive tools confirm), `TurnSink::compaction` markers, compaction/condense replays across restart and Continue, the condense summary cap | 5-guard: `text::for_model` at every edge (tool outputs, packed passages, device answers, context-API ingests, web titles, stored names and titles) and the injection suite; 5-retry: every `text_model` wrapped, waits shown on lessons/videos/proposals; 5-security: per-principal rate limits, no CORS, callback CSP, media `Cache-Control`, the §7 limits pinned; 5-data: `check-data`, `backup`, the schema-version guard, restore drill; 5-ops: alerts from traces (`GET /api/alerts`, journald, `/api/version` counts, webhook), `p95_ms`, `provider_ms`, `margin-eval alerts`/`perf` | 5-ios: `BGContinuedProcessingTask` (iOS 26) while a held folder syncs or a chat reading one runs (`state::active = foreground ‖ continued`, `background::Coordinator`) |
 | **Providers** | One seam (`model.rs`: `CallOptions`, `TextModel`, `Provider`, `ModelRequest`, `ModelEvent`); `ResponsesClient` on it (OpenAI, ChatGPT bearer), `ClaudeClient` (Messages API, D2/D12), `list_models` with windows | The loop on neutral `ModelEvent`s, `replay::claude`, Claude tool gating (D5), web rows/cards/citations, pause/pending continuation, window-scaled compaction | `model_for`/`provider_config` per provider with the window cache, three secrets in the service's store, the SIWC flow, chats on their provider, traces per provider (D14) | Settings: default provider and three slots per provider, ChatGPT sign-in, Claude key; New chat provider picker; web card and citations |
 | **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
@@ -160,6 +181,30 @@ R1 shared types: `Settings.pipeline: pipeline::PipelineConfig` and
 sockets); `context.rs`: `Project`, `Document` (with `generation`, `actor`, `access`),
 `Origin`, `Modality`, `Scope`, `ContextQuery` (with the caller's `access`), `Hit`,
 `DocumentOutline`, `ContextIngest`, `ContextChanges`, `TraceRow`, `TraceRollup`.
+
+L1 (`principal.rs`, re-exported at the crate root): `PrincipalId` (`person/<id>`,
+`agent/<id>` or a group path), `person_id`, `agent_id`, `is_group_path` (1–8 segments of
+`[a-z0-9-]{1,40}`, the first `company`), `ancestors`, `is_handle`, `handle_for_login`,
+`ROOT_GROUP`, `AGENT_TOKEN_PREFIX` (`mga_`), `MENTION_RECIPIENTS_MAX` (50, L3),
+`INVITATION_DAYS` (30); `OrgRole { Owner, Admin, Member }`, `PersonState { Invited,
+Active, Disabled }`, `Person { id, github_login, github_id, handle, name, avatar_url,
+org_role, state, groups, settings, created_at }`, `PersonSettings { default_provider,
+reasoning_effort }`, `PersonPatch`, `Group { path, name, source, members, created_at }`,
+`NewGroup`, `GroupPatch`, `AgentKind { Margin, External, Voice }`, `Agent { id, owner_id,
+name, kind, ceiling, disabled, token: Option<AgentTokenInfo>, created_at }`, `NewAgent`,
+`AgentPatch`, `AgentToken { token, agent }`, `Invitation`, `NewInvitation`; the API codes
+`access_code::{ADMIN_REQUIRED, DEVICE_REQUIRED, AGENT_NOT_ALLOWED, NOT_OWNER, OWNER_FIXED,
+OUTSIDE_OWNER, BAD_ACCESS, UNKNOWN_GROUP, HAS_CHILDREN, HAS_MEMBERS, ALREADY_MEMBER,
+ALREADY_INVITED, MANAGED_BY_SOURCE}`. `Topic`, `Lesson`, `Note`, `Chat`, `Source`,
+`Workspace`, `Proposal` gain `owner: Option<Id>`, `access: Vec<String>`, `deny:
+Vec<String>` (all `#[serde(default)]`; read empty, `access` means private to `owner`);
+`Document.owner`; `TraceRow.principal`; `Device.person_id`; `Me { github_login, device:
+Option<Device>, person: Option<Person>, agent: Option<Agent> }` (`device` is `Some` for a
+device token, so the wire is unchanged for today's apps); `Event::{PersonChanged,
+GroupChanged, GroupDeleted, MembershipChanged, AgentChanged, AgentDeleted,
+InvitationChanged, InvitationDeleted, AccessChanged}`; routes `PEOPLE`, `person`,
+`person_groups`, `ME_SETTINGS`, `INVITATIONS`, `invitation`, `GROUPS`, `group`, `AGENTS`,
+`agent`, `agent_token`. `margin_agent::TurnInput.actor` (`person/<id>` or `agent/<id>`).
 
 Title (owner decision): set from the first message, its first line cut to
 `CHAT_TITLE_MAX` (60) characters (`title_by: FirstLine`; the app shows it in placeholder
@@ -581,6 +626,30 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
 → the stored picture, counted against the turn's picture budget. Each output ≤ 16 KB;
 `search_library` keeps its name and runs on the FULLTEXT index.
 
+### L1, what is and isn't enforced (`docs/l1-brief.md` D6)
+
+- **List routes** return the principal's slice: `GET /api/library` with `WHERE doc.access
+  CONTAINSANY $paths` on each table, `GET /api/chats`, `GET /api/workspaces`, `GET
+  /api/workspaces/{id}/files`, `GET /api/search`. `deny` is written and read back; it is
+  not evaluated until L2.
+- **Item routes** answer 404 outside the principal's access; writing (patch/delete) also
+  needs `owner == principal.person_id` (403 `not_owner`); admins are not exempt.
+- **Chat controls:** stop and continue by anyone in the chat's audience; confirm only by
+  the chat's owner.
+- **Settings:** `PATCH /api/settings` admin-only; `GET` for anyone.
+- **Traces:** `GET /api/traces`, `/api/traces/rollup` and `?traces=1` admin-only; every
+  trace row gets `principal`.
+- **Retrieval plumbing, not enforcement:** the agent's `search` and the context API pass
+  the principal's paths; a caller-supplied `access` that isn't a subset is 400
+  `bad_access`.
+
+**Accepted L1 gaps (closed by L2):** agent tools that read a library row by id
+(`get_topic`, `read_note`, `list_sources`, …) still take any id; `read_passage`/
+`document_outline`/`passages` by `document_id` likewise; passages all say `company` so a
+search by B finds A's private note's passages. A second *trusted* person (a tester) is
+fine on L1; a second *untrusted* one is not until L2 ships (plan §8.3 still stands for
+untrusted accounts).
+
 ## 6. Device tool transport
 
 - The events socket registers with `DeviceHub::register` on open (`DeviceChanged` with
@@ -668,7 +737,7 @@ test at its boundary:
 | `GET /api/traces` | paged by the server (500 rows a read) | `trace::PAGE` |
 | Condense summary | 8 000 characters | `routes::CONDENSE_SUMMARY_MAX_CHARS` |
 | Alert job tick | 60 s | `routes::ALERT_TICK_SECS` |
-| Per-device rate limits (5-security) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min together (a folder's files, `?workspace_id=`, aren't counted: a sync sends every file of the folder); 429 `rate_limited` with `Retry-After` in seconds until the minute's window ends (`margin-mcp` waits it out); sign-in per IP: start 10/min, poll 90/min, same answer | `auth::{MESSAGES_LIMIT, CONTEXT_SEARCH_LIMIT, CONTEXT_INGEST_LIMIT, SOURCES_LIMIT, START_LIMIT, POLL_LIMIT}` through `auth::limit` |
+| Per-principal rate limits (5-security; a person's devices share one window, an agent has its own) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min together (a folder's files, `?workspace_id=`, aren't counted: a sync sends every file of the folder); 429 `rate_limited` with `Retry-After` in seconds until the minute's window ends (`margin-mcp` waits it out); sign-in per IP: start 10/min, poll 90/min, same answer | `auth::{MESSAGES_LIMIT, CONTEXT_SEARCH_LIMIT, CONTEXT_INGEST_LIMIT, SOURCES_LIMIT, START_LIMIT, POLL_LIMIT}` through `auth::limit` |
 | Signed media links | 6 h; `Cache-Control: private, max-age=<seconds left on the link>` | `state::MEDIA_URL_TTL_SECONDS`, `media::cache_control` |
 | Sign-in callback page | `Content-Security-Policy: default-src 'none'` (its one stylesheet by hash), `Referrer-Policy: no-referrer`, `no-store`; a replayed callback is refused (410) | `auth::page_csp` |
 | CORS | none: no route sets `Access-Control-*` (native apps and `margin-mcp` only) | — |
@@ -742,3 +811,11 @@ parse; the injection rows load; `budgets.toml` parses; `margin-mcp` waits out a 
 ## 9. Open points for the owner
 
 Listed in the build report; nothing above depends on them being answered differently.
+
+L1 (`docs/l1-brief.md` §8; the owner accepted every recommendation): the bootstrap owner
+is fixed (no ownership transfer in L1); no person switcher (Sign out → sign in); only the
+owner grants or removes the Admin role and invites admins; everyone may list people and
+groups (names and handles, never content); invitations expire after 30 days and can be
+re-sent; traces are admin-only, `?traces=1` included; members see the org AI settings
+read-only with the sentence; `margin-mcp login` (device token) stays beside `margin-mcp
+token` (agent token, the one to use).

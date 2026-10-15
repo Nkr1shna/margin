@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use axum::Extension;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -38,9 +37,9 @@ use margin_shared::{
     SourceStatus, TranscriptSegment, Workspace, folder_file_type, routes,
 };
 
-use crate::auth::CurrentDevice;
 use crate::folders;
-use crate::state::DeviceRow;
+use crate::principal::{CurrentDevice, CurrentPrincipal, Principal};
+use crate::state::{DeviceRow, Emitted, Owned, Ownership, check_owner, readable};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -129,12 +128,18 @@ pub fn is_pending(status: &SourceStatus) -> bool {
     )
 }
 
+/// The source whoever asks (the reading worker, jobs).
 pub async fn source(state: &AppState, id: &str) -> AppResult<Source> {
     state
         .store
         .get(db::SOURCE, id)
         .await?
         .ok_or_else(|| AppError::not_found("source"))
+}
+
+/// The source, when `p` may read it (else 404).
+pub async fn readable_source(state: &AppState, p: &Principal, id: &str) -> AppResult<Source> {
+    readable(p, state.store.get(db::SOURCE, id).await?, "source")
 }
 
 // ---------------------------------------------------------------------------
@@ -168,13 +173,24 @@ pub struct Upload {
     pub workspace: Option<Workspace>,
     #[serde(default)]
     pub modified: Option<DateTime<Utc>>,
+    /// The person uploading (L1): the new source is theirs. `None` on an upload started
+    /// before L1, which was the bootstrap owner's.
+    #[serde(default)]
+    pub owner: Option<Id>,
 }
 
 impl Upload {
-    /// Checks an upload's query; `device` is the device sending it.
-    pub async fn check(state: &AppState, q: UploadQuery, device: &DeviceRow) -> AppResult<Upload> {
+    /// Checks an upload's query; `device` is the device sending it, as `p`. A topic must
+    /// be `p`'s own (404 when `p` can't read it, 403 `not_owner` when it is someone
+    /// else's).
+    pub async fn check(
+        state: &AppState,
+        q: UploadQuery,
+        p: &Principal,
+        device: &DeviceRow,
+    ) -> AppResult<Upload> {
         if let Some(workspace_id) = q.workspace_id.clone() {
-            return Self::check_folder_file(state, &workspace_id, q, device).await;
+            return Self::check_folder_file(state, &workspace_id, q, p, device).await;
         }
         let name: String = q.name.trim().chars().take(500).collect();
         if name.is_empty() {
@@ -192,7 +208,7 @@ impl Upload {
             .map(|f| f.trim().chars().take(500).collect::<String>())
             .filter(|f| !f.is_empty());
         if let Some(topic_id) = &q.topic_id {
-            library::topic(state, topic_id).await?;
+            library::own_topic(state, p, topic_id).await?;
         }
         Ok(Upload {
             name,
@@ -201,6 +217,7 @@ impl Upload {
             kind,
             workspace: None,
             modified: q.modified,
+            owner: Some(p.person_id.clone()),
         })
     }
 
@@ -211,13 +228,14 @@ impl Upload {
         state: &AppState,
         workspace_id: &str,
         q: UploadQuery,
+        p: &Principal,
         device: &DeviceRow,
     ) -> AppResult<Upload> {
-        let workspace: Workspace = state
-            .store
-            .get(db::WORKSPACE, workspace_id)
-            .await?
-            .ok_or_else(|| AppError::not_found("folder"))?;
+        let workspace: Workspace = readable(
+            p,
+            state.store.get(db::WORKSPACE, workspace_id).await?,
+            "folder",
+        )?;
         if workspace.device_id != device.id {
             return Err(AppError::new(
                 StatusCode::FORBIDDEN,
@@ -254,6 +272,7 @@ impl Upload {
             kind: kind.source_kind(),
             workspace: Some(workspace),
             modified: q.modified,
+            owner: Some(p.person_id.clone()),
         })
     }
 
@@ -409,14 +428,15 @@ where
 
 pub async fn upload(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentPrincipal(p): CurrentPrincipal,
+    CurrentDevice(device): CurrentDevice,
     headers: HeaderMap,
     query: Result<Query<UploadQuery>, QueryRejection>,
     body: Body,
 ) -> AppResult<Json<Source>> {
     let Query(q) =
         query.map_err(|rej| AppError::new(rej.status(), "bad_request", rej.body_text()))?;
-    let upload = Upload::check(&state, q, &device).await?;
+    let upload = Upload::check(&state, q, &p, &device).await?;
     // Refused before a byte is read when the size is known up front.
     if content_length(&headers).is_some_and(|n| n > upload.request_limit()) {
         drain(&mut body.into_data_stream()).await;
@@ -509,11 +529,21 @@ async fn create_locked(
     upload: Upload,
     bytes: u64,
 ) -> AppResult<Source> {
-    // The topic may have been deleted while the file was being saved.
-    if let Some(topic_id) = &upload.topic_id {
-        library::topic(state, topic_id).await?;
-    }
+    // The topic may have been deleted while the file was being saved. A topic's source
+    // copies its owner and access; a chat's file is private to the person uploading it.
+    let own = match &upload.topic_id {
+        Some(topic_id) => Ownership::of(&library::topic_row(state, topic_id).await?),
+        None => Ownership::private_to(
+            upload
+                .owner
+                .as_deref()
+                .unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID),
+        ),
+    };
     let source = Source {
+        access: own.access,
+        deny: own.deny,
+        owner: Some(own.owner),
         media_url: None,
         id: id.to_string(),
         topic_id: upload.topic_id,
@@ -610,7 +640,12 @@ async fn replace_locked(
             old
         }
         None => {
+            // A folder's file copies the folder's owner and access.
+            let own = Ownership::of(&ws);
             let source = Source {
+                access: own.access,
+                deny: own.deny,
+                owner: Some(own.owner),
                 media_url: None,
                 id: id.to_string(),
                 topic_id: None,
@@ -637,11 +672,13 @@ async fn replace_locked(
 /// What didn't change keeps its vectors (`ingest`'s diff).
 pub async fn reprocess(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Source>> {
     let source = {
         let _w = state.write_lock.lock().await;
-        let mut s = source(&state, &id).await?;
+        let mut s = readable_source(&state, &p, &id).await?;
+        check_owner(&p, &s)?;
         if is_pending(&s.status) {
             return Err(AppError::conflict(
                 "source_busy",
@@ -662,9 +699,10 @@ pub async fn reprocess(
 /// other kinds and recordings without one.
 pub async fn transcript(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Vec<TranscriptSegment>>> {
-    let source = source(&state, &id).await?;
+    let source = readable_source(&state, &p, &id).await?;
     if !matches!(source.kind, SourceKind::Audio | SourceKind::Video) {
         return Ok(Json(Vec::new()));
     }
@@ -702,25 +740,34 @@ pub async fn transcript(
 
 pub async fn delete_source(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
     let event = {
         let _w = state.write_lock.lock().await;
-        source(&state, &id).await?;
+        let s = readable_source(&state, &p, &id).await?;
+        check_owner(&p, &s)?;
         delete_locked(&state, &id).await?
     };
-    state.emit(event);
+    state.emit_all([event]);
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Deletes a source's passages, document, row and file (an ingest still running for it
-/// stops at its next write). Call with the write lock held; returns the event to emit.
-pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Event> {
+/// stops at its next write). Call with the write lock held; returns the event to emit,
+/// to whoever could read the source.
+pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<Emitted> {
+    let row: Option<Source> = state.store.get(db::SOURCE, id).await?;
     delete_old_rows(state, id).await?;
     ingest::delete_document_locked(state, id).await?;
     state.store.delete(db::SOURCE, id).await?;
     remove_dir(&state.source_dir(id)).await;
-    Ok(Event::SourceDeleted { id: id.to_string() })
+    let event = Event::SourceDeleted { id: id.to_string() };
+    Ok(match row {
+        Some(s) => Emitted::row(&s, event),
+        // Gone already: nobody can be told more than that it is gone.
+        None => Emitted::paths(&[], event),
+    })
 }
 
 /// Whether the `chunk`/`media` tables of a store from before the `passage` table are
@@ -746,14 +793,15 @@ pub(crate) async fn remove_dir(dir: &std::path::Path) {
     }
 }
 
-/// Attaches unattached sources to `topic_id`, and makes their passages searchable from
-/// the topic. Call with the write lock held; returns the events to emit. Sources that no
-/// longer exist or already belong to a topic are left alone.
+/// Attaches unattached sources to `topic`, and makes their passages searchable from the
+/// topic: each takes the topic's access (the topic is the unit of audience). Call with
+/// the write lock held; returns the events to emit. Sources that no longer exist,
+/// already belong to a topic, or aren't the topic owner's are left alone.
 pub async fn attach_locked(
     state: &AppState,
     source_ids: &[Id],
-    topic_id: &str,
-) -> anyhow::Result<Vec<Event>> {
+    topic: &margin_shared::Topic,
+) -> anyhow::Result<Vec<Emitted>> {
     let mut events = Vec::new();
     for id in source_ids {
         let Some(mut source) = state.store.get::<Source>(db::SOURCE, id).await? else {
@@ -763,12 +811,30 @@ pub async fn attach_locked(
         if source.topic_id.is_some() || source.workspace_id.is_some() {
             continue;
         }
-        source.topic_id = Some(topic_id.to_string());
+        if source.owner_id() != topic.owner_id() {
+            continue;
+        }
+        // Whoever could read it before hears that it moved (and is gone from their view
+        // when the topic's audience is narrower).
+        let before = source.audience();
+        let own = Ownership::of(topic);
+        source.topic_id = Some(topic.id.clone());
+        source.access = own.access;
+        source.deny = own.deny;
         state.store.put(db::SOURCE, id, &source).await?;
-        events.push(Event::SourceChanged {
-            source: state.public_source(&source),
-        });
-        events.extend(ingest::add_scope_locked(state, id, topic_id).await?);
+        let mut audience = source.audience();
+        for a in before {
+            if !audience.contains(&a) {
+                audience.push(a);
+            }
+        }
+        events.push(Emitted::paths(
+            &audience,
+            Event::SourceChanged {
+                source: state.public_source(&source),
+            },
+        ));
+        events.extend(ingest::add_scope_locked(state, id, &topic.id).await?);
     }
     Ok(events)
 }
@@ -1284,7 +1350,7 @@ async fn wait_until_read(
         }
         let changed = async {
             loop {
-                match events.recv().await {
+                match events.recv().await.map(|e| e.event) {
                     Ok(Event::SourceChanged { .. } | Event::SourceDeleted { .. })
                     | Err(RecvError::Lagged(_)) => return,
                     Ok(_) => {}

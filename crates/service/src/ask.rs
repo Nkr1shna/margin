@@ -34,8 +34,12 @@ use crate::engines::{JobCalls, JobWait, failed_attempts, ordered_waits, waiting_
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
 use crate::pipeline::Packed;
+use crate::principal::{CurrentPrincipal, Principal};
 use crate::retrieval::{self, QueryPlan};
-use crate::state::{AppState, Author, StoredLesson, new_id};
+use crate::state::{
+    AppState, Author, Emitted, Owned, Ownership, StoredLesson, can_read, check_owner, list_visible,
+    new_id, readable,
+};
 use crate::trace::{self, SpanGuard};
 use crate::{db, sources, video};
 
@@ -43,13 +47,14 @@ pub const MAX_LESSONS: usize = 12;
 /// How often a streaming lesson's partial body is saved.
 const PARTIAL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Every source must exist and be unattached or already in the topic the course is
-/// filed under. Duplicates are dropped.
-async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> {
+/// Every source must exist, be `p`'s to read, and be unattached or already in the topic
+/// the course is filed under. Duplicates are dropped.
+async fn check_sources(state: &AppState, p: &Principal, req: &mut AskRequest) -> AppResult<()> {
     let mut seen = HashSet::new();
     req.source_ids.retain(|id| seen.insert(id.clone()));
     for id in &req.source_ids {
-        let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
+        let source = state.store.get::<Source>(db::SOURCE, id).await?;
+        let Some(source) = source.filter(|s| can_read(p, s)) else {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 "unknown_source",
@@ -92,11 +97,12 @@ async fn check_sources(state: &AppState, req: &mut AskRequest) -> AppResult<()> 
 /// so only the newest outline in a chat can create a course.
 pub async fn propose(
     state: &AppState,
+    p: &Principal,
     chat_id: &str,
     request: AskRequest,
     outline: Outline,
 ) -> AppResult<Proposal> {
-    propose_planned(state, chat_id, request, outline, None, None).await
+    propose_planned(state, p, chat_id, request, outline, None, None).await
 }
 
 /// `propose`, surveying the sources and running the outline planner first when
@@ -106,6 +112,7 @@ pub async fn propose(
 /// id.
 pub async fn propose_planned(
     state: &AppState,
+    p: &Principal,
     chat_id: &str,
     mut request: AskRequest,
     outline: Outline,
@@ -119,14 +126,14 @@ pub async fn propose_planned(
     let outline = validate_outline(&outline)?;
     match &request.parent_topic_id {
         Some(parent) => {
-            library::topic(state, parent).await?;
+            library::own_topic(state, p, parent).await?;
         }
         None if outline.subject_title.is_empty() => {
             return Err(AppError::bad_request("Give the subject a title."));
         }
         None => {}
     }
-    check_sources(state, &mut request).await?;
+    check_sources(state, p, &mut request).await?;
     let mut outline = outline;
     let workspaces = match state.store.get::<Chat>(db::CHAT, chat_id).await? {
         Some(chat) => chat.workspace_ids,
@@ -149,7 +156,12 @@ pub async fn propose_planned(
         }
     }
     request.lesson_count = outline.lessons.len() as u32;
+    // The proposal is `p`'s, private to them, like the chat it was made in (D6).
+    let own = Ownership::private(p);
     let proposal = Proposal {
+        access: own.access,
+        deny: own.deny,
+        owner: Some(own.owner),
         id: new_id(),
         request,
         status: ProposalStatus::Ready,
@@ -188,14 +200,11 @@ pub async fn propose_planned(
 
 pub async fn get_proposal(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Proposal>> {
-    let p = state
-        .store
-        .get(db::PROPOSAL, &id)
-        .await?
-        .ok_or_else(|| AppError::not_found("proposal"))?;
-    Ok(Json(p))
+    let proposal: Proposal = readable(&p, state.store.get(db::PROPOSAL, &id).await?, "proposal")?;
+    Ok(Json(proposal))
 }
 
 pub fn validate_outline(outline: &Outline) -> AppResult<Outline> {
@@ -232,10 +241,11 @@ pub fn validate_outline(outline: &Outline) -> AppResult<Outline> {
 /// so the agent knows the course exists.
 pub async fn accept(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
     ApiJson(req): ApiJson<AcceptProposal>,
 ) -> AppResult<Json<Topic>> {
-    let (topic, proposal) = accept_proposal(&state, &id, req).await?;
+    let (topic, proposal) = accept_proposal(&state, &p, &id, req).await?;
     if let Some(chat_id) = &proposal.chat_id {
         let lessons = proposal.outline.as_ref().map_or(0, |o| o.lessons.len());
         if let Err(e) = record_course_created(&state, chat_id, &topic, lessons).await {
@@ -296,6 +306,7 @@ async fn record_course_created(
 /// Returns the topic and the accepted proposal.
 pub async fn accept_proposal(
     state: &AppState,
+    p: &Principal,
     id: &str,
     req: AcceptProposal,
 ) -> AppResult<(Topic, Proposal)> {
@@ -304,11 +315,9 @@ pub async fn accept_proposal(
 
     let (topic, events, lesson_ids, proposal) = {
         let _w = state.write_lock.lock().await;
-        let mut stored: StoredProposal = state
-            .store
-            .get(db::PROPOSAL, id)
-            .await?
-            .ok_or_else(|| AppError::not_found("proposal"))?;
+        let mut stored: StoredProposal =
+            readable(p, state.store.get(db::PROPOSAL, id).await?, "proposal")?;
+        check_owner(p, &stored.proposal)?;
         let proposal = &mut stored.proposal;
         match &proposal.status {
             ProposalStatus::Ready => {}
@@ -350,10 +359,15 @@ pub async fn accept_proposal(
         proposal.request.lesson_count = outline.lessons.len() as u32;
         let mut events = Vec::new();
 
-        // A parent topic deleted since the proposal was made: the course goes under the
-        // outline's subject title instead, as the outline card shows it.
+        // A parent topic deleted (or no longer `p`'s) since the proposal was made: the
+        // course goes under the outline's subject title instead, as the outline card
+        // shows it.
         let parent = match &proposal.request.parent_topic_id {
-            Some(id) => state.store.get::<Topic>(db::TOPIC, id).await?,
+            Some(id) => state
+                .store
+                .get::<Topic>(db::TOPIC, id)
+                .await?
+                .filter(|t| can_read(p, t) && check_owner(p, t).is_ok()),
             None => None,
         };
         if parent.is_none() {
@@ -365,11 +379,12 @@ pub async fn accept_proposal(
                 if outline.subject_title.is_empty() {
                     return Err(AppError::bad_request("Give the subject a title."));
                 }
-                let topics: Vec<Topic> = state.store.list(db::TOPIC).await?;
+                // The subject is one of `p`'s own top-level topics, or a new one.
+                let topics: Vec<Topic> = list_visible(&state.store, db::TOPIC, p).await?;
                 let wanted = outline.subject_title.to_lowercase();
                 let mut roots: Vec<Topic> = topics
                     .into_iter()
-                    .filter(|t| t.parent_id.is_none())
+                    .filter(|t| t.parent_id.is_none() && check_owner(p, t).is_ok())
                     .collect();
                 library::sort_topics(&mut roots);
                 match roots
@@ -378,25 +393,32 @@ pub async fn accept_proposal(
                 {
                     Some(t) => t,
                     None => {
-                        let t = create_topic_locked(state, None, &outline.subject_title).await?;
-                        events.push(Event::TopicChanged { topic: t.clone() });
+                        let t = create_topic_locked(state, p, None, &outline.subject_title).await?;
+                        events.push(Emitted::row(&t, Event::TopicChanged { topic: t.clone() }));
                         t
                     }
                 }
             }
         };
 
-        let topic =
-            create_topic_locked(state, Some(subject.id.clone()), &outline.topic_title).await?;
-        events.push(Event::TopicChanged {
-            topic: topic.clone(),
-        });
+        let topic = create_topic_locked(state, p, Some(&subject), &outline.topic_title).await?;
+        events.push(Emitted::row(
+            &topic,
+            Event::TopicChanged {
+                topic: topic.clone(),
+            },
+        ));
 
         let now = Utc::now();
         let mut lesson_ids = Vec::new();
         for (i, l) in outline.lessons.iter().enumerate() {
+            // A lesson copies its topic's owner and access (D6).
+            let own = Ownership::of(&topic);
             let row = StoredLesson {
                 lesson: Lesson {
+                    access: own.access,
+                    deny: own.deny,
+                    owner: Some(own.owner),
                     citations: Vec::new(),
                     id: new_id(),
                     topic_id: topic.id.clone(),
@@ -420,14 +442,16 @@ pub async fn accept_proposal(
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
-            events.push(Event::LessonChanged {
-                lesson: state.public_lesson(&row.lesson),
-            });
+            events.push(Emitted::row(
+                &row,
+                Event::LessonChanged {
+                    lesson: state.public_lesson(&row.lesson),
+                },
+            ));
         }
 
         // The proposal's sources now belong to the new topic.
-        events
-            .extend(sources::attach_locked(state, &proposal.request.source_ids, &topic.id).await?);
+        events.extend(sources::attach_locked(state, &proposal.request.source_ids, &topic).await?);
 
         proposal.outline = Some(outline);
         proposal.status = ProposalStatus::Accepted {
@@ -435,14 +459,15 @@ pub async fn accept_proposal(
         };
         let proposal = proposal.clone();
         state.store.put(db::PROPOSAL, &proposal.id, &stored).await?;
-        events.push(Event::ProposalChanged {
-            proposal: proposal.clone(),
-        });
+        events.push(Emitted::row(
+            &proposal,
+            Event::ProposalChanged {
+                proposal: proposal.clone(),
+            },
+        ));
         (topic, events, lesson_ids, proposal)
     };
-    for e in events {
-        state.emit(e);
-    }
+    state.emit_all(events);
     for lesson_id in lesson_ids {
         spawn_lesson_job(state, lesson_id, true);
     }
@@ -451,19 +476,23 @@ pub async fn accept_proposal(
 
 pub async fn regenerate(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Lesson>> {
-    Ok(Json(regenerate_lesson(&state, &id).await?))
+    Ok(Json(regenerate_lesson(&state, &p, &id).await?))
 }
 
 /// Queues a lesson to be written again and starts its job (`POST
 /// /api/lessons/{id}/regenerate` and the agent's `regenerate_lesson`). Its body stays
 /// until the new one is done, and comes back if writing fails.
-pub async fn regenerate_lesson(state: &AppState, id: &str) -> AppResult<Lesson> {
+pub async fn regenerate_lesson(state: &AppState, p: &Principal, id: &str) -> AppResult<Lesson> {
+    // Who may see it and whether it's theirs, before anything else is checked.
+    check_owner(p, &library::lesson(state, p, id).await?)?;
     state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
-        let mut row = library::lesson(state, id).await?;
+        let mut row = library::lesson(state, p, id).await?;
+        check_owner(p, &row)?;
         let running = state.lesson_jobs.lock().unwrap().contains_key(id);
         if is_busy(&row.lesson.status) && running {
             return Err(AppError::conflict(
@@ -497,12 +526,13 @@ pub struct NewLesson {
 /// proposal behind it, the lesson keeps its own prompt (the request of the course its
 /// topic came from, when there is one) and quiz option for the lesson writer. No video
 /// follows it (`make_video` asks for one).
-pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson> {
+pub async fn append_lesson(state: &AppState, p: &Principal, req: NewLesson) -> AppResult<Lesson> {
     let title = library::clean_title(&req.title, "lesson")?;
     state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
-        library::topic(state, &req.topic_id).await?;
+        // A lesson copies its topic's owner and access (D6).
+        let own = Ownership::of(&library::own_topic(state, p, &req.topic_id).await?);
         let siblings = topic_lessons(state, &req.topic_id).await?;
         let position = siblings
             .iter()
@@ -526,6 +556,9 @@ pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson
         let now = Utc::now();
         let row = StoredLesson {
             lesson: Lesson {
+                access: own.access,
+                deny: own.deny,
+                owner: Some(own.owner),
                 citations: Vec::new(),
                 id: new_id(),
                 topic_id: req.topic_id.clone(),
@@ -749,6 +782,18 @@ pub struct StoredProposal {
     pub workspace_ids: Vec<Id>,
 }
 
+impl Owned for StoredProposal {
+    fn owner(&self) -> Option<&str> {
+        self.proposal.owner()
+    }
+    fn access(&self) -> &[String] {
+        self.proposal.access()
+    }
+    fn deny(&self) -> &[String] {
+        self.proposal.deny()
+    }
+}
+
 /// The planner's answer (`margin_ai::prompts`, `plan-v1`): the outline plus, per
 /// lesson, its retrieval questions and the sections it must cite.
 pub use margin_ai::{CoursePlan, PlannedLesson, SectionRef};
@@ -950,15 +995,20 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         let state = state.clone();
         let partial = partial.clone();
         let lesson_id = lesson_id.to_string();
+        // Whoever may read the lesson sees it being written.
+        let audience = row.audience();
         Box::new(move |text: &str| {
             if text.is_empty() {
                 return;
             }
             partial.lock().unwrap().push_str(text);
-            state.emit(Event::LessonDelta {
-                lesson_id: lesson_id.clone(),
-                text: text.to_string(),
-            });
+            state.emit_row(
+                &audience,
+                Event::LessonDelta {
+                    lesson_id: lesson_id.clone(),
+                    text: text.to_string(),
+                },
+            );
         })
     };
     let opts = write_options(&margin_ai::prompts::lesson(&ctx));

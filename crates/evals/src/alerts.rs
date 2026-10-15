@@ -14,7 +14,7 @@ use crate::traces::{self, AlertLine, TraceFilter};
 /// How far back the history goes.
 pub const HISTORY: chrono::Duration = chrono::Duration::days(1);
 
-/// `GET {base}/api/alerts` with the device token.
+/// `GET {base}/api/alerts` with an admin's device token (the route is admin-only).
 pub async fn fetch(
     http: &reqwest::Client,
     base_url: &str,
