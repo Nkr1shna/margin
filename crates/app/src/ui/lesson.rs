@@ -15,6 +15,7 @@ use crate::citations;
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
+use crate::ui::audience::FollowsLine;
 use crate::ui::citations::{CitationList, SourceViewerDialog, open_viewer};
 use crate::ui::common::{
     ConfirmDialog, CrumbLink, DeleteNoteDialog, ErrorNotice, Icon, Loading, RegenerateLessonDialog,
@@ -55,7 +56,7 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                 } else {
                     div { class: "empty",
                         h2 { "This lesson isn't here any more" }
-                        p { "It may have been deleted on another device." }
+                        p { "It may have been deleted, or its topic's owner changed who can read it." }
                         button { class: "btn btn-primary", onclick: move |_| { nav.replace(Route::Ask {}); }, "New chat" }
                     }
                 }
@@ -473,6 +474,7 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                         }
                     }
                 }
+                FollowsLine { topic_id: lesson.topic_id.clone(), narrowed: lesson.audience_narrowed, kind: "lesson" }
                 h1 { "{lesson.title}" }
                 if !lesson.summary.is_empty() {
                     p { class: "lede", "{lesson.summary}" }

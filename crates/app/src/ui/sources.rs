@@ -10,6 +10,7 @@ use crate::picker;
 use crate::sources::{Destination, Tone, Upload, UploadState, human_bytes, status_text};
 use crate::state::{AppCtx, use_app};
 use crate::store::LibraryState;
+use crate::ui::audience::{AudienceLine, AudienceTarget};
 use crate::ui::common::{ConfirmDialog, Icon, js};
 use crate::ui::settings::{MODELS_ADMIN_ONLY, SettingsPane};
 
@@ -724,6 +725,9 @@ fn AttachedLine(
         status = format!("{status} · in “{t}”");
     }
     let label = source.name.clone();
+    // A file of no topic and no folder is a unit of its own (L2): who reads it.
+    let own_unit = source.topic_id.is_none() && source.workspace_id.is_none();
+    let target = own_unit.then(|| AudienceTarget::source(&source));
     rsx! {
         SourceLine {
             kind: source.kind,
@@ -740,6 +744,11 @@ fn AttachedLine(
                 title: "Remove from this chat…",
                 onclick: move |_| on_remove.call(()),
                 Icon { name: "x" }
+            }
+        }
+        if let Some(target) = target {
+            div { class: "aud-under",
+                AudienceLine { target }
             }
         }
     }
@@ -892,6 +901,7 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
         .get(&topic_id)
         .map(|t| t.title.clone())
         .unwrap_or_default();
+    let audience = lib.topics.get(&topic_id).map(AudienceTarget::topic);
     let mut groups: Vec<(Option<String>, Vec<Source>)> = Vec::new();
     for source in lib.sources_in_topic(&topic_id) {
         match groups.last_mut() {
@@ -962,6 +972,9 @@ pub fn TopicSourcesDialog(topic_id: Id, on_close: EventHandler<()>) -> Element {
                 p {
                     "Outlines and lessons in this topic draw on the passages, pages, pictures and clips of these files that matter most."
                     if !empty { " " {margin_shared::routes::source_limits_text()} }
+                }
+                if let Some(target) = audience.clone() {
+                    AudienceLine { target, prefix: "They follow the topic: ".to_string() }
                 }
                 if !empty {
                     EmbeddingNotice {}

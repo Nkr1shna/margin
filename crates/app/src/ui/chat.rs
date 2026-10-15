@@ -891,6 +891,13 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 "aria-label": "Answers with {chat.provider.label()}",
                 {chat.provider.label()}
             }
+            // Chats stay private to their owner (L2); sharing one comes with comments.
+            span {
+                class: "aud-badge",
+                title: "Only you can read this chat.",
+                Icon { name: "user" }
+                "Private to you"
+            }
         }
         div { id: "{LOG_ID}", class: "scroll chat-scroll",
             div { class: "chat-col chat-log", role: "log", "aria-label": "Conversation",

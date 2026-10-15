@@ -355,6 +355,7 @@ pub fn OrganisationPane() -> Element {
         InvitationsSection {}
         GroupsSection { loading }
         AgentsSection {}
+        crate::ui::audit::AuditSection {}
     }
 }
 
@@ -1307,6 +1308,22 @@ fn AgentsSection() -> Element {
             .cmp(&handle_of(&people, &b.owner_id))
             .then(a.name.cmp(&b.name))
     });
+    // The documents agents ingested, for each agent's "Documents (n)": the change feed,
+    // once a session (events keep it current).
+    let mut documents = use_resource(move || async move {
+        if app.lib.peek().documents_loaded {
+            return Ok(());
+        }
+        let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+        let docs = api.agent_documents().await.map_err(|e| app.failure(&e))?;
+        let mut lib = app.lib;
+        lib.write().replace_agent_documents(docs);
+        Ok::<(), String>(())
+    });
+    let documents_failed = match &*documents.read() {
+        Some(Err(e)) => Some(format!("Couldn't list the agents' documents. {e}")),
+        _ => None,
+    };
     let mut editing = use_signal(|| None::<AgentEdit>);
     let mut confirm = use_signal(|| None::<AgentConfirm>);
     let mut shown_token = use_signal(|| None::<(String, String)>);
@@ -1374,6 +1391,9 @@ fn AgentsSection() -> Element {
             p { class: "help", "An agent acts for you, never beyond what you can read: its ceiling is the part of your access it may use. Give an outside agent, like Claude Code, a token and run margin-mcp with it." }
             if let Some(err) = error.read().clone() {
                 ErrorNotice { message: err }
+            }
+            if let Some(err) = documents_failed {
+                ErrorNotice { message: err, on_retry: move |_| documents.restart() }
             }
             if mine.is_empty() {
                 p { class: "faint", "You have no agents yet." }
@@ -1455,6 +1475,7 @@ fn AgentsSection() -> Element {
                                     "Delete…"
                                 }
                             }
+                            AgentDocuments { agent: a.clone() }
                         }
                     }
                 }
@@ -1481,6 +1502,7 @@ fn AgentsSection() -> Element {
                                         None => "No token".to_string(),
                                     }
                                 }
+                                AgentDocuments { agent: a.clone() }
                             }
                             if a.disabled {
                                 button {
@@ -1608,6 +1630,93 @@ fn AgentsSection() -> Element {
                         },
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The documents an agent ingested that the signed-in person reads ("Documents (n)"):
+/// each with its audience, and for its owner Change… and Delete. The list comes from
+/// the change feed, fetched once (`GET routes::CONTEXT_CHANGES`), and stays current
+/// through `DocumentChanged` and `AudienceRevoked`.
+#[component]
+pub fn AgentDocuments(agent: Agent) -> Element {
+    let app = use_app();
+    let mut confirm = use_signal(|| None::<margin_shared::context::Document>);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let lib = app.lib.read();
+    let loaded = lib.documents_loaded;
+    let docs: Vec<margin_shared::context::Document> =
+        lib.documents_of(&agent).into_iter().cloned().collect();
+    drop(lib);
+    let mine = app.person().is_some_and(|p| p.id == agent.owner_id);
+    if !loaded {
+        return rsx! { small { class: "faint", "Documents: loading…" } };
+    }
+    rsx! {
+        details { class: "agent-docs",
+            summary { "Documents ({docs.len()})" }
+            if let Some(err) = error.read().clone() {
+                ErrorNotice { message: err }
+            }
+            if docs.is_empty() {
+                p { class: "faint",
+                    if mine {
+                        "None yet. What {agent.name} adds through margin-mcp ingest shows here, visible only to you unless it names an audience."
+                    } else {
+                        "None you can read."
+                    }
+                }
+            }
+            div { class: "org-list", role: "list", "aria-label": "Documents of {agent.name}",
+                for d in docs {
+                    div { key: "{d.id}", class: "org-row agent-doc", role: "listitem",
+                        Icon { name: "file-add" }
+                        div { class: "grow",
+                            b { "{d.name}" }
+                            crate::ui::audience::AudienceLine { target: crate::ui::audience::AudienceTarget::document(&d) }
+                        }
+                        if mine {
+                            button {
+                                class: "btn btn-secondary btn-sm",
+                                "aria-label": "Delete {d.name}",
+                                onclick: { let d = d.clone(); move |_| confirm.set(Some(d.clone())) },
+                                "Delete…"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(d) = confirm.read().clone() {
+            ConfirmDialog {
+                title: "Delete “{d.name}”?",
+                message: "Its passages leave Margin's search for everyone who could read them. The agent can add it again.",
+                confirm_label: "Delete document",
+                busy: *busy.read(),
+                error: error.read().clone(),
+                on_cancel: move |_| confirm.set(None),
+                on_confirm: {
+                    let id = d.id.clone();
+                    move |_| {
+                        let id = id.clone();
+                        async move {
+                            let Some(api) = app.api() else { return };
+                            busy.set(true);
+                            match api.delete_document(&id).await {
+                                Ok(()) => {
+                                    error.set(None);
+                                    let mut lib = app.lib;
+                                    lib.write().agent_documents.remove(&id);
+                                    confirm.set(None);
+                                }
+                                Err(e) => error.set(Some(app.failure(&e))),
+                            }
+                            busy.set(false);
+                        }
+                    }
+                },
             }
         }
     }

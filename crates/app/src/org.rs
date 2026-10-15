@@ -5,9 +5,10 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
+use margin_shared::context::{AuditKind, AuditRow};
 use margin_shared::{
-    AgentKind, Group, Invitation, OrgRole, Person, PersonState, ROOT_GROUP, ancestors,
-    is_group_path, person_id,
+    Agent, AgentKind, Audience, Group, Invitation, OrgRole, Person, PersonState, ROOT_GROUP,
+    ancestors, is_group_path, person_id,
 };
 
 /// What `person` may read: `person/<id>`, `company`, and every group they're in with its
@@ -272,6 +273,370 @@ pub fn token_command(service_url: &str) -> String {
     format!("margin-mcp token - --url {service_url}")
 }
 
+// ---------------------------------------------------------------------------
+// Audiences (L2, `docs/l2-brief.md` D3, D9)
+// ---------------------------------------------------------------------------
+
+/// A row's audience as stored: read empty, it is private to its owner.
+pub fn audience_of(owner: Option<&str>, access: &[String], deny: &[String]) -> Audience {
+    let access = if access.is_empty() {
+        owner.map(|o| vec![person_id(o)]).unwrap_or_default()
+    } else {
+        access.to_vec()
+    };
+    Audience {
+        access,
+        deny: deny.to_vec(),
+    }
+}
+
+/// Whether `person` reads `audience` (exact membership over their expansion).
+pub fn person_reads(person: &Person, audience: &Audience) -> bool {
+    let paths = expansion(person);
+    margin_shared::reads(&paths, &paths, audience)
+}
+
+/// The active people other than the owner who read `before` and won't read `after`.
+pub fn losing_readers<'a>(
+    people: &'a [Person],
+    owner: Option<&str>,
+    before: &Audience,
+    after: &Audience,
+) -> Vec<&'a Person> {
+    people
+        .iter()
+        .filter(|p| p.state == PersonState::Active && Some(p.id.as_str()) != owner)
+        .filter(|p| person_reads(p, before) && !person_reads(p, after))
+        .collect()
+}
+
+/// Who an audience can name, for its words: the directory, the groups and the agents.
+#[derive(Clone, Copy)]
+pub struct Names<'a> {
+    pub groups: &'a [Group],
+    pub people: &'a [Person],
+    pub agents: &'a [Agent],
+}
+
+/// One audience entry in words: a group as "@engineering", a person as "@bob", an agent
+/// by its name.
+pub fn entry_label(entry: &str, names: Names<'_>) -> String {
+    if let Some(id) = entry.strip_prefix(margin_shared::PERSON_PREFIX) {
+        return names
+            .people
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| format!("@{}", p.handle))
+            .unwrap_or_else(|| "someone".into());
+    }
+    if let Some(id) = entry.strip_prefix(margin_shared::AGENT_PREFIX) {
+        return names
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "an agent".into());
+    }
+    if entry == ROOT_GROUP {
+        return "everyone at the company".into();
+    }
+    format!("@{}", entry.rsplit('/').next().unwrap_or(entry))
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    plural(n, one, many)
+}
+
+/// "@a", "@a and @b", "@a, @b and 3 more".
+fn listed(labels: &[String]) -> String {
+    match labels {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+    }
+}
+
+/// Who reads an audience, in words, as the summary line says it everywhere: "Only
+/// you", "Everyone at the company", "@engineering and 2 people", "Everyone except
+/// @sales". `owner` is the row's owner (always a reader, so never named); `me` the
+/// signed-in person.
+pub fn audience_summary(
+    audience: &Audience,
+    owner: Option<&str>,
+    me: Option<&str>,
+    names: Names<'_>,
+) -> String {
+    let own = owner.map(person_id);
+    let others: Vec<&String> = audience
+        .access
+        .iter()
+        .filter(|e| Some(*e) != own.as_ref())
+        .collect();
+    let denied: Vec<String> = audience
+        .deny
+        .iter()
+        .filter(|e| Some(*e) != own.as_ref())
+        .map(|e| entry_label(e, names))
+        .collect();
+    if others.is_empty() {
+        return match (owner, me) {
+            (Some(o), Some(m)) if o == m => "Only you".into(),
+            (Some(o), _) => format!("Only {}", entry_label(&person_id(o), names)),
+            (None, _) => "Only its owner".into(),
+        };
+    }
+    if others.iter().any(|e| e.as_str() == ROOT_GROUP) {
+        return if denied.is_empty() {
+            "Everyone at the company".into()
+        } else {
+            format!("Everyone except {}", listed(&denied))
+        };
+    }
+    let groups: Vec<String> = others
+        .iter()
+        .filter(|e| is_group_path(e))
+        .map(|e| entry_label(e, names))
+        .collect();
+    let people: Vec<String> = others
+        .iter()
+        .filter(|e| e.starts_with(margin_shared::PERSON_PREFIX))
+        .map(|e| entry_label(e, names))
+        .collect();
+    let agents: Vec<String> = others
+        .iter()
+        .filter(|e| e.starts_with(margin_shared::AGENT_PREFIX))
+        .map(|e| entry_label(e, names))
+        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    if groups.is_empty() && people.len() <= 2 {
+        parts.extend(people);
+    } else {
+        parts.extend(groups);
+        if !people.is_empty() {
+            parts.push(count(people.len(), "person", "people"));
+        }
+    }
+    if agents.len() == 1 && parts.is_empty() {
+        parts.push(agents[0].clone());
+    } else if !agents.is_empty() {
+        parts.push(count(agents.len(), "agent", "agents"));
+    }
+    let mut text = match parts.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    if !denied.is_empty() {
+        text = format!("{text}, except {}", listed(&denied));
+    }
+    text
+}
+
+/// What the service will store for `asked` on a row of `owner` (D3): the owner always
+/// reads it and is never denied.
+pub fn stored_audience(owner: Option<&str>, asked: &Audience) -> Audience {
+    let own = owner.map(person_id);
+    let mut access: Vec<String> = own.iter().cloned().collect();
+    for e in &asked.access {
+        if !access.contains(e) {
+            access.push(e.clone());
+        }
+    }
+    let deny = asked
+        .deny
+        .iter()
+        .filter(|e| Some(*e) != own.as_ref())
+        .cloned()
+        .collect();
+    Audience { access, deny }
+}
+
+/// Which list of an audience an entry is checked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Who may read it.
+    Access,
+    /// Never visible to.
+    Deny,
+}
+
+/// The Audience control's choices, without the owner (who always reads the row).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudienceDraft {
+    pub access: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl AudienceDraft {
+    /// The control over a stored audience: the owner's own entry left out.
+    pub fn from_stored(audience: &Audience, owner: Option<&str>) -> Self {
+        let own = owner.map(person_id);
+        let keep = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .filter(|e| Some(*e) != own.as_ref())
+                .cloned()
+                .collect()
+        };
+        Self {
+            access: keep(&audience.access),
+            deny: keep(&audience.deny),
+        }
+    }
+
+    /// Private to the owner: nothing shared, nothing to deny.
+    pub fn only_me(&self) -> bool {
+        self.access.is_empty()
+    }
+
+    /// Checks or unchecks `entry` in one list. An entry is in one list at most: checking
+    /// it in one takes it out of the other. `Err` when the list is full.
+    pub fn toggle(&mut self, side: Side, entry: &str, on: bool) -> Result<(), String> {
+        let (list, other) = match side {
+            Side::Access => (&mut self.access, &mut self.deny),
+            Side::Deny => (&mut self.deny, &mut self.access),
+        };
+        if !on {
+            list.retain(|e| e != entry);
+            return Ok(());
+        }
+        if list.iter().any(|e| e == entry) {
+            return Ok(());
+        }
+        if list.len() >= margin_shared::AUDIENCE_MAX {
+            return Err(format!(
+                "An audience can name at most {} in each list. Use a group instead.",
+                margin_shared::AUDIENCE_MAX
+            ));
+        }
+        other.retain(|e| e != entry);
+        list.push(entry.to_string());
+        Ok(())
+    }
+
+    /// The body of `PUT routes::audience`: nothing denied when nothing is shared.
+    pub fn body(&self) -> Audience {
+        Audience {
+            access: self.access.clone(),
+            deny: if self.only_me() {
+                Vec::new()
+            } else {
+                self.deny.clone()
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The audit trail (L2 D7), as the Audit view shows it
+// ---------------------------------------------------------------------------
+
+pub fn audit_kind_label(kind: AuditKind) -> &'static str {
+    match kind {
+        AuditKind::AudienceChange => "Audience changed",
+        AuditKind::MembershipChange => "Groups changed",
+        AuditKind::GroupChange => "Group changed",
+        AuditKind::PersonChange => "Person changed",
+        AuditKind::AgentChange => "Agent changed",
+        AuditKind::AgentToken => "Agent token",
+        AuditKind::Export => "Export",
+    }
+}
+
+/// Who made a change: "@alice", "claude-code (agent of @alice)", "root on the service
+/// host".
+pub fn actor_label(row: &AuditRow, names: Names<'_>) -> String {
+    if let Some(user) = row.actor.strip_prefix("host/") {
+        return format!("{user} on the service host");
+    }
+    let who = entry_label(&row.actor, names);
+    match &row.on_behalf_of {
+        Some(owner) if row.actor.starts_with(margin_shared::AGENT_PREFIX) => {
+            format!("{who} (agent of {})", entry_label(owner, names))
+        }
+        _ => who,
+    }
+}
+
+/// What a row is about, by name when the service joined it, else by kind ("a topic").
+pub fn subject_label(row: &AuditRow, names: Names<'_>) -> String {
+    if let Some(name) = &row.subject_name {
+        return name.clone();
+    }
+    let id = &row.subject.id;
+    match row.subject.kind.as_str() {
+        "person" => entry_label(&person_id(id), names),
+        "group" => names
+            .groups
+            .iter()
+            .find(|g| g.path == *id)
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| id.clone()),
+        "agent" => entry_label(&margin_shared::agent_id(id), names),
+        "workspace" => "a folder".into(),
+        "topic" => "a topic".into(),
+        "source" => "a file".into(),
+        "document" => "a document".into(),
+        other => format!("a {other}"),
+    }
+}
+
+/// The change as a diff: entries added (+) and removed (−) for each list, a value that
+/// moved ("role: member → admin"), else what it is now.
+pub fn audit_change(row: &AuditRow, names: Names<'_>) -> String {
+    use serde_json::Value;
+    let empty = serde_json::Map::new();
+    let before = row.before.as_object().unwrap_or(&empty);
+    let after = row.after.as_object().unwrap_or(&empty);
+    let mut keys: Vec<&String> = before.keys().chain(after.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let word = |v: &Value| match v {
+        Value::String(s) if s.contains('/') || s == ROOT_GROUP => entry_label(s, names),
+        Value::String(s) => s.clone(),
+        Value::Null => "none".into(),
+        other => other.to_string(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for key in keys {
+        let (b, a) = (before.get(key), after.get(key));
+        if b == a {
+            continue;
+        }
+        let list = |v: Option<&Value>| -> Option<Vec<Value>> {
+            match v {
+                Some(Value::Array(items)) => Some(items.clone()),
+                None | Some(Value::Null) => Some(Vec::new()),
+                _ => None,
+            }
+        };
+        match (list(b), list(a)) {
+            (Some(b), Some(a)) if !(b.is_empty() && a.is_empty()) => {
+                let added: Vec<String> = a.iter().filter(|x| !b.contains(x)).map(word).collect();
+                let removed: Vec<String> = b.iter().filter(|x| !a.contains(x)).map(word).collect();
+                let mut text = format!("{key}:");
+                for x in added {
+                    text.push_str(&format!(" +{x}"));
+                }
+                for x in removed {
+                    text.push_str(&format!(" −{x}"));
+                }
+                parts.push(text);
+            }
+            _ => {
+                let from = b.map(word).unwrap_or_else(|| "none".into());
+                let to = a.map(word).unwrap_or_else(|| "none".into());
+                parts.push(format!("{key}: {from} → {to}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "No change recorded".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +807,209 @@ mod tests {
             token_command("https://m.example"),
             "margin-mcp token - --url https://m.example"
         );
+    }
+
+    fn aud(access: &[&str], deny: &[&str]) -> Audience {
+        Audience {
+            access: access.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn agent(id: &str, owner: &str, name: &str) -> Agent {
+        Agent {
+            id: id.into(),
+            owner_id: owner.into(),
+            name: name.into(),
+            kind: AgentKind::External,
+            ceiling: vec![ROOT_GROUP.into()],
+            disabled: false,
+            token: None,
+            created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn audiences_read_as_the_summary_line() {
+        let people = vec![
+            person("alice", &["company/eng"]),
+            person("bob", &["company/sales"]),
+            person("carol", &[]),
+            person("dave", &[]),
+        ];
+        let groups = vec![
+            group("company", 4),
+            group("company/eng", 1),
+            group("company/sales", 1),
+        ];
+        let agents = vec![agent("x", "alice", "claude-code")];
+        let names = Names {
+            groups: &groups,
+            people: &people,
+            agents: &agents,
+        };
+        let s = |a: &Audience, me: &str| audience_summary(a, Some("alice"), Some(me), names);
+        // Read empty, a row is its owner's alone.
+        let private = audience_of(Some("alice"), &[], &[]);
+        assert_eq!(private.access, ["person/alice"]);
+        assert_eq!(s(&private, "alice"), "Only you");
+        assert_eq!(s(&private, "bob"), "Only @alice");
+        assert_eq!(
+            s(&aud(&["person/alice", "company"], &[]), "alice"),
+            "Everyone at the company"
+        );
+        assert_eq!(
+            s(
+                &aud(&["person/alice", "company"], &["company/sales"]),
+                "alice"
+            ),
+            "Everyone except @sales"
+        );
+        assert_eq!(
+            s(
+                &aud(
+                    &["person/alice", "company/eng", "person/bob", "person/carol"],
+                    &[]
+                ),
+                "alice"
+            ),
+            "@eng and 2 people"
+        );
+        assert_eq!(
+            s(&aud(&["person/alice", "person/bob"], &[]), "alice"),
+            "@bob"
+        );
+        assert_eq!(
+            s(
+                &aud(
+                    &["person/alice", "person/bob", "person/carol", "person/dave"],
+                    &[]
+                ),
+                "alice"
+            ),
+            "3 people"
+        );
+        assert_eq!(
+            s(&aud(&["person/alice", "agent/x"], &[]), "alice"),
+            "claude-code"
+        );
+        assert_eq!(
+            s(
+                &aud(&["person/alice", "company/eng"], &["person/bob"]),
+                "alice"
+            ),
+            "@eng, except @bob"
+        );
+        assert_eq!(entry_label("company", names), "everyone at the company");
+        assert_eq!(entry_label("person/zed", names), "someone");
+    }
+
+    #[test]
+    fn the_control_keeps_the_owner_and_one_list_per_entry() {
+        let stored = aud(&["person/alice", "company/eng"], &["person/bob"]);
+        let mut d = AudienceDraft::from_stored(&stored, Some("alice"));
+        assert_eq!(d.access, ["company/eng"]);
+        assert_eq!(d.deny, ["person/bob"]);
+        // Sharing with Bob takes him out of the denials.
+        d.toggle(Side::Access, "person/bob", true).unwrap();
+        assert_eq!(d.access, ["company/eng", "person/bob"]);
+        assert!(d.deny.is_empty());
+        d.toggle(Side::Access, "company/eng", false).unwrap();
+        assert_eq!(d.access, ["person/bob"]);
+        // Only me sends nothing, denials included.
+        let only = AudienceDraft {
+            access: vec![],
+            deny: vec!["person/bob".into()],
+        };
+        assert!(only.only_me());
+        assert_eq!(only.body(), Audience::default());
+        // At most AUDIENCE_MAX in a list.
+        let mut full = AudienceDraft::default();
+        for i in 0..margin_shared::AUDIENCE_MAX {
+            full.toggle(Side::Access, &format!("person/p{i}"), true)
+                .unwrap();
+        }
+        assert!(full.toggle(Side::Access, "person/extra", true).is_err());
+        assert!(full.toggle(Side::Deny, "person/extra", true).is_ok());
+        // The service stores the owner first and never denies them.
+        let asked = aud(
+            &["company/eng", "person/alice"],
+            &["person/alice", "agent/x"],
+        );
+        let stored = stored_audience(Some("alice"), &asked);
+        assert_eq!(stored.access, ["person/alice", "company/eng"]);
+        assert_eq!(stored.deny, ["agent/x"]);
+    }
+
+    #[test]
+    fn readers_who_lose_access_are_counted_before_saving() {
+        let people = vec![
+            person("alice", &["company/eng"]),
+            person("bob", &["company/eng"]),
+            person("carol", &[]),
+        ];
+        let before = aud(&["person/alice", "company"], &[]);
+        let after = aud(&["person/alice", "company/eng"], &[]);
+        let losing: Vec<&str> = losing_readers(&people, Some("alice"), &before, &after)
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(losing, ["carol"]);
+        // Denying Bob loses him too; the owner never counts.
+        let denied = aud(&["person/alice", "company/eng"], &["person/bob"]);
+        let losing = losing_readers(&people, Some("alice"), &after, &denied);
+        assert_eq!(losing.len(), 1);
+        assert_eq!(losing[0].id, "bob");
+        assert!(losing_readers(&people, Some("alice"), &after, &before).is_empty());
+    }
+
+    #[test]
+    fn audit_rows_read_as_who_what_and_a_diff() {
+        let people = vec![person("alice", &[]), person("bob", &[])];
+        let groups = vec![group("company", 2), group("company/eng", 1)];
+        let agents = vec![agent("x", "alice", "claude-code")];
+        let names = Names {
+            groups: &groups,
+            people: &people,
+            agents: &agents,
+        };
+        let mut row = AuditRow {
+            kind: AuditKind::AudienceChange,
+            at: Utc.timestamp_opt(0, 0).unwrap(),
+            actor: "person/alice".into(),
+            on_behalf_of: None,
+            subject: margin_shared::context::AuditSubject {
+                kind: "topic".into(),
+                id: "t1".into(),
+            },
+            before: serde_json::json!({ "access": ["person/alice", "company"], "deny": [] }),
+            after: serde_json::json!({ "access": ["person/alice", "company/eng"], "deny": ["person/bob"] }),
+            device_id: None,
+            subject_name: None,
+        };
+        assert_eq!(actor_label(&row, names), "@alice");
+        assert_eq!(subject_label(&row, names), "a topic");
+        assert_eq!(
+            audit_change(&row, names),
+            "access: +@eng −everyone at the company · deny: +@bob"
+        );
+        row.subject_name = Some("Thermodynamics".into());
+        assert_eq!(subject_label(&row, names), "Thermodynamics");
+        row.kind = AuditKind::PersonChange;
+        row.subject = margin_shared::context::AuditSubject {
+            kind: "person".into(),
+            id: "bob".into(),
+        };
+        row.subject_name = None;
+        row.before = serde_json::json!({ "role": "member", "state": "active" });
+        row.after = serde_json::json!({ "role": "admin", "state": "active" });
+        assert_eq!(subject_label(&row, names), "@bob");
+        assert_eq!(audit_change(&row, names), "role: member → admin");
+        row.actor = "agent/x".into();
+        row.on_behalf_of = Some("person/alice".into());
+        assert_eq!(actor_label(&row, names), "claude-code (agent of @alice)");
+        row.actor = "host/root".into();
+        assert_eq!(actor_label(&row, names), "root on the service host");
+        assert_eq!(audit_kind_label(AuditKind::Export), "Export");
     }
 }
