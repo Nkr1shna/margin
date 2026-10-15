@@ -70,7 +70,7 @@ Cargo builds keep their output in `~/.cache/margin-ci/target-{test,release}` on 
 4. Settings → Environments → `dev`: deployment branches = `dev`.
 5. Settings → Actions → General → Workflow permissions: **Read repository contents** (the default token stays read-only).
 6. Merge methods: **dev PRs squash, release PRs merge-commit** (§4a). A squash-only repository can't release: a squash-merged release PR is a new commit that isn't on dev, so release would stop being an exact dev snapshot. Settings → General → Pull Requests: turn on **Allow merge commits** and **Allow squash merging** (squash default message: pull request title; rebase merging off). Then pin each branch to its method in Settings → Rules → Rulesets (the ruleset that already requires CI, or one per branch): for `dev`, "Require a pull request before merging" → Allowed merge methods: **Squash** only; for `release`, Allowed merge methods: **Merge** only, and don't turn on "Require branches to be up to date" for `release` (the release PR's branch is a dev commit, which never contains release's merge commits). Without the rulesets, pick the right button by hand; promote-release still refuses to tag a squashed release (§4a).
-6. Settings → Actions → Runners: the `mac-mini-host` runner in the default group, used only by this repository.
+7. Settings → Actions → Runners: the `mac-mini-host` runner in the default group, used only by this repository.
 
 The apps pick the environment on the sign-in screen: **Prod / Dev / Custom** (`config::PRESETS`, `ui/signin.rs`). The device token is stored per URL (`app/secrets.rs`), so one desktop app switches between dev and prod without mixing tokens.
 
@@ -115,10 +115,14 @@ only ever moves to a dev commit, so prod runs code dev already ran.
    commit whose `smoke-dev` passed (newer commits that are red or were never deployed are
    skipped and named in the log), or give a dev commit. It **refuses, naming the commit**,
    when that commit's smoke-dev failed or is missing, when it isn't a commit on dev's
-   first-parent line, or when it is already on release. Commits that change only docs or
-   only the app don't deploy the service, so they get no smoke-dev status; to release
-   them, run **build-service** on `dev` (Run workflow), which deploys and smoke-tests the
-   tip.
+   first-parent line, or when it is already on release. A commit that changes only docs or
+   only the app doesn't deploy the service (none of build-service's paths), so it has no
+   smoke-dev status of its own: it takes the result of the nearest earlier commit that
+   changed the service, and if no commit since the last release did, the service is what
+   prod already runs and it is accepted (the log says which commit's result it relies on).
+   A commit that changes the service must have its own passing status: if the tip is
+   undeployed, run **build-service** on `dev` (Run workflow), which deploys and smoke-tests
+   it.
 2. The workflow (`deploy/scripts/release-snapshot.sh` holds the logic) finds the last dev
    commit release has, `git merge-base origin/release origin/dev`; creates branch
    **`promote/<short-sha>` at the chosen commit** (no new commit); and opens a PR into

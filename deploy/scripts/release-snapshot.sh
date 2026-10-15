@@ -7,9 +7,14 @@
 #       with a merge commit or fast-forward, that is the promoted snapshot.
 #   release-snapshot.sh select <base> <dev-ref> [sha]
 #       The dev commit to promote: `sha` if given, else the newest commit on dev's
-#       first-parent line after <base> whose smoke-dev status is `success`. Refuses, naming
+#       first-parent line after <base> whose smoke-dev result is `success`. Refuses, naming
 #       the commit, when `sha` isn't a dev commit after <base>, or its smoke-dev result
 #       failed or is missing; or when no commit after <base> passed.
+#       A commit with no smoke-dev status that doesn't change the service (docs-only,
+#       app-only: none of build-service.yml's paths) was never deployed because the
+#       service in it is its parent's, so it takes its first parent's result; if that walk
+#       reaches <base>, the service is unchanged since the last release and it counts as
+#       passed. A commit that changes the service must have its own status.
 #   release-snapshot.sh prs <from> <to>
 #       The dev PRs merged in <from>..<to> (first-parent, oldest first) as TSV:
 #       number, title, labels (comma-separated). A commit with no PR is listed as
@@ -26,22 +31,57 @@ set -eu
 repo="${REPO:-${GITHUB_REPOSITORY:-Nkr1shna/margin}}"
 # How many dev commits `select` checks for a passing smoke-dev before giving up.
 max_scan="${SNAPSHOT_MAX_SCAN:-100}"
+# What build-service.yml builds and deploys from (keep in step with its `paths:`): a commit
+# that changes none of these leaves the running service as its parent's.
+service_paths='^(crates/(service|agent|ai|embed|video|shared)/|Cargo\.(toml|lock)$|deploy/|\.github/workflows/(build-service|deploy-dev|deploy-prod)\.yml$)'
 
 die() { echo "refused: $*" >&2; exit 1; }
 short() { git rev-parse --short=7 "$1"; }
 
-# success | failure | error | pending | missing (smoke-dev never ran on it)
+# success | failure | error | pending | missing (smoke-dev never ran on it). Each commit is
+# asked once per run: `select` walks the same commits for several candidates.
+states="$(mktemp -d)"
+trap 'rm -rf "$states"' EXIT
 smoke_state() {
-  gh api "repos/$repo/commits/$1/status" \
-    | jq -r '[.statuses[]? | select(.context == "smoke-dev")][0].state // "missing"'
+  [ -s "$states/$1" ] || gh api "repos/$repo/commits/$1/status" \
+    | jq -r '[.statuses[]? | select(.context == "smoke-dev")][0].state // "missing"' > "$states/$1"
+  cat "$states/$1"
 }
 
-explain() { # sha, state
+changes_service() { # sha: does the commit (against its first parent) touch the service?
+  git diff-tree --no-commit-id --name-only -r --first-parent "$1" | grep -Eq "$service_paths"
+}
+
+# The smoke-dev result that applies to a commit: its own status, or, when it has none and
+# doesn't change the service, its first parent's (down to the base). Prints
+# "<state> <sha the state came from>"; state `unchanged` means the walk reached the base:
+# the service is what release already has.
+verdict() { # sha, base
+  c="$1"
+  while :; do
+    state="$(smoke_state "$c")"
+    if [ "$state" != missing ] || changes_service "$c"; then echo "$state $c"; return; fi
+    c="$(git rev-parse "$c^")"
+    if [ "$c" = "$2" ]; then echo "unchanged $c"; return; fi
+  done
+}
+
+since() { [ "$1" = "$2" ] || printf ', and %s changes nothing in the service since' "$(short "$1")"; }
+
+explain() { # sha, state, from-sha
   case "$2" in
-    failure|error) echo "smoke-dev failed on $(short "$1") — dev was red at that commit" ;;
-    pending) echo "smoke-dev is still running on $(short "$1")" ;;
-    *) echo "$(short "$1") has no smoke-dev result (it was never deployed to dev: docs-only or app-only commits don't deploy; run build-service on dev to deploy and smoke-test the tip)" ;;
+    failure|error) echo "smoke-dev failed on $(short "$3") — dev was red at that commit$(since "$1" "$3")" ;;
+    pending) echo "smoke-dev is still running on $(short "$3")$(since "$1" "$3")" ;;
+    *) echo "$(short "$3") changes the service but has no smoke-dev result (it was never deployed to dev$( [ "$1" = "$3" ] || printf '; %s builds on it' "$(short "$1")"); run build-service on dev to deploy and smoke-test the tip)" ;;
   esac
+}
+
+accepted() { # sha, state, from-sha
+  if [ "$2" = unchanged ]; then
+    echo "$(short "$1") changes nothing in the service since $(short "$3"), the last dev commit release has"
+  else
+    echo "smoke-dev passed on $(short "$3")$(since "$1" "$3")"
+  fi
 }
 
 cmd="${1:-}"
@@ -66,8 +106,9 @@ case "$cmd" in
         fi
         die "$(short "$sha") is not a commit on dev's first-parent line after $(short "$base") (pick a squash commit on dev, not a commit inside a PR)"
       fi
-      state="$(smoke_state "$sha")"
-      [ "$state" = success ] || die "$(explain "$sha" "$state")"
+      set -- $(verdict "$sha" "$base")
+      case "$1" in success|unchanged) ;; *) die "$(explain "$sha" "$1" "$2")" ;; esac
+      accepted "$sha" "$1" "$2" >&2
       echo "$sha"
       exit 0
     fi
@@ -75,15 +116,15 @@ case "$cmd" in
     for c in $cands; do
       n=$((n + 1))
       [ "$n" -le "$max_scan" ] || break
-      state="$(smoke_state "$c")"
-      if [ "$state" = success ]; then
-        echo "$c"
-        exit 0
-      fi
-      echo "skipping $(explain "$c" "$state")" >&2
+      set -- $(verdict "$c" "$base")
+      case "$1" in
+        success|unchanged) accepted "$c" "$1" "$2" >&2; echo "$c"; exit 0 ;;
+      esac
+      echo "skipping $(explain "$c" "$1" "$2")" >&2
     done
     newest="$(printf '%s\n' "$cands" | head -n 1)"
-    die "no dev commit after $(short "$base") passed smoke-dev (checked $((n > max_scan ? max_scan : n))); newest: $(explain "$newest" "$(smoke_state "$newest")")"
+    set -- $(verdict "$newest" "$base")
+    die "no dev commit after $(short "$base") passed smoke-dev (checked $((n > max_scan ? max_scan : n))); newest: $(explain "$newest" "$1" "$2")"
     ;;
 
   prs)

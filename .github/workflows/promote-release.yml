@@ -3,7 +3,8 @@
 #
 # Run by hand (Actions → promote-release → Run workflow), `sha` empty or a dev commit:
 #   promote: picks the snapshot (deploy/scripts/release-snapshot.sh): `sha`, or the newest
-#   dev commit whose smoke-dev status passed; refuses, naming the commit, when that commit's
+#   dev commit whose smoke-dev passed (a docs- or app-only commit takes the nearest service
+#   commit's result); refuses, naming the commit, when that commit's
 #   smoke-dev failed or never ran. Creates branch promote/<short-sha> AT that commit and
 #   opens a PR into release listing the dev PRs it brings (since the last dev commit release
 #   has, `git merge-base origin/release origin/dev`).
@@ -91,7 +92,7 @@ jobs:
 
           {
             echo "<!-- promote-snapshot: $snapshot base: $base -->"
-            echo "Releases **dev at \`$short\`** to prod: dev exactly as it was at that commit (its smoke-dev passed), which is everything merged into dev after \`${base:0:7}\`, the last dev commit release has."
+            echo "Releases **dev at \`$short\`** to prod: dev exactly as it was at that commit (the service in it passed smoke-dev), which is everything merged into dev after \`${base:0:7}\`, the last dev commit release has."
             echo
             echo "> [!IMPORTANT]"
             echo "> Merge with **Create a merge commit**, never *Squash and merge*: release must contain this exact dev commit. A squashed release is caught after the push (prod still deploys it, but it isn't tagged, and the next release's PR list would be wrong)."
