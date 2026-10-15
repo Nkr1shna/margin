@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use margin_shared::sync::Locked;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -84,9 +85,12 @@ impl Config {
 }
 
 /// A value loaded on first use and dropped once unused for `idle`: the encoders' slot.
+/// A load runs outside `value`'s lock, so `sweep` (on every embed call) and `is_loaded`
+/// never wait on a slow one; `loading` keeps it to one at a time.
 pub(crate) struct IdleSlot<T> {
     idle: Duration,
     value: Mutex<Option<(Arc<T>, Instant)>>,
+    loading: Mutex<()>,
 }
 
 impl<T> IdleSlot<T> {
@@ -94,6 +98,7 @@ impl<T> IdleSlot<T> {
         Self {
             idle,
             value: Mutex::new(None),
+            loading: Mutex::new(()),
         }
     }
 
@@ -103,20 +108,31 @@ impl<T> IdleSlot<T> {
         now: Instant,
         load: impl FnOnce() -> Result<T, EmbedError>,
     ) -> Result<Arc<T>, EmbedError> {
-        let mut slot = self.value.lock().unwrap();
-        if let Some((value, used)) = slot.as_mut() {
-            *used = now;
-            return Ok(value.clone());
+        if let Some(value) = self.touch(now) {
+            return Ok(value);
+        }
+        let _loading = self.loading.locked();
+        // Another caller may have loaded it while this one waited.
+        if let Some(value) = self.touch(now) {
+            return Ok(value);
         }
         let value = Arc::new(load()?);
-        *slot = Some((value.clone(), now));
+        *self.value.locked() = Some((value.clone(), now));
         Ok(value)
+    }
+
+    /// The loaded value, marked used at `now`.
+    fn touch(&self, now: Instant) -> Option<Arc<T>> {
+        let mut slot = self.value.locked();
+        let (value, used) = slot.as_mut()?;
+        *used = now;
+        Some(value.clone())
     }
 
     /// Drops the value if it was last used `idle` or more before `now`. Returns whether
     /// it dropped it. A caller still holding an `Arc` keeps it alive until done.
     pub fn sweep(&self, now: Instant) -> bool {
-        let mut slot = self.value.lock().unwrap();
+        let mut slot = self.value.locked();
         let stale = slot
             .as_ref()
             .is_some_and(|(_, used)| now.saturating_duration_since(*used) >= self.idle);
@@ -126,15 +142,16 @@ impl<T> IdleSlot<T> {
         stale
     }
 
-    /// Drops the value whenever it was last used (a model being deleted). Returns
-    /// whether one was loaded.
+    /// Drops the value whenever it was last used (a model being deleted), after any load
+    /// in flight. Returns whether one was loaded.
     pub fn clear(&self) -> bool {
-        self.value.lock().unwrap().take().is_some()
+        let _loading = self.loading.locked();
+        self.value.locked().take().is_some()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_loaded(&self) -> bool {
-        self.value.lock().unwrap().is_some()
+        self.value.locked().is_some()
     }
 }
 
@@ -464,6 +481,43 @@ mod tests {
         // A failed load leaves it empty.
         assert!(slot.get(t0, || Err(EmbedError::Load("x".into()))).is_err());
         assert!(!slot.is_loaded());
+    }
+
+    #[test]
+    fn a_slow_load_blocks_neither_sweep_nor_is_loaded() {
+        use std::sync::mpsc::channel;
+        let slot: Arc<IdleSlot<u32>> = Arc::new(IdleSlot::new(ENCODER_IDLE));
+        let (started_tx, started) = channel();
+        let (release, release_rx) = channel::<()>();
+        let loader = std::thread::spawn({
+            let slot = slot.clone();
+            move || {
+                slot.get(Instant::now(), || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(7)
+                })
+                .map(|v| *v)
+            }
+        });
+        started.recv().unwrap();
+        let (done_tx, done) = channel();
+        std::thread::spawn({
+            let slot = slot.clone();
+            move || {
+                done_tx
+                    .send((slot.sweep(Instant::now()), slot.is_loaded()))
+                    .unwrap()
+            }
+        });
+        assert_eq!(
+            done.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (false, false),
+            "sweep and is_loaded answer mid-load"
+        );
+        release.send(()).unwrap();
+        assert_eq!(loader.join().unwrap().unwrap(), 7);
+        assert!(slot.is_loaded());
     }
 
     #[test]
