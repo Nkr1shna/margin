@@ -4,7 +4,11 @@
 //!
 //! The helpers that build Responses items (`message_item`, `function_call_item`,
 //! `reasoning_item`) are what an OpenAI step stores; `text_reply` and
-//! `tool_calls_reply` wrap them in the events the Responses client would emit.
+//! `tool_calls_reply` wrap them in the events the Responses client would emit. The
+//! `claude_*` helpers do the same with Messages content blocks stored as
+//! `{"role":…,"block":…}` entries (what the Claude client stores), and
+//! `web_search_events`/`web_fetch_events` script a hosted web call on either provider.
+//! [`ScriptedModel::with_kind`] makes it report another provider.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -50,9 +54,11 @@ pub struct Recorded {
 /// with `AiError::Incomplete("the scripted model has no reply queued")`.
 #[derive(Default)]
 pub struct ScriptedModel {
+    /// The provider it says it is (`None`: OpenAI).
+    kind: Option<ProviderKind>,
     script: Mutex<VecDeque<Scripted>>,
     requests: Mutex<Vec<Recorded>>,
-    text_calls: Mutex<Vec<(String, CallOptions)>>,
+    text_calls: Mutex<Vec<(String, CallOptions, String)>>,
 }
 
 impl ScriptedModel {
@@ -61,6 +67,13 @@ impl ScriptedModel {
             script: Mutex::new(replies.into_iter().collect()),
             ..Default::default()
         }
+    }
+
+    /// This model reporting `kind` as its provider (the loop doesn't ask; a service
+    /// test may).
+    pub fn with_kind(mut self, kind: ProviderKind) -> Self {
+        self.kind = Some(kind);
+        self
     }
 
     pub fn push(&self, reply: Scripted) {
@@ -92,8 +105,9 @@ impl ScriptedModel {
             .collect()
     }
 
-    /// Every plain text call so far: its instructions and options.
-    pub fn text_calls(&self) -> Vec<(String, CallOptions)> {
+    /// Every plain text call so far: its instructions, options and input text (its
+    /// text parts joined by blank lines).
+    pub fn text_calls(&self) -> Vec<(String, CallOptions, String)> {
         self.text_calls.lock().unwrap().clone()
     }
 
@@ -157,7 +171,7 @@ async fn play(reply: Option<Scripted>) -> Result<ModelStream, AiError> {
 
 impl Provider for ScriptedModel {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenAi
+        self.kind.unwrap_or_default()
     }
 
     fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
@@ -178,7 +192,7 @@ struct OnModels {
 
 impl Provider for OnModels {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenAi
+        self.inner.kind()
     }
 
     fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
@@ -198,14 +212,15 @@ impl TextModel for ScriptedModel {
     fn stream_parts<'a>(
         &'a self,
         instructions: &'a str,
-        _input: &'a [InputPart],
+        input: &'a [InputPart],
         opts: &'a CallOptions,
         mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
-        self.text_calls
-            .lock()
-            .unwrap()
-            .push((instructions.to_string(), opts.clone()));
+        self.text_calls.lock().unwrap().push((
+            instructions.to_string(),
+            opts.clone(),
+            input_text(input),
+        ));
         let reply = self.script.lock().unwrap().pop_front();
         Box::pin(async move {
             let mut stream = play(reply).await?;
@@ -249,6 +264,18 @@ impl TextModel for ScriptedModel {
             Err(AiError::Network("the scripted reply ended early".into()))
         })
     }
+}
+
+/// The text parts of a text call's input, joined by blank lines.
+fn input_text(input: &[InputPart]) -> String {
+    input
+        .iter()
+        .filter_map(|p| match p {
+            InputPart::Text(t) => Some(t.as_str()),
+            InputPart::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Usage of one scripted call.
@@ -400,6 +427,204 @@ pub fn tool_calls_reply(calls: &[(&str, &str, &str)]) -> Vec<ModelEvent> {
         ));
     }
     events.push(completed(usage(100, 10)));
+    events
+}
+
+/// `ModelEvent::Completed` with this stop reason and what comes next.
+pub fn completed_with(usage: Usage, stop_reason: &str, next: Next) -> ModelEvent {
+    ModelEvent::Completed {
+        usage,
+        model: String::new(),
+        stop_reason: stop_reason.into(),
+        next,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claude (Messages content blocks, stored as `{"role":…,"block":…}` entries)
+// ---------------------------------------------------------------------------
+
+/// An assistant entry holding `block`.
+pub fn claude_assistant(block: Value) -> Value {
+    crate::replay::claude::entry("assistant", block)
+}
+
+/// A stored assistant `text` block.
+pub fn claude_text_entry(text: &str) -> Value {
+    claude_assistant(json!({"type": "text", "text": text}))
+}
+
+/// A stored assistant `thinking` block with its signature.
+pub fn claude_thinking_entry(thinking: &str) -> Value {
+    claude_assistant(json!({
+        "type": "thinking",
+        "thinking": thinking,
+        "signature": format!("sig-{}", thinking.len()),
+    }))
+}
+
+/// A stored assistant `tool_use` block (`arguments` is its JSON input).
+pub fn claude_tool_use_entry(id: &str, name: &str, arguments: &str) -> Value {
+    let input: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    claude_assistant(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+}
+
+/// The events of a Claude response that answers with `text` (streamed in `chunks`),
+/// stored as one `text` block; `end_turn`.
+pub fn claude_text_reply(chunks: &[&str]) -> Vec<ModelEvent> {
+    let text: String = chunks.concat();
+    let mut events = vec![ModelEvent::Started {
+        index: 0,
+        kind: StartKind::Text,
+    }];
+    for chunk in chunks {
+        events.push(ModelEvent::Delta {
+            index: 0,
+            delta: Delta::Text((*chunk).into()),
+        });
+    }
+    events.push(text_done(0, &text, claude_text_entry(&text)));
+    events.push(completed_with(usage(100, 20), "end_turn", Next::Finished));
+    events
+}
+
+/// The events of a Claude response that thinks (`thinking`) and then calls tools:
+/// `(id, name, arguments JSON)` each; `tool_use`.
+pub fn claude_tool_calls_reply(thinking: &str, calls: &[(&str, &str, &str)]) -> Vec<ModelEvent> {
+    let mut events = vec![
+        ModelEvent::Started {
+            index: 0,
+            kind: StartKind::Reasoning,
+        },
+        ModelEvent::Delta {
+            index: 0,
+            delta: Delta::Reasoning(thinking.into()),
+        },
+        reasoning_done(0, thinking, claude_thinking_entry(thinking)),
+    ];
+    for (i, (id, name, args)) in calls.iter().enumerate() {
+        let index = i as u32 + 1;
+        events.push(ModelEvent::Started {
+            index,
+            kind: StartKind::ToolCall {
+                call_id: (*id).into(),
+                name: (*name).into(),
+            },
+        });
+        events.push(ModelEvent::Delta {
+            index,
+            delta: Delta::Arguments((*args).into()),
+        });
+        events.push(call_done(
+            index,
+            id,
+            name,
+            args,
+            claude_tool_use_entry(id, name, args),
+        ));
+    }
+    events.push(completed_with(usage(100, 10), "tool_use", Next::Finished));
+    events
+}
+
+/// The events of a hosted web search at stream indexes `index` (the call) and
+/// `index + 1` (its result, unless `result` is false: a search still running when the
+/// step ended). On Claude (`claude`) the call is a `server_tool_use` block and the
+/// result a `web_search_tool_result` with `encrypted_content`; on OpenAI one
+/// `web_search_call` item (stored with the call), done with its sources. No
+/// `Completed`.
+pub fn web_search_events(
+    claude: bool,
+    index: u32,
+    id: &str,
+    query: &str,
+    results: &[(&str, &str)],
+    result: bool,
+) -> Vec<ModelEvent> {
+    let found: Vec<margin_shared::WebResult> = results
+        .iter()
+        .map(|(url, title)| margin_shared::WebResult {
+            url: (*url).into(),
+            title: Some((*title).into()),
+            page_age: claude.then(|| "April 30, 2025".to_string()),
+        })
+        .collect();
+    let args = json!({"query": query}).to_string();
+    let mut events = vec![ModelEvent::Started {
+        index,
+        kind: StartKind::WebSearch { id: id.into() },
+    }];
+    if claude {
+        events.push(ModelEvent::Delta {
+            index,
+            delta: Delta::Arguments(args),
+        });
+        events.push(ModelEvent::Done {
+            index,
+            item: ModelItem {
+                stored: vec![claude_assistant(json!({
+                    "type": "server_tool_use", "id": id, "name": "web_search", "input": {"query": query},
+                }))],
+                view: ItemView::WebSearch {
+                    id: id.into(),
+                    query: query.into(),
+                },
+            },
+        });
+        if result {
+            let content: Vec<Value> = results
+                .iter()
+                .map(|(url, title)| {
+                    json!({"type": "web_search_result", "url": url, "title": title,
+                        "encrypted_content": format!("enc-{url}"), "page_age": "April 30, 2025"})
+                })
+                .collect();
+            events.push(ModelEvent::Done {
+                index: index + 1,
+                item: ModelItem {
+                    stored: vec![claude_assistant(json!({
+                        "type": "web_search_tool_result", "tool_use_id": id, "content": content,
+                    }))],
+                    view: ItemView::WebSearchResult {
+                        id: id.into(),
+                        results: found,
+                        error: None,
+                    },
+                },
+            });
+        }
+    } else if result {
+        // As the Responses client gives a finished `web_search_call`: two `Done`s on its
+        // index, the search (storing the item) and then its results (storing nothing).
+        let sources: Vec<Value> = results
+            .iter()
+            .map(|(url, title)| json!({"type": "url", "url": url, "title": title}))
+            .collect();
+        events.push(ModelEvent::Done {
+            index,
+            item: ModelItem {
+                stored: vec![json!({
+                    "type": "web_search_call", "id": id, "status": "completed",
+                    "action": {"type": "search", "query": query, "sources": sources},
+                })],
+                view: ItemView::WebSearch {
+                    id: id.into(),
+                    query: query.into(),
+                },
+            },
+        });
+        events.push(ModelEvent::Done {
+            index,
+            item: ModelItem {
+                stored: Vec::new(),
+                view: ItemView::WebSearchResult {
+                    id: id.into(),
+                    results: found,
+                    error: None,
+                },
+            },
+        });
+    }
     events
 }
 
