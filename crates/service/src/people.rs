@@ -8,14 +8,14 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
 use margin_shared::{
-    Event, Id, OrgRole, Person, PersonPatch, PersonSettings, PersonState, ROOT_GROUP,
-    SOURCE_MANUAL, access_code, handle_for_login, is_group_path, is_handle, person_id,
+    Event, Id, OrgRole, Person, PersonPatch, PersonSettings, PersonState, ROOT_GROUP, access_code,
+    handle_for_login, is_group_path, is_handle, person_id,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
-use crate::groups::{GroupRow, MembershipRow};
+use crate::groups;
 use crate::invitations::InvitationRow;
 use crate::principal::{CurrentPrincipal, Principal, RequireAdmin, admin_required};
 use crate::state::{AppState, Audience, DeviceRow, SETTINGS_ID, new_id};
@@ -69,14 +69,9 @@ pub async fn person_by_login(state: &AppState, login: &str) -> anyhow::Result<Op
     Ok(rows.into_iter().next())
 }
 
-/// `person_id`'s direct memberships (group paths), sorted.
+/// `person_id`'s direct memberships (group paths), sorted (`groups::groups_of`).
 pub async fn groups_of(state: &AppState, person_id_: &str) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<MembershipRow> = state
-        .store
-        .list_where(db::MEMBERSHIP, "person_id", person_id_)
-        .await?;
-    let set: BTreeSet<String> = rows.into_iter().map(|m| m.group_path).collect();
-    Ok(set.into_iter().collect())
+    groups::groups_of(&state.store, person_id_).await
 }
 
 /// The wire person: `groups` from the memberships; `settings` only when `own`.
@@ -119,65 +114,21 @@ async fn free_handle(state: &AppState, login: &str) -> anyhow::Result<String> {
     unreachable!()
 }
 
-/// Writes `person_id`'s memberships of `paths` (source `manual`). Call under the write
-/// lock.
-async fn add_memberships_locked(
-    state: &AppState,
-    person_id_: &str,
-    paths: &[String],
-) -> anyhow::Result<()> {
-    for path in paths {
-        let m = MembershipRow {
-            id: new_id(),
-            person_id: person_id_.to_string(),
-            group_path: path.clone(),
-            source: SOURCE_MANUAL.into(),
-        };
-        state.store.put(db::MEMBERSHIP, &m.id, &m).await?;
-    }
-    Ok(())
-}
-
-/// The `company` group, created when missing. Call under the write lock.
-async fn ensure_root_group_locked(state: &AppState) -> anyhow::Result<()> {
-    if state
-        .store
-        .get::<GroupRow>(db::GROUP, ROOT_GROUP)
-        .await?
-        .is_none()
-    {
-        let g = GroupRow {
-            path: ROOT_GROUP.into(),
-            name: "Company".into(),
-            source: SOURCE_MANUAL.into(),
-            created_at: Utc::now(),
-        };
-        state.store.put(db::GROUP, ROOT_GROUP, &g).await?;
-    }
-    Ok(())
-}
-
-/// The paths of `groups` that aren't existing groups.
+/// The paths of `groups` that aren't existing groups (`groups::group_exists`).
 pub async fn unknown_groups(state: &AppState, groups: &[String]) -> AppResult<Vec<String>> {
     let mut unknown = Vec::new();
     for g in groups {
-        if !is_group_path(g) || state.store.get::<GroupRow>(db::GROUP, g).await?.is_none() {
+        if !is_group_path(g) || !groups::group_exists(&state.store, g).await? {
             unknown.push(g.clone());
         }
     }
     Ok(unknown)
 }
 
-/// 400 `unknown_group` naming the first path that isn't a group.
+/// 400 `unknown_group` naming the first path that isn't a group
+/// (`groups::check_groups_exist`).
 pub async fn check_groups(state: &AppState, groups: &[String]) -> AppResult<()> {
-    if let Some(first) = unknown_groups(state, groups).await?.into_iter().next() {
-        return Err(AppError::new(
-            StatusCode::BAD_REQUEST,
-            access_code::UNKNOWN_GROUP,
-            format!("There's no group \"{first}\". Create it first under Organisation → Groups."),
-        ));
-    }
-    Ok(())
+    groups::check_groups_exist(&state.store, groups).await
 }
 
 /// Sorted and without repeats.
@@ -263,7 +214,7 @@ pub async fn migrate(state: &AppState) -> anyhow::Result<()> {
     }
 
     // 1. The owner.
-    ensure_root_group_locked(state).await?;
+    groups::ensure_root_locked(&state.store).await?;
     let owner = match owner_row(state).await? {
         Some(o) => o,
         None => {
@@ -290,12 +241,12 @@ pub async fn migrate(state: &AppState) -> anyhow::Result<()> {
         }
     };
     let owner_id = owner.person.id.clone();
-    if !groups_of(state, &owner_id)
-        .await?
-        .iter()
-        .any(|g| g == ROOT_GROUP)
-    {
-        add_memberships_locked(state, &owner_id, &[ROOT_GROUP.to_string()]).await?;
+    let mut owner_groups = groups_of(state, &owner_id).await?;
+    if !owner_groups.iter().any(|g| g == ROOT_GROUP) {
+        owner_groups.push(ROOT_GROUP.to_string());
+        groups::set_memberships_locked(&state.store, &owner_id, &owner_groups)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
     }
 
     // 2. Devices.
@@ -435,7 +386,8 @@ pub async fn admit(state: &AppState, login: &str, github_id: u64) -> AppResult<A
                         created_at: now,
                     });
                     state.store.put(db::PERSON, &row.person.id, &row).await?;
-                    add_memberships_locked(state, &row.person.id, &groups).await?;
+                    // Their invited groups and `company` (`groups` holds both).
+                    groups::set_memberships_locked(&state.store, &row.person.id, &groups).await?;
                     inv.invitation.accepted_at = Some(now);
                     inv.invitation.accepted_by = Some(row.person.id.clone());
                     state
@@ -675,48 +627,13 @@ pub async fn put_person_groups(
     Path(id): Path<Id>,
     ApiJson(groups): ApiJson<Vec<String>>,
 ) -> AppResult<Json<Person>> {
-    let groups = tidy_groups(groups);
-    let row = {
-        let _w = state.write_lock.lock().await;
-        let Some(row) = person_row(&state, &id).await? else {
-            return Err(AppError::not_found("person"));
-        };
-        check_groups(&state, &groups).await?;
-        let held: Vec<MembershipRow> = state
-            .store
-            .list_where(db::MEMBERSHIP, "person_id", &id)
-            .await?;
-        let mut kept = BTreeSet::new();
-        for m in held {
-            if m.source != SOURCE_MANUAL {
-                continue;
-            }
-            if groups.contains(&m.group_path) && kept.insert(m.group_path.clone()) {
-                continue;
-            }
-            state.store.delete(db::MEMBERSHIP, &m.id).await?;
-        }
-        let added: Vec<String> = groups
-            .iter()
-            .filter(|g| !kept.contains(*g))
-            .cloned()
-            .collect();
-        add_memberships_locked(&state, &id, &added).await?;
-        row
+    let Some(row) = person_row(&state, &id).await? else {
+        return Err(AppError::not_found("person"));
     };
-    state.expansions.invalidate_all();
-    let person = public_person(&state, &row, false).await?;
-    state.emit(Event::MembershipChanged {
-        person_id: id.clone(),
-        groups: person.groups.clone(),
-    });
-    state.emit_to(
-        Audience::Person(id.clone()),
-        Event::AccessChanged {
-            person_id: id.clone(),
-        },
-    );
-    Ok(Json(person))
+    // Replaces the manual memberships, clears the expansion cache and sends
+    // `MembershipChanged` (everyone) and `AccessChanged` (the person).
+    groups::set_memberships(&state, &id, &tidy_groups(groups)).await?;
+    Ok(Json(public_person(&state, &row, false).await?))
 }
 
 /// The caller's person row (the agent's owner for an agent).

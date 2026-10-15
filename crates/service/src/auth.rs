@@ -11,18 +11,16 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use chrono::{DateTime, Duration, Utc};
 use margin_shared::{
-    AGENT_TOKEN_PREFIX, Device, Event, Id, LoginState, Me, PollLoginRequest, StartLogin,
-    StartLoginRequest,
+    Device, Event, Id, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
 };
 use serde::Deserialize;
 
-use crate::agents::AgentRow;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::people::{self, Admission};
 use crate::principal::{CurrentPrincipal, PrincipalKind, device_required};
 use crate::secrets::GITHUB_CLIENT_SECRET;
-use crate::state::{AppState, Audience, DeviceRow, new_id, random_token, sha256_hex};
+use crate::state::{AppState, DeviceRow, new_id, random_token, sha256_hex};
 
 pub const LOGIN_TTL_MINUTES: i64 = 10;
 const START_LIMIT_PER_MINUTE: u32 = 10;
@@ -577,22 +575,12 @@ pub async fn me(
                 agent: None,
             }))
         }
-        PrincipalKind::Agent { agent_id, .. } => {
+        PrincipalKind::Agent { .. } => {
             let row = row.ok_or_else(AppError::unauthorized)?;
-            let agent: AgentRow = state
-                .store
-                .get(db::AGENT, agent_id)
+            // The stored token info already holds only its prefix, never the token.
+            let agent = crate::agents::agent_of(&state, &p)
                 .await?
                 .ok_or_else(AppError::unauthorized)?;
-            let mut agent = agent.agent;
-            if let Some(t) = agent.token.as_mut() {
-                // Never more of the token than its prefix.
-                t.prefix = t
-                    .prefix
-                    .chars()
-                    .take(AGENT_TOKEN_PREFIX.len() + 4)
-                    .collect();
-            }
             Ok(Json(Me {
                 github_login: row.person.github_login.clone(),
                 device: None,
@@ -663,11 +651,10 @@ async fn delete_device_locked(state: &AppState, id: &str) -> anyhow::Result<()> 
 fn after_revoke(state: &AppState, row: &DeviceRow) {
     let _ = state.revocations.send(row.id.clone());
     state.devices.forget_device(&row.id);
-    let audience = match &row.person_id {
-        Some(person) => Audience::PersonOrAdmins(person.clone()),
-        None => Audience::Admins,
-    };
-    state.emit_to(audience, Event::DeviceDeleted { id: row.id.clone() });
+    state.emit_to(
+        crate::events::device_audience(row),
+        Event::DeviceDeleted { id: row.id.clone() },
+    );
     tracing::info!(device = %row.id, "device revoked");
 }
 

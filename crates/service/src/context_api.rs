@@ -271,28 +271,15 @@ pub async fn ingest(
     {
         return Err(not_owner());
     }
-    let written =
-        trace::with_principal(p.id.clone(), crate::ingest::ingest_text(&state, &req)).await?;
-    // Whose it is, and (on an agent token) which agent wrote it.
-    let _w = state.write_lock.lock().await;
-    let Some(mut stored) = state
-        .store
-        .get::<Document>(db::DOCUMENT, &written.id)
-        .await?
-    else {
-        return Ok(Json(written));
-    };
-    let actor = if p.is_agent() {
-        p.id.clone()
-    } else {
-        stored.actor.clone()
-    };
-    if stored.owner.as_deref() != Some(p.person_id.as_str()) || stored.actor != actor {
-        stored.owner = Some(p.person_id.clone());
-        stored.actor = actor;
-        state.store.put(db::DOCUMENT, &stored.id, &stored).await?;
-    }
-    Ok(Json(stored))
+    // Whose it is, and (on an agent token) which agent wrote it: written in the same
+    // write as the document, so no reader sees it without its owner.
+    let actor = p.is_agent().then(|| p.id.clone());
+    let written = trace::with_principal(
+        p.id.clone(),
+        crate::ingest::ingest_text_as(&state, &req, Some(&p.person_id), actor.as_deref()),
+    )
+    .await?;
+    Ok(Json(written))
 }
 
 #[derive(Debug, Deserialize)]

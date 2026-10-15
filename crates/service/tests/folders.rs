@@ -754,9 +754,10 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
     let now = Utc::now();
     let cited = StoredLesson {
         lesson: Lesson {
-            access: Vec::new(),
+            // Filed under the topic: its owner and audience (D6).
+            access: topic.access.clone(),
             deny: Vec::new(),
-            owner: None,
+            owner: topic.owner.clone(),
             id: "l-fig".into(),
             topic_id: topic.id.clone(),
             title: "Leaves".into(),

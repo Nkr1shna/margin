@@ -238,13 +238,15 @@ fn output_for(h: &Harness, call_id: &str) -> Value {
 
 /// The principal of the owner whose rows a test seeds directly (no owner: the bootstrap
 /// owner's, L1).
+/// The organisation owner (made by `people-v1` at start) acting for themself.
 async fn owner(h: &Harness) -> Arc<margin_service::principal::Principal> {
-    margin_service::state::person_principal(
-        &h.state,
-        margin_service::principal::BOOTSTRAP_PERSON_ID,
-    )
-    .await
-    .unwrap()
+    let id = match margin_service::people::owner_row(&h.state).await.unwrap() {
+        Some(row) => row.person.id,
+        None => margin_service::principal::BOOTSTRAP_PERSON_ID.to_string(),
+    };
+    margin_service::state::person_principal(&h.state, &id)
+        .await
+        .unwrap()
 }
 
 fn tool_ctx(chat_id: &str) -> ToolContext {
@@ -1068,12 +1070,15 @@ async fn rows_from_before_authorship_read_as_the_owners() {
     let note = json!({
         "id": "n-old", "topic_id": topic.id, "lesson_id": null, "title": "Old note",
         "body_md": "Written long ago.", "quote": null, "created_at": now, "updated_at": now,
+        // Stamped by `people-v1` like every row from before L1.
+        "owner": topic.owner, "access": topic.access,
     });
     h.state.store.put(db::NOTE, "n-old", &note).await.unwrap();
     let lesson = json!({
         "id": "l-old", "topic_id": topic.id, "title": "Old lesson", "summary": "",
         "position": 0, "level": "intro", "minutes": 5, "body_md": "Old body.",
         "status": {"state": "ready"}, "created_at": now, "updated_at": now, "citations": [],
+        "owner": topic.owner, "access": topic.access,
     });
     h.state
         .store
@@ -1833,6 +1838,7 @@ async fn make_video_makes_a_ready_lessons_video() {
         "id": "l-q", "topic_id": topic.id, "title": "Waiting", "summary": "",
         "position": 5, "level": "intro", "minutes": 5, "body_md": "",
         "status": {"state": "queued"}, "created_at": now, "updated_at": now, "citations": [],
+        "owner": topic.owner, "access": topic.access,
     });
     h.state.store.put(db::LESSON, "l-q", &queued).await.unwrap();
     let registry = agent_tools::registry(&h.state);
@@ -2026,9 +2032,10 @@ mod lesson_retrieval {
             }],
         };
         let proposal = Proposal {
-            access: Vec::new(),
+            // The signed-in owner's, private to them (as `POST /api/proposals` stamps).
+            access: topic.access.clone(),
             deny: Vec::new(),
-            owner: None,
+            owner: topic.owner.clone(),
             id: "prop".into(),
             request,
             status: ProposalStatus::Accepted {
@@ -2071,9 +2078,9 @@ mod lesson_retrieval {
         assert_eq!(plain.id, "prop");
         let lesson = StoredLesson {
             lesson: Lesson {
-                access: Vec::new(),
+                access: topic.access.clone(),
                 deny: Vec::new(),
-                owner: None,
+                owner: topic.owner.clone(),
                 citations: Vec::new(),
                 id: "l1".into(),
                 topic_id: topic.id.clone(),

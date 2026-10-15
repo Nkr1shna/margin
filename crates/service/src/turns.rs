@@ -423,8 +423,19 @@ struct Early {
 /// effort; history from `margin_agent::replay_input`), runs the turn, then sets
 /// `Idle` (finished) or `Failed`, and sends the pending message, if any, as the next
 /// turn.
+///
+/// The whole run happens inside `trace::with_principal(<chat owner>)`, so every trace
+/// row it records (model calls, retrieval, tools) names who the turn worked for.
 pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
     let actor = chat_actor(&state, &chat_id).await;
+    trace::with_principal(
+        actor.clone(),
+        run_as(state, chat_id, turn_id, origin, actor),
+    )
+    .await;
+}
+
+async fn run_as(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef, actor: String) {
     // The turn's own row: recorded when the run ends, or as `cancelled` when Stop
     // aborts the task.
     let mut turn_row = SpanGuard::new(
@@ -1843,11 +1854,11 @@ fn spawn_title(state: &AppState, chat_id: &str, turn_id: &str) {
     {
         return;
     }
-    tokio::spawn(write_title(
-        state.clone(),
-        chat_id.to_string(),
-        turn_id.to_string(),
-    ));
+    let (state, chat_id, turn_id) = (state.clone(), chat_id.to_string(), turn_id.to_string());
+    tokio::spawn(async move {
+        let actor = chat_actor(&state, &chat_id).await;
+        trace::with_principal(actor, write_title(state, chat_id, turn_id)).await;
+    });
 }
 
 /// One plain text call on the default provider's small slot (at most

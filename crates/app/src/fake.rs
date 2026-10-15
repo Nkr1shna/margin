@@ -6551,7 +6551,7 @@ fn unauthorized() -> Response {
 fn disabled(person: &Person) -> Response {
     api_error(
         StatusCode::UNAUTHORIZED,
-        "person_disabled",
+        access_code::PERSON_DISABLED,
         &format!(
             "The GitHub account @{} is disabled on this Margin. Ask an admin.",
             person.github_login
@@ -6571,7 +6571,7 @@ fn owner_required() -> Response {
     api_error(
         StatusCode::FORBIDDEN,
         access_code::ADMIN_REQUIRED,
-        "Only the organisation owner can make someone an admin.",
+        "Only the organisation owner can make someone an admin or remove an admin.",
     )
 }
 

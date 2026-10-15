@@ -77,10 +77,10 @@ async fn admins_make_the_tree_and_everyone_reads_it() {
     let bob = seed_person(&h, "bob", OrgRole::Member).await;
     let mut socket = h.socket(&bob).await;
 
-    // `company` is always there.
+    // `company` is always there, with the owner `people-v1` put in it.
     let groups = list(&h, &bob).await;
     assert_eq!(groups.len(), 1);
-    assert_eq!((groups[0].path.as_str(), groups[0].members), ("company", 0));
+    assert_eq!((groups[0].path.as_str(), groups[0].members), ("company", 1));
 
     let r = create(&h, &ada, "company/engineering", "Engineering").await;
     assert_eq!(r.status(), 200);
@@ -214,7 +214,7 @@ async fn memberships_count_block_deletes_and_move_expansions() {
     assert_eq!(
         counts,
         vec![
-            ("company".to_string(), 0),
+            ("company".to_string(), 1),
             ("company/engineering".to_string(), 0),
             ("company/engineering/web".to_string(), 1),
         ]

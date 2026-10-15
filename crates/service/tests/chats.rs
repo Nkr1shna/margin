@@ -653,9 +653,10 @@ async fn read_tools_answer_from_the_library() {
     let now = Utc::now();
     let lesson = StoredLesson {
         lesson: Lesson {
-            access: Vec::new(),
+            // Filed under the topic: its owner and audience (D6).
+            access: topic.access.clone(),
             deny: Vec::new(),
-            owner: None,
+            owner: topic.owner.clone(),
             id: "l1".into(),
             topic_id: topic.id.clone(),
             title: "Coefficients".into(),

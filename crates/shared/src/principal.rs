@@ -322,8 +322,10 @@ pub mod access_code {
     pub const ALREADY_INVITED: &str = "already_invited";
     /// 400: the row comes from an access source other than `manual`.
     pub const MANAGED_BY_SOURCE: &str = "managed_by_source";
+    /// 401: the token's person is disabled (the message is the sentence to show).
+    pub const PERSON_DISABLED: &str = "person_disabled";
 
-    pub const ALL: [&str; 13] = [
+    pub const ALL: [&str; 14] = [
         ADMIN_REQUIRED,
         DEVICE_REQUIRED,
         AGENT_NOT_ALLOWED,
@@ -337,6 +339,7 @@ pub mod access_code {
         ALREADY_MEMBER,
         ALREADY_INVITED,
         MANAGED_BY_SOURCE,
+        PERSON_DISABLED,
     ];
 }
 
@@ -388,7 +391,7 @@ mod tests {
         assert_eq!(ROOT_GROUP, "company");
         assert!(OrgRole::Owner.is_admin() && OrgRole::Admin.is_admin());
         assert!(!OrgRole::Member.is_admin());
-        assert_eq!(access_code::ALL.len(), 13);
+        assert_eq!(access_code::ALL.len(), 14);
     }
 
     #[test]

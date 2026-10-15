@@ -2169,20 +2169,21 @@ mod retrieval_api {
         .unwrap();
         assert!(hits.len() <= 1, "{hits:?}");
 
-        // Access pre-filter: a reader who may only see finance finds nothing here.
-        let hits: Vec<Hit> = context_search(
-            &h,
-            &t,
-            json!({
-                "text": "Carnot", "scope": {"scope": "library"}, "k": 5,
-                "access": ["company/finance"]
-            }),
+        // Access pre-filter: `access` must be a subset of the caller's own paths; a
+        // path the caller can't read is refused, not silently searched.
+        let (status, e) = api_error(
+            context_search(
+                &h,
+                &t,
+                json!({
+                    "text": "Carnot", "scope": {"scope": "library"}, "k": 5,
+                    "access": ["company/finance"]
+                }),
+            )
+            .await,
         )
-        .await
-        .json()
-        .await
-        .unwrap();
-        assert!(hits.is_empty());
+        .await;
+        assert_eq!((status, e.code.as_str()), (400, "bad_access"));
 
         let (status, e) = api_error(
             context_search(
@@ -2301,7 +2302,14 @@ mod retrieval_api {
         // Deleting an agent's document: its passages go and the feed says so.
         use axum::extract::{Path, State};
         use margin_service::context_api::delete_document;
-        let deleted = delete_document(State(h.state.clone()), Path("carnot".into()))
+        use margin_service::principal::{CurrentPrincipal, principal_for_device_token};
+        let me = CurrentPrincipal(
+            principal_for_device_token(&h.state, &t)
+                .await
+                .unwrap()
+                .expect("the owner's device token"),
+        );
+        let deleted = delete_document(State(h.state.clone()), me.clone(), Path("carnot".into()))
             .await
             .unwrap();
         assert_eq!(deleted, axum::http::StatusCode::NO_CONTENT);
@@ -2327,7 +2335,7 @@ mod retrieval_api {
         assert_eq!(changes.deleted, ["carnot"]);
         assert_eq!(changes.generation, 4);
         assert!(changes.changed.is_empty());
-        let err = delete_document(State(h.state.clone()), Path("carnot".into()))
+        let err = delete_document(State(h.state.clone()), me.clone(), Path("carnot".into()))
             .await
             .unwrap_err();
         assert_eq!(err.code, "not_found");
@@ -2340,7 +2348,7 @@ mod retrieval_api {
             .put(db::DOCUMENT, "mine", &owned)
             .await
             .unwrap();
-        let err = delete_document(State(h.state.clone()), Path("mine".into()))
+        let err = delete_document(State(h.state.clone()), me.clone(), Path("mine".into()))
             .await
             .unwrap_err();
         assert_eq!((err.status.as_u16(), err.code), (403, "forbidden"));
@@ -2366,9 +2374,17 @@ mod retrieval_api {
         let t = h.sign_in("Mac").await;
         h.configure_ai(&t).await;
         let topic = seeded(&h, &t).await;
+        // The chat is the signed-in owner's: its tools read with their access.
+        let owner = margin_service::principal::principal_for_device_token(&h.state, &t)
+            .await
+            .unwrap()
+            .expect("the owner's device token")
+            .person_id
+            .clone();
         let chat: Chat = serde_json::from_value(json!({
             "id": "chat1", "title": "c", "state": {"state": "idle"},
             "created_at": Utc::now(), "updated_at": Utc::now(),
+            "owner": owner, "access": [format!("person/{owner}")],
         }))
         .unwrap();
         h.state.store.put(db::CHAT, "chat1", &chat).await.unwrap();

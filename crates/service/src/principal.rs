@@ -145,6 +145,15 @@ pub fn admin_required() -> AppError {
     )
 }
 
+/// 401 `person_disabled`: the sentence matches the one sign-in gives a disabled login.
+pub fn person_disabled(github_login: &str) -> AppError {
+    AppError::new(
+        StatusCode::UNAUTHORIZED,
+        access_code::PERSON_DISABLED,
+        format!("The GitHub account @{github_login} is disabled on this Margin. Ask an admin."),
+    )
+}
+
 pub fn device_required() -> AppError {
     AppError::new(
         StatusCode::FORBIDDEN,
@@ -205,7 +214,8 @@ pub async fn refuse_agents(req: Request, next: Next) -> Response {
 }
 
 /// A device token's principal. `None` (401) for an unknown token, or a device whose
-/// person is missing or disabled.
+/// person is missing; 401 `person_disabled` (with the sentence the sign-in screen shows)
+/// for a device whose person is disabled.
 ///
 /// A device without `person_id` exists only before `people-v1` (which runs before the
 /// service serves): it is the bootstrap owner, synthesised from
@@ -220,6 +230,9 @@ pub async fn principal_for_device_token(
     let person = match &device.person_id {
         Some(id) => match state.store.get::<PersonRow>(db::PERSON, id).await? {
             Some(row) if row.person.state == PersonState::Active => row.person,
+            Some(row) if row.person.state == PersonState::Disabled => {
+                return Err(person_disabled(&row.person.github_login));
+            }
             _ => return Ok(None),
         },
         None if !crate::people::migration_done(state).await? => bootstrap_person(state),
