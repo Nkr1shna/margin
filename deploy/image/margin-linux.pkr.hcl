@@ -43,7 +43,7 @@ build {
 
   # System packages, tools and the GitHub runner (as root).
   provisioner "shell" {
-    environment_vars = ["DEBIAN_FRONTEND=noninteractive"]
+    environment_vars = ["DEBIAN_FRONTEND=noninteractive", "MARGIN_IMAGE=${var.vm_name}-${formatdate("YYYYMMDDhhmm", timestamp())}"]
     execute_command  = "sudo -E sh -eu '{{ .Path }}'"
     script           = "${path.root}/linux-system.sh"
   }

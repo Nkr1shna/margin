@@ -30,6 +30,11 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
+      # Fits the 6 GB runner VM: line tables instead of full debug info (most of the link's
+      # memory; backtraces keep their line numbers) and lld instead of GNU ld.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
       # margin-eval's live commands refuse to run when CI is set; tests never load the
       # real embedding model.
       CI: "true"
@@ -40,18 +45,25 @@ jobs:
           persist-credentials: false
       # Cargo's build output lives outside the checkout (actions/checkout wipes untracked
       # files on every run), so each run only rebuilds what changed.
+      # The cache is named after the environment (pinned Rust from rust-toolchain.toml + the
+      # image build), so a changed toolchain or image starts a fresh one; caches unused for
+      # a week are removed.
       - name: Put Rust on PATH, keep the build cache
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-test" >> "$GITHUB_ENV"
-      - name: Toolchain
-        run: rustc --version
+          rustc --version
+          env_id="$(rustc -V | cut -d' ' -f2)-$(cat /etc/margin-image 2>/dev/null || echo noimage)"
+          cache="$HOME/.cache/margin-ci"
+          echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
+          echo "Cargo cache: $cache/target-test-$env_id"
+          find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --exclude margin-app --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude margin-app --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --workspace --exclude margin-app
+        run: cargo test --locked --workspace --exclude margin-app
 
   # The app (desktop, iOS) on the Mac host runner, and a check that the macOS backends of
   # the service still build (the owner's Mac stays a full dev/eval box, plan Q8).
@@ -68,20 +80,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The cache is named after the environment (pinned Rust + the Xcode build), so an Xcode
+      # or toolchain update starts a fresh one; caches unused for a week are removed.
       - name: Put Rust and Homebrew on PATH, keep the build cache
         run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-test" >> "$GITHUB_ENV"
-      - name: Toolchain
-        run: |
           rustc --version
-          rustup target add aarch64-apple-ios-sim
+          xcodebuild -version
+          env_id="$(rustc -V | cut -d' ' -f2)-xcode$(xcodebuild -version | awk '/Build version/ {print $3}')"
+          cache="$HOME/.cache/margin-ci"
+          echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
+          echo "Cargo cache: $cache/target-test-$env_id"
+          find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
       - name: Clippy (app)
-        run: cargo clippy -p margin-app --all-targets -- -D warnings
+        run: cargo clippy --locked -p margin-app --all-targets -- -D warnings
       - name: Tests (app)
-        run: cargo test -p margin-app
+        run: cargo test --locked -p margin-app
       - name: iOS simulator check
-        run: cargo check -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
+        run: cargo check --locked -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
       - name: macOS service still builds
-        run: cargo check -p margin-service
+        run: cargo check --locked -p margin-service

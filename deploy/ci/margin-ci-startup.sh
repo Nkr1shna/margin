@@ -3,7 +3,7 @@
 # docs/plan-linux-service.md §5). Runs as admin over SSH each time Orchard starts the VM,
 # which is a fresh clone of the margin-linux image every time:
 #
-#   orchard create vm margin-ci --os linux --image margin-linux-v1 --cpu 4 --memory 4096 \
+#   orchard create vm margin-ci --os linux --image margin-linux-v1 --cpu 4 --memory 6144 \
 #     --disk-size 80 --restart-policy OnFailure --labels host=mac-mini \
 #     --host-dirs margin:$HOME/MarginVMs/margin-ci --startup-script @deploy/ci/margin-ci-startup.sh
 #
@@ -31,6 +31,13 @@ if [ ! -x "$runner/run.sh" ]; then
 fi
 
 mkdir -p "$HOME/actions-work" "$HOME/.cache/margin-ci"
+
+# Swap for the peaks of linking the workspace (rustc and the linker together can pass the
+# VM's memory); on the VM's own disk, so a re-clone recreates it.
+if ! swapon --show=NAME --noheadings | grep -q '^/swapfile$'; then
+  [ -f /swapfile ] || { sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile >/dev/null; }
+  sudo swapon /swapfile
+fi
 
 if [ ! -f "$runner/.runner" ]; then
   echo "margin-ci: the runner isn't registered yet (run deploy/ci/register-margin-ci.sh on the host)."

@@ -80,5 +80,9 @@ tar -xzf "$tmp/runner.tgz" -C /opt/actions-runner-dist
 # status into 1. New users get an empty one (admin's is emptied in linux-user.sh).
 : > /etc/skel/.bash_logout
 
+# Which image build this is; CI names its Cargo cache after it, so a new image (new system
+# libraries) starts a fresh cache instead of reusing artifacts built against the old ones.
+echo "${MARGIN_IMAGE:-unknown}" > /etc/margin-image
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
