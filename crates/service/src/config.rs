@@ -13,15 +13,16 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_ALLOWED_LOGIN: &str = "Nkr1shna";
 pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 pub const DEFAULT_GITHUB_OAUTH_URL: &str = "https://github.com";
-/// What a config without `environment` is (the owner's own Mac, set up before deploys).
+/// What a config without `environment` is (the owner's own instance, set up before
+/// deploys).
 pub const DEFAULT_ENVIRONMENT: &str = "prod";
 /// The deploy environments (`docs/plan-deploy.md` §1); `GET /api/version` reports it.
 pub const ENVIRONMENTS: [&str; 2] = ["dev", "prod"];
-/// Where secrets are kept (`docs/plan-linux-service.md` §2.8): the login Keychain, or a
-/// 0600 file (`secrets::FileStore`; a headless Linux service has no unlocked keyring).
-pub const SECRET_STORES: [&str; 2] = ["keychain", "file"];
-/// The secrets file `secrets = "file"` uses when `secrets_file` isn't set: beside the
-/// data folder, not in it, so backups of the data folder never copy keys.
+/// Where secrets are kept (`docs/plan-linux-service.md` §2.8): a 0600 file
+/// (`secrets::FileStore`; a headless Linux service has no unlocked keyring).
+pub const SECRET_STORES: [&str; 1] = ["file"];
+/// The secrets file used when `secrets_file` isn't set: beside the data folder, not in
+/// it, so backups of the data folder never copy keys.
 pub const SECRETS_FILE: &str = "secrets.toml";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,19 +46,17 @@ pub struct Config {
     /// `deploy.sh` and `margin-eval` check it through `GET /api/version`.
     #[serde(default = "default_environment")]
     pub environment: String,
-    /// The embedding backend (`margin_embed::Backend` names: `"coreml"`, `"onnx-q8"`,
-    /// `"onnx-fp32"`, `"onnx-fp16"`). Default: Core ML on macOS, ONNX 8-bit elsewhere.
+    /// The embedding backend (`margin_embed::Backend` names: `"onnx-q8"`, `"onnx-fp32"`,
+    /// `"onnx-fp16"`). Default: ONNX 8-bit.
     #[serde(default = "default_embedder")]
     pub embedder: String,
-    /// `"keychain"` or `"file"` (`SECRET_STORES`). Default: the Keychain on macOS, the
-    /// file elsewhere.
+    /// `"file"` (`SECRET_STORES`), the only store.
     #[serde(default = "default_secrets")]
     pub secrets: String,
     /// The secrets file (`secrets::FileStore`, a 0600 TOML file of `name = "value"`
     /// lines). Setting it means the file store whatever `secrets` says: the dev and prod
     /// VMs set it to a file on the persistent share, which the deploy jobs fill from
-    /// GitHub Environment secrets. Unset, `secrets = "file"` uses `SECRETS_FILE` beside
-    /// `data_dir`.
+    /// GitHub Environment secrets. Unset, `SECRETS_FILE` beside `data_dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets_file: Option<PathBuf>,
 }
@@ -84,39 +83,24 @@ fn default_embedder() -> String {
     margin_embed::Backend::default().name().into()
 }
 fn default_secrets() -> String {
-    if cfg!(target_os = "macos") {
-        "keychain".into()
-    } else {
-        "file".into()
-    }
+    "file".into()
 }
 fn default_data_dir() -> PathBuf {
     app_support_dir().join("data")
 }
 
-/// The service's own folder: `~/Library/Application Support/Margin` on macOS,
-/// `/var/lib/margin` elsewhere (the systemd service's state directory). The data folder
-/// is `data` inside it, the secrets file sits beside that.
+/// The service's own folder: `/var/lib/margin` (the systemd service's state directory).
+/// The data folder is `data` inside it, the secrets file sits beside that.
 pub fn app_support_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join("Library")
-            .join("Application Support")
-            .join("Margin")
-    } else {
-        PathBuf::from(LINUX_STATE_DIR)
-    }
+    PathBuf::from(LINUX_STATE_DIR)
 }
 
-/// Where a Linux service keeps its data (`app_support_dir`).
+/// Where the service keeps its data (`app_support_dir`).
 pub const LINUX_STATE_DIR: &str = "/var/lib/margin";
-/// Where a Linux service's config is (`config_path`).
+/// Where the service's config is (`config_path`).
 pub const LINUX_CONFIG_PATH: &str = "/etc/margin/service.toml";
 
-/// `MARGIN_CONFIG`, or the per-OS default: `~/Library/Application
-/// Support/Margin/service.toml` on macOS, `/etc/margin/service.toml` elsewhere.
+/// `MARGIN_CONFIG`, or `/etc/margin/service.toml`.
 pub fn config_path() -> PathBuf {
     match std::env::var_os("MARGIN_CONFIG") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
@@ -126,11 +110,7 @@ pub fn config_path() -> PathBuf {
 
 /// `config_path` without `MARGIN_CONFIG`.
 pub fn default_config_path() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        app_support_dir().join("service.toml")
-    } else {
-        PathBuf::from(LINUX_CONFIG_PATH)
-    }
+    PathBuf::from(LINUX_CONFIG_PATH)
 }
 
 impl Default for Config {
@@ -192,18 +172,10 @@ impl Config {
         self.secrets = self.secrets.trim().to_ascii_lowercase();
     }
 
-    /// The configured embedding backend; an error for an unknown name or one this binary
-    /// wasn't built with (never a silent fallback to another backend).
+    /// The configured embedding backend; an error for an unknown name (never a silent
+    /// fallback to another backend).
     pub fn embedder_backend(&self) -> anyhow::Result<margin_embed::Backend> {
-        let backend: margin_embed::Backend = self.embedder.parse()?;
-        if !backend.is_built() {
-            bail!(
-                "embedder is \"{backend}\", which this build of margin-service can't run \
-                 (use \"{}\")",
-                margin_embed::Backend::default()
-            );
-        }
-        Ok(backend)
+        Ok(self.embedder.parse()?)
     }
 
     pub fn validate_for_serving(&self) -> anyhow::Result<()> {
@@ -233,23 +205,22 @@ impl Config {
         Ok(())
     }
 
-    /// The secrets file when secrets are kept in a file (`secrets_file`, else
-    /// `SECRETS_FILE` beside `data_dir`), `None` for the Keychain; an error for an unknown
-    /// `secrets`.
-    pub fn secrets_path(&self) -> anyhow::Result<Option<PathBuf>> {
+    /// The secrets file (`secrets_file`, else `SECRETS_FILE` beside `data_dir`); an error
+    /// for a `secrets` other than `"file"` without `secrets_file` (the macOS Keychain store
+    /// is gone: set `secrets = "file"` and move the keys into the file).
+    pub fn secrets_path(&self) -> anyhow::Result<PathBuf> {
         if let Some(file) = &self.secrets_file {
-            return Ok(Some(file.clone()));
+            return Ok(file.clone());
         }
         match self.secrets.as_str() {
-            "keychain" => Ok(None),
             "file" => {
                 let beside = match self.data_dir.parent() {
                     Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
                     _ => self.data_dir.clone(),
                 };
-                Ok(Some(beside.join(SECRETS_FILE)))
+                Ok(beside.join(SECRETS_FILE))
             }
-            other => bail!("secrets is \"{other}\"; it must be \"keychain\" or \"file\""),
+            other => bail!("secrets is \"{other}\"; it must be \"file\""),
         }
     }
 
@@ -276,14 +247,14 @@ impl Config {
         self.data_dir.join("uploads")
     }
 
-    /// The downloaded embedding model of the configured backend (each backend has its
-    /// own folder; an unknown backend falls back to the default's, and serving refuses
-    /// it in `validate_for_serving`).
     /// Where downloaded models are kept: `data_dir/models`.
     pub fn models_dir(&self) -> PathBuf {
         self.data_dir.join("models")
     }
 
+    /// The downloaded embedding model of the configured backend (each backend has its
+    /// own folder; an unknown backend falls back to the default's, and serving refuses
+    /// it in `validate_for_serving`).
     pub fn embedding_model_dir(&self) -> PathBuf {
         let backend = self.embedder.parse().unwrap_or_default();
         self.data_dir
@@ -300,8 +271,8 @@ impl Config {
 
 /// `margin-service setup`: asks for the environment (dev or prod), the public URL, the
 /// GitHub OAuth app's client id and secret, and the allowed GitHub login; stores the secret
-/// in the store the config names (`secrets`/`secrets_file`: the Keychain by default on
-/// macOS, the secrets file elsewhere) and writes the config file.
+/// in the secrets file (`secrets_file`, else beside the data folder) and writes the config
+/// file.
 pub fn run_setup(path: &Path) -> anyhow::Result<()> {
     let existing = if path.exists() {
         Config::load(path).ok()
@@ -486,75 +457,52 @@ mod tests {
     }
 
     #[test]
-    fn paths_default_per_os() {
+    fn paths_default_to_the_linux_service() {
         let data = default_data_dir();
-        assert!(data.ends_with("data"));
-        if cfg!(target_os = "macos") {
-            // Unchanged on the Mac.
-            assert!(
-                data.to_string_lossy()
-                    .ends_with("Library/Application Support/Margin/data")
-            );
-            assert!(
-                default_config_path()
-                    .to_string_lossy()
-                    .ends_with("Library/Application Support/Margin/service.toml")
-            );
-        } else {
-            assert_eq!(data, Path::new("/var/lib/margin/data"));
-            assert_eq!(default_config_path(), Path::new("/etc/margin/service.toml"));
-            // The secrets file: /var/lib/margin/secrets.toml, outside the backed-up data.
-            let c = Config::default();
-            assert_eq!(
-                c.secrets_path().unwrap().unwrap(),
-                Path::new("/var/lib/margin/secrets.toml")
-            );
-        }
+        assert_eq!(data, Path::new("/var/lib/margin/data"));
+        assert_eq!(default_config_path(), Path::new("/etc/margin/service.toml"));
+        // The secrets file: /var/lib/margin/secrets.toml, outside the backed-up data.
+        let c = Config::default();
+        assert_eq!(
+            c.secrets_path().unwrap(),
+            Path::new("/var/lib/margin/secrets.toml")
+        );
     }
 
     #[test]
-    fn embedder_and_secrets_default_per_os_and_are_checked() {
+    fn embedder_and_secrets_have_defaults_and_are_checked() {
         let c: Config = toml::from_str("github_client_id = \"id\"").unwrap();
         let backend = margin_embed::Backend::default();
         assert_eq!(c.embedder, backend.name());
         assert_eq!(c.embedder_backend().unwrap(), backend);
         assert!(c.embedding_model_dir().ends_with(backend.dir_name()));
         assert_eq!(c.model_files().backend, backend);
-        assert_eq!(
-            c.secrets,
-            if cfg!(target_os = "macos") {
-                "keychain"
-            } else {
-                "file"
-            }
-        );
+        assert_eq!(c.secrets, "file");
         c.validate_for_serving().unwrap();
-        let mut bad = c.clone();
-        bad.embedder = "tensorflow".into();
-        assert!(
-            bad.validate_for_serving()
-                .unwrap_err()
-                .to_string()
-                .contains("onnx-q8")
-        );
-        let mut other = c.clone();
-        other.embedder = if cfg!(target_os = "macos") {
-            "onnx-q8"
-        } else {
-            "coreml"
+        // Unknown names are refused, Core ML's (the Mac service's) among them.
+        for name in ["tensorflow", "coreml"] {
+            let mut bad = c.clone();
+            bad.embedder = name.into();
+            assert!(
+                bad.validate_for_serving()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("onnx-q8")
+            );
         }
-        .into();
-        // Refused when this binary can't run it (macOS builds the service without `onnx`).
-        let built = other.model_files().backend.is_built();
-        assert_eq!(other.validate_for_serving().is_ok(), built);
+        let mut other = c.clone();
+        other.embedder = "onnx-fp32".into();
+        other.validate_for_serving().unwrap();
         assert!(
             other
                 .model_files()
                 .dir
-                .ends_with(other.model_files().backend.dir_name())
+                .ends_with("embeddinggemma-2-onnx-fp32")
         );
-        let mut secrets = c;
-        secrets.secrets = "vault".into();
-        assert!(secrets.validate_for_serving().is_err());
+        for name in ["vault", "keychain"] {
+            let mut secrets = c.clone();
+            secrets.secrets = name.into();
+            assert!(secrets.validate_for_serving().is_err());
+        }
     }
 }

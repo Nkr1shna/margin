@@ -1,12 +1,10 @@
 //! The ONNX text embedder through the public API. Without a model only the load errors
 //! and selection are checked; with `MARGIN_REAL_MODEL_TESTS=1` and a downloaded ONNX
-//! model (`MARGIN_EMBED_ONNX_DIR`, default `~/Library/Caches/margin-embed-test/onnx-q8`,
-//! or `$XDG_CACHE_HOME`/`~/.cache` on Linux; the format comes from
-//! `MARGIN_EMBED_BACKEND`, default `onnx-q8`) the real model is loaded on the CPU and
-//! checked. Download one with
+//! model (`MARGIN_EMBED_ONNX_DIR`, default `$XDG_CACHE_HOME` or
+//! `~/.cache`/`margin-embed-test/onnx-q8`; the format comes from `MARGIN_EMBED_BACKEND`,
+//! default `onnx-q8`) the real model is loaded on the CPU and checked. Download one with
 //! `MARGIN_EMBED_BACKEND=onnx-q8 MARGIN_EMBED_DOWNLOAD_TO=<dir> cargo test -p margin-embed
-//! --features onnx real_download_when_asked`.
-#![cfg(any(target_os = "linux", feature = "onnx"))]
+//! real_download_when_asked`.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -55,11 +53,8 @@ fn files() -> Option<ModelFiles> {
         Some(dir) => PathBuf::from(dir),
         None => {
             let home = PathBuf::from(std::env::var_os("HOME")?);
-            let cache = if cfg!(target_os = "macos") {
-                home.join("Library/Caches")
-            } else {
-                std::env::var_os("XDG_CACHE_HOME").map_or(home.join(".cache"), PathBuf::from)
-            };
+            let cache =
+                std::env::var_os("XDG_CACHE_HOME").map_or(home.join(".cache"), PathBuf::from);
             cache.join("margin-embed-test").join(backend.name())
         }
     };
@@ -160,7 +155,7 @@ fn real_model_batches_match_one_by_one_and_pipelined() {
 fn real_encoder_graphs_are_described() {
     let Some(files) = files() else { return };
     for graph in ["model", "vision_encoder", "audio_encoder"] {
-        let path = files.graph_path(graph).unwrap();
+        let path = files.graph_path(graph);
         let (inputs, outputs) = margin_embed::onnx::describe_graph(&path).unwrap();
         eprintln!("{graph}:");
         for p in &inputs {

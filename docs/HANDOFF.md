@@ -16,8 +16,8 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
 | `docs/agent-engine-review.md` | Fable's review of the ACP/CLI-engine idea. Background only, superseded by the providers decision |
 | `docs/service-setup.md` | How the service and Cloudflare Tunnel run |
 | `docs/plan-dogfood.md` | **D (dogfood)**: Margin as the knowledge base for building Margin. `crates/mcp` (`margin-mcp serve/login/ingest/ingest-dir/purge`), `.mcp.json`, `/margin-handoff`, the automatic `SessionEnd` summary, `scripts/{ingest-docs,claude-session-summary}.sh` (the backup script is now `deploy/scripts/backup-margin.sh`); merged with R1 (live once the owner installs the service and runs `margin-mcp login`) |
-| `docs/plan-deploy.md` | **E (deploy)**: dev and prod as Orchard-managed macOS 26 VMs on the Mac mini (`devmargin.` / `margin.krishnanelloore.com`), everything durable on a host folder shared into each VM (Orchard re-clones the guest disk on every restart), `deploy/scripts/{provision-guest,deploy,backup-margin,restore-into-dev}.sh`, launchd and cloudflared templates, `.github/workflows/{test,build-service,deploy-dev,promote-prod,apps}.yml` on the host runner (`[self-hosted, macOS, ARM64, margin]`), `GET /api/version`, `environment` in `service.toml`, `margin-service scrub-restored`, each app build pinned to its service (§10; no picker), `margin-eval --service-url` (never prod). Built on `agent/e-deploy`; the owner's steps are §7 and the GitHub settings §4 |
-| `docs/plan-linux-service.md` | **LX (Linux service)**: inference on Linux VMs with the Mac kept. Built on `agent/lx-embed`: the first commit (`margin_embed::Backend` + per-backend `embedder_version`, `ModelFiles.backend`, per-backend download manifests, `OnnxOptions`, the `onnx`/`linux-readers`/`heic`/`speech-onnx` features and the Linux dependency table, `PipelineConfig.embedder`, `service.toml` `embedder`/`secrets`, the dense leg's `embedder = $embedder` conjunct, rows stamped with `Embedder::version`) and LX-embed-text (`OnnxEmbedder` text path on `ort` CPU with `PreferCPU`, real batching, `embed_pipelined`, idle-unload scaffold). Media, speech, service wiring, sandbox, evals and deploy areas follow §6 |
+| `docs/plan-deploy.md` | **E (deploy)**: dev and prod as Orchard-managed Linux (Ubuntu 24.04, systemd) VMs on the Mac mini (first built as macOS 26 VMs) (`devmargin.` / `margin.krishnanelloore.com`), everything durable on a host folder shared into each VM (Orchard re-clones the guest disk on every restart), `deploy/scripts/{provision-guest,deploy,backup-margin,restore-into-dev}.sh`, systemd and cloudflared templates, `.github/workflows/{test,build-service,deploy-dev,promote-prod,apps}.yml` on the host runner (`[self-hosted, macOS, ARM64, margin]`), `GET /api/version`, `environment` in `service.toml`, `margin-service scrub-restored`, each app build pinned to its service (§10; no picker), `margin-eval --service-url` (never prod). Built on `agent/e-deploy`; the owner's steps are §7 and the GitHub settings §4 |
+| `docs/plan-linux-service.md` | **LX (Linux service)**: inference on Linux VMs; built, and since `chore/linux-only-service` the only service platform (the macOS backends are removed, see its status line). Built on `agent/lx-embed`: the first commit (`margin_embed::Backend` + per-backend `embedder_version`, `ModelFiles.backend`, per-backend download manifests, `OnnxOptions`, the `onnx`/`linux-readers`/`heic`/`speech-onnx` features and the Linux dependency table, `PipelineConfig.embedder`, `service.toml` `embedder`/`secrets`, the dense leg's `embedder = $embedder` conjunct, rows stamped with `Embedder::version`) and LX-embed-text (`OnnxEmbedder` text path on `ort` CPU with `PreferCPU`, real batching, `embed_pipelined`, idle-unload scaffold). Media, speech, service wiring, sandbox, evals and deploy areas follow §6 |
 | `docs/agent-rag-architecture.md` | **R1** (RAG pipeline): target architecture, eval suite, build brief §6; §2.2 lists the SurrealDB 3.3.4 deviations the build found |
 
 ## Status
@@ -43,8 +43,8 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
     - History stays verbatim per provider (`Chat.provider` is immutable), with Claude-specific replay.
     - Web search and fetch show as tool rows, a `Card::WebResults` card and cited Sources.
     - New error codes: `auth_failed`, `spend_limit_reached`, `plan_limit_reached`, `plan_ineligible`.
-    - Three Keychain entries on the service Mac.
-    - The SIWC OAuth runs in the service, and the owner signs in in a browser on that Mac.
+    - Three secrets in the service's secrets file.
+    - The SIWC OAuth runs in the service, and the owner signs in in a browser.
   - **Areas:** P-ai-openai, P-ai-claude, P-agent, P-service and P-app, after a first commit.
   - **Sequencing (Fable):**
     1. Phase 4 first.
@@ -52,6 +52,7 @@ Written 2026-10-14 so the build can continue from a new Claude Code project. Wor
     3. Then providers.
     4. Then phase 5.
   - **Spike outcome:** if registration or inference fails, ChatGPT is dropped (unselectable) and the rest goes ahead. If only web search fails, ChatGPT ships without it.
+- **Linux-only service** (owner, 2026-10-14: "now that linux is up can you remove macos related service leftovers?"): on `chore/linux-only-service`. Removed from the service side: the Core ML embedder (`Backend::CoreMl`, `coreml.rs`, its downloads and manifests), the PDFKit/Vision/ImageIO/AVFoundation readers, FluidAudio (speech and narration), `sandbox-exec`, the Keychain secret store, the LaunchAgent branch of `backup-margin.sh`, every macOS `cfg` arm and the `objc2-*`/`keyring`/`libc` dependencies of the service crates; the `onnx`/`linux-readers`/`speech-onnx` features are gone (all always built). Defaults are the Linux ones on every OS (`onnx-q8`, the secrets file, `/etc/margin`, `/var/lib/margin`, bubblewrap, `margin-tts`); the service still builds and tests on macOS, where rendering refuses with "only available on Linux". Core ML-stamped passages are re-embedded by the existing one-pass re-embed; the pipeline's default `embedder` stage keeps the name `coreml` so stored hashes keep their meaning. The apps are untouched (their own device-token Keychain use included).
 - **Phase 5** (hardening plus iOS BGContinuedProcessingTask for any chat reading a folder on that device): not started.
 - **Hands-on run:** when every phase is in, rebuild and install the app and service.
 
@@ -120,7 +121,6 @@ The reusable script is `margin-agent-phase` (args: phase, base, extra, first, ar
 - iOS check: `cargo check -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile`
 - Android: `ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724`, `JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`. Android has never been built for the agent; phase 4c must run `dx build -p margin-app --platform android`.
 - Release app: `dx bundle -p margin-app --platform desktop --package-types macos --release`, then `codesign --force --deep --sign -`.
-- Every new service binary path triggers a macOS Keychain "Always Allow" prompt for media-signing-key. The owner has to click it.
 - Fixed: `sources::unsupported_oversized_and_misfiled_uploads_are_rejected` was flaky because the service answered 413 while the client was still sending; refused bodies are now drained (bounded) before the answer.
 
 ## Owner's current test install

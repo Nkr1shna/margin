@@ -1,12 +1,9 @@
-//! OCR off macOS: the `tesseract` 5 CLI (apt `tesseract-ocr tesseract-ocr-eng`,
-//! Apache-2.0), run as a subprocess the way `fluidaudiocli` is
-//! (`docs/plan-linux-service.md` §2.3): the picture is written to a temporary PNG and
-//! read with `tesseract <png> stdout --psm 3 -l eng`.
+//! OCR: the `tesseract` 5 CLI (apt `tesseract-ocr tesseract-ocr-eng`, Apache-2.0), run
+//! as a subprocess (`docs/plan-linux-service.md` §2.3): the picture is written to a
+//! temporary PNG and read with `tesseract <png> stdout --psm 3 -l eng`.
 //!
 //! Without `tesseract`, OCR gives no text (images and scanned pages ingest with their
 //! pictures only) and the service shows a warning (`find_tesseract` is how it knows).
-// On macOS these build (the `linux-readers` feature) for their tests; Linux reads with them.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

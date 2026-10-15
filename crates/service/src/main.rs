@@ -18,16 +18,16 @@ Usage:
   margin-service setup                               Write the config and store the GitHub client secret
   margin-service serve [--allow-unsandboxed-render]  Run the service
   margin-service download-model [--embedder NAME]    Download the embedding model (the configured
-                                                     embedder, or NAME: coreml, onnx-q8,
+                                                     embedder, or NAME: onnx-q8,
                                                      onnx-fp32, onnx-fp16) without the app,
-                                                     and on Linux the speech model
+                                                     and the speech model
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
   margin-service version                             Print the build's version and commit
 ";
 
-/// Where the config is read from on this OS, for the help text.
+/// Where the config is read from, for the help text.
 fn config_help() -> String {
     format!(
         "Config: $MARGIN_CONFIG, or {}",
@@ -115,7 +115,6 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         }
         let secrets = config.secret_store()?;
         // Tools a user installed without root (the pdfium library) are looked for here.
-        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
         margin_embed::set_tools_dir(config.data_dir.join("tools"));
         let source_tools = Arc::new(EmbedTools::new(&config.models_dir()));
         let store = Store::open(&config.db_dir()).await?;
@@ -147,9 +146,9 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
     })
 }
 
-/// Downloads the embedding model into the data folder, and the speech model where this
-/// build transcribes with one (Linux), printing progress: what the Settings buttons do,
-/// for a headless box (the provisioning script runs it).
+/// Downloads the embedding model and the speech model into the data folder, printing
+/// progress: what the Settings buttons do, for a headless box (the provisioning script
+/// runs it).
 fn download_model(embedder: Option<margin_embed::Backend>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

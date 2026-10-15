@@ -3,10 +3,9 @@
 //! chunk's non-overlap region, chunks keep the hard cap, sections and lines are right,
 //! tables and code blocks stay whole, hashes are stable and change only where the text
 //! does, and a recording replays the corpus exactly. Fakes and recordings only: the
-//! token counter is `FakeEmbedder`'s, and no real model is loaded. The PDF and image
-//! tests use PDFKit and Vision on macOS, not the embedding model; their Linux twins
-//! (pdfium, tesseract, `image`, ffmpeg) run only with `MARGIN_REAL_TOOLS=1`, and the ONNX
-//! media encoders on the corpus only with `MARGIN_REAL_MODEL_TESTS=1` and a model.
+//! token counter is `FakeEmbedder`'s, and no real model is loaded. The readers (pdfium,
+//! tesseract, `image`, ffmpeg) run on the corpus only with `MARGIN_REAL_TOOLS=1`, and the
+//! ONNX media encoders only with `MARGIN_REAL_MODEL_TESTS=1` and a model.
 
 use std::path::{Path, PathBuf};
 
@@ -340,137 +339,8 @@ fn the_corpus_folder_tree_is_what_the_chunker_expects() {
     );
 }
 
-#[cfg(target_os = "macos")]
-mod mac {
-    //! PDFKit and Vision on the corpus PDFs and images (no embedding model).
-
-    use super::*;
-
-    /// Vision runs very slowly when several tests call it at once; one at a time.
-    static VISION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-        VISION.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The pages of a PDF's source text (pages separated by a `\f` line).
-    fn source_pages(name: &str) -> Vec<String> {
-        std::fs::read_to_string(corpus().join("sources").join(name))
-            .unwrap()
-            .split("\n\\f\n")
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[test]
-    fn pdfs_are_read_lazily_and_pages_rendered_on_demand() {
-        let _vision = one_at_a_time();
-        let pdf = corpus().join("pdf/rc-circuits.pdf");
-        let media = temp_dir("pdf-media");
-        let doc = margin_embed::extract_lazy(&pdf, SourceKind::Pdf, &media).unwrap();
-        let sources = source_pages("rc-circuits.txt");
-        assert_eq!(doc.pages.len(), sources.len());
-        assert!(doc.pictures.is_empty());
-        assert_eq!(std::fs::read_dir(&media).unwrap().count(), 0);
-        assert_eq!(doc.format, TextFormat::Plain);
-        for (page, source) in doc.pages.iter().zip(&sources) {
-            let first = source.lines().next().unwrap();
-            assert!(
-                normalize(&page.text).contains(&normalize(first)),
-                "{first:?}"
-            );
-        }
-        // The eager path still renders every page.
-        let eager = margin_embed::extract(&pdf, SourceKind::Pdf, &media).unwrap();
-        assert_eq!(eager.pictures.len(), eager.pages.len());
-        assert_eq!(eager.pages, doc.pages);
-
-        let out = temp_dir("pdf-page").join("page-2.png");
-        margin_embed::pdf_page_picture(&pdf, 2, &out).unwrap();
-        assert_eq!(
-            std::fs::read(&out).unwrap(),
-            std::fs::read(&eager.pictures[1].path).unwrap()
-        );
-        assert!(margin_embed::pdf_page_picture(&pdf, 0, &out).is_err());
-        let past = margin_embed::pdf_page_picture(&pdf, 99, &out).unwrap_err();
-        assert!(past.to_string().contains("no page 99"), "{past}");
-
-        // Page chunks: page numbers, no lines, no headings.
-        let chunks = margin_embed::chunk_sections(&doc, SourceKind::Pdf, &count, &SMALL);
-        assert!(
-            chunks
-                .iter()
-                .all(|c| c.page.is_some() && c.start_line.is_none())
-        );
-        assert!(
-            chunks
-                .iter()
-                .all(|c| c.section_path.is_empty() && !c.hash.is_empty())
-        );
-    }
-
-    #[test]
-    fn a_scanned_pdf_is_read_with_ocr() {
-        let _vision = one_at_a_time();
-        let doc = margin_embed::extract_lazy(
-            &corpus().join("pdf/glacier-scan.pdf"),
-            SourceKind::Pdf,
-            &temp_dir("scan"),
-        )
-        .unwrap();
-        let text = normalize(
-            &doc.pages
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<String>(),
-        )
-        .to_lowercase();
-        assert!(text.contains("accumulation zone"), "{text}");
-        assert!(text.contains("equilibrium line"), "{text}");
-    }
-
-    #[test]
-    fn diagram_labels_are_the_images_text_and_photos_have_none() {
-        let _vision = one_at_a_time();
-        let read = |name: &str| {
-            margin_embed::extract(
-                &corpus().join("images").join(name),
-                SourceKind::Image,
-                &temp_dir("img"),
-            )
-            .unwrap()
-        };
-        let calvin = read("calvin-cycle.png");
-        assert_eq!(calvin.pictures.len(), 1);
-        assert_eq!(calvin.pages.len(), 1);
-        let text = calvin.pages[0].text.to_lowercase();
-        assert!(text.contains("calvin cycle"), "{text}");
-        assert!(text.contains("rubisco"), "{text}");
-        let carnot = read("carnot-pv-diagram.png");
-        assert!(
-            carnot.pages[0].text.to_lowercase().contains("adiabatic"),
-            "{carnot:?}"
-        );
-        // The image's text chunks like any OCR text: one unit, no lines.
-        let chunks = margin_embed::chunk_sections(
-            &calvin,
-            SourceKind::Image,
-            &count,
-            &SectionsCfg::default(),
-        );
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].start_line.is_none());
-        for scene in ["scene-red-bicycle.png", "scene-sailboat-sunset.png"] {
-            let doc = read(scene);
-            assert_eq!(doc.pictures.len(), 1);
-            assert!(doc.pages.is_empty(), "{scene}: {:?}", doc.pages);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod linux {
-    //! The Linux readers (pdfium, tesseract, `image`, ffmpeg) on the corpus, through the
+mod readers {
+    //! The readers (pdfium, tesseract, `image`, ffmpeg) on the corpus, through the
     //! public API, with the real programs: only with `MARGIN_REAL_TOOLS=1`, which the
     //! Linux runner sets because it has the apt packages and the pdfium library.
 
@@ -627,7 +497,6 @@ mod linux {
 /// The samples of the mel fixture (`tests/fixtures/mel/speech.mel.bin`): 2.5 s of
 /// synthesized speech, 16 kHz mono ("The Carnot cycle has two isothermal and two
 /// adiabatic steps.").
-#[cfg(any(target_os = "linux", feature = "onnx"))]
 fn speech_samples() -> Vec<f32> {
     let bytes = std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mel/speech.mel.bin"),
@@ -643,7 +512,6 @@ fn speech_samples() -> Vec<f32> {
         .collect()
 }
 
-#[cfg(any(target_os = "linux", feature = "onnx"))]
 mod onnx_media {
     //! The ONNX image and audio encoders on the corpus pictures and the speech fixture,
     //! with the real model: only with `MARGIN_REAL_MODEL_TESTS=1` and a downloaded ONNX
@@ -677,7 +545,7 @@ mod onnx_media {
         };
         // The encoders' graphs, for the record.
         for graph in ["vision_encoder", "audio_encoder"] {
-            let path = files.graph_path(graph).unwrap();
+            let path = files.graph_path(graph);
             eprintln!(
                 "{graph}: {:?}",
                 margin_embed::onnx::describe_graph(&path).unwrap()

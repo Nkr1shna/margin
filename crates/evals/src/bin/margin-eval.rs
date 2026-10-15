@@ -203,12 +203,14 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     } else {
         paths
     };
-    // The backend: the environment's, the variant's `[embedder]`, or the service's.
+    // The backend: the environment's, the variant's `[embedder]`, or the service's. A
+    // variant without one names the legacy default, which means the service's.
     let service = live::service_config()?;
     let variant_embedder = match cmd {
         Command::Run { variant, .. }
         | Command::RecordGenerations { variant }
-        | Command::SynthQuestions { variant, .. } => Some(paths.variant(variant)?.0.embedder.name),
+        | Command::SynthQuestions { variant, .. } => Some(paths.variant(variant)?.0.embedder.name)
+            .filter(|n| n != margin_shared::pipeline::DEFAULT_EMBEDDER),
         _ => None,
     };
     let backend = live::live_backend(
@@ -253,8 +255,8 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
         Box::leak(Box::new(RecordingVectors::new(embedder, seed)?));
     // `record_embeddings` writes `EMBEDDINGS_FILE` and `EXTRACTED_FILE` under `out`: for
     // another backend or reader it writes into a staging folder (seeded with that
-    // backend's recording) whose files are then copied to their own names, so the Core
-    // ML recording and the Mac extraction are never overwritten.
+    // backend's recording) whose files are then copied to their own names, so the
+    // baseline recording and extraction are never overwritten.
     let staged = recording_file != paths.evals.join(EMBEDDINGS_FILE)
         || extraction_file != paths.evals.join(EXTRACTED_FILE);
     let stage = data.join("record-staging").join(backend.dir_name());

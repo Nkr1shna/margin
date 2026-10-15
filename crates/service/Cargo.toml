@@ -12,13 +12,6 @@ path = "src/main.rs"
 name = "margin_service"
 path = "src/lib.rs"
 
-[features]
-# Build the Linux paths on macOS, to check them here (both are always on for Linux):
-# the Linux readers' Tools rows and OCR warning, and Parakeet speech recognition (which
-# then transcribes in place of fluidaudiocli).
-linux-readers = ["margin-embed/linux-readers"]
-speech-onnx = ["margin-embed/speech-onnx"]
-
 [dependencies]
 margin-shared.workspace = true
 margin-ai.workspace = true
@@ -39,7 +32,6 @@ globset = "=0.4.18"
 futures-util.workspace = true
 axum = { version = "=0.8.9", features = ["ws"] }
 surrealdb = { version = "=3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
-keyring = "=4.2.0"
 tower-http = { version = "=0.7.1", features = ["fs"] }
 tower = { version = "=0.5.3", features = ["util"] }
 hmac = "=0.13.0"
@@ -57,7 +49,3 @@ jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["use
 
 [dev-dependencies]
 tokio-tungstenite = "=0.30.0"
-
-# proc_pidinfo and hw.memsize for GET /api/version (version.rs).
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "=0.2.190"

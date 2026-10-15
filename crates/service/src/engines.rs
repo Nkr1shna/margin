@@ -149,17 +149,14 @@ fn claude_client(config: &ProviderConfig) -> ClaudeClient {
     )
 }
 
-/// `margin_video`'s ManimGX + FluidAudio pipeline.
+/// `margin_video`'s ManimGX + `margin-tts` pipeline.
 pub struct VideoRenderer;
 
 impl Renderer for VideoRenderer {
-    /// On Linux the source readers' rows (tesseract, ffmpeg, pdfium) say where
-    /// `margin_embed` finds them, which also looks in the service's tools folder.
+    /// The source readers' rows (tesseract, ffmpeg, pdfium) say where `margin_embed`
+    /// finds them, which also looks in the service's tools folder.
     fn detect_tools(&self) -> BoxFuture<'_, Vec<ToolStatus>> {
-        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
-        return Box::pin(margin_video::detect_tools_with(reader_tools()));
-        #[cfg(not(any(target_os = "linux", feature = "linux-readers")))]
-        Box::pin(margin_video::detect_tools())
+        Box::pin(margin_video::detect_tools_with(reader_tools()))
     }
 
     fn render<'a>(
@@ -172,8 +169,7 @@ impl Renderer for VideoRenderer {
     }
 }
 
-/// Where `margin_embed`'s Linux readers find their programs and library.
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+/// Where `margin_embed`'s readers find their programs and library.
 pub fn reader_tools() -> margin_video::ReaderTools {
     margin_video::ReaderTools {
         tesseract: margin_embed::find_tesseract(),
@@ -238,14 +234,10 @@ pub trait SourceTools: Send + Sync + 'static {
     ) -> Result<Option<Transcript>, EmbedError>;
     /// Why `transcribe` gives `Ok(None)`: what is missing and where to get it.
     fn no_transcriber(&self) -> String {
-        format!(
-            "{} isn't installed on the service (Settings → Tools shows how to install it)",
-            margin_embed::FLUIDAUDIOCLI
-        )
+        "the speech model isn't downloaded (Settings → Sources downloads it)".to_string()
     }
     /// The speech model this service downloads and transcribes with (Parakeet on ONNX
-    /// Runtime, Linux); `None` where an installed program transcribes (`fluidaudiocli`
-    /// on a Mac).
+    /// Runtime); `None` for a test fake without one.
     fn speech_model(&self) -> Option<&dyn SpeechModel> {
         None
     }
@@ -317,22 +309,17 @@ pub trait SpeechModel: Send + Sync {
     fn remove(&self) -> Result<(), EmbedError>;
 }
 
-/// `margin_embed`: EmbeddingGemma 2 on the configured backend (Core ML on macOS, ONNX
-/// Runtime on Linux) and the platform's readers. On Linux speech is recognized
-/// in-process by Parakeet (`margin_embed::transcript_parakeet`), whose model is
-/// downloaded into `data_dir/models` like the embedder's; on a Mac by `fluidaudiocli`.
+/// `margin_embed`: EmbeddingGemma 2 on the configured ONNX backend and the readers.
+/// Speech is recognized in-process by Parakeet (`margin_embed::transcript_parakeet`),
+/// whose model is downloaded into `data_dir/models` like the embedder's.
 pub struct EmbedTools {
-    #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
     speech: ParakeetModel,
 }
 
 impl EmbedTools {
     /// The tools for a service keeping its models in `models_dir` (`data_dir/models`).
     pub fn new(models_dir: &Path) -> Self {
-        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
-        let _ = models_dir;
         Self {
-            #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
             speech: ParakeetModel::new(models_dir),
         }
     }
@@ -340,12 +327,10 @@ impl EmbedTools {
 
 /// Parakeet TDT 0.6B v3 (int8) on ONNX Runtime: loaded on first use, dropped after
 /// `SPEECH_IDLE` unused.
-#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
 struct ParakeetModel {
     parakeet: margin_embed::transcript_parakeet::Parakeet,
 }
 
-#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
 impl ParakeetModel {
     /// Threads the recognizer runs on: half the cores (at least 1, at most 4), so
     /// transcribing leaves room for the embedder and the service.
@@ -367,7 +352,6 @@ impl ParakeetModel {
     }
 }
 
-#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
 impl SpeechModel for ParakeetModel {
     fn repo(&self) -> String {
         margin_embed::transcript_parakeet::PARAKEET_REPO.to_string()
@@ -437,8 +421,7 @@ impl SourceTools for EmbedTools {
         files.remove()
     }
 
-    /// The backend `files.backend` names (`service.toml`'s `embedder`): Core ML on
-    /// macOS, ONNX Runtime on Linux; an error for one this build can't run.
+    /// The backend `files.backend` names (`service.toml`'s `embedder`).
     fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
         margin_embed::load_embedder(files)
     }
@@ -461,61 +444,30 @@ impl SourceTools for EmbedTools {
         margin_embed::extract_lazy(path, kind, media_dir)
     }
 
-    /// Linux: Parakeet in-process, once its model is downloaded. macOS: with
-    /// `fluidaudiocli` (Parakeet on Core ML), found like the video pipeline finds it.
+    /// Parakeet in-process, once its model is downloaded.
     fn transcribe(
         &self,
         samples: &[f32],
-        work_dir: &Path,
+        _work_dir: &Path,
     ) -> Result<Option<Transcript>, EmbedError> {
-        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
-        {
-            let _ = work_dir;
-            if !self.speech.is_complete() {
-                return Ok(None);
-            }
-            self.speech.parakeet.transcribe(samples).map(Some)
+        if !self.speech.is_complete() {
+            return Ok(None);
         }
-        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
-        {
-            let Some(cli) = margin_embed::find_fluidaudiocli() else {
-                return Ok(None);
-            };
-            margin_embed::transcribe(&cli, samples, work_dir).map(Some)
-        }
-    }
-
-    fn no_transcriber(&self) -> String {
-        if self.speech_model().is_some() {
-            "the speech model isn't downloaded (Settings → Sources downloads it)".to_string()
-        } else {
-            format!(
-                "{} isn't installed on the service (Settings → Tools shows how to install it)",
-                margin_embed::FLUIDAUDIOCLI
-            )
-        }
+        self.speech.parakeet.transcribe(samples).map(Some)
     }
 
     fn speech_model(&self) -> Option<&dyn SpeechModel> {
-        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
-        return Some(&self.speech);
-        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
-        None
+        Some(&self.speech)
     }
 
     fn ocr_missing(&self) -> Option<String> {
-        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
-        if cfg!(target_os = "linux") && margin_embed::find_tesseract().is_none() {
-            return Some(
-                "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
-                    .to_string(),
-            );
-        }
-        None
+        margin_embed::find_tesseract().is_none().then(|| {
+            "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
+                .to_string()
+        })
     }
 
     fn sweep(&self) {
-        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
         if self.speech.parakeet.sweep() {
             tracing::info!("the speech model was unloaded after being unused");
         }
@@ -577,7 +529,7 @@ pub mod model_download {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context, bail};
+    use anyhow::Context;
     use margin_embed::{Backend, ModelFiles};
 
     use super::{SourceTools, SpeechModel};
@@ -607,15 +559,12 @@ pub mod model_download {
     }
 
     /// The files to download: the configured backend's, or `embedder`'s (into its own
-    /// folder under `data_dir/models`). A backend this build can't run is refused.
+    /// folder under `data_dir/models`).
     pub fn files_for(config: &Config, embedder: Option<Backend>) -> anyhow::Result<ModelFiles> {
         let backend = match embedder {
             Some(b) => b,
             None => config.embedder_backend()?,
         };
-        if !backend.is_built() {
-            bail!("this build of margin-service can't run the {backend} embedder");
-        }
         Ok(ModelFiles::with_backend(
             config.data_dir.join("models").join(backend.dir_name()),
             backend,
@@ -899,7 +848,15 @@ pub mod model_download {
                 args(&["--embedder", "onnx-q8"]),
                 Ok(Some(Backend::Onnx(OnnxDtype::Q8)))
             );
-            assert_eq!(args(&["--embedder=coreml"]), Ok(Some(Backend::CoreMl)));
+            assert_eq!(
+                args(&["--embedder=onnx-fp32"]),
+                Ok(Some(Backend::Onnx(OnnxDtype::Fp32)))
+            );
+            assert!(
+                args(&["--embedder=coreml"])
+                    .unwrap_err()
+                    .contains("onnx-q8")
+            );
             assert!(args(&["--embedder"]).unwrap_err().contains("needs a name"));
             assert!(args(&["--embedder", "tf"]).unwrap_err().contains("onnx-q8"));
             assert!(args(&["--force"]).unwrap_err().contains("unknown option"));
@@ -915,11 +872,8 @@ pub mod model_download {
             assert_eq!(f.backend, Backend::default());
             assert_eq!(f.dir, c.model_files().dir);
             for b in Backend::ALL {
-                let r = files_for(&c, Some(b));
-                assert_eq!(r.is_ok(), b.is_built(), "{b}");
-                if let Ok(f) = r {
-                    assert_eq!(f.dir, Path::new("/data/models").join(b.dir_name()));
-                }
+                let f = files_for(&c, Some(b)).unwrap();
+                assert_eq!(f.dir, Path::new("/data/models").join(b.dir_name()));
             }
         }
 

@@ -1,7 +1,7 @@
 //! Renders real ManimGX scenes. Needs `manimgx` (on PATH or in `~/.local/bin`); the
-//! PocketTTS test also needs `fluidaudiocli` and is skipped without it. The sandboxed
-//! tests use this OS's sandbox (`SandboxMode::native()`): `sandbox-exec` on macOS,
-//! bubblewrap on Linux (which then needs `bwrap` and user namespaces).
+//! PocketTTS test also needs `margin-tts` and is skipped without it. The sandboxed tests
+//! run on Linux only, under bubblewrap (`SandboxMode::LinuxBubblewrap`, which needs
+//! `bwrap` and user namespaces).
 
 use std::path::PathBuf;
 
@@ -224,20 +224,12 @@ async fn detect_tools_finds_manimgx() {
         "{m:?}"
     );
     assert!(m.install_commands.is_empty());
-    // Each OS lists its own narration tool: FluidAudio on macOS, margin-tts elsewhere.
-    let (voice, install) = if cfg!(target_os = "macos") {
-        (
-            "fluidaudiocli",
-            "swift build -c release --product fluidaudiocli",
-        )
-    } else {
-        ("margin-tts", "margin-tts")
-    };
-    let f = tools.iter().find(|t| t.name == voice).unwrap();
+    // The narration tool.
+    let f = tools.iter().find(|t| t.name == "margin-tts").unwrap();
     assert_eq!(f.found, f.install_commands.is_empty(), "{f:?}");
     if !f.found {
         assert!(
-            f.install_commands.iter().any(|c| c.contains(install)),
+            f.install_commands.iter().any(|c| c.contains("margin-tts")),
             "{f:?}"
         );
     }
@@ -259,22 +251,22 @@ async fn silent_render_unsandboxed() {
     assert!(scene.contains("_margin_voice.attach(globals())"));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn silent_render_sandboxed() {
     let (result, events) = run(
         "silent-sandboxed",
         NARRATED,
-        &config(SandboxMode::native(), Voice::Silent).await,
+        &config(SandboxMode::LinuxBubblewrap, Voice::Silent).await,
     )
     .await;
     assert_rendered(&result.unwrap(), &events);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn rerender_in_the_same_folder_replaces_the_outputs() {
-    let config = config(SandboxMode::native(), Voice::Silent).await;
+    let config = config(SandboxMode::LinuxBubblewrap, Voice::Silent).await;
     let (first, _) = run("rerender", NARRATED, &config).await;
     let first = first.unwrap();
     let silent = r#"import manimgx as m
@@ -306,10 +298,10 @@ async fn poster_unsandboxed() {
     assert_poster(&out, &config, &events);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn poster_sandboxed() {
-    let config = config(SandboxMode::native(), Voice::Silent).await;
+    let config = config(SandboxMode::LinuxBubblewrap, Voice::Silent).await;
     let (result, events) = run("poster-sandboxed", POSTER_SHOT, &config).await;
     let out = result.unwrap();
     assert_poster(&out, &config, &events);
@@ -411,7 +403,7 @@ async fn scene_without_lesson_scene_is_a_scene_error() {
     assert!(message.contains("LessonScene"), "{message}");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sandbox_blocks_the_network() {
     let code = r#"import socket
@@ -435,7 +427,7 @@ class LessonScene(m.Scene):
         run(
             "network",
             code,
-            &config(SandboxMode::native(), Voice::Silent).await,
+            &config(SandboxMode::LinuxBubblewrap, Voice::Silent).await,
         )
         .await
         .0,
@@ -458,12 +450,12 @@ class LessonScene(m.Scene):
         run(
             "network-direct",
             code,
-            &config(SandboxMode::native(), Voice::Silent).await,
+            &config(SandboxMode::LinuxBubblewrap, Voice::Silent).await,
         )
         .await
         .0,
     );
-    // macOS denies the connect; in bubblewrap's empty network namespace there is no route.
+    // In bubblewrap's empty network namespace there is no route.
     assert!(
         message.contains("PermissionError")
             || message.contains("Operation not permitted")
@@ -472,7 +464,7 @@ class LessonScene(m.Scene):
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sandbox_blocks_writes_outside_the_work_dir() {
     let outside = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("margin-video-outside.txt");
@@ -504,7 +496,7 @@ class LessonScene(m.Scene):
     let (result, events) = run(
         "escape",
         &code,
-        &config(SandboxMode::native(), Voice::Silent).await,
+        &config(SandboxMode::LinuxBubblewrap, Voice::Silent).await,
     )
     .await;
     let message = scene_message(result);
@@ -529,14 +521,14 @@ async fn missing_manimgx_is_reported() {
 
 #[tokio::test]
 async fn pocket_tts_narration() {
-    let Some(cli) = tool("fluidaudiocli").await else {
+    let Some(cli) = tool("margin-tts").await else {
         eprintln!(
-            "SKIPPED pocket_tts_narration: fluidaudiocli isn't installed (see detect_tools' install commands)"
+            "SKIPPED pocket_tts_narration: margin-tts isn't installed (see detect_tools' install commands)"
         );
         return;
     };
-    let sandbox = if cfg!(any(target_os = "macos", target_os = "linux")) {
-        SandboxMode::native()
+    let sandbox = if cfg!(target_os = "linux") {
+        SandboxMode::LinuxBubblewrap
     } else {
         SandboxMode::Unsandboxed
     };
