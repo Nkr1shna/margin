@@ -1026,6 +1026,9 @@ async fn old_store(id: &str) -> Store {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
     let s = Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         media_url: None,
         id: id.into(),
         topic_id: None,

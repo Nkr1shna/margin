@@ -59,15 +59,18 @@ fn Harness(props: HarnessProps) -> Element {
         session: Signal::new(signed_in.then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
             me: Some(Me {
+                agent: None,
+                person: None,
                 github_login: "Nkr1shna".into(),
-                device: Device {
+                device: Some(Device {
+                    person_id: None,
                     id: "d1".into(),
                     name: "test-mac".into(),
                     created_at: Utc::now(),
                     last_seen_at: None,
                     current: true,
                     online: true,
-                },
+                }),
             }),
         })),
         signed_out_reason: Signal::new(None),

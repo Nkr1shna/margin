@@ -84,8 +84,8 @@ async fn sign_in_approves_once_and_the_token_works() {
         .await
         .unwrap();
     assert_eq!(me.github_login, "nkr1SHNA");
-    assert_eq!(me.device.name, "MacBook");
-    assert!(me.device.current);
+    assert_eq!(me.device.as_ref().unwrap().name, "MacBook");
+    assert!(me.device.as_ref().unwrap().current);
 
     // Stored hashed, never in clear.
     let rows: Vec<serde_json::Value> = h.state.store.list(db::DEVICE).await.unwrap();
@@ -283,11 +283,14 @@ async fn revoking_a_device_rejects_its_token_and_closes_its_socket() {
         .await
         .unwrap();
     assert_eq!(
-        h.delete(&a, &format!("/api/devices/{}", me.device.id))
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        h.delete(
+            &a,
+            &format!("/api/devices/{}", me.device.as_ref().unwrap().id)
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
         204
     );
     assert_eq!(sock_a.closed().await, Some(1008));
@@ -1571,6 +1574,9 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
     let topic = Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "00000000-0000-4000-8000-000000000001".into(),
         parent_id: None,
         title: "T".into(),
@@ -1582,6 +1588,9 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
     let lesson =
         |id: &str, pos: i64, status: LessonStatus, body: &str, prev: Option<&str>| StoredLesson {
             lesson: Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: id.into(),
                 topic_id: topic.id.clone(),
@@ -1662,6 +1671,9 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         .await
         .unwrap();
     let proposal = Proposal {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "p1".into(),
         request: ask_request("x", 2, false),
         status: ProposalStatus::Drafting,
@@ -1863,6 +1875,7 @@ mod retrieval_api {
 
     fn document(id: &str, name: &str, generation: u64, status: DocumentStatus) -> Document {
         Document {
+            owner: None,
             id: id.into(),
             project_id: "my-library".into(),
             origin: Origin::Agent {

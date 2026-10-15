@@ -703,6 +703,9 @@ mod tests {
 
     fn note(id: &str, quote: Option<&str>) -> Note {
         Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: "t".into(),
             lesson_id: Some("l".into()),

@@ -185,6 +185,7 @@ pub fn actor_for(origin: &Origin) -> String {
 fn new_document(id: Id, project_id: Id, origin: Origin, name: &str, kind: SourceKind) -> Document {
     let now = Utc::now();
     Document {
+        owner: None,
         id,
         project_id,
         actor: actor_for(&origin),

@@ -3032,6 +3032,9 @@ mod tests {
 
     fn t(id: &str, parent: Option<&str>) -> Topic {
         Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(Into::into),
             title: id.to_uppercase(),

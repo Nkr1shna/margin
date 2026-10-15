@@ -7,7 +7,6 @@
 
 use std::collections::HashSet;
 
-use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -321,7 +320,7 @@ pub async fn list_chats(State(state): State<AppState>) -> AppResult<Json<Vec<Cha
 /// and starts the first turn as `post_message` does.
 pub async fn create_chat(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     ApiJson(req): ApiJson<NewChat>,
 ) -> AppResult<Json<ChatDetail>> {
     let workspace_ids = check_workspaces(&state, req.workspace_ids).await?;
@@ -337,6 +336,9 @@ pub async fn create_chat(
     let _w = state.write_lock.lock().await;
     let now = Utc::now();
     let mut chat = Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: new_id(),
         title: String::new(),
         title_by: TitleSource::FirstLine,
@@ -508,7 +510,7 @@ pub async fn delete_chat(
 /// `POST /api/chats/{id}/messages`: see `routes::chat_messages`.
 pub async fn post_message(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(msg): ApiJson<NewMessage>,
 ) -> AppResult<Json<MessageSent>> {
@@ -539,7 +541,7 @@ pub async fn cancel_pending(
 /// `POST /api/chats/{id}/stop`: `turns::stop`.
 pub async fn stop(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Chat>> {
     Ok(Json(turns::stop(&state, &id, &device.id).await?))
@@ -556,7 +558,7 @@ pub async fn continue_turn(
 /// `POST /api/chats/{id}/confirm`: `turns::decide`.
 pub async fn confirm(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(req): ApiJson<ConfirmRequest>,
 ) -> AppResult<Json<Chat>> {

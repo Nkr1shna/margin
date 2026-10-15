@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use margin_shared::{
     Event, FileStamp, FolderFileType, Id, ManifestFile, Source, SourceStatus, SyncManifest,
@@ -309,7 +309,7 @@ async fn workspace(state: &AppState, id: &str) -> AppResult<Workspace> {
 /// `POST /api/workspaces/{id}/sync`: the holding device's manifest → what to upload.
 pub async fn sync(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(manifest): ApiJson<SyncManifest>,
 ) -> AppResult<Json<SyncPlan>> {
@@ -687,6 +687,9 @@ mod tests {
 
     fn source(id: &str, name: &str) -> Source {
         Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: None,
             name: name.into(),

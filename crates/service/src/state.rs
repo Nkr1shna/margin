@@ -29,6 +29,7 @@ use crate::engines::{Generator, ModelChoice, Renderer, SourceTools};
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestQueue;
 use crate::pipeline::{Pipeline, Registry};
+use crate::principal::Principal;
 use crate::retrieval::RetrievalCache;
 use crate::secrets::{ANTHROPIC_API_KEY, OPENAI_API_KEY, SecretStore};
 use crate::trace::Tracer;
@@ -143,6 +144,9 @@ pub struct DeviceRow {
     pub github_login: String,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// The person the device signed in as; `None` only before `people-v1`.
+    #[serde(default)]
+    pub person_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,7 +280,9 @@ pub struct App {
     pub allow_unsandboxed_render: bool,
     pub http: reqwest::Client,
     pub media_key: Vec<u8>,
-    pub events: broadcast::Sender<Event>,
+    /// Events with their audience; each socket sends what its principal may see
+    /// (`Audience::allows`).
+    pub events: broadcast::Sender<Emitted>,
     /// Device ids revoked; open sockets for them close.
     pub revocations: broadcast::Sender<Id>,
     pub shutdown: watch::Receiver<bool>,
@@ -334,12 +340,69 @@ pub struct App {
     pub sources_replaced: Mutex<HashSet<Id>>,
     /// The model providers' endpoints, the ChatGPT sign-in and the model windows.
     pub providers: crate::providers::Providers,
+    /// Each person's expanded read set, cleared whole after any person, group,
+    /// membership or agent write (`groups::Expansions::invalidate_all`).
+    pub expansions: crate::groups::Expansions,
+    /// Where groups and memberships come from: `access::Manual` in L1 (L6 adds GitHub
+    /// organisations).
+    pub access_sources: Vec<Arc<dyn crate::access::AccessSource>>,
+}
+
+/// Who may receive an event (`docs/l1-brief.md` D8). The wire `Event` carries none of
+/// this; `events::serve` filters on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Audience {
+    /// Everyone signed in: `Hello`, `SettingsChanged`, `EmbeddingModelChanged`,
+    /// `PersonChanged`, `GroupChanged`, `GroupDeleted`, `MembershipChanged` (a directory,
+    /// no content).
+    Everyone,
+    /// Organisation admins (and the owner).
+    Admins,
+    /// One person (by person id), on every device.
+    Person(Id),
+    /// One person, and the admins.
+    PersonOrAdmins(Id),
+    /// Whoever's expanded read set meets these paths (a row's `access`).
+    Paths(Vec<String>),
+}
+
+impl Audience {
+    pub fn allows(&self, p: &Principal) -> bool {
+        match self {
+            Audience::Everyone => true,
+            Audience::Admins => p.org_role.is_admin(),
+            Audience::Person(id) => &p.person_id == id,
+            Audience::PersonOrAdmins(id) => &p.person_id == id || p.org_role.is_admin(),
+            Audience::Paths(paths) => paths.iter().any(|path| p.paths.contains(path)),
+        }
+    }
+}
+
+/// An event on its way to the sockets.
+#[derive(Debug, Clone)]
+pub struct Emitted {
+    pub audience: Audience,
+    pub event: Event,
 }
 
 impl App {
-    pub fn emit(&self, event: Event) {
+    /// An event for `audience`.
+    pub fn emit_to(&self, audience: Audience, event: Event) {
         // No receivers is fine: nobody is connected.
-        let _ = self.events.send(event);
+        let _ = self.events.send(Emitted { audience, event });
+    }
+
+    /// An event for everyone. Until L1-events names every emit site's audience this
+    /// forwards everything as `Everyone` (today's behaviour); then it is only for the
+    /// directory events `Audience::Everyone` lists, with a `debug_assert!`.
+    pub fn emit(&self, event: Event) {
+        self.emit_to(Audience::Everyone, event);
+    }
+
+    /// A row's event, to whoever may read the row (`access` must not be empty).
+    pub fn emit_row(&self, access: &[String], event: Event) {
+        debug_assert!(!access.is_empty(), "a row's access is never empty");
+        self.emit_to(Audience::Paths(access.to_vec()), event);
     }
 
     pub fn emit_topic(&self, topic: &Topic) {

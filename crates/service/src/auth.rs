@@ -5,11 +5,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, Instant};
 
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::Json;
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
-use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
 use margin_shared::{
     Device, Event, Id, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
@@ -18,6 +17,7 @@ use serde::Deserialize;
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::principal::CurrentPrincipal;
 use crate::secrets::GITHUB_CLIENT_SECRET;
 use crate::state::{AppState, DeviceRow, new_id, random_token, sha256_hex};
 
@@ -215,6 +215,7 @@ pub async fn poll(
     let (github_login, device_name) = collected;
     let token = random_token();
     let device = DeviceRow {
+        person_id: None,
         id: new_id(),
         name: device_name,
         token_hash: sha256_hex(&token),
@@ -475,37 +476,12 @@ fn page(title: &str, message: &str) -> String {
 // Bearer guard for /api
 // ---------------------------------------------------------------------------
 
-/// The device making an `/api` request.
-#[derive(Clone)]
-pub struct CurrentDevice(pub DeviceRow);
+/// The calling device, as `principal::CurrentDevice` extracts it from the principal.
+pub use crate::principal::CurrentDevice;
 
-pub async fn require_device(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        })
-        .map(|t| t.trim().to_string());
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return AppError::unauthorized().into_response();
-    };
-    let device = match device_for_token(&state, &token).await {
-        Ok(Some(d)) => d,
-        Ok(None) => return AppError::unauthorized().into_response(),
-        Err(e) => return e.into_response(),
-    };
-    req.extensions_mut().insert(CurrentDevice(device));
-    next.run(req).await
-}
-
-async fn device_for_token(state: &AppState, token: &str) -> AppResult<Option<DeviceRow>> {
+/// The device a device token belongs to (touching `last_seen_at` at most every
+/// `LAST_SEEN_INTERVAL_SECONDS`); `principal::require_principal` builds on it.
+pub async fn device_for_token(state: &AppState, token: &str) -> AppResult<Option<DeviceRow>> {
     let hash = sha256_hex(token);
     let found: Vec<DeviceRow> = state
         .store
@@ -541,22 +517,35 @@ pub fn to_device(row: &DeviceRow, current_id: &str, online: bool) -> Device {
         last_seen_at: row.last_seen_at,
         current: row.id == current_id,
         online,
+        person_id: row.person_id.clone(),
     }
 }
 
+/// `GET /api/me`. First commit: the device only; L1-auth adds `person` (and an agent
+/// token's `agent`).
 pub async fn me(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
-) -> Json<Me> {
-    Json(Me {
+    CurrentPrincipal(p): CurrentPrincipal,
+) -> AppResult<Json<Me>> {
+    let device = p
+        .device
+        .as_ref()
+        .ok_or_else(crate::principal::device_required)?;
+    Ok(Json(Me {
         github_login: device.github_login.clone(),
-        device: to_device(&device, &device.id, state.devices.is_online(&device.id)),
-    })
+        device: Some(to_device(
+            device,
+            &device.id,
+            state.devices.is_online(&device.id),
+        )),
+        person: None,
+        agent: None,
+    }))
 }
 
 pub async fn list_devices(
     State(state): State<AppState>,
-    Extension(CurrentDevice(me)): Extension<CurrentDevice>,
+    CurrentDevice(me): CurrentDevice,
 ) -> AppResult<Json<Vec<Device>>> {
     let mut rows: Vec<DeviceRow> = state.store.list(db::DEVICE).await?;
     rows.sort_by(|a, b| {

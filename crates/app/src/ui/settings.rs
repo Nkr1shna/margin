@@ -402,7 +402,10 @@ fn AccountSection() -> Element {
     // Presence comes from live events, and the list is fetched again on reconnecting.
     let connected = *app.live.read() == LiveStatus::Live;
     // This device is the one signed in here (events don't say which is whose).
-    let my_id = me.as_ref().map(|m| m.device.id.clone());
+    let my_id = me
+        .as_ref()
+        .and_then(|m| m.device.as_ref())
+        .map(|d| d.id.clone());
     let known: Vec<Device> = app
         .lib
         .read()
@@ -428,7 +431,7 @@ fn AccountSection() -> Element {
                 span { "GitHub" }
                 span { {me.as_ref().map(|m| m.github_login.clone()).unwrap_or_else(|| "Loading…".into())} }
                 span { "This device" }
-                span { {me.as_ref().map(|m| m.device.name.clone()).unwrap_or_else(|| "Loading…".into())} }
+                span { {me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_else(|| "Loading…".into())} }
             }
             div { class: "row-actions",
                 button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
@@ -2427,11 +2430,11 @@ fn FoldersSection() -> Element {
     let mut attaching = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
 
-    let me = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let me = app.session.read().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|m| m.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let lib = app.lib.read();
     let all: Vec<Workspace> = lib
         .workspaces_in_order(me.as_deref())
@@ -3839,6 +3842,7 @@ mod tests {
     fn device(id: &str, name: &str, online: bool, current: bool) -> Device {
         use chrono::TimeZone;
         Device {
+            person_id: None,
             id: id.into(),
             name: name.into(),
             created_at: chrono::Utc.timestamp_opt(1_760_000_000, 0).unwrap(),

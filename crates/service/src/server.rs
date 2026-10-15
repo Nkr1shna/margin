@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Router, http::StatusCode};
 use chrono::Utc;
 use margin_shared::{
@@ -33,8 +33,9 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, context_api, embedding, events, folders, ingest, library, media, providers,
-    retrieval, search, settings, sources, trace, turns, uploads, version, video, workspaces,
+    access, agents, ask, chats, context_api, embedding, events, folders, groups, ingest,
+    invitations, library, media, people, principal, providers, retrieval, search, settings,
+    sources, trace, turns, uploads, version, video, workspaces,
 };
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -105,7 +106,7 @@ impl Service {
         .context("the pipeline in Settings can't be built")?;
         let state: AppState = Arc::new(App {
             config: opts.config,
-            store: opts.store,
+            store: opts.store.clone(),
             secrets: opts.secrets,
             generator: opts.generator,
             renderer: opts.renderer,
@@ -145,10 +146,14 @@ impl Service {
             folder_sync_emits: Mutex::new(Default::default()),
             sources_replaced: Mutex::new(Default::default()),
             providers: providers::Providers::new(),
+            expansions: groups::Expansions::new(),
+            access_sources: vec![Arc::new(access::Manual(opts.store.clone()))],
         });
 
         // Traces first, so recovery and the workers are traced.
         trace::start(&state);
+        // The bootstrap owner and every existing row's owner, once (L1, `people-v1`).
+        people::migrate(&state).await?;
         let resume = recover(&state).await?;
         if let Err(e) = uploads::purge_stale(&state).await {
             tracing::warn!("couldn't clear unfinished uploads: {e:#}");
@@ -201,8 +206,27 @@ impl Service {
 }
 
 pub fn router(state: AppState) -> Router {
-    let api = Router::new()
+    // What an agent token may call (`margin-mcp serve` needs exactly these).
+    let agent_api = Router::new()
         .route(routes::ME, get(auth::me))
+        .route(routes::PROJECTS, get(context_api::projects))
+        .route(routes::CONTEXT_SEARCH, post(context_api::search))
+        .route(
+            "/api/context/documents/{id}",
+            delete(context_api::delete_document),
+        )
+        .route(
+            "/api/context/documents/{id}/outline",
+            get(context_api::outline),
+        )
+        .route(
+            "/api/context/documents/{id}/passages",
+            get(context_api::passages),
+        )
+        .route(routes::CONTEXT_INGEST, post(context_api::ingest))
+        .route(routes::CONTEXT_CHANGES, get(context_api::changes));
+
+    let device_api = Router::new()
         .route(routes::LIBRARY, get(library::get_library))
         .route(routes::TOPICS, post(library::create_topic))
         .route(
@@ -298,29 +322,57 @@ pub fn router(state: AppState) -> Router {
             post(folders::sync).layer(folders::manifest_limit()),
         )
         .route("/api/workspaces/{id}/files", get(folders::files))
-        .route(routes::PROJECTS, get(context_api::projects))
-        .route(routes::CONTEXT_SEARCH, post(context_api::search))
-        .route(
-            "/api/context/documents/{id}",
-            delete(context_api::delete_document),
-        )
-        .route(
-            "/api/context/documents/{id}/outline",
-            get(context_api::outline),
-        )
-        .route(
-            "/api/context/documents/{id}/passages",
-            get(context_api::passages),
-        )
-        .route(routes::CONTEXT_INGEST, post(context_api::ingest))
-        .route(routes::CONTEXT_CHANGES, get(context_api::changes))
         .route(routes::TRACES, get(trace::list_traces))
         .route(routes::TRACES_ROLLUP, get(trace::rollup))
         .route(routes::EVENTS, get(events::events))
+        // Accounts and principals (L1).
+        .route(routes::PEOPLE, get(people::list_people))
+        .route(
+            "/api/people/{id}",
+            get(people::get_person).patch(people::patch_person),
+        )
+        .route("/api/people/{id}/groups", put(people::put_person_groups))
+        .route(
+            routes::ME_SETTINGS,
+            get(people::get_my_settings).patch(people::patch_my_settings),
+        )
+        .route(
+            routes::INVITATIONS,
+            get(invitations::list_invitations).post(invitations::create_invitation),
+        )
+        .route(
+            "/api/invitations/{id}",
+            delete(invitations::delete_invitation),
+        )
+        .route(
+            routes::GROUPS,
+            get(groups::list_groups).post(groups::create_group),
+        )
+        .route(
+            "/api/groups/{*path}",
+            patch(groups::patch_group).delete(groups::delete_group),
+        )
+        .route(
+            routes::AGENTS,
+            get(agents::list_agents).post(agents::create_agent),
+        )
+        .route(
+            "/api/agents/{id}",
+            patch(agents::patch_agent).delete(agents::delete_agent),
+        )
+        .route(
+            "/api/agents/{id}/token",
+            post(agents::mint_token).delete(agents::revoke_token),
+        )
+        // Inside `require_principal`, so it sees the principal.
+        .route_layer(middleware::from_fn(principal::refuse_agents));
+
+    let api = agent_api
+        .merge(device_api)
         .fallback(api_not_found)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_device,
+            principal::require_principal,
         ));
 
     Router::new()

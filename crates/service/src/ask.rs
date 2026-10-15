@@ -148,6 +148,9 @@ pub async fn propose_planned(
     }
     request.lesson_count = outline.lessons.len() as u32;
     let proposal = Proposal {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: new_id(),
         request,
         status: ProposalStatus::Ready,
@@ -395,6 +398,9 @@ pub async fn accept_proposal(
         for (i, l) in outline.lessons.iter().enumerate() {
             let row = StoredLesson {
                 lesson: Lesson {
+                    access: Vec::new(),
+                    deny: Vec::new(),
+                    owner: None,
                     citations: Vec::new(),
                     id: new_id(),
                     topic_id: topic.id.clone(),
@@ -524,6 +530,9 @@ pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson
         let now = Utc::now();
         let row = StoredLesson {
             lesson: Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: new_id(),
                 topic_id: req.topic_id.clone(),

@@ -2,7 +2,6 @@
 //! folder it holds; the folder's allow-listed files are synced to the service and read
 //! there as sources (`folders.rs`), never read from the device.
 
-use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -40,10 +39,13 @@ fn clean(value: &str, what: &str) -> AppResult<String> {
 /// location trimmed, not empty). Emits `WorkspaceChanged`.
 pub async fn create_workspace(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     ApiJson(req): ApiJson<NewWorkspace>,
 ) -> AppResult<Json<Workspace>> {
     let workspace = Workspace {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: new_id(),
         name: clean(&req.name, "name")?,
         device_id: device.id.clone(),
@@ -71,7 +73,7 @@ pub async fn create_workspace(
 /// otherwise). Detaches it from every chat (`ChatChanged`), emits `WorkspaceDeleted`.
 pub async fn delete_workspace(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
     let _w = state.write_lock.lock().await;

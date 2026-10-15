@@ -1261,7 +1261,11 @@ fn UserMessage(item: ChatItem) -> Element {
         .session
         .read()
         .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| &m.device.id == device_id))
+        .and_then(|s| {
+            s.me.as_ref()
+                .and_then(|m| m.device.as_ref())
+                .map(|d| &d.id == device_id)
+        })
         .unwrap_or(true);
     rsx! {
         div { class: "msg-user",
@@ -1931,11 +1935,11 @@ fn ConfirmationView(item: ChatItem, card: ConfirmationCard, chat: Chat) -> Eleme
             }
         });
     }));
-    let me = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let me = app.session.read().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|m| m.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let outcome = {
         let lib = app.lib.read();
         let items = lib.chat_items.get(&chat.id);
@@ -2722,6 +2726,7 @@ mod tests {
         lib.devices.insert(
             "d2".into(),
             margin_shared::Device {
+                person_id: None,
                 id: "d2".into(),
                 name: "iPhone".into(),
                 created_at: Utc::now(),
@@ -2792,6 +2797,9 @@ mod tests {
 
     fn proposal(status: ProposalStatus) -> margin_shared::Proposal {
         margin_shared::Proposal {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "p1".into(),
             request: margin_shared::AskRequest {
                 prompt: "A course on control theory".into(),
@@ -3036,6 +3044,9 @@ mod tests {
         lib.sources.insert(
             "s-chat".into(),
             margin_shared::Source {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: "s-chat".into(),
                 topic_id: None,
                 name: "gibbs.pdf".into(),

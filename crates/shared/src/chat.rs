@@ -51,6 +51,17 @@ pub struct Chat {
     /// Settings' default) and never changed. Chats stored before providers are OpenAI.
     #[serde(default)]
     pub provider: Provider,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -535,6 +546,17 @@ pub struct Workspace {
     /// Where the folder is, as the owner would recognise it ("~/Developer/margin",
     /// "iCloud Drive/Notes"). Display only; never used to read.
     pub location: String,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     /// The service's counts of the folder's files (it keeps them up to date).
     #[serde(default)]
@@ -759,6 +781,9 @@ mod tests {
 
     fn chat(state: ChatState) -> Chat {
         Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "c1".into(),
             title: "Fourier".into(),
             title_by: TitleSource::Model,
@@ -1084,6 +1109,9 @@ mod tests {
             },
             Event::WorkspaceChanged {
                 workspace: Workspace {
+                    access: Vec::new(),
+                    deny: Vec::new(),
+                    owner: None,
                     id: "w1".into(),
                     name: "margin".into(),
                     device_id: "d1".into(),
@@ -1098,6 +1126,7 @@ mod tests {
             Event::WorkspaceDeleted { id: "w1".into() },
             Event::DeviceChanged {
                 device: crate::Device {
+                    person_id: None,
                     id: "d1".into(),
                     name: "iPhone".into(),
                     created_at: at(),

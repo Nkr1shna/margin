@@ -7,11 +7,11 @@
 
 use std::path::PathBuf;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use margin_shared::{Id, Source, SourceUpload, routes::UPLOAD_PART_BYTES};
 use serde::{Deserialize, Serialize};
@@ -118,7 +118,7 @@ impl Drop for Busy<'_> {
 /// kind's limit; a folder's files have none) and starts an upload in parts.
 pub async fn start(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     query: Result<Query<StartQuery>, QueryRejection>,
 ) -> AppResult<Json<SourceUpload>> {
     let Query(q) =

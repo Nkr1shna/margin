@@ -870,7 +870,7 @@ async fn tool_cards_and_outputs_land_in_the_chat() {
 async fn replacing_the_owners_note_asks_and_appending_never_does() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let topic = new_topic(&h, &t, None, "Optics").await;
     let mine = owner_note(&h, &t, &topic.id, "Lenses", "My own words about lenses.").await;
     assert_eq!(
@@ -1155,7 +1155,7 @@ async fn rows_from_before_authorship_read_as_the_owners() {
 async fn deleting_a_topic_asks_first_and_any_device_approves() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let subject = new_topic(&h, &t, None, "Signals").await;
     let p = {
         let mut req = ask_request("Fourier", 2, false);
@@ -1245,7 +1245,7 @@ async fn deleting_a_topic_asks_first_and_any_device_approves() {
 async fn denied_and_stopped_deletes_leave_things_as_they_were() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let p = h.propose(&t, &ask_request("Optics", 1, false)).await;
     let r = h
         .post(&t, &format!("/api/proposals/{}/accept", p.id))
@@ -2015,6 +2015,9 @@ mod lesson_retrieval {
             }],
         };
         let proposal = Proposal {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "prop".into(),
             request,
             status: ProposalStatus::Accepted {
@@ -2057,6 +2060,9 @@ mod lesson_retrieval {
         assert_eq!(plain.id, "prop");
         let lesson = StoredLesson {
             lesson: Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: "l1".into(),
                 topic_id: topic.id.clone(),

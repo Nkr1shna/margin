@@ -118,6 +118,9 @@ pub async fn create_topic_locked(
 ) -> AppResult<Topic> {
     let now = Utc::now();
     let topic = Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: new_id(),
         position: next_topic_position(state, parent_id.as_deref()).await?,
         parent_id,
@@ -527,6 +530,9 @@ pub async fn new_note(state: &AppState, req: NewNote, by: Author) -> AppResult<N
         let now = Utc::now();
         let row = StoredNote {
             note: Note {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: new_id(),
                 topic_id: req.topic_id,
                 lesson_id: req.lesson_id,
@@ -670,6 +676,9 @@ mod tests {
 
     fn t(id: &str, parent: Option<&str>) -> Topic {
         Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(Into::into),
             title: id.into(),

@@ -292,6 +292,9 @@ pub fn sample_citations() -> Vec<Citation> {
 
 pub fn sample_library() -> Library {
     let topic = |id: &str, parent: Option<&str>, title: &str, position| Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         parent_id: parent.map(Into::into),
         title: title.into(),
@@ -300,6 +303,9 @@ pub fn sample_library() -> Library {
         updated_at: ts(0),
     };
     let lesson = |id: &str, topic_id: &str, title: &str, position, status, body: &str| Lesson {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         citations: Vec::new(),
         id: id.into(),
         topic_id: topic_id.into(),
@@ -360,7 +366,7 @@ pub fn sample_library() -> Library {
             ),
         ],
         notes: vec![
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n1".into(),
                 topic_id: "fourier".into(),
                 lesson_id: Some("l1".into()),
@@ -370,7 +376,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(10),
                 updated_at: ts(10),
             },
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n2".into(),
                 topic_id: "fourier".into(),
                 lesson_id: None,
@@ -395,7 +401,7 @@ pub fn sample_library() -> Library {
             updated_at: ts(0),
         }],
         sources: vec![
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s1", "original")),
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
@@ -412,7 +418,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s2", "original")),
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
@@ -429,7 +435,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: None,
                 id: "s3".into(),
                 topic_id: Some("fourier".into()),
@@ -444,7 +450,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s7", "original")),
                 id: "s7".into(),
                 topic_id: Some("fourier".into()),
@@ -461,7 +467,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s4", "original")),
                 id: "s4".into(),
                 topic_id: Some("fourier".into()),
@@ -478,7 +484,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s5", "original")),
                 id: "s5".into(),
                 topic_id: Some("fourier".into()),
@@ -495,7 +501,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s6", "original")),
                 id: "s6".into(),
                 topic_id: Some("fourier".into()),
@@ -549,6 +555,7 @@ impl FakeState {
             settings: default_settings(),
             devices: vec![
                 Device {
+                    person_id: None,
                     id: "d1".into(),
                     name: "test-mac".into(),
                     created_at: ts(0),
@@ -557,6 +564,7 @@ impl FakeState {
                     online: true,
                 },
                 Device {
+                    person_id: None,
                     id: "d2".into(),
                     name: "iPhone".into(),
                     created_at: ts(5),
@@ -907,8 +915,10 @@ async fn me(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     let device = s.devices.iter().find(|d| d.current).cloned();
     match device {
         Some(device) => Json(Me {
+            agent: None,
+            person: None,
             github_login: "Nkr1shna".into(),
-            device,
+            device: Some(device),
         })
         .into_response(),
         None => api_error(StatusCode::UNAUTHORIZED, "unauthorized", "Sign in again."),
@@ -967,6 +977,9 @@ async fn create_topic(
             .filter(|t| t.parent_id == req.parent_id)
             .count() as i64;
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id,
             parent_id: req.parent_id,
             title: req.title,
@@ -1321,6 +1334,9 @@ async fn create_note(
     let note = {
         let mut s = fake.state.lock().unwrap();
         let note = Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("note"),
             topic_id: req.topic_id,
             lesson_id: req.lesson_id,
@@ -1503,6 +1519,9 @@ impl FakeState {
                     Some(id) => id,
                     None => {
                         let subject = Topic {
+                            access: Vec::new(),
+                            deny: Vec::new(),
+                            owner: None,
                             id: self.id("topic"),
                             parent_id: None,
                             title: req.outline.subject_title.clone(),
@@ -1519,6 +1538,9 @@ impl FakeState {
             }
         };
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: self.id("topic"),
             parent_id: Some(parent),
             title: req.outline.topic_title.clone(),
@@ -1533,6 +1555,9 @@ impl FakeState {
         let mut lessons = Vec::new();
         for (i, l) in req.outline.lessons.iter().enumerate() {
             let lesson = Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: self.id("lesson"),
                 topic_id: topic.id.clone(),
@@ -2367,6 +2392,9 @@ fn add_folder_source(
             .map(|w| w.name.clone());
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: None,
@@ -2417,6 +2445,9 @@ fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) 
         let mut s = fake.state.lock().unwrap();
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: query.topic_id,
@@ -3196,6 +3227,9 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
 /// screenshots. Media URLs are relative until `rebase_chat_media`.
 pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
     let chat = |id: &str, title: &str, state, at| Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         title: title.into(),
         title_by: Default::default(),
@@ -3705,6 +3739,9 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         lesson.summary = summary.into();
     }
     Proposal {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "p-sample".into(),
         request,
         status: match created {
@@ -4371,6 +4408,9 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
     let Some(proposal) =
         step(fake, chat_id, turn_id, |s| {
             let proposal = Proposal {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: s.id("proposal"),
                 request: request.clone(),
                 status: ProposalStatus::Ready,
@@ -4633,6 +4673,9 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             .max()
             .unwrap_or(0);
         let lesson = Lesson {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             citations: Vec::new(),
             id: s.id("lesson"),
             topic_id: topic.id.clone(),
@@ -5318,6 +5361,9 @@ async fn create_chat(
         }
         let now = Utc::now();
         let chat = Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("chat"),
             title: String::new(),
             title_by: Default::default(),
@@ -5883,6 +5929,9 @@ async fn create_workspace(
         let mut s = fake.state.lock().unwrap();
         let (device_id, device_name) = s.current_device();
         let workspace = Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("workspace"),
             name: req.name,
             device_id,
@@ -5947,6 +5996,9 @@ async fn delete_workspace(
 pub fn sample_workspaces() -> Vec<Workspace> {
     let ws =
         |id: &str, name: &str, device: (&str, &str), platform, location: &str, sync| Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             name: name.into(),
             device_id: device.0.into(),
@@ -6027,6 +6079,9 @@ pub fn sample_workspaces() -> Vec<Workspace> {
 /// The files of sample folder `w1` (“notes”), in every state.
 pub fn sample_folder_files() -> Vec<Source> {
     let file = |id: &str, name: &str, kind, bytes, status| Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         topic_id: None,
         name: name.into(),

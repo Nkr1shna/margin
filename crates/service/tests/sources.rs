@@ -860,6 +860,9 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
     let topic = Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "t1".into(),
         parent_id: None,
         title: "Signals".into(),
@@ -869,6 +872,9 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     };
     store.put(db::TOPIC, "t1", &topic).await.unwrap();
     let source = |id: &str, topic_id: Option<&str>, status: SourceStatus, age_h: i64| Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         media_url: None,
         id: id.into(),
         topic_id: topic_id.map(Into::into),
@@ -1464,6 +1470,9 @@ async fn folder_files_are_folder_documents_searchable_from_their_folder() {
     let t = h.sign_in("Mac").await;
     let now = Utc::now();
     let folder_file = Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         media_url: None,
         id: "f1".into(),
         topic_id: None,
@@ -1517,6 +1526,9 @@ async fn old_store(ids: &[&str]) -> Store {
     let now = Utc::now();
     for (i, id) in ids.iter().enumerate() {
         let s = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: None,
             id: id.to_string(),
             topic_id: None,

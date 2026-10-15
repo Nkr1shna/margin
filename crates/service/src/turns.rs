@@ -582,6 +582,12 @@ async fn run_turn(
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
         origin_device: origin,
+        // The chat's owner; L1-events passes the principal's id (`agent/<id>` included).
+        actor: chat
+            .owner
+            .as_deref()
+            .map(margin_shared::person_id)
+            .unwrap_or_else(|| "owner".into()),
         provider: chat.provider,
         reasoning_effort: settings.reasoning_effort,
         history,

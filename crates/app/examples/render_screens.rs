@@ -287,15 +287,18 @@ fn Harness(props: HarnessProps) -> Element {
         let session = (!connect).then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
             me: Some(Me {
+                agent: None,
+                person: None,
                 github_login: "Nkr1shna".into(),
-                device: Device {
+                device: Some(Device {
+                    person_id: None,
                     id: "d1".into(),
                     name: "Krishna's MacBook".into(),
                     created_at: Utc::now(),
                     last_seen_at: Some(Utc::now()),
                     current: true,
                     online: true,
-                },
+                }),
             }),
         });
         AppCtx {
@@ -452,6 +455,9 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
     };
     let done = |mut upload: Upload, id: &str, status: SourceStatus, lib: &mut LibraryState| {
         let source = margin_shared::Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: None,
             id: id.into(),
             topic_id: Some(topic_id.to_string()),
@@ -465,7 +471,7 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
             modified: None,
         };
         lib.sources.insert(source.id.clone(), source.clone());
-        upload.state = UploadState::Done(source);
+        upload.state = UploadState::Done(Box::new(source));
         upload
     };
     let mut failed = file("scan.pdf", None, 9_800_000);

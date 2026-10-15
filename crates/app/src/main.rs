@@ -594,11 +594,11 @@ async fn load_devices(ctx: AppCtx, api: &Api) {
 /// online exactly while its socket is live.
 fn set_self_online(ctx: AppCtx, online: bool) {
     let mut lib = ctx.lib;
-    let me = ctx
-        .session
-        .peek()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|me| me.device.id.clone()));
+    let me = ctx.session.peek().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|me| me.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let id = me.or_else(|| {
         lib.peek()
             .devices

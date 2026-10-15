@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use axum::Extension;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -409,7 +408,7 @@ where
 
 pub async fn upload(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     headers: HeaderMap,
     query: Result<Query<UploadQuery>, QueryRejection>,
     body: Body,
@@ -514,6 +513,9 @@ async fn create_locked(
         library::topic(state, topic_id).await?;
     }
     let source = Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         media_url: None,
         id: id.to_string(),
         topic_id: upload.topic_id,
@@ -611,6 +613,9 @@ async fn replace_locked(
         }
         None => {
             let source = Source {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 media_url: None,
                 id: id.to_string(),
                 topic_id: None,
@@ -1284,7 +1289,7 @@ async fn wait_until_read(
         }
         let changed = async {
             loop {
-                match events.recv().await {
+                match events.recv().await.map(|e| e.event) {
                     Ok(Event::SourceChanged { .. } | Event::SourceDeleted { .. })
                     | Err(RecvError::Lagged(_)) => return,
                     Ok(_) => {}

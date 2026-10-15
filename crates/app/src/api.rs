@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(lib, expected);
         let me = api.me().await.unwrap();
         assert_eq!(me.github_login, "Nkr1shna");
-        assert!(me.device.current);
+        assert!(me.device.unwrap().current);
 
         let topic = api
             .create_topic(&NewTopic {

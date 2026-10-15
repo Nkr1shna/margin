@@ -112,7 +112,7 @@ async fn upload(app: AppCtx, key: u64) {
                 // The topic's list shows it from the store from now on.
                 list.retain(|u| u.key != key);
             } else if let Some(u) = list.iter_mut().find(|u| u.key == key) {
-                u.state = UploadState::Done(source);
+                u.state = UploadState::Done(Box::new(source));
             }
         }
         Ok(source) => {
@@ -380,11 +380,11 @@ pub fn AddSourcesMenu(
             .unwrap_or_default(),
         None => app.ask_workspaces.read().clone(),
     };
-    let me = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let me = app.session.read().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|m| m.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let folders: Vec<margin_shared::Workspace> = app
         .lib
         .read()

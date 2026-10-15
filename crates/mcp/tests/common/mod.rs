@@ -161,6 +161,7 @@ impl Fake {
         let passages = split(text);
         let now = Utc::now();
         let doc = Document {
+            owner: None,
             id: id.clone(),
             project_id: "project1".into(),
             origin,

@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use axum::Extension;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -17,7 +16,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::auth::{self, CurrentDevice};
 use crate::db;
-use crate::state::{AppState, DeviceRow};
+use crate::state::{AppState, DeviceRow, Emitted};
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// "Try again later": the client fell behind and should reload.
@@ -33,7 +32,7 @@ pub struct EventsQuery {
 
 pub async fn events(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentDevice(device): CurrentDevice,
     Query(q): Query<EventsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -52,7 +51,7 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 
 /// What one socket listens to.
 struct Feeds {
-    events: broadcast::Receiver<Event>,
+    events: broadcast::Receiver<Emitted>,
     revocations: broadcast::Receiver<Id>,
     shutdown: watch::Receiver<bool>,
     directed: mpsc::UnboundedReceiver<DirectedFrame>,
@@ -116,8 +115,9 @@ async fn serve(state: &AppState, device_id: &str, socket: &mut WebSocket, mut fe
     loop {
         tokio::select! {
             ev = feeds.events.recv() => match ev {
+                // L1-events: send only when `ev.audience.allows(&principal)`.
                 Ok(ev) => {
-                    if send_json(socket, &ev).await.is_err() {
+                    if send_json(socket, &ev.event).await.is_err() {
                         return;
                     }
                 }

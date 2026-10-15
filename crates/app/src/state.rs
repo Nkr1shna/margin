@@ -189,8 +189,14 @@ impl AppCtx {
         let session = self.session.peek().clone();
         if let Some(session) = session {
             let device = match &session.me {
-                Some(me) => Some(me.device.id.clone()),
-                None => session.api.me().await.ok().map(|me| me.device.id),
+                Some(me) => me.device.as_ref().map(|d| d.id.clone()),
+                None => session
+                    .api
+                    .me()
+                    .await
+                    .ok()
+                    .and_then(|me| me.device)
+                    .map(|d| d.id),
             };
             if let Some(device) = device {
                 let _ = session.api.revoke_device(&device).await;

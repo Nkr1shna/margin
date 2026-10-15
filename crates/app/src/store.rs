@@ -236,6 +236,16 @@ impl LibraryState {
 
     pub fn apply(&mut self, event: Event) {
         match event {
+            // L1-app keeps people, groups, agents and invitations (docs/l1-brief.md D10).
+            Event::PersonChanged { .. }
+            | Event::GroupChanged { .. }
+            | Event::GroupDeleted { .. }
+            | Event::MembershipChanged { .. }
+            | Event::AgentChanged { .. }
+            | Event::AgentDeleted { .. }
+            | Event::InvitationChanged { .. }
+            | Event::InvitationDeleted { .. }
+            | Event::AccessChanged { .. } => {}
             Event::Hello { server_version } => self.server_version = Some(server_version),
             Event::TopicChanged { topic } => {
                 self.topics.insert(topic.id.clone(), topic);
@@ -715,6 +725,9 @@ pub(crate) mod tests {
 
     pub fn topic(id: &str, parent: Option<&str>, title: &str, position: i64) -> Topic {
         Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(Into::into),
             title: title.into(),
@@ -726,6 +739,9 @@ pub(crate) mod tests {
 
     pub fn lesson(id: &str, topic_id: &str, position: i64, status: LessonStatus) -> Lesson {
         Lesson {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             citations: Vec::new(),
             id: id.into(),
             topic_id: topic_id.into(),
@@ -743,6 +759,9 @@ pub(crate) mod tests {
 
     pub fn note(id: &str, topic_id: &str, lesson_id: Option<&str>) -> Note {
         Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: topic_id.into(),
             lesson_id: lesson_id.map(Into::into),
@@ -770,6 +789,9 @@ pub(crate) mod tests {
 
     pub fn source(id: &str, topic_id: Option<&str>, name: &str, folder: Option<&str>) -> Source {
         Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: None,
             id: id.into(),
             topic_id: topic_id.map(Into::into),
@@ -1062,6 +1084,9 @@ pub(crate) mod tests {
     fn proposal_changed_is_tracked() {
         let mut s = sample();
         let p = Proposal {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "p1".into(),
             request: AskRequest {
                 prompt: "Fourier".into(),
@@ -1097,6 +1122,9 @@ pub(crate) mod tests {
             video: video("v2", "l2", VideoStatus::Scripting),
         });
         let mut p = Proposal {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "p1".into(),
             request: AskRequest {
                 prompt: "Fourier".into(),
@@ -1180,6 +1208,9 @@ pub(crate) mod tests {
     fn chat_events_update_loaded_transcripts() {
         let mut s = sample();
         let chat = Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "c1".into(),
             title: "Fourier".into(),
             title_by: Default::default(),
@@ -1261,6 +1292,9 @@ pub(crate) mod tests {
 
     fn chat_at(id: &str, updated: i64) -> Chat {
         Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             title: id.into(),
             title_by: Default::default(),
@@ -1409,6 +1443,7 @@ pub(crate) mod tests {
     fn device_presence_keeps_current() {
         let mut s = sample();
         let me = Device {
+            person_id: None,
             id: "d1".into(),
             name: "Mac".into(),
             created_at: ts(0),
@@ -1429,6 +1464,9 @@ pub(crate) mod tests {
         s.workspaces.insert(
             "w1".into(),
             Workspace {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: "w1".into(),
                 name: "margin".into(),
                 device_id: "d1".into(),
@@ -1445,6 +1483,9 @@ pub(crate) mod tests {
 
         // Folder files live with their folder, never with the sources.
         let ws = |id: &str, device: &str, name: &str| Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             name: name.into(),
             device_id: device.into(),
@@ -1500,6 +1541,7 @@ pub(crate) mod tests {
 
         // The service's list replaces what was known: a device revoked meanwhile goes.
         let phone = Device {
+            person_id: None,
             id: "d2".into(),
             name: "iPhone".into(),
             created_at: ts(0),

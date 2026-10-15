@@ -31,7 +31,7 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | | Item | Plan | Notes |
 |---|---|---|---|
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/plan-live-context.md` | Fixes events going to every device |
+| 🟡 | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/l1-brief.md`, `docs/plan-live-context.md` | Fixes events going to every device; a second *untrusted* account waits for L2 |
 | ⏳ | **R2 — rerank and query rewriting**, eval-gated | `docs/agent-rag-architecture.md` §4 | |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
 | ⏳ | **Phase 5 — hardening** | `docs/agent-architecture.md` §2.10 | iOS background continuation for folders |

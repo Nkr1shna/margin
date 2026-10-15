@@ -653,6 +653,9 @@ async fn read_tools_answer_from_the_library() {
     let now = Utc::now();
     let lesson = StoredLesson {
         lesson: Lesson {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "l1".into(),
             topic_id: topic.id.clone(),
             title: "Coefficients".into(),
@@ -843,7 +846,10 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
     assert_eq!(sent.item, None);
     let pending = sent.chat.pending.clone().unwrap();
     assert_eq!(pending.text, "second");
-    assert_eq!(pending.device_id, me(&h, &phone).await.device.id);
+    assert_eq!(
+        pending.device_id,
+        me(&h, &phone).await.device.as_ref().unwrap().id
+    );
 
     let (status, err) = api_error(send(&h, &t, &chat.id, "third").await).await;
     assert_eq!((status, err.code.as_str()), (409, "already_pending"));
@@ -1275,8 +1281,8 @@ async fn park_on_card(
 async fn any_device_answers_a_confirmation() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let mac_id = me(&h, &t).await.device.id;
-    let phone_id = me(&h, &phone).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     assert_eq!(chat.title, "");
     assert_eq!(chat.state, ChatState::Idle);
@@ -1329,7 +1335,7 @@ async fn any_device_answers_a_confirmation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn turns_waiting_on_the_owner_leave_their_slot() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let a = create_chat(&h, &t, json!({})).await.chat;
     let b = create_chat(&h, &t, json!({})).await.chat;
     let (sink_a, card_a, waiting_a) = park_on_card(&h, &a.id, &mac_id).await;
@@ -1369,7 +1375,7 @@ async fn turns_waiting_on_the_owner_leave_their_slot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deny_answers_a_confirmation() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let (_sink, card, waiting) = park_on_card(&h, &chat.id, &mac_id).await;
     wait_chat(&h, &t, &chat.id, |d| {
@@ -1396,8 +1402,8 @@ async fn deny_answers_a_confirmation() {
 async fn stop_denies_a_waiting_confirmation() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let mac_id = me(&h, &t).await.device.id;
-    let phone_id = me(&h, &phone).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let (_sink, card, _waiting) = park_on_card(&h, &chat.id, &mac_id).await;
     wait_chat(&h, &t, &chat.id, |d| {
@@ -1468,6 +1474,9 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
     let chat = Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "c1".into(),
         title: "Fourier".into(),
         title_by: Default::default(),
@@ -1931,7 +1940,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
     let h = start().await;
     let mac = h.sign_in("Mac").await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let mut watcher = h.socket(&mac).await;
     assert!(
         !devices(&h, &mac)
@@ -1965,7 +1974,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
             .iter()
             .any(|d| d.id == phone_id && d.online)
     );
-    assert!(me(&h, &phone).await.device.online);
+    assert!(me(&h, &phone).await.device.unwrap().online);
 
     // A request reaches only that device; its answer completes the call.
     let call = {
@@ -2043,7 +2052,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
 async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
     let (h, mac) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let r = h
         .post(&phone, "/api/workspaces")
         .json(&json!({"name": " notes ", "platform": "ios", "location": "iCloud Drive/notes"}))
@@ -2162,7 +2171,7 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let now = Utc::now();
     {
@@ -2339,7 +2348,7 @@ async fn stop_waits_for_started_writes_and_records_their_real_results() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(500);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2450,7 +2459,7 @@ async fn stop_waits_for_started_writes_and_records_their_real_results() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(400);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2488,7 +2497,7 @@ async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(300);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2522,7 +2531,7 @@ async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_finishes_a_write_the_loop_was_still_recording() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
     open_call(&sink, "call_topic", "create_topic").await;
@@ -2614,7 +2623,7 @@ async fn a_failed_turn_records_the_writes_it_finished() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_shows_while_its_turn_waits_to_retry() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
     let mut sock = h.socket(&t).await;
