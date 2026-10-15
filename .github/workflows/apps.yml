@@ -168,7 +168,7 @@ jobs:
           apk="$(find target/dx/margin-app -name '*.apk' -newer Cargo.toml | head -n 1)"
           [ -n "$apk" ] || { echo "::error::dx built no APK"; exit 1; }
           cp "$apk" "dist/Margin-${{ matrix.environment }}-${SHA::12}.apk"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: margin-apps-${{ matrix.environment }}-${{ needs.plan.outputs.sha }}
           path: dist/
