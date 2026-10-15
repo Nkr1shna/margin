@@ -60,6 +60,8 @@ pub enum ResponsesToolChoice {
     Function(String),
     /// `{"type":"allowed_tools","mode":…,"tools":[{"type":"function","name":…},…]}`:
     /// restricts this call to some tools while `tools` stays the same (cache-friendly).
+    /// A name that is a hosted tool's type (`"web_search"`, [`HOSTED_TOOLS`]) is
+    /// rendered as that tool (`{"type":"web_search"}`), not as a function.
     AllowedTools {
         /// Requires a call (`"required"`) instead of letting the model choose (`"auto"`).
         required: bool,
@@ -80,11 +82,37 @@ impl ResponsesToolChoice {
                 "mode": if *required { "required" } else { "auto" },
                 "tools": names
                     .iter()
-                    .map(|n| json!({"type": "function", "name": n}))
+                    .map(|n| if HOSTED_TOOLS.contains(&n.as_str()) {
+                        json!({"type": n})
+                    } else {
+                        json!({"type": "function", "name": n})
+                    })
                     .collect::<Vec<_>>(),
             }),
         }
     }
+}
+
+/// The hosted tools a Responses request may offer, by their `type`. No Margin function
+/// tool has one of these names.
+pub const HOSTED_TOOLS: [&str; 1] = [WEB_SEARCH];
+
+/// The hosted web search tool's `type` (and its name in `allowed_tools`).
+pub const WEB_SEARCH: &str = "web_search";
+
+/// `search_context_size` of the hosted web search (D1).
+pub const WEB_SEARCH_CONTEXT_SIZE: &str = "medium";
+
+/// `include` entry that returns the sources a `web_search_call` read (its results).
+pub const INCLUDE_WEB_SOURCES: &str = "web_search_call.action.sources";
+
+/// `include` entry that returns reasoning's encrypted content, so reasoning items can
+/// be replayed under `store: false`.
+pub const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
+
+/// The hosted web search tool definition.
+pub fn web_search_tool() -> Value {
+    json!({"type": WEB_SEARCH, "search_context_size": WEB_SEARCH_CONTEXT_SIZE})
 }
 
 /// `reasoning`.
@@ -213,7 +241,12 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, AiError>
 
 impl ResponsesClient {
     /// The JSON body sent for `req`: always `stream: true` and `store: false`; optional
-    /// fields are left out when `None`/empty.
+    /// fields are left out when `None`/empty. `include` asks for the encrypted
+    /// reasoning when `include_encrypted_reasoning`, and for the web search sources
+    /// whenever `tools` holds the hosted `web_search`.
+    ///
+    /// Under a ChatGPT bearer token (`is_bearer`): `max_output_tokens` is never sent,
+    /// and a request with tools always sends `parallel_tool_calls: false`.
     pub fn response_body(&self, req: &ResponseRequest) -> Value {
         let mut body = json!({
             "model": req.model.as_deref().unwrap_or(&self.model),
@@ -237,10 +270,19 @@ impl ResponsesClient {
             }
             body["reasoning"] = r;
         }
+        let mut include = Vec::new();
         if req.include_encrypted_reasoning {
-            body["include"] = json!(["reasoning.encrypted_content"]);
+            include.push(INCLUDE_ENCRYPTED_REASONING);
         }
-        if let Some(max) = req.max_output_tokens {
+        if req.tools.iter().any(|t| t["type"] == WEB_SEARCH) {
+            include.push(INCLUDE_WEB_SOURCES);
+        }
+        if !include.is_empty() {
+            body["include"] = json!(include);
+        }
+        if let Some(max) = req.max_output_tokens
+            && !self.bearer
+        {
             body["max_output_tokens"] = json!(max);
         }
         if let Some(key) = &req.prompt_cache_key {
@@ -249,7 +291,12 @@ impl ResponsesClient {
         if let Some(cm) = &req.context_management {
             body["context_management"] = cm.to_json();
         }
-        if let Some(parallel) = req.parallel_tool_calls {
+        let parallel = if self.bearer && !req.tools.is_empty() {
+            Some(false)
+        } else {
+            req.parallel_tool_calls
+        };
+        if let Some(parallel) = parallel {
             body["parallel_tool_calls"] = json!(parallel);
         }
         body
@@ -529,26 +576,39 @@ impl ResponsesClient {
 }
 
 /// The Responses request of an agent step on `model`: the system prompt as a leading
-/// developer message, then the history; the function tools (strict), reasoning with
-/// summaries and its encrypted content, the chat's cache key, server compaction when
-/// asked.
+/// developer message, then the history (stored items verbatim: `web_search_call`s
+/// replay like any output item); the function tools (strict), then the hosted
+/// `web_search` (`search_context_size: medium`) when `req.web.search`; reasoning with
+/// summaries and its encrypted content (and the search sources, `response_body`); the
+/// chat's cache key; server compaction when asked. `req.web.fetch` is Claude's: the
+/// Responses search opens pages itself.
 ///
-/// Not yet here (area P-ai-openai): the hosted `web_search` tool for `req.web`, and the
-/// parameters a ChatGPT bearer token must not send.
+/// `ToolChoice::Allowed` keeps web search allowed when it is offered (the gating is for
+/// Margin's own tools). The bearer rules are the client's (`response_body`), so the
+/// same request renders for OpenAI and ChatGPT.
 pub fn responses_request(req: &ModelRequest, model: &str) -> ResponseRequest {
     let mut input = Vec::with_capacity(req.history.len() + 1);
     input.push(
         json!({"role": "developer", "content": [{"type": "input_text", "text": req.system}]}),
     );
     input.extend(req.history.iter().cloned());
-    let tools: Vec<Value> = req.tools.iter().map(function_tool).collect();
+    let mut tools: Vec<Value> = req.tools.iter().map(function_tool).collect();
+    if req.web.search {
+        tools.push(web_search_tool());
+    }
     let tool_choice = (!tools.is_empty()).then(|| match &req.tool_choice {
         ToolChoice::Auto => ResponsesToolChoice::Auto,
         ToolChoice::None => ResponsesToolChoice::None,
-        ToolChoice::Allowed(names) => ResponsesToolChoice::AllowedTools {
-            required: false,
-            names: names.clone(),
-        },
+        ToolChoice::Allowed(names) => {
+            let mut names = names.clone();
+            if req.web.search && !names.iter().any(|n| n == WEB_SEARCH) {
+                names.push(WEB_SEARCH.to_string());
+            }
+            ResponsesToolChoice::AllowedTools {
+                required: false,
+                names,
+            }
+        }
     });
     ResponseRequest {
         model: Some(model.to_string()),
@@ -593,20 +653,63 @@ impl Provider for ResponsesClient {
         })
     }
 
+    /// `GET {base_url}/models`. An API key gets OpenAI's list (`data[].id`); a ChatGPT
+    /// bearer token gets the plan's (`models[]`, those with `visibility == "list"`, by
+    /// `slug` with their `display_name`). Neither carries a window: `windows.rs`' table
+    /// fills it, `None` for an id it doesn't know.
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
-        unimplemented!("providers, P-ai-openai")
+        Box::pin(async move { Ok(models_list(&self.get_json("models").await?)) })
     }
+}
+
+/// The models of a `GET /models` answer, either shape: OpenAI's `{data: [{id}]}` or
+/// ChatGPT's `{models: [{slug, display_name, visibility}]}`. Ids keep the API's order,
+/// each once.
+pub fn models_list(v: &Value) -> Vec<ModelInfo> {
+    let entries: Vec<(String, Option<String>)> = match v.get("models").and_then(Value::as_array) {
+        Some(models) => models
+            .iter()
+            .filter(|m| m["visibility"] == "list")
+            .filter_map(|m| {
+                let id = m["slug"].as_str().or_else(|| m["id"].as_str())?;
+                Some((
+                    id.to_string(),
+                    m["display_name"].as_str().map(str::to_string),
+                ))
+            })
+            .collect(),
+        None => v["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| Some((m["id"].as_str()?.to_string(), None)))
+            .collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .filter(|(id, _)| !id.is_empty() && seen.insert(id.clone()))
+        .map(|(id, display_name)| {
+            let window = crate::windows::openai_window(&id);
+            ModelInfo {
+                context_window: window.map(|w| w.input),
+                max_output_tokens: window.map(|w| w.output),
+                id,
+                display_name,
+            }
+        })
+        .collect()
 }
 
 /// A Responses stream as neutral `ModelEvent`s.
 pub fn model_events(events: ResponseStream) -> ModelStream {
     let mut adapter = Adapter::default();
-    Box::pin(events.filter_map(move |event| {
-        let out = match event {
-            Ok(event) => adapter.event(event).map(Ok),
-            Err(e) => Some(Err(e)),
+    Box::pin(events.flat_map(move |event| {
+        let out: Vec<Result<ModelEvent, AiError>> = match event {
+            Ok(event) => adapter.event(event).into_iter().map(Ok).collect(),
+            Err(e) => vec![Err(e)],
         };
-        std::future::ready(out)
+        futures_util::stream::iter(out)
     }))
 }
 
@@ -614,22 +717,24 @@ pub fn model_events(events: ResponseStream) -> ModelStream {
 /// script a Responses-shaped reply).
 pub fn to_model_events(events: Vec<StreamEvent>) -> Vec<ModelEvent> {
     let mut adapter = Adapter::default();
-    events
-        .into_iter()
-        .filter_map(|e| adapter.event(e))
-        .collect()
+    events.into_iter().flat_map(|e| adapter.event(e)).collect()
 }
 
-/// Per-stream state of the adaptation: the reasoning summary part each item is on.
+/// Per-stream state of the adaptation.
 #[derive(Default)]
 struct Adapter {
     /// By output index: the summary part last streamed, and whether text came yet.
     summaries: std::collections::HashMap<u32, (u32, bool)>,
+    /// `web_search_call` items finished in this response (for `usage`, when the final
+    /// response object doesn't list its output).
+    web_searches: u64,
 }
 
 impl Adapter {
-    fn event(&mut self, event: StreamEvent) -> Option<ModelEvent> {
-        Some(match event {
+    /// The `ModelEvent`s of one Responses event: none for the events the loop doesn't
+    /// need, two for a finished `web_search_call` (the call, then its result).
+    fn event(&mut self, event: StreamEvent) -> Vec<ModelEvent> {
+        vec![match event {
             StreamEvent::OutputItemAdded { output_index, item } => ModelEvent::Started {
                 index: output_index,
                 kind: start_kind(&item),
@@ -668,14 +773,20 @@ impl Adapter {
                 text.push_str(&delta);
                 *any |= !text.is_empty();
                 if text.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 ModelEvent::Delta {
                     index: output_index,
                     delta: Delta::Reasoning(text),
                 }
             }
-            StreamEvent::FunctionCallArgumentsDone { .. } => return None,
+            StreamEvent::FunctionCallArgumentsDone { .. } => return Vec::new(),
+            StreamEvent::OutputItemDone { output_index, item }
+                if item_type(&item) == Some("web_search_call") =>
+            {
+                self.web_searches += 1;
+                return web_search_done(output_index, item);
+            }
             StreamEvent::OutputItemDone { output_index, item } => ModelEvent::Done {
                 index: output_index,
                 item: ModelItem {
@@ -684,22 +795,84 @@ impl Adapter {
                 },
             },
             StreamEvent::Completed {
-                usage,
+                mut usage,
                 model,
                 status,
                 ..
-            } => ModelEvent::Completed {
-                usage,
-                model,
-                stop_reason: status,
-                next: Next::Finished,
-            },
+            } => {
+                usage.web_search_requests = usage.web_search_requests.max(self.web_searches);
+                ModelEvent::Completed {
+                    usage,
+                    model,
+                    stop_reason: status,
+                    next: Next::Finished,
+                }
+            }
             StreamEvent::Incomplete { reason, usage } => ModelEvent::Incomplete { reason, usage },
             StreamEvent::Failed { code, message } | StreamEvent::Error { code, message } => {
                 ModelEvent::Failed { code, message }
             }
-        })
+        }]
     }
+}
+
+/// A finished `web_search_call` as two `Done` events on its index, the way Claude
+/// sends a search as two blocks: the call (`ItemView::WebSearch` with the query; it
+/// carries the item verbatim for `model_items`) and its result
+/// (`ItemView::WebSearchResult`: `action.sources` as the results, the status as the
+/// error when it isn't `completed`; nothing stored, the call's item already holds it).
+fn web_search_done(index: u32, item: Value) -> Vec<ModelEvent> {
+    let id = str_field(&item, "id");
+    let action = &item["action"];
+    let query = action["query"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            let queries: Vec<&str> = action["queries"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            (!queries.is_empty()).then(|| queries.join("; "))
+        })
+        .or_else(|| action["url"].as_str().map(str::to_string))
+        .or_else(|| action["pattern"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let results = action["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some(margin_shared::WebResult {
+                url: s["url"].as_str().filter(|u| !u.is_empty())?.to_string(),
+                title: s["title"].as_str().map(str::to_string),
+                page_age: None,
+            })
+        })
+        .collect();
+    let error = match item["status"].as_str() {
+        None | Some("completed") => None,
+        Some(status) => Some(status.to_string()),
+    };
+    vec![
+        ModelEvent::Done {
+            index,
+            item: ModelItem {
+                stored: vec![item],
+                view: ItemView::WebSearch {
+                    id: id.clone(),
+                    query,
+                },
+            },
+        },
+        ModelEvent::Done {
+            index,
+            item: ModelItem {
+                stored: Vec::new(),
+                view: ItemView::WebSearchResult { id, results, error },
+            },
+        },
+    ]
 }
 
 fn item_type(item: &Value) -> Option<&str> {
@@ -774,27 +947,13 @@ fn item_view(item: &Value) -> ItemView {
             name: str_field(item, "name"),
             arguments: str_field(item, "arguments"),
         },
-        Some("web_search_call") => ItemView::WebSearchResult {
-            id: str_field(item, "id"),
-            results: item
-                .pointer("/action/sources")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|s| margin_shared::WebResult {
-                    url: str_field(s, "url"),
-                    title: s["title"].as_str().map(str::to_string),
-                    page_age: None,
-                })
-                .collect(),
-            error: None,
-        },
         Some("compaction") => ItemView::Compaction,
         _ => ItemView::Other,
     }
 }
 
-/// `response.usage` of a finished response, as one model call.
+/// `response.usage` of a finished response, as one model call; `web_search_requests`
+/// counts the `web_search_call` items in its `output` (OpenAI bills each).
 pub(crate) fn usage(response: &Value) -> Usage {
     let n = |path: &str| {
         response
@@ -808,6 +967,12 @@ pub(crate) fn usage(response: &Value) -> Usage {
         output_tokens: n("output_tokens"),
         reasoning_tokens: n("output_tokens_details/reasoning_tokens"),
         model_calls: 1,
+        web_search_requests: response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item_type(item) == Some("web_search_call"))
+            .count() as u64,
         ..Default::default()
     }
 }
