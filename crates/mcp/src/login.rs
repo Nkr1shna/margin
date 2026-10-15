@@ -1,6 +1,6 @@
 //! `margin-mcp login`: the device sign-in every Margin app uses (`POST /auth/start`,
 //! GitHub in the browser, `POST /auth/poll` every 2 s). The minted token is stored with
-//! the `TokenStore` (the Keychain in the binary); the device shows in Settings → Devices
+//! the `TokenStore` (the secret store in the binary); the device shows in Settings → Devices
 //! as "Claude Code (<host>)" and is revoked there like any other.
 
 use std::time::Duration;
@@ -10,7 +10,7 @@ use chrono::Utc;
 use margin_shared::LoginState;
 
 use crate::client::Client;
-use crate::config::TokenStore;
+use crate::config::{TokenStore, agent_key};
 
 /// How often the service is asked whether the sign-in was approved.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -58,6 +58,11 @@ pub async fn login(
                     "Signed in to {} as {github_login}. The device \"{device_name}\" is in Settings → Devices; revoke it there to sign Claude Code out.",
                     client.base()
                 ));
+                if store.get(&agent_key(client.base()))?.is_some() {
+                    say(
+                        "An agent token (`margin-mcp token`) is also stored for this service and is used first; `margin-mcp token --forget` removes it.",
+                    );
+                }
                 return Ok(github_login);
             }
             LoginState::Denied { reason } => bail!("Margin refused the sign-in: {reason}"),
