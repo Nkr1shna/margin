@@ -84,7 +84,7 @@ jobs:
           [ "$(cat dist/BUILD_SHA)" = "$SHA" ] || { echo "::error::the artifact is stamped $(cat dist/BUILD_SHA), not $SHA"; exit 1; }
           chmod +x dist/margin-service
           deploy/scripts/deploy.sh dev dist/margin-service "$SHA"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deployed-dev-${{ steps.build.outputs.sha }}
           path: dist/
