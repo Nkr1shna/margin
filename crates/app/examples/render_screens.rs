@@ -31,6 +31,13 @@
 //!   stages with `take-k` packing ("Custom" in the variant picker). Settings → AI always
 //!   shows the stage pickers, over the fake's variants, and each provider's models (with
 //!   their windows) where it has a credential.
+//!   `RENDER_PIPELINE=r2` sets the r2-full variant's stages (the Rewriter and the
+//!   listwise reranker).
+//! - `RENDER_RERANKER=missing|downloading|ready|failed` (with `RENDER_EMBEDDING`) adds the
+//!   reranker model to Settings → Sources in that state; `ready` also makes the
+//!   cross-encoder's variants available in Settings → AI.
+//! - The sample lessons say what wrote them in their details line (`/lesson/l1`: Claude,
+//!   `/lesson/l2`: OpenAI); `l3` failed, so it has none.
 //! - `RENDER_PROVIDER=claude` makes Claude the default provider, with its key set (the new
 //!   chat's picker preset to it; `RENDER_PROVIDER=claude-nokey` without the key, so the
 //!   new chat says to set it up). Chat `c3` is on Claude, with a web search, its results
@@ -212,7 +219,21 @@ fn Harness(props: HarnessProps) -> Element {
                 }
             }
         }
-        lib.pipeline_variants = Some(fake::fake_pipeline_variants());
+        if std::env::var("RENDER_PIPELINE").as_deref() == Ok("r2")
+            && let Some(settings) = lib.settings.as_mut()
+        {
+            let variants = fake::fake_pipeline_variants();
+            if let Some(full) = variants.variants.iter().find(|v| v.name == "r2-full") {
+                settings.pipeline = settings.pipeline.with_stages_of(&full.config);
+            }
+        }
+        // The cross-encoder's variants are available once its model is downloaded.
+        lib.pipeline_variants = Some(match std::env::var("RENDER_RERANKER").as_deref() {
+            Ok("ready") => fake::pipeline_variants_with(Some(&EmbeddingModelState::Ready {
+                bytes: fake::RERANKER_DOWNLOAD_BYTES,
+            })),
+            _ => fake::fake_pipeline_variants(),
+        });
         // The text and code sources' originals, so the viewer shows their cited lines
         // (the fetch it would make doesn't run here).
         for source in lib.sources.values() {
@@ -251,7 +272,28 @@ fn Harness(props: HarnessProps) -> Element {
                     done: 212,
                     total: 1480,
                 }),
-                reranker: None,
+                // R2's reranker model (Settings → Sources).
+                reranker: std::env::var("RENDER_RERANKER").ok().map(|state| {
+                    margin_shared::RerankerModelState {
+                        name: fake::RERANKER_NAME.into(),
+                        repo: fake::RERANKER_REPO.into(),
+                        state: match state.as_str() {
+                            "downloading" => EmbeddingModelState::Downloading {
+                                received: 9_400_000,
+                                total: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                            "ready" => EmbeddingModelState::Ready {
+                                bytes: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                            "failed" => EmbeddingModelState::Failed {
+                                error: "Hugging Face answered 503.".into(),
+                            },
+                            _ => EmbeddingModelState::NotDownloaded {
+                                download_bytes: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                        },
+                    }
+                }),
             });
         let uploads = match std::env::var("RENDER_SOURCES") {
             Ok(topic_id) if std::env::var_os("RENDER_UPLOADS").is_some() => {
