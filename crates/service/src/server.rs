@@ -97,8 +97,12 @@ impl Service {
             .get(db::SETTINGS, SETTINGS_ID)
             .await?
             .unwrap_or_default();
-        let pipeline = Pipeline::build(&settings.pipeline, &registry)
-            .context("the pipeline in Settings can't be built")?;
+        // The embedder stage is the one this service runs (`service.toml`'s `embedder`).
+        let pipeline = Pipeline::build(
+            &settings.pipeline.with_embedder(model_files.backend.name()),
+            &registry,
+        )
+        .context("the pipeline in Settings can't be built")?;
         let state: AppState = Arc::new(App {
             config: opts.config,
             store: opts.store,
@@ -125,6 +129,10 @@ impl Service {
             embedder: tokio::sync::Mutex::new(None),
             model_job: Mutex::new(ModelJob::Idle),
             model_download_bytes: Mutex::new(None),
+            speech_job: Mutex::new(ModelJob::Idle),
+            speech_download_bytes: Mutex::new(None),
+            reindex: Mutex::new(None),
+            last_model: Mutex::new(None),
             source_queue: source_tx,
             uploads_busy: Mutex::new(Default::default()),
             turns: Turns::new(),
@@ -246,6 +254,11 @@ pub fn router(state: AppState) -> Router {
             get(embedding::get_model).delete(embedding::delete_model),
         )
         .route(routes::EMBEDDING_DOWNLOAD, post(embedding::start_download))
+        .route(routes::SPEECH_MODEL, delete(embedding::delete_speech))
+        .route(
+            routes::SPEECH_MODEL_DOWNLOAD,
+            post(embedding::start_speech_download),
+        )
         .route(
             routes::CHATS,
             get(chats::list_chats).post(chats::create_chat),
@@ -458,6 +471,9 @@ async fn housekeeping(state: AppState) {
         tick.tick().await;
         auth::purge_expired_logins(&state);
         state.limiter.purge();
+        // Models unused for a while (the speech model) are unloaded.
+        let tools = state.source_tools.clone();
+        let _ = tokio::task::spawn_blocking(move || tools.sweep()).await;
     }
 }
 

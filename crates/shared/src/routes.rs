@@ -144,6 +144,13 @@ pub const TRACES: &str = "/api/traces";
 /// views.
 pub const TRACES_ROLLUP: &str = "/api/traces/rollup";
 pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
+/// `DELETE` removes the speech model's files; `POST SPEECH_MODEL_DOWNLOAD` starts its
+/// download. Both answer with the whole `EmbeddingModel` (its `speech` part changed),
+/// and progress arrives as `Event::EmbeddingModelChanged`. 409 "no_speech_model" on a
+/// service that transcribes with an installed program instead (`EmbeddingModel.speech`
+/// is `None` there).
+pub const SPEECH_MODEL: &str = "/api/embedding/speech";
+pub const SPEECH_MODEL_DOWNLOAD: &str = "/api/embedding/speech/download";
 
 const MB: u64 = 1024 * 1024;
 /// Largest audio or video source.

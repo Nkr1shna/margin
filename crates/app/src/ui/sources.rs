@@ -189,7 +189,7 @@ pub fn ReadAgainButton(id: Id, name: String, on_error: EventHandler<String>) -> 
         button {
             class: "btn btn-secondary btn-sm",
             "aria-label": "Read {name} again",
-            title: "Read it again on the service Mac",
+            title: "Read it again on the service",
             disabled: *busy.read(),
             onclick: move |_| {
                 let id = id.clone();
@@ -219,7 +219,7 @@ pub async fn refresh_embedding(app: AppCtx) -> Result<(), String> {
     Ok(())
 }
 
-/// Start downloading the embedding model on the service Mac.
+/// Start downloading the embedding model on the service.
 pub async fn download_embedding(app: AppCtx) -> Result<(), String> {
     let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
     let model = api
@@ -772,7 +772,7 @@ pub fn EmbeddingNotice() -> Element {
                     div { class: "body",
                         b { class: "notice-title", "Sources need the local embedding model" }
                         span { class: "muted",
-                            "Its text, image and audio encoders run on the service Mac and download together, once. Until then, sources wait in the queue."
+                            "Its text, image and audio encoders run on the service and download together, once. Until then, sources wait in the queue."
                         }
                         match &state {
                             EmbeddingModelState::Downloading { received, total } => rsx! {

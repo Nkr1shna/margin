@@ -1,5 +1,7 @@
 //! Renders real ManimGX scenes. Needs `manimgx` (on PATH or in `~/.local/bin`); the
-//! PocketTTS test also needs `fluidaudiocli` and is skipped without it.
+//! PocketTTS test also needs `fluidaudiocli` and is skipped without it. The sandboxed
+//! tests use this OS's sandbox (`SandboxMode::native()`): `sandbox-exec` on macOS,
+//! bubblewrap on Linux (which then needs `bwrap` and user namespaces).
 
 use std::path::PathBuf;
 
@@ -249,22 +251,22 @@ async fn silent_render_unsandboxed() {
     assert!(scene.contains("_margin_voice.attach(globals())"));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn silent_render_sandboxed() {
     let (result, events) = run(
         "silent-sandboxed",
         NARRATED,
-        &config(SandboxMode::MacosSandboxExec, Voice::Silent).await,
+        &config(SandboxMode::native(), Voice::Silent).await,
     )
     .await;
     assert_rendered(&result.unwrap(), &events);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn rerender_in_the_same_folder_replaces_the_outputs() {
-    let config = config(SandboxMode::MacosSandboxExec, Voice::Silent).await;
+    let config = config(SandboxMode::native(), Voice::Silent).await;
     let (first, _) = run("rerender", NARRATED, &config).await;
     let first = first.unwrap();
     let silent = r#"import manimgx as m
@@ -296,10 +298,10 @@ async fn poster_unsandboxed() {
     assert_poster(&out, &config, &events);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn poster_sandboxed() {
-    let config = config(SandboxMode::MacosSandboxExec, Voice::Silent).await;
+    let config = config(SandboxMode::native(), Voice::Silent).await;
     let (result, events) = run("poster-sandboxed", POSTER_SHOT, &config).await;
     let out = result.unwrap();
     assert_poster(&out, &config, &events);
@@ -401,7 +403,7 @@ async fn scene_without_lesson_scene_is_a_scene_error() {
     assert!(message.contains("LessonScene"), "{message}");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn sandbox_blocks_the_network() {
     let code = r#"import socket
@@ -425,7 +427,7 @@ class LessonScene(m.Scene):
         run(
             "network",
             code,
-            &config(SandboxMode::MacosSandboxExec, Voice::Silent).await,
+            &config(SandboxMode::native(), Voice::Silent).await,
         )
         .await
         .0,
@@ -448,18 +450,21 @@ class LessonScene(m.Scene):
         run(
             "network-direct",
             code,
-            &config(SandboxMode::MacosSandboxExec, Voice::Silent).await,
+            &config(SandboxMode::native(), Voice::Silent).await,
         )
         .await
         .0,
     );
+    // macOS denies the connect; in bubblewrap's empty network namespace there is no route.
     assert!(
-        message.contains("PermissionError") || message.contains("Operation not permitted"),
+        message.contains("PermissionError")
+            || message.contains("Operation not permitted")
+            || message.contains("Network is unreachable"),
         "{message}"
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn sandbox_blocks_writes_outside_the_work_dir() {
     let outside = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("margin-video-outside.txt");
@@ -491,7 +496,7 @@ class LessonScene(m.Scene):
     let (result, events) = run(
         "escape",
         &code,
-        &config(SandboxMode::MacosSandboxExec, Voice::Silent).await,
+        &config(SandboxMode::native(), Voice::Silent).await,
     )
     .await;
     let message = scene_message(result);
@@ -522,8 +527,8 @@ async fn pocket_tts_narration() {
         );
         return;
     };
-    let sandbox = if cfg!(target_os = "macos") {
-        SandboxMode::MacosSandboxExec
+    let sandbox = if cfg!(any(target_os = "macos", target_os = "linux")) {
+        SandboxMode::native()
     } else {
         SandboxMode::Unsandboxed
     };

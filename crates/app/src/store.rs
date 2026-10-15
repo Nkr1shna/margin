@@ -813,6 +813,8 @@ pub(crate) mod tests {
                 received: 10,
                 total: 100,
             },
+            speech: None,
+            reindex: None,
         };
         s.apply(Event::EmbeddingModelChanged {
             model: model.clone(),

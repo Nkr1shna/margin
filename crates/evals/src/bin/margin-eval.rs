@@ -1,7 +1,7 @@
 //! The opt-in eval runner (`docs/agent-rag-architecture.md` §3.4). Never run in CI:
 //! every command that reaches a model or the real embedder checks `live::guard_env`
 //! first. The commands themselves live in `margin_evals::runner` and are tested there
-//! with fakes; this file only wires the real models, embedder and Keychain to them.
+//! with fakes; this file only wires the real models, embedder and secret store to them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,6 @@ use margin_evals::recorded::{EMBEDDINGS_FILE, Recording, RecordingVectors, Vecto
 use margin_evals::runner::{self, Env, Paths};
 use margin_evals::store::{EvalStore, default_data_dir};
 use margin_evals::traces::{self, TraceFilter};
-use margin_service::secrets::KeychainStore;
 
 #[tokio::main]
 async fn main() {
@@ -183,7 +182,6 @@ fn need_judges(js: &[Box<dyn Judge>]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow::Result<()> {
     let cfg = live::RunnerConfig::load(&paths.evals.join("runner.toml"))?;
     // The dogfood suite reads the repository's docs/ (next to evals/) as its corpus.
@@ -202,34 +200,72 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     } else {
         paths
     };
+    // The backend: the environment's, the variant's `[embedder]`, or the service's.
+    let service = live::service_config()?;
+    let variant_embedder = match cmd {
+        Command::Run { variant, .. }
+        | Command::RecordGenerations { variant }
+        | Command::SynthQuestions { variant, .. } => Some(paths.variant(variant)?.0.embedder.name),
+        _ => None,
+    };
+    let backend = live::live_backend(
+        &|k| std::env::var(k).ok(),
+        variant_embedder.as_deref(),
+        &service.embedder,
+    )?;
+    eprintln!(
+        "embedder: {} ({})",
+        backend.label(),
+        backend.embedder_version()
+    );
+    let reader = live::reader_name();
+    let recording_file = paths.evals.join(live::recording_file(backend));
+    let extraction_file = paths.evals.join(live::extraction_file(reader));
     let data = default_data_dir();
     let media = media_dir(&data);
     let corpus = paths.corpus();
     let docs = documents(&corpus)?;
-    let embedder: &'static live::LiveVectors =
-        Box::leak(Box::new(live::LiveVectors::load(&corpus, &media)?));
-    let extraction = match Extraction::load(&paths.evals.join(EXTRACTED_FILE)) {
+    let embedder: &'static live::LiveVectors = Box::leak(Box::new(live::LiveVectors::load(
+        &corpus, &media, &service, backend,
+    )?));
+    let extraction = match Extraction::load(&extraction_file) {
         Ok(e) if !matches!(cmd, Command::RecordEmbeddings) => {
             // Page renders for the image encoder come from a fresh read either way.
-            live::extract_corpus(&corpus, &docs, &media, "pdfkit+vision")?;
+            live::extract_corpus(&corpus, &docs, &media, reader)?;
             e
         }
         _ => live::extract_corpus(
             &corpus,
             &docs,
             &media,
-            &format!("pdfkit+vision on macOS {}", os_version()),
+            &format!("{reader} on {}", live::os_version()),
         )?,
     };
-    let seed = Recording::load(&paths.evals.join(EMBEDDINGS_FILE))
+    let seed = Recording::load(&recording_file)
         .ok()
         .filter(|r| r.version == embedder.version())
         .unwrap_or_else(|| Recording::for_version(embedder.version()));
     // Served from the recording where it has the vector, embedded live otherwise.
     let vectors: &'static RecordingVectors<'static> =
         Box::leak(Box::new(RecordingVectors::new(embedder, seed)?));
+    // `record_embeddings` writes `EMBEDDINGS_FILE` and `EXTRACTED_FILE` under `out`: for
+    // another backend or reader it writes into a staging folder (seeded with that
+    // backend's recording) whose files are then copied to their own names, so the Core
+    // ML recording and the Mac extraction are never overwritten.
+    let staged = recording_file != paths.evals.join(EMBEDDINGS_FILE)
+        || extraction_file != paths.evals.join(EXTRACTED_FILE);
+    let stage = data.join("record-staging").join(backend.dir_name());
+    let mut env_paths = paths.clone();
+    if matches!(cmd, Command::RecordEmbeddings) && staged {
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(stage.join("recorded"))?;
+        if recording_file.is_file() {
+            std::fs::copy(&recording_file, stage.join(EMBEDDINGS_FILE))?;
+        }
+        env_paths.out = stage.clone();
+    }
     let env = Env {
-        paths: paths.clone(),
+        paths: env_paths,
         vectors: if matches!(cmd, Command::RecordEmbeddings) {
             embedder
         } else {
@@ -248,19 +284,34 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
             }
     );
     let models = if needs_models {
-        Some(live::models(&cfg, &KeychainStore)?)
+        Some(live::models(&cfg, &*live::secret_store(&service)?)?)
     } else {
         None
     };
     match cmd {
         Command::RecordEmbeddings => {
             let s = runner::record_embeddings(&env).await?;
+            if staged {
+                for (from, to) in [
+                    (stage.join(EMBEDDINGS_FILE), &recording_file),
+                    (stage.join(EXTRACTED_FILE), &extraction_file),
+                ] {
+                    if let Some(dir) = to.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::copy(&from, to).with_context(|| {
+                        format!("couldn't copy {} to {}", from.display(), to.display())
+                    })?;
+                }
+                let _ = std::fs::remove_dir_all(&stage);
+            }
             println!(
-                "{} vectors recorded ({} embedded now) for chunkers {:?} → {}",
+                "{} vectors recorded ({} embedded now) for chunkers {:?} → {} (extraction → {})",
                 s.vectors,
                 s.embedded,
                 s.chunkers,
-                paths.evals.join(EMBEDDINGS_FILE).display()
+                recording_file.display(),
+                extraction_file.display()
             );
         }
         Command::RecordGenerations { variant } => {
@@ -383,7 +434,7 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
             }
             Suite::Agent => {
                 let m = models.as_ref().unwrap();
-                let (client, model_id) = m.chat.clone().context("the agent suite runs on the OpenAI Responses API: no openai-api-key in the Keychain")?;
+                let (client, model_id) = m.chat.clone().context("the agent suite runs on the OpenAI Responses API: no openai-api-key in the service's secret store")?;
                 let js = if *judge { judges(m) } else { Vec::new() };
                 if *judge {
                     need_judges(&js)?;
@@ -447,22 +498,4 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
         _ => unreachable!("not a live command"),
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn live_command(_: &Command, _: &Paths, _: &EvalStore) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "this command needs the service Mac: the real embedder and PDF/OCR readers are macOS only"
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn os_version() -> String {
-    std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "?".into())
 }

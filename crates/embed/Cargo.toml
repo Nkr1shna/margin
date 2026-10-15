@@ -23,21 +23,21 @@ tokenizers = { version = "=0.23.2", optional = true, default-features = false, f
 realfft = { version = "=3.5.0", optional = true }
 pdfium-render = { version = "=0.9.4", optional = true }
 image = { version = "=0.25.10", optional = true }
-kamadak-exif = { version = "=0.6.1", optional = true }
-libheif-rs = { version = "=3.0.0", optional = true }
 parakeet-rs = { version = "=0.4.1", optional = true, default-features = false, features = ["cpu", "api-28"] }
 
 [features]
-default = []
+default = ["heic"]
 # EmbeddingGemma 2 on ONNX Runtime (CPU). Always on for Linux; on macOS for the A/B.
 onnx = ["dep:ort", "dep:half", "dep:tokenizers", "dep:realfft"]
-# pdfium, `image` and EXIF orientation: the PDF and picture readers off macOS.
-linux-readers = ["dep:pdfium-render", "dep:image", "dep:kamadak-exif"]
-# HEIC/HEIF through libheif (LGPL, dynamic; needs libheif-dev to build). Off by default
-# so a builder without the package still builds; the Linux service build turns it on.
+# pdfium and `image` (which reads EXIF orientation itself): the PDF and picture readers
+# off macOS; tesseract and ffmpeg are run as programs.
+linux-readers = ["dep:pdfium-render", "dep:image"]
+# HEIC/HEIF through libheif (LGPL, dynamic; libheif-dev >= 1.17 to build, Ubuntu 24.04
+# has 1.17.6). On by default; it only has an effect on Linux, where a builder without the
+# package builds with `--no-default-features`.
 heic = ["dep:libheif-rs"]
 # Parakeet speech recognition on the same ONNX Runtime.
-speech-onnx = ["dep:parakeet-rs"]
+speech-onnx = ["onnx", "dep:parakeet-rs"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "half", "tracing", "download-binaries", "copy-dylibs", "tls-rustls", "api-31"] }
@@ -46,7 +46,9 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"
 realfft = "=3.5.0"
 pdfium-render = "=0.9.4"
 image = "=0.25.10"
-kamadak-exif = "=0.6.1"
+# Optional even here: the `heic` feature (default) turns it on. API level 1.17, the
+# libheif Ubuntu 24.04 ships (libheif-rs's default asks for 1.23).
+libheif-rs = { version = "=3.0.0", optional = true, default-features = false, features = ["v1_17"] }
 parakeet-rs = { version = "=0.4.1", default-features = false, features = ["cpu", "api-28"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
