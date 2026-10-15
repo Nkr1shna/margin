@@ -6,17 +6,17 @@
 * Prefer implementing functionality in existing files unless it is a new logical component. Avoid creating many small files.
 * Avoid functions that panic, like `unwrap()` and `expect()`, in non-test code; use `?` to propagate errors. Tests may unwrap.
 * Be careful with operations like indexing (`v[i]`, `&s[a..b]`), which may panic if the indexes are out of bounds.
-* Never silently discard errors with `let _ =` on fallible operations. Always handle errors appropriately:
+* Don't add a new `let _ =` that silently discards a fallible operation's error. Handle it instead (existing ones are cleaned up in their own sweeps; don't convert them in an unrelated PR):
   - Propagate errors with `?` when the calling function should handle them.
   - Log with `tracing::warn!` or `tracing::error!`, with the context needed to act on it, when the work can go on without the result.
   - Use explicit error handling with `match` or `if let Err(...)` when you need custom logic.
   - Use `.ok()` only for an expected failure (a cancelled request, a closed channel at shutdown), with a comment naming that case.
   - Example: avoid `let _ = tx.send(event).await;`, which hides a dropped receiver.
-* Errors have types. Library crates use `thiserror` enums; don't add `Result<_, String>`, and never branch on an error's message text (`err.contains("tool")`). `anyhow` is only for the outer edge of binaries and CLIs.
+* Errors have types. Don't add new `Result<_, String>` or new `anyhow` errors to library crates; new error enums use `thiserror`. Don't convert existing ones in an unrelated PR; sweeps clean them up. Never branch on an error's message text (`err.contains("tool")`). `anyhow` is for the outer edge of binaries and CLIs.
 * When an async operation may fail, make sure the error reaches the person using the app with a sentence that says what happened and what they can do. The app shows the service's sentence; don't replace it with "Something went wrong".
 * A spawned task's handle is stored, awaited, or dropped on purpose with a comment saying why it may outlive its caller.
 * Never create files with `mod.rs` paths; prefer `src/some_module.rs` instead of `src/some_module/mod.rs`. Existing `mod.rs` files move only in their own PR.
-* Don't grow a file past 2,000 lines. Split it first, in its own PR.
+* Don't push a file over 2,000 lines. A file already over it may change, but don't add a new module or large feature to it; split it in its own PR first.
 * Avoid creative additions unless explicitly requested.
 * Use full words for variable names (no abbreviations like `q` for `queue`).
 * Use variable shadowing to scope clones in async contexts, minimizing the lifetime of borrowed references:
@@ -49,9 +49,9 @@ When an agent opens or updates a pull request, it must:
 - Keep the PR about one thing and small: aim under 400 changed lines. CI warns over 1,000 and fails over 3,000 (`Cargo.lock` and generated files don't count); nothing lifts the limit. Split larger work into PRs that are each tested on their own.
 - Link the Linear issue: `Closes ENG-n`, or `Part of ENG-n` for one PR of several.
 - Use a clear, correctly capitalized, imperative PR title (for example, `Retry the export when the share is busy`).
-- Avoid conventional commit prefixes in PR titles (`fix:`, `feat:`, `docs:`, etc.).
+- Don't use conventional-commit prefixes in PR titles: `feat:`, `fix:`, `docs:`, `chore:`, `style:`, `refactor:`, `perf:`, `test:`, `build:`, `revert:`.
 - Avoid trailing punctuation in PR titles.
-- Optionally prefix the title with an area when one is the clear scope: `service:`, `app:`, `agent:`, `evals:`, `deploy:`, `ci:`.
+- Optionally prefix the title with an area when one is the clear scope: `service:`, `app:`, `agent:`, `evals:`, `deploy:`, `ci:`. These are areas, not conventional-commit types, so they are allowed.
 - Fill in the PR template: Summary, Testing (what you ran and what it showed, with the count), Self-review.
 - Include a `Release Notes:` section as the final section in the PR body, with one bullet:
   - `- Added ...`, `- Fixed ...`, or `- Improved ...` for changes people using Margin notice, or
@@ -64,7 +64,7 @@ Release Notes:
 - N/A
 ```
 
-CI fails a PR into `dev` without the Testing section or the release notes, with a conventional-commit title, or over the size limit. Commit messages end with a `Co-Authored-By:` line.
+CI fails a PR into `dev` without the Testing section or the release notes, with a conventional-commit title, or over the size limit. CI checks that the sections are there; the exact format above is the convention. Commit messages end with a `Co-Authored-By:` line.
 
 # Don't touch without the owner asking
 
