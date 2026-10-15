@@ -2,10 +2,9 @@
 //! normalized; Jupyter notebooks become their cells' sources and HTML loses its markup
 //! (headings and table rows kept in Markdown's spelling). Notebooks and HTML are
 //! recognized by extension or, for files stored without one, by their first bytes; the
-//! other text formats (`TextFormat`) by extension or contents. On macOS PDFs are read in
-//! `pdf.rs`, images with ImageIO and Vision OCR (`image.rs`), audio and video with
-//! AVFoundation (`av.rs`); on Linux with pdfium (`pdf_pdfium.rs`), `image`/libheif
-//! (`image_linux.rs`) and tesseract (`ocr_tesseract.rs`), and ffmpeg (`av_ffmpeg.rs`).
+//! other text formats (`TextFormat`) by extension or contents. PDFs are read with pdfium
+//! (`pdf_pdfium.rs`), images with `image`/libheif (`image_linux.rs`) and tesseract
+//! (`ocr_tesseract.rs`), audio and video with ffmpeg (`av_ffmpeg.rs`).
 
 use std::path::Path;
 
@@ -58,146 +57,23 @@ pub(crate) fn extract(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn pdf(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
-    crate::pdf::extract(path, media_dir)
-}
-
-/// Images with fewer non-space characters of recognized text than this have no text
-/// (a photo's stray "I" isn't worth a chunk).
-#[cfg(target_os = "macos")]
-const IMAGE_MIN_TEXT_CHARS: usize = 4;
-
-/// The image itself is the picture; decoding it now finds a broken file early. Its text
-/// (a diagram's labels, a photographed page), read with Vision OCR, is its one page, so
-/// the picture is found by its words too (`docs/agent-rag-architecture.md` §2.1).
-#[cfg(target_os = "macos")]
-fn image(path: &Path) -> Result<Extracted, EmbedError> {
-    let image = crate::image::load(path, Some(crate::image::OCR_MAX_SIDE))?;
-    let (width, height) = crate::image::size(&image);
-    if width == 0 || height == 0 {
-        return Err(EmbedError::Extract("the image is empty".into()));
-    }
-    let text = crate::image::recognize_text(&image)?;
-    let pages = if text.chars().filter(|c| !c.is_whitespace()).count() >= IMAGE_MIN_TEXT_CHARS {
-        vec![Page { number: None, text }]
-    } else {
-        Vec::new()
-    };
-    Ok(Extracted {
-        pages,
-        pictures: vec![crate::Picture {
-            path: path.to_path_buf(),
-            page: None,
-            at_ms: None,
-            tokens: crate::ImageTokens::High,
-        }],
-        ..Default::default()
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn audio(path: &Path) -> Result<Extracted, EmbedError> {
-    let Some(samples) = crate::av::sound(path)? else {
-        return Err(EmbedError::Extract("there's no sound in this file".into()));
-    };
-    if samples.is_empty() {
-        return Err(EmbedError::Extract("there's no sound in this file".into()));
-    }
-    Ok(Extracted {
-        duration_ms: Some(crate::sample_ms(samples.len())),
-        sound: Some(samples),
-        ..Default::default()
-    })
-}
-
-/// Frames at `frame_times` as JPEGs in `media_dir`, plus the soundtrack if there is one.
-#[cfg(target_os = "macos")]
-fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
-    if !crate::av::has_video(path)? {
-        return Err(EmbedError::Extract(
-            "there's no picture in this video".into(),
-        ));
-    }
-    let duration = crate::av::duration_ms(path)?;
-    let (_, times) = crate::frame_times(duration);
-    std::fs::create_dir_all(media_dir)?;
-    let mut pictures = Vec::new();
-    crate::av::frames(path, &times, &mut |ms, image| {
-        let file = media_dir.join(crate::frame_file(ms));
-        crate::image::write(image, &file, crate::image::Format::Jpeg(0.8))?;
-        pictures.push(crate::Picture {
-            path: file,
-            page: None,
-            at_ms: Some(ms),
-            tokens: crate::ImageTokens::Medium,
-        });
-        Ok(())
-    })?;
-    if pictures.is_empty() {
-        return Err(EmbedError::Extract(
-            "couldn't take any pictures from this video".into(),
-        ));
-    }
-    let sound = crate::av::sound(path)?.filter(|s| !s.is_empty());
-    Ok(Extracted {
-        pictures,
-        sound,
-        duration_ms: Some(duration),
-        ..Default::default()
-    })
-}
-
-#[cfg(target_os = "linux")]
 fn pdf(path: &Path, media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
     crate::pdf_pdfium::extract(path, media_dir)
 }
 
-#[cfg(target_os = "linux")]
 fn image(path: &Path) -> Result<Extracted, EmbedError> {
     linux::image(path, &crate::ocr_tesseract::recognize)
 }
 
-#[cfg(target_os = "linux")]
 fn audio(path: &Path) -> Result<Extracted, EmbedError> {
     linux::audio(path, &linux::ffmpeg()?)
 }
 
-#[cfg(target_os = "linux")]
 fn video(path: &Path, media_dir: &Path) -> Result<Extracted, EmbedError> {
     linux::video(path, media_dir, &linux::ffmpeg()?)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn pdf(_path: &Path, _media_dir: Option<&Path>) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract(
-        "reading PDFs needs macOS or Linux".into(),
-    ))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn image(_path: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract(
-        "reading images needs macOS or Linux".into(),
-    ))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn audio(_path: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract(
-        "reading audio needs macOS or Linux".into(),
-    ))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn video(_path: &Path, _media_dir: &Path) -> Result<Extracted, EmbedError> {
-    Err(EmbedError::Extract(
-        "reading video needs macOS or Linux".into(),
-    ))
-}
-
 /// A program at `$env` (when set), on PATH, or in the usual install folders.
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 pub(crate) fn find_program(name: &str, env: &str) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -225,12 +101,8 @@ pub(crate) fn find_program(name: &str, env: &str) -> Option<std::path::PathBuf> 
         .find(|p| executable(p))
 }
 
-/// The Linux readers' sources (`docs/plan-linux-service.md` §2.2–2.5), mirroring the
-/// macOS functions above: pdfium + tesseract, `image` (+ libheif) + tesseract, ffmpeg.
-/// Built on macOS too with the `linux-readers` feature, so they are tested there with
-/// stand-in programs.
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// The readers (`docs/plan-linux-service.md` §2.2–2.5): `image` (+ libheif) + tesseract,
+/// ffmpeg, with the programs passed in so the tests use stand-ins.
 pub(crate) mod linux {
     use std::path::Path;
 

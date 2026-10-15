@@ -1,6 +1,6 @@
 # The opt-in runner's endpoints and models (margin-eval; never read in CI). Keys are
-# not here: the runner reads `openai-api-key` and `anthropic-api-key` from the service
-# Mac's Keychain, as the service does. With both keys, writing uses Claude and every
+# not here: the runner reads `openai-api-key` and `anthropic-api-key` from the service's
+# secrets file, as the service does. With both keys, writing uses Claude and every
 # judge and grader runs once per provider (two judges give the inter-judge κ); with one,
 # that provider does everything and agreement is measured between passage orders.
 

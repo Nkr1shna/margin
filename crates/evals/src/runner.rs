@@ -1,7 +1,7 @@
 //! The runner's commands (§3.4), with everything real passed in: the vectors, the
 //! models, the judges, the budget resolver, the stage registry. The `margin-eval`
 //! binary wires the real ones (`live.rs`); tests wire fakes, so every command is tested
-//! without a model API, Hugging Face or the Core ML model.
+//! without a model API, Hugging Face or the real embedding model.
 //!
 //! Reads come from `Paths::evals` (the checked-in `evals/`); writes go under
 //! `Paths::out` (the same folder when run by hand, a temporary one in tests).

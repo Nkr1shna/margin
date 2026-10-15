@@ -298,7 +298,7 @@ pub enum ChatItemKind {
 
 /// `ChatItemKind::Error.code` values.
 pub mod error_code {
-    /// No API key is stored in the service Mac's Keychain.
+    /// No API key is stored in the service's secrets.
     pub const NO_API_KEY: &str = "no_api_key";
     /// No model is set in Settings.
     pub const NO_MODEL: &str = "no_model";

@@ -1,6 +1,8 @@
 //! The CI regression gate (`docs/agent-rag-architecture.md` §3.3, §6.4 e2e 7):
 //! `cargo test -p margin-evals`. Recorded fixtures and in-memory SurrealDB with the
-//! service's real indexes only; no model API, no Hugging Face, no Core ML model.
+//! service's real indexes only; no model API, no Hugging Face, no real embedding model.
+
+use std::path::PathBuf;
 
 use margin_evals::Gates;
 use margin_evals::ci::run_gates;
@@ -8,17 +10,17 @@ use margin_evals::corpus::{EXTRACTED_FILE, Extraction};
 use margin_evals::gates::{BASELINE_FILE, Baseline};
 use margin_evals::golden::evals_dir;
 use margin_evals::live::recording_file;
-use margin_evals::recorded::RecordedVectors;
+use margin_evals::recorded::{EMBEDDINGS_FILE, RecordedVectors};
 use margin_evals::runner::{Env, Paths};
 
 /// The real pipeline over the recorded corpus against the committed baseline (§6.4
 /// e2e 7): `sections-v2`, `hybrid-rrf`/`rrf`/`mmr-v1` and `pack_budget` on in-memory
 /// SurrealDB with the service's real indexes, the vectors replayed from the recording
-/// of the service's embedder (EmbeddingGemma 2 on ONNX Runtime, 8-bit), never a model.
-/// Recorded by hand with `MARGIN_EVAL_EMBEDDER=onnx-q8 margin-eval record-embeddings`
-/// (`evals/recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin` and
-/// `evals/recorded/extracted.json`) and `margin-eval run --suite retrieval --variant
-/// baseline --write-baseline` (`evals/baseline.json`), committed together.
+/// of the service's embedder (EmbeddingGemma 2 on ONNX Runtime, 8-bit, the default
+/// backend), never a model. Recorded by hand with `margin-eval record-embeddings`
+/// (`evals/recorded/embeddings.bin` and `evals/recorded/extracted.json`) and
+/// `margin-eval run --suite retrieval --variant baseline --write-baseline`
+/// (`evals/baseline.json`), committed together.
 ///
 /// Citations are gated once generations are recorded (`margin-eval record-generations`
 /// calls the writing model with the owner's key): until
@@ -26,9 +28,15 @@ use margin_evals::runner::{Env, Paths};
 /// other gate runs.
 #[tokio::test]
 async fn ci_gates_on_the_recorded_corpus() {
+    // HNSW assigns node levels from a random generator, seeded from entropy unless told
+    // otherwise; with the corpus this small and `ef` this wide the search is exhaustive
+    // either way, but a fixed seed makes the graph, and so the gate, the same on every
+    // run. `SURREAL_HNSW_BUILD_SEED` in the environment still wins.
+    surrealdb_cnf::set_default_hnsw_build_seed(0x4d61_7267_696e);
     let evals = evals_dir();
-    let backend = margin_embed::Backend::Onnx(margin_embed::OnnxDtype::Q8);
-    let vectors = RecordedVectors::open(&evals.join(recording_file(backend))).unwrap();
+    let backend = margin_embed::Backend::default();
+    assert_eq!(recording_file(backend), PathBuf::from(EMBEDDINGS_FILE));
+    let vectors = RecordedVectors::open(&evals.join(EMBEDDINGS_FILE)).unwrap();
     let baseline = Baseline::load(&evals.join(BASELINE_FILE)).unwrap();
     assert_eq!(
         baseline.embedder_version,

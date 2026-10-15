@@ -7,11 +7,11 @@ here, and read the service's trace rows from outside.
 Two ways they run:
 
 - **CI** (`cargo test -p margin-evals`): fakes and recorded fixtures only. No model API,
-  no Hugging Face, no Core ML model, no running service. Gates compare against
+  no Hugging Face, no real embedding model, no running service. Gates compare against
   `baseline.json` with the thresholds in `gates.toml`.
 - **By hand** (`margin-eval`, the opt-in runner): real models with the owner's keys from
-  the service Mac's Keychain, the real EmbeddingGemma embedder, and its own database
-  folder (`~/Library/Application Support/Margin/evals`, or `--data`). It never opens the
+  the service's secrets file, the real EmbeddingGemma embedder (ONNX), and its own database
+  folder (`/var/lib/margin/evals`, or `--data`). It never opens the
   running service's database; it reads cost, latency and cache numbers from the
   service's traces over `GET /api/traces` (or an exported JSONL). It refuses to run when
   `CI` (or `MARGIN_EVAL_NO_LIVE`) is set.
@@ -31,8 +31,8 @@ Two ways they run:
 | `variants/*.toml` | Pipeline configurations, the same shape as `Settings.pipeline`. `baseline` is the shipped default. |
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
 | `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window. The service is `--service-url` (dev; prod is refused). |
-| `recorded/extracted.json` | What PDFKit/Vision read from each PDF and image (CI replays it; another macOS can't reproduce OCR byte for byte). |
-| `recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin` | Real EmbeddingGemma 2 vectors (ONNX Runtime, 8-bit: the service's embedder) of every corpus chunk, picture and golden query; the CI gate replays it. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. Another backend records beside it under its own version (`live::recording_file`; Core ML's was `recorded/embeddings.bin`). |
+| `recorded/extracted.json` | What was read from each PDF and image; CI replays it (OCR isn't reproduced byte for byte elsewhere). The committed one was recorded with PDFKit/Vision on macOS 27.2, before the service moved to Linux; the service's readers are now pdfium/tesseract, which cut other chunks, so a `record-embeddings` run on Linux rewrites it and must re-record the embeddings and re-baseline in the same change (the gate says so). |
+| `recorded/embeddings.bin` | Real EmbeddingGemma 2 vectors (ONNX Runtime, 8-bit: the service's default embedder) of every corpus chunk, picture and golden query; the CI gate replays it. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. Another ONNX format records beside it under its own version (`live::recording_file`). |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
@@ -46,18 +46,23 @@ lessons) are R1-ai's, in `margin_ai::evals`; the runner uses them through
 
 The embeddings and the baseline need no service and no model key: only the ONNX model
 (download it with `margin-service download-model --embedder onnx-q8`, or anywhere and
-point `MARGIN_EMBED_MODEL_DIR` at it). On a Mac build with the `onnx` feature:
+point `MARGIN_EMBED_MODEL_DIR` at it) and, on Linux, the service's readers (pdfium,
+tesseract, ffmpeg):
 
 ```sh
 export MARGIN_EVAL_EMBEDDER=onnx-q8 MARGIN_EMBED_MODEL_DIR=<model folder>
-cargo run -p margin-evals --features margin-embed/onnx --bin margin-eval -- record-embeddings --data <scratch>
-cargo run -p margin-evals --features margin-embed/onnx --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline --data <scratch>
+cargo run -p margin-evals --bin margin-eval -- record-embeddings --data <scratch>
+cargo run -p margin-evals --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline --data <scratch>
 git add evals/recorded evals/baseline.json
 ```
 
 (`MARGIN_CONFIG` pointing at a scratch `service.toml` keeps the runner off the service's
-own config.) `record-generations` calls the writing model with the owner's key; until `recorded/generations/<prompt version>/` exists the CI
-citation gate is skipped and the rest gate.
+own config.) The three files are one unit: the recording's keys are the chunk texts cut
+from `extracted.json`, and the baseline's `corpus_hash`, `pipeline_hash` and
+`embedder_version` are checked by the gate, so a re-record always comes with a
+re-baseline in the same commit. `record-generations` calls the writing model with the
+owner's key; until `recorded/generations/<prompt version>/` exists the CI citation gate
+is skipped and the rest gate.
 
 ## Run, compare, report
 
