@@ -5433,6 +5433,8 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
  "webbrowser",
  "webpki-roots",
 ]

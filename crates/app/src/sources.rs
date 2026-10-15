@@ -120,7 +120,7 @@ impl<P> Selection<P> {
                     bytes: file.bytes,
                 }),
                 Err(error) => {
-                    eprintln!("couldn't copy {}: {error}", file.name);
+                    tracing::warn!("couldn't copy {}: {error}", file.name);
                     let _ = std::fs::remove_file(&to);
                     staged.unreadable += 1;
                 }

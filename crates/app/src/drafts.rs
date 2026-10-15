@@ -148,7 +148,7 @@ impl Registry {
         self.load();
         let Some(path) = path() else { return };
         if let Err(e) = self.file().save(&path) {
-            eprintln!("couldn't keep unsaved note edits: {e}");
+            tracing::warn!("couldn't keep unsaved note edits: {e}");
         }
     }
 
@@ -383,7 +383,7 @@ pub fn save_in_background(app: crate::state::AppCtx, id: Id) {
                 Err(_) => {}
             }
         }
-        eprintln!("couldn't save note {id}; keeping the edit for the next try");
+        tracing::warn!("couldn't save note {id}; keeping the edit for the next try");
         restore(&id, draft);
     });
 }

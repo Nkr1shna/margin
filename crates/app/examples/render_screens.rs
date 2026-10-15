@@ -74,6 +74,8 @@ mod citations;
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/diagnostics.rs"]
+mod diagnostics;
 #[path = "../src/drafts.rs"]
 mod drafts;
 #[path = "../src/fake.rs"]
