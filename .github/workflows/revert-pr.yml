@@ -45,8 +45,10 @@ jobs:
           state="$(jq -r .state "$RUNNER_TEMP/pr.json")"
           base="$(jq -r .baseRefName "$RUNNER_TEMP/pr.json")"
           sha="$(jq -r '.mergeCommit.oid // empty' "$RUNNER_TEMP/pr.json")"
-          [ "$state" = MERGED ] && [ "$base" = dev ] && [ -n "$sha" ] \
-            || { echo "::error::#$PR is not a PR merged into dev (state $state, base $base)"; exit 1; }
+          if [ "$state" != MERGED ] || [ "$base" != dev ] || [ -z "$sha" ]; then
+            echo "::error::#$PR is not a PR merged into dev (state $state, base $base)"
+            exit 1
+          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "#$PR put $sha on dev."
 
@@ -67,9 +69,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -q -B "$branch" origin/dev
           # A squash commit has one parent; PRs merged before squash merging have two.
-          mainline=""
-          [ "$(git rev-list --parents -n 1 "$SHA" | wc -w)" -gt 2 ] && mainline="-m 1"
-          if ! git revert --no-commit $mainline "$SHA"; then
+          set --
+          [ "$(git rev-list --parents -n 1 "$SHA" | wc -w)" -gt 2 ] && set -- -m 1
+          if ! git revert --no-commit "$@" "$SHA"; then
             git revert --abort || true
             echo "::error::#$PR doesn't revert cleanly on today's dev (later PRs changed the same lines); revert it by hand."
             exit 1
