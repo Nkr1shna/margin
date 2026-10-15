@@ -1018,16 +1018,6 @@ impl Store {
         .await?;
         Ok(())
     }
-
-    /// Whether `table` is defined in the database.
-    pub async fn table_exists(&self, table: &'static str) -> anyhow::Result<bool> {
-        let info: Vec<serde_json::Value> = self.query_rows("INFO FOR DB", vec![]).await?;
-        Ok(info
-            .first()
-            .and_then(|i| i.get("tables"))
-            .and_then(|t| t.get(table))
-            .is_some())
-    }
 }
 
 /// Whether an `INFO FOR …` result lists `name` under `section`.
