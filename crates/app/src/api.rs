@@ -494,6 +494,24 @@ impl Api {
             .await
     }
 
+    /// The model files with the reranker model's state (R2); 409 "no_reranker_model" on a
+    /// service that offers none.
+    pub async fn reranker_model(&self) -> ApiResult<EmbeddingModel> {
+        self.get(routes::RERANKER_MODEL).await
+    }
+
+    /// Start downloading the reranker model the `onnx-crossencoder` reranker runs;
+    /// progress arrives as `EmbeddingModelChanged` events.
+    pub async fn download_reranker(&self) -> ApiResult<EmbeddingModel> {
+        self.post_empty(routes::RERANKER_MODEL_DOWNLOAD).await
+    }
+
+    /// Delete the downloaded reranker model.
+    pub async fn delete_reranker(&self) -> ApiResult<EmbeddingModel> {
+        self.json(self.request(Method::DELETE, routes::RERANKER_MODEL))
+            .await
+    }
+
     /// Every chat, newest first.
     pub async fn chats(&self) -> ApiResult<Vec<Chat>> {
         self.get(routes::CHATS).await
@@ -1464,6 +1482,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reranker_model_download_and_delete() {
+        use margin_shared::{EmbeddingModelState, Event};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let mut events = fake.events.subscribe();
+        // A Linux service offers it, not downloaded.
+        let model = api.reranker_model().await.unwrap();
+        let reranker = model.reranker.clone().unwrap();
+        assert_eq!(reranker.name, crate::fake::RERANKER_NAME);
+        assert_eq!(reranker.repo, crate::fake::RERANKER_REPO);
+        assert_eq!(
+            reranker.state,
+            EmbeddingModelState::NotDownloaded {
+                download_bytes: crate::fake::RERANKER_DOWNLOAD_BYTES
+            }
+        );
+        assert_eq!(api.embedding().await.unwrap(), model);
+
+        let downloading = api.download_reranker().await.unwrap();
+        assert!(matches!(
+            downloading.reranker.as_ref().unwrap().state,
+            EmbeddingModelState::Downloading { received: 0, .. }
+        ));
+        // The embedding model's part is unchanged, and the change is sent.
+        assert_eq!(downloading.state, model.state);
+        match events.recv().await.unwrap() {
+            Event::EmbeddingModelChanged { model } => assert_eq!(model, downloading),
+            other => panic!("{other:?}"),
+        }
+        // Asking again while it downloads changes nothing.
+        assert_eq!(api.download_reranker().await.unwrap(), downloading);
+        fake.state.lock().unwrap().reranker = Some(EmbeddingModelState::Ready {
+            bytes: crate::fake::RERANKER_DOWNLOAD_BYTES,
+        });
+        let removed = api.delete_reranker().await.unwrap();
+        assert!(matches!(
+            removed.reranker.unwrap().state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
+
+        // A service with none answers 409.
+        fake.state.lock().unwrap().reranker = None;
+        assert_eq!(api.embedding().await.unwrap().reranker, None);
+        for err in [
+            api.reranker_model().await.unwrap_err(),
+            api.download_reranker().await.unwrap_err(),
+            api.delete_reranker().await.unwrap_err(),
+        ] {
+            assert_eq!(
+                (err.status, err.code.as_str()),
+                (Some(409), "no_reranker_model")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lessons_carry_what_wrote_them() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let lib = api.library().await.unwrap();
+        let l1 = lib.lessons.iter().find(|l| l.id == "l1").unwrap();
+        let w = l1.written_with.as_ref().unwrap();
+        assert_eq!(w.prompt_version, "lesson-v2");
+        assert_eq!(w.model, "claude-sonnet-5-5");
+        assert_eq!(w.provider, margin_shared::Provider::Claude);
+        // A lesson that failed was written by nothing.
+        let l3 = lib.lessons.iter().find(|l| l.id == "l3").unwrap();
+        assert_eq!(l3.written_with, None);
+
+        // A regenerate is written with the pipeline and the default provider's writing
+        // model as they are now.
+        api.patch_settings(&margin_shared::SettingsPatch {
+            default_provider: Some(margin_shared::Provider::Claude),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let settings = api.settings().await.unwrap();
+        fake.state.lock().unwrap().simulate = true;
+        let mut events = fake.events.subscribe();
+        api.regenerate_lesson("l3").await.unwrap();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Ok(margin_shared::Event::LessonChanged { lesson }) = events.recv().await
+                    && lesson.id == "l3"
+                    && lesson.status == margin_shared::LessonStatus::Ready
+                {
+                    return lesson;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let w = done.written_with.unwrap();
+        assert_eq!(w.provider, margin_shared::Provider::Claude);
+        assert_eq!(w.model, settings.claude_models.write);
+        assert_eq!(w.prompt_version, settings.pipeline.prompts);
+        assert_eq!(w.pipeline_hash, settings.pipeline.hash());
+    }
+
+    #[tokio::test]
     async fn lessons_carry_their_citations() {
         use margin_shared::SourceKind;
         let fake = FakeService::start().await;
@@ -2014,18 +2133,72 @@ mod tests {
         assert_eq!(settings.pipeline.fusion.name, "linear");
         assert_eq!(settings.pipeline.packer.name, "take-k");
         assert_eq!(settings.openai_models.get(Route::Write), "gpt-6-astra");
-        // A variant naming a stage the service lacks is refused like any other.
-        let listwise = variants
-            .variants
-            .iter()
-            .find(|v| v.name == "listwise")
-            .unwrap();
-        assert!(listwise.unavailable.is_some());
+        // A stage the service lacks is refused.
         let err = api
-            .patch_settings(&stages_patch(&settings.pipeline, &listwise.config).unwrap())
+            .patch_settings(
+                &stages_patch(
+                    &settings.pipeline,
+                    &settings.pipeline.with_stage("reranker", "cross-v9"),
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, "bad_pipeline");
+        // So is a variant the service can't build until its model is downloaded.
+        let xenc = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rerank-xenc")
+            .unwrap();
+        assert!(xenc.unavailable.is_some());
+        let err = api
+            .patch_settings(&stages_patch(&settings.pipeline, &xenc.config).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "bad_pipeline");
+        assert!(
+            err.message.contains("Settings → Sources"),
+            "{}",
+            err.message
+        );
+
+        // The Rewriter (R2) saves like any stage, and keeps the others.
+        let settings = api
+            .patch_settings(
+                &stages_patch(
+                    &settings.pipeline,
+                    &settings.pipeline.with_stage("rewriter", "small-expand-v1"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.rewriter.name, "small-expand-v1");
+        assert_eq!(settings.pipeline.packer.name, "take-k");
+        assert_eq!(
+            api.settings().await.unwrap().pipeline.rewriter.name,
+            "small-expand-v1"
+        );
+
+        // Once the reranker model is downloaded, the cross-encoder's variant is offered
+        // and saves.
+        fake.state.lock().unwrap().reranker = Some(margin_shared::EmbeddingModelState::Ready {
+            bytes: crate::fake::RERANKER_DOWNLOAD_BYTES,
+        });
+        let variants = api.pipeline_variants().await.unwrap();
+        let xenc = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rerank-xenc")
+            .unwrap();
+        assert_eq!(xenc.unavailable, None);
+        let settings = api
+            .patch_settings(&stages_patch(&settings.pipeline, &xenc.config).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.reranker.name, "onnx-crossencoder");
+        assert_eq!(settings.pipeline.rewriter.name, "none");
 
         // Trace retention, in range or refused.
         let settings = api

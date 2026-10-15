@@ -45,6 +45,9 @@ pub struct FakeState {
     pub embedding: EmbeddingModelState,
     /// The speech model, as a Linux service reports it; `None` as on a Mac.
     pub speech: Option<EmbeddingModelState>,
+    /// The cross-encoder the `onnx-crossencoder` reranker runs (R2), as a Linux service
+    /// reports it; `None` as on a service that offers none.
+    pub reranker: Option<EmbeddingModelState>,
     /// The re-index with a new embedder, while it runs.
     pub reindex: Option<ReindexProgress>,
     /// Uploaded sources' bytes, served as their originals.
@@ -107,6 +110,14 @@ pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 1_480_000_000;
 pub const SPEECH_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 /// What the fake says the speech model download weighs.
 pub const SPEECH_DOWNLOAD_BYTES: u64 = 670_000_000;
+/// The reranker model a Linux service downloads (`params.model` of `onnx-crossencoder`).
+pub const RERANKER_NAME: &str = "ms-marco-minilm-l6-v2";
+/// Its Hugging Face repo.
+pub const RERANKER_REPO: &str = "Xenova/ms-marco-MiniLM-L-6-v2";
+/// What the fake says the reranker model download weighs.
+pub const RERANKER_DOWNLOAD_BYTES: u64 = 23_400_000;
+/// What `Pipeline::build` says of `onnx-crossencoder` while its model isn't downloaded.
+pub const RERANKER_MISSING: &str = "The reranker \"onnx-crossencoder\" needs the ms-marco-minilm-l6-v2 model: download the reranker model in Settings → Sources first.";
 
 #[derive(Clone)]
 pub struct Fake {
@@ -125,6 +136,35 @@ pub struct FakeService {
 
 fn ts(n: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_760_000_000 + n, 0).unwrap()
+}
+
+/// What wrote a sample lesson: `lesson-v2` with the default pipeline on `model`.
+pub fn sample_written_with(provider: Provider, model: &str, at: DateTime<Utc>) -> WrittenWith {
+    WrittenWith {
+        prompt_version: "lesson-v2".into(),
+        pipeline_hash: margin_shared::pipeline::PipelineConfig::default().hash(),
+        provider,
+        model: model.into(),
+        at,
+    }
+}
+
+/// What writes a lesson now, as the service resolves it: the pipeline's prompts on the
+/// default provider's writing model (or the variant's override of the route).
+fn written_with_now(settings: &Settings) -> WrittenWith {
+    let provider = settings.default_provider;
+    WrittenWith {
+        prompt_version: settings.pipeline.prompts.clone(),
+        pipeline_hash: settings.pipeline.hash(),
+        provider,
+        model: settings
+            .pipeline
+            .routes
+            .write
+            .clone()
+            .unwrap_or_else(|| settings.models(provider).write.clone()),
+        at: Utc::now(),
+    }
 }
 
 pub const LESSON_ONE: &str = r#"Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.[^1]
@@ -309,10 +349,12 @@ pub fn sample_library() -> Library {
         level: Level::Intro,
         minutes: 9,
         body_md: body.into(),
+        // Ready lessons say what wrote them, as the service's do since R2.
+        written_with: (status == LessonStatus::Ready)
+            .then(|| sample_written_with(Provider::OpenAi, "gpt-5", ts(position))),
         status,
         created_at: ts(position),
         updated_at: ts(position),
-        written_with: None,
     };
     Library {
         topics: vec![
@@ -324,6 +366,11 @@ pub fn sample_library() -> Library {
         lessons: vec![
             Lesson {
                 citations: sample_citations(),
+                written_with: Some(sample_written_with(
+                    Provider::Claude,
+                    "claude-sonnet-5-5",
+                    ts(0),
+                )),
                 ..lesson(
                     "l1",
                     "fourier",
@@ -574,6 +621,9 @@ impl FakeState {
                 download_bytes: EMBEDDING_DOWNLOAD_BYTES,
             },
             speech: None,
+            reranker: Some(EmbeddingModelState::NotDownloaded {
+                download_bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
             reindex: None,
             source_files: HashMap::new(),
             part_uploads: HashMap::new(),
@@ -618,7 +668,11 @@ impl FakeState {
                 state,
             }),
             reindex: self.reindex,
-            reranker: None,
+            reranker: self.reranker.clone().map(|state| RerankerModelState {
+                name: RERANKER_NAME.into(),
+                repo: RERANKER_REPO.into(),
+                state,
+            }),
         }
     }
 
@@ -794,6 +848,11 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/embedding/download", post(download_embedding))
         .route(routes::SPEECH_MODEL, axum::routing::delete(delete_speech))
         .route(routes::SPEECH_MODEL_DOWNLOAD, post(download_speech))
+        .route(
+            routes::RERANKER_MODEL,
+            get(get_reranker).delete(delete_reranker),
+        )
+        .route(routes::RERANKER_MODEL_DOWNLOAD, post(download_reranker))
         .route("/api/chats", get(list_chats).post(create_chat))
         .route(
             "/api/chats/{id}",
@@ -1177,11 +1236,13 @@ async fn simulate_lesson(fake: Fake, id: Id) {
         for url in citations.iter_mut().filter_map(|c| c.image_url.as_mut()) {
             *url = format!("{}{url}", s.public_url);
         }
+        let written_with = written_with_now(&s.settings);
         let Some(l) = s.library.lessons.iter_mut().find(|l| l.id == id) else {
             return;
         };
         l.status = LessonStatus::Ready;
         l.citations = citations;
+        l.written_with = Some(written_with);
         l.clone()
     };
     publish(&fake, Event::LessonChanged { lesson });
@@ -1792,10 +1853,12 @@ async fn patch_settings(
             "Traces can be kept from 1 to 3650 days.",
         );
     }
-    if let Some(cfg) = &req.pipeline
-        && let Some(problem) = unknown_stage(cfg)
-    {
-        return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
+    if let Some(cfg) = &req.pipeline {
+        let reranker = fake.state.lock().unwrap().reranker.clone();
+        if let Some(problem) = unknown_stage(cfg).or_else(|| missing_model(cfg, reranker.as_ref()))
+        {
+            return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
+        }
     }
     for (provider, models) in [
         (Provider::OpenAi, &req.openai_models),
@@ -1897,13 +1960,13 @@ async fn patch_settings(
 pub const FAKE_STAGES: &[(&str, &[&str])] = &[
     ("chunker", &["pages-v1", "sections-v2"]),
     ("embedder", &["coreml"]),
-    ("rewriter", &["none"]),
+    ("rewriter", &["none", "small-expand-v1"]),
     (
         "retriever",
         &["bm25", "dense", "hybrid-linear", "hybrid-rrf"],
     ),
     ("fusion", &["first", "linear", "rrf"]),
-    ("reranker", &["none"]),
+    ("reranker", &["listwise-small", "none", "onnx-crossencoder"]),
     ("packer", &["mmr-v1", "take-k"]),
     ("prompts", &["lesson-v2"]),
 ];
@@ -1924,27 +1987,83 @@ fn unknown_stage(cfg: &margin_shared::pipeline::PipelineConfig) -> Option<String
         })
 }
 
-/// What `GET /api/pipeline/variants` serves: `FAKE_STAGES` and the repository's
-/// `evals/variants/*.toml` (baseline, bm25, dense, hybrid), plus one naming a reranker
-/// this service doesn't have.
+/// Why the service can't build `cfg` for want of a downloaded model: `onnx-crossencoder`
+/// needs the reranker model (`reranker`, the fake's state of it) and only
+/// `RERANKER_NAME` is offered for download.
+fn missing_model(
+    cfg: &margin_shared::pipeline::PipelineConfig,
+    reranker: Option<&EmbeddingModelState>,
+) -> Option<String> {
+    if cfg.reranker.name != "onnx-crossencoder" {
+        return None;
+    }
+    let model = cfg
+        .reranker
+        .params
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(RERANKER_NAME);
+    if model != RERANKER_NAME {
+        return Some(format!(
+            "The reranker \"onnx-crossencoder\" needs the {model} model: download it on the service first (margin-service download-model --reranker {model})."
+        ));
+    }
+    (!matches!(reranker, Some(EmbeddingModelState::Ready { .. })))
+        .then(|| RERANKER_MISSING.to_string())
+}
+
+/// What `GET /api/pipeline/variants` serves on a fresh fake (the reranker model not
+/// downloaded): see `pipeline_variants_with`.
 pub fn fake_pipeline_variants() -> margin_shared::pipeline::PipelineVariants {
-    use margin_shared::pipeline::{NamedVariant, PipelineConfig, PipelineVariants, StageCfg};
+    pipeline_variants_with(Some(&EmbeddingModelState::NotDownloaded {
+        download_bytes: RERANKER_DOWNLOAD_BYTES,
+    }))
+}
+
+/// One stage with its params (a JSON object).
+fn stage_with(name: &str, params: serde_json::Value) -> margin_shared::pipeline::StageCfg {
+    margin_shared::pipeline::StageCfg {
+        name: name.into(),
+        params: params.as_object().cloned().unwrap_or_default(),
+    }
+}
+
+/// What `GET /api/pipeline/variants` serves: `FAKE_STAGES` and the service's built-in
+/// variants (the repository's `evals/variants/*.toml`: baseline, bm25, dense, hybrid and
+/// R2's r2-full, rerank-small, rerank-xenc, rerank-xenc-bge, rewrite-small). The
+/// cross-encoder's are unavailable until the reranker model is downloaded (`reranker`);
+/// rerank-xenc-bge always, since this service offers only `RERANKER_NAME`.
+pub fn pipeline_variants_with(
+    reranker: Option<&EmbeddingModelState>,
+) -> margin_shared::pipeline::PipelineVariants {
+    use margin_shared::pipeline::{NamedVariant, PipelineConfig, PipelineVariants};
+    use serde_json::json;
     let baseline = PipelineConfig::default();
     let mut hybrid = baseline
         .with_stage("retriever", "hybrid-linear")
         .with_stage("fusion", "linear");
-    hybrid.retriever = StageCfg {
-        name: "hybrid-linear".into(),
-        params:
-            serde_json::json!({"dense_weight": 2.0, "lex_weight": 1.0, "normalisation": "minmax"})
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
+    hybrid.retriever = stage_with(
+        "hybrid-linear",
+        json!({"dense_weight": 2.0, "lex_weight": 1.0, "normalisation": "minmax"}),
+    );
+    let listwise = stage_with(
+        "listwise-small",
+        json!({"apply_to": ["lesson", "plan"], "max_candidates": 24, "drop_grade_0": true, "timeout_secs": 20}),
+    );
+    let expand = stage_with(
+        "small-expand-v1",
+        json!({"min_words": 5, "max_added": 2, "apply_to": ["agent", "context", "lesson", "plan"], "timeout_secs": 10}),
+    );
+    let xenc = |model: &str| {
+        stage_with(
+            "onnx-crossencoder",
+            json!({"model": model, "apply_to": ["agent", "context", "lesson", "plan"], "max_candidates": 24}),
+        )
     };
     let named = |name: &str, config: PipelineConfig| NamedVariant {
         name: name.into(),
+        unavailable: missing_model(&config, reranker),
         config,
-        unavailable: None,
     };
     PipelineVariants {
         stages: FAKE_STAGES
@@ -1966,20 +2085,53 @@ pub fn fake_pipeline_variants() -> margin_shared::pipeline::PipelineVariants {
                     .with_stage("fusion", "first"),
             ),
             named("hybrid", hybrid),
-            NamedVariant {
-                unavailable: Some("There is no reranker named \"listwise-v1\".".into()),
-                ..named("listwise", baseline.with_stage("reranker", "listwise-v1"))
-            },
+            named(
+                "r2-full",
+                PipelineConfig {
+                    rewriter: expand.clone(),
+                    reranker: listwise.clone(),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-small",
+                PipelineConfig {
+                    reranker: listwise,
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-xenc",
+                PipelineConfig {
+                    reranker: xenc(RERANKER_NAME),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-xenc-bge",
+                PipelineConfig {
+                    reranker: xenc("bge-reranker-base"),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rewrite-small",
+                PipelineConfig {
+                    rewriter: expand,
+                    ..baseline
+                },
+            ),
         ],
     }
 }
 
 /// `GET /api/pipeline/variants`.
-async fn pipeline_variants(headers: HeaderMap) -> Response {
+async fn pipeline_variants(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     if let Err(r) = authorized(&headers) {
         return r;
     }
-    Json(fake_pipeline_variants()).into_response()
+    let reranker = fake.state.lock().unwrap().reranker.clone();
+    Json(pipeline_variants_with(reranker.as_ref())).into_response()
 }
 
 /// `GET /api/traces`: the fake records no traces, so none (JSON lines, oldest first).
@@ -2970,6 +3122,113 @@ async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response
     ) {
         Some(model) => Json(model).into_response(),
         None => no_speech_model(),
+    }
+}
+
+/// Sets the reranker model's state and sends the model; `None` when there is none.
+fn set_reranker(fake: &Fake, state: EmbeddingModelState) -> Option<EmbeddingModel> {
+    let model = {
+        let mut s = fake.state.lock().unwrap();
+        s.reranker.as_ref()?;
+        s.reranker = Some(state);
+        s.embedding_model()
+    };
+    publish(
+        fake,
+        Event::EmbeddingModelChanged {
+            model: model.clone(),
+        },
+    );
+    Some(model)
+}
+
+fn no_reranker_model() -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "no_reranker_model",
+        "This service has no reranker model to download.",
+    )
+}
+
+/// `GET routes::RERANKER_MODEL`.
+async fn get_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    if s.reranker.is_none() {
+        return no_reranker_model();
+    }
+    Json(s.embedding_model()).into_response()
+}
+
+/// `POST routes::RERANKER_MODEL_DOWNLOAD`: as the speech model's, a few steps of
+/// progress when simulating (tests drive the state themselves).
+async fn download_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (current, simulate) = {
+        let s = fake.state.lock().unwrap();
+        (s.reranker.clone(), s.simulate)
+    };
+    match current {
+        None => return no_reranker_model(),
+        Some(EmbeddingModelState::Downloading { .. } | EmbeddingModelState::Ready { .. }) => {
+            return Json(fake.state.lock().unwrap().embedding_model()).into_response();
+        }
+        Some(_) => {}
+    }
+    let model = set_reranker(
+        &fake,
+        EmbeddingModelState::Downloading {
+            received: 0,
+            total: RERANKER_DOWNLOAD_BYTES,
+        },
+    );
+    if simulate {
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            let total = RERANKER_DOWNLOAD_BYTES;
+            for step in 1..=4u64 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let downloading = matches!(
+                    fake.state.lock().unwrap().reranker,
+                    Some(EmbeddingModelState::Downloading { .. })
+                );
+                if !downloading {
+                    return;
+                }
+                set_reranker(
+                    &fake,
+                    if step == 4 {
+                        EmbeddingModelState::Ready { bytes: total }
+                    } else {
+                        EmbeddingModelState::Downloading {
+                            received: total * step / 4,
+                            total,
+                        }
+                    },
+                );
+            }
+        });
+    }
+    Json(model).into_response()
+}
+
+/// `DELETE routes::RERANKER_MODEL`.
+async fn delete_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    match set_reranker(
+        &fake,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: RERANKER_DOWNLOAD_BYTES,
+        },
+    ) {
+        Some(model) => Json(model).into_response(),
+        None => no_reranker_model(),
     }
 }
 
