@@ -33,7 +33,7 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, context_api, embedding, events, folders, ingest, library, media, providers,
+    alerts, ask, chats, context_api, embedding, events, folders, ingest, library, media, providers,
     retrieval, search, settings, sources, trace, turns, uploads, version, video, workspaces,
 };
 use anyhow::Context;
@@ -145,6 +145,8 @@ impl Service {
             folder_sync_emits: Mutex::new(Default::default()),
             sources_replaced: Mutex::new(Default::default()),
             providers: providers::Providers::new(),
+            alerts: Arc::new(Mutex::new(alerts::Alerts::default())),
+            http_errors: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Traces first, so recovery and the workers are traced.
@@ -312,12 +314,21 @@ pub fn router(state: AppState) -> Router {
             "/api/context/documents/{id}/passages",
             get(context_api::passages),
         )
-        .route(routes::CONTEXT_INGEST, post(context_api::ingest))
+        // An agent-written document may be long (`docs/agent-contract.md` §7).
+        .route(
+            routes::CONTEXT_INGEST,
+            post(context_api::ingest)
+                .layer(DefaultBodyLimit::max(routes::CONTEXT_INGEST_MAX_BYTES)),
+        )
         .route(routes::CONTEXT_CHANGES, get(context_api::changes))
         .route(routes::TRACES, get(trace::list_traces))
         .route(routes::TRACES_ROLLUP, get(trace::rollup))
+        .route(routes::ALERTS, get(alerts::get_alerts))
         .route(routes::EVENTS, get(events::events))
         .fallback(api_not_found)
+        // Every other body: the limit in code, not axum's default (the routes above
+        // that stream or take more set their own).
+        .layer(DefaultBodyLimit::max(routes::JSON_BODY_MAX_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_device,
@@ -342,11 +353,17 @@ async fn api_not_found() -> AppError {
 }
 
 /// Logs method, path (never the query string: it carries codes and signatures) and status.
-async fn log_requests(State(_state): State<AppState>, req: Request, next: Next) -> Response {
+/// Counts 5xx answers for the alert job (`App.http_errors`).
+async fn log_requests(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let started = std::time::Instant::now();
     let res = next.run(req).await.into_response();
+    if res.status().is_server_error() {
+        state
+            .http_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     tracing::debug!(%method, %path, status = res.status().as_u16(), ms = started.elapsed().as_millis() as u64, "request");
     res
 }

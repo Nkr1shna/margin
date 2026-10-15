@@ -25,10 +25,9 @@ use crate::replay::{
 };
 use crate::tool::{floor_char_boundary, generic_label};
 use crate::{
-    COMPACT_THRESHOLD_TOKENS, ConfirmationPrompt, DeviceBridge, ItemRecord, MAX_STEPS,
-    MODEL_RETRIES, ModelClient, RETRY_BASE_DELAY, RETRY_MAX_DELAY, SinkError,
-    TOOL_OUTPUT_MAX_BYTES, TURN_OUTPUT_MAX_BYTES, ToolContext, ToolKind, ToolOutput, ToolRegistry,
-    TurnSink, error_output, function_call_output, system_prompt, tool_pictures_input,
+    COMPACT_THRESHOLD_TOKENS, ConfirmationPrompt, DeviceBridge, ItemRecord, MAX_STEPS, ModelClient,
+    SinkError, TOOL_OUTPUT_MAX_BYTES, TURN_OUTPUT_MAX_BYTES, ToolContext, ToolKind, ToolOutput,
+    ToolRegistry, TurnSink, error_output, function_call_output, system_prompt, tool_pictures_input,
     truncate_output,
 };
 
@@ -46,58 +45,11 @@ pub struct TurnDeps<'a> {
     pub retry: RetryPolicy,
 }
 
-/// How model calls are retried.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryPolicy {
-    /// Retries after the first attempt.
-    pub retries: u32,
-    pub base_delay: Duration,
-    pub max_delay: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            retries: MODEL_RETRIES,
-            base_delay: RETRY_BASE_DELAY,
-            max_delay: RETRY_MAX_DELAY,
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// No pauses, for tests.
-    pub fn immediate() -> Self {
-        Self {
-            retries: MODEL_RETRIES,
-            base_delay: Duration::ZERO,
-            max_delay: Duration::ZERO,
-        }
-    }
-
-    /// The pause before retry number `attempt + 1`: `retry_after` when the API sent
-    /// one, as asked however long (owner decision) plus up to a second of jitter, so
-    /// two turns told the same thing don't retry at the same instant; else
-    /// `base_delay · 2^attempt`, never more than `max_delay`.
-    pub fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        match retry_after {
-            Some(wait) => wait.saturating_add(jitter()),
-            None => self
-                .base_delay
-                .saturating_mul(2u32.saturating_pow(attempt.min(16)))
-                .min(self.max_delay),
-        }
-    }
-}
-
-/// A random pause of 0–1 s (to the millisecond).
-fn jitter() -> Duration {
-    use std::hash::BuildHasher;
-    // `RandomState` is seeded randomly per instance: enough randomness for spreading
-    // retries, without a dependency.
-    let random = std::collections::hash_map::RandomState::new().hash_one(0u8);
-    Duration::from_millis(random % 1001)
-}
+/// How model calls are retried: the one policy every model call uses
+/// (`margin_ai::Backoff`; `docs/phase5-brief.md` D4). `Default` is `MODEL_RETRIES`
+/// retries from `RETRY_BASE_DELAY` doubling to `RETRY_MAX_DELAY`, a `Retry-After`
+/// honoured as asked plus up to a second; `immediate()` has no computed pauses (tests).
+pub use margin_ai::Backoff as RetryPolicy;
 
 /// One turn (or one Continue of it).
 #[derive(Clone)]
@@ -752,7 +704,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                 }
             }
             if error.retryable && attempt < self.deps.retry.retries {
-                let wait = self.deps.retry.delay(attempt, error.retry_after);
+                let wait = self.deps.retry.pause(attempt, error.retry_after);
                 attempt += 1;
                 tracing::info!(chat = %self.input.chat_id, attempt, ?wait, error = %error.message, "retrying the model call");
                 self.wait_to_retry(wait, wait_reason(error.code)).await?;
@@ -1493,7 +1445,10 @@ impl<'t, 'a> Turn<'t, 'a> {
         out: ToolOutput,
     ) -> Result<(Value, Option<Value>), SinkError> {
         let sink = self.sink();
-        let output = truncate_output(&out.output, TOOL_OUTPUT_MAX_BYTES);
+        let output = truncate_output(
+            &margin_shared::text::for_model(&out.output),
+            TOOL_OUTPUT_MAX_BYTES,
+        );
         self.output_bytes.fetch_add(output.len(), Ordering::SeqCst);
         if self.reserved.lock().unwrap().remove(&call.call_id) {
             self.output_bytes
@@ -1669,7 +1624,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                     return Ok((!text.is_empty()).then(|| text.to_string()));
                 }
                 Err(e) if e.is_retryable() && attempt < self.deps.retry.retries => {
-                    let wait = self.deps.retry.delay(attempt, e.retry_after());
+                    let wait = self.deps.retry.pause(attempt, e.retry_after());
                     self.wait_to_retry(wait, wait_reason(ai_error_code(&e)))
                         .await?;
                     attempt += 1;
@@ -2033,12 +1988,21 @@ mod tests {
 
     #[test]
     fn retry_delays_double_and_cap() {
+        assert_eq!(
+            RetryPolicy::default(),
+            RetryPolicy {
+                retries: crate::MODEL_RETRIES,
+                base_delay: crate::RETRY_BASE_DELAY,
+                max_delay: crate::RETRY_MAX_DELAY,
+                jitter: Duration::from_secs(1),
+            }
+        );
         let p = RetryPolicy::default();
-        assert_eq!(p.delay(0, None), Duration::from_secs(2));
-        assert_eq!(p.delay(1, None), Duration::from_secs(4));
-        assert_eq!(p.delay(2, None), Duration::from_secs(8));
-        assert_eq!(p.delay(10, None), Duration::from_secs(60));
-        assert_eq!(RetryPolicy::immediate().delay(3, None), Duration::ZERO);
+        assert_eq!(p.pause(0, None), Duration::from_secs(2));
+        assert_eq!(p.pause(1, None), Duration::from_secs(4));
+        assert_eq!(p.pause(2, None), Duration::from_secs(8));
+        assert_eq!(p.pause(10, None), Duration::from_secs(60));
+        assert_eq!(RetryPolicy::immediate().pause(3, None), Duration::ZERO);
     }
 
     /// `Retry-After` is waited as the server asks, however long, plus up to a second.
@@ -2049,20 +2013,20 @@ mod tests {
         };
         let p = RetryPolicy::default();
         for _ in 0..50 {
-            assert!(within(p.delay(0, Some(Duration::from_secs(7))), 7));
-            assert!(within(p.delay(2, Some(Duration::from_secs(600))), 600));
+            assert!(within(p.pause(0, Some(Duration::from_secs(7))), 7));
+            assert!(within(p.pause(2, Some(Duration::from_secs(600))), 600));
             assert!(within(
-                RetryPolicy::immediate().delay(0, Some(Duration::from_secs(3))),
+                RetryPolicy::immediate().pause(0, Some(Duration::from_secs(3))),
                 3
             ));
         }
         // The jitter varies.
         let waits: HashSet<Duration> = (0..20)
-            .map(|_| p.delay(0, Some(Duration::from_secs(1))))
+            .map(|_| p.pause(0, Some(Duration::from_secs(1))))
             .collect();
         assert!(waits.len() > 1, "{waits:?}");
         // A server asking for an absurd wait is still honoured, without overflowing.
-        assert_eq!(p.delay(0, Some(Duration::MAX)), Duration::MAX);
+        assert_eq!(p.pause(0, Some(Duration::MAX)), Duration::MAX);
     }
 
     #[test]

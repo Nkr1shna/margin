@@ -1574,6 +1574,7 @@ fn quick() -> Backoff {
         retries: 3,
         base_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(100),
+        jitter: Duration::ZERO,
     }
 }
 

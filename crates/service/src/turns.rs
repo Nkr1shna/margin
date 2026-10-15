@@ -1739,6 +1739,9 @@ impl TurnSink for ServiceSink {
     fn clear_waiting(&self) -> BoxFuture<'_, Result<(), SinkError>> {
         Box::pin(self.set_waiting(None))
     }
+
+    /// Stamping the step's trace row is phase 5's 5-retry (`docs/phase5-brief.md` §4).
+    fn compaction(&self, _step: u32, _kind: margin_shared::context::Compaction) {}
 }
 
 impl ServiceSink {

@@ -16,6 +16,7 @@
 //! phase's first commit: a change goes through the orchestrator.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures_util::Stream;
 use margin_shared::pipeline::Route;
@@ -157,6 +158,125 @@ impl CallOptions {
             opts.prompt_version = Some(prompt.version.to_string());
         }
         opts
+    }
+}
+
+/// How a failed model call is retried, for the agent loop and every job call alike
+/// (`docs/phase5-brief.md` D4: the one retry policy): `retries` more attempts after
+/// the first, each after the pause the API asked for (`Retry-After`, honoured as asked
+/// however long, plus up to `jitter` so two callers told the same thing don't retry at
+/// the same instant), else `base_delay · 2^n` capped at `max_delay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    /// Retries after the first attempt.
+    pub retries: u32,
+    pub base_delay: Duration,
+    /// Longest computed pause. A `Retry-After` isn't capped (owner decision).
+    pub max_delay: Duration,
+    /// Most random time added to a `Retry-After` pause.
+    pub jitter: Duration,
+}
+
+impl Default for Backoff {
+    /// 3 retries, 2 s doubling up to 60 s, `Retry-After` plus 0–1 s.
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(60),
+            jitter: Duration::from_secs(1),
+        }
+    }
+}
+
+impl Backoff {
+    /// No computed pauses, for tests (a `Retry-After` is still honoured).
+    pub fn immediate() -> Self {
+        Self {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+
+    /// The pause before retry number `attempt + 1`: `retry_after` when the API sent one,
+    /// as asked plus up to `jitter`; else `base_delay · 2^attempt`, at most `max_delay`.
+    pub fn pause(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        match retry_after {
+            Some(wait) => wait.saturating_add(jitter(self.jitter)),
+            None => self
+                .base_delay
+                .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+                .min(self.max_delay),
+        }
+    }
+
+    /// The pause before the next attempt after `err`, where `attempt` counts the retries
+    /// already made; `None` when `err` isn't worth retrying or the retries are used up.
+    pub fn delay(&self, attempt: u32, err: &AiError) -> Option<Duration> {
+        if attempt >= self.retries || !err.is_retryable() {
+            return None;
+        }
+        Some(self.pause(attempt, err.retry_after()))
+    }
+}
+
+/// A random pause of up to `max` (to the millisecond).
+fn jitter(max: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let max_ms = max.as_millis().min(u128::from(u64::MAX)) as u64;
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    // `RandomState` is seeded randomly per instance: enough randomness for spreading
+    // retries, without a dependency.
+    let random = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    Duration::from_millis(random % (max_ms + 1))
+}
+
+/// Called when a retried call starts waiting (`Some`, with until when and why) and
+/// when the wait ends (`None`).
+pub type OnWait = Box<dyn Fn(Option<margin_shared::Waiting>) + Send + Sync>;
+
+/// A [`TextModel`] whose calls are retried as `backoff` says when they fail before any
+/// delta arrived (429 except `NOT_RETRYABLE_429`, 5xx incl. 529, network), reporting
+/// each wait through `on_wait` (`docs/phase5-brief.md` D4). The service wraps every
+/// text model it hands to a job (lessons, scenes, the planner, titles, condense).
+pub struct Retrying<M> {
+    pub inner: M,
+    pub backoff: Backoff,
+    pub on_wait: OnWait,
+}
+
+impl<M: TextModel> Retrying<M> {
+    pub fn new(inner: M, backoff: Backoff, on_wait: OnWait) -> Self {
+        Self {
+            inner,
+            backoff,
+            on_wait,
+        }
+    }
+}
+
+impl<M: TextModel> TextModel for Retrying<M> {
+    fn stream_parts<'a>(
+        &'a self,
+        _instructions: &'a str,
+        _input: &'a [InputPart],
+        _opts: &'a CallOptions,
+        _on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        unimplemented!("P5, 5-retry")
+    }
+
+    fn stream_json<'a>(
+        &'a self,
+        _instructions: &'a str,
+        _input: &'a [InputPart],
+        _format: &'a JsonFormat,
+        _opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        unimplemented!("P5, 5-retry")
     }
 }
 

@@ -38,6 +38,13 @@ pub struct VersionInfo {
     /// The machine's (or VM's) physical memory, when the platform reports it.
     #[serde(default)]
     pub physical_memory_bytes: Option<u64>,
+    /// How many alerts are active (`GET /api/alerts` names them; this route is public,
+    /// so only the count).
+    #[serde(default)]
+    pub alerts_active: u32,
+    /// When the oldest active alert rose.
+    #[serde(default)]
+    pub alerts_since: Option<DateTime<Utc>>,
 }
 
 static STARTED_AT: OnceLock<DateTime<Utc>> = OnceLock::new();
@@ -56,11 +63,15 @@ pub fn info(environment: &str) -> VersionInfo {
         started_at: mark_started(),
         rss_bytes: resident_bytes(),
         physical_memory_bytes: physical_memory_bytes(),
+        alerts_active: 0,
+        alerts_since: None,
     }
 }
 
 pub async fn get_version(State(state): State<AppState>) -> Json<VersionInfo> {
-    Json(info(&state.config.environment))
+    let mut v = info(&state.config.environment);
+    (v.alerts_active, v.alerts_since) = state.alerts.lock().unwrap().summary();
+    Json(v)
 }
 
 /// The start-up warning for a machine with less than `LOW_MEMORY_BYTES`.
@@ -165,9 +176,26 @@ mod tests {
         assert_eq!(v.started_at, first);
         // The JSON shape deploy.sh and margin-eval read.
         let json = serde_json::to_value(&v).unwrap();
-        for key in ["version", "sha", "environment", "started_at", "rss_bytes"] {
+        for key in [
+            "version",
+            "sha",
+            "environment",
+            "started_at",
+            "rss_bytes",
+            "alerts_active",
+        ] {
             assert!(json.get(key).is_some(), "{key} missing: {json}");
         }
+    }
+
+    #[test]
+    fn version_from_before_alerts_parses() {
+        let v: VersionInfo = serde_json::from_value(serde_json::json!({
+            "version": "0.1.0", "sha": "abc", "environment": "dev",
+            "started_at": "2026-10-14T10:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!((v.alerts_active, v.alerts_since), (0, None));
     }
 
     #[cfg(target_os = "macos")]

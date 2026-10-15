@@ -118,11 +118,56 @@ fn foreground_channel() -> &'static watch::Sender<bool> {
 #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 pub fn set_foreground(foreground: bool) {
     foreground_channel().send_replace(foreground);
+    update_active();
 }
 
 /// Follows `set_foreground`, starting from the current state.
 pub fn foreground_changes() -> watch::Receiver<bool> {
     foreground_channel().subscribe()
+}
+
+/// Whether the system runs Margin's background task (`background::Work`): set by the
+/// platform when the task starts running, cleared when it ends or expires.
+fn continued_channel() -> &'static watch::Sender<bool> {
+    static CHANNEL: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    CHANNEL.get_or_init(|| watch::Sender::new(false))
+}
+
+/// `foreground || continued`, kept by `set_foreground` and `set_continued`.
+fn active_channel() -> &'static watch::Sender<bool> {
+    static CHANNEL: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    CHANNEL.get_or_init(|| watch::Sender::new(true))
+}
+
+fn update_active() {
+    let active = *foreground_channel().borrow() || *continued_channel().borrow();
+    active_channel().send_if_modified(|now| std::mem::replace(now, active) != active);
+}
+
+/// Report the system running Margin's background task (`true`) or the task ending or
+/// expiring (`false`). Any thread (the iOS task's handlers call it).
+#[allow(dead_code)] // 5-ios calls it from the task's handlers.
+pub fn set_continued(continued: bool) {
+    continued_channel().send_replace(continued);
+    update_active();
+}
+
+/// Whether the system runs Margin's background task now.
+pub fn continued() -> bool {
+    *continued_channel().borrow()
+}
+
+/// Whether the app is active: in the foreground, or kept running in the background by
+/// its task (`docs/phase5-brief.md` D1). While active the events socket stays open and
+/// the sync engine doesn't pause.
+pub fn active() -> bool {
+    *active_channel().borrow()
+}
+
+/// Follows `active`, starting from the current state.
+#[allow(dead_code)]
+pub fn active_changes() -> watch::Receiver<bool> {
+    active_channel().subscribe()
 }
 
 /// Which citation the source viewer shows.

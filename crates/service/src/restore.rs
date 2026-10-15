@@ -124,3 +124,34 @@ mod tests {
         check_environment(&c).unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: checked backups and the schema guard (`docs/phase5-brief.md` D5)
+// ---------------------------------------------------------------------------
+
+/// What `check_data` found in a data folder (a backup or a live copy).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataCheck {
+    /// `SettingsRow.migrations`.
+    pub migrations: Vec<String>,
+    /// `SettingsRow.schema_version()`.
+    pub schema_version: u32,
+    /// Rows per table.
+    pub rows: Vec<(String, u64)>,
+    /// What is wrong: a Ready source or document without its file, a passage of a
+    /// missing document, a missing table. Empty when the folder is sound.
+    pub problems: Vec<String>,
+}
+
+/// `margin-service check-data <dir>`: copies `<dir>/db` to a temporary folder (a backup
+/// is never opened in place), opens the copy, and checks it against `<dir>/sources`.
+pub async fn check_data(_dir: &std::path::Path) -> anyhow::Result<DataCheck> {
+    unimplemented!("P5, 5-data")
+}
+
+/// `margin-service backup [--label NAME]`: the service's own copy of the data folder,
+/// as `deploy/scripts/backup-margin.sh` makes it (copy, then rename; the same keep
+/// rule), also run before a schema migration. Returns the new backup's folder.
+pub async fn backup(_config: &Config, _label: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    unimplemented!("P5, 5-data")
+}

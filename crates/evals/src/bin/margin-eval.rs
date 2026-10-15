@@ -148,6 +148,20 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
                 runner::write_report(&paths, &store, run.as_deref(), eff.as_ref()).await?;
             println!("{}\n{}", md.display(), html.display());
         }
+        Command::Alerts => {
+            let url = cli
+                .service_url
+                .as_deref()
+                .context("alerts needs --service-url")?;
+            margin_evals::alerts::run(&reqwest::Client::new(), url, &token()?).await?;
+        }
+        Command::Perf => {
+            let url = cli
+                .service_url
+                .as_deref()
+                .context("perf needs --service-url")?;
+            margin_evals::perf::run(&reqwest::Client::new(), url, &token()?, &evals).await?;
+        }
         live_cmd => live_command(live_cmd, &paths, &store).await?,
     }
     Ok(())
@@ -434,6 +448,10 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                     scores.len(),
                     if run.valid { "" } else { "  INVALID" }
                 );
+            }
+            Suite::Injection => {
+                margin_evals::injection::run(&env, variant, models.as_ref().unwrap(), store)
+                    .await?;
             }
             Suite::Agent => {
                 let m = models.as_ref().unwrap();

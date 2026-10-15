@@ -56,6 +56,11 @@ pub const TRACE: &str = "trace";
 /// Hourly and daily rollups of `trace`, as table views.
 pub const TRACE_HOURLY: &str = "trace_hourly";
 pub const TRACE_DAILY: &str = "trace_daily";
+/// The version of the stored data's shape this build writes (`SettingsRow.schema_version`):
+/// bumped when a `DEFINE` or a one-pass migration changes. A store with a higher one
+/// refuses to serve; a lower one is backed up, then migrated (`docs/phase5-brief.md` D5).
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
 
@@ -166,6 +171,8 @@ DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
 DEFINE FIELD IF NOT EXISTS via            ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS query          ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS read_range     ON trace TYPE option<array<int>>;
+DEFINE FIELD IF NOT EXISTS compaction     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS provider_ms    ON trace TYPE option<number>;
 DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 

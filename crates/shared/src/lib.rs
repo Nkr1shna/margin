@@ -13,6 +13,7 @@ pub mod device;
 pub mod pipeline;
 pub mod providers;
 pub mod routes;
+pub mod text;
 
 pub use chat::*;
 pub use device::*;

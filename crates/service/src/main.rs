@@ -1,5 +1,6 @@
 //! `margin-service setup` | `margin-service serve [--allow-unsandboxed-render]` |
 //! `margin-service download-model [--embedder NAME]` | `margin-service scrub-restored` |
+//! `margin-service check-data <dir>` | `margin-service backup [--label NAME]` |
 //! `margin-service version`
 
 use std::process::ExitCode;
@@ -24,6 +25,9 @@ Usage:
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
+  margin-service check-data <dir>                    Check a data folder (a backup) on a copy:
+                                                     tables, migrations, source files
+  margin-service backup [--label NAME]               Back up the data folder now
   margin-service version                             Print the build's version and commit
 ";
 
@@ -41,6 +45,15 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("setup") if args.len() == 1 => config::run_setup(&config::config_path()),
         Some("scrub-restored") if args.len() == 1 => scrub_restored(),
+        Some("check-data") if args.len() == 2 => check_data(std::path::Path::new(&args[1])),
+        Some("backup") => match &args[1..] {
+            [] => backup(None),
+            [flag, label] if flag == "--label" => backup(Some(label)),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        },
         Some("download-model") => match model_download::parse_args(&args[1..]) {
             Ok(embedder) => download_model(embedder),
             Err(e) => {
@@ -183,6 +196,42 @@ fn scrub_restored() -> anyhow::Result<()> {
         for done in restore::scrub(&store).await? {
             println!("deleted {} {} rows", done.rows, done.table);
         }
+        Ok(())
+    })
+}
+
+/// Checks a data folder on a copy and prints the verdict; fails on any problem.
+fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let check = restore::check_data(dir).await?;
+        for problem in &check.problems {
+            eprintln!("{problem}");
+        }
+        anyhow::ensure!(
+            check.problems.is_empty(),
+            "{} has {} problem(s)",
+            dir.display(),
+            check.problems.len()
+        );
+        println!("{} is sound", dir.display());
+        Ok(())
+    })
+}
+
+/// Backs up the configured data folder.
+fn backup(label: Option<&str>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let config = Config::load(&config::config_path())?;
+        let dir = restore::backup(&config, label).await?;
+        println!("{}", dir.display());
         Ok(())
     })
 }

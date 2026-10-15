@@ -1,6 +1,7 @@
 //! The Margin app (desktop, iOS, Android): a thin, live client of the Margin service.
 
 mod api;
+mod background;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
 mod citations;
@@ -414,6 +415,30 @@ fn App() -> Element {
         }
     });
 
+    // Keeps the platform's background task (iOS 26's continued processing) going while
+    // a held folder syncs or a chat reading one runs (`background`, D1). Polled: the
+    // inputs are signals the coordinator only peeks at.
+    use_future(move || async move {
+        let mut coordinator = background::Coordinator::new(background::platform());
+        loop {
+            let want = {
+                let lib = ctx.lib.peek();
+                background::wanted(
+                    &ctx.folder_sync.peek(),
+                    lib.chats.values(),
+                    &ctx.folders.peek(),
+                    &lib.workspaces,
+                )
+            };
+            coordinator.observe(background::Inputs {
+                foreground: *ctx.foreground.peek(),
+                continued: state::continued(),
+                want,
+            });
+            tokio::time::sleep(BACKGROUND_TICK).await;
+        }
+    });
+
     // View > Zoom In / Zoom Out / Actual Size change the saved zoom level.
     #[cfg(feature = "desktop")]
     dioxus::desktop::use_muda_event_handler(move |event| {
@@ -576,6 +601,9 @@ async fn load_chats(ctx: AppCtx, api: &Api) -> bool {
 /// foreground state while connected or waiting.
 const LIVE_TICK: Duration = Duration::from_millis(250);
 
+/// How often the background-task coordinator looks at the syncs and chats.
+const BACKGROUND_TICK: Duration = Duration::from_secs(1);
+
 /// The devices again, with who is online now (`DeviceChanged` only says what changes
 /// while the socket is live). Settings shows the ones known before if this fails.
 async fn load_devices(ctx: AppCtx, api: &Api) {
@@ -620,8 +648,8 @@ fn set_self_online(ctx: AppCtx, online: bool) {
 /// Keeps the library live over the events socket and runs the device tools the service
 /// sends this device. The loop owns both halves of the socket: frames for the service
 /// (tool answers) come to it through `AppCtx::device_frames`. On iOS, iPadOS and Android
-/// the socket is closed while the app is in the background and opened again when it
-/// comes back.
+/// the socket is closed while the app isn't active (in the background with no
+/// background task running, `state::active`) and opened again when it is.
 async fn live_loop(ctx: AppCtx) {
     let Some(api) = ctx.api() else { return };
     let Some(token) = api.token().map(str::to_string) else {
@@ -640,11 +668,12 @@ async fn live_loop(ctx: AppCtx) {
     let mut attempt: u32 = 0;
     let mut connected_before = false;
     loop {
-        if !*ctx.foreground.peek() {
-            // Uploads stop with the app (iOS, iPadOS, Android); parts resume later.
+        if !state::active() {
+            // Uploads stop with the app (iOS, iPadOS, Android) unless its background
+            // task keeps it active; parts resume later.
             engine.pause();
             live.set(LiveStatus::Background);
-            while !*ctx.foreground.peek() {
+            while !state::active() {
                 tokio::time::sleep(LIVE_TICK).await;
             }
             attempt = 0;
@@ -701,7 +730,7 @@ async fn live_loop(ctx: AppCtx) {
                             }
                         }
                         _ = tick.tick() => {
-                            if !*ctx.foreground.peek() {
+                            if !state::active() {
                                 engine.pause();
                                 events::close(&mut sender).await;
                                 break String::new();
@@ -740,7 +769,7 @@ async fn live_loop(ctx: AppCtx) {
             Err(ConnectError::Other(message)) => message,
         };
         // Gone to the background: wait for the app to come back, not for a retry.
-        if !*ctx.foreground.peek() {
+        if !state::active() {
             continue;
         }
         let delay = events::backoff(attempt);
@@ -751,7 +780,7 @@ async fn live_loop(ctx: AppCtx) {
         });
         // Wait, but honor a manual reload request (Retry) in the meantime.
         let deadline = tokio::time::Instant::now() + delay;
-        while tokio::time::Instant::now() < deadline && *ctx.foreground.peek() {
+        while tokio::time::Instant::now() < deadline && state::active() {
             tokio::time::sleep(LIVE_TICK).await;
             set_self_online(ctx, false);
             let wanted = *ctx.reload.peek();

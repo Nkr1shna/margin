@@ -3,6 +3,7 @@
 //! See `PLAN.md` ("Service") and `margin_shared::routes`.
 
 pub mod agent_tools;
+pub mod alerts;
 pub mod ask;
 pub mod auth;
 pub mod chats;

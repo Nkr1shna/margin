@@ -319,7 +319,7 @@ pub fn efficiency(rows: &[TraceRow], prices: &Prices) -> Efficiency {
                 e.tool_calls += 1;
                 e.tool_output_max_bytes = e.tool_output_max_bytes.max(r.output_bytes.unwrap_or(0));
             }
-            TraceKind::JobStep | TraceKind::Turn => {}
+            TraceKind::JobStep | TraceKind::Turn | TraceKind::Alert => {}
         }
     }
     for (k, v) in &ms {

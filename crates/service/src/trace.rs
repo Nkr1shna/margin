@@ -959,6 +959,8 @@ pub async fn read_rollup(
                 output: int(r.output),
                 cost_usd: r.cost_usd.filter(|c| c.is_finite()).unwrap_or(0.0),
                 mean_ms: mean,
+                // `p95_ms` in the views is phase 5's 5-ops.
+                p95_ms: None,
             };
             match merged.get_mut(&key) {
                 Some(have) => {

@@ -66,7 +66,7 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **2 Courses through the agent** | — | Confirmation parking (`wait_for_decision`), Write/Destructive ordering | Write and Destructive tools, `propose_course` + `accept_proposal`, `decide`, `AcceptProposal.chips`, `Proposal.chat_id` + Action on accept, Q2 provenance; remove `POST /api/ask` and the proposal job | Outline card (the existing outline editor with chips, Create lessons), result cards, confirmation cards (Approve/Deny from any device); remove the old Ask composer and `Api::ask` |
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
 | **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files` (service `Read` tools over the folder's rows and sources) and `sync_folder` (the one device tool); a folder's text is searched with R1's `search` scoped to the workspace | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
-| **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
+| **5 Hardening** (`docs/phase5-brief.md`) | 5-retry: `Backoff` the one retry policy (`Retry-After` uncapped + 0–1 s jitter), `Retrying<M: TextModel>` for every job call with waits reported through `on_wait` | 5-agent: the normaliser on every tool output in `Turn::record`, injection tests (outputs keep their frame, no URL-taking tool, destructive tools confirm), `TurnSink::compaction` markers, compaction/condense replays across restart and Continue, the condense summary cap | 5-guard: `text::for_model` at every edge (tool outputs, packed passages, device answers, context-API ingests, web titles, stored names and titles) and the injection suite; 5-retry: every `text_model` wrapped, waits shown on lessons/videos/proposals; 5-security: per-device rate limits, no CORS, callback CSP, media `Cache-Control`, the §7 limits pinned; 5-data: `check-data`, `backup`, the schema-version guard, restore drill; 5-ops: alerts from traces (`GET /api/alerts`, journald, `/api/version` counts, webhook), `p95_ms`, `provider_ms`, `margin-eval alerts`/`perf` | 5-ios: `BGContinuedProcessingTask` (iOS 26) while a held folder syncs or a chat reading one runs (`state::active = foreground ‖ continued`, `background::Coordinator`) |
 | **Providers** | One seam (`model.rs`: `CallOptions`, `TextModel`, `Provider`, `ModelRequest`, `ModelEvent`); `ResponsesClient` on it (OpenAI, ChatGPT bearer), `ClaudeClient` (Messages API, D2/D12), `list_models` with windows | The loop on neutral `ModelEvent`s, `replay::claude`, Claude tool gating (D5), web rows/cards/citations, pause/pending continuation, window-scaled compaction | `model_for`/`provider_config` per provider with the window cache, three Keychain entries, the SIWC flow, chats on their provider, traces per provider (D14) | Settings: default provider and three slots per provider, ChatGPT sign-in, Claude key; New chat provider picker; web card and citations |
 | **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
@@ -334,6 +334,16 @@ gives `msg`.
   `overloaded_error`, 500 and 504 are `server_error` and retried; `AiError::Http.code`
   carries the provider's code (`error.details.error_code`, else `error.code`, else
   `error.type`).
+- **Job calls** (phase 5, `docs/phase5-brief.md` D4): every `TextModel` call the service
+  makes (lessons, scenes, the planner, titles, condense) goes through
+  `margin_ai::Retrying` with the same `Backoff` as the loop: a call that fails before
+  any delta with a retryable error is retried up to 3 times, `Retry-After` honoured
+  uncapped plus 0–1 s, else `2 s · 2^n` capped at 60 s; the codes above are never
+  retried. Each wait is reported (`on_wait(Some(Waiting))`, then `on_wait(None)`): a
+  lesson shows it in its progress text, a video in its log line, the planner on the
+  proposal; the title and condense calls wait silently. Each attempt is its own
+  `model_call` trace row (`ok: false`, `error_code`). Stop and deletes abort a job's
+  wait as they abort the job.
 - `Incomplete { reason }` (`max_output_tokens`, `max_messages`, `content_filter`,
   `steered`): items done so far are kept; Error "The answer was cut off (…)"
   `retryable: true`, code `incomplete`.
@@ -645,6 +655,21 @@ Providers, `margin_ai`: `CLAUDE_MAX_OUTPUT_TOKENS` 32 000 (a text call: 64 000),
 `claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI small
 `gpt-6-luna`; ChatGPT `gpt-6.1-sol`.
 
+Phase 5 (`docs/phase5-brief.md` D7), body and frame limits, each a named constant with a
+test at its boundary:
+
+| What | Limit | Where |
+|---|---|---|
+| Source upload (one request) | 50 MB; audio and video 500 MB; folder files unlimited, in parts of 32 MB | `routes::{MAX_OTHER_SOURCE_BYTES, MAX_MEDIA_SOURCE_BYTES, UPLOAD_PART_BYTES}` |
+| Folder manifest (`POST /api/workspaces/{id}/sync`) | 64 MB | `folders::manifest_limit` |
+| `POST /api/context/ingest` | 16 MB | `routes::CONTEXT_INGEST_MAX_BYTES` |
+| Every other JSON body | 2 MB | `routes::JSON_BODY_MAX_BYTES` (on the API router) |
+| A device's frame on the events socket | 1 MB | `routes::DEVICE_FRAME_MAX_BYTES` |
+| `GET /api/traces` | paged by the server (500 rows a read) | `trace::PAGE` |
+| Condense summary | 8 000 characters | `routes::CONDENSE_SUMMARY_MAX_CHARS` |
+| Alert job tick | 60 s | `routes::ALERT_TICK_SECS` |
+| Per-device rate limits (5-security) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min; 429 `rate_limited` with `Retry-After` (`margin-mcp` waits it out) | `auth::RateLimiter` |
+
 ## 8. Tests each owner adds
 
 - **ai**: the fake SSE server streams real event shapes (text, reasoning summary,
@@ -699,6 +724,17 @@ the pipeline by name; `margin-evals` metrics against hand-worked values and the 
 set's anchors against the corpus. Each R1 area adds the tests of §6.2/§6.4 of the
 architecture doc; the eval gates (`cargo test -p margin-evals`) run on
 `RecordedEmbedder` and `kv-mem` only.
+
+**Phase 5**: the tests of `docs/phase5-brief.md` §5, fakes only. The first commit has:
+`text::for_model` (controls, bidi, zero-width and tag characters, private use and
+unassigned, NFC, blank-line runs, idempotence, ASCII/CJK/emoji untouched); round trips
+of the new trace fields, `TraceKind::Alert`, `TraceRollup.p95_ms`, `Alert`/`AlertList`
+with rows from before phase 5 parsing; `Backoff` (computed delays capped,
+`Retry-After` uncapped with jitter bounds, non-retryable codes); `[alerts]` defaults and
+overrides; `VersionInfo` without the alert fields parsing; the background
+`Coordinator` over the D1 table (start in front, update, end, expiry restores phase 4,
+no start in the background, a refusal not retried); the `margin-eval` sub-commands
+parse; the injection rows load; `budgets.toml` parses; `margin-mcp` waits out a 429.
 
 ## 9. Open points for the owner
 

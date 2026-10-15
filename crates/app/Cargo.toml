@@ -63,6 +63,9 @@ block2 = "=0.6.2"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSError", "NSFileCoordinator", "NSObject", "NSString", "NSURL"] }
 objc2-ui-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "UIDocumentPickerViewController", "UIResponder", "UIScene", "UISceneDefinitions", "UISceneOptions", "UISceneSession", "UIView", "UIViewController", "UIWindow", "UIWindowScene", "objc2-uniform-type-identifiers"] }
 objc2-uniform-type-identifiers = { version = "=0.3.2", default-features = false, features = ["std", "UTCoreTypes", "UTType"] }
+# iOS 26's continued processing for folder syncs and chats that read them (phase 5 D1,
+# src/background/ios.rs): BGContinuedProcessingTask(Request), BGTaskScheduler.
+objc2-background-tasks = { version = "=0.3.2", default-features = false, features = ["std", "block2", "BGDefines", "BGTask", "BGTaskRequest", "BGTaskScheduler"] }
 
 [dev-dependencies]
 axum = { version = "=0.8.9", features = ["ws"] }

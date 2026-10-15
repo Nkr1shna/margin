@@ -1,0 +1,42 @@
+# Performance budgets for the Linux prod guest (4 vCPU / 8 GB; docs/plan-linux-service.md §3),
+# docs/phase5-brief.md D8. `margin-eval perf --service-url URL` measures each from the
+# service's trace rows and prints it as met or missed. Reported, not gated: machines differ.
+# Revise after the first `perf` run on dev.
+
+[ingest]
+# End to end, text, q8 ONNX on 3 threads (`ingest` rows: chunks_new, embed_ms).
+min_chunks_per_s = 3.0
+# Re-ingest of an unchanged file.
+unchanged_reingest_max_ms = 1000
+
+[retrieval]
+# Both legs + fusion, no rerank, at 100k passages (`retrieval` rows).
+p50_max_ms = 200
+p95_max_ms = 500
+
+[context_search]
+# POST /api/context/search end to end, timed by the runner.
+p95_max_ms = 700
+
+[agent_step]
+# Service-side overhead per step: duration_ms - provider_ms on `model_call` rows.
+overhead_max_ms = 150
+
+[cache]
+# usage.cached / usage.input from step 2 of a turn.
+min_cached_share = 0.60
+
+[title]
+# A chat title call's input + output tokens.
+max_tokens = 300
+
+[memory]
+# /api/version rss_bytes: the text embedder loaded and encoders idle; with the image
+# encoders or Parakeet loaded.
+idle_max_bytes = 3_221_225_472     # 3 GiB
+loaded_max_bytes = 6_442_450_944   # 6 GiB
+
+[folder_sync]
+# 1 000 small files from an iPhone (manual: app log + WorkspaceChanged timings).
+manifest_max_ms = 5000
+min_uploads_per_s = 2.0
