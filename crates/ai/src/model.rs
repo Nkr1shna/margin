@@ -22,6 +22,7 @@ use margin_shared::pipeline::Route;
 use margin_shared::{ReasoningEffort, Usage, WebCitation, WebResult};
 use serde_json::Value;
 
+use crate::prompts::JsonFormat;
 use crate::{AiError, InputPart, Prompt};
 
 pub use margin_shared::{ModelInfo, RouteModels};
@@ -179,6 +180,29 @@ pub trait TextModel: Send + Sync {
         opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<TextOutput, AiError>>;
+
+    /// A structured answer: JSON following `format`. A provider with a strict-schema
+    /// mode uses it (the Responses client sends `text.format`); the default asks in
+    /// words, appending the schema to the input as a last text part (Messages has no
+    /// `text.format`; the part comes after the cached constant block, so the cached
+    /// prefix is unchanged). The caller parses and checks the answer.
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let mut input = input.to_vec();
+            input.push(InputPart::Text(format!(
+                "Answer with only a JSON object (no prose, no code fence) that follows this JSON schema:\n{}",
+                format.schema
+            )));
+            self.stream_parts(instructions, &input, opts, Box::new(|_| {}))
+                .await
+        })
+    }
 }
 
 /// The events of one agent step. Ends after `Completed`, `Incomplete` or `Failed`; a

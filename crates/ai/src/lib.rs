@@ -25,7 +25,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 mod citations;
-mod clean;
+pub mod clean;
+use clean::json_answer;
 mod messages;
 pub mod model;
 pub mod prompts;
@@ -402,22 +403,20 @@ impl TextModel for ResponsesClient {
             self.stream_body(&body, on_delta).await
         })
     }
-}
 
-/// The JSON of a structured answer: the text itself, or the inside of a code fence a
-/// compatible server wrapped it in.
-fn json_answer(text: &str) -> &str {
-    let t = text.trim();
-    let Some(rest) = t.strip_prefix("```") else {
-        return t;
-    };
-    let Some((lang, body)) = rest.split_once('\n') else {
-        return t;
-    };
-    if !matches!(lang.trim(), "" | "json") {
-        return t;
+    /// Strict JSON through `text.format`.
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a prompts::JsonFormat,
+        opts: &'a CallOptions,
+    ) -> model::BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let body = self.body(instructions, input, opts, Some(format));
+            self.stream_body(&body, |_| {}).await
+        })
     }
-    body.trim_end().strip_suffix("```").map_or(t, str::trim)
 }
 
 /// A piece of a request's input.
@@ -889,6 +888,45 @@ pub struct LessonContext {
     pub passages: Vec<Passage>,
 }
 
+/// One text call of `prompt` on `model`, with the options completed from the prompt.
+async fn text_call(
+    model: &dyn TextModel,
+    prompt: &Prompt,
+    opts: &CallOptions,
+    on_delta: Box<dyn FnMut(&str) + Send + '_>,
+) -> Result<Generated<String>, AiError> {
+    let opts = opts.keyed(prompt);
+    Ok(model
+        .stream_parts(&prompt.instructions(), &prompt.input, &opts, on_delta)
+        .await?
+        .generated())
+}
+
+/// A structured call of `prompt` (its JSON schema) on `model`, parsed as `T`. An answer
+/// that isn't JSON of that shape is `AiError::Parse`.
+async fn json_call<T: DeserializeOwned>(
+    model: &dyn TextModel,
+    prompt: &Prompt,
+    opts: &CallOptions,
+) -> Result<Generated<T>, AiError> {
+    let format = prompt
+        .format
+        .as_ref()
+        .ok_or_else(|| AiError::Parse(format!("the {} prompt has no JSON schema", prompt.job)))?;
+    let opts = opts.keyed(prompt);
+    let Generated { value: text, usage } = model
+        .stream_json(&prompt.instructions(), &prompt.input, format, &opts)
+        .await?
+        .generated();
+    let value = serde_json::from_str(json_answer(&text)).map_err(|e| {
+        AiError::Parse(format!(
+            "the {} answer isn't the JSON asked for: {e}",
+            prompt.job
+        ))
+    })?;
+    Ok(Generated { value, usage })
+}
+
 /// Streams a lesson body as Markdown (see `Lesson::body_md` for conventions).
 ///
 /// The returned body is the streamed text with two mistakes removed if the model made
@@ -899,20 +937,22 @@ pub struct LessonContext {
 /// Runs on the `Write` route with the prompt's cache key (`lesson:lesson-v2`); use
 /// [`write_lesson_with`] to choose the options and get the usage.
 pub async fn write_lesson(
-    client: &ResponsesClient,
+    model: &dyn TextModel,
     ctx: &LessonContext,
     on_delta: impl FnMut(&str) + Send,
 ) -> Result<String, AiError> {
     Ok(
-        write_lesson_with(client, ctx, &CallOptions::new(Route::Write), on_delta)
+        write_lesson_with(model, ctx, &CallOptions::new(Route::Write), on_delta)
             .await?
             .value,
     )
 }
 
-/// [`write_lesson`] with explicit call options; returns the body and the usage.
+/// [`write_lesson`] with explicit call options (completed from the prompt: cache key,
+/// the constant block's length, the version); returns the body and the usage. Any
+/// [`TextModel`]: the Responses client or the Claude one.
 pub async fn write_lesson_with(
-    client: &ResponsesClient,
+    model: &dyn TextModel,
     ctx: &LessonContext,
     opts: &CallOptions,
     on_delta: impl FnMut(&str) + Send,
@@ -924,9 +964,8 @@ pub async fn write_lesson_with(
             ctx.outline.len()
         )));
     }
-    let Generated { value: text, usage } = client
-        .generate(&prompts::lesson(ctx), opts, on_delta)
-        .await?;
+    let Generated { value: text, usage } =
+        text_call(model, &prompts::lesson(ctx), opts, Box::new(on_delta)).await?;
     let body = clean::lesson_markdown(&text);
     if body.trim().is_empty() {
         return Err(AiError::Parse("the lesson came back empty".into()));
@@ -965,9 +1004,9 @@ pub struct FailedScene {
 /// Runs on the `Write` route with the prompt's cache key (`scene:scene-v2`); the
 /// repair call shares the first call's cached prefix. [`write_scene_with`] chooses the
 /// options and returns the usage.
-pub async fn write_scene(client: &ResponsesClient, req: &SceneRequest) -> Result<String, AiError> {
+pub async fn write_scene(model: &dyn TextModel, req: &SceneRequest) -> Result<String, AiError> {
     Ok(
-        write_scene_with(client, req, &CallOptions::new(Route::Write))
+        write_scene_with(model, req, &CallOptions::new(Route::Write))
             .await?
             .value,
     )
@@ -975,12 +1014,12 @@ pub async fn write_scene(client: &ResponsesClient, req: &SceneRequest) -> Result
 
 /// [`write_scene`] with explicit call options; returns the code and the usage.
 pub async fn write_scene_with(
-    client: &ResponsesClient,
+    model: &dyn TextModel,
     req: &SceneRequest,
     opts: &CallOptions,
 ) -> Result<Generated<String>, AiError> {
     let Generated { value: text, usage } =
-        client.generate(&prompts::scene(req), opts, |_| {}).await?;
+        text_call(model, &prompts::scene(req), opts, Box::new(|_| {})).await?;
     let code = clean::scene_code(&text);
     if !code.lines().any(|l| l.trim() == "import manimgx as m") {
         return Err(AiError::Parse(
@@ -1005,13 +1044,12 @@ pub async fn write_scene_with(
 /// count, non-empty titles, 2–3 queries per lesson, `must_cite` limited to sections
 /// listed in `req.contents`.
 pub async fn plan_course(
-    client: &ResponsesClient,
+    model: &dyn TextModel,
     req: &PlanRequest,
     opts: &CallOptions,
 ) -> Result<Generated<CoursePlan>, AiError> {
-    let Generated { value, usage } = client
-        .generate_json::<CoursePlan>(&prompts::plan(req), opts)
-        .await?;
+    let Generated { value, usage } =
+        json_call::<CoursePlan>(model, &prompts::plan(req), opts).await?;
     Ok(Generated {
         value: value.checked(req)?,
         usage,
@@ -1024,7 +1062,7 @@ pub async fn plan_course(
 /// grade 0. Unused by the product until R2; versioned (`rerank-v1`) so the eval can run
 /// it now.
 pub async fn rerank(
-    client: &ResponsesClient,
+    model: &dyn TextModel,
     query: &str,
     candidates: &[RerankCandidate],
     opts: &CallOptions,
@@ -1035,9 +1073,9 @@ pub async fn rerank(
             usage: Usage::default(),
         });
     }
-    let Generated { value, usage } = client
-        .generate_json::<prompts::RerankAnswer>(&prompts::rerank(query, candidates), opts)
-        .await?;
+    let Generated { value, usage } =
+        json_call::<prompts::RerankAnswer>(model, &prompts::rerank(query, candidates), opts)
+            .await?;
     Ok(Generated {
         value: prompts::complete_ranking(value, candidates),
         usage,

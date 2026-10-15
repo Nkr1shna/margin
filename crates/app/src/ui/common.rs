@@ -37,6 +37,10 @@ const ICONS: &[(&str, &str)] = &[
     ),
     ("check", r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#),
     (
+        "globe",
+        r#"<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/>"#,
+    ),
+    (
         "more",
         r#"<circle cx="6" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="18" cy="12" r="1" fill="currentColor"/>"#,
     ),
@@ -148,7 +152,7 @@ const ICONS: &[(&str, &str)] = &[
     ),
 ];
 
-fn icon_svg(name: &str) -> String {
+pub(crate) fn icon_svg(name: &str) -> String {
     let body = ICONS
         .iter()
         .find(|(n, _)| *n == name)

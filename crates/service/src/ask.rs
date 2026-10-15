@@ -280,7 +280,7 @@ async fn record_course_created(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![crate::turns::wire::action(chat.provider, &text)],
+            model_items: vec![margin_agent::replay::action(chat.provider, &text)],
             full_output: None,
         },
     )
@@ -662,29 +662,6 @@ async fn lesson_context(
     Ok((ctx, proposal, retrieved))
 }
 
-/// The window a writing job's passages are a share of (D13): the packer's
-/// `window_tokens` param when the pipeline sets one (an eval variant pins it), else the
-/// input window of the default provider's writing model (`model_for(Write)`, from the
-/// provider's model list or `margin_ai::windows`, the logged fallback otherwise).
-pub async fn write_window(state: &AppState) -> anyhow::Result<usize> {
-    let pinned = state
-        .pipeline
-        .load_full()
-        .config
-        .packer
-        .params
-        .get("window_tokens")
-        .and_then(serde_json::Value::as_u64);
-    if let Some(w) = pinned {
-        return Ok(w as usize);
-    }
-    let m = state
-        .model_for(Route::Write, None)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.message))?;
-    Ok(m.window.input as usize)
-}
-
 /// The options of a writing call: the `Write` route, the prompt's cache key
 /// (`"{job}:{version}"`), the length of its constant block (the Claude client's cache
 /// breakpoint) and its version for the trace.
@@ -726,6 +703,7 @@ async fn lesson_passages(
         let scope = Scope::Union { scopes };
         retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
         let pipeline = state.pipeline.load_full();
+        let window = retrieval::route_window(state, Route::Write, None).await?;
         let req = retrieval::Request {
             plan,
             scope,
@@ -733,7 +711,8 @@ async fn lesson_passages(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: write_window(state).await?,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
             trace_id: lesson.id.clone(),
             caller: None,
         };
@@ -838,6 +817,7 @@ pub async fn survey(
         });
     }
     let pipeline = state.pipeline.load_full();
+    let window = retrieval::route_window(state, Route::Write, None).await?;
     let survey = retrieval::retrieve(
         state,
         &retrieval::Request {
@@ -847,7 +827,8 @@ pub async fn survey(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: write_window(state).await?,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
             trace_id: trace_id.to_string(),
             caller: None,
         },

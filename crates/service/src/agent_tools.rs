@@ -776,7 +776,24 @@ impl TypedTool for Search {
             let packed = if resolved.is_empty() {
                 Vec::new()
             } else {
-                match retrieval::context_search(state, &q, Route::Chat, &ctx.turn_id, None).await {
+                // Packed against the window of the chat's own provider.
+                let provider = state
+                    .store
+                    .get::<Chat>(db::CHAT, &ctx.chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.provider);
+                match retrieval::context_search(
+                    state,
+                    &q,
+                    Route::Chat,
+                    provider,
+                    &ctx.turn_id,
+                    None,
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!("search failed: {e:#}");

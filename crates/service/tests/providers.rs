@@ -78,6 +78,8 @@ struct FakeAuth {
 
 impl FakeAuth {
     fn new() -> Self {
+        // TEST-ONLY: a throwaway RSA key generated for this fake server (the file says
+        // so above its PEM block); nothing outside these tests trusts it.
         let pem = include_bytes!("common/fixtures/fake-auth-signing-key.pem");
         let key = EncodingKey::from_rsa_pem(pem).expect("the test key");
         let mut jwk = Jwk::from_encoding_key(&key, Algorithm::RS256).unwrap();

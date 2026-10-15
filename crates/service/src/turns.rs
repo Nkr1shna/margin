@@ -66,145 +66,6 @@ const TITLE_INSTRUCTIONS: &str = "Write a title for this chat between the owner 
 /// A library change a Write tool started: `(call_id, its task)` (`Turns::register_write`).
 pub type StartedWrite = (String, JoinHandle<ToolOutput>);
 
-/// The model items the service itself stores, in the chat's provider's wire shape
-/// (`docs/agent-providers-brief.md` D4): Responses items on OpenAI and ChatGPT, one
-/// `{"role", "block"}` content block per entry on Claude. A chat never holds another
-/// provider's items.
-///
-/// Same names and signatures as area P-agent's provider-aware `margin_agent::replay`
-/// functions (`history`, `unanswered`, `call_output`, `cancelled_output`,
-/// `output_text`, `action`, `user_message`): once those are merged this module goes and
-/// its callers use `margin_agent::replay::` instead.
-pub mod wire {
-    use margin_agent::{MessageContext, ReplayItem};
-    use margin_shared::{ChatItem, Provider};
-    use serde_json::{Value, json};
-
-    fn block(role: &str, block: Value) -> Value {
-        json!({"role": role, "block": block})
-    }
-
-    /// A user message: the context part, then the owner's words.
-    pub fn user_message(provider: Provider, text: &str, ctx: &MessageContext) -> Vec<Value> {
-        let items = margin_agent::user_message_input(text, ctx);
-        if provider != Provider::Claude {
-            return items;
-        }
-        // The same parts, as Claude text blocks (the context text is the agent's).
-        items
-            .iter()
-            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
-            .filter_map(|part| part["text"].as_str().map(str::to_string))
-            .map(|t| block("user", json!({"type": "text", "text": t})))
-            .collect()
-    }
-
-    /// The model's record of an `Action` (a stop, a course created, a restart).
-    pub fn action(provider: Provider, text: &str) -> Value {
-        match provider {
-            Provider::Claude => margin_agent::replay::claude::action_note(text),
-            Provider::OpenAi | Provider::ChatGpt => margin_agent::action_input(text),
-        }
-    }
-
-    /// A Margin tool's output for `call_id`.
-    pub fn call_output(provider: Provider, call_id: &str, output: &str, ok: bool) -> Value {
-        match provider {
-            Provider::Claude => block(
-                "user",
-                json!({"type": "tool_result", "tool_use_id": call_id, "content": output, "is_error": !ok}),
-            ),
-            Provider::OpenAi | Provider::ChatGpt => {
-                margin_agent::function_call_output(call_id, output)
-            }
-        }
-    }
-
-    /// The output of a call cut short by Stop.
-    pub fn cancelled_output(provider: Provider, call_id: &str) -> Value {
-        match provider {
-            Provider::Claude => margin_agent::replay::claude::cancelled_call_output(call_id),
-            Provider::OpenAi | Provider::ChatGpt => margin_agent::cancelled_call_output(call_id),
-        }
-    }
-
-    /// The text a stored tool output carries (what the model was told).
-    pub fn output_text(item: &Value) -> String {
-        let text = item
-            .get("output")
-            .or_else(|| item.pointer("/block/content"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        match text {
-            Value::String(s) => s,
-            Value::Null => String::new(),
-            other => other.to_string(),
-        }
-    }
-
-    /// Margin's calls without an output yet, and the item each belongs to.
-    pub fn unanswered(provider: Provider, items: &[ReplayItem<'_>]) -> Vec<(String, ChatItem)> {
-        let calls = match provider {
-            Provider::Claude => margin_agent::replay::claude::unanswered_calls(items),
-            Provider::OpenAi | Provider::ChatGpt => margin_agent::unanswered_calls(items),
-        };
-        calls
-            .into_iter()
-            .map(|(id, item)| (id, item.clone()))
-            .collect()
-    }
-
-    /// The input that continues the chat.
-    pub fn history(provider: Provider, items: &[ReplayItem<'_>]) -> Vec<Value> {
-        match provider {
-            Provider::Claude => margin_agent::replay::claude::messages(items),
-            Provider::OpenAi | Provider::ChatGpt => margin_agent::replay_input(items),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn claude_items_are_role_and_block() {
-            let out = call_output(Provider::Claude, "toolu_1", "{\"error\":\"x\"}", false);
-            assert_eq!(out["role"], "user");
-            assert_eq!(out["block"]["type"], "tool_result");
-            assert_eq!(out["block"]["tool_use_id"], "toolu_1");
-            assert_eq!(out["block"]["is_error"], true);
-            assert_eq!(output_text(&out), "{\"error\":\"x\"}");
-            let openai = call_output(Provider::OpenAi, "c1", "done", true);
-            assert_eq!(openai["type"], "function_call_output");
-            assert_eq!(output_text(&openai), "done");
-        }
-
-        #[test]
-        fn a_claude_user_message_is_two_text_blocks() {
-            let ctx = MessageContext {
-                device: margin_shared::DeviceRef {
-                    device_id: "d1".into(),
-                    name: "Mac".into(),
-                },
-                now: chrono::Utc::now(),
-                workspaces: Vec::new(),
-                sources: Vec::new(),
-            };
-            let blocks = user_message(Provider::Claude, "Hello", &ctx);
-            assert_eq!(blocks.len(), 2);
-            assert!(
-                blocks
-                    .iter()
-                    .all(|b| b["role"] == "user" && b["block"]["type"] == "text")
-            );
-            assert_eq!(blocks[1]["block"]["text"], "Hello");
-            let openai = user_message(Provider::OpenAi, "Hello", &ctx);
-            assert_eq!(openai[0]["role"], "user");
-            assert!(openai[0]["content"].is_array());
-        }
-    }
-}
-
 /// Running turns, one per chat at most. Lives in `App`.
 pub struct Turns {
     pub running: Mutex<HashMap<Id, RunningTurn>>,
@@ -398,7 +259,7 @@ pub async fn start_locked(
             }
             let turn_id = crate::state::new_id();
             let ctx = message_context(state, chat, &device, now).await?;
-            let model_items = wire::user_message(chat.provider, &text, &ctx);
+            let model_items = margin_agent::replay::user_message(chat.provider, &text, &ctx);
             let title = chats::title_from(&text);
             let item = chats::new_item_locked(
                 state,
@@ -670,7 +531,7 @@ async fn run_turn(
             model_items: &r.model_items,
         })
         .collect();
-    let history = wire::history(chat.provider, &replay);
+    let history = margin_agent::replay::history(chat.provider, &replay);
     let workspaces = workspaces::by_ids(state, &chat.workspace_ids)
         .await
         .map_err(internal)?;
@@ -1270,7 +1131,7 @@ async fn wind_up_locked(
                 model_items: &r.model_items,
             })
             .collect();
-        wire::unanswered(provider, &replay)
+        margin_agent::replay::unanswered(provider, &replay)
             .into_iter()
             .filter_map(|(call_id, _)| writes.remove(&call_id).map(|out| (call_id, out)))
             .collect()
@@ -1389,9 +1250,12 @@ async fn wind_up_locked(
             model_items: &r.model_items,
         })
         .collect();
-    for (call_id, call) in wire::unanswered(provider, &replay) {
+    for (call_id, call) in margin_agent::replay::unanswered(provider, &replay) {
         let (model_item, summary) = match &ending {
-            Ending::Stop { .. } => (wire::cancelled_output(provider, &call_id), "Cancelled"),
+            Ending::Stop { .. } => (
+                margin_agent::replay::cancelled_output(provider, &call_id),
+                "Cancelled",
+            ),
             Ending::Restart => {
                 let why = if asked.contains(&call_id.as_str()) {
                     CONFIRMATION_EXPIRED
@@ -1399,7 +1263,12 @@ async fn wind_up_locked(
                     CALL_INTERRUPTED
                 };
                 (
-                    wire::call_output(provider, &call_id, &margin_agent::error_output(why), false),
+                    margin_agent::replay::call_output(
+                        provider,
+                        &call_id,
+                        &margin_agent::error_output(why),
+                        false,
+                    ),
                     "Interrupted",
                 )
             }
@@ -1410,12 +1279,17 @@ async fn wind_up_locked(
                     CALL_FAILED
                 };
                 (
-                    wire::call_output(provider, &call_id, &margin_agent::error_output(why), false),
+                    margin_agent::replay::call_output(
+                        provider,
+                        &call_id,
+                        &margin_agent::error_output(why),
+                        false,
+                    ),
                     "Not run",
                 )
             }
         };
-        let output = wire::output_text(&model_item);
+        let output = margin_agent::replay::output_text(&model_item);
         let item = chats::new_item_locked(
             state,
             chat_id,
@@ -1471,7 +1345,7 @@ async fn wind_up_locked(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![wire::action(provider, text)],
+            model_items: vec![margin_agent::replay::action(provider, text)],
             full_output: None,
         },
     )
@@ -1568,7 +1442,9 @@ async fn add_result_locked(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![wire::call_output(provider, call_id, &output, ok)],
+            model_items: vec![margin_agent::replay::call_output(
+                provider, call_id, &output, ok,
+            )],
             full_output: Some(output),
         },
     )
@@ -1605,25 +1481,32 @@ pub struct SinkModel {
     pub window: margin_ai::ModelWindow,
 }
 
-/// The `TurnSink` hooks of area P-agent's sink (`model_window`, `server_compaction`,
-/// `compaction_rejected`, `model_called`). They are inherent methods until P-agent's
-/// `TurnSink` (with these defaulted methods) is merged; then this block's methods move
-/// into `impl TurnSink for ServiceSink` unchanged.
 impl ServiceSink {
+    fn stopped(&self) -> SinkError {
+        SinkError("This answer was stopped.".into())
+    }
+
+    fn storage(e: impl std::fmt::Display) -> SinkError {
+        tracing::error!("couldn't store a chat item: {e:#}");
+        SinkError("The service couldn't save the answer. Check its log.".into())
+    }
+}
+
+impl TurnSink for ServiceSink {
     /// The chat model's window (`ModelChoice.window`, D13).
-    pub fn model_window(&self) -> Option<margin_ai::ModelWindow> {
+    fn model_window(&self) -> Option<margin_ai::ModelWindow> {
         self.model.as_ref().map(|m| m.window)
     }
 
     /// False once this provider and base URL rejected server-side compaction.
-    pub fn server_compaction(&self) -> bool {
+    fn server_compaction(&self) -> bool {
         self.model
             .as_ref()
             .is_none_or(|m| !self.state.turns.rejects_compaction(m.provider, &m.base_url))
     }
 
     /// Remembers, for the process, that the provider and base URL reject compaction.
-    pub fn compaction_rejected(&self) {
+    fn compaction_rejected(&self) {
         if let Some(m) = &self.model {
             tracing::info!(provider = %m.provider, "server-side compaction rejected; condensing locally from now on");
             self.state
@@ -1637,27 +1520,14 @@ impl ServiceSink {
 
     /// One agent step ended. Its trace row is written by `TracedModel`'s stream (model,
     /// stop reason and usage from the terminal event), so this only logs.
-    pub fn model_called(&self, step: u32, model: &str, stop_reason: &str, usage: &Usage) {
+    fn model_called(&self, step: u32, model: &str, stop_reason: &str, usage: &Usage) {
         tracing::debug!(
             chat = %self.chat_id, step, %model, %stop_reason,
             input = usage.input_tokens, output = usage.output_tokens,
             "model call ended"
         );
     }
-}
 
-impl ServiceSink {
-    fn stopped(&self) -> SinkError {
-        SinkError("This answer was stopped.".into())
-    }
-
-    fn storage(e: impl std::fmt::Display) -> SinkError {
-        tracing::error!("couldn't store a chat item: {e:#}");
-        SinkError("The service couldn't save the answer. Check its log.".into())
-    }
-}
-
-impl TurnSink for ServiceSink {
     fn add_item(
         &self,
         status: ItemStatus,
@@ -2187,8 +2057,8 @@ impl TracedModel {
         self.purpose.is_none() && req.tools.is_empty()
     }
 
-    /// The call's row: route, model, provider, prompt version (a hash of the fixed
-    /// instructions: the system prompt for steps, the condense instructions as their
+    /// The call's row: route, model, provider, prompt version (`AGENT_PROMPT_VERSION`
+    /// for steps, else a hash of the fixed instructions: the system prompt for steps, the condense instructions as their
     /// developer message for condense, `TITLE_INSTRUCTIONS` for the title), step.
     fn span(&self, req: &ModelRequest) -> TraceSpan {
         let mut span = self.trace.span(TraceKind::ModelCall);
@@ -2202,10 +2072,11 @@ impl TracedModel {
             }
             None if !req.tools.is_empty() => {
                 row.route = Some(Route::Chat);
-                row.prompt_version = Some(trace::prompt_version(
-                    "agent",
-                    margin_agent::system_prompt(),
-                ));
+                // The agent's own version (`AGENT_PROMPT_VERSION`), which the loop
+                // puts on each step's options; a hash of the system prompt otherwise.
+                row.prompt_version = Some(req.opts.prompt_version.clone().unwrap_or_else(|| {
+                    trace::prompt_version("agent", margin_agent::system_prompt())
+                }));
                 row.step = Some(self.steps.fetch_add(1, Ordering::Relaxed) + 1);
             }
             None => {

@@ -1378,20 +1378,6 @@ fn ProviderErrorNotice(
     }
 }
 
-/// A globe, for the hosted web tools' rows and cards.
-const GLOBE_SVG: &str = r#"<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/></svg>"#;
-
-/// A tool row's icon: the app's icons, and the globe of the web tools.
-#[component]
-fn ToolIcon(name: &'static str, #[props(default)] class: &'static str) -> Element {
-    if name == "globe" {
-        return rsx! {
-            span { class: "ic {class}", "aria-hidden": "true", dangerous_inner_html: GLOBE_SVG }
-        };
-    }
-    rsx! { Icon { name, class } }
-}
-
 /// A summary of the model's reasoning, folded away under its first line.
 #[component]
 fn ReasoningRow(item: ChatItem) -> Element {
@@ -1531,7 +1517,7 @@ fn ToolRow(chat_id: Id, call: Option<ChatItem>, result: Option<ChatItem>) -> Ele
                 "aria-expanded": open.read().to_string(),
                 "aria-controls": "{body_id}",
                 onclick: toggle,
-                ToolIcon { name: tool_icon(&name), class: "tool-ic" }
+                Icon { name: tool_icon(&name), class: "tool-ic" }
                 span { class: "tool-label", title: "{line}", "{line}" }
                 if let Some(d) = &device {
                     span { class: "tool-device", "on {d.name}" }
@@ -1605,7 +1591,7 @@ fn WebResultsView(item_id: Id, card: WebResultsCard) -> Element {
     rsx! {
         section { id: "{card_id}", class: "chat-card", "aria-label": "Web results for {card.query}",
             div { class: "chat-card-h",
-                ToolIcon { name: "globe" }
+                Icon { name: "globe" }
                 b { "Web results for “{card.query}”" }
             }
             if card.results.is_empty() {
@@ -3272,7 +3258,10 @@ mod tests {
         assert!(html.contains(">5 results<"));
         assert!(html.contains("Fetching en.wikipedia.org"));
         assert!(html.contains("Fetched “A Mathematical Theory of Communication”"));
-        assert!(html.contains(GLOBE_SVG), "{html}");
+        assert!(
+            html.contains(&crate::ui::common::icon_svg("globe")),
+            "{html}"
+        );
         // The results card: links with host, title and age.
         assert!(html.contains(r#"aria-label="Web results for Claude Shannon 1948 paper""#));
         assert!(html.contains("Web results for “Claude Shannon 1948 paper”"));

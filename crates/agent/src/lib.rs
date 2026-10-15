@@ -32,7 +32,7 @@ pub use device::{
     device_output_text, device_tools,
 };
 pub use model::ModelClient;
-pub use prompt::{MessageContext, system_prompt, user_message_input};
+pub use prompt::{AGENT_PROMPT_VERSION, MessageContext, system_prompt, user_message_input};
 pub use registry::ToolRegistry;
 pub use replay::{
     CONDENSED_HISTORY_PREFIX, ReplayItem, TOOL_PICTURES_PREFIX, action_input,

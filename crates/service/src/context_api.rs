@@ -77,7 +77,9 @@ pub async fn search(
     if q.k == 0 {
         return Err(AppError::bad_request("k must be at least 1."));
     }
-    match retrieval::context_search(&state, &q, Route::Chat, &new_id(), caller(&headers)).await {
+    match retrieval::context_search(&state, &q, Route::Chat, None, &new_id(), caller(&headers))
+        .await
+    {
         Ok(packed) => Ok(Json(packed.iter().map(retrieval::packed_hit).collect())),
         Err(e) => match e.downcast_ref::<BadScope>() {
             Some(bad) => Err(bad_scope(bad.to_string())),

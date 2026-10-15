@@ -282,11 +282,8 @@ mod claude_prefix {
     /// is none), one breakpoint per text call, the constant block nowhere else; and
     /// each call is on its route's model.
     ///
-    /// Drives the real `ClaudeClient` (area P-ai-claude, built in parallel). Where its
-    /// `TextModel` is still the first commit's `unimplemented!` stub this would panic,
-    /// so it is ignored until P-ai-claude merges.
+    /// Drives the real `ClaudeClient` against the fake Messages server.
     #[tokio::test]
-    #[ignore = "needs P-ai-claude's ClaudeClient (TextModel::stream_parts is unimplemented! in the first commit); remove this ignore when agent/prov-claude merges"]
     async fn claude_prefixes_are_byte_identical_per_prompt_version() {
         let (client, fake) = spawn().await;
         let sent = prompts_sent();

@@ -353,10 +353,11 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
         &req.input,
         "Teach me Fourier series\nwith examples"
     ));
+    // Function tools by name; the hosted web search has only its type.
     let names: Vec<&str> = req
         .tools
         .iter()
-        .map(|t| t["name"].as_str().unwrap())
+        .map(|t| t["name"].as_str().or(t["type"].as_str()).unwrap())
         .collect();
     for name in [
         "search_library",
@@ -373,7 +374,16 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     ] {
         assert!(names.contains(&name), "{name} missing from {names:?}");
     }
-    assert!(req.tools.iter().all(|t| t["strict"] == true));
+    assert!(
+        names.contains(&"web_search"),
+        "the hosted web search is offered"
+    );
+    assert!(
+        req.tools
+            .iter()
+            .filter(|t| t["type"] == "function")
+            .all(|t| t["strict"] == true)
+    );
 
     let chats: Vec<Chat> = h
         .get(&t, "/api/chats")
@@ -2857,10 +2867,9 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         steps.iter().map(|c| c.step).collect::<Vec<_>>(),
         [Some(1), Some(2)]
     );
-    assert!(steps.iter().all(
-        |c| c.prompt_version.as_deref().unwrap().starts_with("agent-")
-            && c.parent_id.as_deref() == Some(turn[0].id.as_str())
-    ));
+    assert!(steps.iter().all(|c| c.prompt_version.as_deref()
+        == Some(margin_agent::AGENT_PROMPT_VERSION)
+        && c.parent_id.as_deref() == Some(turn[0].id.as_str())));
     let title = calls
         .iter()
         .find(|c| c.route == Some(Route::Small))
@@ -3019,7 +3028,16 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         .agent
         .push(Scripted::Hang(text_reply(&["Partial"])[..1].to_vec()));
     let chat = ask(&h, &t, "Again").await.chat;
-    wait_chat(&h, &t, &chat.id, running).await;
+    // Stop once the model streams (its answer item is open), not merely once the turn
+    // runs: a Stop before the call starts leaves no model_call row to check.
+    wait_chat(&h, &t, &chat.id, |d| {
+        running(d)
+            && d.items.iter().any(|i| {
+                i.status == ItemStatus::InProgress
+                    && matches!(i.kind, ChatItemKind::AssistantText { .. })
+            })
+    })
+    .await;
     let r = h
         .post(&t, &format!("/api/chats/{}/stop", chat.id))
         .send()
