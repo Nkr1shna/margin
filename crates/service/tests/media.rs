@@ -967,3 +967,264 @@ async fn video_jobs_are_traced_under_their_id() {
         .collect();
     assert_eq!(renders, [(false, Some("scene_failed")), (true, None)]);
 }
+
+// ---------------------------------------------------------------------------
+// The reranker model (R2, `docs/r2-brief.md` D5)
+// ---------------------------------------------------------------------------
+
+async fn embedding_model(h: &Harness, token: &str, path: &str) -> margin_shared::EmbeddingModel {
+    let r = h.get(token, path).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
+
+/// Puts a finished download of `model` in the service's data folder, as
+/// `RerankerFiles::download` leaves it. Returns its bytes on disk.
+fn place_reranker(h: &Harness, model: margin_embed::RerankerModel) -> u64 {
+    let files = margin_embed::RerankerFiles::new(&h.data_dir.join("models"), model);
+    let contents: Vec<(&str, Vec<u8>)> = vec![
+        ("config.json", b"{\"pad_token_id\": 0}".to_vec()),
+        ("tokenizer.json", vec![b't'; 500]),
+        ("onnx/model_quantized.onnx", vec![7u8; 2000]),
+    ];
+    let mut listed = Vec::new();
+    for (path, bytes) in &contents {
+        let target = files.dir.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, bytes).unwrap();
+        listed.push(json!({"path": path, "size": bytes.len()}));
+    }
+    std::fs::write(
+        files.dir.join("files.json"),
+        serde_json::to_vec(&listed).unwrap(),
+    )
+    .unwrap();
+    assert!(files.is_complete());
+    files.size_on_disk()
+}
+
+#[tokio::test]
+async fn the_reranker_model_shows_downloads_and_can_be_deleted() {
+    use margin_embed::RerankerModel;
+    use margin_shared::{EmbeddingModelState, RerankerModelState};
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let not_downloaded = |model: RerankerModel| RerankerModelState {
+        name: model.name().into(),
+        repo: model.repo().into(),
+        // The fake Hugging Face has no reranker repo: the size is unknown.
+        state: EmbeddingModelState::NotDownloaded { download_bytes: 0 },
+    };
+
+    // Offered, not downloaded: the default model, as the pipeline runs none.
+    let m = embedding_model(&h, &t, "/api/embedding").await;
+    assert_eq!(m.reranker, Some(not_downloaded(RerankerModel::DEFAULT)));
+    let m = embedding_model(&h, &t, routes::RERANKER_MODEL).await;
+    assert_eq!(m.reranker, Some(not_downloaded(RerankerModel::DEFAULT)));
+    let m = embedding_model(
+        &h,
+        &t,
+        &format!("{}?model=bge-reranker-base", routes::RERANKER_MODEL),
+    )
+    .await;
+    assert_eq!(
+        m.reranker,
+        Some(not_downloaded(RerankerModel::BgeRerankerBase))
+    );
+    for r in [
+        h.get(&t, &format!("{}?model=nope", routes::RERANKER_MODEL)),
+        h.post(
+            &t,
+            &format!("{}?model=nope", routes::RERANKER_MODEL_DOWNLOAD),
+        ),
+        h.delete(&t, &format!("{}?model=nope", routes::RERANKER_MODEL)),
+    ] {
+        let r = r.send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        let body = r.text().await.unwrap();
+        assert!(body.contains("ms-marco-minilm-l6-v2"), "{body}");
+    }
+
+    // A download that fails (the repo isn't there): the start and the failure arrive as
+    // events, and the failure is shown until deleted or retried.
+    let mut socket = h.socket(&t).await;
+    let m: margin_shared::EmbeddingModel = h
+        .post(&t, routes::RERANKER_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r = m.reranker.unwrap();
+    assert_eq!(r.name, RerankerModel::DEFAULT.name());
+    assert!(
+        matches!(r.state, EmbeddingModelState::Downloading { .. }),
+        "{r:?}"
+    );
+    let events = socket
+        .until(|e| {
+            matches!(e, Event::EmbeddingModelChanged { model }
+                if matches!(model.reranker.as_ref().map(|r| &r.state), Some(EmbeddingModelState::Failed { .. })))
+        })
+        .await;
+    assert!(events.iter().any(|e| matches!(e, Event::EmbeddingModelChanged { model }
+        if matches!(model.reranker.as_ref().map(|r| &r.state), Some(EmbeddingModelState::Downloading { .. })))));
+    let failed = embedding_model(&h, &t, "/api/embedding")
+        .await
+        .reranker
+        .unwrap();
+    match &failed.state {
+        EmbeddingModelState::Failed { error } => {
+            assert!(error.contains("Download failed"), "{error}")
+        }
+        other => panic!("expected a failed download, got {other:?}"),
+    }
+    // The embedding model's own part is untouched.
+    assert!(matches!(
+        embedding_model(&h, &t, "/api/embedding").await.state,
+        EmbeddingModelState::Ready { .. }
+    ));
+    // Deleting forgets the failure.
+    let m: margin_shared::EmbeddingModel = h
+        .delete(&t, routes::RERANKER_MODEL)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(m.reranker, Some(not_downloaded(RerankerModel::DEFAULT)));
+
+    // A finished download is shown with its size; asking to download it again does
+    // nothing; deleting removes its folder.
+    let bytes = place_reranker(&h, RerankerModel::DEFAULT);
+    let ready = RerankerModelState {
+        name: RerankerModel::DEFAULT.name().into(),
+        repo: RerankerModel::DEFAULT.repo().into(),
+        state: EmbeddingModelState::Ready { bytes },
+    };
+    assert_eq!(
+        embedding_model(&h, &t, "/api/embedding").await.reranker,
+        Some(ready.clone())
+    );
+    let m: margin_shared::EmbeddingModel = h
+        .post(&t, routes::RERANKER_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(m.reranker, Some(ready));
+    let m: margin_shared::EmbeddingModel = h
+        .delete(
+            &t,
+            &format!("{}?model=ms-marco-minilm-l6-v2", routes::RERANKER_MODEL),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(m.reranker, Some(not_downloaded(RerankerModel::DEFAULT)));
+    let dir = h.data_dir.join("models").join(RerankerModel::DEFAULT.dir());
+    assert!(!dir.exists());
+
+    // The models are the organisation's (L1): a member may look, not download or remove.
+    h.invite(&t, "bob-dev", margin_shared::OrgRole::Member, &[])
+        .await;
+    let bob = h.sign_in_as(BOB_CODE, "Bob's laptop").await;
+    let r = h.get(&bob, routes::RERANKER_MODEL).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    for r in [
+        h.post(&bob, routes::RERANKER_MODEL_DOWNLOAD)
+            .send()
+            .await
+            .unwrap(),
+        h.delete(&bob, routes::RERANKER_MODEL).send().await.unwrap(),
+    ] {
+        assert_eq!(r.status(), 403);
+        let err: margin_shared::ApiError = r.json().await.unwrap();
+        assert_eq!(err.code, margin_shared::access_code::ADMIN_REQUIRED);
+    }
+
+    // With only the multilingual model on disk, that is the one shown.
+    let bytes = place_reranker(&h, RerankerModel::BgeRerankerBase);
+    assert_eq!(
+        embedding_model(&h, &t, routes::RERANKER_MODEL)
+            .await
+            .reranker,
+        Some(RerankerModelState {
+            name: "bge-reranker-base".into(),
+            repo: RerankerModel::BgeRerankerBase.repo().into(),
+            state: EmbeddingModelState::Ready { bytes },
+        })
+    );
+}
+
+/// A download that succeeds (the fake Hugging Face has the default reranker's repo):
+/// the size is asked once, only the files the model needs are fetched, progress and the
+/// finish arrive as events, and the files are a complete download on disk.
+#[tokio::test]
+async fn the_reranker_model_downloads_from_hugging_face() {
+    use margin_embed::RerankerModel;
+    use margin_shared::EmbeddingModelState;
+    let h = start().await;
+    h.hf.has_reranker
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let t = h.sign_in("Mac").await;
+
+    let m = embedding_model(&h, &t, routes::RERANKER_MODEL).await;
+    assert_eq!(
+        m.reranker.unwrap().state,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: fake_reranker_bytes()
+        }
+    );
+
+    let mut socket = h.socket(&t).await;
+    let m: margin_shared::EmbeddingModel = h
+        .post(&t, routes::RERANKER_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        m.reranker.unwrap().state,
+        EmbeddingModelState::Downloading { .. }
+    ));
+    socket
+        .until(|e| {
+            matches!(e, Event::EmbeddingModelChanged { model }
+                if matches!(model.reranker.as_ref().map(|r| &r.state), Some(EmbeddingModelState::Ready { .. })))
+        })
+        .await;
+
+    let files =
+        margin_embed::RerankerFiles::new(&h.data_dir.join("models"), RerankerModel::DEFAULT);
+    assert!(files.is_complete());
+    assert!(
+        !files.dir.join("onnx/model.onnx").exists(),
+        "not a file the model needs"
+    );
+    assert_eq!(
+        h.hf.reranker_fetches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        RerankerModel::DEFAULT.files().len() as u32
+    );
+    let r = embedding_model(&h, &t, "/api/embedding")
+        .await
+        .reranker
+        .unwrap();
+    assert_eq!(r.name, RerankerModel::DEFAULT.name());
+    assert_eq!(
+        r.state,
+        EmbeddingModelState::Ready {
+            bytes: files.size_on_disk()
+        }
+    );
+}

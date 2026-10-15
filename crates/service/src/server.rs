@@ -28,6 +28,7 @@ use crate::ingest::IngestQueue;
 use crate::pipeline::{Pipeline, Registry, StageDeps};
 use crate::retrieval::RetrievalCache;
 use crate::secrets::{SecretStore, media_signing_key};
+use crate::small;
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
 use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
@@ -90,8 +91,12 @@ impl Service {
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let model_files = opts.config.model_files();
+        // The small-tasks models (`StageDeps.models`, R2): built before the `App` they
+        // read from, bound to it once it exists (below).
+        let models = Arc::new(small::StateModels::default());
         let registry = Registry::standard(StageDeps {
-            store: opts.store.clone(),
+            models: Some(models.clone()),
+            ..StageDeps::new(opts.store.clone())
         });
         let settings: SettingsRow = opts
             .store
@@ -132,6 +137,7 @@ impl Service {
             model_download_bytes: Mutex::new(None),
             speech_job: Mutex::new(ModelJob::Idle),
             speech_download_bytes: Mutex::new(None),
+            reranker_jobs: Mutex::new(Default::default()),
             reindex: Mutex::new(None),
             last_model: Mutex::new(None),
             source_queue: source_tx,
@@ -151,6 +157,8 @@ impl Service {
             expansions: groups::Expansions::new(),
             access_sources: vec![Arc::new(access::Manual(opts.store.clone()))],
         });
+
+        models.bind(Arc::downgrade(&state));
 
         // Traces first, so recovery and the workers are traced.
         trace::start(&state);
@@ -269,6 +277,7 @@ pub fn router(state: AppState) -> Router {
         .route(routes::TOOLS, get(settings::tools))
         // `routes::PIPELINE_VARIANTS` once crates/shared names it.
         .route(routes::PIPELINE_VARIANTS, get(settings::pipeline_variants))
+        .route(routes::PIPELINE_PROMPTS, get(settings::pipeline_prompts))
         .route("/api/providers/{provider}/models", get(providers::models))
         .route(
             routes::PROVIDERS_CHATGPT,
@@ -311,6 +320,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             routes::SPEECH_MODEL_DOWNLOAD,
             post(embedding::start_speech_download),
+        )
+        .route(
+            routes::RERANKER_MODEL,
+            get(embedding::get_reranker).delete(embedding::delete_reranker),
+        )
+        .route(
+            routes::RERANKER_MODEL_DOWNLOAD,
+            post(embedding::start_reranker_download),
         )
         .route(
             routes::CHATS,

@@ -33,7 +33,19 @@ Commands:
                         (evals/recorded/{extracted.json,embeddings.bin})
   record-generations [--variant NAME]
                         Write and record every golden lesson with the writing model
-                        (evals/recorded/generations/<prompt version>/<model>/)
+                        (evals/recorded/generations/<prompt version>/<model>/; another
+                        variant's under <prompt version>+<variant>/)
+  record-rewrites [--variant NAME]
+                        Run the variant's query rewriter (default rewrite-small) on the
+                        small-tasks model once per golden query and lesson plan and record
+                        each answer (evals/recorded/rewrites.jsonl); CI replays them. Then
+                        run record-embeddings, which embeds the recorded rewrites too
+  record-reranks [--variant NAME]
+                        Run the variant's listwise reranker (default rerank-small) on the
+                        small-tasks model once per golden query and lesson plan over its
+                        fused candidates and record each answer
+                        (evals/recorded/reranks.jsonl); CI replays them. For a variant
+                        that also rewrites, record-rewrites and record-embeddings first
   synth-questions [--variant NAME] [--per N] [--limit N]
                         Generate serious questions per section, check their spans, grade
                         them on the other provider, append those graded >= 2 to
@@ -58,9 +70,15 @@ Commands:
                         Judge recorded generations (default: the baseline's prompt
                         version), with canaries; --against compares pairwise
   compare RUN_A RUN_B [--allow-embedder-change] [--allow-provider-change]
+      [--allow-prompt-change]
                         Per-metric deltas with paired bootstrap 95% intervals; runs
                         whose models came from different providers (OpenAI, ChatGPT,
-                        Claude) are refused without --allow-provider-change
+                        Claude) are refused without --allow-provider-change, runs that
+                        ran one prompt under two versions without --allow-prompt-change
+  prompts [--write-lock]
+                        Every prompt's version and constant-block hash, and whether
+                        evals/prompts.lock agrees; --write-lock rewrites the lock (with a
+                        bumped version, in the same change as the prompt)
   report [RUN] [--traces FILE | --service --service-url URL]
                         Write evals/reports/RUN.md and RUN.html (latest run by default),
                         with efficiency from exported traces or the service at URL
@@ -90,6 +108,18 @@ pub enum Command {
     RecordGenerations {
         variant: String,
     },
+    /// R2: the rewriter's answers on the small-tasks model.
+    RecordRewrites {
+        variant: String,
+    },
+    /// R2: the listwise reranker's answers on the small-tasks model.
+    RecordReranks {
+        variant: String,
+    },
+    /// R2: the prompt catalog against `evals/prompts.lock`.
+    Prompts {
+        write_lock: bool,
+    },
     SynthQuestions {
         variant: String,
         per: u32,
@@ -113,6 +143,7 @@ pub enum Command {
         b: String,
         allow_embedder_change: bool,
         allow_provider_change: bool,
+        allow_prompt_change: bool,
     },
     Report {
         run: Option<String>,
@@ -177,6 +208,7 @@ impl Command {
         !matches!(
             self,
             Command::Compare { .. }
+                | Command::Prompts { .. }
                 | Command::Report { .. }
                 | Command::Export { .. }
                 | Command::Harvest { .. }
@@ -195,6 +227,8 @@ const FLAGS: &[&str] = &[
     "--no-judge",
     "--allow-embedder-change",
     "--allow-provider-change",
+    "--allow-prompt-change",
+    "--write-lock",
     "--service",
 ];
 
@@ -224,7 +258,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         i += 1;
     }
     let mut take = |k: &str| opts.remove(k);
-    let variant = take("variant").unwrap_or_else(|| "baseline".into());
+    let variant_given = take("variant");
+    let variant = variant_given.clone().unwrap_or_else(|| "baseline".into());
     let flag = |o: Option<String>| o.is_some();
     let time = |o: Option<String>| -> anyhow::Result<Option<DateTime<Utc>>> {
         o.map(|t| {
@@ -244,6 +279,15 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         None | Some("help") => Command::Help,
         Some("record-embeddings") => Command::RecordEmbeddings,
         Some("record-generations") => Command::RecordGenerations { variant },
+        Some("record-rewrites") => Command::RecordRewrites {
+            variant: variant_given.unwrap_or_else(|| "rewrite-small".into()),
+        },
+        Some("record-reranks") => Command::RecordReranks {
+            variant: variant_given.unwrap_or_else(|| "rerank-small".into()),
+        },
+        Some("prompts") => Command::Prompts {
+            write_lock: flag(take("write-lock")),
+        },
         Some("synth-questions") => Command::SynthQuestions {
             variant,
             per: take("per").map(|v| v.parse()).transpose()?.unwrap_or(4),
@@ -281,6 +325,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 b: b.clone(),
                 allow_embedder_change: flag(take("allow-embedder-change")),
                 allow_provider_change: flag(take("allow-provider-change")),
+                allow_prompt_change: flag(take("allow-prompt-change")),
             },
             _ => bail!("compare needs two run ids (see `margin-eval runs`)"),
         },
@@ -474,7 +519,8 @@ mod tests {
                 a: "a".into(),
                 b: "b".into(),
                 allow_embedder_change: true,
-                allow_provider_change: false
+                allow_provider_change: false,
+                allow_prompt_change: false
             }
         );
         assert_eq!(
@@ -483,7 +529,8 @@ mod tests {
                 a: "a".into(),
                 b: "b".into(),
                 allow_embedder_change: false,
-                allow_provider_change: true
+                allow_provider_change: true,
+                allow_prompt_change: false
             }
         );
         let c = p("export --kind model_call --from 2026-10-01T00:00:00Z --out x.jsonl --data /tmp/d --token t --service-url http://127.0.0.1:8787").unwrap();
@@ -516,6 +563,36 @@ mod tests {
             Some("https://devmargin.krishnanelloore.com")
         );
         assert!(p("record-embeddings").unwrap().command.is_live());
+        // R2: the small-stage recordings (default variants), the prompt lock, and
+        // compare across prompt versions.
+        assert_eq!(
+            p("record-rewrites").unwrap().command,
+            Command::RecordRewrites {
+                variant: "rewrite-small".into()
+            }
+        );
+        assert_eq!(
+            p("record-reranks --variant r2-full").unwrap().command,
+            Command::RecordReranks {
+                variant: "r2-full".into()
+            }
+        );
+        assert!(p("record-reranks").unwrap().command.is_live());
+        assert_eq!(
+            p("prompts --write-lock").unwrap().command,
+            Command::Prompts { write_lock: true }
+        );
+        assert!(!p("prompts").unwrap().command.is_live());
+        assert_eq!(
+            p("compare a b --allow-prompt-change").unwrap().command,
+            Command::Compare {
+                a: "a".into(),
+                b: "b".into(),
+                allow_embedder_change: false,
+                allow_provider_change: false,
+                allow_prompt_change: true
+            }
+        );
         assert!(!p("runs").unwrap().command.is_live());
         assert!(
             p("run --suite injection --service-url http://127.0.0.1:8787")

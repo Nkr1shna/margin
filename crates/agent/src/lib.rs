@@ -46,7 +46,10 @@ pub use tool::{
     check_strict_schema, clean_card, clean_web_result, error_output, strict_schema,
     truncate_output,
 };
-pub use turn::{RetryPolicy, TurnDeps, TurnInput, TurnOutcome, run_turn};
+pub use turn::{
+    RetryPolicy, SUMMARY_INSTRUCTIONS, SUMMARY_PROMPT_VERSION, TurnDeps, TurnInput, TurnOutcome,
+    run_turn,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

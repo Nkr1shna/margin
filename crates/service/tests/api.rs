@@ -23,6 +23,40 @@ async fn api_error(r: reqwest::Response) -> (u16, ApiError) {
 // Sign-in
 // ---------------------------------------------------------------------------
 
+/// `GET /api/pipeline/prompts` (R2, `docs/r2-brief.md` D4.1): every prompt the service
+/// sends, with its version and the hash of its constant block; signed-in only.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_prompt_catalog_lists_every_prompt_with_its_version_and_hash() {
+    let h = start().await;
+    let r = reqwest::get(h.u("/api/pipeline/prompts")).await.unwrap();
+    assert_eq!(r.status(), 401);
+    let t = h.sign_in("Mac").await;
+    let r = h.get(&t, "/api/pipeline/prompts").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let catalog: Vec<margin_shared::context::PromptInfo> = r.json().await.unwrap();
+    assert_eq!(catalog, margin_service::settings::prompts_catalog());
+    for (job, version) in [
+        ("lesson", "lesson-v2"),
+        ("scene", "scene-v2"),
+        ("plan", "plan-v1"),
+        ("rerank", "rerank-v1"),
+        ("rewrite", "rewrite-v1"),
+        ("agent", "agent-v2"),
+        ("condense", "condense-v2"),
+    ] {
+        let p = catalog
+            .iter()
+            .find(|p| p.job == job)
+            .unwrap_or_else(|| panic!("{job} missing"));
+        assert_eq!(p.version, version);
+        assert_eq!(p.constant_hash.len(), 16);
+        assert!(p.constant_chars > 0);
+    }
+    // The chat title versions itself by the hash of its instructions.
+    let title = catalog.iter().find(|p| p.job == "title").expect("title");
+    assert!(title.version.starts_with("title-"), "{}", title.version);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sign_in_approves_once_and_the_token_works() {
     let h = start().await;
@@ -1354,6 +1388,7 @@ async fn videos_stored_before_posters_existed_still_load() {
         },
         has_captions: true,
         has_poster: true,
+        written_with: None,
     })
     .unwrap();
     assert!(row.as_object_mut().unwrap().remove("has_poster").is_some());
@@ -1599,6 +1634,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
                 status,
                 created_at: now,
                 updated_at: now,
+                written_with: None,
             },
             proposal_id: None,
             previous_body: prev.map(Into::into),
@@ -1652,6 +1688,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         },
         has_captions: false,
         has_poster: false,
+        written_with: None,
     };
     store
         .put(
@@ -1676,6 +1713,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         outline: None,
         created_at: now,
         chat_id: None,
+        written_with: None,
     };
     store.put(db::PROPOSAL, "p1", &proposal).await.unwrap();
     store

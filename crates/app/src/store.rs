@@ -859,6 +859,7 @@ pub(crate) mod tests {
             status,
             created_at: ts(position),
             updated_at: ts(position),
+            written_with: None,
         }
     }
 
@@ -1034,6 +1035,7 @@ pub(crate) mod tests {
             },
             speech: None,
             reindex: None,
+            reranker: None,
         };
         s.apply(Event::EmbeddingModelChanged {
             model: model.clone(),
@@ -1058,6 +1060,39 @@ pub(crate) mod tests {
         l.body_md = "# Full".into();
         s.apply(Event::LessonChanged { lesson: l });
         assert_eq!(s.lessons["l1"].body_md, "# Full");
+    }
+
+    #[test]
+    fn what_wrote_a_lesson_arrives_with_it_and_a_regenerate_replaces_it() {
+        let mut s = sample();
+        let json = r#"{"type":"lesson_changed","lesson":{"id":"l1","topic_id":"f","title":"G",
+            "summary":"","position":1,"level":"intro","minutes":5,"body_md":"Done.",
+            "status":{"state":"ready"},"created_at":"2025-10-09T08:53:20Z",
+            "updated_at":"2025-10-09T08:53:20Z","written_with":{"prompt_version":"lesson-v2",
+            "pipeline_hash":"c39a244aa537f0c2","provider":"claude","model":"claude-sonnet-5-5",
+            "at":"2025-10-09T08:53:20Z"}}}"#;
+        s.apply(serde_json::from_str(json).unwrap());
+        let w = s.lessons["l1"].written_with.clone().unwrap();
+        assert_eq!(
+            (w.prompt_version.as_str(), w.model.as_str()),
+            ("lesson-v2", "claude-sonnet-5-5")
+        );
+        // The streamed body of a regenerate keeps it until the finished lesson replaces it.
+        s.apply(Event::LessonDelta {
+            lesson_id: "l1".into(),
+            text: " More.".into(),
+        });
+        assert_eq!(s.lessons["l1"].written_with, Some(w.clone()));
+        let mut again = s.lessons["l1"].clone();
+        again.written_with = Some(margin_shared::WrittenWith {
+            model: "gpt-6-astra".into(),
+            provider: margin_shared::Provider::OpenAi,
+            ..w
+        });
+        s.apply(Event::LessonChanged {
+            lesson: again.clone(),
+        });
+        assert_eq!(s.lessons["l1"].written_with, again.written_with);
     }
 
     #[test]
@@ -1206,6 +1241,7 @@ pub(crate) mod tests {
             outline: None,
             created_at: ts(0),
             chat_id: None,
+            written_with: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -1244,6 +1280,7 @@ pub(crate) mod tests {
             outline: None,
             created_at: ts(0),
             chat_id: None,
+            written_with: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),

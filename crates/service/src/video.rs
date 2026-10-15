@@ -13,7 +13,7 @@ use chrono::Utc;
 use margin_ai::{CallOptions, FailedScene, Generated, SceneRequest};
 use margin_shared::context::TraceKind;
 use margin_shared::pipeline::Route;
-use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus};
+use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus, WrittenWith};
 use margin_video::{
     RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress, SandboxMode, Voice,
 };
@@ -34,6 +34,15 @@ pub const LOG_LINES: usize = 200;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 /// Log-only updates are saved and sent at most this often.
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What wrote video `id`'s scene (`StoredVideo::written_with`), once one was written.
+pub async fn written_with(state: &AppState, id: &str) -> anyhow::Result<Option<WrittenWith>> {
+    Ok(state
+        .store
+        .get::<StoredVideo>(db::VIDEO, id)
+        .await?
+        .and_then(|v| v.written_with))
+}
 
 pub fn in_progress(status: &VideoStatus) -> bool {
     matches!(
@@ -131,6 +140,7 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
                     },
                     has_captions: false,
                     has_poster: false,
+                    written_with: None,
                 };
                 state.store.put(db::VIDEO, &v.video.id, &v).await?;
                 (v, true, lesson)
@@ -367,9 +377,11 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
             "Repaired scene written. Rendering again…".into()
         });
         let (scene, log_text) = (code.clone(), log.text());
+        let with = crate::ask::written_with(state, &ai, SCENE_PROMPT_VERSION);
         if !update(state, id, move |v| {
             v.video.scene_code = Some(scene);
             v.video.log = log_text;
+            v.written_with = Some(with);
         })
         .await?
         {

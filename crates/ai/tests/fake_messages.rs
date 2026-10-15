@@ -13,13 +13,14 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use margin_ai::prompts::LESSON_CONSTANT;
+use margin_ai::prompts::{LESSON_CONSTANT, RERANK_CONSTANT, REWRITE_CONSTANT};
 use margin_ai::{
     AiError, CLAUDE_BETAS, CallOptions, ClaudeClient, Delta, Image, InputPart, ItemView,
-    ModelEvent, ModelRequest, Next, Provider, RouteModels, StartKind, TextModel, ToolChoice,
-    ToolDef, WebTools,
+    ModelEvent, ModelRequest, Next, Provider, RerankCandidate, RewriteInput, RouteModels,
+    StartKind, TextModel, ToolChoice, ToolDef, WebTools, rerank, rewrite_queries,
 };
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
+use margin_shared::routes::REWRITE_MAX_OUTPUT_TOKENS;
 use margin_shared::{ReasoningEffort, WebCitation, WebResult};
 use serde_json::{Value, json};
 
@@ -1244,6 +1245,96 @@ async fn text_calls_split_system_at_the_constant_and_pick_the_route_model() {
         seen.push(serde_json::to_vec(&body["system"][0]).unwrap());
     }
     assert_eq!(seen[0], seen[1], "system[0] is byte-identical per version");
+}
+
+/// The R2 prompts on the Claude client (the prefix identity the prefix gate checks in
+/// `margin_evals::prefix`): every rewrite and rerank call sends its version's constant
+/// block alone as `system[0]` with the one cache marker (neither prompt has a variable
+/// part), byte-identical across calls, on the small slot; the query, names and
+/// candidates go in the message, the schema after them.
+#[tokio::test]
+async fn rewrite_and_rerank_calls_send_their_constant_block_as_the_cached_system() {
+    let (client, fake) = spawn(vec![
+        text_reply(
+            r#"{"queries": ["gibbs phenomenon ringing", "gibbs", "overshoot near a jump", "x"]}"#,
+        ),
+        text_reply(r#"{"queries": ["fourier coefficient formula"]}"#),
+        text_reply(r#"{"ranking": [{"id": "p2", "grade": 3}]}"#),
+        text_reply(r#"{"ranking": [{"id": "p1", "grade": 2}]}"#),
+    ])
+    .await;
+    let opts = CallOptions::new(Route::Small);
+    let mut input = RewriteInput {
+        query: "gibbs".into(),
+        purpose: RetrievalPurpose::Agent,
+        scope_names: vec!["notes/dsp.pdf".into()],
+        max_added: 2,
+    };
+    let out = rewrite_queries(&client, &input, &opts).await.unwrap().value;
+    assert_eq!(out, ["gibbs phenomenon ringing", "overshoot near a jump"]);
+    input.query = "a_n".into();
+    input.purpose = RetrievalPurpose::Lesson;
+    input.scope_names.push("lecture 4.mp4".into());
+    rewrite_queries(&client, &input, &opts).await.unwrap();
+    let candidates: Vec<RerankCandidate> = (1..=2)
+        .map(|i| RerankCandidate::new(format!("p{i}"), "dsp.pdf", Some(i), "", "text"))
+        .collect();
+    let ranked = rerank(&client, "window leakage", &candidates, &opts)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(ranked[0].id, "p2");
+    rerank(
+        &client,
+        "coefficients\nAlso asked: what is a_n",
+        &candidates,
+        &opts,
+    )
+    .await
+    .unwrap();
+
+    let sent = requests(&fake);
+    assert_eq!(sent.len(), 4);
+    for (i, req) in sent.iter().enumerate() {
+        let body = &req.body;
+        let constant = if i < 2 {
+            REWRITE_CONSTANT
+        } else {
+            RERANK_CONSTANT
+        };
+        assert_eq!(
+            body["system"],
+            json!([{"type": "text", "text": constant, "cache_control": {"type": "ephemeral"}}]),
+            "request {i}"
+        );
+        assert_eq!(breakpoints(body), 1, "request {i}");
+        assert_eq!(
+            body["model"], "claude-haiku-5-5",
+            "request {i}: the small slot"
+        );
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        let last = content.last().unwrap()["text"].as_str().unwrap();
+        assert!(last.contains("JSON schema"), "request {i}: {last}");
+        assert!(!body["messages"].to_string().contains(&constant[..80]));
+    }
+    assert_eq!(sent[0].body["max_tokens"], REWRITE_MAX_OUTPUT_TOKENS);
+    assert_ne!(sent[0].body["messages"], sent[1].body["messages"]);
+    assert_ne!(sent[2].body["messages"], sent[3].body["messages"]);
+    let system = |i: usize| serde_json::to_vec(&sent[i].body["system"][0]).unwrap();
+    assert_eq!(
+        system(0),
+        system(1),
+        "rewrite-v1's prefix is byte-identical"
+    );
+    assert_eq!(system(2), system(3), "rerank-v1's prefix is byte-identical");
+    let first = sent[3].body["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        first.starts_with("Query: coefficients\nAlso asked: what is a_n\n\nCandidates:\n"),
+        "{first}"
+    );
+    assert!(first.contains("[p1] dsp.pdf, p. 1:\n"));
 }
 
 #[tokio::test]

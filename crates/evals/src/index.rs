@@ -8,22 +8,27 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
 use margin_embed::{CHUNK_TOKENS, Purpose, SourceKind};
 use margin_service::db::{INSERT_MANY_MAX, PASSAGE, PassageRow, Store};
 use margin_service::pipeline::{
-    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry, StageDeps,
+    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry,
+    RerankRequest, RewriteRequest, StageDeps,
 };
+use margin_service::retrieval::QueryPlan;
 use margin_shared::context::{ACCESS_COMPANY, Scope};
-use margin_shared::pipeline::PipelineConfig;
+use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose};
 use margin_shared::routes::{RETRIEVAL_K_FUSED, RRF_K};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::corpus::{CorpusDoc, Extraction, approx_tokens};
 use crate::golden::GoldenScope;
 use crate::recorded::Vectors;
+use crate::small::{Meter, moved_at_k, stage_applies};
 
 /// The project every eval passage belongs to.
 pub const PROJECT_ID: &str = "eval";
@@ -55,6 +60,28 @@ pub struct IndexStats {
     pub ms: f64,
 }
 
+/// What the model-backed stages (R2) did on one search.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchStages {
+    /// Query strings retrieved with, after rewriting.
+    pub queries: usize,
+    /// The rewrite's time (as recorded, when replayed).
+    pub rewrite_ms: f64,
+    /// The rerank's time (as recorded, when replayed).
+    pub rerank_ms: f64,
+    /// Share (0–1) of the top 10 places the reranker changed; `None` without a reranker.
+    pub rerank_moved_at_10: Option<f64>,
+    /// Whether the reranker reordered (set `rerank` on a hit).
+    pub reranked: bool,
+    /// The reranker applies to this search's purpose but returned the fused order
+    /// untouched (a timeout, a refusal, bad JSON: the stage's fallback).
+    pub rerank_fallback: bool,
+    /// USD of the small-route calls the rewrite and the rerank made.
+    pub small_cost_usd: f64,
+    pub small_calls: u32,
+}
+
 /// One search's ranked hits.
 #[derive(Debug, Clone)]
 pub struct Ranked {
@@ -62,9 +89,14 @@ pub struct Ranked {
     pub hits: Vec<Hit>,
     /// The first query string's vector.
     pub query_vector: Vec<f32>,
-    /// Wall time of the retriever legs, fusion and reranking (not query embedding).
+    /// Wall time of the retriever legs, fusion and reranking (not query embedding or
+    /// rewriting).
     pub ms: f64,
+    pub stages: SearchStages,
 }
+
+/// How many document names a rewrite sees of its scope (`RewriteRequest.scope_names`).
+pub const SCOPE_NAMES_MAX: usize = 12;
 
 pub struct EvalIndex<'v> {
     pub store: Store,
@@ -72,13 +104,16 @@ pub struct EvalIndex<'v> {
     pub corpus: PathBuf,
     pub vectors: &'v dyn Vectors,
     pub stats: IndexStats,
+    /// What the model-backed stages spend, search by search.
+    pub meter: Arc<Meter>,
     docs: HashMap<String, CorpusDoc>,
 }
 
 impl<'v> EvalIndex<'v> {
     /// Builds the pipeline `cfg` names from the service's standard registry (plus
     /// whatever `extra` registers, which tests use to fake stages under their names)
-    /// and indexes `docs` into `store`.
+    /// and indexes `docs` into `store`. No small-tasks models: `runner::Env::index`
+    /// builds with the recorded or live ones.
     pub async fn build(
         store: Store,
         cfg: &PipelineConfig,
@@ -88,17 +123,39 @@ impl<'v> EvalIndex<'v> {
         docs: &[CorpusDoc],
         extraction: &Extraction,
     ) -> anyhow::Result<Self> {
-        let mut reg = Registry::standard(StageDeps {
-            store: store.clone(),
-        });
+        let mut reg = Registry::standard(StageDeps::new(store.clone()));
         extra(&mut reg);
         let pipeline = Pipeline::build(cfg, &reg)?;
+        Self::build_with(
+            store,
+            pipeline,
+            Arc::new(Meter::new()),
+            vectors,
+            corpus,
+            docs,
+            extraction,
+        )
+        .await
+    }
+
+    /// Indexes `docs` into `store` for a pipeline already built, whose model-backed
+    /// stages report to `meter`.
+    pub async fn build_with(
+        store: Store,
+        pipeline: Pipeline,
+        meter: Arc<Meter>,
+        vectors: &'v dyn Vectors,
+        corpus: &Path,
+        docs: &[CorpusDoc],
+        extraction: &Extraction,
+    ) -> anyhow::Result<Self> {
         let mut index = Self {
             store,
             pipeline,
             corpus: corpus.to_path_buf(),
             vectors,
             stats: IndexStats::default(),
+            meter,
             docs: docs.iter().map(|d| (d.path.clone(), d.clone())).collect(),
         };
         let started = Instant::now();
@@ -271,14 +328,83 @@ impl<'v> EvalIndex<'v> {
         Ok(rows)
     }
 
-    /// Searches with every string of `plan` (the first is the query proper), fuses the
-    /// legs, reranks: what `retrieval::retrieve` does before packing.
+    /// The purpose the retrieval suite searches for: the variant's `params.purpose` on
+    /// its reranker (else its rewriter) when set, else `Agent` (the agent tool's
+    /// `search`, what the golden questions stand for). `rerank-small` sets "lesson" so
+    /// the suite measures the rerank lessons get (`docs/r2-brief.md` D1, §6).
+    pub fn retrieval_purpose(&self) -> RetrievalPurpose {
+        suite_purpose(&self.pipeline.config, RetrievalPurpose::Agent)
+    }
+
+    /// The document names a scope holds, sorted, at most `SCOPE_NAMES_MAX`: what the
+    /// rewriter's prompt is shown (never passage text).
+    pub fn scope_names(&self, scope: &Scope) -> Vec<String> {
+        let mut names: Vec<String> = match scope {
+            Scope::Topic { id } if id == CORPUS_SCOPE => self.docs.keys().cloned().collect(),
+            Scope::Workspace { id } if id == FOLDER_SCOPE => self
+                .docs
+                .values()
+                .filter(|d| d.in_folder)
+                .map(|d| d.path.clone())
+                .collect(),
+            Scope::Sources { ids } => ids
+                .iter()
+                .filter(|id| self.docs.contains_key(*id))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        names.sort();
+        names.truncate(SCOPE_NAMES_MAX);
+        names
+    }
+
+    /// Searches for the retrieval suite's purpose (`retrieval_purpose`).
     pub async fn search(&self, plan: &[String], scope: &Scope) -> anyhow::Result<Ranked> {
+        self.search_as(plan, scope, self.retrieval_purpose()).await
+    }
+
+    /// What `retrieval::retrieve` does before packing, for `purpose`: rewrites the plan
+    /// (the first string is the query proper), searches with every string, fuses the
+    /// legs, reranks with the rewritten plan as the reranker's query. A stage's error is
+    /// the search's (a recording's miss must be loud); the recorded and recording stages
+    /// keep the input themselves when a live call fails, as the service does.
+    pub async fn search_as(
+        &self,
+        plan: &[String],
+        scope: &Scope,
+        purpose: RetrievalPurpose,
+    ) -> anyhow::Result<Ranked> {
         anyhow::ensure!(!plan.is_empty(), "a search needs a query");
-        let vectors = self.vectors.texts(plan, &Purpose::Query)?;
+        self.meter.take();
+        // The strings as given (what the recorded vectors are keyed by).
+        let original = QueryPlan {
+            queries: plan.to_vec(),
+        };
+        let names = self.scope_names(scope);
+        let rw = RewriteRequest {
+            purpose,
+            provider: None,
+            trace_id: "eval",
+            job_id: None,
+            scope_names: &names,
+        };
+        let t = Instant::now();
+        let rewritten = self
+            .pipeline
+            .rewriter
+            .rewrite(&rw, original.clone())
+            .await?;
+        let rewrite_wall = t.elapsed().as_secs_f64() * 1e3;
+        let plan = if rewritten.queries.is_empty() {
+            original
+        } else {
+            rewritten
+        };
+        let vectors = self.vectors.texts(&plan.queries, &Purpose::Query)?;
         let started = Instant::now();
         let mut legs = Vec::new();
-        for (text, vector) in plan.iter().zip(&vectors) {
+        for (text, vector) in plan.queries.iter().zip(&vectors) {
             let q = Query {
                 text: text.clone(),
                 vector: vector.clone(),
@@ -301,11 +427,41 @@ impl<'v> EvalIndex<'v> {
                 params: self.pipeline.config.fusion.params.clone(),
             },
         );
-        let hits = self.pipeline.reranker.rerank(&plan[0], fused).await?;
+        let fused_ids: Vec<String> = fused.iter().map(|h| h.passage.id.clone()).collect();
+        // The reranker's request as `retrieve` builds it, from the rewritten plan.
+        let query = margin_service::retrieval::rerank_query(&QueryPlan::from_strings(
+            plan.queries.iter().cloned(),
+        ));
+        let req = RerankRequest {
+            query: &query,
+            purpose,
+            provider: None,
+            trace_id: "eval",
+            job_id: None,
+        };
+        let t = Instant::now();
+        let hits = self.pipeline.reranker.rerank(&req, fused).await?;
+        let rerank_wall = t.elapsed().as_secs_f64() * 1e3;
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        let spent = self.meter.take();
+        let reranker = &self.pipeline.config.reranker;
+        let active = reranker.name != "none";
+        let reranked = hits.iter().any(|h| h.rerank.is_some());
+        let stages = SearchStages {
+            queries: plan.queries.len(),
+            rewrite_ms: spent.rewrite_ms.unwrap_or(rewrite_wall),
+            rerank_ms: spent.rerank_ms.unwrap_or(rerank_wall),
+            rerank_moved_at_10: active.then(|| moved_at_k(&fused_ids, &hits, 10)),
+            reranked,
+            rerank_fallback: active && stage_applies(reranker, purpose) && !reranked,
+            small_cost_usd: spent.cost_usd,
+            small_calls: spent.calls,
+        };
         Ok(Ranked {
             hits,
             query_vector: vectors.into_iter().next().unwrap_or_default(),
-            ms: started.elapsed().as_secs_f64() * 1e3,
+            ms,
+            stages,
         })
     }
 
@@ -313,6 +469,16 @@ impl<'v> EvalIndex<'v> {
     pub fn pack(&self, hits: Vec<Hit>, budget: &PackBudget) -> Vec<Packed> {
         self.pipeline.packer.pack(hits, budget)
     }
+}
+
+/// The purpose a suite searches for: `params.purpose` on the variant's reranker, else on
+/// its rewriter, else `default`.
+pub fn suite_purpose(cfg: &PipelineConfig, default: RetrievalPurpose) -> RetrievalPurpose {
+    [&cfg.reranker, &cfg.rewriter]
+        .iter()
+        .find_map(|s| s.params.get("purpose").and_then(|v| v.as_str()))
+        .and_then(|p| RetrievalPurpose::ALL.into_iter().find(|x| x.as_str() == p))
+        .unwrap_or(default)
 }
 
 pub fn sha256_hex(text: &str) -> String {
@@ -435,6 +601,39 @@ pub(crate) mod testing {
             cfg: &ChunkerCfg,
         ) -> Vec<margin_embed::Chunk> {
             PagesV1.chunk(doc, kind, tok, cfg)
+        }
+    }
+
+    /// A text hit with id `id` and nothing else, for ranking tests.
+    pub fn hit(id: &str) -> Hit {
+        Hit {
+            passage: PassageRow {
+                id: id.into(),
+                project_id: PROJECT_ID.into(),
+                document_id: "doc".into(),
+                origin: "source".into(),
+                scope_ids: vec![],
+                access: vec![],
+                unit_id: id.into(),
+                modality: "text".into(),
+                ord: 0,
+                page: None,
+                start_line: None,
+                end_line: None,
+                start_ms: None,
+                end_ms: None,
+                section_path: String::new(),
+                text: String::new(),
+                file: None,
+                chunk_hash: String::new(),
+                embedder: String::new(),
+                vector: vec![],
+            },
+            score: 0.0,
+            dense_rank: None,
+            lex_rank: None,
+            rerank: None,
+            highlight: None,
         }
     }
 

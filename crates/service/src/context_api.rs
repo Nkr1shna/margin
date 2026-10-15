@@ -25,7 +25,7 @@ use margin_shared::context::{
     AGENT_HEADER, ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
     Origin, Project, TraceKind, TraceRow, VIA_MCP, is_agent_name,
 };
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
 use margin_shared::text::for_model;
 use serde::Deserialize;
@@ -134,6 +134,7 @@ pub async fn search(
             &q,
             Route::Chat,
             None,
+            RetrievalPurpose::Context,
             &new_id(),
             caller(&p, &headers),
         ),

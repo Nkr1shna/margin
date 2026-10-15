@@ -889,6 +889,8 @@ pub async fn run_and_record(
             p.dedup();
             p
         },
+        // The agent's system prompt is the one prompt this suite sends (R2 D4.4).
+        prompt_versions: vec![AGENT_PROMPT_VERSION.to_string()],
         valid: true,
         notes: std::iter::once(format!("agent prompt {AGENT_PROMPT_VERSION}"))
             .chain(

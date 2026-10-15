@@ -356,6 +356,8 @@ pub struct RetrievalLegs {
     pub lex_ms: f64,
     pub fuse_ms: f64,
     pub rerank_ms: f64,
+    /// The `rewriter` stage (R2); 0 when it is `"none"` or the plan wasn't rewritten.
+    pub rewrite_ms: f64,
 }
 
 /// One trace row: ids, numbers and hashes only. Never prompt text, output text, tool
@@ -461,6 +463,15 @@ pub struct TraceRow {
     /// The passages a `read_passages` call read (`[from, to]` ords, inclusive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_range: Option<[u32; 2]>,
+    /// The strings a retrieval ran with, after the `rewriter` stage (R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<u32>,
+    /// The candidates the reranker saw (R2); `None` when it saw none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranked: Option<u32>,
+    /// The reranker stage's name, for reports without the pipeline table (R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranker: Option<String>,
 
     // Tool calls.
     #[serde(default)]
@@ -527,6 +538,9 @@ impl TraceRow {
             cache_hit: None,
             query: None,
             read_range: None,
+            queries: None,
+            reranked: None,
+            reranker: None,
             tool: None,
             output_bytes: None,
             device_id: None,
@@ -536,6 +550,21 @@ impl TraceRow {
             embed_ms: None,
         }
     }
+}
+
+/// One prompt the service or the eval runner sends (`GET routes::PIPELINE_PROMPTS`, R2
+/// `docs/r2-brief.md` D4.1): its job, its version, and the FNV-1a 64 hash of its
+/// constant block, so the same version always means the same bytes
+/// (`evals/prompts.lock`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptInfo {
+    /// "lesson", "scene", "plan", "rerank", "rewrite", "agent", "title", "condense", …
+    pub job: String,
+    /// "lesson-v2", "rerank-v1", …
+    pub version: String,
+    /// 16 hex digits.
+    pub constant_hash: String,
+    pub constant_chars: usize,
 }
 
 /// The longest query a trace row keeps (`TraceRow::query`).
@@ -772,6 +801,33 @@ mod tests {
             cost_usd: 0.5,
             mean_ms: 12.5,
             p95_ms: Some(40.0),
+        });
+    }
+
+    #[test]
+    fn r2_trace_fields_and_prompt_infos_round_trip() {
+        let mut row = TraceRow::new(TraceKind::Retrieval, "01J1", at());
+        row.queries = Some(3);
+        row.reranked = Some(24);
+        row.reranker = Some("listwise-small".into());
+        row.legs = Some(RetrievalLegs {
+            rerank_ms: 900.0,
+            rewrite_ms: 300.0,
+            ..Default::default()
+        });
+        let json = round_trip(&row);
+        assert_eq!(json["reranker"], "listwise-small");
+        assert_eq!(json["legs"]["rewrite_ms"], 300.0);
+        // Rows written before R2 parse, and a row without them doesn't write them.
+        let legs: RetrievalLegs = serde_json::from_value(json!({"dense_ms": 1.0})).unwrap();
+        assert_eq!(legs.rewrite_ms, 0.0);
+        let bare = serde_json::to_value(TraceRow::new(TraceKind::Retrieval, "x", at())).unwrap();
+        assert!(bare.get("queries").is_none() && bare.get("reranker").is_none());
+        round_trip(&PromptInfo {
+            job: "rerank".into(),
+            version: "rerank-v1".into(),
+            constant_hash: "0123456789abcdef".into(),
+            constant_chars: 1200,
         });
     }
 

@@ -19,7 +19,8 @@ use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
 use margin_ai::{
     AiError, CallOptions, CoursePlan, Generated, InputPart, LessonContext, ModelInfo, PlanRequest,
-    ProviderConfig, RouteModels, SceneRequest, TextModel, TextOutput,
+    ProviderConfig, Ranked, RerankCandidate, RewriteInput, RouteModels, SceneRequest, TextModel,
+    TextOutput,
 };
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
@@ -167,6 +168,32 @@ pub struct FakeGenerator {
     /// When set, lessons are written by the real `AiGenerator` (point the provider at a
     /// fake server).
     pub jobs_over_http: AtomicBool,
+    /// Every listwise rerank call (R2).
+    pub rerank_requests: Mutex<Vec<RerankCall>>,
+    /// The rerank's answer (completed like the real one: every candidate once); `None`
+    /// fails the call, which keeps the fused order.
+    pub rerank_reply: Mutex<Option<Vec<Ranked>>>,
+    /// Every query rewrite call (R2).
+    pub rewrite_requests: Mutex<Vec<RewriteCall>>,
+    /// The rewrite's added queries; `None` fails the call, which keeps the plan.
+    pub rewrite_reply: Mutex<Option<Vec<String>>>,
+}
+
+/// A listwise rerank call the fake got (R2).
+#[derive(Debug, Clone)]
+pub struct RerankCall {
+    pub query: String,
+    pub candidates: Vec<RerankCandidate>,
+    pub opts: CallOptions,
+    pub choice: ModelChoice,
+}
+
+/// A query rewrite call the fake got (R2).
+#[derive(Debug, Clone)]
+pub struct RewriteCall {
+    pub input: RewriteInput,
+    pub opts: CallOptions,
+    pub choice: ModelChoice,
 }
 
 /// A plain text call a test model got.
@@ -425,6 +452,66 @@ impl Generator for FakeGenerator {
         })
     }
 
+    fn rerank<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<Ranked>>, AiError>> {
+        Box::pin(async move {
+            self.rerank_requests.lock().unwrap().push(RerankCall {
+                query: query.to_string(),
+                candidates: candidates.to_vec(),
+                opts: opts.clone(),
+                choice: m.clone(),
+            });
+            let reply = self.rerank_reply.lock().unwrap().clone();
+            match reply {
+                Some(mut ranked) => {
+                    // Completed as `margin_ai::rerank` does: every candidate once.
+                    ranked.retain(|r| candidates.iter().any(|c| c.id == r.id));
+                    for c in candidates {
+                        if !ranked.iter().any(|r| r.id == c.id) {
+                            ranked.push(Ranked {
+                                id: c.id.clone(),
+                                grade: 0,
+                            });
+                        }
+                    }
+                    Ok(Generated {
+                        value: ranked,
+                        usage: fake_usage(),
+                    })
+                }
+                None => Err(AiError::Incomplete("no rerank scripted".into())),
+            }
+        })
+    }
+
+    fn rewrite_queries<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<String>>, AiError>> {
+        Box::pin(async move {
+            self.rewrite_requests.lock().unwrap().push(RewriteCall {
+                input: input.clone(),
+                opts: opts.clone(),
+                choice: m.clone(),
+            });
+            let reply = self.rewrite_reply.lock().unwrap().clone();
+            match reply {
+                Some(queries) => Ok(Generated {
+                    value: queries,
+                    usage: fake_usage(),
+                }),
+                None => Err(AiError::Incomplete("no rewrite scripted".into())),
+            }
+        })
+    }
+
     fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn ModelClient> {
         Self::check_credential(config);
         self.agent_providers.lock().unwrap().push(config.provider);
@@ -597,10 +684,33 @@ pub struct FakeHf {
     pub fail: AtomicBool,
     pub size_requests: AtomicU32,
     pub downloads: AtomicU32,
+    /// When set, the default reranker's repo (`RerankerModel::DEFAULT`) is there, with
+    /// `FAKE_RERANKER_FILES` at its pinned revision; unset, it answers 404 (R2).
+    pub has_reranker: AtomicBool,
+    /// Files of the reranker repo fetched.
+    pub reranker_fetches: AtomicU32,
 }
 
 fn model_path() -> String {
     format!("/{}/resolve/main/{MODEL_FILE}", margin_embed::ONNX_REPO)
+}
+
+/// The fake reranker repo's files: what `RerankerModel::files` needs, plus one the
+/// download skips.
+pub const FAKE_RERANKER_FILES: [(&str, usize); 4] = [
+    ("config.json", 20),
+    ("tokenizer.json", 500),
+    ("onnx/model_quantized.onnx", 3000),
+    ("onnx/model.onnx", 9000),
+];
+
+/// Bytes a download of the fake reranker repo fetches (the files it needs).
+pub fn fake_reranker_bytes() -> u64 {
+    FAKE_RERANKER_FILES
+        .iter()
+        .filter(|(p, _)| margin_embed::RerankerModel::DEFAULT.files().contains(p))
+        .map(|(_, n)| *n as u64)
+        .sum()
 }
 
 pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
@@ -623,6 +733,34 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
             .body(Body::from_stream(parts))
             .unwrap()
     }
+    async fn reranker_tree(State(hf): State<Arc<FakeHf>>) -> Response {
+        if !hf.has_reranker.load(Ordering::SeqCst) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let entries: Vec<serde_json::Value> =
+            std::iter::once(json!({"type": "directory", "path": "onnx", "size": 0}))
+                .chain(
+                    FAKE_RERANKER_FILES
+                        .iter()
+                        .map(|(path, size)| json!({"type": "file", "path": path, "size": size})),
+                )
+                .collect();
+        Json(serde_json::Value::Array(entries)).into_response()
+    }
+    async fn reranker_file(
+        State(hf): State<Arc<FakeHf>>,
+        axum::extract::Path(path): axum::extract::Path<String>,
+    ) -> Response {
+        if !hf.has_reranker.load(Ordering::SeqCst) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        hf.reranker_fetches.fetch_add(1, Ordering::SeqCst);
+        match FAKE_RERANKER_FILES.iter().find(|(p, _)| *p == path) {
+            Some((_, size)) => vec![b'r'; *size].into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    let reranker = margin_embed::RerankerModel::DEFAULT;
     let hf = Arc::new(FakeHf::default());
     let app = Router::new()
         .route(
@@ -630,6 +768,22 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
             get(size),
         )
         .route(&model_path(), get(file))
+        .route(
+            &format!(
+                "/api/models/{}/tree/{}",
+                reranker.repo(),
+                reranker.revision()
+            ),
+            get(reranker_tree),
+        )
+        .route(
+            &format!(
+                "/{}/resolve/{}/{{*path}}",
+                reranker.repo(),
+                reranker.revision()
+            ),
+            get(reranker_file),
+        )
         .with_state(hf.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -671,6 +825,8 @@ pub struct FakeSourceTools {
     pub speech: FakeSpeechModel,
     /// When set, pictures are read without OCR (as on Linux without tesseract).
     pub no_ocr: AtomicBool,
+    /// Cross-encoders opened (`load_reranker`, R2).
+    pub reranker_loads: AtomicU32,
 }
 
 /// A speech model of `FAKE_SPEECH_BYTES` "downloaded" in two progress steps, kept in
@@ -961,6 +1117,15 @@ impl SourceTools for FakeSourceTools {
             "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
                 .to_string()
         })
+    }
+
+    /// `FakeReranker` (shared-word counts) stands in for any downloaded cross-encoder.
+    fn load_reranker(
+        &self,
+        _files: &margin_embed::RerankerFiles,
+    ) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+        self.reranker_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(margin_embed::fake::FakeReranker))
     }
 
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {

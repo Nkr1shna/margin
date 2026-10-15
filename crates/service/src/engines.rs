@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use margin_ai::{
     AiError, Backoff, CallOptions, ClaudeClient, CoursePlan, Generated, InputPart, JsonFormat,
-    LessonContext, ModelWindow, PlanRequest, Provider, ProviderConfig, ProviderKind,
-    ResponsesClient, Retrying, SceneRequest, TextModel, TextOutput,
+    LessonContext, ModelWindow, PlanRequest, Provider, ProviderConfig, ProviderKind, Ranked,
+    RerankCandidate, ResponsesClient, Retrying, RewriteInput, SceneRequest, TextModel, TextOutput,
 };
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::Waiting;
@@ -77,6 +77,38 @@ pub trait Generator: Send + Sync + 'static {
     /// `margin_ai::Retrying` (titles, condense summaries) or [`job_model`] (lessons,
     /// scenes, the planner).
     fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel>;
+
+    /// The listwise rerank (R2, `"listwise-small"`): one strict-JSON call on the
+    /// `Small` route grading `candidates` for `query`, every candidate once, best first,
+    /// retried as the job running on this task says ([`job_model`]). Tests script it
+    /// (`FakeGenerator.rerank_reply`).
+    fn rerank<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<Ranked>>, AiError>> {
+        Box::pin(async move {
+            let model = job_model(self.text_model(&m.config));
+            margin_ai::rerank(&model, query, candidates, opts).await
+        })
+    }
+
+    /// Query rewriting (R2, `"small-expand-v1"`): one strict-JSON call on the `Small`
+    /// route for alternative phrasings of `input.query`. Tests script it
+    /// (`FakeGenerator.rewrite_reply`).
+    fn rewrite_queries<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<String>>, AiError>> {
+        Box::pin(async move {
+            let model = job_model(self.text_model(&m.config));
+            margin_ai::rewrite_queries(&model, input, opts).await
+        })
+    }
 }
 
 pub trait Renderer: Send + Sync + 'static {
@@ -379,6 +411,14 @@ impl Renderer for VideoRenderer {
     }
 }
 
+/// Opens the ONNX cross-encoder in `files` (`SourceTools::load_reranker`'s default).
+pub fn load_onnx_reranker(
+    files: &margin_embed::RerankerFiles,
+) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+    let m = margin_embed::onnx::OnnxReranker::load(files, &margin_embed::OnnxOptions::default())?;
+    Ok(Arc::new(m))
+}
+
 /// Where `margin_embed`'s readers find their programs and library.
 pub fn reader_tools() -> margin_video::ReaderTools {
     margin_video::ReaderTools {
@@ -459,6 +499,16 @@ pub trait SourceTools: Send + Sync + 'static {
     /// Unloads what has been unused for a while (the speech model). The service calls it
     /// every minute. Blocking.
     fn sweep(&self) {}
+    /// Opens a downloaded reranker model (R2, the `"onnx-crossencoder"` reranker; the
+    /// caller has checked `files.is_complete()`). The ONNX cross-encoder where this
+    /// build has the runtime; tests stand in `margin_embed::fake::FakeReranker`.
+    /// Blocking.
+    fn load_reranker(
+        &self,
+        files: &margin_embed::RerankerFiles,
+    ) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+        load_onnx_reranker(files)
+    }
     /// An image file as the lesson writer is shown it: (media type, bytes), at most
     /// `WRITER_IMAGE_SIDE` px. Blocking.
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError>;

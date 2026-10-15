@@ -271,7 +271,7 @@ impl ModelFiles {
     /// Whether every file of every part (text, vision, audio) is present: a finished
     /// download.
     pub fn is_complete(&self) -> bool {
-        download::is_complete(&self.dir, download::Manifest(self.backend))
+        download::is_complete(&self.dir, download::Manifest::Model(self.backend))
     }
 
     /// Path of an ONNX graph (`"model"`, `"vision_encoder"`, `"audio_encoder"`) of this
@@ -293,7 +293,8 @@ impl ModelFiles {
         hf_base: &str,
     ) -> Result<u64, EmbedError> {
         let files =
-            download::remote_files(client, hf_base, download::Manifest(self.backend)).await?;
+            download::remote_files(client, hf_base, download::Manifest::Model(self.backend))
+                .await?;
         Ok(files.iter().map(|f| f.size).sum())
     }
 
@@ -310,7 +311,7 @@ impl ModelFiles {
     ) -> Result<(), EmbedError> {
         download::download(
             &self.dir,
-            download::Manifest(self.backend),
+            download::Manifest::Model(self.backend),
             client,
             hf_base,
             progress,
@@ -612,12 +613,142 @@ impl Chunk {
 }
 
 /// Reorders retrieved passages by relevance to a query (`docs/agent-rag-architecture.md`
-/// §2.4): a local cross-encoder in R3, behind the service's `Reranker` stage. Scores are
-/// in the input's order; higher is more relevant. Blocking.
+/// §2.4): a local cross-encoder (R2, `docs/r2-brief.md` D5; `onnx::OnnxReranker`, or
+/// `fake::FakeReranker` in tests), behind the service's `"onnx-crossencoder"` stage.
+/// Scores are in the input's order; higher is more relevant. Blocking.
 pub trait Reranker: Send + Sync {
     /// The model and version, recorded with eval runs and traces.
     fn name(&self) -> &str;
     fn score(&self, query: &str, passages: &[String]) -> Result<Vec<f32>, EmbedError>;
+}
+
+/// The cross-encoders the `"onnx-crossencoder"` reranker can run (`params.model`),
+/// downloaded on demand into `data_dir/models/{dir}`, never bundled. The repos and file
+/// names are R2-xenc's to confirm (`docs/r2-brief.md` §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RerankerModel {
+    /// `ms-marco-minilm-l6-v2`: 22 M params, English, ~23 MB int8. The default.
+    MsMarcoMiniLmL6,
+    /// `bge-reranker-base`: 278 M params, multilingual, ~280 MB int8; needs ~1.3 GB
+    /// loaded (1266 MB resident measured), so it is opt-in only (`rerank-xenc-bge`).
+    BgeRerankerBase,
+}
+
+impl RerankerModel {
+    pub const ALL: [RerankerModel; 2] = [
+        RerankerModel::MsMarcoMiniLmL6,
+        RerankerModel::BgeRerankerBase,
+    ];
+    /// What `params.model` names when it names nothing.
+    pub const DEFAULT: RerankerModel = RerankerModel::MsMarcoMiniLmL6;
+
+    /// The `params.model` name.
+    pub fn name(self) -> &'static str {
+        match self {
+            RerankerModel::MsMarcoMiniLmL6 => "ms-marco-minilm-l6-v2",
+            RerankerModel::BgeRerankerBase => "bge-reranker-base",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<RerankerModel> {
+        Self::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// The Hugging Face repo of its ONNX export.
+    pub fn repo(self) -> &'static str {
+        match self {
+            RerankerModel::MsMarcoMiniLmL6 => "Xenova/ms-marco-MiniLM-L-6-v2",
+            RerankerModel::BgeRerankerBase => "Xenova/bge-reranker-base",
+        }
+    }
+
+    /// The folder under `data_dir/models` its files are kept in.
+    pub fn dir(self) -> &'static str {
+        match self {
+            RerankerModel::MsMarcoMiniLmL6 => "reranker-ms-marco-minilm-l6-v2",
+            RerankerModel::BgeRerankerBase => "reranker-bge-reranker-base",
+        }
+    }
+
+    /// The repo files a download fetches; all are required.
+    pub fn files(self) -> &'static [&'static str] {
+        &["config.json", "tokenizer.json", RERANKER_GRAPH]
+    }
+
+    /// The model and version, recorded with eval runs and traces (`Reranker::name`).
+    pub fn version(self) -> String {
+        format!("{}@int8", self.name())
+    }
+}
+
+/// The int8 graph of a reranker's ONNX export.
+pub const RERANKER_GRAPH: &str = "onnx/model_quantized.onnx";
+
+/// The downloaded files of one reranker model in one folder
+/// (`data_dir/models/{RerankerModel::dir}`).
+#[derive(Debug, Clone)]
+pub struct RerankerFiles {
+    pub dir: PathBuf,
+    pub model: RerankerModel,
+}
+
+impl RerankerFiles {
+    /// `model`'s download under `models_dir`.
+    pub fn new(models_dir: &Path, model: RerankerModel) -> Self {
+        Self {
+            dir: models_dir.join(model.dir()),
+            model,
+        }
+    }
+
+    /// Whether every file is present: a finished download.
+    pub fn is_complete(&self) -> bool {
+        download::is_complete(&self.dir, download::Manifest::Reranker(self.model))
+    }
+
+    /// The tokenizer and the graph.
+    pub fn tokenizer_path(&self) -> PathBuf {
+        self.dir.join("tokenizer.json")
+    }
+    pub fn graph_path(&self) -> PathBuf {
+        self.dir.join(RERANKER_GRAPH)
+    }
+
+    /// Total bytes the download fetches (from the Hugging Face API, at the pinned
+    /// `RerankerModel::revision`).
+    pub async fn remote_size(
+        &self,
+        client: &reqwest::Client,
+        hf_base: &str,
+    ) -> Result<u64, EmbedError> {
+        let files =
+            download::remote_files(client, hf_base, download::Manifest::Reranker(self.model))
+                .await?;
+        Ok(files.iter().map(|f| f.size).sum())
+    }
+
+    /// Fetches the files (keeping any already complete from an interrupted download),
+    /// reporting `(received, total)`.
+    pub async fn download(
+        &self,
+        client: &reqwest::Client,
+        hf_base: &str,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<(), EmbedError> {
+        download::download(
+            &self.dir,
+            download::Manifest::Reranker(self.model),
+            client,
+            hf_base,
+            progress,
+        )
+        .await
+    }
+
+    /// Deletes the folder. Nothing there is fine.
+    pub fn remove(&self) -> Result<(), EmbedError> {
+        download::remove(&self.dir)
+    }
 }
 
 /// Cuts extracted text into chunks of at most `max_tokens` (as counted by

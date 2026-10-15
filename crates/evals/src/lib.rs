@@ -32,6 +32,7 @@ pub mod recorded;
 pub mod report;
 pub mod retrieval;
 pub mod runner;
+pub mod small;
 pub mod store;
 pub mod synth;
 pub mod traces;
@@ -42,6 +43,48 @@ pub struct Gates {
     pub retrieval: RetrievalGates,
     pub citations: CitationGates,
     pub packing: PackingGates,
+    /// R2: the recorded reranks of the model-backed rerankers.
+    #[serde(default)]
+    pub rerank: RerankGates,
+    /// R2: the prompt lock (`evals/prompts.lock`).
+    #[serde(default)]
+    pub prompts: PromptGates,
+}
+
+/// `[rerank]`: on the recorded reranks over the golden set.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RerankGates {
+    /// Points (0–100): the mean share of the top 10 places a reranker may change. One
+    /// that reorders more than this on the golden set is a bug, not a win.
+    pub moved_at_10_max: f64,
+    /// Points: searches the reranker applies to but left in the fused order (its
+    /// fallback on a timeout, a refusal or bad JSON).
+    pub fallback_rate_max: f64,
+}
+
+impl Default for RerankGates {
+    fn default() -> Self {
+        Self {
+            moved_at_10_max: 60.0,
+            fallback_rate_max: 0.0,
+        }
+    }
+}
+
+/// `[prompts]`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PromptGates {
+    /// Whether a constant block changed under an unchanged version fails CI (else the
+    /// lock test only prints what differs).
+    pub lock: bool,
+}
+
+impl Default for PromptGates {
+    fn default() -> Self {
+        Self { lock: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

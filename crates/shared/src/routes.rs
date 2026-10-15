@@ -119,6 +119,9 @@ pub const SETTINGS: &str = "/api/settings";
 /// `GET` → `pipeline::PipelineVariants`: the stage names the service registers per kind
 /// and the named variants (`evals/variants/*.toml`) Settings can pick a pipeline from.
 pub const PIPELINE_VARIANTS: &str = "/api/pipeline/variants";
+/// `GET` → `Vec<context::PromptInfo>`: every prompt the service sends, with its version
+/// and the hash of its constant block (R2, `docs/r2-brief.md` D4.1).
+pub const PIPELINE_PROMPTS: &str = "/api/pipeline/prompts";
 /// The ChatGPT sign-in: `GET` → `ChatGptStatus`, `DELETE` signs out.
 pub const PROVIDERS_CHATGPT: &str = "/api/providers/chatgpt";
 /// `POST` → `ChatGptStart`: starts a "Sign in with ChatGPT" on the service Mac.
@@ -187,6 +190,13 @@ pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
 /// is `None` there).
 pub const SPEECH_MODEL: &str = "/api/embedding/speech";
 pub const SPEECH_MODEL_DOWNLOAD: &str = "/api/embedding/speech/download";
+/// The `onnx-crossencoder` reranker's model (R2): `GET` → `EmbeddingModel`, `DELETE`
+/// removes its files, `POST RERANKER_MODEL_DOWNLOAD` starts its download; both answer
+/// with the whole `EmbeddingModel` (its `reranker` part changed) and progress arrives as
+/// `Event::EmbeddingModelChanged`, as for the speech model. 409 "no_reranker_model" on a
+/// service that offers none (`EmbeddingModel.reranker` is `None`).
+pub const RERANKER_MODEL: &str = "/api/embedding/reranker";
+pub const RERANKER_MODEL_DOWNLOAD: &str = "/api/embedding/reranker/download";
 /// `GET` → `Vec<Person>`: everyone who may sign in (a directory: handles, names, roles,
 /// groups; never content).
 pub const PEOPLE: &str = "/api/people";
@@ -421,6 +431,24 @@ pub const TOOL_OUTPUT_PASSAGE_CHARS: usize = 1_100;
 /// Most adjacent passages one `read_passage` returns.
 pub const TOOL_READ_PASSAGES_MAX: usize = 4;
 
+// Reranking and query rewriting (R2, `docs/r2-brief.md` D2, D3, D5).
+
+/// Most fused candidates a reranker sees.
+pub const RERANK_MAX_CANDIDATES: usize = 24;
+/// Longest query a reranker is given: the plan's first string, then the others as
+/// "Also asked:" lines.
+pub const RERANK_QUERY_CHARS: usize = 800;
+/// Output cap of the listwise rerank call.
+pub const RERANK_MAX_OUTPUT_TOKENS: u32 = 400;
+/// Most phrasings a rewrite adds to a query plan.
+pub const REWRITE_MAX_ADDED: usize = 2;
+/// An agent or context query with fewer words than this is rewritten.
+pub const REWRITE_MIN_WORDS: usize = 5;
+/// Output cap of the rewrite call.
+pub const REWRITE_MAX_OUTPUT_TOKENS: u32 = 120;
+/// Longest query+passage pair the cross-encoder scores, in tokens (the query kept whole).
+pub const RERANK_PAIR_TOKENS: usize = 512;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +548,14 @@ mod tests {
         }
         const { assert!(RETRIEVAL_K_FUSED <= RETRIEVAL_K_DENSE + RETRIEVAL_K_LEX) };
         const { assert!(TOOL_SEARCH_K_MAX <= RETRIEVAL_K_FUSED) };
+    }
+
+    #[test]
+    fn r2_routes() {
+        assert!(PIPELINE_PROMPTS.starts_with("/api/pipeline/"));
+        assert!(RERANKER_MODEL.starts_with(EMBEDDING));
+        assert!(RERANKER_MODEL_DOWNLOAD.starts_with(RERANKER_MODEL));
+        const { assert!(RERANK_MAX_CANDIDATES == RETRIEVAL_K_FUSED) };
+        const { assert!(REWRITE_MAX_ADDED >= 1) };
     }
 }

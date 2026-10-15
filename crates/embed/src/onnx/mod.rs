@@ -18,6 +18,7 @@
 
 pub(crate) mod audio;
 pub(crate) mod mel;
+pub mod rerank;
 pub(crate) mod session;
 pub(crate) mod text;
 pub(crate) mod vision;
@@ -36,6 +37,7 @@ use session::{AUDIO_FEATURES, IMAGE_FEATURES, MediaRows, OrtTextGraph, TextGraph
 use text::Tokens;
 use vision::{OrtVisionGraph, VisionGraph};
 
+pub use rerank::OnnxReranker;
 pub use session::{GraphPort, describe as describe_graph};
 
 /// Width of the feature rows the encoders produce and the text graph takes.

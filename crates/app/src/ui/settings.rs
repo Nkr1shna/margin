@@ -10,9 +10,9 @@ use margin_shared::pipeline::{
 };
 use margin_shared::{
     CLAUDE_LISTED_MODELS, ChatGptStatus, Device, EmbeddingModel, EmbeddingModelState, Event,
-    FOLDER_FILE_TYPES_TEXT, Id, ModelInfo, Provider, ReasoningEffort, ReindexProgress, RouteModels,
-    SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind, SpeechModel, TRACE_RETENTION_DAYS,
-    ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
+    FOLDER_FILE_TYPES_TEXT, Id, ModelInfo, Provider, ReasoningEffort, ReindexProgress,
+    RerankerModelState, RouteModels, SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind,
+    SpeechModel, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
 };
 
 use crate::config::{APP_NAME, Appearance, PINNED_SERVICE_URL, normalize_service_url};
@@ -661,7 +661,9 @@ pub fn slot_help(route: Route) -> &'static str {
     match route {
         Route::Chat => "Answers in chats and uses the agent's tools.",
         Route::Write => "Writes lessons, video scenes and course outlines.",
-        Route::Small => "Names chats and condenses long ones.",
+        Route::Small => {
+            "Names chats and condenses long ones. Small tasks also runs query rewriting and reranking when the pipeline uses them."
+        }
     }
 }
 
@@ -1616,6 +1618,7 @@ pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
     vec![
         ("Chunker", cfg.chunker.name.clone()),
         ("Embedder", cfg.embedder.name.clone()),
+        ("Rewriter", cfg.rewriter.name.clone()),
         ("Retriever", cfg.retriever.name.clone()),
         ("Fusion", cfg.fusion.name.clone()),
         ("Reranker", cfg.reranker.name.clone()),
@@ -1630,6 +1633,7 @@ pub fn stage_label(kind: &str) -> &'static str {
     match kind {
         "chunker" => "Chunker",
         "embedder" => "Embedder",
+        "rewriter" => "Rewriter",
         "retriever" => "Retriever",
         "fusion" => "Fusion",
         "reranker" => "Reranker",
@@ -1648,9 +1652,14 @@ pub fn stage_help(kind: &str) -> &'static str {
         "embedder" => {
             "The model passages are embedded with. It is set in the service's config (embedder in service.toml), not here; changing it there re-indexes every source once."
         }
+        "rewriter" => {
+            "Extra phrasings of a query, tried beside it. small-expand-v1 asks the model for small tasks for them."
+        }
         "retriever" => "How passages are found: by meaning, by words, or both.",
         "fusion" => "How the meaning and word results are merged into one list.",
-        "reranker" => "Whether the merged list is reordered before packing.",
+        "reranker" => {
+            "Whether the merged list is reordered before packing. listwise-small asks the model for small tasks; onnx-crossencoder runs the reranker model (Settings → Sources)."
+        }
         "packer" => "How the best passages are chosen to fit the budget below.",
         "prompts" => "The version of the instructions lessons and outlines are written with.",
         _ => "",
@@ -1816,12 +1825,23 @@ fn StageForm(cfg: PipelineConfig, variants: PipelineVariants, saved_note: Signal
                             selected: current.as_deref() == Some(v.name.as_str()),
                             disabled: v.unavailable.is_some(),
                             title: v.unavailable.clone().unwrap_or_default(),
-                            if v.unavailable.is_some() { "{v.name} (not on this service)" } else { "{v.name}" }
+                            if v.unavailable.is_some() { "{v.name} (unavailable)" } else { "{v.name}" }
                         }
                     }
                 }
                 span { id: "pl-variant-help", class: "faint", style: "font-size: 13px",
                     "Sets every stage at once, as the evals compare them. The models above and the budget below stay."
+                }
+                if named.iter().any(|v| v.unavailable.is_some()) {
+                    ul { class: "faint variant-why", style: "font-size: 13px; margin: 0; padding-left: 18px; overflow-wrap: anywhere",
+                        "aria-label": "Unavailable variants",
+                        for v in named.iter().filter(|v| v.unavailable.is_some()) {
+                            li { key: "{v.name}",
+                                span { class: "mono", "{v.name}" }
+                                ": {v.unavailable.clone().unwrap_or_default()}"
+                            }
+                        }
+                    }
                 }
             }
             div { class: "grid2",
@@ -2245,6 +2265,9 @@ fn SourcesSection() -> Element {
         if let Some(speech) = app.lib.read().embedding.as_ref().and_then(|m| m.speech.clone()) {
             SpeechModelSection { speech }
         }
+        if let Some(reranker) = app.lib.read().embedding.as_ref().and_then(|m| m.reranker.clone()) {
+            RerankerModelSection { reranker }
+        }
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the embedding model?",
@@ -2395,6 +2418,120 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
                     let Some(api) = app.api() else { return };
                     busy.set(true);
                     apply_model(app, error, api.delete_speech().await);
+                    busy.set(false);
+                    confirm_remove.set(false);
+                },
+            }
+        }
+    }
+}
+
+/// What the reranker model row says of its state.
+pub fn reranker_status(state: &EmbeddingModelState) -> String {
+    match state {
+        EmbeddingModelState::NotDownloaded { .. } => {
+            "Not downloaded; the onnx-crossencoder variant needs it".to_string()
+        }
+        EmbeddingModelState::Downloading { .. } => "Downloading…".to_string(),
+        EmbeddingModelState::Ready { bytes } => format!("Ready · {} on disk", human_bytes(*bytes)),
+        EmbeddingModelState::Failed { .. } => "Download failed".to_string(),
+    }
+}
+
+/// The cross-encoder the `onnx-crossencoder` reranker runs (R2, a Linux service): its
+/// name, size, download progress and removal (`EmbeddingModel.reranker`).
+#[component]
+fn RerankerModelSection(reranker: RerankerModelState) -> Element {
+    let app = use_app();
+    let mut busy = use_signal(|| false);
+    let error = use_signal(|| None::<String>);
+    let mut confirm_remove = use_signal(|| false);
+    let download = move || async move {
+        let Some(api) = app.api() else { return };
+        busy.set(true);
+        apply_model(app, error, api.download_reranker().await);
+        busy.set(false);
+    };
+    // Removing the model the saved pipeline reranks with is allowed, but said.
+    let in_use = app
+        .lib
+        .read()
+        .settings
+        .as_ref()
+        .is_some_and(|s| s.pipeline.reranker.name == "onnx-crossencoder");
+    let remove_message = if in_use {
+        "Its files are deleted from the service. Your pipeline reranks with it now: until you download it again, pick another reranker in Settings → AI."
+    } else {
+        "Its files are deleted from the service. The onnx-crossencoder reranker can't be picked until you download it again."
+    };
+    rsx! {
+        section { class: "set-sec", "aria-label": "Reranker model",
+            h2 { "Reranker model" }
+            p { class: "help",
+                "A small cross-encoder that runs on the service and reorders the passages a search finds by how well each answers the question. Only the onnx-crossencoder reranker uses it (the rerank-xenc variant, Settings → AI → Pipeline)."
+            }
+            div { class: "kv",
+                span { "Model" }
+                span { class: "mono", "{reranker.name}" }
+                span { "From" }
+                span { class: "mono", style: "overflow-wrap: anywhere", "{reranker.repo}" }
+                span { "Runs on" }
+                span { "ONNX Runtime, on the CPU" }
+                span { "Size" }
+                span {
+                    match &reranker.state {
+                        EmbeddingModelState::NotDownloaded { download_bytes } => human_bytes(*download_bytes),
+                        EmbeddingModelState::Downloading { total, .. } => human_bytes(*total),
+                        EmbeddingModelState::Ready { bytes } => human_bytes(*bytes),
+                        EmbeddingModelState::Failed { .. } => "—".to_string(),
+                    }
+                }
+                span { "Status" }
+                span { {reranker_status(&reranker.state)} }
+            }
+            match reranker.state.clone() {
+                EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                    div { class: "row-actions",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: *busy.read(),
+                            onclick: move |_| download(),
+                            if *busy.read() { span { class: "spinner" } }
+                            "Download · {human_bytes(download_bytes)}"
+                        }
+                        span { class: "faint", style: "font-size: 13px", "Downloads once, from Hugging Face." }
+                    }
+                },
+                EmbeddingModelState::Downloading { received, total } => rsx! {
+                    Progress { received, total, label: "Downloading the reranker model".to_string() }
+                },
+                EmbeddingModelState::Ready { .. } => rsx! {
+                    div { class: "row-actions",
+                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
+                    }
+                },
+                EmbeddingModelState::Failed { error: message } => rsx! {
+                    ErrorNotice {
+                        message: "The download failed. {message}",
+                        on_retry: move |_| { spawn(download()); },
+                    }
+                },
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+        }
+        if *confirm_remove.read() {
+            ConfirmDialog {
+                title: "Remove the reranker model?",
+                message: remove_message,
+                confirm_label: "Remove model",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_remove.set(false),
+                on_confirm: move |_| async move {
+                    let Some(api) = app.api() else { return };
+                    busy.set(true);
+                    apply_model(app, error, api.delete_reranker().await);
                     busy.set(false);
                     confirm_remove.set(false);
                 },
@@ -3411,6 +3548,7 @@ mod tests {
             state: EmbeddingModelState::Ready { bytes: 1_000 },
             speech: None,
             reindex: None,
+            reranker: None,
         };
         let html = sources(mac.clone());
         assert!(html.contains("<h2>Embedding model</h2>"), "{html}");
@@ -3739,10 +3877,22 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"<option value="hybrid""#));
-        let listwise = html.find(r#"<option value="listwise""#).unwrap();
-        let tag = &html[listwise..listwise + html[listwise..].find('>').unwrap()];
+        let xenc = html.find(r#"<option value="rerank-xenc""#).unwrap();
+        let tag = &html[xenc..xenc + html[xenc..].find('>').unwrap()];
         assert!(tag.contains("disabled"), "{tag}");
-        assert!(html.contains("listwise (not on this service)"));
+        assert!(html.contains("rerank-xenc (unavailable)"));
+        // Why, under the picker.
+        assert!(
+            html.contains(r#"aria-label="Unavailable variants""#),
+            "{html}"
+        );
+        assert!(html.contains("download the reranker model in Settings → Sources first"));
+        // R2's model-backed variants the service can build are offered.
+        for name in ["rerank-small", "rewrite-small", "r2-full"] {
+            let at = html.find(&format!(r#"<option value="{name}""#)).unwrap();
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(!tag.contains("disabled"), "{tag}");
+        }
         assert!(!html.contains(">Custom<"));
         // A picker per stage with every registered name, the current one chosen.
         for kind in STAGE_KINDS {
@@ -3839,6 +3989,126 @@ mod tests {
         // The picker's key ignores routes and budget.
         assert_eq!(stages_key(&saved), stages_key(&PipelineConfig::default()));
         assert_ne!(stages_key(&saved), stages_key(&draft));
+
+        // The Rewriter (R2): its choices, and picking one sends it with the rest kept.
+        let opts = stage_options("rewriter", "none", &variants);
+        assert_eq!(
+            opts.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+            ["none", "small-expand-v1"]
+        );
+        let rewrite = saved.with_stage("rewriter", "small-expand-v1");
+        assert_eq!(current_variant(&rewrite, &variants), None);
+        let sent = stages_patch(&saved, &rewrite).unwrap().pipeline.unwrap();
+        assert_eq!(sent.rewriter.name, "small-expand-v1");
+        assert_eq!(
+            (sent.budget, sent.routes.clone()),
+            (saved.budget, saved.routes.clone())
+        );
+        assert_ne!(sent.hash(), saved.hash());
+        // rewrite-small's stages are the variant's.
+        let small = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rewrite-small")
+            .unwrap();
+        let picked = saved.with_stages_of(&small.config);
+        assert_eq!(
+            current_variant(&picked, &variants).map(|v| v.name.as_str()),
+            Some("rewrite-small")
+        );
+        assert_eq!(picked.rewriter.params["max_added"], 2);
+        assert!(pipeline_rows(&picked).contains(&("Rewriter", "small-expand-v1".to_string())));
+    }
+
+    #[test]
+    fn the_small_tasks_slot_says_it_rewrites_and_reranks() {
+        assert!(
+            slot_help(Route::Small).contains("Small tasks also runs query rewriting and reranking")
+        );
+        assert_eq!(stage_label("rewriter"), "Rewriter");
+        assert!(stage_help("rewriter").starts_with("Extra phrasings of a query, tried beside it."));
+        assert!(STAGE_KINDS.contains(&"rewriter"));
+    }
+
+    #[test]
+    fn sources_pane_shows_the_reranker_model() {
+        use crate::fake::{RERANKER_DOWNLOAD_BYTES, RERANKER_NAME, RERANKER_REPO};
+        use crate::store::LibraryState;
+        let sources = |reranker: Option<EmbeddingModelState>, pipeline: Option<PipelineConfig>| {
+            let mut lib = LibraryState::from_library(crate::fake::sample_library());
+            let mut settings = crate::fake::FakeState::new().settings;
+            if let Some(p) = pipeline {
+                settings.pipeline = p;
+            }
+            lib.settings = Some(settings);
+            lib.embedding = Some(EmbeddingModel {
+                repo: crate::fake::EMBEDDING_REPO.into(),
+                state: EmbeddingModelState::Ready { bytes: 1_000 },
+                speech: None,
+                reindex: None,
+                reranker: reranker.map(|state| RerankerModelState {
+                    name: RERANKER_NAME.into(),
+                    repo: RERANKER_REPO.into(),
+                    state,
+                }),
+            });
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Sources))
+        };
+        // A service that offers none: no row.
+        assert!(!sources(None, None).contains("Reranker model"));
+
+        let size = human_bytes(RERANKER_DOWNLOAD_BYTES);
+        let html = sources(
+            Some(EmbeddingModelState::NotDownloaded {
+                download_bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(html.contains("<h2>Reranker model</h2>"), "{html}");
+        assert!(html.contains(RERANKER_NAME) && html.contains(RERANKER_REPO));
+        assert!(html.contains("Not downloaded; the onnx-crossencoder variant needs it"));
+        assert!(html.contains(&format!(">{size}<")), "{html}");
+        assert!(html.contains(&format!("Download · {size}")), "{html}");
+
+        let html = sources(
+            Some(EmbeddingModelState::Downloading {
+                received: RERANKER_DOWNLOAD_BYTES / 2,
+                total: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(
+            html.contains(r#"aria-label="Downloading the reranker model""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-valuenow="50""#), "{html}");
+        assert!(!html.contains("Download ·"));
+
+        let html = sources(
+            Some(EmbeddingModelState::Ready {
+                bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(html.contains(&format!("Ready · {size} on disk")), "{html}");
+        // The embedding model's Remove and the reranker's.
+        assert_eq!(html.matches("Remove…").count(), 2, "{html}");
+
+        let html = sources(
+            Some(EmbeddingModelState::Failed {
+                error: "Hugging Face answered 503.".into(),
+            }),
+            None,
+        );
+        assert!(
+            html.contains("The download failed. Hugging Face answered 503."),
+            "{html}"
+        );
+        assert!(html.contains(">Try again<"));
+        assert_eq!(
+            reranker_status(&EmbeddingModelState::Failed { error: "x".into() }),
+            "Download failed"
+        );
     }
 
     #[test]
