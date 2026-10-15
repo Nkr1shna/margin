@@ -387,7 +387,7 @@ pub async fn tick(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<Vec<Al
     };
     let counter = state.http_errors.load(std::sync::atomic::Ordering::Relaxed);
     let events = {
-        let mut alerts = state.alerts.lock().unwrap();
+        let mut alerts = state.alerts.lock().unwrap_or_else(|e| e.into_inner());
         let http_5xx = alerts.http_5xx_in_window(now, window(cfg), counter);
         let m = Measures {
             kinds,
@@ -527,12 +527,17 @@ pub async fn run(state: AppState) {
 
 /// The alerts active now.
 pub fn active(state: &AppState) -> Vec<Alert> {
-    state.alerts.lock().unwrap().active.clone()
+    state
+        .alerts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+        .clone()
 }
 
 /// `GET routes::ALERTS`: the active alerts and the last rises and clears, newest first.
 pub async fn get_alerts(State(state): State<AppState>) -> AppResult<Json<AlertList>> {
-    let alerts = state.alerts.lock().unwrap();
+    let alerts = state.alerts.lock().unwrap_or_else(|e| e.into_inner());
     Ok(Json(AlertList {
         active: alerts.active.clone(),
         recent: alerts.recent.iter().rev().cloned().collect(),

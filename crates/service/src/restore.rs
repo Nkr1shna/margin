@@ -595,6 +595,39 @@ pub fn prune_backups(backups: &Path, keep: usize) -> std::io::Result<Vec<PathBuf
     Ok(removed)
 }
 
+/// How recent a checked `before-schema-<n>` backup must be for a start to reuse it
+/// instead of making another: the restarts of a start that failed after its backup
+/// (systemd retries every few seconds), not a later start on data restored since.
+pub const MIGRATION_BACKUP_REUSE: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+
+/// The newest backup in `backups` named `<date-time>-<label>` that holds `data/` and
+/// is `CHECKED`, made at most `MIGRATION_BACKUP_REUSE` before `now` (by its name's
+/// stamp, local time); `None` when there is none.
+pub fn checked_backup(
+    backups: &Path,
+    label: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<PathBuf> {
+    let suffix = format!("-{label}");
+    let mut names: Vec<String> = std::fs::read_dir(backups)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| is_backup_name(n) && n.ends_with(&suffix) && n.len() == 17 + suffix.len())
+        .collect();
+    names.sort();
+    names.into_iter().rev().find_map(|name| {
+        let stamp = chrono::NaiveDateTime::parse_from_str(&name[..17], "%Y-%m-%d-%H%M%S")
+            .ok()?
+            .and_local_timezone(chrono::Local)
+            .single()?;
+        let age = now.signed_duration_since(stamp);
+        let recent = age >= chrono::TimeDelta::zero() && age <= MIGRATION_BACKUP_REUSE;
+        let dir = backups.join(&name);
+        (recent && dir.join("data").is_dir() && dir.join(CHECKED_MARKER).is_file()).then_some(dir)
+    })
+}
+
 /// The backups folder of a data folder: `<data_dir>/../backups`.
 pub fn backups_dir(data_dir: &Path) -> PathBuf {
     data_dir
@@ -654,8 +687,18 @@ pub async fn backup_data(
     let marker = dest.join(format!("{CHECKED_MARKER}.partial"));
     std::fs::write(&marker, check.report(&data))?;
     std::fs::rename(&marker, dest.join(CHECKED_MARKER))?;
-    for old in prune_backups(&backups, keep)? {
-        tracing::info!("removed the old backup {} (keeping {keep})", old.display());
+    // The backup is complete and checked: an old copy that won't go is a warning, not
+    // a failed backup (a start waiting on this backup must not fail over it).
+    match prune_backups(&backups, keep) {
+        Ok(removed) => {
+            for old in removed {
+                tracing::info!("removed the old backup {} (keeping {keep})", old.display());
+            }
+        }
+        Err(e) => tracing::warn!(
+            "couldn't prune the old backups in {}: {e}",
+            backups.display()
+        ),
     }
     Ok(dest)
 }
@@ -728,16 +771,31 @@ pub async fn open_guarded(config: &Config) -> anyhow::Result<(Store, Option<Path
         SchemaGuard::Fresh | SchemaGuard::Current => None,
         SchemaGuard::Newer(v) => bail!("{}", newer_data_message(v)),
         SchemaGuard::Older(v) => {
-            tracing::info!(
-                "this data is at schema {v} and this build at {}: backing it up before \
-                 migrating",
-                db::SCHEMA_VERSION
-            );
-            let dir = backup(config, Some(&migration_label())).await.context(
-                "the backup before the schema migration failed, so nothing was migrated",
-            )?;
-            tracing::info!("backed up to {}", dir.display());
-            Some(dir)
+            let label = migration_label();
+            // A start that failed after this backup (a bad DEFINE, a store that won't
+            // open) is retried by systemd: one checked copy is enough, or each attempt
+            // would add a copy and the keep rule would prune the good backups away.
+            if let Some(dir) =
+                checked_backup(&backups_dir(&config.data_dir), &label, chrono::Local::now())
+            {
+                tracing::info!(
+                    "this data is at schema {v} and this build at {}: already backed up to {}",
+                    db::SCHEMA_VERSION,
+                    dir.display()
+                );
+                Some(dir)
+            } else {
+                tracing::info!(
+                    "this data is at schema {v} and this build at {}: backing it up before \
+                     migrating",
+                    db::SCHEMA_VERSION
+                );
+                let dir = backup(config, Some(&label)).await.context(
+                    "the backup before the schema migration failed, so nothing was migrated",
+                )?;
+                tracing::info!("backed up to {}", dir.display());
+                Some(dir)
+            }
         }
     };
     let store = Store::open(&db_dir).await?;
@@ -1133,7 +1191,67 @@ mod data_tests {
         let (store, again) = open_guarded(&config).await.unwrap();
         assert_eq!(again, None);
         drop(store);
+        assert_eq!(entries(&root.0.join(BACKUPS_DIR)), vec![backup.clone()]);
+        wait_released(&config.db_dir()).await.unwrap();
+
+        // A start that failed after its backup is retried (systemd): still older, the
+        // checked backup just made is reused, not copied again.
+        run(
+            &config.db_dir(),
+            "UPDATE settings:main UNSET doc.schema_version",
+            vec![],
+        )
+        .await;
+        let (store, reused) = open_guarded(&config).await.unwrap();
+        assert_eq!(reused, Some(backup.clone()));
+        drop(store);
         assert_eq!(entries(&root.0.join(BACKUPS_DIR)), vec![backup]);
+    }
+
+    /// `checked_backup` wants the label, `data/`, `CHECKED` and a recent stamp.
+    #[test]
+    fn a_recent_checked_migration_backup_is_found() {
+        use chrono::TimeZone;
+        let root = root();
+        let backups = root.0.join(BACKUPS_DIR);
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 14, 12, 0, 0)
+            .unwrap();
+        let make = |name: &str, data: bool, checked: bool| {
+            let dir = backups.join(name);
+            std::fs::create_dir_all(dir.join(if data { "data" } else { "x" })).unwrap();
+            if checked {
+                std::fs::write(dir.join(CHECKED_MARKER), "ok\n").unwrap();
+            }
+            dir
+        };
+        assert_eq!(checked_backup(&backups, "before-schema-2", now), None);
+        make("2026-10-14-113000-before-schema-2", true, false);
+        make("2026-10-14-114000-before-schema-2", false, true);
+        make("2026-10-14-115000-before-schema-2-extra", true, true);
+        make("2026-10-14-115500", true, true);
+        assert_eq!(checked_backup(&backups, "before-schema-2", now), None);
+        let old = make("2026-10-14-010000-before-schema-2", true, true);
+        assert_eq!(checked_backup(&backups, "before-schema-2", now), None);
+        let good = make("2026-10-14-100000-before-schema-2", true, true);
+        assert_eq!(
+            checked_backup(&backups, "before-schema-2", now),
+            Some(good.clone())
+        );
+        // The newest recent one wins; a stamp in the future doesn't count.
+        let newer = make("2026-10-14-115900-before-schema-2", true, true);
+        make("2026-10-14-130000-before-schema-2", true, true);
+        assert_eq!(
+            checked_backup(&backups, "before-schema-2", now),
+            Some(newer)
+        );
+        // Earlier in the day, every backup above is in the future except none at all.
+        let early = chrono::Local
+            .with_ymd_and_hms(2026, 10, 14, 0, 30, 0)
+            .unwrap();
+        assert_eq!(checked_backup(&backups, "before-schema-2", early), None);
+        assert!(old.is_dir());
+        assert_eq!(checked_backup(&backups, "before-schema-3", now), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

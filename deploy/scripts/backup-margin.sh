@@ -120,6 +120,14 @@ fi
 mv "$dest/data.partial" "$dest/data"
 echo "Backed up $data_dir to $dest/data ($(du -sh "$dest/data" | cut -f1))."
 
+# The copy is complete: the check and the pruning below read only the copy, so the
+# service needn't stay down for them (the EXIT trap stays as the safety net).
+if [ "$restart_after" = 1 ]; then
+  echo "Starting the service again."
+  $sudo_cmd systemctl start margin-service.service
+  restart_after=0
+fi
+
 if [ "$check" = 1 ]; then
   # check-data opens a copy of the copy, never the backup itself.
   if "$service_bin" check-data "$dest/data" > "$dest/CHECKED.partial" 2>&1; then
@@ -138,12 +146,16 @@ if [ "$keep" -gt 0 ]; then
   ls -1 "$backups" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' | sort -r | tail -n +"$((keep + 1))" |
     while IFS= read -r old; do
       [ -d "$backups/$old/data" ] || continue
-      rm -rf "${backups:?}/$old"
-      echo "Removed the old backup $backups/$old (keeping $keep)."
+      # The backup above is complete and checked: an old copy that won't go is a
+      # warning, not a failed backup.
+      if rm -rf "${backups:?}/$old"; then
+        echo "Removed the old backup $backups/$old (keeping $keep)."
+      else
+        echo "backup-margin: couldn't remove the old backup $backups/$old" >&2
+      fi
     done
 fi
 
-[ "$restart_after" = 1 ] && echo "Starting the service again."
 echo "To restore: stop the service, move $data_dir aside, copy $dest/data back to it, start the service."
 # The path of this backup, last, for deploy.sh.
 echo "BACKUP=$dest"

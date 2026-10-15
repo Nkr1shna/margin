@@ -43,6 +43,14 @@ for a in "$@"; do
     *) [ -z "$name" ] || die "one backup name at most"; name="$a" ;;
   esac
 done
+# A named backup is a folder backup-margin.sh made (date, time, label): nothing that
+# could leave backups/ (`..`) or the quotes the ssh commands below wrap it in.
+case "$name" in
+  "") ;;
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]*) ;;
+  *) die "not a backup name: $name" ;;
+esac
+case "$name" in *[!A-Za-z0-9._-]*) die "not a backup name: $name" ;; esac
 check_allowed_env dev
 command -v jq >/dev/null 2>&1 || die "needs jq (brew install jq)"
 
@@ -90,6 +98,8 @@ fi
 [ -n "$name" ] || die "dev has no checked backup in $backups (backup-margin.sh --check makes one)"
 src="$backups/$name/data"
 [ -d "$src" ] || die "no $src"
+# Only a checked backup is trusted (docs/plan-deploy.md §5), named or not.
+[ -f "$backups/$name/CHECKED" ] || die "$backups/$name has no CHECKED marker (backup-margin.sh --check makes one)"
 : > "$report"
 log "Restore drill of dev, $stamp, backup $name ($(du -sh "$src" | cut -f1))"
 

@@ -475,7 +475,13 @@ impl Tool for FakeTool {
             if let Some(b) = &self.barrier {
                 b.wait().await;
             }
-            tokio::time::sleep(self.delay).await;
+            // Only a delayed tool yields to the timer: a tool without one ends in the
+            // same poll, so a slow and a fast tool end in a fixed order however busy
+            // the machine is (a zero sleep still waits for the next timer tick, which a
+            // loaded runner can reach after the slow tool's deadline).
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             self.log.push(format!("end {}", self.name));
             let mut out = ToolOutput::ok(self.output.clone(), format!("{} done", self.name));
             out.cards = self.cards.clone();

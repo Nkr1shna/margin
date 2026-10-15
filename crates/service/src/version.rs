@@ -70,7 +70,11 @@ pub fn info(environment: &str) -> VersionInfo {
 
 pub async fn get_version(State(state): State<AppState>) -> Json<VersionInfo> {
     let mut v = info(&state.config.environment);
-    (v.alerts_active, v.alerts_since) = state.alerts.lock().unwrap().summary();
+    (v.alerts_active, v.alerts_since) = state
+        .alerts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .summary();
     Json(v)
 }
 
