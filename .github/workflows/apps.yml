@@ -3,10 +3,11 @@
 # independently of the service's CD (build-service.yml), so a UI-only merge rebuilds only
 # the app and a service-only merge redeploys only the service:
 #
-#   a merge into dev      -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
+#   a merge into dev      -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-build"
 #   a merge into release  -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
 #   a v* tag              -> both environments, release named after the tag
-#   workflow_dispatch     -> workflow artifacts only, no release
+#   workflow_dispatch     -> on dev with "dev" / on release with "prod": publishes as above;
+#                            otherwise workflow artifacts only
 #
 # A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
 # the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
@@ -78,7 +79,13 @@ jobs:
                 both) environments='["prod","dev"]' ;;
                 *) echo "::error::unknown environment $CHOICE"; exit 1 ;;
               esac
-              release=none
+              # A manual run on dev (dev) or release (prod) publishes like a merge would, to
+              # republish without a new change; anything else keeps the workflow artifacts only.
+              case "$GITHUB_REF:$CHOICE" in
+                refs/heads/dev:dev) release=dev ;;
+                refs/heads/release:prod) release=prod ;;
+                *) release=none ;;
+              esac
               ;;
           esac
           case "$sha" in *[!0-9a-f]*|"") echo "::error::no deployed commit found (got '$sha')"; exit 1 ;; esac
@@ -189,10 +196,12 @@ jobs:
           EOF
           case "$KIND" in
             dev)
-              # One rolling pre-release that always holds the app for what dev runs now.
-              gh release delete dev-latest -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
-              gh release create dev-latest dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
-                --prerelease --title "Margin dev ($short)" --notes-file notes.md
+              # One rolling pre-release that always holds the app for what dev runs now. (Not
+              # "dev-latest": that tag name stays reserved because it was first published while
+              # the repository had immutable releases on.)
+              gh release delete dev-build -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+              gh release create dev-build dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
+                --prerelease --title "Margin Dev ($short)" --notes-file notes.md
               ;;
             prod)
               gh release create "prod-$short" dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
