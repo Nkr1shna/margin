@@ -647,6 +647,7 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
 async fn sources_wait_for_the_model_download() {
     let h = start_with(Setup {
         model_downloaded: false,
+        embedder: Some("coreml"),
         ..Setup::default()
     })
     .await;
@@ -714,6 +715,7 @@ async fn sources_wait_for_the_model_download() {
 async fn the_model_downloads_with_progress_and_can_be_deleted() {
     let h = start_with(Setup {
         model_downloaded: false,
+        embedder: Some("coreml"),
         ..Setup::default()
     })
     .await;
@@ -1641,6 +1643,7 @@ async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows(
     let h = start_with(Setup {
         store: Some(store),
         model_downloaded: false,
+        embedder: Some("coreml"),
         files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
         ..Setup::default()
     })
