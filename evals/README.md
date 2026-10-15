@@ -32,7 +32,7 @@ Two ways they run:
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
 | `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window. The service is `--service-url` (dev; prod is refused). |
 | `recorded/extracted.json` | What PDFKit/Vision read from each PDF and image (CI replays it; another macOS can't reproduce OCR byte for byte). |
-| `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. |
+| `recorded/embeddings-embeddinggemma-2-onnx-q8+title-prefix-v1.bin` | Real EmbeddingGemma 2 vectors (ONNX Runtime, 8-bit: the service's embedder) of every corpus chunk, picture and golden query; the CI gate replays it. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. Another backend records beside it under its own version (`live::recording_file`; Core ML's was `recorded/embeddings.bin`). |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
@@ -42,14 +42,22 @@ canary sets (10 trivial questions to reject, 5 serious ones to keep, 20 delibera
 lessons) are R1-ai's, in `margin_ai::evals`; the runner uses them through
 `crates/evals/src/ai_judge.rs`.
 
-## First run on the service Mac (before R1 is called done)
+## Recording and re-baselining
+
+The embeddings and the baseline need no service and no model key: only the ONNX model
+(download it with `margin-service download-model --embedder onnx-q8`, or anywhere and
+point `MARGIN_EMBED_MODEL_DIR` at it). On a Mac build with the `onnx` feature:
 
 ```sh
-cargo run -p margin-evals --bin margin-eval -- record-embeddings
-cargo run -p margin-evals --bin margin-eval -- record-generations
-cargo run -p margin-evals --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline
-git add evals/recorded evals/baseline.json   # then remove the `ignore` in crates/evals/tests/gates.rs
+export MARGIN_EVAL_EMBEDDER=onnx-q8 MARGIN_EMBED_MODEL_DIR=<model folder>
+cargo run -p margin-evals --features margin-embed/onnx --bin margin-eval -- record-embeddings --data <scratch>
+cargo run -p margin-evals --features margin-embed/onnx --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline --data <scratch>
+git add evals/recorded evals/baseline.json
 ```
+
+(`MARGIN_CONFIG` pointing at a scratch `service.toml` keeps the runner off the service's
+own config.) `record-generations` calls the writing model with the owner's key; until `recorded/generations/<prompt version>/` exists the CI
+citation gate is skipped and the rest gate.
 
 ## Run, compare, report
 
