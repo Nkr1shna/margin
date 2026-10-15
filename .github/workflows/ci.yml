@@ -14,18 +14,52 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Which platforms this PR touches, from its changed files (crate lists per `cargo
+  # metadata`). A job that's skipped counts as passed for the required checks, so a PR that
+  # only changes the service doesn't wait for the Mac, and an app-only PR doesn't wait for
+  # Linux. Manual runs check both.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.files.outputs.linux }}
+      macos: ${{ steps.files.outputs.macos }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "linux=true" >> "$GITHUB_OUTPUT"; echo "macos=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          linux=false
+          macos=false
+          for f in $(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
+            case "$f" in
+              crates/app/*) macos=true ;;
+              crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) linux=true; macos=true ;;
+              crates/*|deploy/ci/linux-ci.sh) linux=true ;;
+            esac
+          done
+          echo "linux=$linux macos=$macos"
+          echo "linux=$linux" >> "$GITHUB_OUTPUT"
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+
   # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
   # Linux build now (docs/plan-linux-service.md).
   linux:
     name: Linux
+    needs: changes
     # Same-repository pull requests only; never code from a fork on a self-hosted runner.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: needs.changes.outputs.linux == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, Linux, ARM64, margin]
     timeout-minutes: 90
     steps:
@@ -51,11 +85,12 @@ jobs:
       - name: Format, clippy, tests
         run: sh deploy/ci/linux-ci.sh
 
-  # The app (desktop, iOS) on the Mac host runner, and a check that the macOS backends of
-  # the service still build (the owner's Mac stays a full dev/eval box, plan Q8).
+  # The app (desktop, iOS) on the Mac host runner. (The service is a Linux build; its macOS
+  # backends are no longer checked here.)
   macos:
     name: macOS
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: changes
+    if: needs.changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, macOS, ARM64, margin]
     timeout-minutes: 90
     env:
@@ -86,5 +121,3 @@ jobs:
         run: cargo test --locked -p margin-app
       - name: iOS simulator check
         run: cargo check --locked -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
-      - name: macOS service still builds
-        run: cargo check --locked -p margin-service
