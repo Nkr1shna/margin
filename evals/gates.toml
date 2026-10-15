@@ -30,3 +30,19 @@ fallback_rate_max = 0.0
 # Every prompt's constant block hashes as evals/prompts.lock says under its version.
 [prompts]
 lock = true
+
+# L2 (docs/l2-brief.md D8): every golden query searched as every principal of
+# evals/access.toml, on the recorded vectors when committed, else the deterministic
+# FakeEmbedder (leakage is a property of the predicate, not of the vectors). Never
+# ignored: crates/evals/tests/gates.rs::access_gates.
+[access]
+# Hits a principal can't read, by the Rust oracle (the fixture and the expansion).
+leaks_max = 0
+# By-id reads that returned something the oracle forbids.
+by_id_leaks_max = 0
+# The owner's ranked ids equal the run without the conjuncts, to the id.
+owner_rank_identical = true
+# The filter removes, never reorders.
+rank_consistent = true
+# The owner's p95 over the unfiltered run's, same process.
+p95_latency_max_ratio = 1.5

@@ -35,7 +35,7 @@ use crate::engines::{
 };
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
-use crate::pipeline::Packed;
+use crate::pipeline::{Packed, Reader};
 use crate::principal::{CurrentPrincipal, Principal};
 use crate::retrieval::{self, QueryPlan};
 use crate::state::{
@@ -43,7 +43,7 @@ use crate::state::{
     new_id, readable,
 };
 use crate::trace::{self, SpanGuard};
-use crate::{db, sources, video};
+use crate::{audience, db, sources, video};
 
 pub const MAX_LESSONS: usize = 12;
 /// How often a streaming lesson's partial body is saved.
@@ -126,15 +126,17 @@ pub async fn propose_planned(
         return Err(AppError::bad_request("Say what the course is for."));
     }
     let outline = validate_outline(&outline)?;
-    match &request.parent_topic_id {
-        Some(parent) => {
-            library::own_topic(state, p, parent).await?;
-        }
+    // Where the course's lessons go: under the parent topic (its audience), else a new
+    // topic private to `p`.
+    let under = match &request.parent_topic_id {
+        Some(parent) => Some(audience::audience_of(
+            &library::own_topic(state, p, parent).await?,
+        )),
         None if outline.subject_title.is_empty() => {
             return Err(AppError::bad_request("Give the subject a title."));
         }
-        None => {}
-    }
+        None => None,
+    };
     check_sources(state, p, &mut request).await?;
     let mut outline = outline;
     let workspaces = match state.store.get::<Chat>(db::CHAT, chat_id).await? {
@@ -144,14 +146,27 @@ pub async fn propose_planned(
     let wanted = survey.unwrap_or(!request.source_ids.is_empty() || !workspaces.is_empty());
     let mut plan = None;
     let mut written_with = None;
+    let mut surveyed = Vec::new();
     if wanted {
         let trace_id = trace_id.map_or_else(new_id, str::to_string);
-        match plan_course(state, &request, &outline, &workspaces, chat_id, &trace_id).await {
-            Ok(Some((p, with))) => match validate_outline(&p.outline()) {
+        let reader = Reader::of(p);
+        match plan_course(
+            state,
+            &reader,
+            &request,
+            &outline,
+            &workspaces,
+            chat_id,
+            &trace_id,
+        )
+        .await
+        {
+            Ok(Some((p, with, survey))) => match validate_outline(&p.outline()) {
                 Ok(planned) => {
                     outline = planned;
                     plan = Some(p);
                     written_with = Some(with);
+                    surveyed = audience::documents_of(survey.iter().flat_map(|s| &s.hits), None);
                 }
                 Err(e) => tracing::warn!("the planned outline isn't usable: {}", e.message),
             },
@@ -160,6 +175,16 @@ pub async fn propose_planned(
         }
     }
     request.lesson_count = outline.lessons.len() as u32;
+    // Whether the surveyed documents would make the course's lessons private to `p`
+    // under the topic they go to (L2 D4): the Outline card says so before it's accepted.
+    let audience_narrowed = match &under {
+        Some(under) => {
+            audience::derive_under(state, &p.person_id, under, &surveyed)
+                .await?
+                .narrowed
+        }
+        None => false,
+    };
     // The proposal is `p`'s, private to them, like the chat it was made in (D6).
     let own = Ownership::private(p);
     let proposal = Proposal {
@@ -173,6 +198,7 @@ pub async fn propose_planned(
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
         written_with,
+        audience_narrowed,
     };
     let stored = StoredProposal {
         proposal: proposal.clone(),
@@ -437,6 +463,7 @@ pub async fn accept_proposal(
                     created_at: now,
                     updated_at: now,
                     written_with: None,
+                    audience_narrowed: false,
                 },
                 proposal_id: Some(proposal.id.clone()),
                 previous_body: None,
@@ -445,6 +472,7 @@ pub async fn accept_proposal(
                 prompt: None,
                 with_quiz: false,
                 workspace_ids: stored.workspace_ids.clone(),
+                drew_on: Vec::new(),
             };
             state.store.put(db::LESSON, &row.lesson.id, &row).await?;
             lesson_ids.push(row.lesson.id.clone());
@@ -578,6 +606,7 @@ pub async fn append_lesson(state: &AppState, p: &Principal, req: NewLesson) -> A
                 created_at: now,
                 updated_at: now,
                 written_with: None,
+                audience_narrowed: false,
             },
             proposal_id: None,
             previous_body: None,
@@ -586,6 +615,7 @@ pub async fn append_lesson(state: &AppState, p: &Principal, req: NewLesson) -> A
             prompt,
             with_quiz: req.with_quiz,
             workspace_ids: req.workspace_ids.clone(),
+            drew_on: Vec::new(),
         };
         state.store.put(db::LESSON, &row.lesson.id, &row).await?;
         row.lesson
@@ -744,12 +774,13 @@ async fn lesson_passages(
         }
         let scope = Scope::Union { scopes };
         retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
+        let reader = topic_owner_reader(state, lesson).await?;
         let pipeline = state.pipeline.load_full();
         let window = retrieval::route_window(state, Route::Write, None).await?;
         let req = retrieval::Request {
             plan,
             scope,
-            access: None,
+            reader,
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
@@ -769,6 +800,21 @@ async fn lesson_passages(
             Vec::new()
         }
     }
+}
+
+/// Who a lesson job reads as (L2 D1): the topic owner's access at the time the job
+/// runs (the lesson is theirs); the lesson's own owner when the topic is gone, the
+/// bootstrap owner before `people-v1`.
+async fn topic_owner_reader(state: &AppState, lesson: &Lesson) -> anyhow::Result<Reader> {
+    let topic: Option<Topic> = state.store.get(db::TOPIC, &lesson.topic_id).await?;
+    let owner = topic
+        .and_then(|t| t.owner)
+        .or_else(|| lesson.owner.clone())
+        .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string());
+    let p = crate::state::person_principal(state, &owner)
+        .await
+        .map_err(|e| anyhow::anyhow!("couldn't read who owns the lesson: {}", e.message))?;
+    Ok(Reader::of(&p))
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +863,7 @@ const SURVEY_QUERY_CHARS: usize = 500;
 /// as retrieval traced them). `None` when the course has nothing to survey.
 pub async fn survey(
     state: &AppState,
+    reader: &Reader,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
@@ -844,7 +891,7 @@ pub async fn survey(
     let mut contents = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for key in &resolved.keys {
-        let Some(info) = retrieval::doc_info(&state.store, key).await? else {
+        let Some(info) = retrieval::doc_info(&state.store, reader, key).await? else {
             continue;
         };
         if !seen.insert(info.document_id.clone()) {
@@ -852,6 +899,7 @@ pub async fn survey(
         }
         let first = retrieval::read_passages(
             &state.store,
+            reader,
             &info.document_id,
             retrieval::Selector::Ords { from: 0, to: 0 },
             1,
@@ -862,7 +910,7 @@ pub async fn survey(
         };
         queries.push(first.text.chars().take(SURVEY_QUERY_CHARS).collect());
         let mut sections: Vec<String> = Vec::new();
-        for s in retrieval::document_outline(&state.store, &info.document_id).await? {
+        for s in retrieval::document_outline(&state.store, reader, &info.document_id).await? {
             if !s.section_path.is_empty() && !sections.contains(&s.section_path) {
                 sections.push(s.section_path);
             }
@@ -879,7 +927,7 @@ pub async fn survey(
         &retrieval::Request {
             plan: QueryPlan::from_strings(queries),
             scope,
-            access: None,
+            reader: reader.clone(),
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
@@ -907,16 +955,19 @@ pub async fn survey(
 /// Surveys the course's sources and folders and asks the planner (the writing route,
 /// `Generator::plan_course`) for the outline with per-lesson questions and sections.
 /// `Ok(None)` when there is nothing to survey or the planner's answer doesn't fit the
-/// draft (the call is traced as failed). The plan comes with what wrote it.
+/// draft (the call is traced as failed). The plan comes with what wrote it and the
+/// survey it was planned from.
 pub async fn plan_course(
     state: &AppState,
+    reader: &Reader,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
     chat_id: &str,
     trace_id: &str,
-) -> anyhow::Result<Option<(CoursePlan, WrittenWith)>> {
-    let Some((req, _survey)) = survey(state, request, draft, workspaces, trace_id).await? else {
+) -> anyhow::Result<Option<(CoursePlan, WrittenWith, Vec<Packed>)>> {
+    let Some((req, survey)) = survey(state, reader, request, draft, workspaces, trace_id).await?
+    else {
         return Ok(None);
     };
     let ai = state
@@ -952,7 +1003,7 @@ pub async fn plan_course(
             call.row().usage = Some(trace::trace_usage(&usage));
             call.finish(true);
             let with = written_with(state, &ai, margin_ai::prompts::PLAN_VERSION);
-            Ok(Some((value, with)))
+            Ok(Some((value, with, survey)))
         }
         Err(e) => {
             call.fail(trace::ai_error_code(&e));
@@ -1008,6 +1059,11 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
     };
     let (row, ai) = row;
     let (ctx, proposal, retrieved) = lesson_context(state, &row).await?;
+    // The lesson's audience from its topic's and the passages it is written from (L2
+    // D4), set before a word streams so the deltas reach only its readers.
+    let Some((row, before)) = derive_audience(state, lesson_id, &retrieved).await? else {
+        return Ok(());
+    };
 
     let partial = Arc::new(Mutex::new(String::new()));
     let saver = tokio::spawn(save_partial_bodies(
@@ -1094,6 +1150,9 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
                     (Some(body), citations) => {
                         row.lesson.body_md = body;
                         row.lesson.citations = citations.unwrap_or_default();
+                        // The previous body was written from other passages: its
+                        // readers are those of both audiences.
+                        restore_audience(&mut row, &before);
                     }
                     (None, _) => {
                         let streamed = partial.lock().unwrap().clone();
@@ -1110,6 +1169,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         row.previous_citations = None;
         row.lesson.updated_at = Utc::now();
         state.store.put(db::LESSON, lesson_id, &row).await?;
+        audience::restamp_library_locked(state, LibraryKind::Lesson, lesson_id).await?;
         row.lesson
     };
     state.emit_lesson(&lesson);
@@ -1128,6 +1188,85 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         );
     }
     Ok(())
+}
+
+/// Derives a lesson's audience from its topic's and the documents of `retrieved` (its
+/// own document left out) and stores it with what it drew on (L2 D4); the lesson's
+/// document follows. Answers the stored row and the audience it had (with what it drew
+/// on then), `None` when the lesson is gone. A lesson whose topic is gone keeps its
+/// audience.
+async fn derive_audience(
+    state: &AppState,
+    lesson_id: &str,
+    retrieved: &[Packed],
+) -> anyhow::Result<Option<(StoredLesson, Before)>> {
+    let own_doc = audience::lesson_document_id(state, lesson_id).await?;
+    let (row, before, events) = {
+        let _w = state.write_lock.lock().await;
+        let Some(mut row) = state
+            .store
+            .get::<StoredLesson>(db::LESSON, lesson_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let before = Before {
+            audience: audience::audience_of(&row),
+            narrowed: row.lesson.audience_narrowed,
+            drew_on: row.drew_on.clone(),
+        };
+        let topic: Option<Topic> = state.store.get(db::TOPIC, &row.lesson.topic_id).await?;
+        let events = match topic {
+            Some(topic) => {
+                row.drew_on = audience::documents_of(
+                    retrieved.iter().flat_map(|p| &p.hits),
+                    own_doc.as_deref(),
+                );
+                let d =
+                    audience::derive_lesson(state, &row, &audience::audience_of(&topic)).await?;
+                let same = d.audience.access == row.lesson.access
+                    && d.audience.deny == row.lesson.deny
+                    && d.narrowed == row.lesson.audience_narrowed;
+                if same {
+                    // Nobody's view of it changes: what it drew on is the service's.
+                    state.store.put(db::LESSON, lesson_id, &row).await?;
+                    Vec::new()
+                } else {
+                    audience::apply_lesson_locked(state, &mut row, d).await?
+                }
+            }
+            None => Vec::new(),
+        };
+        (row, before, events)
+    };
+    state.emit_all(events);
+    Ok(Some((row, before)))
+}
+
+/// A lesson's audience before it was written again.
+struct Before {
+    audience: margin_shared::Audience,
+    narrowed: bool,
+    drew_on: Vec<Id>,
+}
+
+/// After a failed write that restored the previous body: the lesson is read by whoever
+/// reads both the previous audience and the new one (`derive` over the two), and it drew
+/// on both sets of documents.
+fn restore_audience(row: &mut StoredLesson, before: &Before) {
+    let creator = margin_shared::person_id(row.lesson.owner_id());
+    let d = margin_shared::derive(
+        &creator,
+        &[audience::audience_of(&*row), before.audience.clone()],
+    );
+    row.lesson.access = d.audience.access;
+    row.lesson.deny = d.audience.deny;
+    row.lesson.audience_narrowed |= before.narrowed;
+    for id in &before.drew_on {
+        if !row.drew_on.contains(id) {
+            row.drew_on.push(id.clone());
+        }
+    }
 }
 
 /// The retry policy of job calls: the agent loop's (`Turns.retry`, the one `Backoff`).

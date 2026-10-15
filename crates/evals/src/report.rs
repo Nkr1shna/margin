@@ -299,6 +299,104 @@ pub fn questions_section(grades: [usize; 4], hand: usize, kappa: Option<f64>) ->
     }
 }
 
+/// "Access" (L2 D8, `margin-eval run --suite access`): the gates against `[access]`, then
+/// each principal's hits, what the reader's conjuncts removed, and leaks.
+pub fn access_section(r: &crate::access::AccessReport, g: &crate::AccessGates) -> ReportSection {
+    let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
+    let pass = |ok: bool| if ok { "pass" } else { "FAIL" }.to_string();
+    let gates = Table {
+        title: "Gates ([access] in evals/gates.toml)".into(),
+        columns: ["Metric", "Value", "Gate", ""].map(String::from).to_vec(),
+        rows: vec![
+            vec![
+                "leaks".into(),
+                r.leaks.len().to_string(),
+                format!("≤ {}", g.leaks_max),
+                pass(r.leaks.len() as u64 <= u64::from(g.leaks_max)),
+            ],
+            vec![
+                "by_id_leaks".into(),
+                format!(
+                    "{} of {} forbidden pairs",
+                    r.by_id_leaks.len(),
+                    r.by_id_checked
+                ),
+                format!("≤ {}", g.by_id_leaks_max),
+                pass(r.by_id_leaks.len() as u64 <= u64::from(g.by_id_leaks_max)),
+            ],
+            vec![
+                "owner_rank_identical".into(),
+                format!(
+                    "{} ({} of {} queries differ)",
+                    yes_no(r.owner_rank_identical()),
+                    r.owner_mismatches.len(),
+                    r.queries
+                ),
+                yes_no(g.owner_rank_identical),
+                pass(!g.owner_rank_identical || r.owner_rank_identical()),
+            ],
+            vec![
+                "rank_consistent".into(),
+                format!(
+                    "{} ({} of {} searches reordered)",
+                    yes_no(r.rank_consistent()),
+                    r.rank_inconsistencies.len(),
+                    r.rank_checked
+                ),
+                yes_no(g.rank_consistent),
+                pass(!g.rank_consistent || r.rank_consistent()),
+            ],
+            vec![
+                "p95 latency, owner / unfiltered".into(),
+                format!(
+                    "{:.2}x ({:.2} / {:.2} ms)",
+                    r.latency_ratio(),
+                    r.owner_p95_ms,
+                    r.unfiltered_p95_ms
+                ),
+                format!("≤ {:.2}x", g.p95_latency_max_ratio),
+                pass(r.latency_ratio() <= g.p95_latency_max_ratio),
+            ],
+        ],
+    };
+    let mut principals = Table {
+        title: "By principal".into(),
+        columns: ["Principal", "Reads documents", "Hits", "Removed", "Leaks"]
+            .map(String::from)
+            .to_vec(),
+        rows: Vec::new(),
+    };
+    for p in &r.principals {
+        principals.rows.push(vec![
+            p.name.clone(),
+            format!("{} of {}", p.reads, r.documents),
+            p.hits.to_string(),
+            p.removed.to_string(),
+            p.leaks.to_string(),
+        ]);
+    }
+    let mut text = vec![format!(
+        "{} principals of evals/access.toml × {} golden queries over {} documents, vectors \
+         {}. A leak is a hit the principal can't read by the oracle (the fixture's audiences \
+         and the service's expansion, in Rust, independent of the SQL). The owner ({}, in \
+         every group) is searched through the reader and through the same statements without \
+         its conjuncts; their ranked ids must be equal.",
+        r.principals.len(),
+        r.queries,
+        r.documents,
+        r.embedder,
+        r.owner
+    )];
+    text.extend(r.leaks.iter().take(20).cloned());
+    text.extend(r.by_id_leaks.iter().take(20).cloned());
+    ReportSection {
+        heading: "Access".into(),
+        text,
+        tables: vec![gates, principals],
+        bars: Vec::new(),
+    }
+}
+
 /// "Injection": per provider, how many planted instructions the agent resisted
 /// (`docs/phase5-brief.md` D2, `margin-eval run --suite=injection`).
 pub fn injection_section(

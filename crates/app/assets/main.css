@@ -813,6 +813,40 @@ details.collapse[open] > summary .chev { transform: none; }
 .sb-account { display: flex; align-items: center; gap: 8px; min-width: 0; border: 0; background: none; padding: 4px 6px; margin-left: -6px; border-radius: var(--r-ctl); text-align: left; }
 .sb-account:hover { background: var(--hover); }
 .sb-account-name { font-size: 13px; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* ---------- audiences and the audit log (L2) ---------- */
+/* Who can read a row: one line wherever the row is, "Change…" for its owner. */
+.aud-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; color: var(--fg-2); min-width: 0; margin: 4px 0; }
+.aud-text { overflow-wrap: anywhere; min-width: 0; }
+.aud-under { padding: 0 0 6px 34px; min-width: 0; }
+.aud-narrowed { margin: 8px 0 12px; }
+.aud-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-2); white-space: nowrap; }
+/* The control: a dialog on computers, a sheet on phones (`.modal-scrim.sheet`). */
+.aud-dialog { width: min(560px, 100%); }
+.aud-pickers { display: grid; gap: 14px; min-width: 0; }
+.aud-pick .input { margin-bottom: 6px; width: 100%; }
+.aud-scroll { max-height: 220px; overflow: auto; display: grid; gap: 2px; min-width: 0; -webkit-overflow-scrolling: touch; }
+.aud-deny { display: grid; gap: 12px; min-width: 0; }
+.aud-deny > summary { cursor: pointer; font-size: 14px; color: var(--fg-2); min-height: 32px; display: flex; align-items: center; }
+.aud-now { font-size: 14px; color: var(--fg); overflow-wrap: anywhere; }
+.agent-docs { margin-top: 4px; min-width: 0; }
+.agent-docs > summary { cursor: pointer; font-size: 13px; color: var(--fg-2); min-height: 28px; display: flex; align-items: center; }
+.audit-filters { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.audit-table { display: grid; font-size: 13px; border-top: 1px solid var(--line); min-width: 0; }
+.audit-row { display: grid; grid-template-columns: 136px 128px 120px minmax(0, 1fr) minmax(0, 1.4fr); gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.audit-row > span { min-width: 0; overflow-wrap: anywhere; }
+.audit-head { font-weight: 500; color: var(--fg-2); }
+@media (max-width: 719px) {
+  /* Phones: one audit row is a small card of lines; the pickers get more height. */
+  .audit-row { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .audit-head { display: none; }
+  .audit-when { color: var(--fg-2); font-size: 12px; }
+  .aud-scroll { max-height: 40vh; }
+  .aud-under { padding-left: 0; }
+}
+@media (pointer: coarse) {
+  .aud-line .link-btn, .aud-deny > summary, .agent-docs > summary { min-height: 44px; }
+  .aud-dialog .check-row { min-height: 44px; }
+}
 @media (max-width: 719px) {
   /* Phones: a row's actions go under it, full width. */
   .org-row { flex-wrap: wrap; }

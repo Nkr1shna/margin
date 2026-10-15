@@ -9,8 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
-use margin_shared::SourceKind;
 use margin_shared::context::{ContextIngest, Document, Origin};
+use margin_shared::{Audience, SourceKind};
 
 use crate::client::Client;
 
@@ -51,14 +51,43 @@ pub fn resolve_kind(kind: Option<&str>, name: &str) -> anyhow::Result<(SourceKin
     Ok((SourceKind::Text, named))
 }
 
+/// The audience `--access` and `--deny` name (comma-separated groups, `person/<id>`,
+/// `agent/<id>`), checked as the service checks them (`margin_shared::validate`).
+/// `None` when neither is given: the service keeps the document private to its owner
+/// and the agent that wrote it (or, for a replacement, keeps the document's audience).
+pub fn parse_audience(
+    access: Option<&str>,
+    deny: Option<&str>,
+) -> anyhow::Result<Option<Audience>> {
+    if access.is_none() && deny.is_none() {
+        return Ok(None);
+    }
+    let list = |s: Option<&str>| -> Vec<String> {
+        s.unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let audience = Audience {
+        access: list(access),
+        deny: list(deny),
+    };
+    margin_shared::validate(&audience).map_err(|e| anyhow!(e))?;
+    Ok(Some(audience))
+}
+
 /// Adds one text document as `agent:<agent>`; a document of the same name by the same
-/// agent is replaced by the service.
+/// agent is replaced by the service. `audience` names who else reads it (`None`: the
+/// service's default, private to the owner and the agent).
 pub async fn ingest_text(
     client: &Client,
     agent: &str,
     name: &str,
     kind: Option<&str>,
     text: String,
+    audience: Option<Audience>,
 ) -> anyhow::Result<Document> {
     let name = name.trim();
     if name.is_empty() {
@@ -74,6 +103,7 @@ pub async fn ingest_text(
             origin: Origin::Agent { name: agent.into() },
             kind,
             text,
+            audience,
         })
         .await
 }
@@ -146,11 +176,13 @@ fn under(path: &str, roots: &[String]) -> bool {
 /// last commit that changed the file, with `-dirty` when the checkout differs from it.
 /// A file already in Margin under the same clean name is skipped; an older name of a
 /// file is deleted once the new one is in; a file that is no longer tracked under
-/// `paths` has its document deleted. `say` gets one line per action.
+/// `paths` has its document deleted. Every document written gets `audience` (`None`:
+/// the service's default). `say` gets one line per action.
 pub async fn ingest_dir(
     client: &Client,
     cwd: &Path,
     paths: &[String],
+    audience: Option<&Audience>,
     dry_run: bool,
     say: &mut dyn FnMut(&str),
 ) -> anyhow::Result<DirReport> {
@@ -248,6 +280,7 @@ pub async fn ingest_dir(
                     origin: Origin::Agent { name: REPO.into() },
                     kind: SourceKind::Text,
                     text,
+                    audience: audience.cloned(),
                 })
                 .await?;
         }
@@ -300,9 +333,18 @@ pub async fn purge(
     };
     let actor = format!("agent:{agent}");
     let verb = if dry_run { "would delete" } else { "delete" };
+    // Only the caller's own documents: the feed also lists other people's that they
+    // shared (L2), which are theirs to purge.
+    let me = client.me().await?.person.map(|p| p.id);
     let mut names = Vec::new();
     for doc in client.documents().await? {
         if doc.actor != actor {
+            continue;
+        }
+        if let (Some(me), Some(owner)) = (&me, &doc.owner)
+            && owner != me
+        {
+            say(&format!("skip {} ({}): not yours", doc.name, doc.id));
             continue;
         }
         say(&format!("{verb} {} ({})", doc.name, doc.id));
@@ -327,6 +369,28 @@ pub async fn purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_and_deny_parse_as_the_service_checks_them() {
+        assert_eq!(parse_audience(None, None).unwrap(), None);
+        assert_eq!(
+            parse_audience(Some("company, person/bob,"), None).unwrap(),
+            Some(Audience {
+                access: vec!["company".into(), "person/bob".into()],
+                deny: vec![],
+            })
+        );
+        assert_eq!(
+            parse_audience(None, Some("agent/a1")).unwrap(),
+            Some(Audience {
+                access: vec![],
+                deny: vec!["agent/a1".into()],
+            })
+        );
+        for bad in ["Engineering", "company,company", "person/", "sales/team"] {
+            assert!(parse_audience(Some(bad), None).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn kinds_become_source_kinds_and_name_prefixes() {

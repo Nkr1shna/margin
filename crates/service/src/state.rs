@@ -94,6 +94,11 @@ pub struct StoredLesson {
     /// exist, every time it is written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_ids: Vec<Id>,
+    /// The documents whose passages were packed for the body as it is now (L2 D4): the
+    /// lesson's audience is derived from its topic's and theirs (`audience::derive_lesson`),
+    /// again whenever its topic's audience changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drew_on: Vec<Id>,
 }
 
 /// Who wrote a note's or a lesson's text, for owner decision Q2: the agent changes its
@@ -387,6 +392,16 @@ pub enum Audience {
     PersonOrAdmins(Id),
     /// Whoever's expanded read set meets these paths (a row's `access`).
     Paths(Vec<String>),
+    /// Whoever reads a row with this `access` and `deny` (L2: the deny is evaluated).
+    Readers {
+        access: Vec<String>,
+        deny: Vec<String>,
+    },
+    /// Whoever read `before` and doesn't read `after` (L2 D3: `AudienceRevoked`).
+    Lost {
+        before: margin_shared::Audience,
+        after: margin_shared::Audience,
+    },
 }
 
 impl Audience {
@@ -397,8 +412,25 @@ impl Audience {
             Audience::Person(id) => &p.person_id == id,
             Audience::PersonOrAdmins(id) => &p.person_id == id || p.org_role.is_admin(),
             Audience::Paths(paths) => paths.iter().any(|path| p.paths.contains(path)),
+            Audience::Readers { access, deny } => reads(p, access, deny),
+            Audience::Lost { before, after } => {
+                reads(p, &before.access, &before.deny) && !reads(p, &after.access, &after.deny)
+            }
         }
     }
+
+    /// Whoever reads `row` (its effective access, less its denials).
+    pub fn of_row(row: &(impl Owned + ?Sized)) -> Self {
+        Audience::Readers {
+            access: row.audience(),
+            deny: row.deny().to_vec(),
+        }
+    }
+}
+
+/// Whether `p` reads a row with `access` and `deny`: exact membership (L2).
+fn reads(p: &Principal, access: &[String], deny: &[String]) -> bool {
+    access.iter().any(|a| p.paths.contains(a)) && !deny.iter().any(|d| p.deny_ids.contains(d))
 }
 
 /// An event on its way to the sockets.
@@ -409,10 +441,11 @@ pub struct Emitted {
 }
 
 impl Emitted {
-    /// A row's event, to whoever may read the row (its effective access).
+    /// A row's event, to whoever may read the row (its effective access, less its
+    /// denials).
     pub fn row(row: &impl Owned, event: Event) -> Self {
         Self {
-            audience: Audience::Paths(row.audience()),
+            audience: Audience::of_row(row),
             event,
         }
     }
@@ -492,7 +525,7 @@ impl App {
 
     /// `row`'s event, to whoever may read it (`Owned::audience`).
     pub fn emit_owned(&self, row: &impl Owned, event: Event) {
-        self.emit_to(Audience::Paths(row.audience()), event);
+        self.emit_to(Audience::of_row(row), event);
     }
 
     /// Events collected under the write lock, each with its audience.
@@ -976,10 +1009,10 @@ impl Ownership {
     }
 }
 
-/// Whether `p` may read `row` (its audience meets `p`'s expanded paths). `deny` is
-/// written and read back but not evaluated until L2.
+/// Whether `p` may read `row`: its audience meets `p`'s expanded paths and its `deny`
+/// names none of `p`'s `deny_ids` (L2; exact membership, admins not exempt).
 pub fn can_read(p: &Principal, row: &(impl Owned + ?Sized)) -> bool {
-    row.audience().iter().any(|a| p.paths.contains(a))
+    reads(p, &row.audience(), row.deny())
 }
 
 /// `row` when `p` may read it, else 404 `what` (never 403: a row outside the caller's
@@ -1010,15 +1043,18 @@ pub fn not_owner() -> AppError {
 
 /// The SurrealQL condition a list query adds for the principal (`access_binds`): rows
 /// whose `access` meets `$paths` (the `<table>_access` indexes), and rows read with an
-/// empty `access` that are the caller's own (`Owned::audience`). `can_read` is applied
-/// to the result as well.
-pub const ACCESS_WHERE: &str = "(doc.access CONTAINSANY $paths \
-     OR (array::len(doc.access ?? []) = 0 AND (doc.owner ?? $bootstrap) = $person))";
+/// empty `access` that are the caller's own (`Owned::audience`); in both cases none of
+/// whose `deny` is one of `$deny` (L2, the `<table>_deny` indexes). `can_read` is
+/// applied to the result as well.
+pub const ACCESS_WHERE: &str = "((doc.access CONTAINSANY $paths \
+     OR (array::len(doc.access ?? []) = 0 AND (doc.owner ?? $bootstrap) = $person)) \
+     AND (doc.deny ?? []) CONTAINSNONE $deny)";
 
 /// The parameters `ACCESS_WHERE` reads.
 pub fn access_binds(p: &Principal) -> Vec<(&'static str, serde_json::Value)> {
     vec![
         ("paths", serde_json::json!(p.paths)),
+        ("deny", serde_json::json!(p.deny_ids)),
         ("person", serde_json::json!(p.person_id)),
         ("bootstrap", serde_json::json!(BOOTSTRAP_PERSON_ID)),
     ]
@@ -1181,5 +1217,28 @@ mod access_tests {
             Audience::Admins
         );
         assert!(!Audience::Paths(Vec::new()).allows(&test_principal("a", OrgRole::Owner)));
+    }
+
+    #[test]
+    fn row_events_honour_denials_and_revocations_reach_only_who_lost_access() {
+        let bob = test_principal("bob", OrgRole::Member);
+        let carol = test_principal("carol", OrgRole::Member);
+        let mut shared = topic(Some("alice"), &["company"]);
+        shared.deny = vec!["person/bob".into()];
+        let to = Audience::of_row(&shared);
+        assert!(to.allows(&carol) && !to.allows(&bob));
+        // The admins aren't exempt from a private row.
+        let private = Audience::of_row(&topic(Some("alice"), &["person/alice"]));
+        assert!(!private.allows(&test_principal("ada", OrgRole::Admin)));
+        let a = |access: &[&str], deny: &[&str]| margin_shared::Audience {
+            access: access.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        };
+        let lost = Audience::Lost {
+            before: a(&["person/alice", "company"], &[]),
+            after: a(&["person/alice", "company"], &["person/bob"]),
+        };
+        assert!(lost.allows(&bob) && !lost.allows(&carol));
+        assert!(!lost.allows(&test_principal("alice", OrgRole::Owner)));
     }
 }

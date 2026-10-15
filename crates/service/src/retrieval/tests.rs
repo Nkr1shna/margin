@@ -5,6 +5,11 @@ use super::*;
 use crate::pipeline::{Fusion, StageDeps};
 use margin_shared::pipeline::{PipelineConfig, StageCfg};
 
+/// A reader of `company` (every seeded row's audience) with no denials.
+fn company_reader() -> Reader {
+    Reader::sorted(vec![ACCESS_COMPANY.into()], vec![ACCESS_COMPANY.into()])
+}
+
 fn unit(i: usize) -> Vec<f32> {
     let mut v = vec![0f32; 768];
     v[i] = 1.0;
@@ -38,6 +43,7 @@ fn row(p: P) -> PassageRow {
         origin: "source".into(),
         scope_ids: p.scope.iter().map(|s| s.to_string()).collect(),
         access: vec![ACCESS_COMPANY.into()],
+        deny: Vec::new(),
         unit_id: match p.page {
             Some(n) => format!("{}:page:{n}", p.doc),
             None => format!("{}:{}", p.doc, p.id),
@@ -130,7 +136,7 @@ fn query(text: &str, vector: Vec<f32>, scope: Scope) -> Query {
         embedder: String::new(),
         vector,
         scope,
-        access: None,
+        reader: company_reader(),
         modalities: Vec::new(),
         k: 24,
         budget_tokens: 10_000,
@@ -334,7 +340,7 @@ async fn filters_are_inside_the_index_scans() {
             ..Default::default()
         },
         modalities: vec!["text".into()],
-        access: Some(vec!["company".into()]),
+        reader: Reader::sorted(vec!["company".into()], vec!["person/p".into()]),
         embedder: "test".into(),
     };
     let explain = |sql: String, extra: (&'static str, Value)| {
@@ -354,19 +360,24 @@ async fn filters_are_inside_the_index_scans() {
         plan.contains("KnnScan") && plan.contains("passage_vector"),
         "{plan}"
     );
-    // The scope, modality, access and embedder conditions are the KNN scan's own
-    // predicate.
+    // The scope, modality, embedder and the reader's two conditions are the KNN scan's
+    // own predicate (L2 D1).
     let knn = plan.split("KnnScan").next().unwrap();
     assert!(
         knn.contains("scope_ids CONTAINSANY") && knn.contains("CONTAINSANY ['company']"),
         "{plan}"
     );
+    assert!(knn.contains("CONTAINSNONE ['person/p']"), "{plan}");
     assert!(knn.contains("embedder = 'test'"), "{plan}");
     // The lexical leg doesn't filter by embedder.
     assert!(!r.lex_sql(&filter, 40, "id").contains("embedder"));
     let plan = explain(r.lex_sql(&filter, 40, "id"), ("text", json!("entropy"))).await;
     assert!(
         plan.contains("FullTextScan") && plan.contains("passage_text"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("CONTAINSANY ['company']") && plan.contains("CONTAINSNONE ['person/p']"),
         "{plan}"
     );
     // No passage query of this module scans the table by `list_where`.
@@ -378,38 +389,66 @@ async fn filters_are_inside_the_index_scans() {
     assert!(plan.contains("passage_document"), "{plan}");
 }
 
+/// L2 D1: the reader's paths are matched exactly (the hierarchy is in the reader's
+/// expansion, never a prefix rule here) and its denials are refused, both inside the
+/// scan.
 #[tokio::test]
-async fn access_is_a_prefilter() {
+async fn access_is_exact_membership_with_denials() {
     let s = seeded().await;
     let mut secret = text("z", "d9", &["t1"], 0, "Quarterly entropy forecast", unit(1));
     secret.access = vec!["company/finance".into()];
-    s.insert_many(db::PASSAGE, &[secret]).await.unwrap();
-    // Passages carry their document's paths; the reader's visible paths come from the
-    // documents.
-    let doc: Document = serde_json::from_value(json!({
-        "id": "d9", "project_id": DEFAULT_PROJECT_ID, "origin": {"origin": "agent", "name": "x"},
-        "name": "forecast", "kind": "text", "status": {"state": "ready", "passages": 1},
-        "generation": 1, "bytes": 1, "access": ["company/finance"],
-        "created_at": Utc::now(), "updated_at": Utc::now(),
-    }))
-    .unwrap();
-    s.put(db::DOCUMENT, "d9", &doc).await.unwrap();
+    let mut denied = text("y", "d8", &["t1"], 0, "Entropy of the ledger", unit(1));
+    denied.deny = vec!["person/bob".into()];
+    s.insert_many(db::PASSAGE, &[secret, denied]).await.unwrap();
     put_topic(&s, "t1", None).await;
     let r = retriever(&s, "hybrid-rrf");
     let mut q = query("entropy", unit(1), Scope::Topic { id: "t1".into() });
-    q.access = Some(vec!["company/engineering".into()]);
+    // `company/engineering` alone reads nothing `company` holds.
+    q.reader = Reader::sorted(vec!["company/engineering".into()], Vec::new());
+    assert!(r.search(&q).await.unwrap().is_empty());
+    // `company` does not read `company/finance`: no prefix rule.
+    q.reader = company_reader();
     let hits = r.search(&q).await.unwrap();
-    assert!(!ids(&hits).contains(&"z"));
-    // Engineering doesn't see company-wide passages either: paths are prefixes down.
-    assert!(hits.is_empty(), "{:?}", ids(&hits));
-    q.access = Some(vec!["company".into()]);
+    assert!(ids(&hits).contains(&"b") && ids(&hits).contains(&"y"));
+    assert!(!ids(&hits).contains(&"z"), "{:?}", ids(&hits));
+    // A member of finance holds `company` and `company/finance` (the expansion).
+    q.reader = Reader::sorted(
+        vec![
+            "company".into(),
+            "company/finance".into(),
+            "person/f".into(),
+        ],
+        vec![
+            "company".into(),
+            "company/finance".into(),
+            "person/f".into(),
+        ],
+    );
     let hits = r.search(&q).await.unwrap();
     assert!(ids(&hits).contains(&"z") && ids(&hits).contains(&"b"));
-    q.access = Some(vec!["company/finance".into()]);
-    assert_eq!(ids(&r.search(&q).await.unwrap()), ["z"]);
-    assert!(may_see(&["company".into()], "company/finance/payroll"));
-    assert!(!may_see(&["company/fin".into()], "company/finance"));
-    assert!(!may_see(&["company/finance".into()], "company"));
+    // Bob is denied y by name.
+    q.reader = Reader::sorted(
+        vec!["company".into(), "person/bob".into()],
+        vec!["company".into(), "person/bob".into()],
+    );
+    let hits = r.search(&q).await.unwrap();
+    assert!(ids(&hits).contains(&"b") && !ids(&hits).contains(&"y"));
+    // Every leg, the same rule.
+    for name in ["dense", "bm25", "hybrid-linear"] {
+        let hits = retriever(&s, name).search(&q).await.unwrap();
+        assert!(
+            !ids(&hits).contains(&"y") && !ids(&hits).contains(&"z"),
+            "{name}"
+        );
+    }
+    // A reader with no paths reads nothing, without running a query.
+    q.reader = Reader::sorted(Vec::new(), Vec::new());
+    assert!(r.search(&q).await.unwrap().is_empty());
+    // The filter's SQL carries both conjuncts always, bound from the reader.
+    let filter = Filter::new(&s, &q).await.unwrap();
+    assert!(filter.sql().ends_with(Reader::sql()));
+    let binds = filter.binds();
+    assert!(binds.iter().any(|(k, _)| *k == "paths") && binds.iter().any(|(k, _)| *k == "deny"));
 }
 
 #[tokio::test]
@@ -471,6 +510,7 @@ async fn scopes_resolve_to_keys_and_unknown_ids_are_bad() {
         bytes: 1,
         actor: "owner".into(),
         access: vec!["company".into()],
+        deny: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -913,9 +953,10 @@ async fn documents_read_by_ord_page_section_and_picture() {
     )
     .await
     .unwrap();
-    let rows = passages_by_ord(&s, "d1", 1, 10, 2).await.unwrap();
+    let reader = company_reader();
+    let rows = passages_by_ord(&s, &reader, "d1", 1, 10, 2).await.unwrap();
     assert_eq!(rows.iter().map(|r| r.ord).collect::<Vec<_>>(), [1, 2]);
-    let outline = document_outline(&s, "d1").await.unwrap();
+    let outline = document_outline(&s, &reader, "d1").await.unwrap();
     assert_eq!(outline.len(), 2);
     assert_eq!(
         (
@@ -929,15 +970,42 @@ async fn documents_read_by_ord_page_section_and_picture() {
         (outline[1].start_line, outline[1].end_line),
         (Some(21), Some(39))
     );
-    let pic = document_picture(&s, "d1", Some(2)).await.unwrap().unwrap();
+    let pic = document_picture(&s, &reader, "d1", Some(2))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pic.file.as_deref(), Some("pp.png"));
-    assert!(document_picture(&s, "d1", Some(7)).await.unwrap().is_none());
+    assert!(
+        document_picture(&s, &reader, "d1", Some(7))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
-        doc_state(&s, "d1").await.unwrap(),
+        doc_state(&s, &reader, "d1").await.unwrap(),
         DocState::Ready
     ));
+    // A reader who can't read d1 finds nothing by id: no rows, no outline, Unknown.
+    let other = Reader::sorted(vec!["company/sales".into()], Vec::new());
+    assert!(
+        passages_by_ord(&s, &other, "d1", 0, 10, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(document_outline(&s, &other, "d1").await.unwrap().is_empty());
+    assert!(
+        document_picture(&s, &other, "d1", Some(2))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
-        doc_state(&s, "nope").await.unwrap(),
+        doc_state(&s, &other, "d1").await.unwrap(),
+        DocState::Unknown
+    ));
+    assert!(matches!(
+        doc_state(&s, &reader, "nope").await.unwrap(),
         DocState::Unknown
     ));
     let h = context_hit(&pic, 0.5, None);
@@ -1059,6 +1127,7 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
                 bytes: 1,
                 actor: "owner".into(),
                 access: vec![access.into()],
+                deny: Vec::new(),
                 created_at: now,
                 updated_at: now,
             },
@@ -1070,27 +1139,251 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
         keys: vec!["d1".into(), "d2".into()],
         ..Default::default()
     };
+    let all = Reader::sorted(
+        vec![
+            ACCESS_COMPANY.into(),
+            "company/eng".into(),
+            "person/p".into(),
+        ],
+        Vec::new(),
+    );
     assert_eq!(
-        scope_names(&s, &resolved, None).await,
+        scope_names(&s, &resolved, &all).await,
         ["a-paper.pdf", "b-notes.pdf"]
     );
     let library = Resolved {
         library: true,
         ..Default::default()
     };
-    assert_eq!(scope_names(&s, &library, None).await.len(), 3);
-    // A reader's access (L1) keeps the names of documents they can't read out of the
-    // rewriter's prompt: "company" sees company/eng, not person/p.
-    let company = vec![ACCESS_COMPANY.to_string()];
+    assert_eq!(scope_names(&s, &library, &all).await.len(), 3);
+    // A reader's access keeps the names of documents they can't read out of the
+    // rewriter's prompt, by exact membership (L2): "company" reads neither company/eng
+    // nor person/p.
     assert_eq!(
-        scope_names(&s, &library, Some(&company)).await,
-        ["a-paper.pdf", "b-notes.pdf"]
+        scope_names(&s, &library, &company_reader()).await,
+        ["b-notes.pdf"]
     );
-    let eng = vec!["company/eng".to_string()];
+    let eng = Reader::sorted(vec!["company/eng".into()], Vec::new());
+    assert_eq!(scope_names(&s, &resolved, &eng).await, ["a-paper.pdf"]);
+    let nobody = Reader::sorted(Vec::new(), Vec::new());
+    assert!(scope_names(&s, &library, &nobody).await.is_empty());
+}
+
+// -- L2: readers on by-id reads, the cache key, the rewriter's names ------------------
+
+fn doc_row(id: &str, owner: Option<&str>, access: &[&str], deny: &[&str]) -> Document {
+    let now = Utc::now();
+    Document {
+        owner: owner.map(str::to_string),
+        id: id.into(),
+        project_id: DEFAULT_PROJECT_ID.into(),
+        origin: Origin::Agent { name: "t".into() },
+        name: format!("{id}.md"),
+        kind: SourceKind::Text,
+        status: margin_shared::context::DocumentStatus::Ready { passages: 1 },
+        generation: 1,
+        bytes: 1,
+        actor: "owner".into(),
+        access: access.iter().map(|a| a.to_string()).collect(),
+        deny: deny.iter().map(|d| d.to_string()).collect(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn person_reader(person: &str, groups: &[&str]) -> Reader {
+    let mut paths: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+    paths.push(format!("person/{person}"));
+    Reader::sorted(paths.clone(), paths)
+}
+
+/// Every by-id read answers nothing for a document the reader can't read (so routes
+/// answer 404, never 403): by audience, and by a denial naming the reader.
+#[tokio::test]
+async fn every_by_id_read_refuses_an_unreadable_document() {
+    let s = Store::memory().await.unwrap();
+    let audience = |mut r: PassageRow| {
+        r.access = vec!["company/sales".into()];
+        r.deny = vec!["person/bob".into()];
+        r
+    };
+    s.insert_many(
+        db::PASSAGE,
+        &[
+            audience(row(P {
+                id: "s0",
+                doc: "sd",
+                scope: &[],
+                modality: "text",
+                ord: 0,
+                page: Some(1),
+                text: "pipeline forecast",
+                v: unit(0),
+            })),
+            audience(row(P {
+                id: "s1",
+                doc: "sd",
+                scope: &[],
+                modality: "picture",
+                ord: 1,
+                page: Some(1),
+                text: "a chart",
+                v: unit(1),
+            })),
+        ],
+    )
+    .await
+    .unwrap();
+    s.put(
+        db::DOCUMENT,
+        "sd",
+        &doc_row("sd", Some("alice"), &["company/sales"], &["person/bob"]),
+    )
+    .await
+    .unwrap();
+    let sales = person_reader("sam", &["company", "company/sales"]);
+    let bob = person_reader("bob", &["company", "company/sales"]);
+    let engineer = person_reader("eve", &["company", "company/engineering"]);
+    // Sam (in sales) reads it all.
+    assert!(matches!(
+        doc_state(&s, &sales, "sd").await.unwrap(),
+        DocState::Ready
+    ));
+    assert!(doc_info(&s, &sales, "sd").await.unwrap().is_some());
     assert_eq!(
-        scope_names(&s, &resolved, Some(&eng)).await,
-        ["a-paper.pdf"]
+        read_passages(&s, &sales, "sd", Selector::Page(1), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
-    let nobody: Vec<String> = Vec::new();
-    assert!(scope_names(&s, &library, Some(&nobody)).await.is_empty());
+    assert_eq!(document_outline(&s, &sales, "sd").await.unwrap().len(), 1);
+    assert!(
+        document_picture(&s, &sales, "sd", None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // An engineer (not in sales) and Bob (denied by name) read nothing of it.
+    for reader in [&engineer, &bob] {
+        assert!(matches!(
+            doc_state(&s, reader, "sd").await.unwrap(),
+            DocState::Unknown
+        ));
+        assert!(doc_info(&s, reader, "sd").await.unwrap().is_none());
+        for sel in [Selector::Page(1), Selector::Ords { from: 0, to: 9 }] {
+            assert!(
+                read_passages(&s, reader, "sd", sel, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            passages_on_page(&s, reader, "sd", 1, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(document_outline(&s, reader, "sd").await.unwrap().is_empty());
+        for page in [None, Some(1)] {
+            assert!(
+                document_picture(&s, reader, "sd", page)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    // A document row the reader can't read is Unknown even when a passage of it is
+    // readable (rows out of step mid-publish never open the document).
+    let mut stray = text("x0", "xd", &[], 0, "stray", unit(2));
+    stray.access = vec!["company".into()];
+    s.insert_many(db::PASSAGE, &[stray]).await.unwrap();
+    s.put(
+        db::DOCUMENT,
+        "xd",
+        &doc_row("xd", Some("alice"), &["person/alice"], &[]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        doc_state(&s, &engineer, "xd").await.unwrap(),
+        DocState::Unknown
+    ));
+    // A document stored without an audience is its owner's alone.
+    s.put(db::DOCUMENT, "od", &doc_row("od", Some("sam"), &[], &[]))
+        .await
+        .unwrap();
+    assert!(doc_info(&s, &sales, "od").await.unwrap().is_some());
+    assert!(doc_info(&s, &engineer, "od").await.unwrap().is_none());
+}
+
+/// The cache key holds the reader (paths and denials): a packed result never crosses
+/// readers, and the same reader finds it again.
+#[test]
+fn the_cache_key_crosses_no_reader() {
+    let req = |reader: Reader| Request {
+        plan: QueryPlan::single("entropy"),
+        scope: Scope::Library,
+        reader,
+        modalities: Vec::new(),
+        k: 8,
+        budget: Budget::default(),
+        window_tokens: 100_000,
+        reserve_output: 1_000,
+        trace_id: "t".into(),
+        caller: None,
+        purpose: RetrievalPurpose::Context,
+        provider: None,
+    };
+    let key = |r: Reader| cache_key(&req(r), "p", Some("e".into()), "g");
+    let alice = person_reader("alice", &["company"]);
+    assert_eq!(key(alice.clone()), key(alice.clone()));
+    // The same arrays in another order, with repeats, are the same reader.
+    assert_eq!(
+        key(alice.clone()),
+        key(Reader::sorted(
+            vec!["person/alice".into(), "company".into(), "company".into()],
+            vec!["person/alice".into(), "company".into()],
+        ))
+    );
+    assert_ne!(key(alice.clone()), key(person_reader("bob", &["company"])));
+    // Same paths, other denials (alice's agent: its deny holds `agent/<id>`).
+    let agent = Reader::sorted(
+        vec!["company".into(), "person/alice".into()],
+        vec!["agent/a1".into(), "company".into(), "person/alice".into()],
+    );
+    assert_ne!(key(alice.clone()), key(agent));
+    // The rest of the key still counts.
+    assert_ne!(
+        cache_key(&req(alice.clone()), "p", Some("e".into()), "g"),
+        cache_key(&req(alice), "p", Some("e".into()), "g2")
+    );
+}
+
+/// The rewriter's names come from a statement with the reader's two conjuncts: denials
+/// count, and a document stored without an audience is its owner's.
+#[tokio::test]
+async fn the_rewriters_names_respect_denials_and_owners() {
+    let s = Store::memory().await.unwrap();
+    for d in [
+        doc_row("d1", None, &["company"], &[]),
+        doc_row("d2", None, &["company"], &["person/bob"]),
+        doc_row("d3", Some("bob"), &[], &[]),
+        doc_row("d4", Some("alice"), &[], &[]),
+    ] {
+        s.put(db::DOCUMENT, &d.id.clone(), &d).await.unwrap();
+    }
+    let library = Resolved {
+        library: true,
+        ..Default::default()
+    };
+    let bob = person_reader("bob", &["company"]);
+    assert_eq!(scope_names(&s, &library, &bob).await, ["d1.md", "d3.md"]);
+    let alice = person_reader("alice", &["company"]);
+    assert_eq!(
+        scope_names(&s, &library, &alice).await,
+        ["d1.md", "d2.md", "d4.md"]
+    );
 }
