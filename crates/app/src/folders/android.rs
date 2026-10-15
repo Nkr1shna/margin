@@ -16,8 +16,11 @@ use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::sync::{Mutex, OnceLock};
 
-use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
-use jni::{JNIEnv, JavaVM};
+use jni::objects::{JClass, JObject, JObjectArray, JString, JValue};
+use jni::refs::{Global, IntoAuto as _};
+use jni::signature::{MethodSignature, RuntimeMethodSignature};
+use jni::strings::JNIString;
+use jni::{Env, JavaVM, jni_sig, jni_str};
 
 use super::{Dir, DirEntry, DirError, DirKind, FolderHandle};
 
@@ -38,23 +41,24 @@ enum Answer {
 }
 
 /// The activity (also the `Context` for the `ContentResolver`).
-fn activity<'a>() -> JObject<'a> {
+fn activity<'a>(env: &Env<'a>) -> JObject<'a> {
     // SAFETY: ndk-context holds a global reference to the activity for the app's life.
-    unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) }
+    unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) }
 }
 
 /// `MarginPicker`, loaded through the activity's class loader (a thread Rust attached
 /// only sees the system classes).
-fn class(env: &mut JNIEnv) -> jni::errors::Result<&'static GlobalRef> {
-    static CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+fn class(env: &mut Env) -> jni::errors::Result<&'static Global<JClass<'static>>> {
+    static CLASS_REF: OnceLock<Global<JClass<'static>>> = OnceLock::new();
     if let Some(class) = CLASS_REF.get() {
         return Ok(class);
     }
+    let activity = activity(env);
     let loader = env
         .call_method(
-            activity(),
-            "getClassLoader",
-            "()Ljava/lang/ClassLoader;",
+            activity,
+            jni_str!("getClassLoader"),
+            jni_sig!("()Ljava/lang/ClassLoader;"),
             &[],
         )?
         .l()?;
@@ -62,11 +66,12 @@ fn class(env: &mut JNIEnv) -> jni::errors::Result<&'static GlobalRef> {
     let class = env
         .call_method(
             &loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
+            jni_str!("loadClass"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
             &[JValue::Object(&name)],
         )?
         .l()?;
+    let class = env.cast_local::<JClass>(class)?;
     let global = env.new_global_ref(class)?;
     Ok(CLASS_REF.get_or_init(|| global))
 }
@@ -74,32 +79,29 @@ fn class(env: &mut JNIEnv) -> jni::errors::Result<&'static GlobalRef> {
 /// Run `f` on this thread attached to the JVM, inside a local frame (the sync's blocking
 /// thread stays attached and makes thousands of calls, so local references must not
 /// pile up). A Java exception is cleared and returned as the error's text.
-fn java<T>(f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>) -> Result<T, String> {
+fn java<T>(f: impl FnOnce(&mut Env) -> jni::errors::Result<T>) -> Result<T, String> {
     let ctx = ndk_context::android_context();
     // SAFETY: ndk-context hands out the process JavaVM that the activity glue registered.
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
-    // Detached when the thread ends.
-    let mut env = vm
-        .attach_current_thread_permanently()
-        .map_err(|e| e.to_string())?;
-    let outcome = env.with_local_frame(16, |env| f(env));
-    outcome.map_err(|error| {
-        if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_describe();
-            let _ = env.exception_clear();
-        }
-        error.to_string()
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+    // Attached until the thread ends; each call runs in a local frame of its own.
+    vm.attach_current_thread_with_config(Default::default, Some(16), |env| {
+        f(env).inspect_err(|_| {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+        })
     })
+    .map_err(|error| error.to_string())
 }
 
 /// The `String[]` items.
-fn strings(env: &mut JNIEnv, array: &JObjectArray) -> jni::errors::Result<Vec<String>> {
-    let len = env.get_array_length(array)?;
-    let mut out = Vec::with_capacity(len as usize);
+fn strings(env: &mut Env, array: &JObjectArray<JString>) -> jni::errors::Result<Vec<String>> {
+    let len = array.len(env)?;
+    let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let item = env.get_object_array_element(array, i)?;
-        let item = env.auto_local(JString::from(item));
-        out.push(env.get_string(&item)?.into());
+        let item = array.get_element(env, i)?.auto();
+        out.push(item.try_to_string(env)?);
     }
     Ok(out)
 }
@@ -111,8 +113,10 @@ fn call(method: &str, args: &[&str]) -> Answer {
         "Ljava/lang/String;".repeat(args.len())
     );
     let answered = java(|env| {
+        let name = JNIString::from(method);
+        let sig = RuntimeMethodSignature::from_str(&sig)?;
         let class = class(env)?;
-        let context = activity();
+        let context = activity(env);
         let args = args
             .iter()
             .map(|s| env.new_string(s))
@@ -120,9 +124,9 @@ fn call(method: &str, args: &[&str]) -> Answer {
         let mut values = vec![JValue::Object(&context)];
         values.extend(args.iter().map(|s| JValue::Object(s)));
         let result = env
-            .call_static_method(<&JClass>::from(class.as_obj()), method, &sig, &values)?
+            .call_static_method(class, &name, MethodSignature::from(&sig), &values)?
             .l()?;
-        let result = JObjectArray::from(result);
+        let result = env.cast_local::<JObjectArray<JString>>(result)?;
         if result.is_null() {
             return Ok(Vec::new());
         }
@@ -352,12 +356,12 @@ pub fn forget(handle: &FolderHandle) {
     };
     let released = java(|env| {
         let class = class(env)?;
-        let context = activity();
+        let context = activity(env);
         let uri = env.new_string(uri)?;
         env.call_static_method(
-            <&JClass>::from(class.as_obj()),
-            "releasePersistable",
-            "(Landroid/content/Context;Ljava/lang/String;)V",
+            class,
+            jni_str!("releasePersistable"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)V"),
             &[JValue::Object(&context), JValue::Object(&uri)],
         )?;
         Ok(())

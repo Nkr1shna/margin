@@ -13,9 +13,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
+use jni::objects::{JClass, JObject, JObjectArray, JString, JValue};
+use jni::refs::{Global, IntoAuto as _};
+use jni::signature::MethodSignature;
+use jni::strings::JNIStr;
 use jni::sys::jlong;
-use jni::{JNIEnv, JavaVM, NativeMethod};
+use jni::{Env, EnvUnowned, JavaVM, NativeMethod, Outcome, jni_sig, jni_str};
 use tokio::sync::oneshot;
 
 use crate::folders::{FolderHandle, FolderPick};
@@ -108,18 +111,21 @@ impl Drop for EventLoopLooper {
 
 /// Run `f` with this thread attached to the JVM; a Java exception is logged, cleared and
 /// returned as `None`.
-fn java<T>(f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>) -> Option<T> {
+fn java<T>(f: impl FnOnce(&mut Env) -> jni::errors::Result<T>) -> Option<T> {
     let ctx = ndk_context::android_context();
     // SAFETY: ndk-context hands out the process JavaVM that the activity glue registered.
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    match f(&mut env) {
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+    let outcome = vm.attach_current_thread_for_scope(|env| {
+        f(env).inspect_err(|_| {
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+        })
+    });
+    match outcome {
         Ok(value) => Some(value),
         Err(error) => {
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_describe();
-                let _ = env.exception_clear();
-            }
             tracing::warn!("picker: {error}");
             None
         }
@@ -127,23 +133,24 @@ fn java<T>(f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>) -> Option<T> {
 }
 
 /// The activity (also the `Context` for the `ContentResolver`).
-fn activity<'a>() -> JObject<'a> {
+fn activity<'a>(env: &Env<'a>) -> JObject<'a> {
     // SAFETY: ndk-context holds a global reference to the activity for the app's life.
-    unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) }
+    unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) }
 }
 
 /// `MarginPicker`, loaded through the activity's class loader (a thread Rust attached
 /// only sees the system classes) with its native method registered.
-fn picker_class(env: &mut JNIEnv) -> jni::errors::Result<&'static GlobalRef> {
-    static CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+fn picker_class(env: &mut Env) -> jni::errors::Result<&'static Global<JClass<'static>>> {
+    static CLASS_REF: OnceLock<Global<JClass<'static>>> = OnceLock::new();
     if let Some(class) = CLASS_REF.get() {
         return Ok(class);
     }
+    let activity = activity(env);
     let loader = env
         .call_method(
-            activity(),
-            "getClassLoader",
-            "()Ljava/lang/ClassLoader;",
+            activity,
+            jni_str!("getClassLoader"),
+            jni_sig!("()Ljava/lang/ClassLoader;"),
             &[],
         )?
         .l()?;
@@ -151,38 +158,45 @@ fn picker_class(env: &mut JNIEnv) -> jni::errors::Result<&'static GlobalRef> {
     let class = env
         .call_method(
             &loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
+            jni_str!("loadClass"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
             &[JValue::Object(&name)],
         )?
         .l()?;
-    let class = JClass::from(class);
-    env.register_native_methods(
-        &class,
-        &[NativeMethod {
-            name: "onPicked".into(),
-            sig: "(J[Ljava/lang/String;)V".into(),
-            fn_ptr: on_picked as *mut c_void,
-        }],
-    )?;
+    let class = env.cast_local::<JClass>(class)?;
+    // SAFETY: `on_picked` takes `(long, String[])` and returns nothing, as the signature says.
+    unsafe {
+        env.register_native_methods(
+            &class,
+            &[NativeMethod::from_raw_parts(
+                jni_str!("onPicked"),
+                jni_str!("(J[Ljava/lang/String;)V"),
+                on_picked as *mut c_void,
+            )],
+        )
+    }?;
     let global = env.new_global_ref(class)?;
     Ok(CLASS_REF.get_or_init(|| global))
 }
 
 /// `MarginPicker.onPicked`: the picker's result, on the UI thread.
 extern "system" fn on_picked<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     token: jlong,
-    uris: JObjectArray<'local>,
+    uris: JObjectArray<'local, JString<'local>>,
 ) {
     let uris = if uris.is_null() {
         None
     } else {
-        match strings(&mut env, &uris) {
-            Ok(list) => Some(list),
-            Err(error) => {
+        match env.with_env(|env| strings(env, &uris)).into_outcome() {
+            Outcome::Ok(list) => Some(list),
+            Outcome::Err(error) => {
                 tracing::warn!("picker: couldn't read the picked documents: {error}");
+                None
+            }
+            Outcome::Panic(_) => {
+                tracing::warn!("picker: reading the picked documents panicked");
                 None
             }
         }
@@ -193,36 +207,33 @@ extern "system" fn on_picked<'local>(
     }
 }
 
-fn strings(env: &mut JNIEnv, array: &JObjectArray) -> jni::errors::Result<Vec<String>> {
-    let len = env.get_array_length(array)?;
-    let mut out = Vec::with_capacity(len as usize);
+fn strings(env: &mut Env, array: &JObjectArray<JString>) -> jni::errors::Result<Vec<String>> {
+    let len = array.len(env)?;
+    let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        let item = env.get_object_array_element(array, i)?;
-        let item = env.auto_local(JString::from(item));
-        out.push(env.get_string(&item)?.into());
+        let item = array.get_element(env, i)?.auto();
+        out.push(item.try_to_string(env)?);
     }
     Ok(out)
 }
 
 /// Call a static `MarginPicker` method that returns a `String[]` (`None` for null).
 fn call_strings(
-    env: &mut JNIEnv,
-    method: &str,
-    sig: &str,
+    env: &mut Env,
+    method: &JNIStr,
+    sig: MethodSignature,
     args: &[&str],
 ) -> jni::errors::Result<Option<Vec<String>>> {
     let class = picker_class(env)?;
-    let context = activity();
+    let context = activity(env);
     let mut values = vec![JValue::Object(&context)];
     let strings_in = args
         .iter()
         .map(|s| env.new_string(s))
         .collect::<Result<Vec<_>, _>>()?;
     values.extend(strings_in.iter().map(|s| JValue::Object(s)));
-    let result = env
-        .call_static_method(<&JClass>::from(class.as_obj()), method, sig, &values)?
-        .l()?;
-    let result = env.auto_local(JObjectArray::from(result));
+    let result = env.call_static_method(class, method, sig, &values)?.l()?;
+    let result = env.cast_local::<JObjectArray<JString>>(result)?.auto();
     if result.is_null() {
         return Ok(None);
     }
@@ -245,8 +256,8 @@ fn describe_tree(tree: String) -> Option<FolderPick> {
     let root = java(|env| {
         call_strings(
             env,
-            "treeRoot",
-            "(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;",
+            jni_str!("treeRoot"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;"),
             &[&tree],
         )
     })
@@ -298,13 +309,14 @@ async fn show(folder: bool) -> Option<Vec<String>> {
         });
     let shown = java(|env| {
         let class = picker_class(env)?;
+        let activity = activity(env);
         env.call_static_method(
-            <&JClass>::from(class.as_obj()),
-            "pick",
-            "(Landroid/app/Activity;ZJ)V",
+            class,
+            jni_str!("pick"),
+            jni_sig!("(Landroid/app/Activity;ZJ)V"),
             &[
-                JValue::Object(&activity()),
-                JValue::Bool(folder.into()),
+                JValue::Object(&activity),
+                JValue::Bool(folder),
                 JValue::Long(token),
             ],
         )?;
@@ -336,8 +348,8 @@ fn select_documents(uris: Vec<String>) -> Selection<Doc> {
             let described = java(|env| {
                 call_strings(
                     env,
-                    "describe",
-                    "(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;",
+                    jni_str!("describe"),
+                    jni_sig!("(Landroid/content/Context;Ljava/lang/String;)[Ljava/lang/String;"),
                     &[&uri],
                 )
             })
@@ -358,14 +370,14 @@ fn copy(uri: &str, to: &std::path::Path) -> Result<(), String> {
     let to = to.to_string_lossy();
     let outcome = java(|env| {
         let class = picker_class(env)?;
-        let context = activity();
+        let context = activity(env);
         let uri = env.new_string(uri)?;
         let path = env.new_string(to.as_ref())?;
         let error = env
             .call_static_method(
-                <&JClass>::from(class.as_obj()),
-                "copy",
-                "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                class,
+                jni_str!("copy"),
+                jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
                 &[
                     JValue::Object(&context),
                     JValue::Object(&uri),
@@ -376,8 +388,8 @@ fn copy(uri: &str, to: &std::path::Path) -> Result<(), String> {
         if error.is_null() {
             return Ok(None);
         }
-        let error = JString::from(error);
-        let message: String = env.get_string(&error)?.into();
+        let error = env.cast_local::<JString>(error)?;
+        let message = error.try_to_string(env)?;
         Ok(Some(message))
     });
     match outcome {

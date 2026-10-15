@@ -166,25 +166,33 @@ pub fn cache_dir() -> Option<PathBuf> {
 #[cfg(target_os = "android")]
 fn android_dir(getter: &str) -> Option<PathBuf> {
     use jni::objects::{JObject, JString};
+    use jni::strings::JNIString;
+    use jni::{jni_sig, jni_str};
     let ctx = ndk_context::android_context();
     // SAFETY: ndk-context hands out the process JavaVM and the application Context
     // that the Android activity glue registered; both outlive the app.
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let dir = env
-        .call_method(&context, getter, "()Ljava/io/File;", &[])
-        .ok()?
-        .l()
-        .ok()?;
-    let path = env
-        .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
-        .ok()?
-        .l()
-        .ok()?;
-    let path = JString::from(path);
-    let path: String = env.get_string(&path).ok()?.into();
-    Some(PathBuf::from(path))
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+    let path = vm.attach_current_thread_for_scope(|env| -> jni::errors::Result<String> {
+        let context = unsafe { JObject::from_raw(env, ctx.context().cast()) };
+        let dir = env
+            .call_method(
+                &context,
+                JNIString::from(getter),
+                jni_sig!("()Ljava/io/File;"),
+                &[],
+            )?
+            .l()?;
+        let path = env
+            .call_method(
+                &dir,
+                jni_str!("getAbsolutePath"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )?
+            .l()?;
+        env.cast_local::<JString>(path)?.try_to_string(env)
+    });
+    Some(PathBuf::from(path.ok()?))
 }
 
 pub fn config_path() -> Option<PathBuf> {
