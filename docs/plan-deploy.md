@@ -52,7 +52,9 @@ GitHub Actions holds **no secrets**: deploys go runner → VM over the host's NA
 | `image.yml` | a merge into `dev` that changes `deploy/image/**` or `rust-toolchain.toml`, `workflow_dispatch` | on the Mac host: `packer build deploy/image/margin-linux.pkr.hcl` (Ubuntu 24.04 + the pinned Rust) and `tart push` to **`ghcr.io/nkr1shna/margin-linux`** (`<date>-<sha>` and `latest`) with the job's `GITHUB_TOKEN`; the image holds no secrets |
 | `build-service.yml` | a merge into `dev` or `release` that changes the service (paths: `crates/{service,agent,ai,embed,video,shared}`, `Cargo.toml`/`Cargo.lock`, `deploy/`, its workflows), `workflow_dispatch` | no test job (the PR's CI checks already passed on a branch kept up to date with the base); on **margin-ci**: `cargo build --release --locked -p margin-service` (lld, Cargo cache named after the environment) with `MARGIN_BUILD_SHA`; checks it is a Linux aarch64 binary stamped with that commit; uploads `margin-service-<sha>`. Linux binaries aren't code-signed. |
 | `deploy-dev.yml` | after a successful `build-service` on `dev` (push or dispatch, this repository), or `workflow_dispatch` with a build run id | `MARGIN_DEPLOY_ONLY=dev`; `deploy.sh dev`: preflight, copy the binary, stop, backup (§5), swap, start, wait for `/health`, check `/api/version` reports `<sha>` and `dev`, roll back to the previous binary if not. Uploads the installed bytes again as `deployed-dev-<sha>`. GitHub Environment `dev` (no reviewer; a deployment record) |
-| `deploy-prod.yml` | after a successful `build-service` on `release` (push or dispatch, this repository), or `workflow_dispatch` with a build run id of `release` | Environment **`prod`** (admits only the `release` branch); `MARGIN_DEPLOY_ONLY=prod`; `deploy.sh prod` with that build's artifact; uploads `deployed-prod-<sha>`. Shipping a change = merging `dev` into `release` (replaces promote-prod). |
+| `deploy-prod.yml` | after a successful `build-service` on `release` (push or dispatch, this repository), or `workflow_dispatch` with a build run id of `release` | Environment **`prod`** (admits only the `release` branch); `MARGIN_DEPLOY_ONLY=prod`; `deploy.sh prod` with that build's artifact; uploads `deployed-prod-<sha>`. Shipping a change = merging a promote-release PR into `release` (§4a). |
+| `smoke-dev.yml` | after a successful `deploy-dev`, or `workflow_dispatch` with a deploy-dev run id | on the Mac host, no secrets: `/health`; `/api/version` reports the deployed sha (from that run's `deployed-dev-<sha>` artifact) and `dev`; protected routes answer 401 signed out and to a made-up token. Comments the result on every PR merged into dev since the previous dev deploy; fails if a check fails (§4a) |
+| `promote-release.yml` | `workflow_dispatch` (`prs`, `allow_overlap`); a merged `promote/*` PR into `release` | on **margin-ci**: cherry-picks verified PRs onto `promote/<date>-<run>` cut from `release` and opens one PR into `release`; after it is merged, labels the PRs `shipped` and opens a PR into dev that regenerates `docs/RELEASES.md` (§4a) |
 | `apps.yml` | a merge into `dev` or `release` that changes the app (paths: `crates/{app,shared}`, `Cargo.toml`/`Cargo.lock`, `apps.yml`), tag `v*`, or `workflow_dispatch` (prod, dev or both; artifacts only) | per environment, `MARGIN_DEFAULT_SERVICE_URL` set: `dx bundle -p margin-app --platform desktop --package-types macos --release` → ad hoc signed `.dmg`; `dx build -p margin-app --platform android --release` → APK (skipped while the runner has no Android SDK). Published as GitHub releases: rolling pre-release `dev-build` after each dev deploy, `prod-<sha>` (latest) after each promotion, the tag's name for `v*`. iOS TestFlight waits on the Apple Developer account (Q7). |
 
 Cargo builds keep their output in `~/.cache/margin-ci/target-{test,release}` on the runner (outside the checkout, which `actions/checkout` wipes), so CI and CD rebuild only what changed. Prune it if the disk fills (`rm -rf ~/.cache/margin-ci`; the next run rebuilds once).
@@ -62,13 +64,82 @@ Cargo builds keep their output in `~/.cache/margin-ci/target-{test,release}` on 
 **Keeping the deploy key and prod safe.** `deploy.sh` and `provision-guest.sh` refuse any environment but `MARGIN_DEPLOY_ONLY` when it is set, so a deploy-dev job never opens a connection to margin-prod. Prod is reachable only from the `prod` Environment's job, which waits for the owner's approval. What protects the scripts themselves is that only the owner's commits reach the deploy branch; the owner applies these settings **[owner, GitHub]**:
 
 1. Settings → Actions → General → "Fork pull request workflows from outside collaborators": **Require approval for all outside collaborators**; and keep the repository private. `ci.yml` also skips pull requests whose head is a fork, so fork code never runs on the self-hosted runner.
-2. Branches: **`dev`** (the default branch; every push builds and deploys dev) and **`release`** (every push builds and deploys prod; merge `dev` into `release` to ship). Branch protection and required reviewers need a paid plan on a private repository, so the guard is the Environments below plus the owner being the only one who can push.
+2. Branches: **`dev`** (the default branch; every push builds and deploys dev) and **`release`** (every push builds and deploys prod; ship by merging a promote-release PR, §4a). Branch protection and required reviewers need a paid plan on a private repository, so the guard is the Environments below plus the owner being the only one who can push.
 3. Settings → Environments → `prod`: deployment branches = **Selected branches: `release`**, so only a build of `release` can reach prod (deploy-prod.yml also checks the build run's branch).
 4. Settings → Environments → `dev`: deployment branches = `dev`.
 5. Settings → Actions → General → Workflow permissions: **Read repository contents** (the default token stays read-only).
+6. Settings → General → Pull Requests: **Allow squash merging** only (default message: pull request title), so every PR becomes one commit on `dev` that promote-release can cherry-pick (§4a). Merge commits are turned back on just for the one-time block promotion into `release`, then off again.
 6. Settings → Actions → Runners: the `mac-mini-host` runner in the default group, used only by this repository.
 
 The apps pick the environment on the sign-in screen: **Prod / Dev / Custom** (`config::PRESETS`, `ui/signin.rs`). The device token is stored per URL (`app/secrets.rs`), so one desktop app switches between dev and prod without mixing tokens.
+
+## 4a. Releasing: PRs are promoted to prod one by one
+
+`dev` takes every merged PR, including ones that turn out broken; `release` takes only the
+PRs that have been tried on devmargin. Prod never gets "everything on dev", it gets a list
+of PRs, and `docs/RELEASES.md` says which PR is where.
+
+**Contributing (the rules).**
+
+1. **One PR = one commit on `dev`: squash merge.** The squash commit is what gets promoted,
+   so a PR must stand on its own (the repository setting below makes squash the only merge
+   button); if it needs another PR, say so in its description and
+   promote the two together.
+2. After the merge, `build-service` → `deploy-dev` → **`smoke-dev`** run. smoke-dev comments
+   on the PR: a pass means devmargin is up with that build (`/health`, `/api/version` sha and
+   environment, signed-out requests refused). It does not test the feature itself.
+3. **Try the change on devmargin.** When it works, add the label **`verified-on-dev`**. A
+   broken PR stays unlabelled; its fix is a new PR, verified on its own (promote both).
+4. **Big features ship dark: label them `needs-flag`.** Such a PR adds a setting that keeps
+   the feature off unless enabled (a field in the settings API, or a `service.toml` key for
+   service-wide behaviour), defaulting to off; dev turns it on to test. Prod gets the code
+   with the feature off, so it can be promoted before it is finished; the promotion PR lists
+   it as "ships dark" and the owner turns it on in prod when ready. A later PR removes the
+   flag once the feature is on everywhere.
+5. **Promote:** Actions → **promote-release** → Run workflow, with `prs` = `12,15`, or empty
+   for every PR labelled `verified-on-dev` and not `shipped`. The workflow
+   (`deploy/scripts/promote-release.sh` does the git part):
+   - cuts `promote/<date>-<run>` from `release` and cherry-picks each PR's dev commit onto it
+     in dev order (`git cherry-pick -x`; `-m 1` for PRs merged before squash merging);
+   - **refuses, naming the PR**, when a chosen PR isn't verified or is already shipped; when
+     it touches a file that an *earlier* dev commit also touched and that commit is neither
+     chosen nor shipped (its PR isn't verified, or it had no PR), because the chosen PR may
+     build on it; or when its cherry-pick conflicts. Nothing is pushed then. The file check
+     is deliberately simple and conservative (two PRs editing the same doc look dependent):
+     after checking by hand that they are independent, rerun with `allow_overlap`, which
+     turns the overlap into a warning (a conflict still refuses). PRs already on release are
+     skipped;
+   - pushes the branch, runs CI on it, and opens **one PR into `release`** listing the PRs
+     (in a `<!-- promote-prs: ... -->` line) and which of them ship dark.
+6. **Merge that PR.** The push to `release` deploys prod. The workflow's `shipped` job then
+   labels each PR **`shipped`**, comments on it, and opens a PR into `dev` that regenerates
+   `docs/RELEASES.md`; merge that one when its CI passes.
+
+**Why the ledger is generated.** `docs/RELEASES.md` is written by
+`deploy/scripts/releases-ledger.sh` from GitHub's own record (PRs merged into dev, their
+labels, the merged `promote/*` PRs) instead of being appended to. dev takes only PRs, so a
+ledger change is a PR either way; generating it means a missed or failed run is fixed by the
+next one, and the file can be rebuilt any time:
+`sh deploy/scripts/releases-ledger.sh > docs/RELEASES.md`.
+
+**Token.** Without the optional repository secret `PROMOTE_TOKEN` the workflow uses its
+`GITHUB_TOKEN`, which can open PRs only with **[owner, GitHub]** Settings → Actions →
+General → "Allow GitHub Actions to create and approve pull requests". PRs opened by
+`GITHUB_TOKEN` trigger no workflows, so the workflow dispatches `ci.yml` on the branch
+itself (the same `Linux`/`macOS` checks the ruleset requires). `GITHUB_TOKEN` also can't
+push commits that change `.github/workflows/`, so promoting such a PR needs `PROMOTE_TOKEN`:
+a fine-grained token for this repository with Contents, Pull requests and Workflows
+read/write. With it, the PRs trigger CI as usual.
+
+**Starting point.** `release` is at `85b861f`. The 86 commits on dev after it came from PRs
+#1–#15, merged with merge commits, and `release` has no `ci.yml` yet. The first release is
+a one-time block promotion the owner decides on: a PR from `dev` into `release` merged with
+a **merge commit** (not a squash, so `release` contains dev's commits and promote-release's
+"dev since release" range starts empty), then label those PRs `shipped`. Until then promote-release refuses most PRs (they touch files those
+earlier PRs changed) and can't run CI on its branch.
+
+Check the cherry-pick rules locally (a throwaway repository, no network):
+`sh deploy/scripts/promote-release-test.sh`.
 
 ## 5. Data: what persists, what is wiped
 

@@ -4,7 +4,7 @@ The one place to see what's built, what's in flight and what's next. Update it i
 
 **Product:** a "Live context" app for a company's projects: humans through a voice-first GUI, agents through context, with learning (courses, lessons, quizzes) built in. Margin is a startup and the vision moves, so designs stay pluggable and every RAG/prompt/model change is measured by evals.
 
-**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR into `dev` (deploys `devmargin.krishnanelloore.com`). Prod ships by a PR from `dev` into `release` (deploys `margin.krishnanelloore.com`). `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
+**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). Once tried on devmargin the PR is labelled `verified-on-dev`; the **promote-release** workflow cherry-picks verified PRs into one PR into `release` (deploys `margin.krishnanelloore.com`) and labels them `shipped` when it merges. Big features ship dark behind a setting (`needs-flag`). Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
 
 Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting on the owner
 
