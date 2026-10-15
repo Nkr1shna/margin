@@ -52,14 +52,18 @@ jobs:
         with:
           persist-credentials: false
       # Cargo's build output lives outside the checkout, named after the environment (pinned
-      # Rust + the image build), so each build only recompiles what changed.
+      # Rust + the image build), so each build only recompiles what changed; caches unused
+      # for a week, or in the way when the disk is tight, are removed.
       - name: Put Rust on PATH, keep the build cache
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustc --version
           env_id="$(rustc -V | cut -d' ' -f2)-$(cat /etc/margin-image 2>/dev/null || echo noimage)"
-          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-release-$env_id" >> "$GITHUB_ENV"
+          target="$HOME/.cache/margin-ci/target-release-$env_id"
+          echo "CARGO_TARGET_DIR=$target" >> "$GITHUB_ENV"
+          # The release cache shares the VM's disk with CI's test cache: prune before building.
+          sh deploy/ci/prune-cache.sh "$target"
       - name: Build
         run: cargo build --release --locked -p margin-service
       - name: Check the binary
