@@ -166,6 +166,66 @@ pub struct Efficiency {
     pub embed_chunks_per_s: f64,
     pub tool_calls: usize,
     pub tool_output_max_bytes: u64,
+    /// Margin's own time per agent step, `duration_ms − provider_ms` over the model-call
+    /// rows that carry `provider_ms` (`docs/phase5-brief.md` D8).
+    #[serde(default)]
+    pub step_overhead: Option<Overhead>,
+    /// The alert rows' rises and clears, oldest first (`docs/phase5-brief.md` D6).
+    #[serde(default)]
+    pub alerts: Vec<AlertLine>,
+}
+
+/// Margin's share of the model calls that recorded the provider's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Overhead {
+    pub steps: usize,
+    pub mean_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+}
+
+impl Overhead {
+    /// `None` when no row carries `provider_ms`.
+    pub fn of(rows: &[TraceRow]) -> Option<Self> {
+        let ms: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.kind == TraceKind::ModelCall)
+            .filter_map(|r| r.provider_ms.map(|p| (r.duration_ms - p).max(0.0)))
+            .collect();
+        (!ms.is_empty()).then(|| Overhead {
+            steps: ms.len(),
+            mean_ms: crate::metrics::mean(&ms),
+            p95_ms: percentile(&ms, 95.0),
+            max_ms: ms.iter().copied().fold(0.0, f64::max),
+        })
+    }
+}
+
+/// One alert row: a rise or a clear.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertLine {
+    pub at: DateTime<Utc>,
+    /// The alert's name (the row's `error_code`).
+    pub name: String,
+    /// The trace kind it is about (the row's `tool`), when it is about one.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub raised: bool,
+    /// The value that crossed the threshold (the row's `duration_ms`).
+    pub value: f64,
+}
+
+impl AlertLine {
+    /// The rise or clear an `alert` row records; `None` for any other row.
+    pub fn of(r: &TraceRow) -> Option<Self> {
+        (r.kind == TraceKind::Alert).then(|| AlertLine {
+            at: r.at,
+            name: r.error_code.clone().unwrap_or_else(|| "?".into()),
+            kind: r.tool.clone(),
+            raised: !r.ok,
+            value: r.duration_ms,
+        })
+    }
 }
 
 /// The model's prices: its own row, else the longest row id it starts with followed by
@@ -319,7 +379,8 @@ pub fn efficiency(rows: &[TraceRow], prices: &Prices) -> Efficiency {
                 e.tool_calls += 1;
                 e.tool_output_max_bytes = e.tool_output_max_bytes.max(r.output_bytes.unwrap_or(0));
             }
-            TraceKind::JobStep | TraceKind::Turn | TraceKind::Alert => {}
+            TraceKind::Alert => e.alerts.extend(AlertLine::of(r)),
+            TraceKind::JobStep | TraceKind::Turn => {}
         }
     }
     for (k, v) in &ms {
@@ -335,6 +396,8 @@ pub fn efficiency(rows: &[TraceRow], prices: &Prices) -> Efficiency {
             s.mean_ms = crate::metrics::mean(v);
         }
     }
+    e.step_overhead = Overhead::of(rows);
+    e.alerts.sort_by_key(|a| a.at);
     e.retrieval_p50_ms = percentile(&retrieval_ms, 50.0);
     e.retrieval_p95_ms = percentile(&retrieval_ms, 95.0);
     e.embed_chunks_per_s = if embed_ms > 0.0 {
@@ -604,6 +667,51 @@ mod tests {
         let e = efficiency(&[odd], &prices());
         assert_eq!(e.total.cost_usd, 0.0);
         assert_eq!(e.total.plan_billed, 1);
+    }
+
+    #[test]
+    fn overhead_and_alert_lines() {
+        let mut steps = Vec::new();
+        for (i, (d, p)) in [(1_000.0, 900.0), (500.0, 480.0), (300.0, 310.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut r = row(TraceKind::ModelCall, "t", 30 + i as i64);
+            r.duration_ms = d;
+            r.provider_ms = Some(p);
+            steps.push(r);
+        }
+        // A job call without the provider's share doesn't count.
+        let mut job = row(TraceKind::ModelCall, "j", 40);
+        job.duration_ms = 9_999.0;
+        steps.push(job);
+        let mut clear = row(TraceKind::Alert, "alerts", 51);
+        clear.error_code = Some("error_rate".into());
+        clear.tool = Some("model_call".into());
+        clear.duration_ms = 0.5;
+        let mut rise = clear.clone();
+        rise.id = "u50".into();
+        rise.at = DateTime::from_timestamp(50, 0).unwrap();
+        rise.ok = false;
+        steps.push(clear);
+        steps.push(rise);
+        let e = efficiency(&steps, &prices());
+        let o = e.step_overhead.unwrap();
+        assert_eq!(o.steps, 3);
+        // 100, 20 and 0 (a provider share past the duration counts as none).
+        assert!((o.mean_ms - 40.0).abs() < 1e-9);
+        assert_eq!((o.p95_ms, o.max_ms), (100.0, 100.0));
+        assert_eq!(
+            e.alerts
+                .iter()
+                .map(|a| (a.raised, a.name.as_str(), a.kind.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (true, "error_rate", Some("model_call")),
+                (false, "error_rate", Some("model_call"))
+            ]
+        );
+        assert_eq!(efficiency(&sample(), &prices()).step_overhead, None);
     }
 
     #[test]
