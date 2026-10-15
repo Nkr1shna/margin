@@ -1233,3 +1233,172 @@ async fn sign_out_cancels_a_sign_in_that_is_waiting() {
     // No code was exchanged.
     assert!(fake.token_forms.lock().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// A ChatGPT chat end to end: sign-in, the real client, web search
+// ---------------------------------------------------------------------------
+
+/// A fake Responses API for the ChatGPT tests: one scripted SSE body per request; every
+/// request's `Authorization` and body are kept.
+#[derive(Default)]
+struct FakeResponses {
+    replies: Mutex<std::collections::VecDeque<String>>,
+    requests: Mutex<Vec<(Option<String>, Value)>>,
+}
+
+async fn fake_responses(
+    State(f): State<Arc<FakeResponses>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    f.requests.lock().unwrap().push((auth, body));
+    match f.replies.lock().unwrap().pop_front() {
+        Some(sse) => ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response(),
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "no reply scripted").into_response(),
+    }
+}
+
+async fn start_fake_responses() -> (String, Arc<FakeResponses>) {
+    let fake = Arc::new(FakeResponses::default());
+    let app = Router::new()
+        .route("/v1/responses", post(fake_responses))
+        .with_state(fake.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, fake)
+}
+
+fn sse_event(v: Value) -> String {
+    format!("event: {}\ndata: {}\n\n", v["type"].as_str().unwrap(), v)
+}
+
+/// A searched answer in the Responses shapes: the `web_search_call` with its sources,
+/// then a message with a `url_citation`.
+fn web_search_answer() -> String {
+    let searched = json!({"id": "ws_1", "type": "web_search_call", "status": "completed",
+    "action": {"type": "search", "query": "rust 1.99 release date",
+        "sources": [
+            {"type": "url", "url": "https://blog.rust-lang.org/1.99"},
+            {"type": "url", "url": "https://releases.rs", "title": "Rust releases"}
+        ]}});
+    let message = json!({"id": "msg_2", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "output_text", "text": "Rust 1.99 shipped in May.",
+            "annotations": [{"type": "url_citation", "url": "https://blog.rust-lang.org/1.99",
+                "title": "Rust 1.99", "start_index": 0, "end_index": 9}]}]});
+    [
+        sse_event(
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress", "output": []}}),
+        ),
+        sse_event(json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"}})),
+        sse_event(
+            json!({"type": "response.web_search_call.searching", "output_index": 0, "item_id": "ws_1"}),
+        ),
+        sse_event(json!({"type": "response.output_item.done", "output_index": 0, "item": searched})),
+        sse_event(json!({"type": "response.output_item.added", "output_index": 1,
+            "item": {"id": "msg_2", "type": "message", "role": "assistant", "status": "in_progress", "content": []}})),
+        sse_event(json!({"type": "response.output_text.delta", "item_id": "msg_2", "output_index": 1,
+            "content_index": 0, "delta": "Rust 1.99 shipped in May."})),
+        sse_event(json!({"type": "response.output_item.done", "output_index": 1, "item": message})),
+        sse_event(json!({"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed", "model": "gpt-6.1-sol-2026-09-30", "output": [],
+            "usage": {"input_tokens": 900, "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 40, "output_tokens_details": {"reasoning_tokens": 0}}}})),
+    ]
+    .concat()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chatgpt_chat_signs_in_and_searches_the_web_through_the_real_client() {
+    let (auth, _auth_fake) = start_fake_auth().await;
+    let (api, fake) = start_fake_responses().await;
+    let (h, t) = signed_in().await;
+    h.state.providers.set_endpoints(Endpoints {
+        chatgpt_auth: auth.clone(),
+        chatgpt_api: api,
+        chatgpt_callback_port: 0,
+        ..Endpoints::default()
+    });
+    sign_in_chatgpt(&h, &t).await;
+    h.generator
+        .agent_over_http
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    fake.replies.lock().unwrap().push_back(web_search_answer());
+    let created = chat(
+        &h,
+        &t,
+        json!({"provider": "chatgpt", "message": {"text": "When did Rust 1.99 ship?"}}),
+    )
+    .await;
+    assert_eq!(created.chat.provider, Provider::ChatGpt);
+    let d = wait_chat(&h, &t, &created.chat.id, |d| {
+        d.chat.state == ChatState::Idle && d.items.len() > 1
+    })
+    .await;
+
+    // The call went to the ChatGPT endpoint with the signed-in token, on the plan's
+    // rules: one tool call per step, no output cap, the hosted web search offered.
+    let (bearer, body) = fake.requests.lock().unwrap()[0].clone();
+    assert_eq!(bearer.as_deref(), Some("Bearer at-1"));
+    assert_eq!(body["model"], RouteModels::chatgpt_default().chat);
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(body.get("max_output_tokens").is_none(), "{body}");
+    assert!(
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["type"] == "web_search"),
+        "{body}"
+    );
+
+    // The search's rows and card, then the cited answer.
+    let call = d
+        .items
+        .iter()
+        .find(|i| matches!(&i.kind, margin_shared::ChatItemKind::ToolCall { name, .. } if name == "web_search"))
+        .expect("a web_search row");
+    let margin_shared::ChatItemKind::ToolCall { label, .. } = &call.kind else {
+        unreachable!()
+    };
+    assert!(label.contains("rust 1.99 release date"), "{label}");
+    let card = d
+        .items
+        .iter()
+        .find_map(|i| match &i.kind {
+            margin_shared::ChatItemKind::Card {
+                card: margin_shared::Card::WebResults(c),
+                ..
+            } => Some(c.clone()),
+            _ => None,
+        })
+        .expect("a web results card");
+    assert_eq!(card.results.len(), 2);
+    let margin_shared::ChatItemKind::AssistantText { text, citations } =
+        &d.items.last().unwrap().kind
+    else {
+        panic!("{:?}", d.items.last())
+    };
+    assert_eq!(text, "Rust 1.99 shipped in May.");
+    assert_eq!(citations[0].url, "https://blog.rust-lang.org/1.99");
+
+    // Traced on ChatGPT, with its tokens and the search counted, and no dollar price.
+    let turn_id = d.items[0].turn_id.clone();
+    let step = eventually(|| async {
+        traces(&h, &t, &turn_id)
+            .await
+            .into_iter()
+            .find(|r| r.kind == TraceKind::ModelCall && r.route == Some(Route::Chat))
+    })
+    .await;
+    assert_eq!(step.provider.as_deref(), Some("chatgpt"));
+    assert_eq!(step.model.as_deref(), Some("gpt-6.1-sol-2026-09-30"));
+    assert_eq!(step.cost_usd, None, "plan-billed");
+    let usage = step.usage.unwrap();
+    assert_eq!((usage.input, usage.web_searches), (900, 1));
+}

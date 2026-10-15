@@ -1774,3 +1774,106 @@ async fn app_control_goes_to_the_device_and_stop_keeps_a_running_writes_result()
         .unwrap();
     assert!(!nav.contains("Opened"), "{nav}");
 }
+
+// ---------------------------------------------------------------------------
+// Providers phase: a web search on OpenAI through the real client
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_openai_web_search_is_rows_a_card_and_a_cited_answer_and_is_traced() {
+    let (openai, fake) = start_fake_openai().await;
+    let h = start_service(None).await;
+    let t = h.sign_in("Mac").await;
+    let r = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let searched = json!({"id": "ws_1", "type": "web_search_call", "status": "completed",
+        "action": {"type": "search", "query": "tides and the moon",
+            "sources": [{"type": "url", "url": "https://example.com/tides", "title": "Tides"}]}});
+    let cited = json!({"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "output_text", "text": "The moon pulls the sea.",
+            "annotations": [{"type": "url_citation", "url": "https://example.com/tides",
+                "title": "Tides", "start_index": 0, "end_index": 8}]}]});
+    fake.push(Reply::Stream(
+        [
+            created("resp_1"),
+            event(
+                json!({"type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"}}),
+            ),
+            event(
+                json!({"type": "response.output_item.done", "output_index": 0, "item": searched}),
+            ),
+            message_start(1, "msg_1", &["The moon pulls the sea."]),
+            event(json!({"type": "response.output_item.done", "output_index": 1, "item": cited})),
+            completed("resp_1"),
+        ]
+        .concat(),
+    ));
+    let r = h
+        .post(&t, "/api/chats")
+        .json(&json!({"message": {"text": "Why are there tides?"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let chat: ChatDetail = r.json().await.unwrap();
+    let d = wait_chat(&h, &t, &chat.chat.id, |d| {
+        d.chat.state == ChatState::Idle && d.items.len() > 1
+    })
+    .await;
+    let body = &fake.bodies()[0];
+    assert!(
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["type"] == "web_search"),
+        "{body}"
+    );
+    assert!(
+        body["include"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("web_search_call.action.sources"))
+    );
+    let l = lines(&d);
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("call web_search: ") && x.contains("tides and the moon")),
+        "{l:#?}"
+    );
+    assert!(d.items.iter().any(|i| matches!(
+        &i.kind,
+        ChatItemKind::Card { card: Card::WebResults(c), .. } if c.results.len() == 1
+    )));
+    let ChatItemKind::AssistantText { text, citations } = &d.items.last().unwrap().kind else {
+        panic!("{l:#?}")
+    };
+    assert_eq!(text, "The moon pulls the sea.");
+    assert_eq!(citations[0].url, "https://example.com/tides");
+
+    // The step's trace row: OpenAI, the search counted.
+    let turn_id = d.items[0].turn_id.clone();
+    let step = eventually(|| async {
+        let r = h
+            .get(&t, "/api/traces")
+            .query(&[("trace_id", turn_id.as_str())])
+            .send()
+            .await
+            .unwrap();
+        r.text()
+            .await
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<margin_shared::context::TraceRow>(l).unwrap())
+            .find(|r| r.kind == margin_shared::context::TraceKind::ModelCall)
+    })
+    .await;
+    assert_eq!(step.provider.as_deref(), Some("openai"));
+    assert_eq!(step.usage.unwrap().web_searches, 1);
+}
