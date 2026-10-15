@@ -693,6 +693,7 @@ async fn read_tools_answer_from_the_library() {
         author: Default::default(),
         prompt: None,
         with_quiz: false,
+        drew_on: Vec::new(),
         workspace_ids: Vec::new(),
     };
     h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();

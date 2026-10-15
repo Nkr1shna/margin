@@ -44,6 +44,7 @@ use margin_shared::{Chat, ChatItemKind, Event, Id, Note, Source, SourceStatus};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::audience;
 use crate::chats::StoredChatItem;
 use crate::db::{self, INSERT_MANY_MAX, PassageRow};
 use crate::embedding;
@@ -51,8 +52,8 @@ use crate::library;
 use crate::pipeline::{Chunker, ChunkerCfg, Registry, StageCtor};
 use crate::sources;
 use crate::state::{
-    AppState, Audience, Emitted, Owned, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson, new_id,
-    sha256_hex,
+    AppState, Audience, Emitted, Owned, Ownership, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson,
+    new_id, sha256_hex,
 };
 
 /// The migration that moves sources from `chunk`/`media` to `passage`, by its name in
@@ -214,7 +215,7 @@ fn new_document(id: Id, project_id: Id, origin: Origin, name: &str, kind: Source
 }
 
 /// The document of `origin`, found by its origin (and, for an agent's, its name).
-async fn find_by_origin(
+pub async fn find_by_origin(
     state: &AppState,
     origin: &Origin,
     name: &str,
@@ -232,10 +233,13 @@ async fn find_by_origin(
     Ok(found.into_iter().next())
 }
 
-/// Who hears about a document (`DocumentChanged`): its audience (L2 D3; read empty,
-/// its owner, the bootstrap owner before `people-v1`).
+/// Who hears about a document (`DocumentChanged`): its readers (L2 D3: its access less
+/// its denials; read empty, its owner, the bootstrap owner before `people-v1`).
 pub fn document_audience(doc: &Document) -> Audience {
-    Audience::Paths(crate::retrieval::document_access(doc))
+    Audience::Readers {
+        access: crate::retrieval::document_access(doc),
+        deny: doc.deny.clone(),
+    }
 }
 
 /// Sends `DocumentChanged` to the document's audience.
@@ -291,6 +295,8 @@ async fn upsert_document_locked(
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             }
+            // The audience of the row that owns it, which may have moved (L2 D2).
+            audience::restamp_locked(state, &mut doc).await?;
             doc
         }
         None => {
@@ -300,14 +306,12 @@ async fn upsert_document_locked(
             };
             let mut doc = new_document(id, project_id.to_string(), origin, name, kind);
             doc.actor = actor.to_string();
-            // Private to its owner by default (L2 D2); `audience::of_document` stamps
-            // the owning row's audience (L2-write).
-            doc.access = vec![margin_shared::person_id(
-                owner
-                    .as_deref()
-                    .unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID),
-            )];
             doc.owner = owner;
+            // The owning row's audience; an agent's document is private to its owner
+            // (L2 D2: nothing is `company` unless published).
+            let own = audience::of_document(state, &doc).await?;
+            doc.access = own.access;
+            doc.deny = own.deny;
             state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             doc
         }
@@ -354,6 +358,8 @@ pub async fn source_document_locked(
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             }
+            // The source's audience (L2 D2), which may have moved.
+            audience::stamp_locked(state, &mut doc, &Ownership::of(source)).await?;
             Ok(doc)
         }
         None => {
@@ -368,8 +374,9 @@ pub async fn source_document_locked(
             doc.created_at = source.created_at;
             doc.owner = owner;
             // The source's audience (L2 D2: the row that owns the document).
-            doc.access = source.audience();
-            doc.deny = source.deny().to_vec();
+            let own = Ownership::of(source);
+            doc.access = own.access;
+            doc.deny = own.deny;
             state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             Ok(doc)
         }
@@ -429,6 +436,25 @@ pub async fn ingest_text_as(
             owner,
         )
         .await?;
+        // An audience given with the text (checked by the route against the caller's
+        // paths) replaces the document's; without one it keeps what it has (private
+        // when new).
+        if let Some(a) = &req.audience {
+            let owner = doc
+                .owner
+                .clone()
+                .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string());
+            let me = margin_shared::person_id(&owner);
+            let mut access = vec![me.clone()];
+            access.extend(a.access.iter().filter(|x| **x != me).cloned());
+            let deny = a.deny.iter().filter(|x| **x != me).cloned().collect();
+            let own = Ownership {
+                owner,
+                access,
+                deny,
+            };
+            audience::stamp_locked(state, &mut doc, &own).await?;
+        }
         let dir = document_dir(state, &doc.id);
         tokio::fs::create_dir_all(&dir)
             .await
@@ -1651,11 +1677,19 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         };
         anyhow::bail!("{error}");
     }
-    // The document as it is now (access, project) and what may search it.
-    let Some(doc) = document(state, id).await? else {
-        return Ok(report);
+    // The document as it is now (access, project) and what may search it, stamped
+    // again from the row that owns it (L2 D2).
+    let doc = {
+        let _w = state.write_lock.lock().await;
+        let Some(mut doc) = document(state, id).await? else {
+            return Ok(report);
+        };
+        audience::restamp_locked(state, &mut doc).await?;
+        doc
     };
     let scope = scope_ids(state, &doc).await?;
+    // What the rows written below carry; a publish meanwhile is caught up at the end.
+    let stamped = (crate::retrieval::document_access(&doc), doc.deny.clone());
     let mut items = prepared.items;
     for item in &mut items {
         item.row.scope_ids = scope.clone();
@@ -1794,12 +1828,22 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
     );
 
     // Done: a new generation when anything changed (or on the first read).
-    let changed = report.chunks_new > 0 || report.chunks_deleted > 0 || !moved_rows.is_empty();
+    let mut changed = report.chunks_new > 0 || report.chunks_deleted > 0 || !moved_rows.is_empty();
     let (doc, source) = {
         let _w = state.write_lock.lock().await;
         let Some(mut doc) = document(state, id).await? else {
             return Ok(report);
         };
+        // Its audience changed while it was read (a publish re-stamped the rows there
+        // were then): the rows written since carry the old one (L2 D3).
+        let access = crate::retrieval::document_access(&doc);
+        if (&access, &doc.deny) != (&stamped.0, &stamped.1) {
+            state
+                .store
+                .set_document_audience(id, &access, &doc.deny)
+                .await?;
+            changed = true;
+        }
         if changed || doc.generation == 0 {
             doc.generation = state.store.next_generation().await?;
         }
