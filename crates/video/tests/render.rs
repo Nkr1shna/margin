@@ -224,13 +224,21 @@ async fn detect_tools_finds_manimgx() {
         "{m:?}"
     );
     assert!(m.install_commands.is_empty());
-    let f = tools.iter().find(|t| t.name == "fluidaudiocli").unwrap();
+    // Each OS lists its own narration tool: FluidAudio on macOS, margin-tts elsewhere.
+    let (voice, install) = if cfg!(target_os = "macos") {
+        (
+            "fluidaudiocli",
+            "swift build -c release --product fluidaudiocli",
+        )
+    } else {
+        ("margin-tts", "margin-tts")
+    };
+    let f = tools.iter().find(|t| t.name == voice).unwrap();
     assert_eq!(f.found, f.install_commands.is_empty(), "{f:?}");
     if !f.found {
         assert!(
-            f.install_commands
-                .iter()
-                .any(|c| c.contains("swift build -c release --product fluidaudiocli"))
+            f.install_commands.iter().any(|c| c.contains(install)),
+            "{f:?}"
         );
     }
 }

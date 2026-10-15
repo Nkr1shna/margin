@@ -880,12 +880,12 @@ async fn settings_switch_the_pipeline_by_name() {
         .json()
         .await
         .unwrap();
-    assert_eq!(s.pipeline, PipelineConfig::default());
+    // The service stamps its own embedder (Core ML on macOS, ONNX elsewhere).
+    let mut expected = PipelineConfig::default();
+    expected.embedder.name = margin_embed::Backend::default().name().into();
+    assert_eq!(s.pipeline, expected);
     assert_eq!(s.trace_retention_days, 90);
-    assert_eq!(
-        h.state.pipeline.load().hash,
-        PipelineConfig::default().hash()
-    );
+    assert_eq!(h.state.pipeline.load().hash, expected.hash());
 
     // An unknown stage is refused and changes nothing.
     let r = h
@@ -1398,11 +1398,13 @@ async fn missing_tools_fail_the_video() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
     h.configure_ai(&t).await;
-    h.renderer
-        .missing
-        .lock()
-        .unwrap()
-        .insert("fluidaudiocli".into());
+    // The narration tool this OS installs (`video::voice_tool`).
+    let voice = if cfg!(target_os = "macos") {
+        "fluidaudiocli"
+    } else {
+        "margin-tts"
+    };
+    h.renderer.missing.lock().unwrap().insert(voice.into());
     let (topic, _) = create_lessons(&h, &t, "x", 1, false).await;
     let lesson = wait_lessons_ready(&h, &t, &topic.id).await.remove(0);
     let tools: Vec<margin_shared::ToolStatus> = h
@@ -1416,7 +1418,7 @@ async fn missing_tools_fail_the_video() {
     assert!(
         tools
             .iter()
-            .any(|t| t.name == "fluidaudiocli" && !t.found && !t.install_commands.is_empty())
+            .any(|t| t.name == voice && !t.found && !t.install_commands.is_empty())
     );
 
     let v: Video = h
@@ -1442,7 +1444,7 @@ async fn missing_tools_fail_the_video() {
     assert_eq!(
         v.status,
         VideoStatus::Failed {
-            error: "fluidaudiocli isn't installed".into()
+            error: format!("{voice} isn't installed")
         }
     );
     assert_eq!(h.renderer.renders.load(Ordering::SeqCst), 0);

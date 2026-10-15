@@ -462,7 +462,7 @@ async fn library_text(
                     .iter()
                     .filter_map(|i| match &i.item.kind {
                         ChatItemKind::UserMessage { text, .. } => Some(format!("Owner: {text}")),
-                        ChatItemKind::AssistantText { text } => Some(format!("Margin: {text}")),
+                        ChatItemKind::AssistantText { text, .. } => Some(format!("Margin: {text}")),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

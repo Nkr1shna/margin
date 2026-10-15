@@ -401,6 +401,30 @@
     stopCitations: function () {
       if (window.MarginApp._stopCitations) window.MarginApp._stopCitations();
     },
+    // Clicks on the web citation markers of a chat's answers (button.cite[data-cite]
+    // inside a [data-answer] inside #`logId`): call send(answerItemId, n). Separate from
+    // watchCitations (the lesson's); one chat watcher at a time.
+    watchWebCites: function (logId, send) {
+      if (window.MarginApp._stopWebCites) window.MarginApp._stopWebCites();
+      function onClick(e) {
+        var b = e.target.closest && e.target.closest("button.cite[data-cite]");
+        var log = document.getElementById(logId);
+        if (!b || !log || !log.contains(b)) return;
+        var answer = b.closest("[data-answer]");
+        if (!answer) return;
+        e.preventDefault();
+        var n = parseInt(b.getAttribute("data-cite"), 10);
+        if (n > 0) send(answer.getAttribute("data-answer"), n);
+      }
+      document.addEventListener("click", onClick);
+      window.MarginApp._stopWebCites = function () {
+        document.removeEventListener("click", onClick);
+        window.MarginApp._stopWebCites = null;
+      };
+    },
+    stopWebCites: function () {
+      if (window.MarginApp._stopWebCites) window.MarginApp._stopWebCites();
+    },
     // A modal dialog (#id) was opened or changed what it shows: remember what had focus
     // before it opened (to give it back on close), keep Tab inside it, and move focus in
     // if it isn't there yet.

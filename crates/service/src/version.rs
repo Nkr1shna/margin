@@ -95,9 +95,30 @@ pub fn resident_bytes() -> Option<u64> {
     (written == size).then_some(info.pti_resident_size)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// This process's resident set size, from `VmRSS` in `/proc/self/status`.
+#[cfg(target_os = "linux")]
+pub fn resident_bytes() -> Option<u64> {
+    proc_kib(
+        &std::fs::read_to_string("/proc/self/status").ok()?,
+        "VmRSS:",
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn resident_bytes() -> Option<u64> {
     None
+}
+
+/// The `kB` value on the `/proc` line starting with `key`, in bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_kib(text: &str, key: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with(key))?;
+    let mut parts = line[key.len()..].split_whitespace();
+    let n: u64 = parts.next()?.parse().ok()?;
+    match parts.next() {
+        Some("kB") | None => n.checked_mul(1024),
+        _ => None,
+    }
 }
 
 /// `hw.memsize`: the physical memory macOS sees (the VM's size inside a guest).
@@ -119,7 +140,13 @@ pub fn physical_memory_bytes() -> Option<u64> {
     (rc == 0 && len == std::mem::size_of::<u64>()).then_some(bytes)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// `MemTotal` from `/proc/meminfo`: the memory the guest sees.
+#[cfg(target_os = "linux")]
+pub fn physical_memory_bytes() -> Option<u64> {
+    proc_kib(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn physical_memory_bytes() -> Option<u64> {
     None
 }
@@ -149,6 +176,26 @@ mod tests {
         let rss = resident_bytes().expect("rss");
         let total = physical_memory_bytes().expect("hw.memsize");
         assert!(rss > 0 && rss < total, "rss {rss}, total {total}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_memory_on_linux() {
+        let rss = resident_bytes().expect("VmRSS");
+        let total = physical_memory_bytes().expect("MemTotal");
+        assert!(rss > 0 && rss < total, "rss {rss}, total {total}");
+    }
+
+    #[test]
+    fn parses_proc_lines() {
+        let status = "Name:\tmargin\nVmRSS:\t  123456 kB\nThreads:\t9\n";
+        assert_eq!(proc_kib(status, "VmRSS:"), Some(123_456 * 1024));
+        assert_eq!(
+            proc_kib("MemTotal:       8123456 kB\n", "MemTotal:"),
+            Some(8_123_456 * 1024)
+        );
+        assert_eq!(proc_kib(status, "VmSwap:"), None);
+        assert_eq!(proc_kib("VmRSS: x kB\n", "VmRSS:"), None);
     }
 
     #[test]

@@ -370,5 +370,29 @@ mod tests {
                 .values()
                 .all(|p| p.input > 0.0 && p.output > 0.0)
         );
+        // Every listed model has its web-search price; Haiku 5.5 its long-context tier;
+        // the slots' OpenAI defaults are listed.
+        assert!(prices.models.values().all(|p| p.web_search == 10.0));
+        let haiku = &prices.models["claude-haiku-5-5"];
+        let tier = haiku.long_context.expect("Haiku 5.5's long-context tier");
+        assert_eq!((tier.over, tier.input, tier.output), (100_000, 0.50, 2.50));
+        assert!(prices.models["claude-opus-5-5"].long_context.is_none());
+        for id in [
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "claude-opus-5-5",
+            "claude-haiku-5-5",
+        ] {
+            assert!(prices.models.contains_key(id), "{id}");
+        }
+        assert_eq!(
+            prices.models["gpt-6-luna"].provider,
+            crate::Provider::Openai
+        );
+        let chatgpt: crate::Provider = toml::from_str::<
+            std::collections::BTreeMap<String, crate::Provider>,
+        >("p = \"chatgpt\"")
+        .unwrap()["p"];
+        assert_eq!(chatgpt, crate::Provider::Chatgpt);
     }
 }

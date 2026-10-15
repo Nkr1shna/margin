@@ -31,6 +31,10 @@
 //! | GET    | /api/settings                          |                    | Settings            |
 //! | PATCH  | /api/settings                          | SettingsPatch      | Settings            |
 //! | GET    | /api/pipeline/variants                 |                    | pipeline::PipelineVariants |
+//! | GET    | /api/providers/{provider}/models       |                    | Vec<ModelInfo> (409 not_configured: no credential) |
+//! | POST   | /api/providers/chatgpt/start           |                    | ChatGptStart (sign in on the service Mac) |
+//! | GET    | /api/providers/chatgpt                 |                    | ChatGptStatus       |
+//! | DELETE | /api/providers/chatgpt                 |                    | 204 (signs out)     |
 //! | GET    | /api/tools                             |                    | Vec<ToolStatus>     |
 //! | GET    | /api/devices                           |                    | Vec<Device>         |
 //! | DELETE | /api/devices/{id}                      |                    | 204                 |
@@ -90,6 +94,10 @@ pub const SETTINGS: &str = "/api/settings";
 /// `GET` → `pipeline::PipelineVariants`: the stage names the service registers per kind
 /// and the named variants (`evals/variants/*.toml`) Settings can pick a pipeline from.
 pub const PIPELINE_VARIANTS: &str = "/api/pipeline/variants";
+/// The ChatGPT sign-in: `GET` → `ChatGptStatus`, `DELETE` signs out.
+pub const PROVIDERS_CHATGPT: &str = "/api/providers/chatgpt";
+/// `POST` → `ChatGptStart`: starts a "Sign in with ChatGPT" on the service Mac.
+pub const PROVIDERS_CHATGPT_START: &str = "/api/providers/chatgpt/start";
 pub const TOOLS: &str = "/api/tools";
 pub const DEVICES: &str = "/api/devices";
 pub const EVENTS: &str = "/api/events";
@@ -246,6 +254,11 @@ pub fn source_upload_finish(id: &str) -> String {
 pub fn device(id: &str) -> String {
     format!("/api/devices/{id}")
 }
+/// `GET` → `Vec<ModelInfo>`: the models `provider` offers, with their windows when
+/// known. 409 `not_configured` when the provider has no credential.
+pub fn providers_models(provider: crate::Provider) -> String {
+    format!("/api/providers/{}/models", provider.as_str())
+}
 pub fn chat(id: &str) -> String {
     format!("/api/chats/{id}")
 }
@@ -360,6 +373,19 @@ mod tests {
             source_limits_text(),
             "Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
+    }
+
+    #[test]
+    fn provider_routes() {
+        assert_eq!(
+            providers_models(crate::Provider::Claude),
+            "/api/providers/claude/models"
+        );
+        assert_eq!(
+            providers_models(crate::Provider::ChatGpt),
+            "/api/providers/chatgpt/models"
+        );
+        assert!(PROVIDERS_CHATGPT_START.starts_with(PROVIDERS_CHATGPT));
     }
 
     #[test]

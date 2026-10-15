@@ -2,12 +2,12 @@
 //! applying every [`Event`] from the `/api/events` socket. Pure data: no Dioxus here,
 //! so the reducer is unit-tested directly.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use margin_shared::{
-    Chat, ChatDetail, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id, ItemStatus,
-    Lesson, LessonStatus, Library, Note, Proposal, ProposalStatus, Settings, Source, Topic, Video,
-    VideoStatus, Workspace,
+    Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id,
+    ItemStatus, Lesson, LessonStatus, Library, ModelInfo, Note, Proposal, ProposalStatus, Provider,
+    Settings, Source, Topic, Video, VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -47,6 +47,15 @@ pub struct LibraryState {
     /// What Settings can pick the pipeline from (`GET /api/pipeline/variants`), once
     /// fetched; fetched again each time the Pipeline section opens.
     pub pipeline_variants: Option<margin_shared::pipeline::PipelineVariants>,
+    /// The models each provider offers (`GET routes::providers_models`), for the providers
+    /// whose list was fetched; dropped when the provider loses its credential.
+    pub provider_models: HashMap<Provider, Vec<ModelInfo>>,
+    /// Moves each time a provider's model list goes stale (`forget_models`); Settings
+    /// keys its slots on it, so they fetch the list again.
+    pub models_epoch: HashMap<Provider, u32>,
+    /// The ChatGPT sign-in as last fetched (`GET routes::PROVIDERS_CHATGPT`) or started;
+    /// `None` until then (see [`LibraryState::chatgpt_status`]).
+    pub chatgpt: Option<ChatGptStatus>,
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -65,6 +74,89 @@ impl LibraryState {
         let mut state = Self::default();
         state.replace_library(library);
         state
+    }
+
+    /// New settings: the ChatGPT sign-in follows the account they carry (signed in, or
+    /// signed out where it was signed in; a sign-in still waiting or failed stays), and a
+    /// provider without its credential forgets its models.
+    pub fn set_settings(&mut self, settings: Settings) {
+        match (&settings.chatgpt, &self.chatgpt) {
+            (Some(account), current) => {
+                // A failed attempt noted on the same account stays noted.
+                let last_error = match current {
+                    Some(ChatGptStatus::SignedIn {
+                        account: was,
+                        last_error,
+                    }) if was.email == account.email => last_error.clone(),
+                    _ => None,
+                };
+                self.chatgpt = Some(ChatGptStatus::SignedIn {
+                    account: account.clone(),
+                    last_error,
+                })
+            }
+            (None, Some(ChatGptStatus::SignedIn { .. })) => {
+                self.chatgpt = Some(ChatGptStatus::SignedOut)
+            }
+            (None, _) => {}
+        }
+        self.provider_models
+            .retain(|p, _| settings.has_credential(*p));
+        // Another base URL, or another ChatGPT account: another list of models.
+        let email = |s: &Settings| s.chatgpt.as_ref().map(|a| a.email.clone());
+        let (base_moved, account_moved) = match &self.settings {
+            Some(old) => (
+                old.openai_base_url != settings.openai_base_url,
+                email(old) != email(&settings),
+            ),
+            None => (false, false),
+        };
+        if base_moved {
+            self.forget_models(Provider::OpenAi);
+        }
+        if account_moved {
+            self.forget_models(Provider::ChatGpt);
+        }
+        self.settings = Some(settings);
+    }
+
+    /// `provider`'s credential or base URL changed: its model list is stale. It is
+    /// dropped and `models_epoch` moves, so Settings fetches it again.
+    pub fn forget_models(&mut self, provider: Provider) {
+        self.provider_models.remove(&provider);
+        *self.models_epoch.entry(provider).or_default() += 1;
+    }
+
+    /// The key Settings mounts a provider's slots under: again when the credential
+    /// comes or goes, and when the list went stale.
+    pub fn slots_key(&self, settings: &Settings, provider: Provider) -> String {
+        format!(
+            "{}-{}",
+            settings.has_credential(provider),
+            self.models_epoch.get(&provider).copied().unwrap_or(0)
+        )
+    }
+
+    /// Where the ChatGPT sign-in is: as fetched, else as the settings say.
+    pub fn chatgpt_status(&self) -> ChatGptStatus {
+        if let Some(status) = &self.chatgpt {
+            return status.clone();
+        }
+        match self.settings.as_ref().and_then(|s| s.chatgpt.clone()) {
+            Some(account) => ChatGptStatus::SignedIn {
+                account,
+                last_error: None,
+            },
+            None => ChatGptStatus::SignedOut,
+        }
+    }
+
+    /// Whether `provider` can answer (a key, or a ChatGPT sign-in); unknown settings
+    /// count as yes, so nothing is refused before they arrive.
+    pub fn provider_ready(&self, provider: Provider) -> bool {
+        self.settings
+            .as_ref()
+            .is_none_or(|s| s.has_credential(provider))
     }
 
     /// Replace topics, lessons, notes, videos and sources with a fresh library, keeping
@@ -174,7 +266,7 @@ impl LibraryState {
             Event::ProposalChanged { proposal } => {
                 self.proposals.insert(proposal.id.clone(), proposal);
             }
-            Event::SettingsChanged { settings } => self.settings = Some(settings),
+            Event::SettingsChanged { settings } => self.set_settings(settings),
             Event::SourceChanged { source } => match &source.workspace_id {
                 Some(workspace_id) => {
                     if let Some(files) = self.folder_files.get_mut(workspace_id) {
@@ -1099,12 +1191,20 @@ pub(crate) mod tests {
             waiting: None,
             created_at: ts(0),
             updated_at: ts(0),
+            provider: Default::default(),
         };
         s.apply(Event::ChatChanged { chat: chat.clone() });
         assert_eq!(s.chats["c1"], chat);
 
         // Not loaded: item events are ignored (the transcript is fetched on open).
-        let text = chat_item("i2", 2, ChatItemKind::AssistantText { text: "Hi".into() });
+        let text = chat_item(
+            "i2",
+            2,
+            ChatItemKind::AssistantText {
+                text: "Hi".into(),
+                citations: vec![],
+            },
+        );
         s.apply(Event::ChatItemChanged { item: text.clone() });
         assert!(!s.chat_items.contains_key("c1"));
 
@@ -1142,13 +1242,15 @@ pub(crate) mod tests {
         assert_eq!(
             items[1].kind,
             ChatItemKind::AssistantText {
-                text: "Hi there".into()
+                text: "Hi there".into(),
+                citations: vec![],
             }
         );
         let mut done = text;
         done.status = ItemStatus::Done;
         done.kind = ChatItemKind::AssistantText {
             text: "Hi there!".into(),
+            citations: vec![],
         };
         s.apply(Event::ChatItemChanged { item: done.clone() });
         assert_eq!(s.chat_items["c1"][1], done);
@@ -1170,11 +1272,19 @@ pub(crate) mod tests {
             waiting: None,
             created_at: ts(0),
             updated_at: ts(updated),
+            provider: Default::default(),
         }
     }
 
     fn text(id: &str, seq: u64, status: ItemStatus, text: &str, updated: i64) -> ChatItem {
-        let mut item = chat_item(id, seq, ChatItemKind::AssistantText { text: text.into() });
+        let mut item = chat_item(
+            id,
+            seq,
+            ChatItemKind::AssistantText {
+                text: text.into(),
+                citations: vec![],
+            },
+        );
         item.status = status;
         item.updated_at = ts(updated);
         item
@@ -1429,11 +1539,98 @@ pub(crate) mod tests {
             agent_model: None,
             pipeline: Default::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+            default_provider: Default::default(),
+            openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+            chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
+            claude_models: margin_shared::RouteModels::claude_default(),
+            has_claude_api_key: false,
+            chatgpt: None,
         };
         s.apply(Event::SettingsChanged {
             settings: settings.clone(),
         });
-        assert_eq!(s.settings, Some(settings));
+        assert_eq!(s.settings, Some(settings.clone()));
+
+        // The ChatGPT sign-in follows the settings' account; a provider that loses its
+        // credential forgets its models; unknown settings refuse no provider.
+        assert!(LibraryState::default().provider_ready(Provider::Claude));
+        assert!(s.provider_ready(Provider::OpenAi));
+        assert!(!s.provider_ready(Provider::Claude));
+        assert_eq!(s.chatgpt_status(), ChatGptStatus::SignedOut);
+        s.chatgpt = Some(ChatGptStatus::Waiting {
+            authorize_url: "https://auth.example/a".into(),
+        });
+        s.provider_models
+            .insert(Provider::OpenAi, crate::fake::fake_models(Provider::OpenAi));
+        s.apply(Event::SettingsChanged {
+            settings: settings.clone(),
+        });
+        // Still waiting: settings without an account don't end a sign-in.
+        assert!(matches!(s.chatgpt_status(), ChatGptStatus::Waiting { .. }));
+        assert!(s.provider_models.contains_key(&Provider::OpenAi));
+        let account = crate::fake::fake_account("owner@example.com");
+        let signed_in = Settings {
+            chatgpt: Some(account.clone()),
+            has_api_key: false,
+            ..settings.clone()
+        };
+        s.apply(Event::SettingsChanged {
+            settings: signed_in,
+        });
+        assert_eq!(
+            s.chatgpt_status(),
+            ChatGptStatus::SignedIn {
+                account: account.clone(),
+                last_error: None,
+            }
+        );
+        assert!(s.provider_ready(Provider::ChatGpt));
+        assert!(!s.provider_models.contains_key(&Provider::OpenAi));
+        s.apply(Event::SettingsChanged { settings });
+        assert_eq!(s.chatgpt_status(), ChatGptStatus::SignedOut);
+    }
+
+    #[test]
+    fn a_new_key_base_url_or_account_makes_the_model_list_stale() {
+        let mut s = sample();
+        let settings = Settings {
+            has_api_key: true,
+            has_claude_api_key: true,
+            chatgpt: Some(crate::fake::fake_account("owner@example.com")),
+            ..crate::fake::FakeState::new().settings
+        };
+        s.apply(Event::SettingsChanged {
+            settings: settings.clone(),
+        });
+        for p in [Provider::OpenAi, Provider::Claude, Provider::ChatGpt] {
+            s.provider_models.insert(p, crate::fake::fake_models(p));
+        }
+        let key = s.slots_key(&settings, Provider::OpenAi);
+
+        // A key replaced (the settings don't change): the UI calls `forget_models`.
+        s.forget_models(Provider::Claude);
+        assert!(!s.provider_models.contains_key(&Provider::Claude));
+        assert!(s.provider_models.contains_key(&Provider::OpenAi));
+
+        // Another base URL: the OpenAI list is dropped and its slots mount again.
+        let moved = Settings {
+            openai_base_url: "https://proxy.example/v1".into(),
+            ..settings.clone()
+        };
+        s.apply(Event::SettingsChanged {
+            settings: moved.clone(),
+        });
+        assert!(!s.provider_models.contains_key(&Provider::OpenAi));
+        assert_ne!(s.slots_key(&moved, Provider::OpenAi), key);
+        assert!(s.provider_models.contains_key(&Provider::ChatGpt));
+
+        // Another ChatGPT account: its list is dropped.
+        let other = Settings {
+            chatgpt: Some(crate::fake::fake_account("other@example.com")),
+            ..moved
+        };
+        s.apply(Event::SettingsChanged { settings: other });
+        assert!(!s.provider_models.contains_key(&Provider::ChatGpt));
     }
 
     #[test]

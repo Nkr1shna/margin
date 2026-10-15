@@ -37,6 +37,21 @@ Frozen after R1's first commit and changed only through the orchestrator:
 | **R1-trace** | `crates/service/src/{trace,turns,video,chats}.rs` (`chats.rs` only the `?traces=1` flag), `tests/{chats,media}.rs` |
 | **R1-evals** | `crates/evals/**`, `evals/**` |
 
+**Providers (switchable model providers; `docs/agent-providers-brief.md` §3–§4).** Frozen
+after the providers phase's first commit and changed only through the orchestrator:
+`crates/shared` (all of it), `crates/ai/src/model.rs` (the one model seam), the price
+types in `crates/evals/src/lib.rs`, and `server.rs` beyond the provider route lines. The
+ai crate has two owners by file: **P-ai-openai** owns `crates/ai/src/{lib,responses,windows}.rs`,
+`tests/fake_responses.rs` and `examples/siwc_spike.rs`; **P-ai-claude** owns
+`crates/ai/src/messages.rs` and `tests/fake_messages.rs`. **P-agent** owns
+`crates/agent/src/{turn,replay/*,prompt,scripted,sink}.rs` and `tests/turn.rs`;
+**P-service** `crates/service/src/{engines,state,settings,secrets,providers,turns,chats,server,video,trace}.rs`,
+the model call sites of `ask.rs`, `tests/{chats,agent_e2e,api,media}.rs` and
+`tests/common/mod.rs`; **P-app** `crates/app/src/ui/{settings,chat}.rs`, `api.rs`,
+`store.rs`, `fake.rs`, `citations.rs` (the `WebCitation` helpers), `ui/test_render.rs`,
+`examples/render_screens.rs`, `assets/`; **P-evals** `crates/evals/**` but the price
+types, and `evals/README.md`.
+
 `crates/shared` is the contract and is changed only through the orchestrator. It already
 contains everything below; `crates/video` and `crates/embed` are untouched.
 
@@ -52,13 +67,15 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **3 Jobs, attachments, app control** | — | App-control device tools, `device_output_text`; uncapped `Retry-After` with `sink.retrying`/`clear_waiting` (4.5); `Error.code` on every Error; context in the user role (4.11) | `write_lesson`, `regenerate_lesson`, `make_video`, `attach_sources`; files attached to chats (cleanup skips them, deleted with the chat); `DeviceHub::call`/`deliver`, events socket registration, `DeviceChanged`, `Device.online`, `DeviceDeleted` + workspace cleanup on revoke; Stop awaits started writes (4.6); `Chat.waiting`; model-written titles (§3); `Superseded` proposals (§5) | Usage footer, attach files in the chat composer, device presence (online dots in Settings → Devices), the socket's `ServerFrame` parsing and `DeviceFrame` sending, app-control runner (navigate, open citation, show passage, toggle sidebar); waiting banner; titles by `title_by`; superseded outline card; "Open Settings" for `no_api_key`/`no_model`; reasoning effort list from `ReasoningEffort::ALL`; Create lessons opens the first lesson |
 | **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files` (service `Read` tools over the folder's rows and sources) and `sync_folder` (the one device tool); a folder's text is searched with R1's `search` scoped to the workspace | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
+| **Providers** | One seam (`model.rs`: `CallOptions`, `TextModel`, `Provider`, `ModelRequest`, `ModelEvent`); `ResponsesClient` on it (OpenAI, ChatGPT bearer), `ClaudeClient` (Messages API, D2/D12), `list_models` with windows | The loop on neutral `ModelEvent`s, `replay::claude`, Claude tool gating (D5), web rows/cards/citations, pause/pending continuation, window-scaled compaction | `model_for`/`provider_config` per provider with the window cache, three Keychain entries, the SIWC flow, chats on their provider, traces per provider (D14) | Settings: default provider and three slots per provider, ChatGPT sign-in, Claude key; New chat provider picker; web card and citations |
 | **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
 
 Between the phase 1 and phase 2 merges courses can't be created (the old composer is
 unrouted until phase 2 reuses its outline editor); no release happens in between.
 
-Web search is not built (owner decision Q1). Nothing in the registry assumes a fixed set
-of tools, so a search tool can be added later. The service registers the app-control
+Web search is the provider's hosted tool (providers phase, superseding Q1): `web_search`
+on OpenAI and ChatGPT, `web_search` and `web_fetch` on Claude (§5). Nothing in the
+registry assumes a fixed set of tools. The service registers the app-control
 device tools from phase 3 and the folder tools from phase 4 (the `tools` array changes,
 and the prompt cache prefix with it, once at each of those releases).
 
@@ -67,7 +84,21 @@ and the prompt cache prefix with it, once at each of those releases).
 All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
 
 - `Chat { id, title, title_by: TitleSource, state: ChatState, workspace_ids, source_ids,
-  pending, usage, waiting: Option<Waiting { until, reason }>, … }`.
+  pending, usage, waiting: Option<Waiting { until, reason }>, provider: Provider, … }`
+  (`provider` set at creation from `NewChat.provider` else Settings' `default_provider`,
+  never changed; chats stored before it are `openai`).
+- Providers (`margin_shared::providers`): `Provider { OpenAi, ChatGpt, Claude }` (wire
+  `openai`/`chatgpt`/`claude`), `RouteModels { chat, write, small }`, `ModelInfo { id,
+  display_name, context_window, max_output_tokens }`, `ChatGptAccount`, `ChatGptStatus`,
+  `WebCitation`, `WebResult`; `Settings` gains `default_provider`, `openai_models`,
+  `chatgpt_models`, `claude_models`, `has_claude_api_key`, `chatgpt` (a `Settings` without
+  slots migrates `agent_model` into `openai_models.chat`); `SettingsPatch` the same plus
+  `anthropic_api_key`; `AssistantText.citations: Vec<WebCitation>`;
+  `Card::WebResults(WebResultsCard { query, results })`; `Usage` gains
+  `cache_write_input_tokens`, `web_search_requests`, `web_fetch_requests`;
+  `context::TraceUsage.web_fetches`; `error_code::{AUTH_FAILED, SPEND_LIMIT_REACHED,
+  PLAN_LIMIT_REACHED, PLAN_INELIGIBLE}`; routes `providers_models(provider)`,
+  `PROVIDERS_CHATGPT`, `PROVIDERS_CHATGPT_START`.
   `ChatState`: `Idle | Running { turn_id, device_id, started_at } | WaitingForUser {
   turn_id, device_id, item_id } | Interrupted { turn_id } | Failed { turn_id, error }`.
 - `ChatItem { id, chat_id, turn_id, seq, status: InProgress|Done|Cancelled, … , kind }`,
@@ -178,7 +209,24 @@ state.devices, retry: RetryPolicy::default() }`.
 
 ### 4.2 One step (model call)
 
-Request: `input = [developer system_prompt()] + history`; `tools =
+**Per provider (providers phase).** The loop builds one neutral `ModelRequest` (`opts:
+CallOptions { route: Chat, cache_key: chat_id, .. }`, `system`, `history`, `tools:
+Vec<ToolDef>`, `tool_choice: Auto | None | Allowed(names)`, `web`, `effort`,
+`compaction`, `parallel_tool_calls`) and consumes neutral `ModelEvent`s (`Started`,
+`Delta`, `Done { item: ModelItem { stored, view } }`, `Completed { usage, model,
+stop_reason, next }`, `Incomplete`, `Failed`); `stored` is what goes into `model_items`,
+verbatim. The model is the provider config's slot for the route: nothing in the request
+overrides it. The Responses rendering is below (`margin_ai::responses_request`); the
+Messages rendering (Claude) is `docs/agent-providers-brief.md` D2: `system` cached, every
+tool constant for the chat's life with `strict: true`, `Allowed` sent as `auto` (D5),
+`thinking: adaptive` with `display: summarized` and `block_binding.prefix_mismatch_behavior:
+drop_block`, `output_config.effort`, betas `compact-2026-01-12,thinking-binding-controls-2026-08-01`,
+web tools `web_search_20260318` / `web_fetch_20260318`. On ChatGPT the agent sends
+`parallel_tool_calls: false` (or caps the calls it runs per step): the SIWC spike saw one
+`allowed_tools`/required response return 128 calls of one tool
+(`docs/agent-siwc-spike.md`).
+
+Request (Responses): `input = [developer system_prompt()] + history`; `tools =
 registry.definitions()` (same every call); `parallel_tool_calls: true`; `reasoning =
 {effort, summary: auto}`; `include_encrypted_reasoning`; `prompt_cache_key = chat_id`;
 `tool_choice`:
@@ -275,6 +323,17 @@ gives `msg`.
   than 429; `code` from `error_code`: `rate_limited`, `server_error`, `network`,
   `context_too_long`, `incomplete`, `bad_request`, … — every Error the loop or the
   service stores carries one).
+- Providers (`docs/agent-providers-brief.md` D7): a refused credential (OpenAI 401/403;
+  Claude 401 `authentication_error`, 403 `permission_error`, 402 `billing_error`) is
+  `auth_failed` (owner decision, not `no_api_key`); Claude 429 with
+  `details.error_code: enforced_spend_limit_reached` is `spend_limit_reached`; ChatGPT's
+  `subscription_sharing_usage_limit_exceeded` / `_usage_unavailable` (HTTP 429 or
+  `response.failed`) is `plan_limit_reached` (untested against the live API: the spike's
+  step 5 couldn't run), `subscription_sharing_user_not_eligible` is `plan_ineligible`.
+  None of the four is retried; each offers Open Settings → that provider. Claude 529
+  `overloaded_error`, 500 and 504 are `server_error` and retried; `AiError::Http.code`
+  carries the provider's code (`error.details.error_code`, else `error.code`, else
+  `error.type`).
 - `Incomplete { reason }` (`max_output_tokens`, `max_messages`, `content_filter`,
   `steered`): items done so far are kept; Error "The answer was cut off (…)"
   `retryable: true`, code `incomplete`.
@@ -348,6 +407,14 @@ pending message), delete items, delete sources whose only attachment is this cha
 
 ### 4.11 Replay
 
+Replay is per provider (`replay::openai`, `replay::claude`; `docs/agent-providers-brief.md`
+D4). A chat stays on the provider it was created on (`Chat.provider`) and its
+`model_items` hold that provider's wire items verbatim; nothing stored is rewritten. On
+Claude a stored entry is `{"role", "block"}` (one content block) and `replay::claude::messages`
+regroups blocks into messages deterministically (same items → same prefix, what preserved
+thinking checks); an `Action` is a user-role `Margin: …` note. What follows is the
+Responses replay (OpenAI, ChatGPT).
+
 `replay_input` = each stored item's `model_items` in `seq` order, plus the safety net for
 unanswered calls. Anything stored between a step's `function_call`s and their outputs (an
 `Action` recorded while the turn waited on a confirmation) is replayed right after those
@@ -379,6 +446,16 @@ last Error item while `Failed`.
 
 Arguments are `strict` JSON schemas from `schemars` (`Option` fields are required and
 nullable). Outputs are compact JSON text unless noted. `summary` is the tool row's line.
+
+### Providers, hosted web tools
+
+`web_search` (all providers) and `web_fetch` (Claude: `max_uses` 8, `citations` on,
+`max_content_tokens` 50 000; owner decision: on, no per-chat switch) are the provider's
+hosted tools, not registry tools: a `ToolCall`/`ToolResult` row pair named
+`web_search`/`web_fetch` (icon `globe`), a `Card::WebResults` after a search, and
+`AssistantText.citations` (`WebCitation { url, title, cited_text, start, end }`) shown
+as a numbered Sources list. Not counted against the tool output budget; never in
+`unanswered_calls`. `encrypted_content` never leaves the service.
 
 ### Phase 1, Read (service)
 
@@ -559,6 +636,14 @@ R1, `margin_shared::routes`: `RETRIEVAL_K_DENSE` 40, `RETRIEVAL_K_LEX` 40,
 `retrieval::RETRIEVAL_CACHE_ENTRIES` 256; `trace::TRACE_CHANNEL` 4 096. `Budget`
 defaults: `share_of_window` 0.5, `min_score_pct` 25, `images_max` 8, `passages_min` 0
 (no fixed token cap; owner Q3).
+Providers, `margin_ai`: `CLAUDE_MAX_OUTPUT_TOKENS` 32 000 (a text call: 64 000),
+`WEB_SEARCH_MAX_USES` 8, `WEB_FETCH_MAX_USES` 8, `WEB_FETCH_MAX_CONTENT_TOKENS` 50 000,
+`MODEL_WINDOW_FALLBACK` 200 000 input / 32 000 output, `WEB_SEARCH_TOOL`
+`web_search_20260318`, `WEB_FETCH_TOOL` `web_fetch_20260318`, `CLAUDE_BETAS`
+`compact-2026-01-12,thinking-binding-controls-2026-08-01`; `windows::openai_window`
+(GPT-6 family: 1 050 000 / 128 000). Model defaults (`margin_shared`): Claude
+`claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI small
+`gpt-6-luna`; ChatGPT `gpt-6.1-sol`.
 
 ## 8. Tests each owner adds
 
@@ -585,6 +670,16 @@ defaults: `share_of_window` 0.5, `min_score_pct` 25, `images_max` 8, `passages_m
   folder access code.
 
 Never call the real OpenAI API; never touch the running service or its data folder.
+
+**Providers**: `docs/agent-providers-brief.md` §5 per area (fake Responses and fake
+Messages servers that record bodies, a fake auth server for the SIWC flow, `ScriptedModel`
+on neutral `ModelEvent`s). No test calls api.openai.com, auth.openai.com or
+api.anthropic.com. The first commit has: shared round trips (a `Chat` without `provider`
+is OpenAI, an `AssistantText` without `citations` parses, `Settings` without slots gets
+the defaults with `agent_model` migrated into `openai_models.chat`), the Responses
+adapter (`responses_request` + `to_model_events`), `AiError` codes and retries, price
+parsing with the web-search price, Haiku 5.5's long-context tier and ChatGPT's `None`
+cost.
 
 **Phase 4**: the e2e tests of `docs/agent-phase4-brief.md` D13, rewritten by the
 phase's integrator for the ingest path (`docs/agent-rag-architecture.md` §6.6); the

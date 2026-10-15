@@ -62,14 +62,49 @@ margin-eval grade-questions                # every golden question through every
 margin-eval judge --against evals/recorded/generations/lesson-v3   # pairwise, both orders
 margin-eval runs
 margin-eval compare <run-a> <run-b>        # paired bootstrap 95 % intervals per metric
+margin-eval compare <run-a> <run-b> --allow-provider-change   # e.g. OpenAI vs Claude writer
 margin-eval export --kind model_call --from 2026-10-01T00:00:00Z --out traces.jsonl
 margin-eval report <run> --traces traces.jsonl
 ```
 
 `compare` refuses runs made with different embedder versions unless
 `--allow-embedder-change` is passed, so a win is never a side effect of fresh vectors.
-Commit the new `baseline.json` (and the report's summary table) with the change that
-improves it.
+It likewise refuses runs whose models came from different providers (OpenAI, ChatGPT,
+Claude) unless `--allow-provider-change` is passed, so a win is never a side effect of
+switching providers; with the flag the comparison carries a warning that the deltas
+include the provider's effect. Each run records its providers (`providers` on the run,
+shown as "Provider" in its report): the courses writer (or the recorded generations'
+writer), the agent's model, the question generator; a retrieval run has none. A run
+recorded before providers were compares with a warning. ChatGPT is its own provider even
+on model ids OpenAI also serves. Commit the new `baseline.json` (and the report's summary
+table) with the change that improves it.
+
+## Cost per provider
+
+`margin-eval report --traces FILE` (or `--service`) adds an Efficiency section from the
+service's `model_call` trace rows (`docs/agent-providers-brief.md` D14): one line per
+route, provider and model (calls, input, cached %, cache writes, output, web searches,
+cost, mean latency), the total, and a **Cost by provider** table. A row's own `cost_usd`
+(priced by the service when it was written) wins; otherwise the row is priced from
+`prices.toml` by the same rule as the service's `trace::cost_usd`: fresh input
+(input − cached − cache writes), cached reads and cache writes at their own prices,
+output, Haiku 5.5's long-context tier past its `over`, plus `web_search` per 1 000
+searches. A model missing from the table counts as "unpriced", never a guess. ChatGPT
+calls are plan-billed: their tokens count, their cost cell says "plan-billed". A row
+with no `provider` (recorded before providers) takes the one `prices.toml` lists its
+model under.
+
+## The Claude prompt-prefix gate
+
+`crates/evals/tests/gates.rs` (`claude_prefix`) drives the real `ClaudeClient` against a
+fake Messages server that records every request body, and checks them with
+`margin_evals::prefix` (D12): for one prompt version, `system[0]` is that version's
+constant block byte for byte with `cache_control: {"type": "ephemeral"}`; `system[1]` is
+the rest of the instructions (the variable part), unmarked, and left out when there is
+none; a text call has exactly one breakpoint; the constant block is sent nowhere else.
+It covers lessons, scenes, the planner and the reranker, each call on its route's model.
+A change to a constant block bumps its `prompt_version`. The OpenAI counterpart is
+R1's prefix-identity test in `crates/ai/tests/fake_responses.rs`.
 
 ## How quality is shown without human review
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::judge::{Agreement, CanaryReport};
 use crate::retrieval::RetrievalReport;
 use crate::store::EvalRun;
-use crate::traces::Efficiency;
+use crate::traces::{CallStats, Efficiency};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Table {
@@ -234,15 +234,35 @@ pub fn questions_section(grades: [usize; 4], hand: usize, kappa: Option<f64>) ->
     }
 }
 
+/// A cost cell: dollars, with the calls that have none said in words. ChatGPT calls
+/// are plan-billed (`docs/agent-providers-brief.md` D14): a line of only those says so
+/// instead of a misleading $0.
+pub fn cost_cell(s: &CallStats) -> String {
+    if s.calls > 0 && s.plan_billed == s.calls {
+        return "plan-billed".into();
+    }
+    let mut cell = format!("{:.4}", s.cost_usd);
+    if s.unpriced > 0 {
+        cell.push_str(&format!(" (+{} unpriced)", s.unpriced));
+    }
+    if s.plan_billed > 0 {
+        cell.push_str(&format!(" (+{} plan-billed)", s.plan_billed));
+    }
+    cell
+}
+
 pub fn efficiency_section(e: &Efficiency) -> ReportSection {
     let mut t = Table {
-        title: "Model calls by route and model (from the service's traces)".into(),
+        title: "Model calls by route, provider and model (from the service's traces)".into(),
         columns: [
             "Route / model",
+            "Provider",
             "Calls",
             "Input",
             "Cached %",
+            "Cache writes",
             "Output",
+            "Web searches",
             "Cost (USD)",
             "Mean ms",
         ]
@@ -250,24 +270,66 @@ pub fn efficiency_section(e: &Efficiency) -> ReportSection {
         .to_vec(),
         rows: Vec::new(),
     };
-    for (k, s) in e
-        .calls
-        .iter()
-        .chain(std::iter::once((&"**total**".to_string(), &e.total)))
-    {
+    for s in e.calls.values() {
         t.rows.push(vec![
-            k.clone(),
+            format!("{} / {}", s.route, s.model),
+            s.provider.clone(),
             s.calls.to_string(),
             s.input.to_string(),
             f1(s.cache_share()),
+            s.cache_write.to_string(),
             s.output.to_string(),
-            if s.unpriced > 0 {
-                format!("{:.4} (+{} unpriced)", s.cost_usd, s.unpriced)
-            } else {
-                format!("{:.4}", s.cost_usd)
-            },
+            s.web_searches.to_string(),
+            cost_cell(s),
             format!("{:.0}", s.mean_ms),
         ]);
+    }
+    let s = &e.total;
+    t.rows.push(vec![
+        "**total**".into(),
+        "all".into(),
+        s.calls.to_string(),
+        s.input.to_string(),
+        f1(s.cache_share()),
+        s.cache_write.to_string(),
+        s.output.to_string(),
+        s.web_searches.to_string(),
+        cost_cell(s),
+        format!("{:.0}", s.mean_ms),
+    ]);
+    let mut by_provider = Table {
+        title: "Cost by provider".into(),
+        columns: [
+            "Provider",
+            "Calls",
+            "Input",
+            "Cached %",
+            "Cache writes",
+            "Output",
+            "Web searches",
+            "Cost (USD)",
+            "Mean ms",
+        ]
+        .map(String::from)
+        .to_vec(),
+        rows: Vec::new(),
+    };
+    for (p, s) in &e.providers {
+        by_provider.rows.push(vec![
+            p.clone(),
+            s.calls.to_string(),
+            s.input.to_string(),
+            f1(s.cache_share()),
+            s.cache_write.to_string(),
+            s.output.to_string(),
+            s.web_searches.to_string(),
+            cost_cell(s),
+            format!("{:.0}", s.mean_ms),
+        ]);
+    }
+    let mut tables = vec![t];
+    if !e.providers.is_empty() {
+        tables.push(by_provider);
     }
     ReportSection {
         heading: "Efficiency".into(),
@@ -284,7 +346,7 @@ pub fn efficiency_section(e: &Efficiency) -> ReportSection {
             e.embed_chunks_per_s,
             e.tool_output_max_bytes
         )],
-        tables: vec![t],
+        tables,
         bars: Vec::new(),
     }
 }
@@ -297,6 +359,14 @@ fn header(run: &EvalRun) -> Vec<(String, String)> {
         ("Embedder".into(), run.embedder_version.clone()),
         ("Corpus".into(), run.corpus_hash.chars().take(12).collect()),
         ("Started".into(), run.started_at.to_rfc3339()),
+        (
+            "Provider".into(),
+            if run.providers.is_empty() {
+                "none recorded".into()
+            } else {
+                run.providers.join(", ")
+            },
+        ),
         (
             "Judges".into(),
             if run.judges.is_empty() {
@@ -472,6 +542,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             finished_at: None,
             judges: vec!["openai:j".into()],
+            providers: vec!["claude".into()],
             valid,
             notes: vec!["a note <b>".into()],
             summary: serde_json::Value::Null,
@@ -561,5 +632,62 @@ mod tests {
             !page.contains("http://") && !page.contains("https://"),
             "no external files"
         );
+    }
+
+    /// The cost table has a provider column and a per-provider table; ChatGPT lines
+    /// say "plan-billed" instead of $0.
+    #[test]
+    fn the_cost_table_is_per_provider() {
+        use crate::traces::efficiency;
+        use margin_shared::context::{TraceKind, TraceRow, TraceUsage};
+        use margin_shared::pipeline::Route;
+        let prices: crate::Prices = toml::from_str(
+            &std::fs::read_to_string(crate::golden::evals_dir().join("prices.toml")).unwrap(),
+        )
+        .unwrap();
+        let call = |i: i64, provider: &str, model: &str| {
+            let mut r: TraceRow = serde_json::from_value(serde_json::json!({
+                "id": format!("u{i}"),
+                "kind": TraceKind::ModelCall.as_str(),
+                "at": chrono::DateTime::from_timestamp(i, 0).unwrap(),
+            }))
+            .unwrap();
+            r.trace_id = "t".into();
+            r.route = Some(Route::Chat);
+            r.provider = Some(provider.into());
+            r.model = Some(model.into());
+            r.usage = Some(TraceUsage {
+                input: 1_000_000,
+                cached: 500_000,
+                cache_write: 100_000,
+                output: 100_000,
+                web_searches: 4,
+                ..Default::default()
+            });
+            r
+        };
+        let rows = [
+            call(1, "claude", "claude-sonnet-5-5"),
+            call(2, "openai", "gpt-6.1-sol"),
+            call(3, "chatgpt", "gpt-6.1-sol"),
+        ];
+        let sec = efficiency_section(&efficiency(&rows, &prices));
+        let md = markdown(&run(true), &[sec]);
+        for want in [
+            "| Route / model | Provider | Calls | Input | Cached % | Cache writes | Output | Web searches | Cost (USD) | Mean ms |",
+            // 0.4M × $2 + 0.5M × $0.20 + 0.1M × $2.50 + 0.1M × $10 + 4 × $0.01.
+            "| chat / claude-sonnet-5-5 | claude | 1 | 1000000 | 50.0 | 100000 | 100000 | 4 | 2.1900 |",
+            "| chat / gpt-6.1-sol | chatgpt | 1 | 1000000 | 50.0 | 100000 | 100000 | 4 | plan-billed |",
+            "| chat / gpt-6.1-sol | openai | 1 |",
+            "| **total** | all | 3 |",
+            "(+1 plan-billed)",
+            "### Cost by provider",
+            "| Provider | Calls |",
+            "| chatgpt | 1 | 1000000 | 50.0 | 100000 | 100000 | 4 | plan-billed |",
+            "| claude | 1 | 1000000 | 50.0 | 100000 | 100000 | 4 | 2.1900 |",
+            "- **Provider:** claude",
+        ] {
+            assert!(md.contains(want), "{want} not in\n{md}");
+        }
     }
 }

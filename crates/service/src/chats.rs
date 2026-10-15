@@ -329,6 +329,11 @@ pub async fn create_chat(
         Some(m) => Some(check_message(&state, m).await?),
         None => None,
     };
+    // The provider asked for, else Settings' default; the chat stays on it for good.
+    let provider = match req.provider {
+        Some(p) => p,
+        None => state.settings_row().await?.default_provider,
+    };
     let _w = state.write_lock.lock().await;
     let now = Utc::now();
     let mut chat = Chat {
@@ -341,6 +346,7 @@ pub async fn create_chat(
         pending: None,
         usage: Usage::default(),
         waiting: None,
+        provider,
         created_at: now,
         updated_at: now,
     };
@@ -375,7 +381,7 @@ pub async fn get_chat(
         }
         if let Some(text) = live.get(&item.id) {
             match &mut item.kind {
-                ChatItemKind::AssistantText { text: t }
+                ChatItemKind::AssistantText { text: t, .. }
                 | ChatItemKind::Reasoning { summary: t }
                 | ChatItemKind::ToolCall { arguments: t, .. } => *t = text.clone(),
                 _ => {}

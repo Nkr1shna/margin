@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod library;
 pub mod media;
 pub mod pipeline;
+pub mod providers;
 pub mod restore;
 pub mod retrieval;
 pub mod search;

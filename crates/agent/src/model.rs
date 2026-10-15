@@ -1,19 +1,5 @@
-//! The seam between the loop and the model API.
+//! The seam between the loop and the model API: `margin_ai::Provider`, one agent step
+//! per call on neutral events (`docs/agent-providers-brief.md` D1). `ResponsesClient`
+//! and `ClaudeClient` in production; tests use [`crate::ScriptedModel`].
 
-use margin_ai::{AiError, ResponseRequest, ResponseStream, ResponsesClient};
-
-use crate::BoxFuture;
-
-/// Makes one streamed model call. `margin_ai::ResponsesClient` in production; tests use
-/// [`crate::ScriptedModel`].
-pub trait ModelClient: Send + Sync + 'static {
-    /// Starts the call. `Err` before any event (HTTP status, connection) is retried by
-    /// the loop when `AiError::is_retryable`.
-    fn stream(&self, req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>>;
-}
-
-impl ModelClient for ResponsesClient {
-    fn stream(&self, req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>> {
-        Box::pin(async move { self.stream_response(&req).await })
-    }
-}
+pub use margin_ai::Provider as ModelClient;

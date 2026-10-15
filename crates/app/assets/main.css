@@ -408,6 +408,24 @@ body.resizing-sb * { user-select: none !important; }
 .chat-card-h { display: flex; align-items: center; gap: 8px; font-size: 14px; }
 .chat-card-h b { font-weight: 500; }
 .chat-card .cite-item { margin: 0; width: calc(100% - 16px); }
+/* Providers: the new chat's picker, the chat header's badge, a web search's results and
+   an answer's cited pages. */
+.prov-pick { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: -10px; }
+.prov-pick .label { font-size: 13px; font-weight: 500; color: var(--fg-3); }
+.seg button:disabled { opacity: .45; cursor: default; }
+.prov-badge { flex: none; margin-left: 8px; padding: 1px 8px; border-radius: var(--r-pill); border: 1px solid var(--line-2); font-size: 11.5px; font-weight: 600; line-height: 18px; color: var(--fg-2); white-space: nowrap; }
+.web-result .cite-name { white-space: normal; overflow-wrap: anywhere; }
+.web-sources { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+.web-sources h4 { margin: 0 0 4px; font-size: 12.5px; font-weight: 600; color: var(--fg-3); letter-spacing: 0; }
+.web-src-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+.web-src { width: 100%; display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; margin: 0 -6px; box-sizing: content-box; border: 0; border-radius: var(--r-ctl); background: transparent; text-align: left; color: var(--fg); font-size: 13.5px; }
+.web-src:hover { background: var(--hover); }
+.web-src .cite-n { min-width: 16px; height: 16px; line-height: 16px; font-size: 10.5px; }
+.web-src-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.web-src-host { flex: none; font-size: 12.5px; color: var(--fg-3); }
+.slot-window { color: var(--fg-2); font-weight: 500; }
+.slot-pinned { font-size: 13px; font-weight: 500; color: var(--warn, var(--fg-2)); }
+.chatgpt-wait { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; }
 .result-card { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .result-card .grow { white-space: normal; }
 .result-card b { display: block; font-weight: 500; }

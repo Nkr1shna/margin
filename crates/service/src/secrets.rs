@@ -16,7 +16,11 @@ use anyhow::Context;
 pub const KEYCHAIN_SERVICE: &str = "com.krishnanelloore.margin";
 pub const GITHUB_CLIENT_SECRET: &str = "github-client-secret";
 pub const OPENAI_API_KEY: &str = "openai-api-key";
+/// The Claude provider's key (`docs/agent-providers-brief.md` D9).
 pub const ANTHROPIC_API_KEY: &str = "anthropic-api-key";
+/// The ChatGPT sign-in as JSON: `client_id`, `ext_agent_host_id`, `access_token`,
+/// `refresh_token`, `expires_at`, `scopes`, `sub`, `email`. Never leaves the service.
+pub const CHATGPT_TOKENS: &str = "chatgpt-tokens";
 pub const ELEVENLABS_API_KEY: &str = "elevenlabs-api-key";
 pub const MEDIA_SIGNING_KEY: &str = "media-signing-key";
 

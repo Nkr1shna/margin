@@ -616,9 +616,25 @@ fn the_budget_is_a_share_of_the_window() {
     };
     let pb = pack_budget(&b, 1_000_000, 4);
     assert_eq!((pb.tokens, pb.images_max, pb.passages_min), (100_000, 1, 2));
-    assert_eq!(context_window("claude-sonnet-5-5"), 200_000);
-    assert_eq!(context_window("gpt-5.2"), 400_000);
-    assert_eq!(context_window("test-model"), DEFAULT_CONTEXT_WINDOW);
+    // D13: the answer's output is kept out of the share.
+    let pb = pack_budget_reserving(&Budget::default(), 200_000, 32_000, 12);
+    assert_eq!(pb.tokens, 68_000);
+    assert_eq!(
+        pack_budget_reserving(&Budget::default(), 1_000, 32_000, 4).tokens,
+        0
+    );
+    let w = margin_ai::ModelWindow {
+        input: 1_000_000,
+        output: 128_000,
+    };
+    assert_eq!(output_reserve(Provider::Claude, Route::Chat, w), 32_000);
+    assert_eq!(output_reserve(Provider::Claude, Route::Write, w), 64_000);
+    assert_eq!(output_reserve(Provider::OpenAi, Route::Write, w), 128_000);
+    let small = margin_ai::ModelWindow {
+        input: 200_000,
+        output: 8_000,
+    };
+    assert_eq!(output_reserve(Provider::Claude, Route::Write, small), 8_000);
 }
 
 #[test]

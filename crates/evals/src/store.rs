@@ -39,6 +39,13 @@ pub struct EvalRun {
     /// Judges and graders used, by id.
     #[serde(default)]
     pub judges: Vec<String>,
+    /// The providers whose models wrote what the run scores (the courses writer, the
+    /// agent's model, the question generator), as trace rows name them ("openai",
+    /// "chatgpt", "claude"), sorted; empty for a suite with no model under test
+    /// (retrieval) and for runs recorded before providers were. `compare` refuses runs
+    /// whose providers differ unless `--allow-provider-change`.
+    #[serde(default)]
+    pub providers: Vec<String>,
     /// False when a judge's canaries failed (the report says which).
     #[serde(default = "yes")]
     pub valid: bool,
@@ -163,6 +170,7 @@ mod tests {
             started_at: DateTime::from_timestamp(at, 0).unwrap(),
             finished_at: None,
             judges: vec![],
+            providers: vec![],
             valid: true,
             notes: vec![],
             summary: serde_json::json!({"x": 1}),

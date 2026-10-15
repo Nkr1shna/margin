@@ -280,7 +280,7 @@ async fn record_course_created(
         state,
         &StoredChatItem {
             item,
-            model_items: vec![margin_agent::action_input(&text)],
+            model_items: vec![margin_agent::replay::action(chat.provider, &text)],
             full_output: None,
         },
     )
@@ -298,7 +298,7 @@ pub async fn accept_proposal(
     req: AcceptProposal,
 ) -> AppResult<(Topic, Proposal)> {
     let outline = validate_outline(&req.outline)?;
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
 
     let (topic, events, lesson_ids, proposal) = {
         let _w = state.write_lock.lock().await;
@@ -458,7 +458,7 @@ pub async fn regenerate(
 /// /api/lessons/{id}/regenerate` and the agent's `regenerate_lesson`). Its body stays
 /// until the new one is done, and comes back if writing fails.
 pub async fn regenerate_lesson(state: &AppState, id: &str) -> AppResult<Lesson> {
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
         let mut row = library::lesson(state, id).await?;
@@ -497,7 +497,7 @@ pub struct NewLesson {
 /// follows it (`make_video` asks for one).
 pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson> {
     let title = library::clean_title(&req.title, "lesson")?;
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
         library::topic(state, &req.topic_id).await?;
@@ -662,6 +662,16 @@ async fn lesson_context(
     Ok((ctx, proposal, retrieved))
 }
 
+/// The options of a writing call: the `Write` route, the prompt's cache key
+/// (`"{job}:{version}"`), the length of its constant block (the Claude client's cache
+/// breakpoint) and its version for the trace.
+fn write_options(prompt: &margin_ai::Prompt) -> CallOptions {
+    CallOptions::new(Route::Write)
+        .with_cache_key(prompt.cache_key())
+        .with_cache_prefix_len(prompt.constant.len())
+        .with_prompt_version(prompt.version)
+}
+
 /// A lesson's passages: retrieved from its topic, the sources its course was asked with
 /// and the attached folders it draws on (waiting for those still being read, up to `sources::SOURCE_WAIT`), packed to
 /// the pipeline's budget against the writing model's window. When retrieval fails the
@@ -693,6 +703,7 @@ async fn lesson_passages(
         let scope = Scope::Union { scopes };
         retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
         let pipeline = state.pipeline.load_full();
+        let window = retrieval::route_window(state, Route::Write, None).await?;
         let req = retrieval::Request {
             plan,
             scope,
@@ -700,7 +711,8 @@ async fn lesson_passages(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
             trace_id: lesson.id.clone(),
             caller: None,
         };
@@ -805,6 +817,7 @@ pub async fn survey(
         });
     }
     let pipeline = state.pipeline.load_full();
+    let window = retrieval::route_window(state, Route::Write, None).await?;
     let survey = retrieval::retrieve(
         state,
         &retrieval::Request {
@@ -814,7 +827,8 @@ pub async fn survey(
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
-            window_tokens: retrieval::route_window(state, Route::Write).await?,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
             trace_id: trace_id.to_string(),
             caller: None,
         },
@@ -848,17 +862,17 @@ pub async fn plan_course(
         return Ok(None);
     };
     let ai = state
-        .route_ai_config(Route::Write)
+        .model_for(Route::Write, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
-    let opts = CallOptions::new(Route::Write);
+    let opts = write_options(&margin_ai::prompts::plan(&req));
     let mut call = SpanGuard::new(
         trace::model_call(
             state,
             trace_id,
             Route::Write,
             &ai.model,
-            trace::provider_of(&ai.base_url),
+            ai.config.provider.as_str(),
             margin_ai::prompts::PLAN_VERSION.to_string(),
         ),
         state,
@@ -889,7 +903,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         else {
             return Ok(());
         };
-        let ai = match state.route_ai_config(Route::Write).await {
+        let ai = match state.model_for(Route::Write, None).await {
             Ok(ai) => ai,
             Err(e) => {
                 row.lesson.status = LessonStatus::Failed { error: e.message };
@@ -934,14 +948,14 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
             });
         })
     };
-    let opts = CallOptions::new(Route::Write);
+    let opts = write_options(&margin_ai::prompts::lesson(&ctx));
     let mut call = SpanGuard::new(
         trace::model_call(
             state,
             lesson_id,
             Route::Write,
             &ai.model,
-            trace::provider_of(&ai.base_url),
+            ai.config.provider.as_str(),
             margin_ai::prompts::LESSON_VERSION.to_string(),
         ),
         state,

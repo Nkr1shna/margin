@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Citation, Id, Level};
+use crate::{Citation, Id, Level, Provider, WebCitation, WebResult};
 
 // ---------------------------------------------------------------------------
 // Chats
@@ -47,6 +47,10 @@ pub struct Chat {
     /// starts or the turn ends.
     #[serde(default)]
     pub waiting: Option<Waiting>,
+    /// The model provider the chat runs on: set at creation (`NewChat.provider`, else
+    /// Settings' default) and never changed. Chats stored before providers are OpenAI.
+    #[serde(default)]
+    pub provider: Provider,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -148,7 +152,8 @@ pub struct PendingMessage {
     pub created_at: DateTime<Utc>,
 }
 
-/// Tokens spent, as the Responses API reports them in `response.usage`.
+/// Tokens spent, as the provider reports them (Responses `response.usage`, Messages
+/// `usage`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -159,6 +164,16 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     /// Model calls made.
     pub model_calls: u64,
+    /// Input tokens written to the prompt cache (Claude's `cache_creation_input_tokens`;
+    /// 0 on OpenAI, which writes no explicit entries).
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
+    /// Hosted web searches run (Claude bills them per 1 000).
+    #[serde(default)]
+    pub web_search_requests: u64,
+    /// Hosted web page fetches run.
+    #[serde(default)]
+    pub web_fetch_requests: u64,
 }
 
 impl Usage {
@@ -168,6 +183,9 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
         self.model_calls += other.model_calls;
+        self.cache_write_input_tokens += other.cache_write_input_tokens;
+        self.web_search_requests += other.web_search_requests;
+        self.web_fetch_requests += other.web_fetch_requests;
     }
 }
 
@@ -217,8 +235,13 @@ pub enum ChatItemKind {
         device_name: String,
     },
     /// The agent's answer text (Markdown, `$…$` math as in lessons). Deltas append to
-    /// `text`.
-    AssistantText { text: String },
+    /// `text`. `citations` are the web pages a hosted web tool cited (shown as a
+    /// numbered "Sources" list under the answer); empty without web use.
+    AssistantText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<WebCitation>,
+    },
     /// A summary of the model's reasoning. Deltas append to `summary`. May stay empty
     /// (the app shows nothing for an empty summary).
     Reasoning { summary: String },
@@ -297,6 +320,33 @@ pub mod error_code {
     pub const STORAGE: &str = "storage";
     /// The turn ended without finishing (a panic or an unexpected stop).
     pub const INTERRUPTED: &str = "interrupted";
+    /// The provider refused the credential (OpenAI 401/403; Claude 401, 403, 402), or
+    /// the ChatGPT sign-in ended. The app offers Open Settings → that provider.
+    pub const AUTH_FAILED: &str = "auth_failed";
+    /// The Claude organization's spend limit is reached.
+    pub const SPEND_LIMIT_REACHED: &str = "spend_limit_reached";
+    /// Margin's share of the owner's ChatGPT plan is used up.
+    pub const PLAN_LIMIT_REACHED: &str = "plan_limit_reached";
+    /// The owner's ChatGPT plan can't be used by apps.
+    pub const PLAN_INELIGIBLE: &str = "plan_ineligible";
+
+    /// Every code, for exhaustiveness checks.
+    pub const ALL: [&str; 14] = [
+        NO_API_KEY,
+        NO_MODEL,
+        RATE_LIMITED,
+        SERVER_ERROR,
+        NETWORK,
+        CONTEXT_TOO_LONG,
+        INCOMPLETE,
+        BAD_REQUEST,
+        STORAGE,
+        INTERRUPTED,
+        AUTH_FAILED,
+        SPEND_LIMIT_REACHED,
+        PLAN_LIMIT_REACHED,
+        PLAN_INELIGIBLE,
+    ];
 }
 
 /// What `ChatItemKind::apply_delta` did.
@@ -317,7 +367,7 @@ impl ChatItemKind {
     /// `ToolCall.arguments`.
     pub fn streaming_text(&self) -> Option<&str> {
         match self {
-            ChatItemKind::AssistantText { text } => Some(text),
+            ChatItemKind::AssistantText { text, .. } => Some(text),
             ChatItemKind::Reasoning { summary } => Some(summary),
             ChatItemKind::ToolCall { arguments, .. } => Some(arguments),
             _ => None,
@@ -326,7 +376,7 @@ impl ChatItemKind {
 
     fn streaming_text_mut(&mut self) -> Option<&mut String> {
         match self {
-            ChatItemKind::AssistantText { text } => Some(text),
+            ChatItemKind::AssistantText { text, .. } => Some(text),
             ChatItemKind::Reasoning { summary } => Some(summary),
             ChatItemKind::ToolCall { arguments, .. } => Some(arguments),
             _ => None,
@@ -385,6 +435,15 @@ pub enum Card {
     Passages(PassagesCard),
     /// The agent wants to do something that needs the owner's OK.
     Confirmation(ConfirmationCard),
+    /// What a hosted web search found: links that open in the system browser.
+    WebResults(WebResultsCard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebResultsCard {
+    /// What was searched for.
+    pub query: String,
+    pub results: Vec<WebResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,6 +575,9 @@ pub struct NewChat {
     pub message: Option<NewMessage>,
     #[serde(default)]
     pub workspace_ids: Vec<Id>,
+    /// The provider the chat runs on; `None` uses Settings' default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
 }
 
 /// `POST routes::chat_messages(id)`.
@@ -715,11 +777,13 @@ mod tests {
                 output_tokens: 5,
                 reasoning_tokens: 2,
                 model_calls: 1,
+                ..Default::default()
             },
             waiting: Some(Waiting {
                 until: at(),
                 reason: "The model API asked Margin to slow down.".into(),
             }),
+            provider: Provider::OpenAi,
             created_at: at(),
             updated_at: at(),
         }
@@ -810,6 +874,86 @@ mod tests {
     }
 
     #[test]
+    fn providers_on_chats_and_web_items() {
+        // A chat stored before providers is on OpenAI.
+        let mut json = serde_json::to_value(chat(ChatState::Idle)).unwrap();
+        json.as_object_mut().unwrap().remove("provider");
+        let old: Chat = serde_json::from_value(json).unwrap();
+        assert_eq!(old.provider, Provider::OpenAi);
+        let mut on_claude = chat(ChatState::Idle);
+        on_claude.provider = Provider::Claude;
+        assert_eq!(round_trip(&on_claude)["provider"], "claude");
+
+        // An answer without citations parses, and serializes without the field.
+        let old: ChatItemKind =
+            serde_json::from_value(serde_json::json!({"kind": "assistant_text", "text": "a"}))
+                .unwrap();
+        assert_eq!(
+            old,
+            ChatItemKind::AssistantText {
+                text: "a".into(),
+                citations: vec![]
+            }
+        );
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("citations")
+                .is_none()
+        );
+        let cited = ChatItemKind::AssistantText {
+            text: "Shannon was born in 1916.".into(),
+            citations: vec![WebCitation {
+                url: "https://en.wikipedia.org/wiki/Claude_Shannon".into(),
+                title: Some("Claude Shannon".into()),
+                cited_text: Some("born April 30, 1916".into()),
+                start: Some(0),
+                end: Some(25),
+            }],
+        };
+        round_trip(&item(cited));
+
+        let card = ChatItemKind::Card {
+            call_id: "srvtoolu_1".into(),
+            card: Card::WebResults(WebResultsCard {
+                query: "claude shannon".into(),
+                results: vec![WebResult {
+                    url: "https://example.com".into(),
+                    title: Some("Example".into()),
+                    page_age: None,
+                }],
+            }),
+        };
+        let json = round_trip(&item(card));
+        assert_eq!(json["card"]["type"], "web_results");
+
+        let new: NewChat = serde_json::from_str("{}").unwrap();
+        assert_eq!(new.provider, None);
+        let new = NewChat {
+            provider: Some(Provider::Claude),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&new).unwrap()["provider"], "claude");
+
+        let mut usage = Usage::default();
+        usage.add(&Usage {
+            cache_write_input_tokens: 3,
+            web_search_requests: 2,
+            web_fetch_requests: 1,
+            ..Default::default()
+        });
+        assert_eq!(usage.web_search_requests, 2);
+        let old: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1,
+            "reasoning_tokens": 0, "model_calls": 1
+        }))
+        .unwrap();
+        assert_eq!(old.cache_write_input_tokens, 0);
+        assert_eq!(error_code::ALL.len(), 14);
+        assert!(error_code::ALL.contains(&error_code::AUTH_FAILED));
+    }
+
+    #[test]
     fn items_round_trip_flat() {
         let kinds = vec![
             ChatItemKind::UserMessage {
@@ -820,6 +964,7 @@ mod tests {
             },
             ChatItemKind::AssistantText {
                 text: "Sure".into(),
+                citations: vec![],
             },
             ChatItemKind::Reasoning {
                 summary: String::new(),
@@ -902,7 +1047,10 @@ mod tests {
         for kind in kinds {
             round_trip(&item(kind));
         }
-        let json = round_trip(&item(ChatItemKind::AssistantText { text: "x".into() }));
+        let json = round_trip(&item(ChatItemKind::AssistantText {
+            text: "x".into(),
+            citations: vec![],
+        }));
         assert_eq!(json["kind"], "assistant_text");
         assert_eq!(json["status"], "in_progress");
         assert_eq!(json["text"], "x");
@@ -923,7 +1071,10 @@ mod tests {
             },
             Event::ChatDeleted { id: "c1".into() },
             Event::ChatItemChanged {
-                item: item(ChatItemKind::AssistantText { text: "a".into() }),
+                item: item(ChatItemKind::AssistantText {
+                    text: "a".into(),
+                    citations: vec![],
+                }),
             },
             Event::ChatItemDelta {
                 chat_id: "c1".into(),
@@ -972,6 +1123,7 @@ mod tests {
                 source_ids: vec![],
             }),
             workspace_ids: vec!["w".into()],
+            ..Default::default()
         });
         assert_eq!(
             serde_json::from_value::<NewChat>(json!({})).unwrap(),
@@ -1013,7 +1165,10 @@ mod tests {
 
     #[test]
     fn deltas_apply_by_offset() {
-        let mut text = ChatItemKind::AssistantText { text: "Hel".into() };
+        let mut text = ChatItemKind::AssistantText {
+            text: "Hel".into(),
+            citations: vec![],
+        };
         assert_eq!(text.apply_delta(3, "lo"), DeltaOutcome::Applied);
         assert_eq!(text.streaming_text(), Some("Hello"));
         // Loaded after these were sent.
@@ -1052,6 +1207,7 @@ mod tests {
             output_tokens: 2,
             reasoning_tokens: 1,
             model_calls: 1,
+            ..Default::default()
         };
         total.add(&one);
         total.add(&one);
