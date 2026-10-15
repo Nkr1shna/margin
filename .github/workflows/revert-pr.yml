@@ -45,8 +45,10 @@ jobs:
           state="$(jq -r .state "$RUNNER_TEMP/pr.json")"
           base="$(jq -r .baseRefName "$RUNNER_TEMP/pr.json")"
           sha="$(jq -r '.mergeCommit.oid // empty' "$RUNNER_TEMP/pr.json")"
-          [ "$state" = MERGED ] && [ "$base" = dev ] && [ -n "$sha" ] \
-            || { echo "::error::#$PR is not a PR merged into dev (state $state, base $base)"; exit 1; }
+          if [ "$state" != MERGED ] || [ "$base" != dev ] || [ -z "$sha" ]; then
+            echo "::error::#$PR is not a PR merged into dev (state $state, base $base)"
+            exit 1
+          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "#$PR put $sha on dev."
 
