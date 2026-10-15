@@ -464,6 +464,9 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
     let mut confirm = use_signal(|| false);
     let mut deleting = use_signal(|| false);
     let mut del_error = use_signal(|| None::<String>);
+    // Edits can't be kept on this device (see `drafts::local_failure`); shown until a
+    // write of the drafts file works again.
+    let local_failure = use_signal(drafts::local_failure);
 
     // Leaving the note (another note, Back, the lesson chip) unmounts the editor and
     // cancels its debounced save: hand any unsaved edit to a task that outlives it.
@@ -499,6 +502,11 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
             let (st, sb) = saved.peek().clone();
             let patch = drafts::patch_for((&st, &sb), (&title.peek(), &body.peek()));
             drafts::record(&id, app.api().as_ref(), patch);
+            let now = drafts::local_failure();
+            if *local_failure.peek() != now {
+                let mut local_failure = local_failure;
+                local_failure.set(now);
+            }
         }
     };
 
@@ -620,6 +628,9 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                 if error.read().is_some() {
                     button { class: "btn btn-secondary btn-sm", onclick: move |_| schedule_retry(Duration::ZERO), "Try again" }
                 }
+                if let Some(reason) = local_failure() {
+                    LocalSaveWarning { reason }
+                }
                 div { class: "note-tools",
                     div { class: "seg", role: "tablist", "aria-label": "Editor mode",
                         button { role: "tab", "aria-selected": (!showing_preview).to_string(), tabindex: if showing_preview { "-1" } else { "0" }, onclick: move |_| preview.set(false), "Write" }
@@ -724,5 +735,49 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                 },
             }
         }
+    }
+}
+
+/// The note editor's warning that its edits live only in this process: the drafts file
+/// can't be written, so quitting (or the app being killed) before the service has them
+/// loses them. `reason` is why, for the tooltip.
+#[component]
+fn LocalSaveWarning(reason: String) -> Element {
+    rsx! {
+        span { class: "save-state error", role: "alert", title: "{reason}",
+            "Edits not saved on this device"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::LibraryState;
+    use crate::ui::test_render::render_route;
+
+    #[test]
+    fn the_editor_warns_when_edits_cant_be_kept_on_this_device() {
+        let mut dom = VirtualDom::new_with_props(
+            LocalSaveWarning,
+            LocalSaveWarningProps {
+                reason: "Couldn't write drafts.json.tmp: disk full".into(),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Edits not saved on this device"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("disk full"), "{html}");
+    }
+
+    #[test]
+    fn the_editor_renders_its_save_state() {
+        let mut lib = LibraryState::default();
+        lib.replace_library(crate::fake::sample_library());
+        let id = lib.notes.keys().next().unwrap().clone();
+        let html = render_route(&format!("/note/{id}"), lib);
+        assert!(html.contains("save-state"), "{html}");
+        assert!(html.contains("Note body (Markdown)"), "{html}");
     }
 }
