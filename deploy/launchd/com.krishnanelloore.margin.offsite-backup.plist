@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The weekly off-site copy of Margin's backups on the Mac mini (docs/plan-deploy.md
+     runbook 13). A template: `deploy/scripts/offsite-backup.sh --install DEST` fills
+     __SCRIPT__, __DEST__, __ENV__, __HOME__ and __VMS_DIR__ and loads it. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.krishnanelloore.margin.offsite-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>__SCRIPT__</string>
+    <string>__DEST__</string>
+    <string>--env</string>
+    <string>__ENV__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MARGIN_VMS_DIR</key>
+    <string>__VMS_DIR__</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+  <!-- Sundays at 04:30, after the guests' nightly backups at 03:30. A Mac asleep at
+       that time runs it when it wakes. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/Margin/offsite-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Margin/offsite-backup.log</string>
+</dict>
+</plist>

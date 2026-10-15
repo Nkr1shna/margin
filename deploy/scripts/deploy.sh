@@ -10,7 +10,7 @@
 # backup taken first:
 #   preflight (Linux guest with systemd, share mounted and belonging to this environment, config
 #   environment matches, data_dir on the share) -> copy the binary into the share ->
-#   stop the service -> backup-margin.sh --label <old sha> -> swap the binary -> start ->
+#   stop the service -> backup-margin.sh --check --label <old sha> -> swap the binary -> start ->
 #   wait for /health -> GET /api/version must report SHA and the environment.
 # A build that doesn't come up is rolled back to the previous binary (data is left as
 # the new build left it; the backup path is printed for a by-hand restore).
@@ -52,9 +52,11 @@ if [ "${1:-}" = "--in-guest" ]; then
   data_dir="$(toml_value "$MARGIN_CONFIG" data_dir)"
   backup=""
   if [ -d "$data_dir" ]; then
-    out="$("$bin/backup-margin.sh" --label "before-$sha-from-$old_sha")" || {
+    # Checked with the NEW build (the old one may predate check-data); a copy that
+    # fails its check is deleted and the deploy stops here, before the swap.
+    out="$(MARGIN_SERVICE_BIN="$bin/margin-service.new" "$bin/backup-margin.sh" --check --label "before-$sha-from-$old_sha")" || {
       sudo systemctl start "$unit" || true
-      die "the backup failed; the old build was started again and nothing changed"
+      die "the backup (or its check) failed; the old build was started again and nothing changed"
     }
     echo "$out"
     backup="$(printf '%s\n' "$out" | sed -n 's/^BACKUP=//p')"
@@ -67,8 +69,9 @@ if [ "${1:-}" = "--in-guest" ]; then
     i=0
     until curl -fsS -m 2 "http://$bind/health" >/dev/null 2>&1; do
       i=$((i + 1))
-      # Migrations (the passages-v1 re-embed) run at start; give them time.
-      [ "$i" -le 180 ] || return 1
+      # Migrations (the passages-v1 re-embed) run at start, and a build with a higher
+      # schema version first backs the data up itself (the schema guard): give them time.
+      [ "$i" -le 600 ] || return 1
       sleep 1
     done
   }
@@ -76,7 +79,7 @@ if [ "${1:-}" = "--in-guest" ]; then
   sudo systemctl start "$unit"
   ok=1
   if ! wait_up; then
-    echo "The new build didn't answer /health in 180 s." >&2
+    echo "The new build didn't answer /health in 600 s." >&2
     ok=0
   else
     version="$(curl -fsS -m 5 "http://$bind/api/version")"
