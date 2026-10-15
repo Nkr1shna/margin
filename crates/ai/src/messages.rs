@@ -32,8 +32,7 @@ use crate::{
     error_message, network,
 };
 
-/// Default `base_url`.
-pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub use margin_shared::providers::ANTHROPIC_BASE_URL;
 /// The `anthropic-version` header.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// `anthropic-beta`: server-side compaction (`compact_20260112` edits) and the thinking

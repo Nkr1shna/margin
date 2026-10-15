@@ -27,6 +27,9 @@ pub enum Provider {
     Claude,
 }
 
+/// The Messages API Claude calls (the service's and the evals' default; Settings shows it).
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
 impl Provider {
     pub const ALL: [Provider; 3] = [Provider::OpenAi, Provider::ChatGpt, Provider::Claude];
 

@@ -1,6 +1,6 @@
 //! Render tests: the signed-in app rendered to HTML on a route, with a given library and
 //! no window or service. Effects, futures and JS calls don't run, so what shows is each
-//! screen's first render (like `examples/render_screens.rs`).
+//! screen's first render (like `examples/render_screens.rs`); `render_after` runs them.
 
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
@@ -132,6 +132,42 @@ pub fn render_with(
     );
     dom.rebuild_in_place();
     dioxus_ssr::render(&dom)
+}
+
+/// Like `render_with_settings`, but live: once the screen is up, `act` runs as an event
+/// handler would (with the app's context), then effects and futures run until the screen
+/// settles. Returns the settled HTML. Effects that panic fail the test.
+pub async fn render_after(
+    route: &str,
+    lib: LibraryState,
+    pane: Option<SettingsPane>,
+    act: impl FnOnce(AppCtx),
+) -> String {
+    let mut dom = VirtualDom::new_with_props(
+        Harness,
+        HarnessProps {
+            route: route.into(),
+            lib,
+            settings: pane,
+            extra: Extra::default(),
+        },
+    );
+    dom.rebuild_in_place();
+    settle(&mut dom).await;
+    dom.in_scope(ScopeId::APP, || act(consume_context::<AppCtx>()));
+    settle(&mut dom).await;
+    dioxus_ssr::render(&dom)
+}
+
+/// Run `dom`'s pending effects, futures and renders for a while.
+async fn settle(dom: &mut VirtualDom) {
+    for _ in 0..10 {
+        tokio::select! {
+            _ = dom.wait_for_work() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+    }
 }
 
 /// The sign-in screen's HTML for a device whose saved service URL is `service_url`, in

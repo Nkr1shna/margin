@@ -2321,9 +2321,9 @@ pub fn ReadOnlyAi(settings: Settings) -> Element {
                 div { class: "kv",
                     span { "Set up" }
                     span { {setup_text(&settings, p)} }
-                    if p == Provider::OpenAi {
+                    if let Some(url) = crate::ui::settings::provider_base_url(&settings, p) {
                         span { "Base URL" }
-                        span { class: "mono", "{settings.openai_base_url}" }
+                        span { class: "mono", "{url}" }
                     }
                     for route in Route::ALL {
                         span { key: "{p.as_str()}-l-{route:?}", {slot_label(route)} }
@@ -2537,6 +2537,8 @@ mod tests {
         let html = render_with("/", lib, Some(SettingsPane::Ai), extra);
         assert!(html.contains("Model for chats"));
         assert!(html.contains("https://api.openai.com/v1"));
+        let claude = &html[html.find("<h2>Claude</h2>").unwrap()..];
+        assert!(claude.contains("https://api.anthropic.com"));
         // An admin keeps the controls.
         let html = render_with(
             "/",
