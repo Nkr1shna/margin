@@ -678,6 +678,16 @@ pub fn open_provider_settings(app: crate::state::AppCtx, provider: Provider) {
     open.set(Some(SettingsPane::Ai));
 }
 
+/// The API base URL `provider` calls, where Settings shows it: OpenAI's is set here,
+/// Claude's is always Anthropic's, ChatGPT's comes with the sign-in.
+pub fn provider_base_url(settings: &Settings, provider: Provider) -> Option<&str> {
+    match provider {
+        Provider::OpenAi => Some(&settings.openai_base_url),
+        Provider::Claude => Some(margin_shared::providers::ANTHROPIC_BASE_URL),
+        Provider::ChatGpt => None,
+    }
+}
+
 /// The id of a provider's block in Settings → AI: "ai-openai", "ai-chatgpt", "ai-claude".
 pub fn provider_block_id(provider: Provider) -> String {
     format!("ai-{}", provider.as_str())
@@ -838,7 +848,10 @@ fn ProvidersSection(settings: Settings) -> Element {
     let current = settings.default_provider;
     // Scroll to the block an error or the chat asked for.
     use_effect(move || {
-        if let Some(p) = *AI_FOCUS.read() {
+        // A copy, not `*AI_FOCUS.read()`: that guard would live through the block and
+        // the write below would panic (AlreadyBorrowed).
+        let focus = AI_FOCUS();
+        if let Some(p) = focus {
             let id = provider_block_id(p);
             let _ = js(&format!(
                 "setTimeout(function () {{ var el = document.getElementById('{id}'); if (el) {{ el.scrollIntoView({{block: 'start'}}); var f = el.querySelector('input, button'); if (f) f.focus({{preventScroll: true}}); }} }}, 50);"
@@ -977,6 +990,10 @@ fn ClaudeSection(settings: Settings) -> Element {
         section { id: provider_block_id(Provider::Claude), class: "set-sec",
             h2 { "Claude" }
             p { class: "help", {provider_help(Provider::Claude)} }
+            div { class: "kv",
+                span { "Base URL" }
+                span { class: "mono", {margin_shared::providers::ANTHROPIC_BASE_URL} }
+            }
             ApiKeyField { provider: Provider::Claude, has_key: settings.has_claude_api_key }
             // Mounted again when the credential comes or goes or the list went stale
             // (another key, base URL or account), so the list is fetched then.
@@ -3680,6 +3697,35 @@ mod tests {
         let html = ai_pane(settings.clone());
         assert!(html.contains("Add a Claude API key to use it."), "{html}");
         assert!(html.contains(">Set it up below<"));
+    }
+
+    #[tokio::test]
+    async fn set_it_up_below_with_the_pane_open_does_not_crash() {
+        use crate::store::LibraryState;
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.default_provider = Provider::Claude;
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        lib.settings = Some(settings);
+        // "Set it up below" with Settings → AI already open: the pane scrolls to Claude's
+        // block and forgets the request.
+        let html = crate::ui::test_render::render_after("/", lib, Some(SettingsPane::Ai), |app| {
+            open_provider_settings(app, Provider::Claude)
+        })
+        .await;
+        assert!(html.contains(r#"id="ai-claude""#), "{html}");
+        assert!(html.contains(">Set it up below<"));
+    }
+
+    #[test]
+    fn the_claude_block_shows_anthropics_base_url() {
+        let html = ai_pane(crate::fake::FakeState::new().settings);
+        let claude = &html[html.find(r#"id="ai-claude""#).unwrap()..];
+        let claude = &claude[..claude.find("</section>").unwrap()];
+        assert!(
+            claude.contains(r#"<span class="mono">https://api.anthropic.com</span>"#),
+            "{claude}"
+        );
+        assert!(!claude.contains("api.openai.com"), "{claude}");
     }
 
     #[test]
