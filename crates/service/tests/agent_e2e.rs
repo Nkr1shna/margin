@@ -1537,18 +1537,17 @@ async fn a_rate_limited_turn_waits_then_the_model_titles_the_chat() {
             .get("tools")
             .is_none_or(|t| t.as_array().is_some_and(Vec::is_empty))
     );
-    assert_eq!(title["reasoning"]["effort"], "low");
+    // A plain text call on the small slot (OpenAI's default small model: no slots were
+    // set, only `openai_model`).
+    assert_eq!(title["model"], "gpt-6-luna");
+    assert!(
+        title["instructions"]
+            .as_str()
+            .is_some_and(|i| i.starts_with("Write a title"))
+    );
     assert_eq!(title["max_output_tokens"], TITLE_MAX_OUTPUT_TOKENS);
-    let data = title["input"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["role"] == "user")
-        .unwrap()["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let data: Value = serde_json::from_str(&data).unwrap();
+    // Text only: the input is the data as one string.
+    let data: Value = serde_json::from_str(title["input"].as_str().unwrap()).unwrap();
     assert_eq!(
         data["owner_message"],
         "How do plants make food?\nKeep it short."

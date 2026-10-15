@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
-use margin_ai::{Credential, MODEL_WINDOW_FALLBACK, ProviderConfig};
+use margin_ai::{Credential, ProviderConfig};
 use margin_embed::{Embedder, ModelFiles};
 use margin_shared::pipeline::PipelineConfig;
 use margin_shared::pipeline::Route;
 use margin_shared::{
     Citation, Event, Id, Lesson, Note, Proposal, Provider, ReasoningEffort, RouteModels, Settings,
-    Source, Topic, Video, VideoMedia, VideoStatus,
+    Source, Topic, Video, VideoMedia, VideoStatus, error_code,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -168,10 +168,75 @@ pub struct SettingsRow {
     /// runs once.
     #[serde(default)]
     pub migrations: Vec<String>,
+    /// The provider new chats and the job routes use (D9).
+    #[serde(default)]
+    pub default_provider: Provider,
+    /// The OpenAI slots once stored; `None` (settings from before the slots) derives
+    /// them from `openai_model` and the deprecated `agent_model`
+    /// (`RouteModels::openai_from`).
+    #[serde(default)]
+    pub openai_models: Option<RouteModels>,
+    /// The ChatGPT slots; `None` = `RouteModels::chatgpt_default`.
+    #[serde(default)]
+    pub chatgpt_models: Option<RouteModels>,
+    /// The Claude slots; `None` = `RouteModels::claude_default`.
+    #[serde(default)]
+    pub claude_models: Option<RouteModels>,
 }
 
 fn trace_retention_days() -> u32 {
     margin_shared::TRACE_RETENTION_DAYS
+}
+
+impl SettingsRow {
+    /// `provider`'s three slots as stored (before any pipeline override).
+    pub fn slots(&self, provider: Provider) -> RouteModels {
+        match provider {
+            Provider::OpenAi => self.openai_models.clone().unwrap_or_else(|| {
+                RouteModels::openai_from(self.openai_model.trim(), self.agent_model.as_deref())
+            }),
+            Provider::ChatGpt => self
+                .chatgpt_models
+                .clone()
+                .unwrap_or_else(RouteModels::chatgpt_default),
+            Provider::Claude => self
+                .claude_models
+                .clone()
+                .unwrap_or_else(RouteModels::claude_default),
+        }
+    }
+
+    /// The legacy `openai_model` patch: the writing slot; the chat slot too while it
+    /// follows the writing one (no agent model of its own).
+    pub fn set_openai_model(&mut self, model: &str) {
+        let mut slots = self.slots(Provider::OpenAi);
+        if slots.chat == slots.write || slots.chat.is_empty() {
+            slots.chat = model.to_string();
+        }
+        slots.write = model.to_string();
+        self.openai_model = model.to_string();
+        self.openai_models = Some(slots);
+    }
+
+    /// The legacy `agent_model` patch: the chat slot, or back to the writing slot.
+    pub fn set_agent_model(&mut self, model: Option<String>) {
+        let mut slots = self.slots(Provider::OpenAi);
+        slots.chat = model.clone().unwrap_or_else(|| slots.write.clone());
+        self.agent_model = model;
+        self.openai_models = Some(slots);
+    }
+
+    /// Replaces `provider`'s slots.
+    pub fn set_slots(&mut self, provider: Provider, slots: RouteModels) {
+        match provider {
+            Provider::OpenAi => {
+                self.openai_model = slots.write.clone();
+                self.openai_models = Some(slots);
+            }
+            Provider::ChatGpt => self.chatgpt_models = Some(slots),
+            Provider::Claude => self.claude_models = Some(slots),
+        }
+    }
 }
 
 impl Default for SettingsRow {
@@ -188,6 +253,10 @@ impl Default for SettingsRow {
             pipeline: PipelineConfig::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
             migrations: Vec::new(),
+            default_provider: Provider::default(),
+            openai_models: None,
+            chatgpt_models: None,
+            claude_models: None,
         }
     }
 }
@@ -263,6 +332,8 @@ pub struct App {
     /// Folder sources replaced by a new upload while being read: the read in progress
     /// leaves their status alone (the new copy is queued behind it).
     pub sources_replaced: Mutex<HashSet<Id>>,
+    /// The model providers' endpoints, the ChatGPT sign-in and the model windows.
+    pub providers: crate::providers::Providers,
 }
 
 impl App {
@@ -468,8 +539,11 @@ impl App {
             .secret_get(ANTHROPIC_API_KEY)
             .await?
             .is_some_and(|k| !k.is_empty());
-        let openai_models = openai_slots(&row);
+        let chatgpt = crate::providers::chatgpt_account(self).await?;
         Ok(Settings {
+            openai_models: row.slots(Provider::OpenAi),
+            chatgpt_models: row.slots(Provider::ChatGpt),
+            claude_models: row.slots(Provider::Claude),
             openai_base_url: row.openai_base_url,
             openai_model: row.openai_model,
             has_api_key,
@@ -481,97 +555,115 @@ impl App {
             agent_model: row.agent_model,
             pipeline: row.pipeline.with_embedder(self.model_files.backend.name()),
             trace_retention_days: row.trace_retention_days,
-            // The provider slots are stored by area P-service; until then OpenAI is the
-            // only provider the service calls, on the slots it uses today.
-            default_provider: Provider::OpenAi,
-            openai_models,
-            chatgpt_models: RouteModels::chatgpt_default(),
-            claude_models: RouteModels::claude_default(),
+            default_provider: row.default_provider,
             has_claude_api_key,
-            chatgpt: None,
+            chatgpt,
         })
     }
 
-    /// Where and how to call `provider`: its base URL, credential and slots (each slot
-    /// after the `pipeline.routes` override). `no_api_key` when it has no credential.
-    /// An empty slot is left empty here; `model_for` refuses it with `no_model`.
+    /// Where and how to call `provider` (D10): its base URL, credential and slots, each
+    /// slot after the `pipeline.routes` override when that names one of this provider's
+    /// models (an override for another provider is logged and ignored). `no_api_key`
+    /// naming the provider when it has no key, `auth_failed` when ChatGPT is signed out
+    /// (or its sign-in ran out). An empty slot is left empty here; `model_for` refuses
+    /// it with `no_model`. The ChatGPT token is refreshed first when it is about to run
+    /// out.
     pub async fn provider_config(&self, provider: Provider) -> AppResult<ProviderConfig> {
-        match provider {
-            Provider::OpenAi => {}
-            Provider::ChatGpt | Provider::Claude => unimplemented!("providers, P-service"),
-        }
         let row = self.settings_row().await?;
-        let key = self
-            .secret_get(OPENAI_API_KEY)
-            .await?
-            .filter(|k| !k.is_empty());
-        let Some(api_key) = key else {
-            return Err(AppError::new(
-                StatusCode::BAD_REQUEST,
-                "no_api_key",
-                "Add an OpenAI API key in Settings → AI provider first. It's kept in the service's secret store and never sent back.",
-            ));
+        let endpoints = self.providers.endpoints();
+        let key = |name| async move {
+            Ok::<_, AppError>(
+                self.secret_get(name)
+                    .await?
+                    .filter(|k| !k.trim().is_empty()),
+            )
+        };
+        let (base_url, credential) = match provider {
+            Provider::OpenAi => {
+                let Some(api_key) = key(OPENAI_API_KEY).await? else {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        error_code::NO_API_KEY,
+                        "Add an OpenAI API key in Settings → AI first. It's kept in the service's secret store and never sent back.",
+                    ));
+                };
+                (row.openai_base_url.clone(), Credential::ApiKey(api_key))
+            }
+            Provider::Claude => {
+                let Some(api_key) = key(ANTHROPIC_API_KEY).await? else {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        error_code::NO_API_KEY,
+                        "Add a Claude API key in Settings → AI first. It's kept in the service's secret store and never sent back.",
+                    ));
+                };
+                (endpoints.anthropic.clone(), Credential::ApiKey(api_key))
+            }
+            Provider::ChatGpt => {
+                let token = crate::providers::chatgpt_access_token(self, false).await?;
+                (endpoints.chatgpt_api.clone(), Credential::Bearer(token))
+            }
         };
         let routes = self.pipeline.load().routes.clone();
-        let mut models = openai_slots(&row);
+        let mut models = row.slots(provider);
         for route in Route::ALL {
-            if let Some(m) = routes.get(route).filter(|m| !m.trim().is_empty()) {
-                models.set(route, m.trim());
+            let Some(m) = routes.get(route).map(str::trim).filter(|m| !m.is_empty()) else {
+                continue;
+            };
+            if crate::providers::override_applies(self, provider, m) {
+                models.set(route, m);
+            } else {
+                tracing::info!(
+                    %provider, ?route, model = %m,
+                    "the pipeline's route override isn't one of this provider's models; ignored"
+                );
             }
         }
         Ok(ProviderConfig {
             provider,
-            base_url: row.openai_base_url,
-            credential: Credential::ApiKey(api_key),
+            base_url,
+            credential,
             models,
         })
     }
 
-    /// The provider, model and window a call on `route` uses: `provider`'s config (Settings'
-    /// default provider when `None`) and its slot for the route. `no_api_key` without a
-    /// credential, `no_model` when the slot is empty. The window comes from the
-    /// provider's model table, else `MODEL_WINDOW_FALLBACK` (logged).
+    /// The provider, model and window a call on `route` uses: `provider`'s config
+    /// (Settings' default provider when `None`) and its slot for the route. `no_api_key`
+    /// or `auth_failed` without a credential, `no_model` when the slot is empty. The
+    /// window comes from the provider's model list or `margin_ai::windows`, else
+    /// `MODEL_WINDOW_FALLBACK` (logged).
     pub async fn model_for(
         &self,
         route: Route,
         provider: Option<Provider>,
     ) -> AppResult<ModelChoice> {
-        let provider = provider.unwrap_or(Provider::OpenAi);
+        let provider = match provider {
+            Some(p) => p,
+            None => self.settings_row().await?.default_provider,
+        };
         let config = self.provider_config(provider).await?;
         let model = config.models.get(route).trim().to_string();
         if model.is_empty() {
+            let slot = match route {
+                Route::Chat => "chats",
+                Route::Write => "writing",
+                Route::Small => "small tasks",
+            };
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
-                "no_model",
-                "Choose a model in Settings → AI provider first: enter the name of a model your API key can use with the Responses API.",
+                error_code::NO_MODEL,
+                format!(
+                    "Choose a model for {slot} in Settings → AI → {} first.",
+                    provider.label()
+                ),
             ));
         }
-        let window = margin_ai::windows::openai_window(&model).unwrap_or_else(|| {
-            tracing::debug!(%model, "the model's window isn't known; using the fallback");
-            MODEL_WINDOW_FALLBACK
-        });
+        let window = crate::providers::window(self, &config, &model).await;
         Ok(ModelChoice {
             config,
             model,
             window,
         })
-    }
-}
-
-/// The OpenAI slots as the service uses them today: chats on `agent_model` (else
-/// `openai_model`), writing and small tasks on `openai_model`. Area P-service stores the
-/// slots themselves (and the `gpt-6-luna` small default).
-fn openai_slots(row: &SettingsRow) -> RouteModels {
-    let chat = row
-        .agent_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .unwrap_or(row.openai_model.trim());
-    RouteModels {
-        chat: chat.to_string(),
-        write: row.openai_model.trim().to_string(),
-        small: row.openai_model.trim().to_string(),
     }
 }
 

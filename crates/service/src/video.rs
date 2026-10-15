@@ -319,7 +319,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         );
         call.row().job_id = Some(id.to_string());
         call.row().step = Some(attempt);
-        let opts = CallOptions::new(Route::Write);
+        let opts = scene_options(&request);
         let code = match state.generator.write_scene(&ai, &request, &opts).await {
             Ok(Generated { value: code, usage }) => {
                 call.row().usage = Some(trace::trace_usage(&usage));
@@ -393,6 +393,17 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
 
 /// The scene prompt's version as traces record it (`margin_ai`'s constant-first prompt).
 const SCENE_PROMPT_VERSION: &str = margin_ai::prompts::SCENE_VERSION;
+
+/// A scene call's options: the `Write` route, the scene prompt's cache key
+/// (`scene:{version}`, shared by the repair call), its constant block's length (the
+/// cheat sheet: the Claude client's cache breakpoint) and its version.
+fn scene_options(req: &SceneRequest) -> CallOptions {
+    let prompt = margin_ai::prompts::scene(req);
+    CallOptions::new(Route::Write)
+        .with_cache_key(prompt.cache_key())
+        .with_cache_prefix_len(prompt.constant.len())
+        .with_prompt_version(prompt.version)
+}
 
 /// A render failure as a trace code (never its message).
 fn render_error_code(e: &RenderError) -> &'static str {

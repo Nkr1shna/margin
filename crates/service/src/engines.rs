@@ -87,18 +87,11 @@ pub trait Renderer: Send + Sync + 'static {
 /// `margin_ai` against the configured providers.
 pub struct AiGenerator;
 
-/// The Responses client of a job's choice, on its model. Lessons, scenes and the
-/// planner run on the Responses API only until they move onto `TextModel` (area
-/// P-service).
-fn client(m: &ModelChoice) -> ResponsesClient {
-    match m.config.provider {
-        ProviderKind::OpenAi | ProviderKind::ChatGpt => ResponsesClient::new(
-            m.config.base_url.clone(),
-            m.config.credential.secret(),
-            m.model.clone(),
-        ),
-        ProviderKind::Claude => unimplemented!("providers, P-service"),
-    }
+/// The Responses client of an OpenAI or ChatGPT choice: each call's model is the
+/// config's slot for its route (`m.model` for the route `model_for` resolved), and a
+/// ChatGPT bearer token gets that route's rules.
+fn responses_client(m: &ModelChoice) -> ResponsesClient {
+    ResponsesClient::from_config(&m.config)
 }
 
 impl Generator for AiGenerator {
@@ -109,7 +102,16 @@ impl Generator for AiGenerator {
         opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
-        Box::pin(async move { margin_ai::write_lesson_with(&client(m), ctx, opts, on_delta).await })
+        Box::pin(async move {
+            match m.config.provider {
+                ProviderKind::OpenAi | ProviderKind::ChatGpt => {
+                    margin_ai::write_lesson_with(&responses_client(m), ctx, opts, on_delta).await
+                }
+                ProviderKind::Claude => {
+                    on_text::write_lesson(&claude_client(&m.config), ctx, opts, on_delta).await
+                }
+            }
+        })
     }
 
     fn write_scene<'a>(
@@ -118,7 +120,16 @@ impl Generator for AiGenerator {
         req: &'a SceneRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
-        Box::pin(async move { margin_ai::write_scene_with(&client(m), req, opts).await })
+        Box::pin(async move {
+            match m.config.provider {
+                ProviderKind::OpenAi | ProviderKind::ChatGpt => {
+                    margin_ai::write_scene_with(&responses_client(m), req, opts).await
+                }
+                ProviderKind::Claude => {
+                    on_text::write_scene(&claude_client(&m.config), req, opts).await
+                }
+            }
+        })
     }
 
     fn plan_course<'a>(
@@ -127,7 +138,16 @@ impl Generator for AiGenerator {
         req: &'a PlanRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
-        Box::pin(async move { margin_ai::plan_course(&client(m), req, opts).await })
+        Box::pin(async move {
+            match m.config.provider {
+                ProviderKind::OpenAi | ProviderKind::ChatGpt => {
+                    margin_ai::plan_course(&responses_client(m), req, opts).await
+                }
+                ProviderKind::Claude => {
+                    on_text::plan_course(&claude_client(&m.config), req, opts).await
+                }
+            }
+        })
     }
 
     fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn Provider> {
@@ -155,6 +175,197 @@ fn claude_client(config: &ProviderConfig) -> ClaudeClient {
         config.credential.secret(),
         config.models.clone(),
     )
+}
+
+/// Lessons, scenes and the planner on any [`TextModel`] (the Claude provider): the
+/// same versioned prompts as `margin_ai`'s Responses path, sent with the options
+/// completed from the prompt (cache key, the constant block's length for the cache
+/// breakpoint, the version), and the same checks on the answer.
+pub mod on_text {
+    use margin_ai::prompts::{self, Prompt};
+    use margin_ai::{
+        AiError, CallOptions, CoursePlan, Generated, InputPart, LessonContext, PlanRequest,
+        SceneRequest, TextModel, TextOutput,
+    };
+
+    async fn generate(
+        model: &dyn TextModel,
+        prompt: &Prompt,
+        input: &[InputPart],
+        opts: &CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + '_>,
+    ) -> Result<TextOutput, AiError> {
+        let opts = opts.keyed(prompt);
+        model
+            .stream_parts(&prompt.instructions(), input, &opts, on_delta)
+            .await
+    }
+
+    /// A lesson body: the streamed Markdown without a fence around the whole answer or
+    /// a leading `# ` title.
+    pub async fn write_lesson(
+        model: &dyn TextModel,
+        ctx: &LessonContext,
+        opts: &CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + '_>,
+    ) -> Result<Generated<String>, AiError> {
+        if ctx.index >= ctx.outline.len() {
+            return Err(AiError::Parse(format!(
+                "lesson {} doesn't exist in an outline of {} lessons",
+                ctx.index + 1,
+                ctx.outline.len()
+            )));
+        }
+        let prompt = prompts::lesson(ctx);
+        let out = generate(model, &prompt, &prompt.input, opts, on_delta).await?;
+        let body = lesson_markdown(&out.text);
+        if body.trim().is_empty() {
+            return Err(AiError::Parse("the lesson came back empty".into()));
+        }
+        Ok(Generated {
+            value: body,
+            usage: out.usage,
+        })
+    }
+
+    /// A ManimGX scene: the code (out of a fence when the model put it in one), which
+    /// must import `manimgx as m` and define `LessonScene(m.Scene)`.
+    pub async fn write_scene(
+        model: &dyn TextModel,
+        req: &SceneRequest,
+        opts: &CallOptions,
+    ) -> Result<Generated<String>, AiError> {
+        let prompt = prompts::scene(req);
+        let out = generate(model, &prompt, &prompt.input, opts, Box::new(|_| {})).await?;
+        let code = scene_code(&out.text);
+        if !code.lines().any(|l| l.trim() == "import manimgx as m") {
+            return Err(AiError::Parse(
+                "the scene doesn't import manimgx as m".into(),
+            ));
+        }
+        if !code.contains("class LessonScene(m.Scene)") {
+            return Err(AiError::Parse(
+                "the scene doesn't define class LessonScene(m.Scene)".into(),
+            ));
+        }
+        Ok(Generated {
+            value: code,
+            usage: out.usage,
+        })
+    }
+
+    /// The planner as one text call: the prompt's input, then the JSON schema the
+    /// answer must follow (Messages has no `text.format`; the schema is after the
+    /// cached constant block, so it doesn't change the cached prefix). The answer is
+    /// parsed and checked like the strict-JSON one.
+    pub async fn plan_course(
+        model: &dyn TextModel,
+        req: &PlanRequest,
+        opts: &CallOptions,
+    ) -> Result<Generated<CoursePlan>, AiError> {
+        let prompt = prompts::plan(req);
+        let mut input = prompt.input.clone();
+        if let Some(format) = &prompt.format {
+            input.push(InputPart::Text(format!(
+                "Answer with only a JSON object (no prose, no code fence) that follows this JSON schema:\n{}",
+                format.schema
+            )));
+        }
+        let out = generate(model, &prompt, &input, opts, Box::new(|_| {})).await?;
+        let plan: CoursePlan = serde_json::from_str(json_answer(&out.text)).map_err(|e| {
+            AiError::Parse(format!(
+                "the {} answer isn't the JSON asked for: {e}",
+                prompt.job
+            ))
+        })?;
+        Ok(Generated {
+            value: plan.checked(req)?,
+            usage: out.usage,
+        })
+    }
+
+    /// The contents of a fence wrapping the whole of `text`, when `accept` takes its
+    /// language tag and no other fence is inside.
+    fn wrapped(text: &str, accept: impl Fn(&str) -> bool) -> Option<&str> {
+        let rest = text.trim().strip_prefix("```")?;
+        let (lang, body) = rest.split_once('\n')?;
+        if !accept(lang.trim()) {
+            return None;
+        }
+        let body = body.trim_end().strip_suffix("```")?;
+        if body.lines().any(|l| l.trim_start().starts_with("```")) {
+            return None;
+        }
+        Some(body.trim_matches('\n'))
+    }
+
+    /// The JSON of a structured answer: the text, or the inside of a fence around it.
+    pub fn json_answer(text: &str) -> &str {
+        wrapped(text, |lang| matches!(lang, "" | "json")).unwrap_or(text.trim())
+    }
+
+    /// A lesson body without a fence around the whole answer or a leading `# ` title.
+    pub fn lesson_markdown(answer: &str) -> String {
+        let body = wrapped(answer, |lang| {
+            lang.is_empty()
+                || lang.eq_ignore_ascii_case("markdown")
+                || lang.eq_ignore_ascii_case("md")
+        })
+        .unwrap_or(answer)
+        .trim();
+        let body = match body.split_once('\n') {
+            Some((first, rest)) if first.starts_with("# ") => rest.trim_start(),
+            None if body.starts_with("# ") => "",
+            _ => body,
+        };
+        format!("{}\n", body.trim_end())
+    }
+
+    /// Python from an answer: the bare code, or the fenced block that defines
+    /// `LessonScene` when the model fenced it.
+    pub fn scene_code(answer: &str) -> String {
+        if let Some(body) = wrapped(answer, |_| true) {
+            return format!("{}\n", body.trim_end());
+        }
+        let t = answer.trim();
+        let mut lines = t.lines();
+        while let Some(line) = lines.next() {
+            if !line.trim_start().starts_with("```") {
+                continue;
+            }
+            let block: Vec<&str> = lines
+                .by_ref()
+                .take_while(|l| !l.trim_start().starts_with("```"))
+                .collect();
+            let code = block.join("\n");
+            if code.contains("class LessonScene") {
+                return format!("{}\n", code.trim_matches('\n').trim_end());
+            }
+        }
+        format!("{t}\n")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn answers_are_cleaned_like_the_responses_path() {
+            let body = "## Intuition\n\nText.\n";
+            assert_eq!(lesson_markdown(&format!("```markdown\n{body}```")), body);
+            assert_eq!(lesson_markdown(&format!("# Title\n\n{body}")), body);
+            let code = "import manimgx as m\n\nclass LessonScene(m.Scene):\n    pass\n";
+            assert_eq!(scene_code(&format!("```python\n{code}```")), code);
+            assert_eq!(
+                scene_code(&format!(
+                    "Here:\n\n```bash\nrun\n```\n\n```python\n{code}```\nDone."
+                )),
+                code
+            );
+            assert_eq!(json_answer("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+            assert_eq!(json_answer(" {\"a\":1} "), "{\"a\":1}");
+        }
+    }
 }
 
 /// `margin_video`'s ManimGX + FluidAudio pipeline.

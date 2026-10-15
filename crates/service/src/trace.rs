@@ -352,15 +352,6 @@ pub fn trace_usage(usage: &margin_shared::Usage) -> TraceUsage {
     }
 }
 
-/// The provider a base URL belongs to.
-pub fn provider_of(base_url: &str) -> &'static str {
-    if base_url.contains("anthropic") {
-        "anthropic"
-    } else {
-        "openai"
-    }
-}
-
 /// A model call row of `route` under `trace_id`, stamped with the pipeline in use.
 pub fn model_call(
     state: &AppState,
@@ -1097,15 +1088,30 @@ impl Drop for TracedStream {
     }
 }
 
-/// A code for a failed model call (never its message).
+/// A code for a failed model call (never its message): the chat error codes of
+/// `docs/agent-providers-brief.md` D7 for what the provider said, by its error code
+/// first (a spend cap, a ChatGPT plan share used up or not eligible), then by status.
 pub fn ai_error_code(e: &margin_ai::AiError) -> &'static str {
     use margin_ai::AiError;
+    use margin_shared::error_code as code;
     match e {
-        AiError::Http { status: 429, .. } => "rate_limited",
-        AiError::Http { status, .. } if *status >= 500 => "server_error",
+        AiError::Http { code: Some(c), .. } if c == "enforced_spend_limit_reached" => {
+            code::SPEND_LIMIT_REACHED
+        }
+        AiError::Http { code: Some(c), .. }
+            if c == "subscription_sharing_usage_limit_exceeded"
+                || c == "subscription_sharing_usage_unavailable" =>
+        {
+            code::PLAN_LIMIT_REACHED
+        }
+        AiError::Http { code: Some(c), .. } if c == "subscription_sharing_user_not_eligible" => {
+            code::PLAN_INELIGIBLE
+        }
+        AiError::Http { status: 429, .. } => code::RATE_LIMITED,
+        AiError::Http { status, .. } if *status >= 500 => code::SERVER_ERROR,
         AiError::Http {
-            status: 401 | 403, ..
-        } => "unauthorized",
+            status: 401..=403, ..
+        } => code::AUTH_FAILED,
         AiError::Http { .. } => "bad_request",
         AiError::Network(_) => "network",
         AiError::Parse(_) => "parse",

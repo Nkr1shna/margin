@@ -144,6 +144,7 @@ impl Service {
             retrieval_cache: RetrievalCache::new(retrieval::RETRIEVAL_CACHE_ENTRIES),
             folder_sync_emits: Mutex::new(Default::default()),
             sources_replaced: Mutex::new(Default::default()),
+            providers: providers::Providers::new(),
         });
 
         // Traces first, so recovery and the workers are traced.
