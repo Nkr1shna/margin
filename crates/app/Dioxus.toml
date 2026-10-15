@@ -16,6 +16,12 @@ info_plist_path = "macos/Info.plist"
 # the layered icon macOS 26+ renders; Margin.icns is the flat fallback.
 files = { "Resources/Assets.car" = "icon/build/Assets.car", "Resources/Margin.icns" = "icon/build/Margin.icns" }
 
+# iOS 26's continued processing (src/background/ios.rs): the one task identifier a
+# folder sync, or a chat that reads a folder this device holds, keeps running under.
+# Same string as `background::TASK_ID`. No UIBackgroundModes: the task needs none.
+[ios.plist]
+BGTaskSchedulerPermittedIdentifiers = ["com.krishnanelloore.margin.app.folders"]
+
 # iOS 27 requires the UIKit scene lifecycle; tao 0.34 has none, so the app declares one
 # scene configuration whose delegate (src/scene.rs) puts tao's window into the scene.
 [ios.plist.UIApplicationSceneManifest]

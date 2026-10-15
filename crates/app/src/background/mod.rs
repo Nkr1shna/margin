@@ -69,9 +69,19 @@ impl Work for NoWork {
     fn end(&self) {}
 }
 
+#[cfg(target_os = "ios")]
+pub mod ios;
+
 /// This platform's [`Work`].
 pub fn platform() -> Arc<dyn Work> {
-    Arc::new(NoWork)
+    #[cfg(target_os = "ios")]
+    {
+        Arc::new(ios::ContinuedProcessing)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        Arc::new(NoWork)
+    }
 }
 
 /// What should keep running now, by the D1 table, or `None`.
