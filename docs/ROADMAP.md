@@ -35,6 +35,16 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | | Item | Plan | Notes |
 |---|---|---|---|
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
+| ⏳ | **Basics: search inside files and chats** with highlighted matches, on the EmbeddingGemma hybrid retrieval pipeline (not plain text matching) | `docs/basics-brief.md` | Owner-approved 2026-10-15; after L2 |
+| ⏳ | **Basics: a Files screen** (open, rename, download, sort) | `docs/basics-brief.md` | |
+| ⏳ | **Basics: trash** with undo and restore | `docs/basics-brief.md` | |
+| ⏳ | **Basics: move and reorder** topics, lessons and notes | `docs/basics-brief.md` | |
+| ⏳ | **Basics: copy an answer and a code block** on every platform | `docs/basics-brief.md` | |
+| ⏳ | **Basics: Office formats** (docx, pptx, xlsx) | `docs/basics-brief.md` | Replaces the "Later" row |
+| ⏳ | **Basics: usage per person**, on L2's audit log | `docs/basics-brief.md` | |
+| ⏳ | **Basics: offboarding, removal and export**: an offboarding session asks the questions only the leaving person can answer and keeps the answers; then content is reassigned and the person removed; per-person export | `docs/basics-brief.md` | |
+| ⏳ | **Basics: a web page as a source, and the share sheet** on iOS and Android | `docs/basics-brief.md` | |
+| ⏳ | **Basics: help, feedback, version everywhere, and toasts** | `docs/basics-brief.md` | |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
 | ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
@@ -44,7 +54,7 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 
 ## Later / ideas
 
-- 🗓 Office and e-book formats (`.docx .pptx .epub`) once an extractor exists.
+- 🗓 E-book formats (`.epub`) once an extractor exists.
 - 🗓 Audio and video in folders.
 - 🗓 R2's variants as defaults (listwise rerank for lessons, rewriting, the cross-encoder for agent search) once the eval earns it (`docs/r2-brief.md` §6); a `by-purpose` reranker if both rerankers win.
 - 🗓 Agents over MCP for other companies' tools (after L1's agent tokens).
