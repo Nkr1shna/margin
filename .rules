@@ -1,0 +1,85 @@
+# Margin rules for agents
+
+Every agent session reads this file. The rules are traps to avoid, not a map of the code:
+read the code for that. `CLAUDE.md` adds how to reach Margin's knowledge base.
+
+# Rust
+
+* Correctness and clarity first. Speed only when the task asks for it.
+* Comments explain a non-obvious *why*. Don't write comments that restate the code.
+* No brief or phase codes in comments or doc comments: no `(D9)`, `(R2)`, `(L1)`, "phase 4",
+  `§4a`. They mean nothing once the brief is gone. Write the reason itself. When you edit a
+  line that has one, rewrite it; don't sweep other files in an unrelated PR.
+* No `unwrap()`, `expect()` or panicking index (`v[i]`, `&s[a..b]`) in non-test code.
+  Propagate with `?`, or handle the `None`/`Err` case. Tests may unwrap.
+* Never discard a fallible result with `let _ =`. Instead:
+  - propagate it with `?` when the caller should decide;
+  - log it with `tracing::warn!`/`error!` and enough context to act on, when the work can
+    go on without it;
+  - `match` or `if let Err(..)` when the failure needs its own handling;
+  - `.ok()` only for an expected failure (a cancelled request, a closed channel at
+    shutdown), with a comment naming that case.
+  Example: `let _ = tx.send(event).await;` hides a dropped receiver; say which of the above
+  it is.
+* Errors get a type. Library crates use `thiserror` enums; don't add `Result<_, String>`,
+  and never branch on an error's message text (`err.contains("tool")`). `anyhow` is for the
+  binaries' and CLIs' outer edge only.
+* An error the person sees says what happened and what they can do, in a sentence. The app
+  shows the service's sentence; don't replace it with "Something went wrong".
+* A spawned task's handle is stored, awaited, or dropped on purpose with a comment saying
+  why it may outlive its caller.
+* New modules are `src/name.rs`, never `src/name/mod.rs`.
+* Full words for names (`queue`, not `q`) except loop indexes.
+* Don't grow a file past 2,000 lines. Split it first, in its own PR.
+* Prefer adding to an existing file over many small new ones, unless it is a new component.
+
+# Tests
+
+* Tests run on in-memory stores and fakes only: in-memory SurrealDB, the fake GitHub and
+  Hugging Face servers in `crates/service/tests/common`, `margin_embed::fake::FakeEmbedder`,
+  `margin_agent::Scripted` for model replies. Never call a real model API or the network.
+* Never touch the running margin-service, `~/Library/Application Support/Margin`, the dev
+  or prod VMs, or their data from a test or a script you run.
+* A test must fail when the behavior breaks. No early `return` that passes when a tool or
+  model is missing: use `#[ignore = "why"]`. Assert exact values, not "is non-empty".
+* Wait for a condition with a timeout, never a fixed `sleep`.
+* Run what CI runs before opening a PR: `sh deploy/local/linux-check.sh` (CI / Linux in the
+  same image) for the workspace minus the app; `cargo clippy --locked -p margin-app
+  --all-targets -- -D warnings` and `cargo test --locked -p margin-app` for the app.
+
+# Pull requests
+
+* One thing per PR, aimed under 400 changed lines (`Cargo.lock` and generated files don't
+  count). CI warns over 1,000 and fails over 3,000 unless the owner adds the `large-pr`
+  label. Plan big work as a stack of PRs, each saying `Part of #N`.
+* Branch from `origin/dev` and open the PR into `dev`. Never push to `dev`, `release` or
+  `main`, never merge a PR the owner didn't tell you to, never edit rulesets, Environments
+  or secrets.
+* Fill in the PR template: `Summary` (with `Closes #N` or `Part of #N`), `Testing` (the
+  command you ran and its result, with the pass count), and `Release Notes:` with one
+  bullet, `- Added/Fixed/Improved ...` or `- N/A`. CI checks the
+  `Testing` and `Release Notes:` sections.
+* Title: imperative, capitalized, under 72 characters, no trailing period, no
+  conventional-commit prefix (`feat:`, `fix:`). An area scope is fine: `service:`, `app:`,
+  `agent:`, `evals:`, `deploy:`, `ci:`, `docs:`.
+* Commit messages end with a `Co-Authored-By:` line.
+* A toolchain bump (`rust-toolchain.toml`) or a dependency bump is its own PR.
+
+# Don't touch without the owner asking
+
+* `release`, prod deploys (`deploy-prod.yml`, `promote-release.yml`, the `prod`
+  Environment) and anything that reaches margin-prod.
+* Secrets: never in the repo, a log, a command line or a device. API keys stay on the
+  service.
+* `evals/baseline.json` and `evals/recorded/` change only by re-recording
+  (`evals/README.md`). A changed prompt bumps its version, then
+  `margin-eval prompts --write-lock`; never edit `evals/prompts.lock` by hand.
+* Scope: never narrow a task on your own ("for now", "desktop only", "later"). Ask.
+* UI: every control works. No placeholder or mock controls; leave a thing out and ask.
+
+# Changing these rules
+
+Don't edit `.rules` during feature or fix work. If you hit a non-obvious trap that would
+catch the next agent, add a **Suggested .rules additions** heading to your PR body with the
+proposed text. A rule gets added when it is non-obvious, has come up more than once, and is
+concrete enough to act on. The owner decides.
