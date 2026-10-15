@@ -291,6 +291,10 @@ impl AppCtx {
         let mut next = self.config.peek().clone();
         update(&mut next);
         let result = config::save(&next);
+        if let Err(e) = &result {
+            // Callers that ignore the result (zoom, the sidebar) still leave a trace.
+            config::report_save_failure(&format!("couldn't save settings: {e}"));
+        }
         this.config.set(next);
         result
     }

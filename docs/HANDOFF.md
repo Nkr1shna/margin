@@ -1,6 +1,6 @@
 # Handoff: Margin agent build
 
-Written 2026-10-14 so the build can continue from a new Claude Code project. Work happens on branch **`claude/agent-build`**. GitHub `main` is still old (dbd08ff); don't build on it.
+Written 2026-10-14 so the build can continue from a new Claude Code project. Work goes to a feature branch and a PR squash-merged into **`dev`** (deploys devmargin); prod ships by promoting a dev snapshot into **`release`** (`docs/RELEASES.md`, `docs/plan-deploy.md` §4a). `main` and the old `claude/agent-build` branch are unused; don't build on them.
 
 ## Read first
 
