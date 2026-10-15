@@ -22,6 +22,10 @@ use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
     ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js, open_external,
 };
+use crate::ui::organisation::{
+    EveryonesDevices, MySettingsSection, OrganisationPane, PersonLine, ReadOnlyAdvanced,
+    ReadOnlyAi, ReadOnlyVideo, devices_by_person,
+};
 use crate::ui::sources::kind_icon;
 
 /// How long a Copy button says "Copied".
@@ -66,6 +70,7 @@ use crate::ui::sources::{
 pub enum SettingsPane {
     General,
     Account,
+    Organisation,
     Service,
     Ai,
     Sources,
@@ -76,9 +81,10 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    pub const ALL: [SettingsPane; 9] = [
+    pub const ALL: [SettingsPane; 10] = [
         SettingsPane::General,
         SettingsPane::Account,
+        SettingsPane::Organisation,
         SettingsPane::Service,
         SettingsPane::Ai,
         SettingsPane::Sources,
@@ -92,6 +98,7 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "General",
             SettingsPane::Account => "Account",
+            SettingsPane::Organisation => "Organisation",
             SettingsPane::Service => "Service",
             SettingsPane::Ai => "AI",
             SettingsPane::Sources => "Sources",
@@ -106,6 +113,7 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "half",
             SettingsPane::Account => "user",
+            SettingsPane::Organisation => "users",
             SettingsPane::Service => "server",
             SettingsPane::Ai => "spark",
             SettingsPane::Sources => "clip",
@@ -140,6 +148,7 @@ pub fn SettingsDialog() -> Element {
         }
     });
     let settings = app.lib.read().settings.clone();
+    let admin = app.is_admin();
     // Panes backed by the service's settings: their content, or the load state.
     let service_settings =
         |body: fn(Settings) -> Element| match (settings.clone(), settings_error.read().clone()) {
@@ -226,7 +235,18 @@ pub fn SettingsDialog() -> Element {
                                 TextSizeSection {}
                             },
                             SettingsPane::Account => rsx! { AccountSection {} },
+                            SettingsPane::Organisation => rsx! { OrganisationPane {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
+                            // A member reads the organisation's settings; admins change them.
+                            SettingsPane::Ai if !admin => service_settings(|s| rsx! {
+                                ReadOnlyAi { settings: s }
+                            }),
+                            SettingsPane::Video if !admin => service_settings(|s| rsx! {
+                                ReadOnlyVideo { settings: s }
+                            }),
+                            SettingsPane::Advanced if !admin => service_settings(|s| rsx! {
+                                ReadOnlyAdvanced { settings: s }
+                            }),
                             SettingsPane::Ai => service_settings(|s| rsx! {
                                 ProvidersSection { settings: s.clone() }
                                 OpenAiSection { settings: s.clone() }
@@ -406,7 +426,10 @@ fn AccountSection() -> Element {
         .as_ref()
         .and_then(|m| m.device.as_ref())
         .map(|d| d.id.clone());
-    let known: Vec<Device> = app
+    // The person's own devices here; an admin's list also has everyone else's, shown
+    // below by person.
+    let person = me.as_ref().and_then(|m| m.person.clone());
+    let all: Vec<Device> = app
         .lib
         .read()
         .devices
@@ -416,6 +439,20 @@ fn AccountSection() -> Element {
             ..d.clone()
         })
         .collect();
+    let (known, others): (Vec<Device>, Vec<Device>) =
+        all.into_iter()
+            .partition(|d| match (&person, &d.person_id) {
+                (Some(p), Some(owner)) => *owner == p.id,
+                _ => true,
+            });
+    let everyone = match (&person, app.is_admin()) {
+        (Some(p), true) => Some(devices_by_person(
+            &others,
+            &p.id,
+            &app.lib.read().people.values().cloned().collect::<Vec<_>>(),
+        )),
+        _ => None,
+    };
     let list = match devices.read().clone() {
         Some(Ok(())) => Some(Ok(devices_in_order(&known))),
         Some(Err(e)) => Some(Err(e)),
@@ -427,18 +464,30 @@ fn AccountSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Account" }
-            div { class: "kv",
-                span { "GitHub" }
-                span { {me.as_ref().map(|m| m.github_login.clone()).unwrap_or_else(|| "Loading…".into())} }
-                span { "This device" }
-                span { {me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_else(|| "Loading…".into())} }
-            }
-            div { class: "row-actions",
-                button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+            if let Some(p) = person.clone() {
+                PersonLine {
+                    person: p,
+                    device: me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_default(),
+                    on_sign_out: move |_| confirm_signout.set(true),
+                }
+            } else {
+                // A service before L1 (or `me` still loading).
+                div { class: "kv",
+                    span { "GitHub" }
+                    span { {me.as_ref().map(|m| m.github_login.clone()).unwrap_or_else(|| "Loading…".into())} }
+                    span { "This device" }
+                    span { {me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_else(|| "Loading…".into())} }
+                }
+                div { class: "row-actions",
+                    button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+                }
             }
         }
+        if let Some(p) = person.clone() {
+            MySettingsSection { person: p }
+        }
         section { class: "set-sec",
-            h2 { "Devices" }
+            h2 { if everyone.is_some() { "My devices" } else { "Devices" } }
             p { class: "help", "Every signed-in device has its own key. Revoke one to sign it out. A device is online while Margin runs on it; the agent can only use it then." }
             if !connected {
                 p { class: "help", "This device isn't connected to the service, so who is online may be out of date. It updates when the connection is back." }
@@ -482,6 +531,9 @@ fn AccountSection() -> Element {
                     }
                 },
             }
+        }
+        if let Some(groups) = everyone {
+            EveryonesDevices { groups, on_revoke: move |d: Device| confirm_revoke.set(Some(d)) }
         }
         if let Some(device) = confirm_revoke.read().clone() {
             ConfirmDialog {

@@ -5,10 +5,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
-use chrono::Utc;
 use dioxus::history::{History, MemoryHistory};
 use dioxus::prelude::*;
-use margin_shared::{Citation, Device, Id, Me};
+use margin_shared::{Citation, Id, Me};
 
 use crate::api::Api;
 use crate::config::{Appearance, LocalConfig};
@@ -37,6 +36,8 @@ pub struct Extra {
     pub shown_passage: Option<Citation>,
     /// Signed out at this configured service URL: the sign-in screen renders instead.
     pub connect: Option<Option<String>>,
+    /// Who is signed in; `None`: the fake's owner on `d1` (`fake::sample_me(TOKEN)`).
+    pub me: Option<Me>,
 }
 
 #[allow(non_snake_case)]
@@ -48,6 +49,10 @@ fn Harness(props: HarnessProps) -> Element {
     let extra = props.extra.clone();
     let connect = extra.connect.clone();
     let signed_in = connect.is_none();
+    let me = extra
+        .me
+        .clone()
+        .unwrap_or_else(|| crate::fake::sample_me(crate::fake::TOKEN));
     use_context_provider(move || AppCtx {
         config: Signal::new(LocalConfig {
             service_url: connect.unwrap_or(Some("https://margin.example".into())),
@@ -58,20 +63,7 @@ fn Harness(props: HarnessProps) -> Element {
         }),
         session: Signal::new(signed_in.then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
-            me: Some(Me {
-                agent: None,
-                person: None,
-                github_login: "Nkr1shna".into(),
-                device: Some(Device {
-                    person_id: None,
-                    id: "d1".into(),
-                    name: "test-mac".into(),
-                    created_at: Utc::now(),
-                    last_seen_at: None,
-                    current: true,
-                    online: true,
-                }),
-            }),
+            me: Some(me),
         })),
         signed_out_reason: Signal::new(None),
         lib: Signal::new(lib),
