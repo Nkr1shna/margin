@@ -1,0 +1,17 @@
+# The environment's Cloudflare Tunnel in a Linux guest (docs/plan-deploy.md §2), from the
+# config and credentials on the host share (__PERSIST__/cloudflared). Installed by
+# provision-guest.sh.
+[Unit]
+Description=Cloudflare Tunnel for Margin
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=admin
+ExecStart=/usr/bin/cloudflared --no-autoupdate --config __PERSIST__/cloudflared/config.yml tunnel run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

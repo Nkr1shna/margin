@@ -1,0 +1,31 @@
+# margin-service in a Linux guest (docs/plan-linux-service.md §2.10, §5). Installed by
+# provision-guest.sh with __PERSIST__ (the host share, e.g. /mnt/shared/margin) and
+# __MEMORY_MAX__ filled in. Config, data and secrets live on the share, so Orchard
+# re-cloning the VM loses nothing; the share is mounted by the startup script, and
+# Restart= retries until it is.
+#
+# No RestrictNamespaces=, SystemCallFilter= or PrivateUsers=: the scene sandbox
+# (bubblewrap) creates user, mount, PID and network namespaces.
+[Unit]
+Description=Margin service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=admin
+Environment=MARGIN_CONFIG=__PERSIST__/service.toml
+ExecStartPre=/usr/bin/test -f __PERSIST__/.margin-persistent
+ExecStart=__PERSIST__/bin/margin-service serve
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=__PERSIST__
+PrivateTmp=yes
+MemoryMax=__MEMORY_MAX__
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

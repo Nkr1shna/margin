@@ -3,7 +3,7 @@
 # of that branch): merging dev into release is how a change ships. Only ever reaches
 # margin-prod: MARGIN_DEPLOY_ONLY=prod makes deploy.sh refuse anything else, and the prod
 # Environment only admits the release branch. The installed binary is uploaded again as
-# `deployed-prod-<sha>`, which apps.yml builds the matching Margin app from.
+# `deployed-prod-<sha>`, a record of what prod runs.
 name: deploy-prod
 
 on:
