@@ -1,0 +1,195 @@
+# Promotes verified dev PRs to release, one PR at a time (docs/plan-deploy.md §4a).
+#
+# Run by hand (Actions → promote-release → Run workflow) with `prs` = "12,15", or empty
+# for every PR merged into dev that is labelled verified-on-dev and not shipped:
+#   promote: cuts promote/<date>-<run> from origin/release, cherry-picks each PR's squash
+#   commit onto it in dev order (deploy/scripts/promote-release.sh: refuses, naming the PR,
+#   when a PR isn't verified, may depend on an earlier unverified dev PR, or doesn't
+#   apply), pushes it, runs CI on it and opens one PR into release listing the PRs.
+# When that PR is merged (by the owner; the push to release deploys prod):
+#   shipped: labels each listed PR `shipped`, comments on it, and opens a PR into dev that
+#   regenerates docs/RELEASES.md (deploy/scripts/releases-ledger.sh) from the labels.
+#
+# Token: the optional repository secret PROMOTE_TOKEN (a fine-grained token on this
+# repository with Contents, Pull requests and Workflows read/write) is used when set: its
+# PRs trigger CI like the owner's, and it can push cherry-picks that change workflow files.
+# Without it the job's GITHUB_TOKEN is used: PRs it opens don't trigger CI, so the job
+# dispatches ci.yml on the branch itself (same jobs, same `Linux`/`macOS` checks), and a
+# promotion that changes .github/workflows/ is refused by GitHub at the push.
+name: promote-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: "PR numbers to promote, comma-separated (empty: all verified-on-dev, not shipped)"
+        required: false
+        type: string
+        default: ""
+      allow_overlap:
+        description: "Only warn when a PR touches files of an earlier unverified dev PR (check by hand first)"
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    types: [closed]
+    branches: [release]
+
+permissions: {}
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.event_name == 'workflow_dispatch'
+    # Git work on the Linux runner VM (margin-ci), like build-service.
+    runs-on: [self-hosted, Linux, ARM64, margin]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
+      PRS: ${{ inputs.prs }}
+      ALLOW_OVERLAP: ${{ inputs.allow_overlap }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+
+      - name: Promote
+        id: promote
+        run: |
+          set -euo pipefail
+          # The scripts come from dev; the branch below is release's tree.
+          cp deploy/scripts/promote-release.sh "$RUNNER_TEMP/"
+          git fetch -q origin release dev
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Every PR merged into dev: its commit on dev and its state.
+          gh pr list --repo "$GITHUB_REPOSITORY" --base dev --state merged --limit 1000 \
+            --json number,title,mergeCommit,labels > "$RUNNER_TEMP/prs.json"
+          jq -r '.[] | select(.mergeCommit != null) | ([.labels[].name]) as $l
+            | "\(.mergeCommit.oid) \(.number) \(if $l | index("shipped") then "shipped"
+                elif $l | index("verified-on-dev") then "verified" else "pending" end)"' \
+            "$RUNNER_TEMP/prs.json" > "$RUNNER_TEMP/prmap"
+
+          chosen="$(printf '%s' "$PRS" | tr ',' ' ' | xargs)"
+          if [ -z "$chosen" ]; then
+            chosen="$(awk '$3 == "verified" { print $2 }' "$RUNNER_TEMP/prmap" | sort -n | xargs)"
+            [ -n "$chosen" ] || { echo "::notice::No PRs are verified-on-dev and not shipped; nothing to promote."; exit 0; }
+          fi
+          echo "Promoting: $chosen"
+
+          branch="promote/$(date -u +%Y-%m-%d)-$GITHUB_RUN_NUMBER"
+          git checkout -q -B "$branch" origin/release
+          allow=""
+          [ "$ALLOW_OVERLAP" = true ] && allow=allow-overlap
+          if ! sh "$RUNNER_TEMP/promote-release.sh" origin/release origin/dev "$RUNNER_TEMP/prmap" "$chosen" $allow \
+              2>&1 | tee "$RUNNER_TEMP/promote.log"; then
+            { echo "### Promotion refused"; echo; echo '```'; cat "$RUNNER_TEMP/promote.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          applied="$(sed -n 's/^promoted: *//p' "$RUNNER_TEMP/promote.log")"
+          if [ -z "$applied" ] || [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/release)" ]; then
+            echo "::notice::Every chosen PR is already on release; nothing to promote."
+            exit 0
+          fi
+
+          git push -q origin "$branch"
+
+          # The PR into release. The promote-prs line is what the shipped job reads.
+          {
+            echo "<!-- promote-prs: $applied -->"
+            echo "Promotes these dev PRs to release (cherry-picked in dev order onto \`release\`):"
+            echo
+            for pr in $applied; do
+              jq -r --argjson n "$pr" '.[] | select(.number == $n) | ([.labels[].name]) as $l
+                | "- #\(.number) \(.title)" + (if $l | index("needs-flag") then " — **ships dark** (needs-flag): turn its setting on in prod when ready" else "" end)' \
+                "$RUNNER_TEMP/prs.json"
+            done
+            echo
+            echo "Merging this deploys prod. Afterwards the PRs are labelled \`shipped\` and docs/RELEASES.md is regenerated (a PR into dev)."
+            echo
+            echo "_Opened by [promote-release run $GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)._"
+          } > "$RUNNER_TEMP/body.md"
+          title="Promote to release: $(printf '#%s, ' $applied | sed 's/, $//')"
+          url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base release --head "$branch" \
+            --title "$title" --body-file "$RUNNER_TEMP/body.md")"
+          echo "Opened $url"
+          echo "### [$title]($url)" >> "$GITHUB_STEP_SUMMARY"
+
+          # A PR opened with GITHUB_TOKEN triggers no CI; run it on the branch.
+          if [ "$HAS_PROMOTE_TOKEN" != true ]; then
+            if [ -f .github/workflows/ci.yml ]; then
+              gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+              echo "Dispatched CI on $branch."
+            else
+              echo "::warning::release has no .github/workflows/ci.yml yet (before the first block promotion), so CI can't run on $branch."
+            fi
+          fi
+
+  shipped:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'promote/')
+    runs-on: [self-hosted, Linux, ARM64, margin]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
+      PROMOTION: ${{ github.event.pull_request.number }}
+      BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - name: Label the promoted PRs shipped
+        run: |
+          set -euo pipefail
+          prs="$(printf '%s\n' "$BODY" | sed -n 's/^<!-- promote-prs: \([0-9 ]*\) -->.*/\1/p' | head -n 1)"
+          [ -n "$prs" ] || { echo "::error::#$PROMOTION has no promote-prs line"; exit 1; }
+          for pr in $prs; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" -f "labels[]=shipped" > /dev/null
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "🚀 Shipped to release in #$PROMOTION."
+            echo "#$pr labelled shipped."
+          done
+
+      # The ledger lives on dev, which takes changes only by PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+
+      - name: Regenerate docs/RELEASES.md (PR into dev)
+        run: |
+          set -euo pipefail
+          sh deploy/scripts/releases-ledger.sh "$GITHUB_REPOSITORY" > docs/RELEASES.md
+          if git diff --quiet -- docs/RELEASES.md; then
+            echo "docs/RELEASES.md is already current."
+            exit 0
+          fi
+          branch="ledger/promote-$PROMOTION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -B "$branch"
+          git commit -q -m "RELEASES.md: record promotion #$PROMOTION" -- docs/RELEASES.md
+          git push -q -f origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base dev --head "$branch" \
+            --title "RELEASES.md: record promotion #$PROMOTION" \
+            --body "Regenerated by promote-release after #$PROMOTION was merged into release (deploy/scripts/releases-ledger.sh). Docs only."
+          if [ "$HAS_PROMOTE_TOKEN" != true ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+            echo "Dispatched CI on $branch."
+          fi
