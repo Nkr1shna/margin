@@ -13,10 +13,11 @@ use chrono::Utc;
 use margin_ai::{CallOptions, FailedScene, Generated, SceneRequest};
 use margin_shared::context::TraceKind;
 use margin_shared::pipeline::Route;
-use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus};
+use margin_shared::{Id, LessonStatus, ToolStatus, Video, VideoStatus, WrittenWith};
 use margin_video::{
     RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress, SandboxMode, Voice,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::db;
@@ -32,6 +33,26 @@ pub const LOG_LINES: usize = 200;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 /// Log-only updates are saved and sent at most this often.
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A stored video with what wrote its scene (R2, `docs/r2-brief.md` D4.3: the scene
+/// prompt's version, the pipeline, the provider and model). Service-only: read as a
+/// plain `StoredVideo` elsewhere, the field is ignored; this module's writes keep it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoRow {
+    #[serde(flatten)]
+    pub stored: StoredVideo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_with: Option<WrittenWith>,
+}
+
+/// What wrote video `id`'s scene, once one was written.
+pub async fn written_with(state: &AppState, id: &str) -> anyhow::Result<Option<WrittenWith>> {
+    Ok(state
+        .store
+        .get::<VideoRow>(db::VIDEO, id)
+        .await?
+        .and_then(|v| v.written_with))
+}
 
 pub fn in_progress(status: &VideoStatus) -> bool {
     matches!(
@@ -153,15 +174,24 @@ async fn update(
     id: &str,
     f: impl FnOnce(&mut StoredVideo),
 ) -> anyhow::Result<bool> {
+    update_row(state, id, |row| f(&mut row.stored)).await
+}
+
+/// `update` on the whole row (with `written_with`).
+async fn update_row(
+    state: &AppState,
+    id: &str,
+    f: impl FnOnce(&mut VideoRow),
+) -> anyhow::Result<bool> {
     let video = {
         let _w = state.write_lock.lock().await;
-        let Some(mut v) = state.store.get::<StoredVideo>(db::VIDEO, id).await? else {
+        let Some(mut v) = state.store.get::<VideoRow>(db::VIDEO, id).await? else {
             return Ok(false);
         };
         f(&mut v);
-        v.video.updated_at = Utc::now();
+        v.stored.video.updated_at = Utc::now();
         state.store.put(db::VIDEO, id, &v).await?;
-        v
+        v.stored
     };
     state.emit_video(&video);
     Ok(true)
@@ -337,9 +367,11 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
             "Repaired scene written. Rendering again…".into()
         });
         let (scene, log_text) = (code.clone(), log.text());
-        if !update(state, id, move |v| {
-            v.video.scene_code = Some(scene);
-            v.video.log = log_text;
+        let with = crate::ask::written_with(state, &ai, SCENE_PROMPT_VERSION);
+        if !update_row(state, id, move |v| {
+            v.stored.video.scene_code = Some(scene);
+            v.stored.video.log = log_text;
+            v.written_with = Some(with);
         })
         .await?
         {

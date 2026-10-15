@@ -1011,3 +1011,64 @@ async fn the_dense_leg_only_compares_vectors_of_the_query_embedder() {
     assert_eq!(ids(&hits), ["c"]);
     assert!(hits.iter().all(|h| h.dense_rank.is_none()));
 }
+
+#[test]
+fn the_trace_counts_what_the_reranker_saw_and_dropped() {
+    let fused = vec![
+        hit("a", "d1", 0, 0.9, unit(0)),
+        hit("b", "d1", 1, 0.5, unit(1)),
+        hit("c", "d2", 0, 0.1, unit(2)),
+    ];
+    // "none", or a purpose passed through: nothing.
+    assert_eq!(reranked_count(&fused, &fused), None);
+    // Two graded, one dropped (grade 0).
+    let mut out = vec![fused[1].clone(), fused[0].clone()];
+    out[0].rerank = Some(3.0);
+    out[1].rerank = Some(1.0);
+    assert_eq!(reranked_count(&fused, &out), Some(3));
+}
+
+#[tokio::test]
+async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
+    let s = Store::memory().await.unwrap();
+    for (id, name) in [
+        ("d1", "b-notes.pdf"),
+        ("d2", "a-paper.pdf"),
+        ("d3", "other.md"),
+    ] {
+        let now = Utc::now();
+        s.put(
+            db::DOCUMENT,
+            id,
+            &Document {
+                id: id.into(),
+                project_id: DEFAULT_PROJECT_ID.into(),
+                origin: Origin::Agent { name: "t".into() },
+                name: name.into(),
+                kind: SourceKind::Text,
+                status: margin_shared::context::DocumentStatus::Ready { passages: 1 },
+                generation: 1,
+                bytes: 1,
+                actor: "owner".into(),
+                access: vec![ACCESS_COMPANY.into()],
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let resolved = Resolved {
+        keys: vec!["d1".into(), "d2".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        scope_names(&s, &resolved).await,
+        ["a-paper.pdf", "b-notes.pdf"]
+    );
+    let library = Resolved {
+        library: true,
+        ..Default::default()
+    };
+    assert_eq!(scope_names(&s, &library).await.len(), 3);
+}
