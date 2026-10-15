@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+</head>
+<body>
+<title>Droplet Orb</title>
+<style>
+/* Layout: one living object, full-bleed, nothing else on the page. */
+:root { --bg: #ebebea; color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #111214; color-scheme: dark; } }
+:root[data-theme="dark"] { --bg: #111214; color-scheme: dark; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); overflow: hidden; transition: background-color .6s; }
+#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+<canvas id="stage" role="img" aria-label="A ruby glass droplet that splits into beads and gathers them back."></canvas>
+<p class="sr" id="live" aria-live="polite"></p>
+<script type="module">
+// Droplet. Built from src/ by src/build.py: edit the sources, not this file.
+// Nothing is drawn but the object. It moves through idle, listening, thinking and speaking on its
+// own; a tap on it moves to the next mode; T switches light and dark; 1 to 4 open the other studies.
+// ============================================================== core ====
+const root = document.documentElement;
+const $ = (s) => document.querySelector(s);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const h2r = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+
+// The one accent. Change this line to recolour the object.
+const ACCENT = '#c41a1e';
+const ACC = h2r(ACCENT);
+const BG = { light: h2r('#ebebea'), dark: h2r('#111214') };
+// key 1 is the main page: index.html on disk, the page's own root once published
+const PAGES = [location.protocol === 'file:' ? 'index.html' : './', 'option-droplet.html', 'option-medusa.html', 'option-silk.html'];
+
+const reduceMQ = matchMedia('(prefers-reduced-motion: reduce)');
+let reduce = reduceMQ.matches; reduceMQ.addEventListener('change', (e) => { reduce = e.matches; });
+const darkMQ = matchMedia('(prefers-color-scheme: dark)');
+if (location.hash === '#dark' || location.hash === '#light') root.dataset.theme = location.hash.slice(1);
+const isDark = () => (root.dataset.theme ? root.dataset.theme === 'dark' : darkMQ.matches);
+
+// ---------------------------------------------------------------- state ----
+const MODES = ['idle', 'listening', 'thinking', 'speaking'];
+const HOLD = { idle: 5.5, listening: 6.5, thinking: 5, speaking: 6.5 };   // seconds in each mode
+const INTENSITY = { idle: 0, listening: 0.62, thinking: 0.78, speaking: 1 }; // how much of the accent it holds
+const S = {
+  i: 0, mode: 'idle', held: 0, w: { idle: 1, listening: 0, thinking: 0, speaking: 0 },
+  level: 0, K: 0, T: 0, spin: 0, rip: 0, ph: 0, breath: 0, breathT: 0, pulse: 0, clock: 0,
+  bg: [...BG[isDark() ? 'dark' : 'light']], dark: isDark() ? 1 : 0,
+  x: 0, y: 0, r: 100, dpr: 1, W: 1, H: 1,
+};
+
+// ------------------------------------------------------------------ GL ----
+const canvas = $('#stage');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false, powerPreference: 'high-performance' });
+function program(vs, fs) {
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  return p;
+}
+function uniformsOf(p) {
+  const U = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; U[name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, name); }
+  return U;
+}
+// the uniforms every study can read
+function setCommon(U) {
+  const f = (k, v) => { if (U[k]) gl.uniform1f(U[k], v); };
+  if (U.uRes) gl.uniform2f(U.uRes, S.W, S.H);
+  if (U.uC) gl.uniform2f(U.uC, S.x * S.dpr, S.y * S.dpr);
+  f('uR', S.r * S.dpr); f('uT', S.T); f('uL', S.level); f('uDark', S.dark); f('uK', S.K);
+  f('uSpin', S.spin); f('uRip', S.rip); f('uPh', S.ph); f('uBreath', S.breath); f('uPulse', S.pulse); f('uClock', S.clock);
+  if (U.uW) gl.uniform4f(U.uW, S.w.idle, S.w.listening, S.w.thinking, S.w.speaking);
+  if (U.uAcc) gl.uniform3f(U.uAcc, ACC[0], ACC[1], ACC[2]);
+  if (U.uBg) gl.uniform3f(U.uBg, S.bg[0], S.bg[1], S.bg[2]);
+}
+const FS_VERT = `#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+// a full-screen pass for a fragment shader
+function fullscreen(frag) {
+  const prog = program(FS_VERT, frag), U = uniformsOf(prog);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { prog, U, draw(extra) { gl.useProgram(prog); gl.bindVertexArray(vao); setCommon(U); if (extra) extra(U); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null); } };
+}
+
+// Shared glass shading (the pearl's): a soft studio environment, reflection and refraction with a
+// little dispersion, silver glass at rest and ruby glass (Beer–Lambert colour, inner glow, a soft
+// highlight band, a bright rim) as the accent intensity uK rises.
+const GLASS = `
+vec3 g3(vec3 p) { p = fract(p * vec3(0.1031, 0.1030, 0.0973)); p += dot(p, p.yxz + 33.33); return fract((p.xxy + p.yxx) * p.zyx) * 2.0 - 1.0; }
+float n3(vec3 p) { vec3 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(dot(g3(i), f), dot(g3(i + vec3(1, 0, 0)), f - vec3(1, 0, 0)), u.x),
+                 mix(dot(g3(i + vec3(0, 1, 0)), f - vec3(0, 1, 0)), dot(g3(i + vec3(1, 1, 0)), f - vec3(1, 1, 0)), u.x), u.y),
+             mix(mix(dot(g3(i + vec3(0, 0, 1)), f - vec3(0, 0, 1)), dot(g3(i + vec3(1, 0, 1)), f - vec3(1, 0, 1)), u.x),
+                 mix(dot(g3(i + vec3(0, 1, 1)), f - vec3(0, 1, 1)), dot(g3(i + vec3(1, 1, 1)), f - vec3(1, 1, 1)), u.x), u.y), u.z); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+vec3 env(vec3 d) {
+  vec3 skyL = mix(vec3(0.88, 0.885, 0.893), vec3(1.0), smoothstep(-0.3, 0.7, d.y));
+  vec3 skyD = mix(vec3(0.045, 0.047, 0.052), vec3(0.24, 0.245, 0.26), smoothstep(-0.2, 0.9, d.y));
+  vec3 c = mix(skyL, skyD, uDark);
+  c = mix(c, mix(vec3(0.7, 0.71, 0.73), uAcc, uK) * mix(1.0, 0.8, uDark), smoothstep(0.05, -0.75, d.y) * 0.7);
+  c += 1.7 * smoothstep(0.88, 0.985, dot(d, normalize(vec3(-0.55, 0.62, 0.55))));
+  c += 0.75 * smoothstep(0.92, 0.995, dot(d, normalize(vec3(0.75, 0.2, 0.62))));
+  return c;
+}
+vec3 glassShade(vec3 p, vec3 n, vec3 rd, float causAmt) {
+  float ndv = clamp(dot(n, -rd), 0.0, 1.0);
+  float fr = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+  vec3 rf = reflect(rd, n);
+  vec3 refl = env(rf);
+  vec3 tr = vec3(env(refract(rd, n, 1.0 / 1.26)).r, env(refract(rd, n, 1.0 / 1.33)).g, env(refract(rd, n, 1.0 / 1.41)).b);
+  vec3 cp = p * 1.25 + refract(rd, n, 0.75) * 0.8; cp.xz = rot(uSpin * 1.6) * cp.xz;
+  float v = n3(cp + vec3(0.0, uT * 0.18, uT * 0.1));
+  float caus = clamp(pow(max(1.0 - abs(v) * 1.8, 0.0), 10.0), 0.0, 1.0);
+  vec3 milk = mix(vec3(0.99, 0.988, 0.984), vec3(0.6, 0.61, 0.63), uDark);
+  vec3 silver = mix(tr, milk, 0.5);
+  float thick = (0.75 + 0.9 * (1.0 - ndv)) * (0.6 + 1.1 * uK);
+  vec3 ruby = tr * pow(uAcc, vec3(thick)) * 0.98 + uAcc * (0.05 + 0.14 * uK + uDark * (0.3 + 0.25 * uK)) * pow(ndv, 1.3);
+  ruby += mix(uAcc, vec3(1.0), 0.6) * 0.3 * smoothstep(0.15, 0.85, n.y) * smoothstep(0.25, 0.8, ndv);
+  ruby += mix(uAcc, vec3(1.0, 0.7, 0.65), 0.35) * 0.22 * smoothstep(-0.2, -0.9, n.y) * (1.0 - ndv);
+  vec3 body = mix(silver, ruby, smoothstep(0.0, 0.45, uK));
+  body += caus * mix(vec3(1.0), mix(uAcc, vec3(1.0), 0.45), uK) * causAmt;
+  vec3 film = 0.5 + 0.5 * cos(6.2831 * (vec3(0.0, 0.33, 0.67) + (1.0 - ndv) * 1.4 + n3(p * 2.0 + uT * 0.1) * 0.6));
+  vec3 col = mix(body, refl, fr * (1.0 - 0.35 * uK));
+  col += film * pow(1.0 - ndv, 2.4) * 0.3 * (1.0 - uK);
+  col += mix(vec3(1.0), vec3(1.0, 0.8, 0.76), uK) * pow(1.0 - ndv, 7.0) * 0.55;
+  col += pow(max(dot(rf, normalize(vec3(-0.55, 0.62, 0.55))), 0.0), 140.0) * 1.8;
+  col += pow(max(dot(rf, normalize(vec3(0.7, 0.25, 0.65))), 0.0), 50.0) * 0.35;
+  col *= 1.0 + 0.22 * uPulse;
+  return mix(col, 1.0 - exp(-col * 1.25), 0.45);
+}`;
+
+// Generative sound, live Web Audio (no files): a five-voice pad whose chord glides between modes,
+// a filter that opens with the voice, soft bells, and music-box notes from the chord.
+const hz = (n) => 440 * Math.pow(2, (n - 69) / 12);
+class Sound {
+  constructor(v) { this.v = v; this.ctx = null; this.enabled = false; this.chordName = 'idle'; this.voices = []; this.last = 0; this.bright = -1; this.timer = 0; }
+  get running() { return !!this.ctx && this.ctx.state === 'running'; }
+  start() {
+    if (this.ctx) { this.ctx.resume(); return; }
+    const ctx = (this.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -18; comp.ratio.value = 3; comp.connect(ctx.destination);
+    this.master = ctx.createGain(); this.master.gain.value = 0; this.master.connect(comp);
+    const verb = ctx.createConvolver(); verb.buffer = room(ctx, this.v.room, 2.4);
+    const wet = ctx.createGain(); wet.gain.value = this.v.wet; verb.connect(wet).connect(this.master);
+    this.send = ctx.createGain(); this.send.connect(verb);
+    this.filter = ctx.createBiquadFilter(); this.filter.type = 'lowpass'; this.filter.frequency.value = this.v.filterBase; this.filter.Q.value = 0.65;
+    const dry = ctx.createGain(); dry.gain.value = 0.52; this.filter.connect(dry).connect(this.master); this.filter.connect(this.send);
+    this.v.chords[this.chordName].forEach((note, i) => {
+      const g = ctx.createGain(); g.gain.value = i === 0 ? 0.11 : 0.072; const oscs = [];
+      for (const [type, det, lvl] of this.v.partials) {
+        const o = ctx.createOscillator(); o.type = type; o.frequency.value = hz(note) * det;
+        const gg = ctx.createGain(); gg.gain.value = lvl; o.connect(gg).connect(g); o.start(); oscs.push([o, det]);
+      }
+      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.04 + i * 0.019;
+      const depth = ctx.createGain(); depth.gain.value = 0.03; lfo.connect(depth).connect(g.gain); lfo.start();
+      g.connect(this.filter); this.voices.push(oscs);
+    });
+    this.sparkle();
+  }
+  setEnabled(on, fade = 6) {
+    this.enabled = on; if (!this.ctx) return; if (on) this.ctx.resume();
+    const t = this.ctx.currentTime, g = this.master.gain;
+    g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(on ? this.v.level : 0, t + (on ? fade : 0.35));
+    clearTimeout(this.sus); if (!on) { const ctx = this.ctx; this.sus = setTimeout(() => { if (!this.enabled) ctx.suspend(); }, 500); }
+  }
+  hidden(h) { if (!this.ctx) return; if (h) this.ctx.suspend(); else if (this.enabled) this.ctx.resume(); }
+  chord(name, glide = 2.2) {
+    if (this.chordName === name) return; this.chordName = name; if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.v.chords[name].forEach((n, i) => this.voices[i].forEach(([o, det]) => o.frequency.setTargetAtTime(hz(n) * det, t, glide / 3)));
+  }
+  brightness(v, tc = 0.25) {
+    if (!this.ctx) return; v = clamp(v, 0, 1); if (Math.abs(v - this.bright) < 0.008) return; this.bright = v;
+    this.filter.frequency.setTargetAtTime(this.v.filterBase + v * v * this.v.filterRange, this.ctx.currentTime, tc);
+  }
+  out(node, pan, dryAmt = 0.48) { const p = this.ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); const d = this.ctx.createGain(); d.gain.value = dryAmt; p.connect(d).connect(this.master); p.connect(this.send); }
+  bell(f, vel = 0.5, pan = 0, gap = 0.05, decay = 2.6) {
+    if (!this.ctx || !this.enabled) return; const ctx = this.ctx, t = ctx.currentTime;
+    if (t - this.last < gap) return; this.last = t;
+    const env = ctx.createGain(); env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(0.09 * clamp(vel, 0.05, 1), t + 0.008); env.gain.exponentialRampToValueAtTime(0.0001, t + decay);
+    for (const [r, l, d] of this.v.bell) {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f * r;
+      const g = ctx.createGain(); g.gain.setValueAtTime(l, t); g.gain.exponentialRampToValueAtTime(0.001, t + decay * d);
+      o.connect(g).connect(env); o.start(t); o.stop(t + decay + 0.1);
+    }
+    this.out(env, pan);
+  }
+  touch(pos, vel = 0.4, pan = 0) { const s = this.v.scale; this.bell(hz(s[clamp(Math.floor(pos * s.length), 0, s.length - 1)]), vel, pan); }
+  chordNote(step, vel = 0.4, pan = 0) {
+    const c = this.v.chords[this.chordName]; const n = c[1 + (step % 4)] + 24;
+    this.bell(hz(n), vel, pan, 0);
+    if (this.v.answer) setTimeout(() => this.bell(hz(n + this.v.answer), vel * 0.55, -pan, 0), 130);
+  }
+  sparkle() {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      if (this.enabled && this.ctx && Math.random() < 0.75) {
+        const c = this.v.chords[this.chordName]; const pick = () => hz(c[1 + Math.floor(Math.random() * 4)] + 24);
+        this.bell(pick(), 0.12 + Math.random() * 0.1, Math.random() * 1.2 - 0.6, 0, 3);
+        if (Math.random() < 0.3) setTimeout(() => this.bell(pick(), 0.09, Math.random() - 0.5, 0, 3), 260 + Math.random() * 240);
+      }
+      this.sparkle();
+    }, this.v.sparkleEvery * (0.7 + Math.random() * 0.9));
+  }
+  // air moving: a filtered breath of noise, rising or falling
+  breath(strength = 0.5, up = true, q = 0.8) {
+    if (!this.ctx || !this.enabled) return; const ctx = this.ctx, t = ctx.currentTime;
+    const src = ctx.createBufferSource(); src.buffer = noise(ctx, 2.6);
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+    bp.frequency.setValueAtTime(up ? 480 : 2400, t); bp.frequency.exponentialRampToValueAtTime(up ? 2400 : 480, t + 1.1);
+    const env = ctx.createGain(); env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(0.032 * strength, t + 0.7); env.gain.exponentialRampToValueAtTime(0.0001, t + 2.3);
+    src.connect(bp).connect(env); env.connect(this.send); env.connect(this.master); src.start(t);
+  }
+  // a water drop: a sine that falls quickly in pitch
+  drop(vel = 0.5, pan = 0, pitch = 1) {
+    if (!this.ctx || !this.enabled) return; const ctx = this.ctx, t = ctx.currentTime;
+    const o = ctx.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(1500 * pitch, t); o.frequency.exponentialRampToValueAtTime(420 * pitch, t + 0.09); o.frequency.exponentialRampToValueAtTime(700 * pitch, t + 0.16);
+    const env = ctx.createGain(); env.gain.setValueAtTime(0, t); env.gain.linearRampToValueAtTime(0.1 * vel, t + 0.005); env.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(env); o.start(t); o.stop(t + 0.3); this.out(env, pan, 0.6);
+  }
+  // the chord comes home with a short falling-into-place phrase
+  resolve() {
+    this.chord('idle', 1.4);
+    this.v.home.forEach((n, i) => setTimeout(() => this.bell(hz(n), 0.3 - i * 0.05, (i - 1) * 0.35, 0, 3), 260 + i * 150));
+  }
+}
+function noise(ctx, s) { const b = ctx.createBuffer(1, Math.floor(ctx.sampleRate * s), ctx.sampleRate); const d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; return b; }
+function room(ctx, s, decay) { const n = Math.floor(ctx.sampleRate * s), b = ctx.createBuffer(2, n, ctx.sampleRate); for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, decay); } return b; }
+
+// ============================================================ Droplet ====
+// A ruby-glass droplet that is never quite one thing: beads split from it and flow back in.
+// Idle: one drop, a bead slowly parting and rejoining. Listening: beads rise from below, toward
+// you, and are drawn into the body, faster with the voice. Thinking: the beads circle close and
+// bridge to the body in a slow swirl. Speaking: on each phrase beads are thrown outward and
+// shrink back into the body as new ones bud.
+const NB = 7;
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform vec2 uRes, uC;
+uniform float uR, uT, uL, uDark, uK, uSpin, uPulse, uBodyR, uSmooth;
+uniform vec4 uW;
+uniform vec3 uAcc, uBg;
+uniform vec4 uB[${NB}];
+${GLASS}
+float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+float map(vec3 p) {
+  float d = length(p) - uBodyR + 0.035 * n3(p * 1.8 + vec3(0.0, uT * 0.3, uT * 0.2));
+  for (int i = 0; i < ${NB}; i++) { if (uB[i].w > 0.005) d = smin(d, length(p - uB[i].xyz) - uB[i].w, uSmooth); }
+  return d;
+}
+vec3 nrm(vec3 p) { const vec2 e = vec2(0.002, -0.002);
+  return normalize(e.xyy * map(p + e.xyy) + e.yyx * map(p + e.yyx) + e.yxy * map(p + e.yxy) + e.xxx * map(p + e.xxx)); }
+void main() {
+  vec2 frag = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+  vec2 uv = (frag - uC) / uR; uv.y = -uv.y;
+  vec3 col = uBg;
+  // a soft shadow under the body, tinted where light passes through coloured glass
+  float sh = exp(-pow(uv.x / 1.05, 2.0) - pow((uv.y + 1.45) / 0.13, 2.0));
+  col = mix(col, mix(col * mix(0.76, 0.55, uDark), col * mix(vec3(1.0), uAcc, 0.55), 0.5 * uK), sh * 0.55);
+  // and a faint glow of the accent around it while it speaks
+  col = mix(col, uAcc, exp(-max(length(uv) - 1.0, 0.0) * 2.5) * uK * uW.w * (0.08 + 0.12 * uL));
+  if (length(uv) < 2.4) {
+    vec3 ro = vec3(uv, 3.0), rd = vec3(0.0, 0.0, -1.0);
+    float t = 0.0, mh = 1e3; bool hit = false;
+    for (int i = 0; i < 80; i++) {
+      float h = map(ro + rd * t); mh = min(mh, h);
+      if (h < 0.001) { hit = true; break; }
+      t += h * 0.9; if (t > 6.0) break;
+    }
+    float aa = 1.2 / uR;
+    if (hit) { vec3 p = ro + rd * t; col = glassShade(p, nrm(p), rd, 0.14 + 0.3 * uW.z + 0.3 * uW.w * uL); }
+    else if (mh < aa) col = mix(col, mix(vec3(1.0), mix(uAcc, vec3(1.0), 0.4), uK), (1.0 - mh / aa) * mix(0.45, 0.3, uDark));
+  }
+  fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+// a stable direction per bead, spread over the sphere
+const DIRS = Array.from({ length: NB }, (_, i) => { const y = 1 - (2 * (i + 0.5)) / NB, r = Math.sqrt(1 - y * y), a = i * 2.39996; return [Math.cos(a) * r, y * 0.8, Math.abs(Math.sin(a) * r) * 0.8 + 0.25]; });
+const RAD = Array.from({ length: NB }, (_, i) => 0.2 + 0.14 * ((i * 0.618) % 1));
+const ease = (t) => t * t * (3 - 2 * t);
+function beads() {
+  const w = S.w, out = new Float32Array(NB * 4);
+  for (let i = 0; i < NB; i++) {
+    const acc = [0, 0, 0, 0], add = (wt, x, y, z, r) => { acc[0] += wt * x; acc[1] += wt * y; acc[2] += wt * z; acc[3] += wt * r; };
+    const d = DIRS[i], r0 = RAD[i];
+    // idle: beads rest inside the surface as soft bumps; two of them slowly part and rejoin
+    { const a = i * 2.4 + S.T * 0.12, part = i < 2 ? Math.pow(0.5 - 0.5 * Math.cos((S.T * 0.11 + i * 0.5) * Math.PI * 2), 3) : 0;
+      const rho = 0.6 + 0.62 * part; add(w.idle, Math.cos(a) * rho * 0.95, d[1] * rho * 0.9, Math.sin(a) * rho * 0.6 + 0.1, r0 * (1 - 0.25 * part)); }
+    // listening: beads rise from below, toward you, and are drawn into the body
+    { const u = (S.rip * 0.06 + i / NB) % 1, e = ease(u);
+      const sx = Math.sin(i * 1.7) * 0.7;
+      add(w.listening, lerp(sx, sx * 0.15, e), lerp(-2.05, -0.3, e), lerp(0.9, 0.2, e), r0 * (0.55 + 0.6 * e) * clamp(u / 0.12, 0, 1)); }
+    // thinking: beads circle close on a tilted ring and bridge to the body
+    { const a = S.spin * 1.7 + (i / NB) * Math.PI * 2, rho = 1.02 + 0.07 * Math.sin(S.T * 1.3 + i);
+      const x = Math.cos(a) * rho, z = Math.sin(a) * rho, tilt = 0.5;
+      add(w.thinking, x, z * Math.sin(tilt) + 0.08 * Math.sin(a * 2), z * Math.cos(tilt), r0 * 0.85); }
+    // speaking: thrown outward on the phrase, shrinking back as new beads bud
+    { const u = (S.ph * 0.085 + i / NB) % 1, e = 1 - Math.pow(1 - u, 2.2), rho = 0.62 + 1.0 * e;
+      add(w.speaking, d[0] * rho, d[1] * rho, d[2] * rho * 0.7, r0 * (1.05 - 0.75 * u) * clamp(u / 0.08, 0, 1)); }
+    out.set(acc, i * 4);
+  }
+  return out;
+}
+const PAGE = {
+  scale: 0.15,
+  voicing: {
+    chords: { idle: [43, 55, 62, 66, 69], listen: [40, 52, 59, 62, 67], think: [48, 55, 62, 66, 71], speak: [50, 57, 64, 66, 71], pad: [47, 54, 59, 62, 66] }, // G
+    scale: [67, 69, 71, 74, 76, 79, 81, 83, 86, 88, 91],
+    partials: [['sine', 1, 1], ['sine', 2.002, 0.1], ['triangle', 0.997, 0.2]],
+    bell: [[1, 1, 1], [2, 0.18, 0.4], [4.07, 0.04, 0.15]], answer: 0,
+    level: 0.38, filterBase: 340, filterRange: 2600, wet: 0.95, room: 3.8, sparkleEvery: 3600, home: [79, 83, 86],
+  },
+  setup() { this.fs = fullscreen(FRAG); },
+  draw() {
+    const w = S.w, L = S.level;
+    const bodyR = 0.8 * (1 + 0.035 * S.breath * w.idle + 0.07 * w.speaking * L + 0.03 * w.listening * L - 0.07 * w.thinking + 0.04 * S.pulse);
+    const B = beads();
+    this.fs.draw((U) => {
+      gl.uniform1f(U.uBodyR, bodyR);
+      gl.uniform1f(U.uSmooth, 0.22 + 0.1 * w.thinking + 0.04 * w.listening);
+      gl.uniform4fv(U.uB, B);
+    });
+  },
+};
+
+// ====================================================== core, part two ====
+const sound = new Sound(PAGE.voicing);
+const live = $('#live');
+const WORDS = { idle: 'Idle', listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking' };
+function setMode(i) {
+  S.i = ((i % 4) + 4) % 4; S.mode = MODES[S.i]; S.held = 0;
+  live.textContent = WORDS[S.mode];
+  const map = { idle: 'idle', listening: 'listen', thinking: 'think', speaking: 'speak' };
+  sound.chord(map[S.mode], S.mode === 'thinking' ? 3 : 2.2);
+  if (S.mode === 'listening') sound.touch(0.3, 0.22, -0.3);
+}
+// a simulated voice: syllables inside phrases, with breaths between them
+function voice(t, who) {
+  const syl = Math.abs(Math.sin(t * (who === 'agent' ? 10.5 : 13.2) + Math.sin(t * 2.3)));
+  const phrase = 0.55 + 0.45 * Math.sin(t * 1.6 + Math.sin(t * 0.55) * 2);
+  const grain = 0.5 + 0.5 * Math.sin(t * 37.3) * Math.sin(t * 21.7);
+  const gate = clamp((Math.sin(t * 1.15 + Math.sin(t * 0.43) * 1.8) + 0.55) * 2.2, 0, 1);
+  return clamp(0.1 + syl * phrase * 0.78 + grain * 0.12, 0, 1) * gate;
+}
+function resize() {
+  S.dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = innerWidth, h = innerHeight, W = Math.round(w * S.dpr), H = Math.round(h * S.dpr);
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  S.W = W; S.H = H; S.x = w / 2; S.y = h / 2;
+  S.r = clamp(Math.min(w, h) * (PAGE.scale || 0.165), 56, 170);
+}
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const slow = reduce ? 0.15 : 1;
+  S.clock += dt; S.held += dt;
+  if (S.held > HOLD[S.mode] * (reduce ? 1.4 : 1)) setMode(S.i + 1);
+  for (const m of MODES) S.w[m] = lerp(S.w[m], S.mode === m ? 1 : 0, 1 - Math.exp(-dt * 2.6));
+  let target = 0;
+  if (S.mode === 'listening') target = voice(S.held + 0.4, 'you');
+  else if (S.mode === 'speaking') target = voice(S.held + 3.1, 'agent');
+  else if (S.mode === 'thinking') target = 0.18 + 0.06 * Math.sin(S.clock * 2.1);
+  S.level = lerp(S.level, target, 1 - Math.exp(-dt * (target > S.level ? 18 : 7)));
+  if (reduce) S.level *= 0.5;
+  const w = S.w, L = S.level;
+  const kT = INTENSITY.idle * w.idle + INTENSITY.listening * w.listening + INTENSITY.thinking * w.thinking + INTENSITY.speaking * w.speaking;
+  S.K = lerp(S.K, kT, 1 - Math.exp(-dt * 3));
+  // each motion has its own clock, integrated so speeds can change without jumps
+  S.T += dt * slow * (0.8 + 0.3 * w.thinking);
+  S.spin += dt * slow * (0.12 + 0.9 * w.thinking);
+  S.rip += dt * slow * (2.4 + 9 * L) * (0.3 + w.listening);
+  S.ph += dt * slow * (1.5 + 11 * L) * (0.3 + w.speaking);
+  S.breathT += dt * slow * (0.9 + w.thinking * 0.8); S.breath = Math.sin(S.breathT * 1.25) * 0.5 + 0.5;
+  S.pulse = Math.max(0, S.pulse - dt * 1.4);
+  const bg = BG[isDark() ? 'dark' : 'light'], kb = 1 - Math.exp(-dt * 4);
+  for (let i = 0; i < 3; i++) S.bg[i] = lerp(S.bg[i], bg[i], kb);
+  S.dark = lerp(S.dark, isDark() ? 1 : 0, kb);
+  if (sound.ctx) sound.brightness(S.mode === 'listening' ? 0.22 + L * 0.7 : S.mode === 'speaking' ? 0.42 + L * 0.35 : S.mode === 'thinking' ? 0.34 : 0.2, S.mode === 'listening' ? 0.06 : 0.3);
+  resize();
+  gl.viewport(0, 0, S.W, S.H);
+  gl.clearColor(S.bg[0], S.bg[1], S.bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  PAGE.draw(dt);
+  requestAnimationFrame(frame);
+}
+
+// --------------------------------------------------------------- input ----
+// Sound starts on the first tap or key press and fades in.
+let soundOn = false;
+function startSound() { if (soundOn) return; soundOn = true; sound.start(); sound.chord('idle', 0.1); sound.setEnabled(true, 6); }
+canvas.addEventListener('pointerdown', (e) => {
+  startSound();
+  const dx = e.clientX - S.x, dy = e.clientY - S.y;
+  if (Math.hypot(dx, dy) < S.r * 1.9) { setMode(S.i + 1); S.pulse = 1; sound.touch(0.5, 0.4, clamp(dx / S.r / 3, -1, 1)); }
+});
+addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  startSound();
+  if (e.key === 't' || e.key === 'T') { root.dataset.theme = isDark() ? 'light' : 'dark'; return; }
+  const n = '1234'.indexOf(e.key);
+  if (n >= 0) { const here = Math.max(0, PAGES.findIndex((p) => location.pathname.endsWith('/' + p))); if (n !== here) location.href = PAGES[n] + (root.dataset.theme ? '#' + root.dataset.theme : ''); }
+});
+document.addEventListener('visibilitychange', () => sound.hidden(document.hidden));
+PAGE.setup();
+setMode(0);
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>
+

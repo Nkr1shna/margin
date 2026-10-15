@@ -1,0 +1,23 @@
+{{HEAD}}<title>{{TITLE}}</title>
+<style>
+/* Layout: one living object, full-bleed, nothing else on the page. */
+:root { --bg: #ebebea; color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #111214; color-scheme: dark; } }
+:root[data-theme="dark"] { --bg: #111214; color-scheme: dark; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); overflow: hidden; transition: background-color .6s; }
+#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+<canvas id="stage" role="img" aria-label="{{LABEL}}"></canvas>
+<p class="sr" id="live" aria-live="polite"></p>
+<script type="module">
+// {{NAME}}. Built from src/ by src/build.py: edit the sources, not this file.
+// Nothing is drawn but the object. It moves through idle, listening, thinking and speaking on its
+// own; a tap on it moves to the next mode; T switches light and dark; 1 to 4 open the other studies.
+{{CORE_A}}
+{{SOUND}}
+{{PAGE}}
+{{CORE_B}}
+</script>
+{{TAIL}}
