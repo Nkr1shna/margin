@@ -1271,7 +1271,15 @@ async fn deleting_and_attaching_sources_follow_through_to_documents() {
         .unwrap()
         .generation;
     // Filed under a topic: its passages are searchable from the topic.
-    let topic = new_topic(&h, &t, None, "Signals").await;
+    let mut topic = new_topic(&h, &t, None, "Signals").await;
+    // A topic shared with the company but not with Bob (L2): the source takes both.
+    topic.access = vec!["person/bootstrap".into(), "company".into()];
+    topic.deny = vec!["person/bob".into()];
+    h.state
+        .store
+        .put(db::TOPIC, &topic.id, &topic)
+        .await
+        .unwrap();
     let events = {
         let _w = h.state.write_lock.lock().await;
         margin_service::sources::attach_locked(&h.state, std::slice::from_ref(&s.id), &topic)
@@ -1283,6 +1291,18 @@ async fn deleting_and_attaching_sources_follow_through_to_documents() {
             |e| matches!(&e.event, Event::DocumentChanged { document } if document.id == s.id)
         )
     );
+    // The `SourceChanged` goes to the topic's readers less its denials, never to Bob.
+    let moved = events
+        .iter()
+        .find(|e| matches!(&e.event, Event::SourceChanged { source } if source.id == s.id))
+        .expect("the attached source's SourceChanged");
+    match &moved.audience {
+        margin_service::state::Audience::Readers { access, deny } => {
+            assert!(access.contains(&"company".to_string()), "{access:?}");
+            assert_eq!(deny, &["person/bob".to_string()]);
+        }
+        other => panic!("SourceChanged went to {other:?}, not to the readers"),
+    }
     assert!(
         chunks(&h, &s.id)
             .await

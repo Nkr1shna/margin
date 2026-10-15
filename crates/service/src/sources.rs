@@ -833,12 +833,17 @@ pub async fn attach_locked(
                 audience.push(a);
             }
         }
-        events.push(Emitted::paths(
-            &audience,
-            Event::SourceChanged {
+        // The topic's denials hold here too (L2): someone the topic denies never hears
+        // of a source filed under it, even when the union of paths names them.
+        events.push(Emitted {
+            audience: crate::state::Audience::Readers {
+                access: audience,
+                deny: source.deny.clone(),
+            },
+            event: Event::SourceChanged {
                 source: state.public_source(&source),
             },
-        ));
+        });
         events.extend(ingest::add_scope_locked(state, id, &topic.id).await?);
     }
     Ok(events)

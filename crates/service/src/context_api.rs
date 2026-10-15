@@ -471,16 +471,23 @@ pub async fn changes(
 }
 
 /// `DELETE routes::context_document(id)`: an agent's document and its passages go, and
-/// the change feed lists it as deleted. 404 unknown; 403 `forbidden` for a document
-/// that isn't an agent's (sources, folder files and library items are deleted where
-/// they live); 403 `not_owner` for another person's.
+/// the change feed lists it as deleted. 404 unknown or outside the caller's access (L2:
+/// never 403 for a document they can't read); 403 `forbidden` for a document that isn't
+/// an agent's (sources, folder files and library items are deleted where they live);
+/// 403 `not_owner` for another person's that the caller reads.
 pub async fn delete_document(
     State(state): State<AppState>,
     CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     let _w = state.write_lock.lock().await;
-    let Some(doc) = state.store.get::<Document>(db::DOCUMENT, &id).await? else {
+    // A document the caller can't read is no document to them (404, never 403: L2).
+    let Some(doc) = state
+        .store
+        .get::<Document>(db::DOCUMENT, &id)
+        .await?
+        .filter(|d| retrieval::reads_document(&Reader::of(&p), d))
+    else {
         return Err(AppError::not_found("document"));
     };
     if !matches!(doc.origin, Origin::Agent { .. }) {
