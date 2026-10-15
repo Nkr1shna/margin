@@ -734,9 +734,19 @@ async fn the_context_api_reads_what_the_agents_tools_read() {
     assert_eq!(hits[0].document_id, ids[2]);
     let registry = margin_service::agent_tools::registry(&h.state);
     let tool = registry.get("search").unwrap().clone();
+    // The tool acts as its chat's owner (L1), so it runs in one of the owner's chats.
+    let chat: margin_shared::ChatDetail = h
+        .post(&t, "/api/chats")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let out = tool
         .run(
-            &tool_ctx("no-chat"),
+            &tool_ctx(&chat.chat.id),
             json!({"query": query, "scope": {"topic_id": topic.id, "source_ids": null, "workspace_ids": null, "chat_files": null, "library": null}, "k": 12, "modalities": null}),
         )
         .await;

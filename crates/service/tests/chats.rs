@@ -1189,7 +1189,7 @@ async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSi
     let now = Utc::now();
     {
         let _w = h.state.write_lock.lock().await;
-        let mut chat = chats::chat(&h.state, chat_id).await.unwrap();
+        let mut chat = chats::chat_row(&h.state, chat_id).await.unwrap();
         chat.state = ChatState::Running {
             turn_id: turn_id.clone(),
             device_id: device_id.into(),
@@ -2176,7 +2176,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     let now = Utc::now();
     {
         let _w = h.state.write_lock.lock().await;
-        let mut c = chats::chat(&h.state, &chat.id).await.unwrap();
+        let mut c = chats::chat_row(&h.state, &chat.id).await.unwrap();
         c.state = ChatState::Running {
             turn_id: "turn-1".into(),
             device_id: mac_id,
@@ -2864,7 +2864,12 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         assert_eq!(c.model.as_deref(), Some("test-model"));
         assert_eq!(c.provider.as_deref(), Some("openai"));
         assert_eq!(c.stop_reason.as_deref(), Some("completed"));
-        assert_eq!(c.actor.as_deref(), Some("owner"));
+        // The chat owner's principal (L1).
+        assert!(
+            c.actor.as_deref().is_some_and(|a| a.starts_with("person/")),
+            "{c:?}"
+        );
+        assert_eq!(c.principal, c.actor);
         let u = c.usage.expect("usage");
         assert!(u.input == 100 && u.output > 0, "{u:?}");
         let cost = c.cost_usd.expect("priced at write time");

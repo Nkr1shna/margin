@@ -50,7 +50,10 @@ use crate::embedding;
 use crate::library;
 use crate::pipeline::{Chunker, ChunkerCfg, Registry, StageCtor};
 use crate::sources;
-use crate::state::{AppState, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson, new_id, sha256_hex};
+use crate::state::{
+    AppState, Audience, Emitted, Owned, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson, new_id,
+    sha256_hex,
+};
 
 /// The migration that moves sources from `chunk`/`media` to `passage`, by its name in
 /// `SettingsRow.migrations`.
@@ -220,17 +223,37 @@ async fn find_by_origin(
     Ok(found.into_iter().next())
 }
 
-/// Creates (or finds) the document for `origin`.
+/// Who hears about a document (`DocumentChanged`): its owner (L1; L2 widens it to the
+/// document's audience). A document from before `people-v1` is the bootstrap owner's.
+pub fn document_audience(doc: &Document) -> Audience {
+    Audience::Person(
+        doc.owner
+            .clone()
+            .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string()),
+    )
+}
+
+/// Sends `DocumentChanged` to the document's audience.
+pub fn emit_document(state: &AppState, doc: Document) {
+    state.emit_to(
+        document_audience(&doc),
+        Event::DocumentChanged { document: doc },
+    );
+}
+
+/// Creates (or finds) the document for `origin`, owned by `owner` (the owning row's
+/// person; `None` keeps what it has).
 pub async fn upsert_document(
     state: &AppState,
     origin: Origin,
     name: &str,
     kind: SourceKind,
     actor: &str,
+    owner: Option<&str>,
 ) -> anyhow::Result<Document> {
     let project = library::default_project(state).await?;
     let _w = state.write_lock.lock().await;
-    upsert_document_locked(state, &project.id, origin, name, kind, actor).await
+    upsert_document_locked(state, &project.id, origin, name, kind, actor, owner).await
 }
 
 /// `upsert_document` with the write lock held.
@@ -241,14 +264,25 @@ async fn upsert_document_locked(
     name: &str,
     kind: SourceKind,
     actor: &str,
+    owner: Option<&str>,
 ) -> anyhow::Result<Document> {
+    let owner = owner.map(str::to_string);
     let doc = match find_by_origin(state, &origin, name).await? {
         Some(mut doc) => {
-            if doc.name != name || doc.kind != kind || doc.actor != actor || doc.origin != origin {
+            let new_owner = owner.is_some() && doc.owner != owner;
+            if doc.name != name
+                || doc.kind != kind
+                || doc.actor != actor
+                || doc.origin != origin
+                || new_owner
+            {
                 doc.name = name.to_string();
                 doc.kind = kind;
                 doc.actor = actor.to_string();
                 doc.origin = origin;
+                if new_owner {
+                    doc.owner = owner;
+                }
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             }
@@ -261,6 +295,7 @@ async fn upsert_document_locked(
             };
             let mut doc = new_document(id, project_id.to_string(), origin, name, kind);
             doc.actor = actor.to_string();
+            doc.owner = owner;
             state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             doc
         }
@@ -289,17 +324,21 @@ pub async fn source_document_locked(
     source: &Source,
 ) -> anyhow::Result<Document> {
     let origin = source_origin(source);
+    // The document belongs to the source's owner (D6).
+    let owner = Some(source.owner_id().to_string());
     match document(state, &source.id).await? {
         Some(mut doc) => {
             if doc.name != source.name
                 || doc.kind != source.kind
                 || doc.origin != origin
                 || doc.bytes != source.bytes
+                || doc.owner != owner
             {
                 doc.name = source.name.clone();
                 doc.kind = source.kind;
                 doc.origin = origin;
                 doc.bytes = source.bytes;
+                doc.owner = owner;
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             }
@@ -315,6 +354,7 @@ pub async fn source_document_locked(
             );
             doc.bytes = source.bytes;
             doc.created_at = source.created_at;
+            doc.owner = owner;
             state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             Ok(doc)
         }
@@ -342,13 +382,25 @@ pub async fn queue_source(state: &AppState, source_id: &str) -> anyhow::Result<(
 /// document's file, the document is created (or found again by its agent and name) with
 /// `actor: agent:<name>` and queued. Only `Origin::Agent` documents come in as text.
 pub async fn ingest_text(state: &AppState, req: &ContextIngest) -> anyhow::Result<Document> {
+    ingest_text_as(state, req, None, None).await
+}
+
+/// `ingest_text` for a principal (L1 D7): the document belongs to `owner` (an agent
+/// token's owner, a device's person) and records `actor` (`agent/<id>` on an agent
+/// token) instead of `actor_for(origin)` when given.
+pub async fn ingest_text_as(
+    state: &AppState,
+    req: &ContextIngest,
+    owner: Option<&str>,
+    actor: Option<&str>,
+) -> anyhow::Result<Document> {
     anyhow::ensure!(
         matches!(req.origin, Origin::Agent { .. }),
         "only an agent's document can be added as text"
     );
     let name = req.name.trim();
     anyhow::ensure!(!name.is_empty(), "the document needs a name");
-    let actor = actor_for(&req.origin);
+    let actor = actor.map_or_else(|| actor_for(&req.origin), str::to_string);
     let project = library::default_project(state).await?;
     let doc = {
         let _w = state.write_lock.lock().await;
@@ -359,6 +411,7 @@ pub async fn ingest_text(state: &AppState, req: &ContextIngest) -> anyhow::Resul
             name,
             req.kind,
             &actor,
+            owner,
         )
         .await?;
         let dir = document_dir(state, &doc.id);
@@ -395,7 +448,16 @@ pub async fn index_library(
         kind,
         id: id.to_string(),
     };
-    let doc = upsert_document(state, origin, &name, SourceKind::Text, ACTOR_OWNER).await?;
+    let owner = library_owner(state, kind, id).await?;
+    let doc = upsert_document(
+        state,
+        origin,
+        &name,
+        SourceKind::Text,
+        ACTOR_OWNER,
+        owner.as_deref(),
+    )
+    .await?;
     {
         let _w = state.write_lock.lock().await;
         if let Some(mut d) = document(state, &doc.id).await? {
@@ -428,6 +490,31 @@ pub fn spawn_reindex(state: &AppState, kind: LibraryKind, id: &str) {
             tracing::warn!("couldn't index {kind:?} {id}: {e:#}");
         }
     });
+}
+
+/// The owner of a library item (the document follows it, D6); `None` when it is gone.
+async fn library_owner(
+    state: &AppState,
+    kind: LibraryKind,
+    id: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(match kind {
+        LibraryKind::Lesson => state
+            .store
+            .get::<StoredLesson>(db::LESSON, id)
+            .await?
+            .map(|l| l.owner_id().to_string()),
+        LibraryKind::Note => state
+            .store
+            .get::<Note>(db::NOTE, id)
+            .await?
+            .map(|n| n.owner_id().to_string()),
+        LibraryKind::Chat => state
+            .store
+            .get::<Chat>(db::CHAT, id)
+            .await?
+            .map(|c| c.owner_id().to_string()),
+    })
 }
 
 /// A library item's name, text and scope ids; `None` when it is gone.
@@ -517,7 +604,7 @@ pub async fn add_scope_locked(
     state: &AppState,
     document_id: &str,
     scope_id: &str,
-) -> anyhow::Result<Option<Event>> {
+) -> anyhow::Result<Option<Emitted>> {
     rescope_locked(state, document_id, scope_id, true).await
 }
 
@@ -526,7 +613,7 @@ pub async fn remove_scope_locked(
     state: &AppState,
     document_id: &str,
     scope_id: &str,
-) -> anyhow::Result<Option<Event>> {
+) -> anyhow::Result<Option<Emitted>> {
     rescope_locked(state, document_id, scope_id, false).await
 }
 
@@ -535,7 +622,7 @@ async fn rescope_locked(
     document_id: &str,
     scope_id: &str,
     add: bool,
-) -> anyhow::Result<Option<Event>> {
+) -> anyhow::Result<Option<Emitted>> {
     let Some(mut doc) = document(state, document_id).await? else {
         return Ok(None);
     };
@@ -551,7 +638,10 @@ async fn rescope_locked(
     doc.updated_at = Utc::now();
     state.store.put(db::DOCUMENT, document_id, &doc).await?;
     state.retrieval_cache.invalidate(document_id);
-    Ok(Some(Event::DocumentChanged { document: doc }))
+    Ok(Some(Emitted {
+        audience: document_audience(&doc),
+        event: Event::DocumentChanged { document: doc },
+    }))
 }
 
 /// Every document whose generation passed `since`, and those deleted since then.
@@ -1384,7 +1474,7 @@ async fn set_status(
         return Ok(false);
     };
     if !matches!(doc.status, DocumentStatus::Indexing { .. }) {
-        state.emit(Event::DocumentChanged { document: doc });
+        emit_document(state, doc);
     }
     Ok(true)
 }
@@ -1719,7 +1809,7 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         state.emit_source(s);
         refresh_folder(state, s).await;
     }
-    state.emit(Event::DocumentChanged { document: doc });
+    emit_document(state, doc);
     tracing::info!(
         "document {id} is indexed: {} new, {} kept, {} gone",
         report.chunks_new,

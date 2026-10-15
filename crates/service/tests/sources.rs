@@ -1268,14 +1268,14 @@ async fn deleting_and_attaching_sources_follow_through_to_documents() {
     let topic = new_topic(&h, &t, None, "Signals").await;
     let events = {
         let _w = h.state.write_lock.lock().await;
-        margin_service::sources::attach_locked(&h.state, std::slice::from_ref(&s.id), &topic.id)
+        margin_service::sources::attach_locked(&h.state, std::slice::from_ref(&s.id), &topic)
             .await
             .unwrap()
     };
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::DocumentChanged { document } if document.id == s.id))
+        events.iter().any(
+            |e| matches!(&e.event, Event::DocumentChanged { document } if document.id == s.id)
+        )
     );
     assert!(
         chunks(&h, &s.id)
