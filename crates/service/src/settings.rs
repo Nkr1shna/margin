@@ -2,15 +2,16 @@
 
 use axum::Json;
 use axum::extract::State;
-use margin_shared::{Event, Settings, SettingsPatch, ToolStatus};
+use margin_shared::pipeline::Route;
+use margin_shared::{Event, Provider, RouteModels, Settings, SettingsPatch, ToolStatus};
 
 use axum::http::StatusCode;
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::pipeline::Pipeline;
-use crate::secrets::OPENAI_API_KEY;
-use crate::state::{AppState, SETTINGS_ID};
+use crate::secrets::{ANTHROPIC_API_KEY, OPENAI_API_KEY};
+use crate::state::{App, AppState, SETTINGS_ID};
 
 pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<Settings>> {
     Ok(Json(state.settings().await?))
@@ -43,14 +44,29 @@ pub async fn patch_settings(
             }
             row.openai_base_url = url.to_string();
         }
+        // The legacy OpenAI fields first, then the slots (which win when both come).
         if let Some(model) = &patch.openai_model {
-            row.openai_model = model.trim().to_string();
+            row.set_openai_model(model.trim());
         }
         if let Some(model) = &patch.agent_model {
-            row.agent_model = model
-                .as_ref()
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty());
+            row.set_agent_model(
+                model
+                    .as_ref()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty()),
+            );
+        }
+        for (provider, slots) in [
+            (Provider::OpenAi, &patch.openai_models),
+            (Provider::ChatGpt, &patch.chatgpt_models),
+            (Provider::Claude, &patch.claude_models),
+        ] {
+            if let Some(slots) = slots {
+                row.set_slots(provider, checked_slots(provider, slots)?);
+            }
+        }
+        if let Some(provider) = patch.default_provider {
+            row.default_provider = provider;
         }
         if let Some(effort) = patch.reasoning_effort {
             row.reasoning_effort = effort;
@@ -110,16 +126,52 @@ pub async fn patch_settings(
             Some(key) => state.secret_set(OPENAI_API_KEY, key.to_string()).await?,
             None => {}
         }
+        match patch.anthropic_api_key.as_deref().map(str::trim) {
+            Some("") => state.secret_delete(ANTHROPIC_API_KEY).await?,
+            Some(key) => state.secret_set(ANTHROPIC_API_KEY, key.to_string()).await?,
+            None => {}
+        }
         state.store.put(db::SETTINGS, SETTINGS_ID, &row).await?;
         if let Some(pipeline) = rebuilt {
             state.pipeline.store(std::sync::Arc::new(pipeline));
         }
     }
+    // A key, a base URL or a slot may have changed: the model lists are fetched again.
+    state.providers.forget_models();
     let settings = state.settings().await?;
     state.emit(Event::SettingsChanged {
         settings: settings.clone(),
     });
     Ok(Json(settings))
+}
+
+/// Sends `SettingsChanged` with the settings as they are now (a ChatGPT sign-in or
+/// sign-out, a refresh that signed out). Logged when they can't be read.
+pub async fn emit_settings(state: &App) {
+    match state.settings().await {
+        Ok(settings) => state.emit(Event::SettingsChanged { settings }),
+        Err(e) => tracing::error!("couldn't read the settings to announce them: {e:#}"),
+    }
+}
+
+/// Slots from a patch: trimmed, none empty.
+fn checked_slots(provider: Provider, slots: &RouteModels) -> AppResult<RouteModels> {
+    let mut out = RouteModels::default();
+    for route in Route::ALL {
+        let id = slots.get(route).trim();
+        if id.is_empty() {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "no_model",
+                format!(
+                    "Every {} slot needs a model: chats, writing and small tasks.",
+                    provider.label()
+                ),
+            ));
+        }
+        out.set(route, id);
+    }
+    Ok(out)
 }
 
 pub async fn tools(State(state): State<AppState>) -> Json<Vec<ToolStatus>> {

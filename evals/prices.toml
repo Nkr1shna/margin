@@ -3,10 +3,13 @@
 #
 # Claude rows: Anthropic first-party API prices for the current models (input, output and
 # cache reads as published; cache writes at the standard 5-minute rate, 1.25 x input).
-# Claude Haiku 5.5's published price covers prompts up to 100K tokens ($0.50 / $2.50
-# beyond); its cache-read rate is taken as 0.1 x input. OpenAI rows are added when their
-# prices are checked; a model missing here records cost_usd as none, never a guess.
-checked = "2026-10-06"
+# Claude Haiku 5.5's published price covers prompts up to 100K tokens; beyond that its
+# `long_context` tier applies ($0.50 / $2.50). Its cache-read rate is taken as 0.1 x
+# input. `web_search` is USD per 1 000 hosted web searches (Claude and OpenAI: $10).
+# OpenAI rows: standard tier as published on the pricing page (no explicit cache writes).
+# ChatGPT calls are plan-billed and never priced (cost_usd none, by rule). A model missing
+# here records cost_usd as none, never a guess.
+checked = "2026-10-14"
 
 [models.claude-opus-5-5]
 provider = "anthropic"
@@ -14,6 +17,7 @@ input = 4.00
 cached_input = 0.20
 cache_write = 5.00
 output = 20.00
+web_search = 10.0
 
 [models.claude-sonnet-5-5]
 provider = "anthropic"
@@ -21,6 +25,7 @@ input = 2.00
 cached_input = 0.20
 cache_write = 2.50
 output = 10.00
+web_search = 10.0
 
 [models.claude-haiku-5-5]
 provider = "anthropic"
@@ -28,3 +33,30 @@ input = 0.10
 cached_input = 0.01
 cache_write = 0.125
 output = 0.50
+web_search = 10.0
+
+[models.claude-haiku-5-5.long_context]
+over = 100000
+input = 0.50
+output = 2.50
+
+[models.gpt-6-astra]
+provider = "openai"
+input = 10.00
+cached_input = 1.00
+output = 50.00
+web_search = 10.0
+
+[models."gpt-6.1-sol"]
+provider = "openai"
+input = 2.00
+cached_input = 0.10
+output = 10.00
+web_search = 10.0
+
+[models.gpt-6-luna]
+provider = "openai"
+input = 0.10
+cached_input = 0.01
+output = 0.50
+web_search = 10.0

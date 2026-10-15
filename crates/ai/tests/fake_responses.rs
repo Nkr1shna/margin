@@ -17,8 +17,8 @@ use margin_ai::prompts::{LESSON_CONSTANT, SCENE_CONSTANT};
 use margin_ai::{
     AiError, Backoff, CallOptions, DocumentContents, FailedScene, Image, LessonContext, Passage,
     PlanRequest, Ranked, ReasoningConfig, ReasoningSummary, RerankCandidate, ResponseRequest,
-    ResponseStream, ResponsesClient, SceneRequest, StreamEvent, ToolChoice, plan_course, rerank,
-    write_lesson, write_lesson_with, write_scene, write_scene_with,
+    ResponseStream, ResponsesClient, ResponsesToolChoice, SceneRequest, StreamEvent, plan_course,
+    rerank, write_lesson, write_lesson_with, write_scene, write_scene_with,
 };
 use margin_shared::pipeline::Route;
 use margin_shared::{Level, OutlineLesson, ReasoningEffort, Usage};
@@ -94,18 +94,42 @@ async fn responses(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: Byte
     }
 }
 
-async fn spawn(replies: Vec<Reply>) -> (ResponsesClient, Arc<Fake>) {
+/// `GET /v1/models`: recorded as `(auth, "GET /models")`, answered with the next reply.
+async fn models(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    fake.requests
+        .lock()
+        .unwrap()
+        .push((auth, json!("GET /models")));
+    let reply = fake.replies.lock().unwrap().pop_front();
+    match reply.expect("a reply was queued for this request") {
+        Reply::Json(status, v) => (status, axum::Json(v)).into_response(),
+        _ => panic!("GET /models answers JSON"),
+    }
+}
+
+/// A fake server at `{base_url}` (".../v1/") answering `replies` in order.
+async fn serve(replies: Vec<Reply>) -> (String, Arc<Fake>) {
     let fake = Arc::new(Fake {
         replies: Mutex::new(replies.into()),
         ..Default::default()
     });
     let app = Router::new()
         .route("/v1/responses", post(responses))
+        .route("/v1/models", axum::routing::get(models))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = ResponsesClient::new(format!("http://{addr}/v1/"), "test-key", "test-model");
+    (format!("http://{addr}/v1/"), fake)
+}
+
+async fn spawn(replies: Vec<Reply>) -> (ResponsesClient, Arc<Fake>) {
+    let (base_url, fake) = serve(replies).await;
+    let client = ResponsesClient::new(base_url, "test-key", "test-model");
     (client, fake)
 }
 
@@ -726,6 +750,7 @@ async fn call_options_set_the_cache_key_and_output_cap_and_usage_comes_back() {
             output_tokens: 300,
             reasoning_tokens: 0,
             model_calls: 1,
+            ..Default::default()
         }
     );
     let (_, body) = last_request(&fake);
@@ -1007,7 +1032,7 @@ fn agent_request() -> ResponseRequest {
                            "required": ["query"], "additionalProperties": false},
             "strict": true
         })],
-        tool_choice: Some(ToolChoice::Auto),
+        tool_choice: Some(ResponsesToolChoice::Auto),
         reasoning: Some(ReasoningConfig {
             effort: ReasoningEffort::Medium,
             summary: Some(ReasoningSummary::Auto),
@@ -1039,6 +1064,7 @@ fn usage_1200() -> Usage {
         output_tokens: 300,
         reasoning_tokens: 200,
         model_calls: 1,
+        ..Default::default()
     }
 }
 
@@ -1106,6 +1132,8 @@ async fn stream_response_yields_a_text_answer_split_anywhere() {
     expected.push(Ok(StreamEvent::Completed {
         response_id: "resp_1".into(),
         usage: usage_1200(),
+        model: String::new(),
+        status: "completed".into(),
     }));
     for size in [3, 13, 4096] {
         let (client, fake) = spawn(vec![chunked(&body, size)]).await;
@@ -1191,6 +1219,8 @@ async fn stream_response_yields_parallel_function_calls() {
     expected.push(Ok(StreamEvent::Completed {
         response_id: "resp_tools".into(),
         usage: usage_1200(),
+        model: String::new(),
+        status: "completed".into(),
     }));
     let (client, _) = spawn(vec![chunked(&body, 7)]).await;
     let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
@@ -1252,7 +1282,9 @@ async fn stream_response_yields_reasoning_summaries_and_keeps_encrypted_content(
             }),
             Ok(StreamEvent::Completed {
                 response_id: "resp_1".into(),
-                usage: usage_1200()
+                usage: usage_1200(),
+                model: String::new(),
+                status: "completed".into(),
             }),
         ]
     );
@@ -1486,7 +1518,9 @@ async fn stream_response_ignores_done_markers_and_unknown_events() {
             Ok(text_delta_event("x")),
             Ok(StreamEvent::Completed {
                 response_id: "resp_1".into(),
-                usage: usage_1200()
+                usage: usage_1200(),
+                model: String::new(),
+                status: "completed".into(),
             })
         ]
     );
@@ -1530,7 +1564,7 @@ async fn stream_response_http_errors_carry_retry_after() {
     assert!(err.is_retryable());
     let err = client.stream_response(&req).await.err().unwrap();
     assert!(
-        matches!(&err, AiError::Http { status: 400, message, retry_after: None } if message.contains("context_management"))
+        matches!(&err, AiError::Http { status: 400, message, retry_after: None, .. } if message.contains("context_management"))
     );
     assert!(!err.is_retryable());
 }
@@ -1639,4 +1673,549 @@ async fn stream_response_unreachable_server_is_a_network_error() {
         .unwrap();
     assert!(matches!(err, AiError::Network(_)));
     assert!(err.is_retryable());
+}
+
+// ---------------------------------------------------------------------------
+// The provider seam: OpenAI (API key) and ChatGPT (plan bearer token)
+// ---------------------------------------------------------------------------
+
+use margin_ai::{
+    Credential, InputPart, ItemView, ModelEvent, ModelRequest, ModelStream, Next, Provider,
+    ProviderConfig, ProviderKind, RouteModels, StartKind, TextModel, ToolDef, WebTools,
+};
+
+fn config(base_url: &str, provider: ProviderKind, credential: Credential) -> ProviderConfig {
+    ProviderConfig {
+        provider,
+        base_url: base_url.to_string(),
+        credential,
+        models: RouteModels {
+            chat: "chat-model".into(),
+            write: "write-model".into(),
+            small: "small-model".into(),
+        },
+    }
+}
+
+fn openai(base_url: &str) -> ResponsesClient {
+    ResponsesClient::from_config(&config(
+        base_url,
+        ProviderKind::OpenAi,
+        Credential::ApiKey("sk-test".into()),
+    ))
+}
+
+fn chatgpt(base_url: &str) -> ResponsesClient {
+    ResponsesClient::from_config(&config(
+        base_url,
+        ProviderKind::ChatGpt,
+        Credential::Bearer("plan-token".into()),
+    ))
+}
+
+/// An agent step with one function tool, web search on, an output cap, parallel calls.
+fn step(route: Route, history: Vec<Value>) -> ModelRequest {
+    ModelRequest {
+        opts: CallOptions::new(route)
+            .with_cache_key("chat-7")
+            .with_max_output_tokens(4000),
+        system: "You are Margin.".into(),
+        history,
+        tools: vec![ToolDef {
+            name: "search".into(),
+            description: "Search the library.".into(),
+            parameters: json!({"type": "object", "properties": {"q": {"type": "string"}},
+                "required": ["q"], "additionalProperties": false}),
+        }],
+        tool_choice: margin_ai::ToolChoice::Auto,
+        web: WebTools {
+            search: true,
+            fetch: false,
+        },
+        effort: ReasoningEffort::Medium,
+        compaction: Some(200_000),
+        parallel_tool_calls: true,
+    }
+}
+
+async fn drain_model(stream: ModelStream) -> Vec<Result<ModelEvent, String>> {
+    stream
+        .map(|r| r.map_err(|e| format!("{e:?}")))
+        .collect()
+        .await
+}
+
+async fn run_step(client: &ResponsesClient, req: ModelRequest) -> Vec<Result<ModelEvent, String>> {
+    drain_model(Provider::stream(client, req).await.unwrap()).await
+}
+
+async fn text_call(client: &ResponsesClient, opts: &CallOptions) -> Result<String, AiError> {
+    let input = [InputPart::Text("Name this chat.".into())];
+    client
+        .stream_parts("Be brief.", &input, opts, Box::new(|_| {}))
+        .await
+        .map(|out| out.text)
+}
+
+const BEARER_FORBIDDEN: [&str; 5] = [
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "user",
+    "previous_response_id",
+];
+
+#[tokio::test]
+async fn key_and_bearer_bodies_follow_their_rules() {
+    let (base_url, fake) = serve(vec![
+        whole(agent_text_body(&["a"])),
+        whole(agent_text_body(&["b"])),
+        whole(text_stream(&["c"])),
+        whole(text_stream(&["d"])),
+    ])
+    .await;
+    let key = openai(&base_url);
+    let plan = chatgpt(&base_url);
+    assert_eq!(Provider::kind(&plan), ProviderKind::ChatGpt);
+    assert_eq!(Provider::kind(&key), ProviderKind::OpenAi);
+    assert!(plan.is_bearer() && !key.is_bearer());
+    assert!(!format!("{plan:?}").contains("plan-token"));
+
+    run_step(&key, step(Route::Chat, vec![])).await;
+    run_step(&plan, step(Route::Chat, vec![])).await;
+    let opts = CallOptions::new(Route::Small)
+        .with_cache_key("title")
+        .with_max_output_tokens(40);
+    assert_eq!(text_call(&key, &opts).await.unwrap(), "c");
+    assert_eq!(text_call(&plan, &opts).await.unwrap(), "d");
+
+    let sent = all_requests(&fake);
+    let auth: Vec<Option<String>> = fake
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(a, _)| a.clone())
+        .collect();
+    assert_eq!(auth[0].as_deref(), Some("Bearer sk-test"));
+    assert_eq!(auth[1].as_deref(), Some("Bearer plan-token"));
+
+    // Both steps: the route's model, the cache key, store off, strict tools then the
+    // hosted web search, both includes, compaction.
+    for body in &sent[..2] {
+        assert_eq!(body["model"], "chat-model");
+        assert_eq!(body["prompt_cache_key"], "chat-7");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(
+            body["tools"][1],
+            json!({"type": "web_search", "search_context_size": "medium"})
+        );
+        assert_eq!(
+            body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["context_management"][0]["compact_threshold"], 200_000);
+    }
+    // The key keeps the cap and parallel calls; the plan token sends neither.
+    assert_eq!(sent[0]["max_output_tokens"], 4000);
+    assert_eq!(sent[0]["parallel_tool_calls"], true);
+    assert_eq!(sent[1]["parallel_tool_calls"], false);
+    for field in BEARER_FORBIDDEN {
+        assert!(sent[1].get(field).is_none(), "{field} sent on the bearer");
+        assert!(sent[3].get(field).is_none(), "{field} sent on the bearer");
+    }
+    // Text calls: the small route's model; the cap only with a key.
+    assert_eq!(sent[2]["model"], "small-model");
+    assert_eq!(sent[2]["max_output_tokens"], 40);
+    assert_eq!(sent[3]["model"], "small-model");
+    assert_eq!(sent[3]["prompt_cache_key"], "title");
+    assert!(sent[2].get("tools").is_none() && sent[2].get("include").is_none());
+}
+
+#[tokio::test]
+async fn the_model_follows_the_route() {
+    let (base_url, fake) = serve(vec![
+        whole(agent_text_body(&["a"])),
+        whole(text_stream(&["b"])),
+        whole(text_stream(&["c"])),
+    ])
+    .await;
+    let c = openai(&base_url);
+    let mut req = step(Route::Chat, vec![]);
+    req.web = WebTools::default();
+    run_step(&c, req).await;
+    for route in [Route::Write, Route::Small] {
+        text_call(&c, &CallOptions::new(route)).await.unwrap();
+    }
+    let sent = all_requests(&fake);
+    let models: Vec<&str> = sent.iter().map(|b| b["model"].as_str().unwrap()).collect();
+    assert_eq!(models, ["chat-model", "write-model", "small-model"]);
+    // Without web search: no hosted tool, only the reasoning include.
+    assert_eq!(sent[0]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(sent[0]["include"], json!(["reasoning.encrypted_content"]));
+    // A text call sends no cache key unless given.
+    assert!(sent[1].get("prompt_cache_key").is_none());
+}
+
+#[tokio::test]
+async fn allowed_tools_keep_web_search_and_none_stops_everything() {
+    let (base_url, fake) = serve(vec![
+        whole(agent_text_body(&["a"])),
+        whole(agent_text_body(&["b"])),
+    ])
+    .await;
+    let c = chatgpt(&base_url);
+    let mut req = step(Route::Chat, vec![]);
+    req.tool_choice = margin_ai::ToolChoice::Allowed(vec!["search".into()]);
+    run_step(&c, req.clone()).await;
+    req.tool_choice = margin_ai::ToolChoice::None;
+    run_step(&c, req).await;
+    let sent = all_requests(&fake);
+    assert_eq!(
+        sent[0]["tool_choice"],
+        json!({"type": "allowed_tools", "mode": "auto", "tools": [
+            {"type": "function", "name": "search"}, {"type": "web_search"}
+        ]})
+    );
+    assert_eq!(sent[1]["tool_choice"], "none");
+    // The tool list is the same on both steps (the cache prefix).
+    assert_eq!(sent[0]["tools"], sent[1]["tools"]);
+}
+
+fn web_search_item(status: &str) -> Value {
+    if status == "in_progress" {
+        return json!({"id": "ws_1", "type": "web_search_call", "status": "in_progress"});
+    }
+    json!({"id": "ws_1", "type": "web_search_call", "status": status,
+    "action": {"type": "search", "query": "rust 1.99 release date",
+        "sources": [
+            {"type": "url", "url": "https://blog.rust-lang.org/1.99"},
+            {"type": "url", "url": "https://releases.rs", "title": "Rust releases"}
+        ]}})
+}
+
+fn cited_message() -> Value {
+    json!({"id": "msg_2", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "output_text", "text": "Rust 1.99 shipped in May.",
+            "annotations": [{"type": "url_citation", "url": "https://blog.rust-lang.org/1.99",
+                "title": "Rust 1.99", "start_index": 0, "end_index": 9}]}]})
+}
+
+/// A searched answer: the `web_search_call` (added, the API's search progress events,
+/// done), then a message with a `url_citation`.
+fn web_search_body(completed_output: Value) -> String {
+    [
+        created(),
+        event(
+            json!({"type": "response.output_item.added", "output_index": 0, "item": web_search_item("in_progress")}),
+        ),
+        event(
+            json!({"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": "ws_1"}),
+        ),
+        event(
+            json!({"type": "response.web_search_call.searching", "output_index": 0, "item_id": "ws_1"}),
+        ),
+        event(
+            json!({"type": "response.web_search_call.completed", "output_index": 0, "item_id": "ws_1"}),
+        ),
+        event(
+            json!({"type": "response.output_item.done", "output_index": 0, "item": web_search_item("completed")}),
+        ),
+        event(
+            json!({"type": "response.output_item.added", "output_index": 1, "item": message_item("in_progress", "")}),
+        ),
+        event(
+            json!({"type": "response.output_text.delta", "item_id": "msg_2", "output_index": 1, "content_index": 0, "delta": "Rust 1.99 shipped in May."}),
+        ),
+        event(
+            json!({"type": "response.output_item.done", "output_index": 1, "item": cited_message()}),
+        ),
+        event(json!({"type": "response.completed", "response": {
+            "id": "resp_9", "status": "completed", "model": "gpt-6.1-sol-2026-09-30",
+            "output": completed_output,
+            "usage": {"input_tokens": 900, "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 40, "output_tokens_details": {"reasoning_tokens": 0}}
+        }})),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_web_search_becomes_a_call_its_results_and_a_cited_answer() {
+    let full_output = json!([web_search_item("completed"), cited_message()]);
+    let (base_url, fake) = serve(vec![
+        whole(web_search_body(full_output)),
+        // A final response object that lists no output: the count comes from the items.
+        whole(web_search_body(json!([]))),
+        whole(agent_text_body(&["ok"])),
+    ])
+    .await;
+    let c = chatgpt(&base_url);
+    for _ in 0..2 {
+        let events = run_step(&c, step(Route::Chat, vec![]))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            events[0],
+            ModelEvent::Started {
+                index: 0,
+                kind: StartKind::WebSearch { id: "ws_1".into() }
+            }
+        );
+        // The call, carrying the item verbatim, then its results (nothing stored twice).
+        let ModelEvent::Done { index: 0, item } = &events[1] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(item.stored, vec![web_search_item("completed")]);
+        assert_eq!(
+            item.view,
+            ItemView::WebSearch {
+                id: "ws_1".into(),
+                query: "rust 1.99 release date".into()
+            }
+        );
+        let ModelEvent::Done { index: 0, item } = &events[2] else {
+            panic!("{events:?}");
+        };
+        assert!(item.stored.is_empty());
+        let ItemView::WebSearchResult { id, results, error } = &item.view else {
+            panic!("{item:?}");
+        };
+        assert_eq!(id, "ws_1");
+        assert_eq!(*error, None);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://blog.rust-lang.org/1.99");
+        assert_eq!(results[0].title, None);
+        assert_eq!(results[1].title.as_deref(), Some("Rust releases"));
+
+        assert_eq!(
+            events[3],
+            ModelEvent::Started {
+                index: 1,
+                kind: StartKind::Text
+            }
+        );
+        let ModelEvent::Done { index: 1, item } = &events[5] else {
+            panic!("{events:?}");
+        };
+        let ItemView::Text { text, citations } = &item.view else {
+            panic!("{item:?}");
+        };
+        assert_eq!(text, "Rust 1.99 shipped in May.");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url, "https://blog.rust-lang.org/1.99");
+        assert_eq!(citations[0].title.as_deref(), Some("Rust 1.99"));
+        assert_eq!((citations[0].start, citations[0].end), (Some(0), Some(9)));
+        assert_eq!(citations[0].cited_text, None);
+        let ModelEvent::Completed {
+            usage,
+            model,
+            stop_reason,
+            next,
+        } = events.last().unwrap()
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(model, "gpt-6.1-sol-2026-09-30");
+        assert_eq!(stop_reason, "completed");
+        assert_eq!(*next, Next::Finished);
+        assert_eq!(usage.web_search_requests, 1);
+        assert_eq!((usage.input_tokens, usage.model_calls), (900, 1));
+    }
+
+    // Replayed: the stored search call goes back verbatim as input.
+    let history = vec![
+        json!({"role": "user", "content": [{"type": "input_text", "text": "When?"}]}),
+        web_search_item("completed"),
+        cited_message(),
+    ];
+    run_step(&c, step(Route::Chat, history.clone())).await;
+    let sent = all_requests(&fake);
+    let input = sent[2]["input"].as_array().unwrap();
+    assert_eq!(input[0]["role"], "developer");
+    assert_eq!(&input[1..], &history[..]);
+}
+
+#[tokio::test]
+async fn a_failed_search_is_its_results_error() {
+    let failed = json!({"id": "ws_2", "type": "web_search_call", "status": "failed",
+        "action": {"type": "search", "queries": ["a", "b"]}});
+    let body = [
+        created(),
+        event(json!({"type": "response.output_item.done", "output_index": 0, "item": failed})),
+        completed_with_usage("r"),
+    ]
+    .concat();
+    let (base_url, _) = serve(vec![whole(body)]).await;
+    let events = run_step(&openai(&base_url), step(Route::Chat, vec![])).await;
+    assert!(matches!(&events[0], Ok(ModelEvent::Done { item, .. })
+        if item.view == ItemView::WebSearch { id: "ws_2".into(), query: "a; b".into() }));
+    assert!(matches!(&events[1], Ok(ModelEvent::Done { item, .. })
+    if item.view == ItemView::WebSearchResult {
+        id: "ws_2".into(), results: vec![], error: Some("failed".into())
+    }));
+}
+
+fn plan_limit_failed() -> String {
+    [
+        created(),
+        event(json!({"type": "response.failed", "response": {
+            "id": "resp_1", "status": "failed", "output": [],
+            "error": {"code": "subscription_sharing_usage_limit_exceeded",
+                "message": "You have reached the usage limit for this app."}
+        }})),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn chatgpt_plan_limits_carry_their_codes() {
+    let limit = json!({"error": {"message": "Usage limit reached.", "type": "usage_limit",
+        "code": "subscription_sharing_usage_limit_exceeded"}});
+    let (base_url, _) = serve(vec![
+        // An agent step that fails mid-stream.
+        whole(plan_limit_failed()),
+        // A text call that fails mid-stream.
+        whole(plan_limit_failed()),
+        // Before any stream: 429, then 403.
+        Reply::Json(StatusCode::TOO_MANY_REQUESTS, limit),
+        Reply::Json(
+            StatusCode::FORBIDDEN,
+            json!({"error": {"message": "Not eligible.", "code": "subscription_sharing_user_not_eligible"}}),
+        ),
+        // An `error` event naming an invalid user.
+        whole(
+            [
+                created(),
+                event(
+                    json!({"type": "error", "code": "subscription_sharing_invalid_user", "message": "Sign in again."}),
+                ),
+            ]
+            .concat(),
+        ),
+        // Any other failure.
+        whole(
+            [
+                created(),
+                event(json!({"type": "response.failed", "response": {"id": "r", "status": "failed",
+                    "error": {"code": "server_error", "message": "Oops."}}})),
+            ]
+            .concat(),
+        ),
+    ])
+    .await;
+    let c = chatgpt(&base_url);
+    let small = CallOptions::new(Route::Small);
+
+    let events = run_step(&c, step(Route::Chat, vec![])).await;
+    assert_eq!(
+        events,
+        vec![Ok(ModelEvent::Failed {
+            code: Some("subscription_sharing_usage_limit_exceeded".into()),
+            message: "You have reached the usage limit for this app.".into(),
+        })]
+    );
+
+    let err = text_call(&c, &small).await.unwrap_err();
+    assert!(matches!(&err, AiError::Http { status: 429, .. }), "{err:?}");
+    assert_eq!(
+        err.code(),
+        Some("subscription_sharing_usage_limit_exceeded")
+    );
+    assert!(!err.is_retryable());
+
+    let err = match Provider::stream(&c, step(Route::Chat, vec![])).await {
+        Err(e) => e,
+        Ok(_) => panic!("a 429 starts no stream"),
+    };
+    assert!(
+        matches!(&err, AiError::Http { status: 429, message, .. } if message == "Usage limit reached.")
+    );
+    assert_eq!(
+        err.code(),
+        Some("subscription_sharing_usage_limit_exceeded")
+    );
+    assert!(!err.is_retryable());
+
+    let err = text_call(&c, &small).await.unwrap_err();
+    assert!(matches!(&err, AiError::Http { status: 403, .. }));
+    assert_eq!(err.code(), Some("subscription_sharing_user_not_eligible"));
+    assert!(!err.is_retryable());
+
+    let err = text_call(&c, &small).await.unwrap_err();
+    assert!(matches!(&err, AiError::Http { status: 401, .. }), "{err:?}");
+    assert_eq!(err.code(), Some("subscription_sharing_invalid_user"));
+
+    let err = text_call(&c, &small).await.unwrap_err();
+    assert!(
+        matches!(&err, AiError::Incomplete(m) if m.contains("Oops.")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_models_for_a_key_and_for_a_plan_token() {
+    let (base_url, fake) = serve(vec![
+        Reply::Json(
+            StatusCode::OK,
+            json!({"object": "list", "data": [
+                {"id": "gpt-6.1-sol", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-6-luna", "object": "model", "owned_by": "openai"},
+                {"id": "my-fine-tune", "object": "model", "owned_by": "me"},
+                {"id": "gpt-6-luna", "object": "model", "owned_by": "openai"}
+            ]}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [
+                {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"},
+                {"slug": "gpt-6-internal", "display_name": "Hidden", "visibility": "hide"},
+                {"slug": "gpt-5.6-terra", "display_name": "GPT-5.6 Terra", "visibility": "list"}
+            ]}),
+        ),
+        Reply::Json(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": {"message": "Bad key.", "code": "invalid_api_key"}}),
+        ),
+    ])
+    .await;
+
+    let models = Provider::list_models(&openai(&base_url)).await.unwrap();
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gpt-6.1-sol", "gpt-6-luna", "my-fine-tune"]);
+    assert_eq!(models[0].context_window, Some(1_050_000));
+    assert_eq!(models[0].max_output_tokens, Some(128_000));
+    assert_eq!(models[0].display_name, None);
+    assert_eq!(models[2].context_window, None);
+    assert_eq!(models[2].max_output_tokens, None);
+
+    let models = Provider::list_models(&chatgpt(&base_url)).await.unwrap();
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gpt-6.1-sol", "gpt-5.6-terra"]);
+    assert_eq!(models[0].display_name.as_deref(), Some("GPT-6.1 Sol"));
+    assert_eq!(models[0].context_window, Some(1_050_000));
+    assert_eq!(models[1].context_window, None);
+
+    let err = Provider::list_models(&openai(&base_url)).await.unwrap_err();
+    assert!(matches!(&err, AiError::Http { status: 401, .. }));
+    assert_eq!(err.code(), Some("invalid_api_key"));
+
+    let requests = fake.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests[0],
+        (Some("Bearer sk-test".into()), json!("GET /models"))
+    );
+    assert_eq!(
+        requests[1],
+        (Some("Bearer plan-token".into()), json!("GET /models"))
+    );
 }

@@ -9,10 +9,12 @@ use std::sync::Arc;
 use common::*;
 use margin_agent::scripted::text_reply;
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
-use margin_ai::ResponseRequest;
+use margin_ai::{CallOptions, ModelRequest, RouteModels, ToolChoice, ToolDef, WebTools};
 use margin_service::settings::PipelineVariants;
 use margin_service::turns::{SmallRoute, TracedModel, TurnTrace};
+use margin_shared::ReasoningEffort;
 use margin_shared::pipeline::PipelineConfig;
+use margin_shared::pipeline::Route;
 use margin_shared::{ChatDetail, ChatState};
 use serde_json::json;
 
@@ -60,8 +62,9 @@ async fn turns_use_the_chat_route_and_titles_the_small_one() {
     .await;
     let turn = h.generator.agent.requests();
     assert_eq!(turn[0].model.as_deref(), Some("chat-model"));
-    let title = h.generator.titles.requests();
-    assert_eq!(title[0].model.as_deref(), Some("small-model"));
+    // The title is a plain text call on the small route.
+    let title = h.generator.text_calls.lock().unwrap().clone();
+    assert_eq!(title[0].model, "small-model");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -81,23 +84,39 @@ async fn condense_calls_go_to_the_small_route() {
         None,
     )
     .with_small(SmallRoute {
-        client: small.clone(),
+        client: small.on_models(RouteModels {
+            chat: "chat-model".into(),
+            write: "write-model".into(),
+            small: "small-model".into(),
+        }),
         model: "small-model".into(),
         provider: "openai",
     });
+    let request = |tools: Vec<ToolDef>, route| ModelRequest {
+        opts: CallOptions::new(route).with_cache_key("c"),
+        system: "condense".into(),
+        history: vec![json!({"role": "user", "content": "hi"})],
+        tools,
+        tool_choice: ToolChoice::Auto,
+        web: WebTools::default(),
+        effort: ReasoningEffort::Low,
+        compaction: None,
+        parallel_tool_calls: true,
+    };
     // A step (with tools) stays on the chat model…
-    let step = ResponseRequest {
-        tools: vec![json!({"type": "function", "name": "search"})],
-        ..Default::default()
+    let search = ToolDef {
+        name: "search".into(),
+        description: "Search.".into(),
+        parameters: json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
     };
-    drop(model.stream(step).await.unwrap());
-    // …a condense call (no tools) goes to the small one, naming its model.
-    let condense = ResponseRequest {
-        model: Some("chat-model".into()),
-        input: vec![json!({"role": "developer", "content": "condense"})],
-        ..Default::default()
-    };
-    drop(model.stream(condense).await.unwrap());
+    drop(
+        model
+            .stream(request(vec![search], Route::Chat))
+            .await
+            .unwrap(),
+    );
+    // …a condense call (no tools) goes to the small one, on its small slot.
+    drop(model.stream(request(vec![], Route::Small)).await.unwrap());
     assert_eq!(chat.requests().len(), 1);
     let sent = small.requests();
     assert_eq!(sent.len(), 1);

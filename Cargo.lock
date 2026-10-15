@@ -5528,6 +5528,7 @@ dependencies = [
  "globset",
  "hex",
  "hmac 0.13.0",
+ "jsonwebtoken",
  "keyring",
  "libc",
  "margin-agent",

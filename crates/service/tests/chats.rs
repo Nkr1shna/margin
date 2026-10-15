@@ -32,9 +32,9 @@ use margin_shared::{
     ApiError, Card, Chat, ChatDetail, ChatItem, ChatItemKind, ChatState, Citation,
     ConfirmationCard, Decision, Device, DeviceFrame, DeviceRef, DeviceToolCall, DeviceToolOutput,
     DeviceToolResult, DirectedFrame, Event, ItemStatus, Lesson, LessonStatus, Level, Me,
-    MessageSent, Note, PendingMessage, ReasoningEffort, ResultCard, ResultTarget, Settings, Source,
-    SourceKind, SourceStatus, TitleSource, ToolOutputText, Topic, Usage, Waiting, Workspace,
-    error_code,
+    MessageSent, Note, PendingMessage, Provider, ReasoningEffort, ResultCard, ResultTarget,
+    Settings, Source, SourceKind, SourceStatus, TitleSource, ToolOutputText, Topic, Usage, Waiting,
+    Workspace, error_code,
 };
 use serde_json::{Value, json};
 
@@ -130,7 +130,7 @@ fn line(item: &ChatItem) -> String {
     };
     let what = match &item.kind {
         ChatItemKind::UserMessage { text, .. } => format!("user: {text}"),
-        ChatItemKind::AssistantText { text } => format!("assistant: {text}"),
+        ChatItemKind::AssistantText { text, .. } => format!("assistant: {text}"),
         ChatItemKind::Reasoning { summary } => format!("reasoning: {summary}"),
         ChatItemKind::ToolCall { name, .. } => format!("call {name}"),
         ChatItemKind::ToolResult { ok, summary, .. } => {
@@ -141,6 +141,7 @@ fn line(item: &ChatItem) -> String {
             Card::Result(_) => "card result".into(),
             Card::Passages(p) => format!("card passages: {}", p.passages.len()),
             Card::Confirmation(c) => format!("card confirm: {:?}", c.decision),
+            Card::WebResults(w) => format!("card web results: {}", w.query),
         },
         ChatItemKind::Action { text } => format!("action: {text}"),
         ChatItemKind::Error {
@@ -339,7 +340,11 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     assert_eq!(reqs.len(), 1);
     let req = &reqs[0];
     assert_eq!(req.prompt_cache_key.as_deref(), Some(chat_id.as_str()));
-    assert_eq!(req.model, None, "no agent model: the client's model");
+    assert_eq!(
+        req.model.as_deref(),
+        Some("test-model"),
+        "no agent model: the main model's slot"
+    );
     assert_eq!(
         req.input[0]["role"], "developer",
         "the system prompt comes first"
@@ -348,10 +353,11 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
         &req.input,
         "Teach me Fourier series\nwith examples"
     ));
+    // Function tools by name; the hosted web search has only its type.
     let names: Vec<&str> = req
         .tools
         .iter()
-        .map(|t| t["name"].as_str().unwrap())
+        .map(|t| t["name"].as_str().or(t["type"].as_str()).unwrap())
         .collect();
     for name in [
         "search_library",
@@ -368,7 +374,16 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     ] {
         assert!(names.contains(&name), "{name} missing from {names:?}");
     }
-    assert!(req.tools.iter().all(|t| t["strict"] == true));
+    assert!(
+        names.contains(&"web_search"),
+        "the hosted web search is offered"
+    );
+    assert!(
+        req.tools
+            .iter()
+            .filter(|t| t["type"] == "function")
+            .all(|t| t["strict"] == true)
+    );
 
     let chats: Vec<Chat> = h
         .get(&t, "/api/chats")
@@ -449,7 +464,10 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         .push(Scripted::Events(text_reply(&["ok"])));
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 4).await;
-    assert_eq!(h.generator.agent.requests()[1].model, None);
+    assert_eq!(
+        h.generator.agent.requests()[1].model.as_deref(),
+        Some("test-model")
+    );
 
     // An agent model alone is enough for chats.
     let r = h
@@ -1052,6 +1070,7 @@ async fn a_failed_turn_can_be_continued() {
         status: 400,
         message: "bad request".into(),
         retry_after: None,
+        code: None,
     }));
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     let d = wait_chat(&h, &t, &chat.id, |d| {
@@ -1190,6 +1209,7 @@ async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSi
         chat_id: chat_id.into(),
         turn_id,
         slot: Arc::new(std::sync::Mutex::new(permit)),
+        model: None,
     })
 }
 
@@ -1468,6 +1488,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         waiting: None,
         created_at: now,
         updated_at: now,
+        provider: Default::default(),
     };
     store.put(db::CHAT, "c1", &chat).await.unwrap();
     let user_input =
@@ -1496,6 +1517,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
             ItemStatus::InProgress,
             ChatItemKind::AssistantText {
                 text: "Half".into(),
+                citations: vec![],
             },
         ),
         vec![],
@@ -2168,6 +2190,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         chat_id: chat.id.clone(),
         turn_id: "turn-1".into(),
         slot: Default::default(),
+        model: None,
     };
     let mut sock = h.socket(&t).await;
     let item = sink
@@ -2175,6 +2198,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
             ItemStatus::InProgress,
             ChatItemKind::AssistantText {
                 text: String::new(),
+                citations: vec![],
             },
             ItemRecord::default(),
         )
@@ -2200,6 +2224,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     done.status = ItemStatus::Done;
     done.kind = ChatItemKind::AssistantText {
         text: "Über".into(),
+        citations: vec![],
     };
     sink.update_item(
         &done,
@@ -2227,6 +2252,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         output_tokens: 3,
         reasoning_tokens: 1,
         model_calls: 1,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -2645,18 +2671,24 @@ async fn the_model_titles_a_chat_after_its_first_answer() {
     assert_eq!(d.chat.usage.model_calls, 2, "the title call counts");
     assert_eq!(d.items.len(), 2, "not an item");
 
-    let reqs = h.generator.titles.requests();
-    assert_eq!(reqs.len(), 1);
-    let req = &reqs[0];
-    assert!(req.tools.is_empty());
-    assert_eq!(req.max_output_tokens, Some(TITLE_MAX_OUTPUT_TOKENS));
+    // A plain text call on the default provider's small slot.
+    let calls = h.generator.text_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.opts.route, Route::Small);
+    assert_eq!(call.opts.max_output_tokens, Some(TITLE_MAX_OUTPUT_TOKENS));
+    assert_eq!(call.opts.cache_key.as_deref(), Some(d.chat.id.as_str()));
     assert_eq!(
-        req.reasoning.as_ref().map(|r| r.effort),
-        Some(ReasoningEffort::Low)
+        (call.provider, call.model.as_str()),
+        (Provider::OpenAi, "test-model")
     );
-    let input = serde_json::to_string(&req.input).unwrap();
-    assert!(input.contains("Teach me Fourier series"), "{input}");
-    assert!(input.contains("sums of waves"), "{input}");
+    assert!(call.instructions.starts_with("Write a title for this chat"));
+    assert!(
+        call.input.contains("Teach me Fourier series"),
+        "{}",
+        call.input
+    );
+    assert!(call.input.contains("sums of waves"), "{}", call.input);
     assert_eq!(
         h.generator.agent.requests().len(),
         1,
@@ -2670,7 +2702,7 @@ async fn the_model_titles_a_chat_after_its_first_answer() {
     assert_eq!(send(&h, &t, &d.chat.id, "more").await.status(), 200);
     wait_chat(&h, &t, &d.chat.id, |d| idle(d) && d.items.len() == 4).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h.generator.titles.requests().len(), 1);
+    assert_eq!(h.generator.text_calls.lock().unwrap().len(), 1);
 
     // The owner's name sticks.
     let renamed: Chat = h
@@ -2697,7 +2729,8 @@ async fn a_title_that_fails_or_comes_after_a_rename_changes_nothing() {
         .push(Scripted::Events(text_reply(&["Hi!"])));
     let a = ask(&h, &t, "Hello there").await.chat;
     wait_chat(&h, &t, &a.id, idle).await;
-    eventually(|| async { (h.generator.titles.requests().len() == 1).then_some(()) }).await;
+    eventually(|| async { (h.generator.text_calls.lock().unwrap().len() == 1).then_some(()) })
+        .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let d = detail(&h, &t, &a.id).await;
     assert_eq!(
@@ -2837,10 +2870,9 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         steps.iter().map(|c| c.step).collect::<Vec<_>>(),
         [Some(1), Some(2)]
     );
-    assert!(steps.iter().all(
-        |c| c.prompt_version.as_deref().unwrap().starts_with("agent-")
-            && c.parent_id.as_deref() == Some(turn[0].id.as_str())
-    ));
+    assert!(steps.iter().all(|c| c.prompt_version.as_deref()
+        == Some(margin_agent::AGENT_PROMPT_VERSION)
+        && c.parent_id.as_deref() == Some(turn[0].id.as_str())));
     let title = calls
         .iter()
         .find(|c| c.route == Some(Route::Small))
@@ -2975,6 +3007,7 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         status: 400,
         message: "your prompt mentions the secret pelican".into(),
         retry_after: None,
+        code: None,
     }));
     let chat = ask(&h, &t, "Hello").await.chat;
     let d = wait_chat(&h, &t, &chat.id, |d| {
@@ -2998,7 +3031,16 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         .agent
         .push(Scripted::Hang(text_reply(&["Partial"])[..1].to_vec()));
     let chat = ask(&h, &t, "Again").await.chat;
-    wait_chat(&h, &t, &chat.id, running).await;
+    // Stop once the model streams (its answer item is open), not merely once the turn
+    // runs: a Stop before the call starts leaves no model_call row to check.
+    wait_chat(&h, &t, &chat.id, |d| {
+        running(d)
+            && d.items.iter().any(|i| {
+                i.status == ItemStatus::InProgress
+                    && matches!(i.kind, ChatItemKind::AssistantText { .. })
+            })
+    })
+    .await;
     let r = h
         .post(&t, &format!("/api/chats/{}/stop", chat.id))
         .send()

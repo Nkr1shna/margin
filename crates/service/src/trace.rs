@@ -84,6 +84,20 @@ pub struct ModelPrice {
     #[serde(default)]
     pub cache_write: f64,
     pub output: f64,
+    /// USD per 1 000 hosted web searches.
+    #[serde(default)]
+    pub web_search: f64,
+    /// A higher tier once a call's input passes `over` tokens (Claude Haiku 5.5).
+    #[serde(default)]
+    pub long_context: Option<LongContextPrice>,
+}
+
+/// The input and output prices of a call whose input passes `over` tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct LongContextPrice {
+    pub over: u64,
+    pub input: f64,
+    pub output: f64,
 }
 
 impl Prices {
@@ -156,7 +170,7 @@ impl Tracer {
         if row.cost_usd.is_none()
             && let (Some(model), Some(usage)) = (&row.model, &row.usage)
         {
-            row.cost_usd = cost_usd(&self.prices.load(), model, usage);
+            row.cost_usd = cost_usd(&self.prices.load(), row.provider.as_deref(), model, usage);
         }
         // A query is kept only for an agent's context-API search, and only so long.
         let agent = row.via.is_some()
@@ -330,19 +344,11 @@ pub fn trace_usage(usage: &margin_shared::Usage) -> TraceUsage {
     TraceUsage {
         input: usage.input_tokens,
         cached: usage.cached_input_tokens,
-        cache_write: 0,
+        cache_write: usage.cache_write_input_tokens,
         output: usage.output_tokens,
         reasoning: usage.reasoning_tokens,
-        web_searches: 0,
-    }
-}
-
-/// The provider a base URL belongs to.
-pub fn provider_of(base_url: &str) -> &'static str {
-    if base_url.contains("anthropic") {
-        "anthropic"
-    } else {
-        "openai"
+        web_searches: usage.web_search_requests,
+        web_fetches: usage.web_fetch_requests,
     }
 }
 
@@ -599,23 +605,34 @@ pub async fn delete_before(
 }
 
 /// `cost_usd` of a call from its usage and the price table. `input` counts every input
-/// token, `cached` and `cache_write` among them; reasoning is part of `output`. `None`
-/// for a model the table doesn't list (never a guess).
+/// token, `cached` and `cache_write` among them; reasoning is part of `output`; hosted web
+/// searches add `web_search` per 1 000; past a model's `long_context.over` input tokens
+/// its tier's input and output prices apply. `None` for a model the table doesn't list
+/// (never a guess), and always for ChatGPT calls (`provider` "chatgpt": plan-billed, no
+/// dollar price; the rollups still count their tokens).
 pub fn cost_usd(
     prices: &Prices,
+    provider: Option<&str>,
     model: &str,
     usage: &margin_shared::context::TraceUsage,
 ) -> Option<f64> {
+    if provider == Some(margin_shared::Provider::ChatGpt.as_str()) {
+        return None;
+    }
     let p = prices.get(model)?;
+    let (input, output) = match p.long_context {
+        Some(tier) if usage.input > tier.over => (tier.input, tier.output),
+        _ => (p.input, p.output),
+    };
     let fresh = usage
         .input
         .saturating_sub(usage.cached)
         .saturating_sub(usage.cache_write);
-    let micro = fresh as f64 * p.input
+    let micro = fresh as f64 * input
         + usage.cached as f64 * p.cached_input
         + usage.cache_write as f64 * p.cache_write
-        + usage.output as f64 * p.output;
-    Some(micro / 1_000_000.0)
+        + usage.output as f64 * output;
+    Some(micro / 1_000_000.0 + usage.web_searches as f64 * p.web_search / 1_000.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,13 +1000,13 @@ pub async fn read_rollup(
 /// reason from the terminal event, `ok: false` with a code when it fails, ends early or
 /// is dropped (a stopped turn).
 pub struct TracedStream {
-    inner: margin_ai::ResponseStream,
+    inner: margin_ai::ModelStream,
     span: Option<TraceSpan>,
     state: AppState,
 }
 
 impl TracedStream {
-    pub fn new(inner: margin_ai::ResponseStream, span: TraceSpan, state: AppState) -> Self {
+    pub fn new(inner: margin_ai::ModelStream, span: TraceSpan, state: AppState) -> Self {
         Self {
             inner,
             span: Some(span),
@@ -1003,10 +1020,15 @@ impl TracedStream {
         code: Option<&str>,
         usage: Option<&margin_shared::Usage>,
         stop: Option<&str>,
+        model: Option<&str>,
     ) {
         let Some(mut span) = self.span.take() else {
             return;
         };
+        // What the provider answered with, when it said.
+        if let Some(model) = model.filter(|m| !m.is_empty()) {
+            span.row.model = Some(model.to_string());
+        }
         if let Some(u) = usage {
             span.row.usage = Some(trace_usage(u));
         }
@@ -1017,32 +1039,43 @@ impl TracedStream {
 }
 
 impl Stream for TracedStream {
-    type Item = Result<margin_ai::StreamEvent, margin_ai::AiError>;
+    type Item = Result<margin_ai::ModelEvent, margin_ai::AiError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        use margin_ai::StreamEvent as E;
+        use margin_ai::ModelEvent as E;
         let polled = self.inner.as_mut().poll_next(cx);
         match &polled {
             Poll::Ready(Some(Ok(event))) => match event {
-                E::Completed { usage, .. } => {
+                E::Completed {
+                    usage,
+                    model,
+                    stop_reason,
+                    ..
+                } => {
                     let usage = *usage;
-                    self.end(true, None, Some(&usage), Some("completed"));
+                    let stop = if stop_reason.is_empty() {
+                        "completed".to_string()
+                    } else {
+                        stop_reason.clone()
+                    };
+                    let model = model.clone();
+                    self.end(true, None, Some(&usage), Some(&stop), Some(&model));
                 }
                 E::Incomplete { reason, usage } => {
                     let (reason, usage) = (format!("incomplete:{reason}"), *usage);
-                    self.end(true, None, Some(&usage), Some(&reason));
+                    self.end(true, None, Some(&usage), Some(&reason), None);
                 }
-                E::Failed { code, .. } | E::Error { code, .. } => {
+                E::Failed { code, .. } => {
                     let code = code.clone().unwrap_or_else(|| "failed".into());
-                    self.end(false, Some(&code), None, Some("failed"));
+                    self.end(false, Some(&code), None, Some("failed"), None);
                 }
                 _ => {}
             },
             Poll::Ready(Some(Err(e))) => {
                 let code = ai_error_code(e);
-                self.end(false, Some(code), None, None);
+                self.end(false, Some(code), None, None, None);
             }
-            Poll::Ready(None) => self.end(false, Some("ended_early"), None, None),
+            Poll::Ready(None) => self.end(false, Some("ended_early"), None, None, None),
             Poll::Pending => {}
         }
         polled
@@ -1051,19 +1084,34 @@ impl Stream for TracedStream {
 
 impl Drop for TracedStream {
     fn drop(&mut self) {
-        self.end(false, Some("cancelled"), None, None);
+        self.end(false, Some("cancelled"), None, None, None);
     }
 }
 
-/// A code for a failed model call (never its message).
+/// A code for a failed model call (never its message): the chat error codes of
+/// `docs/agent-providers-brief.md` D7 for what the provider said, by its error code
+/// first (a spend cap, a ChatGPT plan share used up or not eligible), then by status.
 pub fn ai_error_code(e: &margin_ai::AiError) -> &'static str {
     use margin_ai::AiError;
+    use margin_shared::error_code as code;
     match e {
-        AiError::Http { status: 429, .. } => "rate_limited",
-        AiError::Http { status, .. } if *status >= 500 => "server_error",
+        AiError::Http { code: Some(c), .. } if c == "enforced_spend_limit_reached" => {
+            code::SPEND_LIMIT_REACHED
+        }
+        AiError::Http { code: Some(c), .. }
+            if c == "subscription_sharing_usage_limit_exceeded"
+                || c == "subscription_sharing_usage_unavailable" =>
+        {
+            code::PLAN_LIMIT_REACHED
+        }
+        AiError::Http { code: Some(c), .. } if c == "subscription_sharing_user_not_eligible" => {
+            code::PLAN_INELIGIBLE
+        }
+        AiError::Http { status: 429, .. } => code::RATE_LIMITED,
+        AiError::Http { status, .. } if *status >= 500 => code::SERVER_ERROR,
         AiError::Http {
-            status: 401 | 403, ..
-        } => "unauthorized",
+            status: 401..=403, ..
+        } => code::AUTH_FAILED,
         AiError::Http { .. } => "bad_request",
         AiError::Network(_) => "network",
         AiError::Parse(_) => "parse",
@@ -1103,11 +1151,44 @@ mod tests {
             output: 10_000,
             reasoning: 5_000,
             web_searches: 0,
+            ..Default::default()
         };
         // 400k fresh × 4 + 500k × 0.2 + 100k × 5 + 10k × 20, per million.
-        let cost = cost_usd(&prices, "claude-opus-5-5", &usage).unwrap();
+        let cost = cost_usd(&prices, Some("claude"), "claude-opus-5-5", &usage).unwrap();
         assert!((cost - (1.6 + 0.1 + 0.5 + 0.2)).abs() < 1e-9, "{cost}");
-        assert_eq!(cost_usd(&prices, "gpt-unknown", &usage), None);
+        assert_eq!(
+            cost_usd(&prices, Some("openai"), "gpt-unknown", &usage),
+            None
+        );
+
+        // Web searches at $10 per 1 000.
+        let searched = TraceUsage {
+            web_searches: 3,
+            ..usage
+        };
+        let cost = cost_usd(&prices, Some("claude"), "claude-opus-5-5", &searched).unwrap();
+        assert!((cost - (2.4 + 0.03)).abs() < 1e-9, "{cost}");
+        // Haiku 5.5 past 100k input tokens: $0.50 / $2.50 instead of $0.10 / $0.50.
+        let short = TraceUsage {
+            input: 100_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        let cost = cost_usd(&prices, Some("claude"), "claude-haiku-5-5", &short).unwrap();
+        assert!((cost - (0.01 + 0.5)).abs() < 1e-9, "{cost}");
+        let long = TraceUsage {
+            input: 200_000,
+            ..short
+        };
+        let cost = cost_usd(&prices, Some("claude"), "claude-haiku-5-5", &long).unwrap();
+        assert!((cost - (0.1 + 2.5)).abs() < 1e-9, "{cost}");
+        // OpenAI is priced; ChatGPT never is, whatever the model.
+        let luna = cost_usd(&prices, Some("openai"), "gpt-6-luna", &short).unwrap();
+        assert!((luna - (0.01 + 0.5)).abs() < 1e-9, "{luna}");
+        assert_eq!(
+            cost_usd(&prices, Some("chatgpt"), "gpt-6-luna", &short),
+            None
+        );
     }
 
     #[test]
@@ -1153,7 +1234,8 @@ mod tests {
         span.finish(&tracer, true);
         let got = rx.recv().await.unwrap();
         assert_eq!(got.trace_id, "t1");
-        assert!((got.cost_usd.unwrap() - 0.2).abs() < 1e-9);
+        // 2M input tokens on Haiku 5.5: past 100k, its long-context $0.50 applies.
+        assert!((got.cost_usd.unwrap() - 1.0).abs() < 1e-9);
         assert_eq!(got.error_code.as_deref(), Some("other"));
         assert!(got.duration_ms >= 0.0 && !got.id.is_empty());
         // Nothing marks it written: flush times out rather than hanging.

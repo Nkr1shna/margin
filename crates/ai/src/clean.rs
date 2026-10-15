@@ -76,6 +76,22 @@ pub fn lesson_markdown(answer: &str) -> String {
     format!("{}\n", body.trim_end())
 }
 
+/// The JSON of a structured answer: the text itself, or the inside of a code fence a
+/// compatible server wrapped it in.
+pub fn json_answer(text: &str) -> &str {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("```") else {
+        return t;
+    };
+    let Some((lang, body)) = rest.split_once('\n') else {
+        return t;
+    };
+    if !matches!(lang.trim(), "" | "json") {
+        return t;
+    }
+    body.trim_end().strip_suffix("```").map_or(t, str::trim)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

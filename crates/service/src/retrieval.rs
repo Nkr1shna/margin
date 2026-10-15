@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::Utc;
 use margin_embed::Purpose;
+use margin_shared::Provider;
 use margin_shared::context::{
     ACCESS_COMPANY, Document, Modality, Origin, Project, RetrievalLegs, Scope, TraceKind, TraceRow,
 };
@@ -103,6 +104,8 @@ pub struct Request {
     pub budget: Budget,
     /// The context window of the route's model, in tokens, which `budget` is a share of.
     pub window_tokens: usize,
+    /// Tokens kept back from the share for the model's answer (`PackWindow`).
+    pub reserve_output: usize,
     /// Correlates the retrieval's trace row with its turn or job.
     pub trace_id: String,
     /// An agent calling the context API from outside (`margin-mcp`): its trace row says
@@ -1308,11 +1311,24 @@ pub fn fused_k(cfg: &margin_shared::pipeline::PipelineConfig) -> usize {
     param_usize(&cfg.fusion.params, "k_fused", RETRIEVAL_K_FUSED).max(1)
 }
 
-/// `PackBudget` for `budget` against a model window of `window_tokens`.
+/// `PackBudget` for `budget` against a model window of `window_tokens`, nothing
+/// reserved for the answer (an eval variant pinning `window_tokens`).
 pub fn pack_budget(budget: &Budget, window_tokens: usize, k: usize) -> PackBudget {
+    pack_budget_reserving(budget, window_tokens, 0, k)
+}
+
+/// `PackBudget` for `budget` against a model window of `window_tokens`, less the
+/// `reserve_output` tokens the answer may take (D13):
+/// `floor(window × share_of_window) − reserve_output`.
+pub fn pack_budget_reserving(
+    budget: &Budget,
+    window_tokens: usize,
+    reserve_output: usize,
+    k: usize,
+) -> PackBudget {
     let share = budget.share_of_window.clamp(0.0, 1.0) as f64;
     PackBudget {
-        tokens: (window_tokens as f64 * share) as usize,
+        tokens: ((window_tokens as f64 * share) as usize).saturating_sub(reserve_output),
         images_max: budget.images_max as usize,
         min_score_pct: budget.min_score_pct.min(100),
         passages_min: budget.passages_min as usize,
@@ -1325,51 +1341,37 @@ pub fn pack_budget(budget: &Budget, window_tokens: usize, k: usize) -> PackBudge
 // Model windows
 // ---------------------------------------------------------------------------
 
-/// The window assumed for a model this build doesn't know.
-pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
-
-/// Context windows by model id prefix, longest prefix first. Providers' `ModelInfo`
-/// replaces this when it lands.
-const WINDOWS: &[(&str, usize)] = &[
-    ("claude-", 200_000),
-    ("gpt-4.1", 1_000_000),
-    ("gpt-4o", 128_000),
-    ("gpt-5", 400_000),
-    ("gpt-6", 400_000),
-    ("o3", 200_000),
-    ("o4", 200_000),
-];
-
-/// The context window of `model`, in tokens.
-pub fn context_window(model: &str) -> usize {
-    let model = model.trim().to_ascii_lowercase();
-    WINDOWS
-        .iter()
-        .filter(|(prefix, _)| model.starts_with(prefix))
-        .max_by_key(|(prefix, _)| prefix.len())
-        .map_or(DEFAULT_CONTEXT_WINDOW, |(_, w)| *w)
+/// The window a route's passages are a share of, and the tokens kept back for the
+/// model's answer (D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackWindow {
+    pub tokens: usize,
+    pub reserve_output: usize,
 }
 
-/// The model a route calls: the pipeline's route table, else Settings (the agent model
-/// for chats, the writing model otherwise).
-pub async fn route_model(state: &AppState, route: Route) -> anyhow::Result<String> {
-    let pipeline = state.pipeline.load_full();
-    if let Some(m) = pipeline.routes.get(route).filter(|m| !m.trim().is_empty()) {
-        return Ok(m.to_string());
-    }
-    let row = state.settings_row().await?;
-    Ok(match route {
-        Route::Chat => row
-            .agent_model
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or(row.openai_model),
-        Route::Write | Route::Small => row.openai_model,
-    })
+/// The output a call on `route` may take, kept out of the packed passages: on Claude
+/// `min(window.output, the client's max_tokens)` (`CLAUDE_MAX_OUTPUT_TOKENS` for chat
+/// steps, `CLAUDE_TEXT_MAX_OUTPUT_TOKENS` for text calls); on OpenAI and ChatGPT the
+/// model's own output cap, which the Responses client asks for.
+pub fn output_reserve(provider: Provider, route: Route, window: margin_ai::ModelWindow) -> usize {
+    let cap = match (provider, route) {
+        (Provider::Claude, Route::Chat) => window.output.min(margin_ai::CLAUDE_MAX_OUTPUT_TOKENS),
+        (Provider::Claude, _) => window.output.min(margin_ai::CLAUDE_TEXT_MAX_OUTPUT_TOKENS),
+        (Provider::OpenAi | Provider::ChatGpt, _) => window.output,
+    };
+    cap as usize
 }
 
-/// The window `budget` is a share of for `route`: the packer's `window_tokens` param
-/// when the pipeline sets one, else the route's model's window.
-pub async fn route_window(state: &AppState, route: Route) -> anyhow::Result<usize> {
+/// The window `budget` is a share of for `route` on `provider` (the default provider
+/// when `None`): the packer's `window_tokens` param when the pipeline sets one (an eval
+/// variant pins it; nothing is reserved then), else the input window of the route's
+/// model (`model_for`) less [`output_reserve`]. When no model is configured for the
+/// route, `MODEL_WINDOW_FALLBACK` (logged), so the context API still answers.
+pub async fn route_window(
+    state: &AppState,
+    route: Route,
+    provider: Option<Provider>,
+) -> anyhow::Result<PackWindow> {
     let pipeline = state.pipeline.load_full();
     if let Some(w) = pipeline
         .config
@@ -1378,9 +1380,30 @@ pub async fn route_window(state: &AppState, route: Route) -> anyhow::Result<usiz
         .get("window_tokens")
         .and_then(Value::as_u64)
     {
-        return Ok(w as usize);
+        return Ok(PackWindow {
+            tokens: w as usize,
+            reserve_output: 0,
+        });
     }
-    Ok(context_window(&route_model(state, route).await?))
+    let (provider, window) = match state.model_for(route, provider).await {
+        Ok(m) => (m.config.provider, m.window),
+        Err(e) => {
+            tracing::warn!(
+                ?route,
+                "no model for the route ({}); packing against the fallback window",
+                e.message
+            );
+            let provider = match provider {
+                Some(p) => p,
+                None => state.settings_row().await?.default_provider,
+            };
+            (provider, margin_ai::MODEL_WINDOW_FALLBACK)
+        }
+    };
+    Ok(PackWindow {
+        tokens: window.input as usize,
+        reserve_output: output_reserve(provider, route, window),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,6 +1609,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         "k": req.k,
         "budget": req.budget,
         "window": req.window_tokens,
+        "reserve": req.reserve_output,
         "pipeline": pipeline.hash,
         "embedder": embedder.as_ref().map(|e| e.version().to_string()),
         "generation": index_generation(&state.store).await?,
@@ -1618,7 +1642,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         rrf_k: param_usize(fusion_params, "rrf_k", RRF_K as usize) as u32,
         params: fusion_params.clone(),
     };
-    let budget = pack_budget(&req.budget, req.window_tokens, req.k);
+    let budget = pack_budget_reserving(&req.budget, req.window_tokens, req.reserve_output, req.k);
     let mut legs = Vec::new();
     let t = Instant::now();
     for (text, vector) in req.plan.queries.iter().zip(vectors) {
@@ -2284,11 +2308,12 @@ pub async fn context_search(
     state: &AppState,
     q: &margin_shared::context::ContextQuery,
     route: Route,
+    provider: Option<Provider>,
     trace_id: &str,
     caller: Option<Caller>,
 ) -> anyhow::Result<Vec<Packed>> {
     let budget = q.budget.unwrap_or(state.pipeline.load_full().config.budget);
-    let window_tokens = route_window(state, route).await?;
+    let window = route_window(state, route, provider).await?;
     retrieve(
         state,
         &Request {
@@ -2298,7 +2323,8 @@ pub async fn context_search(
             modalities: q.modalities.clone(),
             k: q.k as usize,
             budget,
-            window_tokens,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
             trace_id: trace_id.to_string(),
             caller,
         },

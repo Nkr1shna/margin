@@ -220,6 +220,8 @@ EmbeddingGemma 2 itself is not a reranker; the Matryoshka truncation it supports
 
 ### 2.6 Prompt caching and model routing (`crates/ai`, providers' `model.rs`)
 
+> Providers phase: the routing table's defaults are now the three slots per provider of `docs/agent-providers-brief.md` D9 (`Settings.{openai,chatgpt,claude}_models`); `pipeline.routes` stays the eval variants' override. `CallOptions` moved to `crates/ai/src/model.rs` and gained `cache_prefix_len` and `prompt_version` (D1, D12).
+
 **Caching rules** (both providers):
 - OpenAI: automatic prefix caching needs a ≥ 1 024-token identical prefix; `prompt_cache_key` groups requests. Every `TextModel` call gets a `cache_key`: lessons `lesson:{prompt_version}`, scenes `scene:{prompt_version}`, titles/condense `chat:{id}` as today.
 - Claude: explicit `cache_control: ephemeral` breakpoints (the providers brief already places them on system, last tool, last message). Add one after the constant instruction block of lesson and scene calls. Minimum cacheable prefix is model-dependent (1 024–4 096 tokens); the lesson instructions plus `LESSON_SOURCES` is ~1.3k tokens, the scene cheat sheet ~4k, so both clear it.

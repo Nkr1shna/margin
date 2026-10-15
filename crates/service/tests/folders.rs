@@ -241,14 +241,24 @@ fn output_sent(h: &Harness, call_id: &str) -> Value {
 }
 
 /// The tools a request lets the model call: `allowed_tools` when it restricts them,
-/// else every tool in `tools`.
+/// else every tool in `tools`. Hosted tools go by their type (`"web_search"`), as
+/// `allowed_tools` names them.
 fn offered(req: &margin_ai::ResponseRequest) -> Vec<String> {
     match &req.tool_choice {
-        Some(margin_ai::ToolChoice::AllowedTools { names, .. }) => names.clone(),
-        Some(margin_ai::ToolChoice::Auto) | None => req
+        Some(margin_ai::ResponsesToolChoice::AllowedTools { names, .. }) => names.clone(),
+        Some(margin_ai::ResponsesToolChoice::Auto) | None => req
             .tools
             .iter()
-            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .filter_map(|t| {
+                t["name"]
+                    .as_str()
+                    .or_else(|| {
+                        t["type"]
+                            .as_str()
+                            .filter(|ty| margin_ai::HOSTED_TOOLS.contains(ty))
+                    })
+                    .map(str::to_string)
+            })
             .collect(),
         other => panic!("tool_choice {other:?}"),
     }
@@ -563,6 +573,7 @@ async fn a_folder_syncs_is_searched_listed_and_cited_in_a_course() {
     let n = agent.requests().len() - 1;
     let tools = offered(&agent.requests()[n]);
     assert!(tools.iter().any(|n| n == "search"));
+    assert!(tools.iter().any(|n| n == "web_search"), "{tools:?}");
     for name in ["list_files", "find_files", "sync_folder"] {
         assert!(
             !tools.iter().any(|n| n == name),

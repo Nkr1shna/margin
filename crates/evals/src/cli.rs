@@ -56,8 +56,10 @@ Commands:
   judge [--dir PATH] [--against PATH]
                         Judge recorded generations (default: the baseline's prompt
                         version), with canaries; --against compares pairwise
-  compare RUN_A RUN_B [--allow-embedder-change]
-                        Per-metric deltas with paired bootstrap 95% intervals
+  compare RUN_A RUN_B [--allow-embedder-change] [--allow-provider-change]
+                        Per-metric deltas with paired bootstrap 95% intervals; runs
+                        whose models came from different providers (OpenAI, ChatGPT,
+                        Claude) are refused without --allow-provider-change
   report [RUN] [--traces FILE | --service --service-url URL]
                         Write evals/reports/RUN.md and RUN.html (latest run by default),
                         with efficiency from exported traces or the service at URL
@@ -103,6 +105,7 @@ pub enum Command {
         a: String,
         b: String,
         allow_embedder_change: bool,
+        allow_provider_change: bool,
     },
     Report {
         run: Option<String>,
@@ -174,6 +177,7 @@ const FLAGS: &[&str] = &[
     "--write-baseline",
     "--no-judge",
     "--allow-embedder-change",
+    "--allow-provider-change",
     "--service",
 ];
 
@@ -258,6 +262,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 a: a.clone(),
                 b: b.clone(),
                 allow_embedder_change: flag(take("allow-embedder-change")),
+                allow_provider_change: flag(take("allow-provider-change")),
             },
             _ => bail!("compare needs two run ids (see `margin-eval runs`)"),
         },
@@ -424,7 +429,17 @@ mod tests {
             Command::Compare {
                 a: "a".into(),
                 b: "b".into(),
-                allow_embedder_change: true
+                allow_embedder_change: true,
+                allow_provider_change: false
+            }
+        );
+        assert_eq!(
+            p("compare a b --allow-provider-change").unwrap().command,
+            Command::Compare {
+                a: "a".into(),
+                b: "b".into(),
+                allow_embedder_change: false,
+                allow_provider_change: true
             }
         );
         let c = p("export --kind model_call --from 2026-10-01T00:00:00Z --out x.jsonl --data /tmp/d --token t --service-url http://127.0.0.1:8787").unwrap();
