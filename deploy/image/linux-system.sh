@@ -14,7 +14,7 @@ apt-get install -y --no-install-recommends \
   libc++-dev libc++abi-dev libc++1 libc++abi1 \
   libheif-dev libheif1 zlib1g-dev \
   tesseract-ocr tesseract-ocr-eng ffmpeg bubblewrap \
-  python3 ca-certificates curl git jq unzip zstd rsync gnupg
+  python3 ca-certificates curl git jq unzip zstd rsync gnupg lsof avahi-daemon libnss-mdns
 
 # The scene sandbox (bubblewrap) needs unprivileged user namespaces, which Ubuntu 24.04's
 # AppArmor restricts. Allow them for bwrap only, the way Ubuntu documents for one program,

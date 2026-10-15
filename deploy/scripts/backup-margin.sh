@@ -1,7 +1,7 @@
 #!/bin/sh
 # Back up Margin's data folder: the one backup script (docs/plan-deploy.md §5,
 # docs/plan-dogfood.md §5). Used on the owner's Mac by hand, by deploy.sh before every
-# deploy, nightly by the com.krishnanelloore.margin.backup LaunchAgent, and by
+# deploy, nightly by the margin-backup systemd timer in the guests, and by
 # restore-into-dev.sh before it replaces dev's data.
 #
 #   backup-margin.sh [--label TEXT] [--keep N] [--stop-service]
@@ -9,8 +9,9 @@
 # Copies `data_dir` from the service config to `<data_dir>/../backups/<date-time>[-label]/data`.
 # In a VM that is the persistent share, so backups live on the Mac mini's disk.
 # Refuses while the service is up (a copy of a live database isn't a backup) unless
-# --stop-service, which stops the LaunchAgent, backs up, and starts it again even when
-# the copy fails. Keeps the newest N backups (default 10; 0 keeps all).
+# --stop-service, which stops the service (the margin-service systemd unit in a guest,
+# the LaunchAgent on the owner's Mac), backs up, and starts it again even when the copy
+# fails. Keeps the newest N backups (default 10; 0 keeps all).
 # The config is $MARGIN_CONFIG, else ~/Library/Application Support/Margin/service.toml.
 set -eu
 
@@ -59,13 +60,21 @@ running() {
 
 service="gui/$(id -u)/com.krishnanelloore.margin.service"
 plist="$HOME/Library/LaunchAgents/com.krishnanelloore.margin.service.plist"
+unit=/etc/systemd/system/margin-service.service
+sudo_cmd=""
+[ "$(id -u)" = 0 ] || sudo_cmd="sudo"
 restart_after=0
 if [ "$stop_service" = 1 ] && running; then
-  [ -f "$plist" ] || { echo "backup-margin: the service runs but not from $plist; stop it by hand" >&2; exit 1; }
-  launchctl bootout "$service" 2>/dev/null || true
   restart_after=1
-  # Always start it again, whatever happens below.
-  trap 'launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "$service" 2>/dev/null || true' EXIT
+  if [ -f "$unit" ]; then
+    $sudo_cmd systemctl stop margin-service.service
+    # Always start it again, whatever happens below.
+    trap '$sudo_cmd systemctl start margin-service.service || true' EXIT
+  else
+    [ -f "$plist" ] || { echo "backup-margin: the service runs but not from $plist or $unit; stop it by hand" >&2; exit 1; }
+    launchctl bootout "$service" 2>/dev/null || true
+    trap 'launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "$service" 2>/dev/null || true' EXIT
+  fi
   i=0
   while running; do
     i=$((i + 1))

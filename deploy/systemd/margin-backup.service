@@ -1,0 +1,10 @@
+# Nightly backup of the data folder on the share (docs/plan-deploy.md §5): stops the
+# service, copies data/ to backups/<date>-nightly, starts it again. Installed by
+# provision-guest.sh; triggered by margin-backup.timer.
+[Unit]
+Description=Margin nightly backup
+
+[Service]
+Type=oneshot
+Environment=MARGIN_CONFIG=__PERSIST__/service.toml
+ExecStart=/bin/sh __PERSIST__/bin/backup-margin.sh --label nightly --stop-service

@@ -1,7 +1,7 @@
-# Builds margin-service for the VMs (docs/plan-deploy.md §4): tests first, then a
-# release build stamped with the commit (MARGIN_BUILD_SHA, reported by GET /api/version),
-# signed with the stable self-signed identity "Margin Service Signing" so the guests'
-# Keychain ACLs keep matching across deploys. deploy-dev.yml installs the artifact.
+# Builds margin-service for the Linux guests (docs/plan-deploy.md §4,
+# docs/plan-linux-service.md): a release build on the Linux runner VM, stamped with the
+# commit (MARGIN_BUILD_SHA, reported by GET /api/version). deploy-dev.yml / deploy-prod.yml
+# install the artifact (from the Mac host runner, which holds the deploy key).
 name: build-service
 
 on:
@@ -37,45 +37,35 @@ jobs:
   # passed on the PR branch kept up to date with the base (the repository ruleset), so the
   # merged commit is the one CI tested.
   build:
-    runs-on: [self-hosted, macOS, ARM64, margin]
+    # The service is a Linux build: on the Linux runner VM (margin-ci), from the same image
+    # the dev and prod guests run. Linux binaries aren't code-signed; the artifact carries
+    # the commit it was built from (BUILD_SHA, and `margin-service version`).
+    runs-on: [self-hosted, Linux, ARM64, margin]
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       MARGIN_BUILD_SHA: ${{ github.sha }}
-      SIGNING_IDENTITY: Margin Service Signing
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # Cargo's build output lives outside the checkout (actions/checkout wipes untracked
-      # files on every run), so each build only recompiles what changed.
+      # Cargo's build output lives outside the checkout, named after the environment (pinned
+      # Rust + the image build), so each build only recompiles what changed.
       - name: Put Rust on PATH, keep the build cache
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-release" >> "$GITHUB_ENV"
+          rustc --version
+          env_id="$(rustc -V | cut -d' ' -f2)-$(cat /etc/margin-image 2>/dev/null || echo noimage)"
+          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-release-$env_id" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --locked -p margin-service
-      # The signing identity comes from the repository secrets into a keychain that lives
-      # only for this job (deploy/scripts/signing-keychain.sh); the runner keeps none.
-      - name: Sign
-        env:
-          P12_BASE64: ${{ secrets.MARGIN_SIGNING_P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.MARGIN_SIGNING_P12_PASSWORD }}
-          SIGNING_KEYCHAIN: ${{ runner.temp }}/margin-signing-${{ github.run_id }}-${{ github.run_attempt }}.keychain-db
+      - name: Check the binary
         run: |
-          identity="$(deploy/scripts/signing-keychain.sh create "$SIGNING_KEYCHAIN")"
-          echo "Signing as \"$SIGNING_IDENTITY\" ($identity)."
-          codesign --force --keychain "$SIGNING_KEYCHAIN" --sign "$identity" \
-            --identifier com.krishnanelloore.margin.service "$CARGO_TARGET_DIR/release/margin-service"
-          codesign --verify --verbose "$CARGO_TARGET_DIR/release/margin-service"
-      - name: Remove the signing keychain
-        if: always()
-        env:
-          SIGNING_KEYCHAIN: ${{ runner.temp }}/margin-signing-${{ github.run_id }}-${{ github.run_attempt }}.keychain-db
-        run: deploy/scripts/signing-keychain.sh delete "$SIGNING_KEYCHAIN"
-      - name: Check the stamp
-        run: |
-          out="$("$CARGO_TARGET_DIR/release/margin-service" version)"
+          bin="$CARGO_TARGET_DIR/release/margin-service"
+          file "$bin" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "::error::not a Linux arm64 binary"; exit 1; }
+          out="$("$bin" version)"
           echo "$out"
           case "$out" in *"($MARGIN_BUILD_SHA)"*) ;; *) echo "::error::the binary isn't stamped with $MARGIN_BUILD_SHA"; exit 1 ;; esac
       - name: Package
