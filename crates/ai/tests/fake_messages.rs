@@ -332,7 +332,8 @@ async fn text_streams_in_any_chunking() {
                 assert_eq!(model, "claude-opus-5-5-20261001");
                 assert_eq!(stop_reason, "end_turn");
                 assert_eq!(*next, Next::Finished);
-                assert_eq!(usage.input_tokens, 120);
+                // 120 fresh + 1000 cache reads + 30 cache writes.
+                assert_eq!(usage.input_tokens, 1150);
                 assert_eq!(usage.cached_input_tokens, 1000);
                 assert_eq!(usage.cache_write_input_tokens, 30);
                 assert_eq!(usage.output_tokens, 42);
@@ -802,13 +803,43 @@ async fn usage_counts_server_tools_cache_writes_and_iterations() {
     let ModelEvent::Completed { usage, .. } = terminal(&events) else {
         panic!()
     };
-    assert_eq!(usage.input_tokens, 180_050);
+    // Every input token: the iterations' fresh input plus the cache reads and writes
+    // (Claude's `input_tokens` leaves those out).
+    assert_eq!(usage.input_tokens, 180_050 + 2000 + 700);
     assert_eq!(usage.output_tokens, 2_800);
     assert_eq!(usage.cached_input_tokens, 2000);
     assert_eq!(usage.cache_write_input_tokens, 700);
     assert_eq!(usage.reasoning_tokens, 120);
     assert_eq!(usage.web_search_requests, 3);
     assert_eq!(usage.web_fetch_requests, 1);
+}
+
+#[tokio::test]
+async fn usage_sums_cache_counts_of_iterations_when_given() {
+    let mut events = vec![message_start("claude-opus-5-5")];
+    events.push(message_delta(
+        "end_turn",
+        json!({
+            "input_tokens": 40, "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 60, "output_tokens": 20,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 1000, "cache_read_input_tokens": 5000,
+                 "cache_creation_input_tokens": 0, "output_tokens": 200},
+                {"type": "message", "input_tokens": 40, "cache_read_input_tokens": 900,
+                 "cache_creation_input_tokens": 60, "output_tokens": 20}
+            ]
+        }),
+    ));
+    events.push(message_stop());
+    let (client, _) = spawn(vec![whole(sse(&events))]).await;
+    let (events, _) = run(&client, step(user_says("q"))).await;
+    let ModelEvent::Completed { usage, .. } = terminal(&events) else {
+        panic!()
+    };
+    assert_eq!(usage.cached_input_tokens, 5900);
+    assert_eq!(usage.cache_write_input_tokens, 60);
+    assert_eq!(usage.input_tokens, 1040 + 5900 + 60);
+    assert_eq!(usage.output_tokens, 220);
 }
 
 #[tokio::test]
@@ -828,7 +859,8 @@ async fn cut_off_refused_and_failed_responses() {
         );
     }
 
-    // A refusal: the text as it came, then `Incomplete { reason: "refusal" }`.
+    // A refusal: the text as it came, then `Incomplete { reason: "refusal:cyber" }`
+    // (the category from `stop_details`).
     let mut events = vec![message_start("claude-opus-5-5")];
     events.extend(text());
     events.push(json!({"type": "message_delta",
@@ -843,7 +875,20 @@ async fn cut_off_refused_and_failed_responses() {
     ));
     assert!(matches!(
         terminal(&events),
-        ModelEvent::Incomplete { reason, usage } if reason == "refusal" && usage.output_tokens == 3
+        ModelEvent::Incomplete { reason, usage } if reason == "refusal:cyber" && usage.output_tokens == 3
+    ));
+
+    // Without `stop_details` the reason is plain `refusal`.
+    let mut events = vec![message_start("claude-opus-5-5")];
+    events.extend(text());
+    events.push(json!({"type": "message_delta",
+        "delta": {"stop_reason": "refusal"}, "usage": {"output_tokens": 3}}));
+    events.push(message_stop());
+    let (client, _) = spawn(vec![whole(sse(&events))]).await;
+    let (events, _) = run(&client, step(user_says("q"))).await;
+    assert!(matches!(
+        terminal(&events),
+        ModelEvent::Incomplete { reason, .. } if reason == "refusal"
     ));
 
     // `event: error` mid-stream.

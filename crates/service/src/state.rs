@@ -600,7 +600,7 @@ impl App {
                 (endpoints.anthropic.clone(), Credential::ApiKey(api_key))
             }
             Provider::ChatGpt => {
-                let token = crate::providers::chatgpt_access_token(self, false).await?;
+                let token = crate::providers::chatgpt_access_token(self, None).await?;
                 (endpoints.chatgpt_api.clone(), Credential::Bearer(token))
             }
         };

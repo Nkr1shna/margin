@@ -645,7 +645,7 @@ pub fn agent_client(state: &AppState, config: &ProviderConfig) -> Arc<dyn ModelC
     Arc::new(ChatGptRetry {
         state: state.clone(),
         config: config.clone(),
-        inner: Mutex::new(inner),
+        inner: Mutex::new((inner, config.credential.secret().to_string())),
     })
 }
 
@@ -660,7 +660,8 @@ fn invalid_plan_token(e: &AiError) -> bool {
 struct ChatGptRetry {
     state: AppState,
     config: ProviderConfig,
-    inner: Mutex<Arc<dyn ModelClient>>,
+    /// The client and the access token it calls with.
+    inner: Mutex<(Arc<dyn ModelClient>, String)>,
 }
 
 impl ModelClient for ChatGptRetry {
@@ -670,22 +671,26 @@ impl ModelClient for ChatGptRetry {
 
     fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
         Box::pin(async move {
-            let client = self.inner.lock().unwrap().clone();
+            let (client, used) = self.inner.lock().unwrap().clone();
             match client.stream(req.clone()).await {
                 Err(e) if invalid_plan_token(&e) => {
                     tracing::info!("ChatGPT refused the plan token; refreshing it once");
-                    let token =
-                        match crate::providers::chatgpt_access_token(&self.state, true).await {
-                            Ok(t) => t,
-                            Err(refresh) => {
-                                tracing::warn!("couldn't refresh: {}", refresh.message);
-                                return Err(e);
-                            }
-                        };
+                    let token = match crate::providers::chatgpt_access_token(
+                        &self.state,
+                        Some(&used),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(refresh) => {
+                            tracing::warn!("couldn't refresh: {}", refresh.message);
+                            return Err(e);
+                        }
+                    };
                     let mut config = self.config.clone();
-                    config.credential = margin_ai::Credential::Bearer(token);
+                    config.credential = margin_ai::Credential::Bearer(token.clone());
                     let fresh = self.state.generator.agent_model(&config);
-                    *self.inner.lock().unwrap() = fresh.clone();
+                    *self.inner.lock().unwrap() = (fresh.clone(), token);
                     fresh.stream(req).await
                 }
                 other => other,
@@ -695,7 +700,7 @@ impl ModelClient for ChatGptRetry {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
         Box::pin(async move {
-            let client = self.inner.lock().unwrap().clone();
+            let client = self.inner.lock().unwrap().0.clone();
             client.list_models().await
         })
     }

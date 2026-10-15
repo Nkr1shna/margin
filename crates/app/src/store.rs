@@ -50,6 +50,9 @@ pub struct LibraryState {
     /// The models each provider offers (`GET routes::providers_models`), for the providers
     /// whose list was fetched; dropped when the provider loses its credential.
     pub provider_models: HashMap<Provider, Vec<ModelInfo>>,
+    /// Moves each time a provider's model list goes stale (`forget_models`); Settings
+    /// keys its slots on it, so they fetch the list again.
+    pub models_epoch: HashMap<Provider, u32>,
     /// The ChatGPT sign-in as last fetched (`GET routes::PROVIDERS_CHATGPT`) or started;
     /// `None` until then (see [`LibraryState::chatgpt_status`]).
     pub chatgpt: Option<ChatGptStatus>,
@@ -78,9 +81,18 @@ impl LibraryState {
     /// provider without its credential forgets its models.
     pub fn set_settings(&mut self, settings: Settings) {
         match (&settings.chatgpt, &self.chatgpt) {
-            (Some(account), _) => {
+            (Some(account), current) => {
+                // A failed attempt noted on the same account stays noted.
+                let last_error = match current {
+                    Some(ChatGptStatus::SignedIn {
+                        account: was,
+                        last_error,
+                    }) if was.email == account.email => last_error.clone(),
+                    _ => None,
+                };
                 self.chatgpt = Some(ChatGptStatus::SignedIn {
                     account: account.clone(),
+                    last_error,
                 })
             }
             (None, Some(ChatGptStatus::SignedIn { .. })) => {
@@ -90,7 +102,39 @@ impl LibraryState {
         }
         self.provider_models
             .retain(|p, _| settings.has_credential(*p));
+        // Another base URL, or another ChatGPT account: another list of models.
+        let email = |s: &Settings| s.chatgpt.as_ref().map(|a| a.email.clone());
+        let (base_moved, account_moved) = match &self.settings {
+            Some(old) => (
+                old.openai_base_url != settings.openai_base_url,
+                email(old) != email(&settings),
+            ),
+            None => (false, false),
+        };
+        if base_moved {
+            self.forget_models(Provider::OpenAi);
+        }
+        if account_moved {
+            self.forget_models(Provider::ChatGpt);
+        }
         self.settings = Some(settings);
+    }
+
+    /// `provider`'s credential or base URL changed: its model list is stale. It is
+    /// dropped and `models_epoch` moves, so Settings fetches it again.
+    pub fn forget_models(&mut self, provider: Provider) {
+        self.provider_models.remove(&provider);
+        *self.models_epoch.entry(provider).or_default() += 1;
+    }
+
+    /// The key Settings mounts a provider's slots under: again when the credential
+    /// comes or goes, and when the list went stale.
+    pub fn slots_key(&self, settings: &Settings, provider: Provider) -> String {
+        format!(
+            "{}-{}",
+            settings.has_credential(provider),
+            self.models_epoch.get(&provider).copied().unwrap_or(0)
+        )
     }
 
     /// Where the ChatGPT sign-in is: as fetched, else as the settings say.
@@ -99,7 +143,10 @@ impl LibraryState {
             return status.clone();
         }
         match self.settings.as_ref().and_then(|s| s.chatgpt.clone()) {
-            Some(account) => ChatGptStatus::SignedIn { account },
+            Some(account) => ChatGptStatus::SignedIn {
+                account,
+                last_error: None,
+            },
             None => ChatGptStatus::SignedOut,
         }
     }
@@ -1533,13 +1580,57 @@ pub(crate) mod tests {
         assert_eq!(
             s.chatgpt_status(),
             ChatGptStatus::SignedIn {
-                account: account.clone()
+                account: account.clone(),
+                last_error: None,
             }
         );
         assert!(s.provider_ready(Provider::ChatGpt));
         assert!(!s.provider_models.contains_key(&Provider::OpenAi));
         s.apply(Event::SettingsChanged { settings });
         assert_eq!(s.chatgpt_status(), ChatGptStatus::SignedOut);
+    }
+
+    #[test]
+    fn a_new_key_base_url_or_account_makes_the_model_list_stale() {
+        let mut s = sample();
+        let settings = Settings {
+            has_api_key: true,
+            has_claude_api_key: true,
+            chatgpt: Some(crate::fake::fake_account("owner@example.com")),
+            ..crate::fake::FakeState::new().settings
+        };
+        s.apply(Event::SettingsChanged {
+            settings: settings.clone(),
+        });
+        for p in [Provider::OpenAi, Provider::Claude, Provider::ChatGpt] {
+            s.provider_models.insert(p, crate::fake::fake_models(p));
+        }
+        let key = s.slots_key(&settings, Provider::OpenAi);
+
+        // A key replaced (the settings don't change): the UI calls `forget_models`.
+        s.forget_models(Provider::Claude);
+        assert!(!s.provider_models.contains_key(&Provider::Claude));
+        assert!(s.provider_models.contains_key(&Provider::OpenAi));
+
+        // Another base URL: the OpenAI list is dropped and its slots mount again.
+        let moved = Settings {
+            openai_base_url: "https://proxy.example/v1".into(),
+            ..settings.clone()
+        };
+        s.apply(Event::SettingsChanged {
+            settings: moved.clone(),
+        });
+        assert!(!s.provider_models.contains_key(&Provider::OpenAi));
+        assert_ne!(s.slots_key(&moved, Provider::OpenAi), key);
+        assert!(s.provider_models.contains_key(&Provider::ChatGpt));
+
+        // Another ChatGPT account: its list is dropped.
+        let other = Settings {
+            chatgpt: Some(crate::fake::fake_account("other@example.com")),
+            ..moved
+        };
+        s.apply(Event::SettingsChanged { settings: other });
+        assert!(!s.provider_models.contains_key(&Provider::ChatGpt));
     }
 
     #[test]

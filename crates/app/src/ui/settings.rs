@@ -885,8 +885,9 @@ fn OpenAiSection(settings: Settings) -> Element {
                 span { class: "save-state error", role: "alert", "{err}" }
             }
             ApiKeyField { provider: Provider::OpenAi, has_key: settings.has_api_key }
-            // Mounted again when the credential comes or goes, so the list is fetched then.
-            ModelSlots { key: "{settings.has_credential(Provider::OpenAi)}", provider: Provider::OpenAi, settings: settings.clone() }
+            // Mounted again when the credential comes or goes or the list went stale
+            // (another key, base URL or account), so the list is fetched then.
+            ModelSlots { key: "{app.lib.read().slots_key(&settings, Provider::OpenAi)}", provider: Provider::OpenAi, settings: settings.clone() }
         }
     }
 }
@@ -894,13 +895,15 @@ fn OpenAiSection(settings: Settings) -> Element {
 /// Claude: the API key and the three slots.
 #[component]
 fn ClaudeSection(settings: Settings) -> Element {
+    let app = use_app();
     rsx! {
         section { id: provider_block_id(Provider::Claude), class: "set-sec",
             h2 { "Claude" }
             p { class: "help", {provider_help(Provider::Claude)} }
             ApiKeyField { provider: Provider::Claude, has_key: settings.has_claude_api_key }
-            // Mounted again when the credential comes or goes, so the list is fetched then.
-            ModelSlots { key: "{settings.has_credential(Provider::Claude)}", provider: Provider::Claude, settings: settings.clone() }
+            // Mounted again when the credential comes or goes or the list went stale
+            // (another key, base URL or account), so the list is fetched then.
+            ModelSlots { key: "{app.lib.read().slots_key(&settings, Provider::Claude)}", provider: Provider::Claude, settings: settings.clone() }
         }
     }
 }
@@ -936,6 +939,9 @@ fn ApiKeyField(provider: Provider, has_key: bool) -> Element {
                             return;
                         }
                         if save_settings(app, key_patch(provider, k), key_error, key_busy).await {
+                            // Another key may see other models.
+                            let mut lib = app.lib;
+                            lib.write().forget_models(provider);
                             key.set(String::new());
                             key_rev += 1;
                             replacing.set(false);
@@ -1316,7 +1322,7 @@ fn ChatGptSection(settings: Settings) -> Element {
                         }
                     }
                 },
-                ChatGptStatus::SignedIn { account } => rsx! {
+                ChatGptStatus::SignedIn { account, last_error } => rsx! {
                     div { class: "key-saved",
                         Icon { name: "check" }
                         span { class: "grow", style: "white-space: normal",
@@ -1325,6 +1331,11 @@ fn ChatGptSection(settings: Settings) -> Element {
                             span { class: "faint", " · Signed in {date(&account.signed_in_at)}" }
                         }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+                    }
+                    if let Some(message) = last_error {
+                        p { class: "faint chatgpt-last-error", role: "status", style: "margin: 0; font-size: 13px",
+                            "The latest sign-in attempt didn't work; the sign-in above still holds. {message}"
+                        }
                     }
                 },
                 ChatGptStatus::Failed { message } => rsx! {
@@ -1347,8 +1358,9 @@ fn ChatGptSection(settings: Settings) -> Element {
             if let Some(err) = error.read().clone() {
                 span { class: "save-state error", role: "alert", "{err}" }
             }
-            // Mounted again when the credential comes or goes, so the list is fetched then.
-            ModelSlots { key: "{settings.has_credential(Provider::ChatGpt)}", provider: Provider::ChatGpt, settings: settings.clone() }
+            // Mounted again when the credential comes or goes or the list went stale
+            // (another key, base URL or account), so the list is fetched then.
+            ModelSlots { key: "{app.lib.read().slots_key(&settings, Provider::ChatGpt)}", provider: Provider::ChatGpt, settings: settings.clone() }
         }
         if *confirm_signout.read() {
             ConfirmDialog {
@@ -3556,6 +3568,21 @@ mod tests {
         assert!(!html.contains(">Continue with ChatGPT<"));
         assert!(!html.contains("Sign in with ChatGPT to choose"));
         assert!(html.contains(r#"value="gpt-6.1-sol""#));
+        assert!(!html.contains("The latest sign-in attempt didn"));
+        // Signed in after a failed attempt: still signed in, with the note.
+        let html = pane(
+            Some(ChatGptStatus::SignedIn {
+                account: crate::fake::fake_account("owner@example.com"),
+                last_error: Some("The owner declined.".into()),
+            }),
+            true,
+        );
+        assert!(html.contains(">Sign out…<"));
+        assert!(
+            html.contains("The latest sign-in attempt didn&#39;t work; the sign-in above still holds. The owner declined."),
+            "{html}"
+        );
+        assert!(!html.contains(">Try again<"));
         // Failed: why, and Try again.
         let html = pane(
             Some(ChatGptStatus::Failed {

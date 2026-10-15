@@ -43,8 +43,10 @@ pub const CLAUDE_BETAS: &str = "compact-2026-01-12,thinking-binding-controls-202
 pub const CLAUDE_MAX_OUTPUT_TOKENS: u32 = 32_000;
 /// `max_tokens` of a plain text call (a lesson, a scene, the planner) unless set.
 pub const CLAUDE_TEXT_MAX_OUTPUT_TOKENS: u32 = 64_000;
-/// The hosted web search tool's type (dynamic filtering and response inclusion; checked
-/// against the web search tool docs on 2026-10-14).
+/// The hosted web search tool's type (dynamic filtering and response inclusion). The
+/// live web search tool docs list three versions with this one the newest (rechecked
+/// 2026-10-14); the claude-api skill's cached table still names `web_search_20260209`,
+/// which is older, so the docs win.
 pub const WEB_SEARCH_TOOL: &str = "web_search_20260318";
 /// The hosted web fetch tool's type (checked against the web fetch tool docs on
 /// 2026-10-14).
@@ -576,6 +578,12 @@ fn incomplete_words(reason: &str) -> String {
         "max_tokens" => "the answer hit the output token limit".into(),
         "model_context_window_exceeded" => "the request exceeds the model's context window".into(),
         "refusal" => "the model declined to answer".into(),
+        other if other.starts_with("refusal:") => {
+            format!(
+                "the model declined to answer ({})",
+                &other["refusal:".len()..]
+            )
+        }
         other => format!("the response is incomplete ({other})"),
     }
 }
@@ -723,7 +731,11 @@ struct FetchedDoc {
 struct Adapter {
     model: String,
     usage: Usage,
+    /// Claude's own `input_tokens` (cache reads and writes left out).
+    uncached_input: u64,
     stop_reason: Option<String>,
+    /// `stop_details.category` of a refusal (`cyber`, `bio`, ...).
+    refusal_category: Option<String>,
     next_index: u32,
     blocks: HashMap<u64, Block>,
     text: Option<TextItem>,
@@ -817,6 +829,7 @@ impl Adapter {
                     .and_then(Value::as_str)
                 {
                     tracing::info!(category, "the model declined to answer");
+                    self.refusal_category = Some(category.to_string());
                 }
                 self.apply_usage(&v["usage"]);
                 self.flush_text(&mut out);
@@ -845,10 +858,14 @@ impl Adapter {
         let usage = self.usage;
         let next = match stop_reason.as_str() {
             "max_tokens" | "model_context_window_exceeded" | "refusal" => {
-                return ModelEvent::Incomplete {
-                    reason: stop_reason,
-                    usage,
+                // A refusal carries its category: `refusal:cyber`.
+                let reason = match &self.refusal_category {
+                    Some(category) if stop_reason == "refusal" => {
+                        format!("refusal:{category}")
+                    }
+                    _ => stop_reason,
                 };
+                return ModelEvent::Incomplete { reason, usage };
             }
             "pause_turn" => Next::Paused,
             "tool_use" if !self.pending_server.is_empty() => Next::ServerToolPending,
@@ -863,16 +880,18 @@ impl Adapter {
     }
 
     /// Usage fields are cumulative: each one present replaces what came before.
+    /// Claude's `input_tokens` leaves out cache reads and writes; `Usage.input_tokens`
+    /// counts every input token, so the three are added together.
     fn apply_usage(&mut self, u: &Value) {
         if !u.is_object() {
             return;
         }
         let n = |path: &str| u.pointer(path).and_then(Value::as_u64);
-        let usage = &mut self.usage;
-        usage.model_calls = 1;
+        self.usage.model_calls = 1;
         if let Some(x) = n("/input_tokens") {
-            usage.input_tokens = x;
+            self.uncached_input = x;
         }
+        let usage = &mut self.usage;
         if let Some(x) = n("/cache_read_input_tokens") {
             usage.cached_input_tokens = x;
         }
@@ -891,15 +910,23 @@ impl Adapter {
         if let Some(x) = n("/server_tool_use/web_fetch_requests") {
             usage.web_fetch_requests = x;
         }
+        let mut uncached = self.uncached_input;
         // With server-side compaction the call ran in iterations (the compaction, then
         // the answer); the top-level counts are the last one only.
         if let Some(iterations) = u["iterations"].as_array()
             && !iterations.is_empty()
         {
-            let sum = |key: &str| iterations.iter().filter_map(|i| i[key].as_u64()).sum();
-            usage.input_tokens = sum("input_tokens");
+            let sum =
+                |key: &str| -> u64 { iterations.iter().filter_map(|i| i[key].as_u64()).sum() };
+            let has = |key: &str| iterations.iter().any(|i| i[key].is_u64());
+            uncached = sum("input_tokens");
             usage.output_tokens = sum("output_tokens");
+            if has("cache_read_input_tokens") || has("cache_creation_input_tokens") {
+                usage.cached_input_tokens = sum("cache_read_input_tokens");
+                usage.cache_write_input_tokens = sum("cache_creation_input_tokens");
+            }
         }
+        usage.input_tokens = uncached + usage.cached_input_tokens + usage.cache_write_input_tokens;
     }
 
     fn flush_text(&mut self, out: &mut Vec<ModelEvent>) {

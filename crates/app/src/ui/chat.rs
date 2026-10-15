@@ -230,7 +230,8 @@ pub fn tokens_text(n: u64) -> String {
 
 /// What the chat has spent, for the footer under the composer, and in full for its
 /// tooltip; `None` before the first model call. Web searches are counted when there were
-/// any, with what they cost on `provider`.
+/// any, with what they cost on `provider`; pages fetched are counted with them, or on
+/// their own when there was no search.
 pub fn usage_text(usage: &Usage, provider: Provider) -> Option<(String, String)> {
     if usage.model_calls == 0 {
         return None;
@@ -249,8 +250,15 @@ pub fn usage_text(usage: &Usage, provider: Provider) -> Option<(String, String)>
         tokens_text(usage.input_tokens),
         tokens_text(usage.output_tokens)
     );
-    if let Some(searches) = &searches {
-        short.push_str(&format!(" · {searches}"));
+    let fetches = match usage.web_fetch_requests {
+        0 => None,
+        1 => Some("1 page fetched".to_string()),
+        n => Some(format!("{n} pages fetched")),
+    };
+    match (&searches, &fetches) {
+        (Some(searches), _) => short.push_str(&format!(" · {searches}")),
+        (None, Some(fetches)) => short.push_str(&format!(" · {fetches}")),
+        (None, None) => {}
     }
     let mut full = format!(
         "This chat so far: {} input tokens ({} from the prompt cache), {} output tokens ({} \
@@ -263,21 +271,25 @@ pub fn usage_text(usage: &Usage, provider: Provider) -> Option<(String, String)>
             usage.cache_write_input_tokens
         ));
     }
-    if let Some(searches) = searches {
-        let fetches = match usage.web_fetch_requests {
-            0 => String::new(),
-            1 => " and 1 page fetched".to_string(),
-            n => format!(" and {n} pages fetched"),
-        };
-        let price = match provider {
-            Provider::ChatGpt => "they count against your ChatGPT plan",
-            Provider::OpenAi | Provider::Claude => "web search costs $10 per 1 000 searches",
-        };
-        full.push_str(&format!(
-            " {}{fetches} on {} ({price}).",
-            crate::ui::common::capitalize_first(&searches),
+    match (searches, fetches) {
+        (Some(searches), fetches) => {
+            let fetches = fetches.map(|f| format!(" and {f}")).unwrap_or_default();
+            let price = match provider {
+                Provider::ChatGpt => "they count against your ChatGPT plan",
+                Provider::OpenAi | Provider::Claude => "web search costs $10 per 1 000 searches",
+            };
+            full.push_str(&format!(
+                " {}{fetches} on {} ({price}).",
+                crate::ui::common::capitalize_first(&searches),
+                provider.label()
+            ));
+        }
+        (None, Some(fetches)) => full.push_str(&format!(
+            " {} on {}.",
+            crate::ui::common::capitalize_first(&fetches),
             provider.label()
-        ));
+        )),
+        (None, None) => {}
     }
     Some((short, full))
 }
@@ -3245,6 +3257,16 @@ mod tests {
             full.contains("1 web search on ChatGPT (they count against your ChatGPT plan)."),
             "{full}"
         );
+        // Pages fetched without a search are still counted.
+        let fetched = Usage {
+            web_search_requests: 0,
+            web_fetch_requests: 2,
+            ..usage
+        };
+        let (short, full) = usage_text(&fetched, Provider::Claude).unwrap();
+        assert!(short.ends_with(" · 2 pages fetched"), "{short}");
+        assert!(full.ends_with(" 2 pages fetched on Claude."), "{full}");
+        assert!(!full.contains("web search"), "{full}");
     }
 
     #[test]

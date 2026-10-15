@@ -448,11 +448,13 @@ fn signed_out_error() -> AppError {
 }
 
 /// A ChatGPT access token to call with: the stored one, refreshed first when less than
-/// `REFRESH_MARGIN` is left (and `earliest_refresh_at` has passed), or always when
-/// `force` (the API refused the token). A refresh the server refuses for good signs
-/// ChatGPT out (`SettingsChanged`) and is `auth_failed`; one that fails for a while
-/// (network, 5xx) keeps the tokens and uses the old access token while it lasts.
-pub async fn chatgpt_access_token(state: &App, force: bool) -> AppResult<String> {
+/// `REFRESH_MARGIN` is left (and `earliest_refresh_at` has passed). `refused` is the
+/// access token the API just refused (a forced refresh): under the refresh lock, a
+/// stored token other than it is already newer and is returned as it is; else it is
+/// refreshed, but never before `earliest_refresh_at`. A refresh the server refuses for
+/// good signs ChatGPT out (`SettingsChanged`) and is `auth_failed`; one that fails for a
+/// while (network, 5xx) keeps the tokens and uses the old access token while it lasts.
+pub async fn chatgpt_access_token(state: &App, refused: Option<&str>) -> AppResult<String> {
     let _one = state.providers.refresh.lock().await;
     let tokens = load_tokens(state).await?;
     let (Some(access), Some(refresh)) = (tokens.access_token.clone(), tokens.refresh_token.clone())
@@ -460,12 +462,27 @@ pub async fn chatgpt_access_token(state: &App, force: bool) -> AppResult<String>
         return Err(signed_out_error());
     };
     let now = Utc::now();
-    let fresh = tokens
-        .expires_at
-        .is_some_and(|at| at - now > REFRESH_MARGIN);
     let too_early = tokens.earliest_refresh_at.is_some_and(|at| now < at);
-    if !force && (fresh || too_early) {
-        return Ok(access);
+    match refused {
+        // Another call refreshed (or the owner signed in again) meanwhile.
+        Some(refused) if refused != access => return Ok(access),
+        Some(_) if too_early => {
+            tracing::warn!("ChatGPT refused the access token before it may be refreshed");
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                error_code::AUTH_FAILED,
+                "ChatGPT refused the sign-in's access token, and it can't be renewed yet. Try again in a few minutes.",
+            ));
+        }
+        Some(_) => {}
+        None => {
+            let fresh = tokens
+                .expires_at
+                .is_some_and(|at| at - now > REFRESH_MARGIN);
+            if fresh || too_early {
+                return Ok(access);
+            }
+        }
     }
     let endpoints = state.providers.endpoints();
     let client_id = tokens.client_id.clone().unwrap_or_default();
@@ -667,13 +684,9 @@ pub async fn chatgpt_start(State(state): State<AppState>) -> AppResult<Json<Chat
             .append_pair("ext_agent_host_id", &tokens.ext_agent_host_id);
         if tokens.client_id.is_none() {
             q.append_pair("agent_name_hint", AGENT_NAME);
-        } else {
-            if let Some(hint) = &tokens.id_token {
-                q.append_pair("id_token_hint", hint);
-            }
-            if let Some(email) = &tokens.email {
-                q.append_pair("login_hint", email);
-            }
+        } else if let Some(email) = &tokens.email {
+            // No `id_token_hint`: this URL goes to devices and the clipboard.
+            q.append_pair("login_hint", email);
         }
     }
     let authorize_url = url.to_string();
@@ -891,6 +904,16 @@ async fn complete(
     )
     .await?;
 
+    // Under the refresh lock and only while this sign-in is still the one waiting: a
+    // sign-out or a newer sign-in that came meanwhile wins.
+    let _one = app.providers.refresh.lock().await;
+    let current = matches!(
+        &*app.providers.flow.lock().unwrap(),
+        Flow::Waiting { state, .. } if *state == cb.state
+    );
+    if !current {
+        return Err("The sign-in was cancelled or replaced by a newer one.".into());
+    }
     let now = Utc::now();
     let mut tokens = load_tokens(app)
         .await
@@ -960,23 +983,24 @@ async fn validate_id_token(
     Ok(data.claims)
 }
 
-/// `GET /api/providers/chatgpt`.
+/// `GET /api/providers/chatgpt`. A sign-in that failed while valid tokens are kept is
+/// `SignedIn` with the failure as `last_error`.
 pub async fn chatgpt_status(State(state): State<AppState>) -> AppResult<Json<ChatGptStatus>> {
-    let pending = match &*state.providers.flow.lock().unwrap() {
-        Flow::Waiting { authorize_url, .. } => Some(ChatGptStatus::Waiting {
-            authorize_url: authorize_url.clone(),
-        }),
-        Flow::Failed(message) => Some(ChatGptStatus::Failed {
-            message: message.clone(),
-        }),
-        Flow::Idle => None,
+    let (waiting, failed) = match &*state.providers.flow.lock().unwrap() {
+        Flow::Waiting { authorize_url, .. } => (Some(authorize_url.clone()), None),
+        Flow::Failed(message) => (None, Some(message.clone())),
+        Flow::Idle => (None, None),
     };
-    if let Some(status) = pending {
-        return Ok(Json(status));
+    if let Some(authorize_url) = waiting {
+        return Ok(Json(ChatGptStatus::Waiting { authorize_url }));
     }
-    Ok(Json(match chatgpt_account(&state).await? {
-        Some(account) => ChatGptStatus::SignedIn { account },
-        None => ChatGptStatus::SignedOut,
+    Ok(Json(match (chatgpt_account(&state).await?, failed) {
+        (Some(account), last_error) => ChatGptStatus::SignedIn {
+            account,
+            last_error,
+        },
+        (None, Some(message)) => ChatGptStatus::Failed { message },
+        (None, None) => ChatGptStatus::SignedOut,
     }))
 }
 

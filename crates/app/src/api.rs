@@ -1928,7 +1928,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settings.claude_models, claude);
-        // An empty slot is refused, naming it.
+        // An empty slot is refused as the service refuses it (`no_model`).
         let err = api
             .patch_settings(&models_patch(
                 Provider::ChatGpt,
@@ -1940,7 +1940,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, Some(400));
-        assert_eq!(err.message, "Choose a ChatGPT model for small tasks.");
+        assert_eq!(err.code, margin_shared::error_code::NO_MODEL);
+        assert_eq!(
+            err.message,
+            "Every ChatGPT slot needs a model: chats, writing and small tasks."
+        );
 
         // The budget's numbers, saved with the rest of the pipeline kept.
         let mut fields = budget_fields(&settings.pipeline.budget);
@@ -2564,7 +2568,7 @@ mod tests {
             }
         );
         fake.state.lock().unwrap().chatgpt_finish = Some(Ok("owner@example.com".into()));
-        let ChatGptStatus::SignedIn { account } = api.chatgpt_status().await.unwrap() else {
+        let ChatGptStatus::SignedIn { account, .. } = api.chatgpt_status().await.unwrap() else {
             panic!("not signed in");
         };
         assert_eq!(account.email, "owner@example.com");
@@ -2580,6 +2584,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A sign-in that fails while signed in keeps the account and says why.
+        api.start_chatgpt().await.unwrap();
+        fake.state.lock().unwrap().chatgpt_finish = Some(Err("The owner declined.".into()));
+        let ChatGptStatus::SignedIn { last_error, .. } = api.chatgpt_status().await.unwrap() else {
+            panic!("still signed in");
+        };
+        assert_eq!(last_error.as_deref(), Some("The owner declined."));
+        assert!(api.settings().await.unwrap().chatgpt.is_some());
 
         api.sign_out_chatgpt().await.unwrap();
         assert_eq!(
@@ -2607,7 +2619,7 @@ mod tests {
             api.chatgpt_status().await.unwrap(),
             ChatGptStatus::SignedOut
         );
-        assert_eq!(fake.state.lock().unwrap().chatgpt_starts, 3);
+        assert_eq!(fake.state.lock().unwrap().chatgpt_starts, 4);
     }
 
     /// A chat is created on the provider asked for (else the default) and keeps it; a

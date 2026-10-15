@@ -281,15 +281,18 @@ impl CallError {
             }
             _ => (false, false),
         };
+        let code = if too_long {
+            error_code::CONTEXT_TOO_LONG
+        } else {
+            ai_error_code(e)
+        };
         Self {
-            message: error_text(e),
+            message: account_error_text(code)
+                .map(str::to_string)
+                .unwrap_or_else(|| error_text(e)),
             retryable: e.is_retryable(),
             retry_after: e.retry_after(),
-            code: if too_long {
-                error_code::CONTEXT_TOO_LONG
-            } else {
-                ai_error_code(e)
-            },
+            code,
             too_long,
             rejects_compaction,
         }
@@ -339,6 +342,22 @@ fn account_error_code(code: &str) -> Option<&'static str> {
             Some(error_code::PLAN_LIMIT_REACHED)
         }
         "subscription_sharing_user_not_eligible" => Some(error_code::PLAN_INELIGIBLE),
+        _ => None,
+    }
+}
+
+/// The Error item's fixed text for an account limit (D7), in place of the API's own
+/// words; `None` for every other code.
+fn account_error_text(code: &str) -> Option<&'static str> {
+    match code {
+        error_code::SPEND_LIMIT_REACHED => {
+            Some("Your Claude organization has reached its spend limit.")
+        }
+        error_code::PLAN_LIMIT_REACHED => Some(
+            "Margin's share of your ChatGPT plan is used up. Raise it in ChatGPT → Settings → \
+             Usage, or start a new chat on another provider.",
+        ),
+        error_code::PLAN_INELIGIBLE => Some("Your ChatGPT plan can't be used by apps like Margin."),
         _ => None,
     }
 }
@@ -997,11 +1016,14 @@ impl<'t, 'a> Turn<'t, 'a> {
                             rejects_compaction: false,
                         }));
                     }
-                    let message = format!("The model couldn't answer: {message}");
                     let code = if too_long {
                         error_code::CONTEXT_TOO_LONG
                     } else {
                         stream_error_code(code.as_deref())
+                    };
+                    let message = match account_error_text(code) {
+                        Some(text) => text.to_string(),
+                        None => format!("The model couldn't answer: {message}"),
                     };
                     return self.abandon(open, &calls, message, true, code).await;
                 }

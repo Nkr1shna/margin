@@ -161,6 +161,10 @@ pub enum ChatGptStatus {
     },
     SignedIn {
         account: ChatGptAccount,
+        /// Why the latest sign-in attempt failed, when it failed while this account's
+        /// sign-in stayed valid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
     Failed {
         message: String,
@@ -243,6 +247,15 @@ mod tests {
                     signed_in_at: Utc::now(),
                     expires_at: None,
                 },
+                last_error: None,
+            },
+            ChatGptStatus::SignedIn {
+                account: ChatGptAccount {
+                    email: "a@b.c".into(),
+                    signed_in_at: Utc::now(),
+                    expires_at: None,
+                },
+                last_error: Some("The owner declined.".into()),
             },
             ChatGptStatus::Failed {
                 message: "no".into(),

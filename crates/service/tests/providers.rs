@@ -31,8 +31,8 @@ use margin_service::state::{SETTINGS_ID, SettingsRow};
 use margin_shared::context::{TraceKind, TraceRow};
 use margin_shared::pipeline::Route;
 use margin_shared::{
-    ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatState, Event, Provider,
-    RouteModels, Settings, TitleSource, error_code, routes,
+    ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatItemKind, ChatState, Event,
+    Provider, RouteModels, Settings, TitleSource, error_code, routes,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -74,6 +74,8 @@ struct FakeAuth {
     earliest_in: Mutex<Option<i64>>,
     /// Signs id_tokens with another nonce.
     wrong_nonce: AtomicBool,
+    /// Held by a test to keep token requests waiting (each takes it while answering).
+    gate: tokio::sync::Mutex<()>,
 }
 
 impl FakeAuth {
@@ -99,6 +101,7 @@ impl FakeAuth {
             expires_in: AtomicI64::new(3600),
             earliest_in: Mutex::new(None),
             wrong_nonce: AtomicBool::new(false),
+            gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -194,6 +197,7 @@ async fn token(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     f.token_forms.lock().unwrap().push(form.clone());
+    let _gate = f.gate.lock().await;
     let refuse =
         |error: &str| (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
     match form["grant_type"].as_str() {
@@ -321,6 +325,25 @@ async fn browser(h: &Harness, authorize_url: &str) -> (u16, String) {
     (page.status().as_u16(), page.text().await.unwrap())
 }
 
+/// `browser` off the test's task (for a token exchange held at the fake's gate).
+fn browser_in_background(
+    http: reqwest::Client,
+    authorize_url: String,
+) -> tokio::task::JoinHandle<(u16, String)> {
+    tokio::spawn(async move {
+        let r = http.get(&authorize_url).send().await.unwrap();
+        assert_eq!(r.status(), 302);
+        let to = r.headers()[header::LOCATION].to_str().unwrap().to_string();
+        let page = http.get(&to).send().await.unwrap();
+        (page.status().as_u16(), page.text().await.unwrap())
+    })
+}
+
+/// Waits until the fake auth server has had `n` token requests.
+async fn token_requests(fake: &FakeAuth, n: usize) {
+    eventually(|| async { (fake.token_forms.lock().unwrap().len() >= n).then_some(()) }).await;
+}
+
 /// A whole sign-in.
 async fn sign_in_chatgpt(h: &Harness, t: &str) {
     let (start, _) = start_sign_in(h, t).await;
@@ -340,6 +363,20 @@ fn expire_in(h: &Harness, secs: i64) {
     h.secrets
         .set(CHATGPT_TOKENS, &serde_json::to_string(&t).unwrap())
         .unwrap();
+}
+
+/// Moves the stored `earliest_refresh_at` into the past.
+fn refreshable_now(h: &Harness) {
+    let mut t = stored_tokens(h);
+    t.earliest_refresh_at = Some(Utc::now() - chrono::Duration::seconds(1));
+    h.secrets
+        .set(CHATGPT_TOKENS, &serde_json::to_string(&t).unwrap())
+        .unwrap();
+}
+
+/// The stored id_token (kept after a sign-out, for the next sign-in).
+fn kept_id_token(h: &Harness) -> String {
+    stored_tokens(h).id_token.expect("an id_token")
 }
 
 async fn bearer(h: &Harness) -> Result<String, (String, String)> {
@@ -475,6 +512,11 @@ async fn settings_hold_three_slots_per_provider_and_the_keys_stay_on_the_service
     assert_eq!(r.status(), 400);
     let e: ApiError = r.json().await.unwrap();
     assert_eq!(e.code, "no_model");
+    // The app's fake answers with the same words (`crates/app/src/api.rs`).
+    assert_eq!(
+        e.message,
+        "Every ChatGPT slot needs a model: chats, writing and small tasks."
+    );
     assert_eq!(
         settings(&h, &t).await.chatgpt_models,
         RouteModels::chatgpt_default()
@@ -966,7 +1008,11 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
     let (code, page) = browser(&h, &start.authorize_url).await;
     assert_eq!(code, 200, "{page}");
     assert!(page.contains(OWNER_EMAIL), "{page}");
-    let ChatGptStatus::SignedIn { account } = status(&h, &t).await else {
+    let ChatGptStatus::SignedIn {
+        account,
+        last_error: None,
+    } = status(&h, &t).await
+    else {
         panic!("not signed in");
     };
     assert_eq!(account.email, OWNER_EMAIL);
@@ -1023,9 +1069,25 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
     expire_in(&h, 60);
     assert_eq!(bearer(&h).await.unwrap(), "at-2");
     assert_eq!(fake.token_forms.lock().unwrap().len(), 2);
-    // …unless the API refused the token (a forced refresh).
+    // Nor when the API refused the token (a forced refresh): it fails without signing
+    // out.
+    let (code, _) = providers::chatgpt_access_token(&h.state, Some("at-2"))
+        .await
+        .map_err(|e| (e.code.to_string(), e.message))
+        .unwrap_err();
+    assert_eq!(code, error_code::AUTH_FAILED);
+    assert_eq!(fake.token_forms.lock().unwrap().len(), 2);
+    assert!(stored_tokens(&h).is_signed_in());
+    // A refused token that is no longer the stored one: the stored one, no refresh.
+    let newer = providers::chatgpt_access_token(&h.state, Some("at-1"))
+        .await
+        .unwrap();
+    assert_eq!(newer, "at-2");
+    assert_eq!(fake.token_forms.lock().unwrap().len(), 2);
+    // Once `earliest_refresh_at` has passed, a refused token is refreshed.
     *fake.earliest_in.lock().unwrap() = None;
-    let forced = providers::chatgpt_access_token(&h.state, true)
+    refreshable_now(&h);
+    let forced = providers::chatgpt_access_token(&h.state, Some("at-2"))
         .await
         .unwrap();
     assert_eq!(forced, "at-3");
@@ -1059,6 +1121,31 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
     );
     let (code, _) = browser(&h, &start.authorize_url).await;
     assert_eq!(code, 200);
+
+    // Signing in again while signed in: the URL goes to devices and the clipboard, so
+    // it carries no id_token (`login_hint` only).
+    let id_token = kept_id_token(&h);
+    let (start, q) = start_sign_in(&h, &t).await;
+    assert!(!q.contains_key("id_token_hint"));
+    assert!(!start.authorize_url.contains(&id_token));
+    assert_eq!(q["login_hint"], OWNER_EMAIL);
+    // That attempt fails: still signed in, with why.
+    let denied = format!(
+        "{}?error=access_denied&error_description=The+owner+declined.&state={}",
+        q["redirect_uri"], start.state
+    );
+    assert_eq!(h.http.get(&denied).send().await.unwrap().status(), 400);
+    let ChatGptStatus::SignedIn {
+        account,
+        last_error,
+    } = status(&h, &t).await
+    else {
+        panic!("still signed in");
+    };
+    assert_eq!(account.email, OWNER_EMAIL);
+    assert_eq!(last_error.as_deref(), Some("The owner declined."));
+    assert!(bearer(&h).await.is_ok());
+
     let current = stored_tokens(&h).refresh_token.unwrap();
 
     // Sign-out revokes the refresh token and forgets the tokens.
@@ -1204,6 +1291,157 @@ async fn a_chatgpt_chat_refreshes_a_refused_token_once_and_its_title_has_no_pric
         .collect();
     assert_eq!(steps.len(), 1);
     assert!(steps[0].ok);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn account_limits_end_a_turn_with_the_fixed_d7_texts_not_the_apis_words() {
+    let (h, t) = signed_in().await;
+    let http = |status: u16, code: &str| {
+        Scripted::Fail(AiError::Http {
+            status,
+            message: "raw API words".into(),
+            retry_after: None,
+            code: Some(code.into()),
+        })
+    };
+    let streamed = |code: &str| {
+        Scripted::Events(vec![margin_ai::ModelEvent::Failed {
+            code: Some(code.into()),
+            message: "raw API words".into(),
+        }])
+    };
+    let plan_limit = "Margin's share of your ChatGPT plan is used up. Raise it in ChatGPT → \
+                      Settings → Usage, or start a new chat on another provider.";
+    let cases = [
+        (
+            http(429, "enforced_spend_limit_reached"),
+            error_code::SPEND_LIMIT_REACHED,
+            "Your Claude organization has reached its spend limit.",
+        ),
+        (
+            http(429, "subscription_sharing_usage_limit_exceeded"),
+            error_code::PLAN_LIMIT_REACHED,
+            plan_limit,
+        ),
+        (
+            streamed("subscription_sharing_usage_unavailable"),
+            error_code::PLAN_LIMIT_REACHED,
+            plan_limit,
+        ),
+        (
+            http(403, "subscription_sharing_user_not_eligible"),
+            error_code::PLAN_INELIGIBLE,
+            "Your ChatGPT plan can't be used by apps like Margin.",
+        ),
+    ];
+    for (reply, want_code, want_text) in cases {
+        h.generator.agent.push(reply);
+        let created = chat(&h, &t, json!({"message": {"text": "Hello"}})).await;
+        let d = wait_chat(&h, &t, &created.chat.id, |d| {
+            matches!(d.chat.state, ChatState::Failed { .. })
+        })
+        .await;
+        let error = d
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ChatItemKind::Error { message, code, .. } => Some((message, code)),
+                _ => None,
+            })
+            .expect("an Error item");
+        assert_eq!(error.0, want_text);
+        assert_eq!(error.1.as_deref(), Some(want_code));
+        assert!(!error.0.contains("raw API words"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_refreshes_of_one_refused_token_refresh_once() {
+    let (auth, fake) = start_fake_auth().await;
+    let (h, t) = signed_in().await;
+    use_fake_auth(&h, &auth);
+    sign_in_chatgpt(&h, &t).await;
+    assert_eq!(stored_tokens(&h).access_token.as_deref(), Some("at-1"));
+
+    // Two calls had `at-1` refused at once. The first refresh is held at the token
+    // endpoint while the second asks; the second waits for it and takes its token
+    // instead of refreshing again (which would rotate the refresh token twice).
+    let gate = fake.gate.lock().await;
+    let state = h.state.clone();
+    let first =
+        tokio::spawn(async move { providers::chatgpt_access_token(&state, Some("at-1")).await });
+    token_requests(&fake, 2).await;
+    let state = h.state.clone();
+    let second =
+        tokio::spawn(async move { providers::chatgpt_access_token(&state, Some("at-1")).await });
+    drop(gate);
+    let first = first.await.unwrap().map_err(|e| e.message).unwrap();
+    let second = second.await.unwrap().map_err(|e| e.message).unwrap();
+    assert_eq!((first.as_str(), second.as_str()), ("at-2", "at-2"));
+    assert_eq!(
+        fake.token_forms.lock().unwrap().len(),
+        2,
+        "the sign-in and one refresh"
+    );
+    assert!(stored_tokens(&h).is_signed_in());
+    assert!(matches!(
+        status(&h, &t).await,
+        ChatGptStatus::SignedIn { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_code_exchange_in_flight_does_not_undo_a_sign_out_or_a_newer_sign_in() {
+    let (auth, fake) = start_fake_auth().await;
+    let (h, t) = signed_in().await;
+    use_fake_auth(&h, &auth);
+
+    // The browser came back and the service is exchanging the code (held at the fake)
+    // when the owner signs out: the exchange's tokens are not stored.
+    let (start, _) = start_sign_in(&h, &t).await;
+    let gate = fake.gate.lock().await;
+    let page = browser_in_background(h.http.clone(), start.authorize_url.clone());
+    token_requests(&fake, 1).await;
+    let r = h
+        .delete(&t, routes::PROVIDERS_CHATGPT)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    drop(gate);
+    let (code, body) = page.await.unwrap();
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("cancelled"), "{body}");
+    assert_eq!(status(&h, &t).await, ChatGptStatus::SignedOut);
+    assert!(!stored_tokens(&h).is_signed_in());
+    assert!(settings(&h, &t).await.chatgpt.is_none());
+
+    // The same while a newer sign-in started: the older one stores nothing and the
+    // newer one is still waiting, then completes.
+    let (old, _) = start_sign_in(&h, &t).await;
+    let gate = fake.gate.lock().await;
+    let page = browser_in_background(h.http.clone(), old.authorize_url.clone());
+    token_requests(&fake, 2).await;
+    let (newer, _) = start_sign_in(&h, &t).await;
+    drop(gate);
+    let (code, body) = page.await.unwrap();
+    assert_eq!(code, 400, "{body}");
+    assert!(!stored_tokens(&h).is_signed_in());
+    assert_eq!(
+        status(&h, &t).await,
+        ChatGptStatus::Waiting {
+            authorize_url: newer.authorize_url.clone()
+        }
+    );
+    let (code, body) = browser(&h, &newer.authorize_url).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(matches!(
+        status(&h, &t).await,
+        ChatGptStatus::SignedIn {
+            last_error: None,
+            ..
+        }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

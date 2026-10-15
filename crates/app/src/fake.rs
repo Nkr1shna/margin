@@ -1799,22 +1799,18 @@ async fn patch_settings(
         (Provider::ChatGpt, &req.chatgpt_models),
         (Provider::Claude, &req.claude_models),
     ] {
+        // As the service's `checked_slots`.
         if let Some(models) = models
-            && let Some(route) = margin_shared::pipeline::Route::ALL
+            && margin_shared::pipeline::Route::ALL
                 .into_iter()
-                .find(|r| models.get(*r).trim().is_empty())
+                .any(|r| models.get(r).trim().is_empty())
         {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "bad_request",
+                error_code::NO_MODEL,
                 &format!(
-                    "Choose a {} model for {}.",
-                    provider.label(),
-                    match route {
-                        margin_shared::pipeline::Route::Chat => "chats",
-                        margin_shared::pipeline::Route::Write => "writing",
-                        margin_shared::pipeline::Route::Small => "small tasks",
-                    }
+                    "Every {} slot needs a model: chats, writing and small tasks.",
+                    provider.label()
                 ),
             );
         }
@@ -2107,11 +2103,23 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
                 Some(Ok(email)) => {
                     let account = fake_account(&email);
                     s.settings.chatgpt = Some(account.clone());
-                    s.chatgpt = ChatGptStatus::SignedIn { account };
+                    s.chatgpt = ChatGptStatus::SignedIn {
+                        account,
+                        last_error: None,
+                    };
                     s.settings.has_api_key = s.has_api_key;
                     changed = Some(s.settings.clone());
                 }
-                Some(Err(message)) => s.chatgpt = ChatGptStatus::Failed { message },
+                // As the service: a failed attempt while signed in keeps the account.
+                Some(Err(message)) => {
+                    s.chatgpt = match s.settings.chatgpt.clone() {
+                        Some(account) => ChatGptStatus::SignedIn {
+                            account,
+                            last_error: Some(message),
+                        },
+                        None => ChatGptStatus::Failed { message },
+                    }
+                }
                 None => {}
             }
         }

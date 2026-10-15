@@ -520,6 +520,8 @@ async fn a_claude_chat_runs_through_the_real_client_tools_web_replay_stop_and_re
         let usage = c.usage.unwrap();
         assert_eq!(usage.cache_write, 100);
         assert_eq!(usage.cached, 800);
+        // Every input token: 200 fresh + 800 read + 100 written.
+        assert_eq!(usage.input, 1100);
         assert!(c.cost_usd.is_some_and(|p| p > 0.0), "{c:#?}");
     }
 

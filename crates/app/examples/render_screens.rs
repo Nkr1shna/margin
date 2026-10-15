@@ -192,7 +192,10 @@ fn Harness(props: HarnessProps) -> Element {
                 Ok("signed_in") => {
                     let account = fake::fake_account("owner@example.com");
                     settings.chatgpt = Some(account.clone());
-                    Some(margin_shared::ChatGptStatus::SignedIn { account })
+                    Some(margin_shared::ChatGptStatus::SignedIn {
+                        account,
+                        last_error: None,
+                    })
                 }
                 Ok("failed") => Some(margin_shared::ChatGptStatus::Failed {
                     message: "The sign-in was cancelled in the browser.".into(),
