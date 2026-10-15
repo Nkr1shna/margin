@@ -981,6 +981,7 @@ pub async fn write_report(
         serde_json::from_value(run.summary["sections"].clone()).unwrap_or_default();
     if let Some(e) = efficiency {
         sections.push(crate::report::efficiency_section(e));
+        sections.push(crate::report::alerts_section(e));
     }
     let dir = paths.out.join("reports");
     std::fs::create_dir_all(&dir)?;

@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1923,8 +1923,11 @@ async fn ask_title(
 }
 
 /// A title from the model's reply: its first line without quotes or an ending period,
-/// cut like a first-line title (`chats::title_from`). `None` when nothing is left.
+/// cut like a first-line title (`chats::title_from`), normalised first
+/// (`text::for_model`: the model may have copied hidden characters from the chat's
+/// sources). `None` when nothing is left.
 pub fn model_title(reply: &str) -> Option<String> {
+    let reply = margin_shared::text::for_model(reply);
     let line = reply.trim().lines().next().unwrap_or("");
     let quotes: &[char] = &['"', '\'', '“', '”', '‘', '’', '«', '»', '`', '*'];
     let line = line.trim().trim_matches(quotes).trim();
@@ -2065,6 +2068,10 @@ pub struct TracedModel {
     provider: &'static str,
     purpose: Option<Purpose>,
     steps: AtomicU32,
+    /// The last step call failed before any output: the loop retries that step (after
+    /// a wait, a too-long condense or a compaction rejection), so the next step call
+    /// keeps its number.
+    step_failed: Arc<AtomicBool>,
     /// Where the loop's condense calls go: the small-tasks route
     /// (`pipeline.routes.small`), when it differs from the turn's.
     small: Option<SmallRoute>,
@@ -2092,6 +2099,7 @@ impl TracedModel {
             provider,
             purpose,
             steps: AtomicU32::new(0),
+            step_failed: Arc::new(AtomicBool::new(false)),
             small: None,
         }
     }
@@ -2127,7 +2135,13 @@ impl TracedModel {
                 row.prompt_version = Some(req.opts.prompt_version.clone().unwrap_or_else(|| {
                     trace::prompt_version("agent", margin_agent::system_prompt())
                 }));
-                let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+                // A retried step keeps the loop's step number (its first attempt's row
+                // already took the step's compaction, if any).
+                let step = if self.step_failed.swap(false, Ordering::Relaxed) {
+                    self.steps.load(Ordering::Relaxed).max(1)
+                } else {
+                    self.steps.fetch_add(1, Ordering::Relaxed) + 1
+                };
                 row.step = Some(step);
                 // A local condense reported before this step's call.
                 row.compaction = self.trace.take_compaction(step);
@@ -2158,12 +2172,19 @@ impl ModelClient for TracedModel {
                 span.row.model = Some(small.model.clone());
                 span.row.provider = Some(small.provider.to_string());
             }
+            let is_step = span.row.step.is_some();
             match client.stream(req).await {
-                Ok(stream) => Ok(
-                    Box::pin(TracedStream::new(stream, span, self.trace.state.clone()))
-                        as ModelStream,
-                ),
+                Ok(stream) => {
+                    let mut traced = TracedStream::new(stream, span, self.trace.state.clone());
+                    if is_step {
+                        traced = traced.flag_failure_without_output(self.step_failed.clone());
+                    }
+                    Ok(Box::pin(traced) as ModelStream)
+                }
                 Err(e) => {
+                    if is_step {
+                        self.step_failed.store(true, Ordering::Relaxed);
+                    }
                     span.fail(&self.trace.state.tracer, trace::ai_error_code(&e));
                     Err(e)
                 }
@@ -2260,5 +2281,18 @@ mod tests {
         let long = model_title(&"word ".repeat(30)).unwrap();
         assert_eq!(long.chars().count(), margin_shared::CHAT_TITLE_MAX);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn model_titles_are_normalised() {
+        // Bidi overrides, zero-width characters and controls go; the visible text stays.
+        assert_eq!(
+            model_title("\u{202E}Fou\u{200B}rier\u{0007} series\u{202C}.").as_deref(),
+            Some("Fourier series")
+        );
+        // Only invisible characters: no title.
+        assert_eq!(model_title("\u{200B}\u{FEFF}\u{202E}"), None);
+        // NFC: a decomposed é is stored composed.
+        assert_eq!(model_title("Caf\u{0065}\u{0301}").as_deref(), Some("Café"));
     }
 }

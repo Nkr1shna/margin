@@ -293,11 +293,46 @@ impl TraceSpan {
     }
 }
 
+/// The attempts of one job model call (`engines::job_model`): when the latest retried
+/// attempt began and how long the provider took on the latest attempt. A [`SpanGuard`]
+/// holding one times only the last attempt (each failed attempt before it has a row of
+/// its own) and records the provider's share of it as `provider_ms`.
+#[derive(Debug, Default)]
+pub struct AttemptClock {
+    retried_at: Mutex<Option<Instant>>,
+    provider: Mutex<Option<Duration>>,
+}
+
+impl AttemptClock {
+    /// A retried attempt begins now: the call's row is timed from here.
+    pub fn retry_started(&self) {
+        *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// The latest attempt's call to the provider took `took`.
+    pub fn provider_took(&self, took: Duration) {
+        *self.provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(took);
+    }
+
+    /// Restarts `span`'s timer at the latest retry and sets its `provider_ms`.
+    fn apply(&self, span: &mut TraceSpan) {
+        if let Some(at) = *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) {
+            span.started = at;
+            span.row.at =
+                Utc::now() - chrono::TimeDelta::from_std(at.elapsed()).unwrap_or_default();
+        }
+        if let Some(took) = *self.provider.lock().unwrap_or_else(|e| e.into_inner()) {
+            span.row.provider_ms = Some(took.as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 /// A span that records itself as failed with `cancelled` if it is dropped unfinished
 /// (a stopped turn drops the futures it was running).
 pub struct SpanGuard {
     span: Option<TraceSpan>,
     state: AppState,
+    clock: Option<std::sync::Arc<AttemptClock>>,
 }
 
 impl SpanGuard {
@@ -305,6 +340,7 @@ impl SpanGuard {
         Self {
             span: Some(span),
             state: state.clone(),
+            clock: None,
         }
     }
 
@@ -313,14 +349,28 @@ impl SpanGuard {
         &mut self.span.as_mut().expect("an unfinished span").row
     }
 
+    /// The clock of this call's attempts, for `engines::JobCalls`: the row is timed
+    /// from the last retried attempt's start and gets the provider's share of it.
+    pub fn clock(&mut self) -> std::sync::Arc<AttemptClock> {
+        self.clock.get_or_insert_with(Default::default).clone()
+    }
+
+    fn take(&mut self) -> Option<TraceSpan> {
+        let mut span = self.span.take()?;
+        if let Some(clock) = &self.clock {
+            clock.apply(&mut span);
+        }
+        Some(span)
+    }
+
     pub fn finish(mut self, ok: bool) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.finish(&self.state.tracer, ok);
         }
     }
 
     pub fn fail(mut self, code: &str) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.fail(&self.state.tracer, code);
         }
     }
@@ -328,7 +378,7 @@ impl SpanGuard {
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.fail(&self.state.tracer, "cancelled");
         }
     }
@@ -1047,6 +1097,11 @@ pub struct TracedStream {
     provider: Duration,
     /// When a poll last found nothing ready, until the next event arrives.
     waiting_since: Option<Instant>,
+    /// Whether the stream brought a finished item yet.
+    output: bool,
+    /// Set when the stream fails before any finished item (the agent loop retries
+    /// that step), cleared when it ends otherwise.
+    failed_without_output: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TracedStream {
@@ -1058,7 +1113,19 @@ impl TracedStream {
             state,
             provider,
             waiting_since: None,
+            output: false,
+            failed_without_output: None,
         }
+    }
+
+    /// Sets `flag` when the stream fails before any finished item and clears it when
+    /// it ends otherwise.
+    pub fn flag_failure_without_output(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.failed_without_output = Some(flag);
+        self
     }
 
     /// The provider's time so far, in ms.
@@ -1077,6 +1144,9 @@ impl TracedStream {
         let Some(mut span) = self.span.take() else {
             return;
         };
+        if let Some(flag) = &self.failed_without_output {
+            flag.store(!ok && !self.output, Ordering::Relaxed);
+        }
         // Dropped while waiting for the provider: that wait was the provider's.
         if let Some(since) = self.waiting_since.take() {
             self.provider += since.elapsed();
@@ -1122,6 +1192,14 @@ impl Stream for TracedStream {
         }
         match &polled {
             Poll::Ready(Some(Ok(event))) => match event {
+                E::Done { item, .. } => {
+                    let compacted = item.view == margin_ai::ItemView::Compaction;
+                    self.output = true;
+                    // The provider compacted the history in this call (D3).
+                    if compacted && let Some(span) = self.span.as_mut() {
+                        span.row.compaction = Some(margin_shared::context::Compaction::Server);
+                    }
+                }
                 E::Completed {
                     usage,
                     model,

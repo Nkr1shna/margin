@@ -450,8 +450,14 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                 );
             }
             Suite::Injection => {
-                margin_evals::injection::run(&env, variant, models.as_ref().unwrap(), store)
-                    .await?;
+                margin_evals::injection::run(
+                    &env,
+                    variant,
+                    models.as_ref().unwrap(),
+                    *judge,
+                    store,
+                )
+                .await?;
             }
             Suite::Agent => {
                 let m = models.as_ref().unwrap();

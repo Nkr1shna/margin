@@ -178,6 +178,9 @@ pub struct JobCalls {
     pub backoff: Backoff,
     pub on_wait: JobWait,
     pub on_failed: FailedAttempt,
+    /// The caller's row's clock (`SpanGuard::clock`): restarted when a retried attempt
+    /// begins, and given the provider's time on the last attempt (`provider_ms`).
+    pub clock: Option<Arc<crate::trace::AttemptClock>>,
 }
 
 tokio::task_local! {
@@ -191,6 +194,7 @@ impl JobCalls {
             backoff,
             on_wait: Arc::new(|_| {}),
             on_failed: Arc::new(|_, _| {}),
+            clock: None,
         }
     }
 
@@ -218,6 +222,8 @@ pub fn job_model(model: Arc<dyn TextModel>) -> Retrying<Attempts> {
     let inner = Attempts {
         inner: model,
         last: last.clone(),
+        clock: calls.clock,
+        attempts: std::sync::atomic::AtomicU32::new(0),
     };
     let (on_wait, on_failed) = (calls.on_wait, calls.on_failed);
     Retrying::new(
@@ -240,10 +246,28 @@ pub fn job_model(model: Arc<dyn TextModel>) -> Retrying<Attempts> {
 pub struct Attempts {
     inner: Arc<dyn TextModel>,
     last: Arc<std::sync::Mutex<Option<(&'static str, Duration)>>>,
+    clock: Option<Arc<crate::trace::AttemptClock>>,
+    attempts: std::sync::atomic::AtomicU32,
 }
 
 impl Attempts {
+    /// An attempt begins: a retried one restarts the caller's row's timer.
+    fn begin(&self) -> Instant {
+        let n = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n > 0
+            && let Some(clock) = &self.clock
+        {
+            clock.retry_started();
+        }
+        Instant::now()
+    }
+
     fn note<T>(&self, started: Instant, result: &Result<T, AiError>) {
+        if let Some(clock) = &self.clock {
+            clock.provider_took(started.elapsed());
+        }
         if let Err(e) = result {
             *self.last.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((crate::trace::ai_error_code(e), started.elapsed()));
@@ -260,7 +284,7 @@ impl TextModel for Attempts {
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> margin_ai::model::BoxFuture<'a, Result<TextOutput, AiError>> {
         Box::pin(async move {
-            let started = Instant::now();
+            let started = self.begin();
             let result = self
                 .inner
                 .stream_parts(instructions, input, opts, on_delta)
@@ -278,7 +302,7 @@ impl TextModel for Attempts {
         opts: &'a CallOptions,
     ) -> margin_ai::model::BoxFuture<'a, Result<TextOutput, AiError>> {
         Box::pin(async move {
-            let started = Instant::now();
+            let started = self.begin();
             let result = self
                 .inner
                 .stream_json(instructions, input, format, opts)

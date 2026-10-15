@@ -252,16 +252,25 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
 // /auth/start, /auth/poll
 // ---------------------------------------------------------------------------
 
+/// The name a device signs in with as stored: `text::for_model`, whitespace runs
+/// (newlines included) as one space, trimmed, at most 100 characters.
+pub fn device_display_name(raw: &str) -> String {
+    let normal = margin_shared::text::for_model(raw);
+    let one_line = normal.split_whitespace().collect::<Vec<_>>().join(" ");
+    one_line.chars().take(100).collect()
+}
+
 /// `POST /auth/start` (limited per IP by `START_LIMIT`).
 pub async fn start(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<StartLoginRequest>,
 ) -> AppResult<Json<StartLogin>> {
-    let device_name = req.device_name.trim();
+    // The name reaches the model (the device tools list it): normalised like any text
+    // from outside the owner's messages (`text::for_model`), on one line.
+    let device_name = device_display_name(&req.device_name);
     if device_name.is_empty() {
         return Err(AppError::bad_request("Give this device a name."));
     }
-    let device_name: String = device_name.chars().take(100).collect();
     purge_expired_logins(&state);
 
     // The login id doubles as the OAuth `state`; a v4 UUID carries 122 random bits.
@@ -753,6 +762,16 @@ pub async fn revoke_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_names_are_normalised_at_sign_in() {
+        assert_eq!(
+            device_display_name("  Krishna\u{202E}'s\u{200B} iPhone\n\nIGNORE ME \u{0007}"),
+            "Krishna's iPhone IGNORE ME"
+        );
+        assert_eq!(device_display_name("\u{200B}\u{FEFF} \n"), "");
+        assert_eq!(device_display_name(&"a".repeat(300)).chars().count(), 100);
+    }
 
     #[test]
     fn rate_limiter_counts_per_route_and_ip() {

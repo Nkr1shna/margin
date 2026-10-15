@@ -886,6 +886,7 @@ pub async fn plan_course(
         backoff: job_backoff(state),
         on_wait: chat_waits(state, chat_id),
         on_failed: failed_attempts(state, call.row().clone()),
+        clock: Some(call.clock()),
     };
     match calls
         .run(state.generator.plan_course(&ai, &req, &opts))
@@ -977,6 +978,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         backoff: job_backoff(state),
         on_wait: lesson_waits(state, &row.lesson),
         on_failed: failed_attempts(state, call.row().clone()),
+        clock: Some(call.clock()),
     };
     let result = calls
         .run(state.generator.write_lesson(&ai, &ctx, &opts, on_delta))

@@ -325,6 +325,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
             backoff: crate::ask::job_backoff(state),
             on_wait: video_waits(state, id),
             on_failed: failed_attempts(state, call.row().clone()),
+            clock: Some(call.clock()),
         };
         let code = match calls
             .run(state.generator.write_scene(&ai, &request, &opts))

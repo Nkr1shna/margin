@@ -190,6 +190,9 @@ impl Overhead {
         let ms: Vec<f64> = rows
             .iter()
             .filter(|r| r.kind == TraceKind::ModelCall)
+            // Job calls (lessons, scenes, the planner: the Write route) carry the
+            // provider's share too, but aren't agent steps.
+            .filter(|r| r.route != Some(margin_shared::pipeline::Route::Write))
             .filter_map(|r| r.provider_ms.map(|p| (r.duration_ms - p).max(0.0)))
             .collect();
         (!ms.is_empty()).then(|| Overhead {

@@ -905,9 +905,11 @@ pub async fn run_and_record(
     };
     let results = run_all(evals, contenders, judge, retry).await?;
     let summary = summarize(&results, contenders);
+    let sections = vec![crate::report::injection_section(&summary, judge.is_some())];
     run.summary = json!({
         "prompt_version": AGENT_PROMPT_VERSION,
         "providers": summary,
+        "sections": sections,
     });
     run.finished_at = Some(Utc::now());
     store.put_run(&run).await?;
@@ -917,11 +919,13 @@ pub async fn run_and_record(
 
 /// Runs the suite with `variant` and records it as a run: every provider with a key in
 /// the service's secret store (OpenAI's chat model; Claude's writing model, as
-/// `evals/runner.toml` names them), judged by the first small-tasks model.
+/// `evals/runner.toml` names them), judged by the first small-tasks model unless
+/// `judge` is false (`--no-judge`: mechanical checks only).
 pub async fn run(
     env: &Env<'_>,
     variant: &str,
     models: &Models,
+    judge: bool,
     store: &EvalStore,
 ) -> anyhow::Result<()> {
     crate::live::guard_env()?;
@@ -961,7 +965,7 @@ pub async fn run(
             small: client,
         });
     }
-    let judge = models.small.first().map(|m| m.as_ref());
+    let judge = models.small.first().filter(|_| judge).map(|m| m.as_ref());
     let (run, _) = run_and_record(
         &evals,
         variant,
