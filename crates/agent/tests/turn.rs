@@ -6,6 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use margin_agent::replay::{self, claude};
+use margin_agent::scripted::{
+    call_done, claude_assistant, claude_text_entry, claude_text_reply, claude_tool_calls_reply,
+    claude_tool_use_entry, completed_with, text_done, web_search_events,
+};
 use margin_agent::scripted::{
     function_call_item, message_item, reasoning_item, text_reply, tool_calls_reply, usage,
 };
@@ -18,12 +23,14 @@ use margin_agent::{
     user_message_input,
 };
 use margin_ai::{
-    AiError, ContextManagement, ModelEvent, ResponseRequest, ResponsesToolChoice as ToolChoice,
-    StreamEvent, to_model_events,
+    AiError, ContextManagement, ItemView, ModelEvent, ModelItem, ModelWindow, Next,
+    ResponseRequest, ResponsesToolChoice as ToolChoice, StartKind, StreamEvent,
+    ToolChoice as AgentToolChoice, WebTools, to_model_events,
 };
 use margin_shared::{
     Card, ChatItem, ChatItemKind, Decision, DeviceRef, DeviceToolOutput, ItemStatus, Platform,
-    Provider, ReasoningEffort, ResultCard, ResultTarget, Usage, Workspace, error_code,
+    Provider, ReasoningEffort, ResultCard, ResultTarget, Usage, WebCitation, WebResult,
+    WebResultsCard, Workspace, error_code,
 };
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
@@ -57,6 +64,14 @@ struct Stored {
 
 #[derive(Default)]
 struct Sink {
+    /// The chat model's window, as the service would give it.
+    window: Option<ModelWindow>,
+    /// The service remembers this provider rejected server compaction.
+    no_server_compaction: bool,
+    /// `compaction_rejected` calls.
+    rejections: Mutex<u32>,
+    /// `model_called` calls: step, model, stop reason.
+    model_calls: Mutex<Vec<(u32, String, String)>>,
     stored: Mutex<Stored>,
     /// Answers to confirmation cards, in order; none left waits forever (like a turn
     /// parked until Stop).
@@ -151,6 +166,66 @@ impl Sink {
         });
         s.model_items.insert(id, model.clone());
         model
+    }
+
+    /// Stores the turn's user message like the service does on Claude.
+    fn claude_user_message(&self, text: &str) -> Vec<Value> {
+        let model = claude::user_message("Context Margin adds to the owner's message: …", text);
+        let mut s = self.stored.lock().unwrap();
+        let seq = s.items.len() as u64 + 1;
+        let id = format!("i{seq}");
+        s.items.push(ChatItem {
+            id: id.clone(),
+            chat_id: "chat1".into(),
+            turn_id: "turn1".into(),
+            seq,
+            status: ItemStatus::Done,
+            created_at: at(),
+            updated_at: at(),
+            kind: ChatItemKind::UserMessage {
+                text: text.into(),
+                source_ids: vec![],
+                device_id: "mac".into(),
+                device_name: "MacBook Pro".into(),
+            },
+        });
+        s.model_items.insert(id, model.clone());
+        model
+    }
+
+    /// What the service starts the next turn on Claude from, and its `messages`.
+    fn claude_history(&self) -> (Vec<Value>, Vec<Value>) {
+        let s = self.stored.lock().unwrap();
+        let empty = Vec::new();
+        let items: Vec<ReplayItem> = s
+            .items
+            .iter()
+            .map(|item| ReplayItem {
+                item,
+                model_items: s.model_items.get(&item.id).unwrap_or(&empty),
+            })
+            .collect();
+        (
+            replay::history(Provider::Claude, &items),
+            claude::messages(&items),
+        )
+    }
+
+    fn claude_unanswered(&self) -> Vec<String> {
+        let s = self.stored.lock().unwrap();
+        let empty = Vec::new();
+        let items: Vec<ReplayItem> = s
+            .items
+            .iter()
+            .map(|item| ReplayItem {
+                item,
+                model_items: s.model_items.get(&item.id).unwrap_or(&empty),
+            })
+            .collect();
+        replay::unanswered(Provider::Claude, &items)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     fn replay(&self) -> Vec<Value> {
@@ -290,6 +365,25 @@ impl TurnSink for Sink {
     fn clear_waiting(&self) -> BoxFuture<'_, Result<(), SinkError>> {
         self.stored.lock().unwrap().events.push(Ev::ClearWaiting);
         Box::pin(async { Ok(()) })
+    }
+
+    fn model_window(&self) -> Option<ModelWindow> {
+        self.window
+    }
+
+    fn server_compaction(&self) -> bool {
+        !self.no_server_compaction
+    }
+
+    fn compaction_rejected(&self) {
+        *self.rejections.lock().unwrap() += 1;
+    }
+
+    fn model_called(&self, step: u32, model: &str, stop_reason: &str, _usage: &Usage) {
+        self.model_calls
+            .lock()
+            .unwrap()
+            .push((step, model.to_string(), stop_reason.to_string()));
     }
 }
 
@@ -580,10 +674,30 @@ async fn a_text_answer_streams_into_one_item() {
     assert_eq!(req.input[0]["role"], "developer");
     assert_eq!(req.input[0]["content"][0]["text"], system_prompt());
     assert_eq!(req.input[1..], history[..]);
-    assert_eq!(req.tools, tools.definitions());
+    let function_tools: Vec<Value> = req
+        .tools
+        .iter()
+        .filter(|t| t["type"] == "function")
+        .cloned()
+        .collect();
+    assert_eq!(function_tools, tools.definitions());
     assert_eq!(req.tool_choice, Some(ToolChoice::Auto));
     assert_eq!(req.parallel_tool_calls, Some(true));
     assert!(req.include_encrypted_reasoning);
+    // The neutral request: every tool, web search (no fetch on OpenAI), the agent
+    // prompt's version, the chat model's route.
+    let neutral = &model.model_requests()[0];
+    assert_eq!(neutral.tools, tools.tool_defs());
+    assert_eq!(
+        neutral.web,
+        WebTools {
+            search: true,
+            fetch: false
+        }
+    );
+    assert_eq!(neutral.opts.prompt_version.as_deref(), Some("agent-v2"));
+    assert_eq!(neutral.opts.route, margin_shared::pipeline::Route::Chat);
+    assert_eq!(neutral.compaction, Some(200_000));
     assert_eq!(req.prompt_cache_key.as_deref(), Some("chat1"));
     assert_eq!(req.reasoning.unwrap().effort, ReasoningEffort::High);
     assert_eq!(
@@ -714,11 +828,11 @@ async fn reasoning_summaries_and_refusals_are_items() {
     assert_eq!(text_of(&kinds[2]), "I can't help with that.");
     assert_eq!(sink.model_items("i2"), vec![reasoning_with_two]);
     assert_eq!(sink.model_items("i3"), vec![refusal]);
-    // No tools: none offered, no tool_choice.
-    let req = &model.requests()[0];
+    // No tools of Margin's: none offered (the provider's web search stays on).
+    let req = &model.model_requests()[0];
     assert!(req.tools.is_empty());
-    assert_eq!(req.tool_choice, None);
-    assert_eq!(req.parallel_tool_calls, None);
+    assert_eq!(req.tool_choice, AgentToolChoice::Auto);
+    assert!(req.web.search);
 }
 
 #[tokio::test]
@@ -1716,11 +1830,8 @@ async fn device_tools_are_offered_only_where_they_can_work() {
     )
     .await;
     assert_eq!(
-        model.requests()[0].tool_choice,
-        Some(ToolChoice::AllowedTools {
-            required: false,
-            names: vec!["list_topics".into(), "search".into()]
-        })
+        model.model_requests()[0].tool_choice,
+        AgentToolChoice::Allowed(vec!["list_topics".into(), "search".into()])
     );
 
     // No folders, the phone online: everything but exactly the three folder tools.
@@ -1738,7 +1849,7 @@ async fn device_tools_are_offered_only_where_they_can_work() {
         input(history.clone()),
     )
     .await;
-    let Some(ToolChoice::AllowedTools { names, .. }) = &model.requests()[0].tool_choice else {
+    let AgentToolChoice::Allowed(names) = &model.model_requests()[0].tool_choice else {
         panic!()
     };
     let left_out: Vec<String> = tools
@@ -1760,7 +1871,7 @@ async fn device_tools_are_offered_only_where_they_can_work() {
         with_folder.clone(),
     )
     .await;
-    let Some(ToolChoice::AllowedTools { names, .. }) = &model.requests()[0].tool_choice else {
+    let AgentToolChoice::Allowed(names) = &model.model_requests()[0].tool_choice else {
         panic!()
     };
     assert_eq!(
@@ -1936,11 +2047,18 @@ async fn without_server_compaction_a_long_history_is_condensed_here() {
     assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
 
     let requests = model.requests();
-    assert_eq!(requests.len(), 4);
-    // The summary call: no tools, the earlier exchange as a transcript.
-    let summary_req = &requests[2];
-    assert!(summary_req.tools.is_empty());
-    let transcript = summary_req.input[1]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(requests.len(), 3);
+    // The summary call: a plain text call on the small-tasks model, the earlier
+    // exchange as a transcript.
+    let summary = &model.text_calls()[0];
+    assert!(
+        summary
+            .0
+            .starts_with("You condense the earlier part of a chat")
+    );
+    assert_eq!(summary.1.route, margin_shared::pipeline::Route::Small);
+    assert_eq!(summary.1.cache_key.as_deref(), Some("chat:chat1"));
+    let transcript = summary.2.as_str();
     assert!(
         transcript.contains("Owner: Teach me about Fourier series"),
         "{transcript}"
@@ -1949,7 +2067,7 @@ async fn without_server_compaction_a_long_history_is_condensed_here() {
     assert!(!transcript.contains("Now quiz me"));
 
     // The next step: summary, then the current message and its calls verbatim.
-    let step = &requests[3];
+    let step = &requests[2];
     assert_eq!(step.context_management, None);
     let first_text = step.input[1]["content"][0]["text"].as_str().unwrap();
     assert!(first_text.starts_with(CONDENSED_HISTORY_PREFIX));
@@ -2156,5 +2274,875 @@ async fn pictures_follow_their_output_and_replay_identically() {
     assert_eq!(
         serde_json::to_string(&model.requests()[2].input[1..]).unwrap(),
         serde_json::to_string(&next).unwrap()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Providers (docs/agent-providers-brief.md D3–D6, D13)
+// ---------------------------------------------------------------------------
+
+fn claude_input(history: Vec<Value>) -> TurnInput {
+    TurnInput {
+        provider: Provider::Claude,
+        ..input(history)
+    }
+}
+
+/// The items of a web call's rows: (ToolCall, ToolResult, optional card).
+fn web_rows(sink: &Sink, id: &str) -> (ChatItem, ChatItem, Option<Card>) {
+    let items = sink.items();
+    let call = items
+        .iter()
+        .find(|i| matches!(&i.kind, ChatItemKind::ToolCall { call_id, .. } if call_id == id))
+        .cloned()
+        .expect("the web call's row");
+    let result = items
+        .iter()
+        .find(|i| matches!(&i.kind, ChatItemKind::ToolResult { call_id, .. } if call_id == id))
+        .cloned()
+        .expect("the web call's result");
+    let card = items.iter().find_map(|i| match &i.kind {
+        ChatItemKind::Card { call_id, card } if call_id == id => Some(card.clone()),
+        _ => None,
+    });
+    (call, result, card)
+}
+
+fn cited(index: u32, text: &str, stored: Value, citations: Vec<WebCitation>) -> ModelEvent {
+    ModelEvent::Done {
+        index,
+        item: ModelItem {
+            stored: vec![stored],
+            view: ItemView::Text {
+                text: text.into(),
+                citations,
+            },
+        },
+    }
+}
+
+fn shannon_citation() -> WebCitation {
+    WebCitation {
+        url: "https://en.wikipedia.org/wiki/Claude_Shannon".into(),
+        title: Some("Claude Shannon".into()),
+        cited_text: Some("born April 30, 1916".into()),
+        start: Some(0),
+        end: Some(25),
+    }
+}
+
+fn shift(events: Vec<ModelEvent>, by: u32) -> Vec<ModelEvent> {
+    events
+        .into_iter()
+        .map(|e| match e {
+            ModelEvent::Started { index, kind } => ModelEvent::Started {
+                index: index + by,
+                kind,
+            },
+            ModelEvent::Delta { index, delta } => ModelEvent::Delta {
+                index: index + by,
+                delta,
+            },
+            ModelEvent::Done { index, item } => ModelEvent::Done {
+                index: index + by,
+                item,
+            },
+            other => other,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_web_search_on_openai_is_rows_a_card_and_citations() {
+    let mut events = web_search_events(
+        false,
+        0,
+        "ws_1",
+        "claude shannon",
+        &[(
+            "https://en.wikipedia.org/wiki/Claude_Shannon",
+            "Claude Shannon",
+        )],
+        true,
+    );
+    let answer = "Shannon was born in 1916.";
+    events.push(ModelEvent::Started {
+        index: 1,
+        kind: StartKind::Text,
+    });
+    events.push(cited(
+        1,
+        answer,
+        message_item("msg_1", answer),
+        vec![shannon_citation()],
+    ));
+    events.push(completed_with(usage(100, 20), "completed", Next::Finished));
+    let model = ScriptedModel::new([Scripted::Events(events)]);
+    let sink = Sink::default();
+    let history = sink.user_message("when was Shannon born?");
+    let outcome = run(
+        &model,
+        &ToolRegistry::new(),
+        &sink,
+        Arc::new(NoDevices),
+        input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 1 });
+
+    let (call, result, card) = web_rows(&sink, "ws_1");
+    assert_eq!(call.status, ItemStatus::Done);
+    let ChatItemKind::ToolCall { name, label, .. } = &call.kind else {
+        panic!()
+    };
+    assert_eq!(name, "web_search");
+    assert_eq!(label, "Searching the web for “claude shannon”");
+    assert!(matches!(&result.kind,
+        ChatItemKind::ToolResult { ok: true, summary, .. } if summary == "1 result"));
+    // The `web_search_call` is stored once, with the call; replayed verbatim.
+    let stored = sink.model_items(&call.id);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0]["type"], "web_search_call");
+    assert!(sink.model_items(&result.id).is_empty());
+    assert_eq!(sink.replay()[1], stored[0]);
+    assert_eq!(sink.replay().len(), 3);
+    let sent_next = model.requests();
+    assert_eq!(sent_next.len(), 1);
+    assert!(
+        sink.full_output(&result.id)
+            .unwrap()
+            .contains("https://en.wikipedia.org/wiki/Claude_Shannon")
+    );
+    assert_eq!(
+        card,
+        Some(Card::WebResults(WebResultsCard {
+            query: "claude shannon".into(),
+            results: vec![WebResult {
+                url: "https://en.wikipedia.org/wiki/Claude_Shannon".into(),
+                title: Some("Claude Shannon".into()),
+                page_age: None,
+            }],
+        }))
+    );
+    assert!(sink.kinds().contains(&ChatItemKind::AssistantText {
+        text: answer.into(),
+        citations: vec![shannon_citation()],
+    }));
+    // Web calls are the provider's: never unanswered.
+    assert!(sink.unanswered().is_empty());
+}
+
+#[tokio::test]
+async fn a_web_search_on_claude_is_stored_as_blocks_and_replays_identically() {
+    let mut events = web_search_events(
+        true,
+        0,
+        "srvtoolu_1",
+        "claude shannon",
+        &[(
+            "https://en.wikipedia.org/wiki/Claude_Shannon",
+            "Claude Shannon",
+        )],
+        true,
+    );
+    let answer = "Shannon was born in 1916.";
+    events.push(ModelEvent::Started {
+        index: 2,
+        kind: StartKind::Text,
+    });
+    let mut text_block = claude_text_entry(answer);
+    text_block["block"]["citations"] = json!([{"type": "web_search_result_location",
+        "url": "https://en.wikipedia.org/wiki/Claude_Shannon", "title": "Claude Shannon",
+        "encrypted_index": "ei", "cited_text": "born April 30, 1916"}]);
+    events.push(cited(
+        2,
+        answer,
+        text_block.clone(),
+        vec![shannon_citation()],
+    ));
+    events.push(completed_with(usage(100, 20), "end_turn", Next::Finished));
+    let model = ScriptedModel::new([
+        Scripted::Events(events),
+        Scripted::Events(claude_text_reply(&["You're welcome."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("when was Shannon born?");
+    let outcome = run(
+        &model,
+        &ToolRegistry::new(),
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history.clone()),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 1 });
+
+    // The request: the user message rendered as one message; web search and fetch.
+    let req = model.model_requests()[0].clone();
+    assert_eq!(
+        req.history,
+        vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "Context Margin adds to the owner's message: …"},
+            {"type": "text", "text": "when was Shannon born?"},
+        ]})]
+    );
+    assert_eq!(
+        req.web,
+        WebTools {
+            search: true,
+            fetch: true
+        }
+    );
+    assert_eq!(req.system, system_prompt());
+
+    let (call, result, card) = web_rows(&sink, "srvtoolu_1");
+    assert_eq!(call.status, ItemStatus::Done);
+    assert!(matches!(&call.kind,
+        ChatItemKind::ToolCall { name, label, arguments, .. }
+            if name == "web_search" && label == "Searching the web for “claude shannon”"
+                && arguments == r#"{"query":"claude shannon"}"#));
+    // The call stores its `server_tool_use`, the result its `web_search_tool_result`
+    // (with `encrypted_content`), verbatim; the output the owner sees never has it.
+    assert_eq!(
+        claude::block_type(&sink.model_items(&call.id)[0]),
+        Some("server_tool_use")
+    );
+    let stored_result = sink.model_items(&result.id)[0].clone();
+    assert_eq!(
+        claude::block_type(&stored_result),
+        Some("web_search_tool_result")
+    );
+    assert!(stored_result.to_string().contains("encrypted_content"));
+    let output = sink.full_output(&result.id).unwrap();
+    assert!(output.contains("Claude Shannon") && output.contains("April 30, 2025"));
+    assert!(!output.contains("enc-"));
+    assert!(
+        matches!(card, Some(Card::WebResults(WebResultsCard { ref query, .. })) if query == "claude shannon")
+    );
+    assert!(sink.kinds().contains(&ChatItemKind::AssistantText {
+        text: answer.into(),
+        citations: vec![shannon_citation()],
+    }));
+
+    // The next turn starts from the stored entries; what the first call was sent is a
+    // byte-identical prefix of the next call, and the answer is one assistant message.
+    let (mut next, _) = sink.claude_history();
+    next.extend(sink.claude_user_message("thanks"));
+    run(
+        &model,
+        &ToolRegistry::new(),
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(next),
+    )
+    .await;
+    let second = &model.model_requests()[1];
+    assert_eq!(
+        serde_json::to_string(&second.history[..1]).unwrap(),
+        serde_json::to_string(&req.history).unwrap()
+    );
+    assert_eq!(second.history[1]["role"], "assistant");
+    let content = second.history[1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "server_tool_use");
+    assert_eq!(content[1]["type"], "web_search_tool_result");
+    assert_eq!(content[2], text_block["block"]);
+    assert!(sink.claude_unanswered().is_empty());
+}
+
+#[tokio::test]
+async fn a_paused_response_is_called_again_with_the_same_history() {
+    let mut first = web_search_events(
+        true,
+        0,
+        "srvtoolu_1",
+        "fft",
+        &[("https://f.example", "FFT")],
+        true,
+    );
+    first.push(completed_with(usage(50, 5), "pause_turn", Next::Paused));
+    let model = ScriptedModel::new([
+        Scripted::Events(first),
+        Scripted::Events(claude_text_reply(&["The FFT is fast."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("what is the fft?");
+    let outcome = run(
+        &model,
+        &ToolRegistry::new(),
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
+    let requests = model.model_requests();
+    assert_eq!(requests.len(), 2);
+    // The paused content goes back as it came, after the same prefix.
+    assert_eq!(requests[1].history[..1], requests[0].history[..]);
+    let (call, result, _) = web_rows(&sink, "srvtoolu_1");
+    assert_eq!(
+        requests[1].history[1],
+        json!({"role": "assistant", "content": [
+            claude::block(&sink.model_items(&call.id)[0]),
+            claude::block(&sink.model_items(&result.id)[0]),
+        ]})
+    );
+    // Each call reported for the trace, with its step and stop reason.
+    let calls = sink.model_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            (1, String::new(), "pause_turn".to_string()),
+            (2, String::new(), "end_turn".to_string())
+        ]
+    );
+}
+
+/// A search still running when the step ends with a client call: the call runs, the
+/// next step's first block is the search result, which finishes the open row.
+#[tokio::test]
+async fn a_pending_server_tool_is_finished_by_the_next_step() {
+    let log = Log::default();
+    let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    let mut first = web_search_events(true, 0, "srvtoolu_1", "fft", &[], false);
+    first.push(ModelEvent::Started {
+        index: 1,
+        kind: StartKind::ToolCall {
+            call_id: "toolu_1".into(),
+            name: "list_topics".into(),
+        },
+    });
+    first.push(call_done(
+        1,
+        "toolu_1",
+        "list_topics",
+        "{}",
+        claude_tool_use_entry("toolu_1", "list_topics", "{}"),
+    ));
+    first.push(completed_with(
+        usage(50, 5),
+        "tool_use",
+        Next::ServerToolPending,
+    ));
+    let mut second: Vec<ModelEvent> = web_search_events(
+        true,
+        0,
+        "srvtoolu_1",
+        "fft",
+        &[("https://f.example", "FFT")],
+        true,
+    )
+    .into_iter()
+    .filter_map(|e| match e {
+        ModelEvent::Done { item, .. } if matches!(item.view, ItemView::WebSearchResult { .. }) => {
+            Some(ModelEvent::Done { index: 0, item })
+        }
+        _ => None,
+    })
+    .collect();
+    second.push(ModelEvent::Started {
+        index: 1,
+        kind: StartKind::Text,
+    });
+    second.push(text_done(1, "Found it.", claude_text_entry("Found it.")));
+    second.push(completed_with(usage(60, 6), "end_turn", Next::Finished));
+    let model = ScriptedModel::new([Scripted::Events(first), Scripted::Events(second)]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("search and list");
+    let outcome = run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
+    assert_eq!(log.get(), vec!["start list_topics", "end list_topics"]);
+
+    // The second call: the pending server call with the client call, then its result.
+    let second_req = model.model_requests()[1].clone();
+    assert_eq!(second_req.history.len(), 3);
+    let assistant = second_req.history[1]["content"].as_array().unwrap();
+    assert_eq!(assistant[0]["type"], "server_tool_use");
+    assert_eq!(assistant[1]["type"], "tool_use");
+    assert_eq!(
+        second_req.history[2]["content"],
+        json!([{"type": "tool_result", "tool_use_id": "toolu_1", "content": "{\"from\":\"list_topics\"}", "is_error": false}])
+    );
+
+    // The open web row was finished by the result in the next step.
+    let (call, result, card) = web_rows(&sink, "srvtoolu_1");
+    assert_eq!(call.status, ItemStatus::Done);
+    assert!(
+        matches!(&result.kind, ChatItemKind::ToolResult { ok: true, summary, .. } if summary == "1 result")
+    );
+    assert!(card.is_some());
+    assert!(result.seq > call.seq);
+    // Replayed: the same messages, then the result and answer in one assistant message.
+    let (_, messages) = sink.claude_history();
+    assert_eq!(messages[..3], second_req.history[..]);
+    assert_eq!(messages[3]["content"][0]["type"], "web_search_tool_result");
+    assert_eq!(messages[3]["content"][1]["text"], "Found it.");
+}
+
+#[tokio::test]
+async fn a_web_call_still_open_when_the_turn_ends_is_cancelled() {
+    let log = Log::default();
+    let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    let mut first = web_search_events(true, 0, "srvtoolu_1", "fft", &[], false);
+    first.extend(shift(
+        claude_tool_calls_reply("t", &[("toolu_1", "list_topics", "{}")])
+            .into_iter()
+            .filter(|e| !matches!(e, ModelEvent::Completed { .. }))
+            .collect(),
+        1,
+    ));
+    first.push(completed_with(
+        usage(50, 5),
+        "tool_use",
+        Next::ServerToolPending,
+    ));
+    let model = ScriptedModel::new([
+        Scripted::Events(first),
+        // The result never comes.
+        Scripted::Events(claude_text_reply(&["I couldn't search."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("search and list");
+    let outcome = run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
+    let (call, result, card) = web_rows(&sink, "srvtoolu_1");
+    assert_eq!(call.status, ItemStatus::Cancelled);
+    assert!(
+        matches!(&result.kind, ChatItemKind::ToolResult { ok: false, summary, .. } if summary == "Cancelled")
+    );
+    assert!(sink.model_items(&result.id).is_empty());
+    assert!(card.is_none());
+    // The next turn leaves the unresolved server call out, and never counts it.
+    sink.claude_user_message("ok");
+    let (_, messages) = sink.claude_history();
+    assert!(
+        !serde_json::to_string(&messages)
+            .unwrap()
+            .contains("server_tool_use")
+    );
+    assert!(sink.claude_unanswered().is_empty());
+}
+
+#[tokio::test]
+async fn refusals_end_the_turn_without_a_retry() {
+    for (reason, message) in [
+        ("refusal", "The model declined to answer."),
+        ("refusal:cyber", "The model declined to answer (cyber)."),
+    ] {
+        let events = vec![
+            ModelEvent::Started {
+                index: 0,
+                kind: StartKind::Text,
+            },
+            text_done(
+                0,
+                "I can't help with that.",
+                claude_text_entry("I can't help with that."),
+            ),
+            ModelEvent::Incomplete {
+                reason: reason.into(),
+                usage: usage(10, 2),
+            },
+        ];
+        let model = ScriptedModel::new([Scripted::Events(events)]);
+        let sink = Sink::default();
+        let history = sink.claude_user_message("…");
+        let outcome = run(
+            &model,
+            &ToolRegistry::new(),
+            &sink,
+            Arc::new(NoDevices),
+            claude_input(history),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                error: message.into(),
+                retryable: false
+            }
+        );
+        assert_eq!(sink.error_code().as_deref(), Some(error_code::BAD_REQUEST));
+        assert_eq!(model.model_requests().len(), 1);
+        // The refusal's text is kept as it came.
+        assert_eq!(text_of(&sink.kinds()[1]), "I can't help with that.");
+    }
+}
+
+/// Claude steps: thinking with its signature and tool calls stored as blocks, results
+/// as `tool_result`s; each step's request is a byte-identical prefix of the next, and
+/// of the next turn's replay (preserved thinking needs that).
+#[tokio::test]
+async fn claude_steps_render_byte_identically_across_steps_and_turns() {
+    let log = Log::default();
+    let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    let model = ScriptedModel::new([
+        Scripted::Events(claude_tool_calls_reply(
+            "Look first.",
+            &[("toolu_1", "list_topics", "{}")],
+        )),
+        Scripted::Events(claude_text_reply(&["One topic."])),
+        Scripted::Events(claude_text_reply(&["Still one."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("what do I have?");
+    run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    let requests = model.model_requests();
+    let (first, second) = (&requests[0].history, &requests[1].history);
+    assert_eq!(
+        serde_json::to_string(&second[..first.len()]).unwrap(),
+        serde_json::to_string(first).unwrap()
+    );
+    assert_eq!(second[1]["content"][0]["type"], "thinking");
+    assert_eq!(second[1]["content"][0]["signature"], "sig-11");
+    assert_eq!(second[1]["content"][1]["type"], "tool_use");
+    assert_eq!(second[2]["content"][0]["tool_use_id"], "toolu_1");
+    // Stored per item.
+    let result = sink
+        .items()
+        .into_iter()
+        .find(|i| matches!(i.kind, ChatItemKind::ToolResult { .. }))
+        .unwrap();
+    assert_eq!(
+        sink.model_items(&result.id),
+        vec![claude::tool_result(
+            "toolu_1",
+            "{\"from\":\"list_topics\"}",
+            true,
+            &[]
+        )]
+    );
+
+    let (mut next, replayed) = sink.claude_history();
+    assert_eq!(
+        serde_json::to_string(&replayed[..second.len()]).unwrap(),
+        serde_json::to_string(second).unwrap()
+    );
+    next.extend(sink.claude_user_message("and now?"));
+    run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(next),
+    )
+    .await;
+    let third = &model.model_requests()[2].history;
+    assert_eq!(
+        serde_json::to_string(&third[..replayed.len()]).unwrap(),
+        serde_json::to_string(&replayed).unwrap()
+    );
+    assert_eq!(third.len(), replayed.len() + 1);
+}
+
+/// D5: on Claude the tool list and `tool_choice` never narrow; tools that can't work
+/// now answer why themselves.
+#[tokio::test]
+async fn claude_gates_tools_by_their_answers_not_the_request() {
+    let mut tools = registry(vec![FakeTool::new(
+        "list_topics",
+        ToolKind::Read,
+        &Log::default(),
+    )]);
+    for t in device_tools() {
+        tools.register(t);
+    }
+    // The Claude `input_schema` of each tool is its strict schema as it stands.
+    for def in tools.tool_defs() {
+        check_strict_schema(&def.parameters).unwrap();
+    }
+    let model = ScriptedModel::new([
+        Scripted::Events(claude_tool_calls_reply(
+            "Sync it.",
+            &[("toolu_1", "sync_folder", r#"{"workspace_id":"w1"}"#)],
+        )),
+        Scripted::Events(claude_text_reply(&["No folder is attached."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("sync my folder");
+    run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    let requests = model.model_requests();
+    assert_eq!(requests[0].tool_choice, AgentToolChoice::Auto);
+    assert_eq!(requests[0].tools, tools.tool_defs());
+    assert_eq!(requests[0].tools, requests[1].tools);
+    let output = requests[1].history[2]["content"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        output.contains("No folder is attached to this chat"),
+        "{output}"
+    );
+    assert_eq!(requests[1].history[2]["content"][0]["is_error"], true);
+}
+
+#[tokio::test]
+async fn chatgpt_steps_ask_for_one_call_at_a_time() {
+    let model = ScriptedModel::new([Scripted::Events(text_reply(&["hi"]))]);
+    let sink = Sink::default();
+    let history = sink.user_message("hi");
+    let tools = registry(vec![FakeTool::new(
+        "list_topics",
+        ToolKind::Read,
+        &Log::default(),
+    )]);
+    let chatgpt = TurnInput {
+        provider: Provider::ChatGpt,
+        ..input(history)
+    };
+    run(&model, &tools, &sink, Arc::new(NoDevices), chatgpt).await;
+    let req = &model.model_requests()[0];
+    assert!(!req.parallel_tool_calls);
+    assert_eq!(
+        req.web,
+        WebTools {
+            search: true,
+            fetch: false
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_compaction_threshold_scales_with_the_window() {
+    let window = |input, output| Some(ModelWindow { input, output });
+    for (window, threshold) in [
+        (None, 200_000),
+        (window(1_050_000, 128_000), 200_000),
+        (window(200_000, 32_000), 120_000),
+        (window(100_000, 8_000), 60_000),
+    ] {
+        let model = ScriptedModel::new([Scripted::Events(text_reply(&["hi"]))]);
+        let sink = Sink {
+            window,
+            ..Default::default()
+        };
+        let history = sink.user_message("hi");
+        run(
+            &model,
+            &ToolRegistry::new(),
+            &sink,
+            Arc::new(NoDevices),
+            input(history),
+        )
+        .await;
+        assert_eq!(
+            model.model_requests()[0].compaction,
+            Some(threshold),
+            "{window:?}"
+        );
+    }
+
+    // Condensing here starts at the same threshold: 70k input on a 100k window.
+    let log = Log::default();
+    let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    let mut first = tool_calls_reply(&[("call_1", "list_topics", "{}")]);
+    *first.last_mut().unwrap() = margin_agent::scripted::completed(Usage {
+        input_tokens: 70_000,
+        ..usage(0, 10)
+    });
+    let model = ScriptedModel::new([
+        Scripted::Events(first),
+        Scripted::Events(text_reply(&["They talked."])),
+        Scripted::Events(text_reply(&["ok"])),
+    ]);
+    let sink = Sink {
+        window: window(100_000, 8_000),
+        no_server_compaction: true,
+        ..Default::default()
+    };
+    let history = long_history(&sink);
+    run(&model, &tools, &sink, Arc::new(NoDevices), input(history)).await;
+    let requests = model.model_requests();
+    assert_eq!(
+        requests[0].compaction, None,
+        "the service remembered the rejection"
+    );
+    assert_eq!(model.text_calls().len(), 1);
+    assert!(
+        requests[1].history[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(CONDENSED_HISTORY_PREFIX)
+    );
+}
+
+#[tokio::test]
+async fn a_claude_compaction_rejection_is_remembered_by_the_service() {
+    let model = ScriptedModel::new([
+        Scripted::Fail(http(
+            400,
+            "anthropic-beta: compact-2026-01-12 is not available for this model",
+        )),
+        Scripted::Events(claude_text_reply(&["hi"])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("hi");
+    let outcome = run(
+        &model,
+        &ToolRegistry::new(),
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 1 });
+    let requests = model.model_requests();
+    assert_eq!(requests[0].compaction, Some(200_000));
+    assert_eq!(requests[1].compaction, None);
+    assert_eq!(*sink.rejections.lock().unwrap(), 1);
+}
+
+/// Condensing a Claude chat: the summary is a plain text call on the small model; the
+/// condensed tail keeps the current message and its calls but not their thinking.
+#[tokio::test]
+async fn condensing_on_claude_leaves_the_tails_thinking_out() {
+    let log = Log::default();
+    let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
+    let mut first = claude_tool_calls_reply("Plan it.", &[("toolu_1", "list_topics", "{}")]);
+    *first.last_mut().unwrap() = completed_with(
+        Usage {
+            input_tokens: 250_000,
+            ..usage(0, 10)
+        },
+        "tool_use",
+        Next::Finished,
+    );
+    let model = ScriptedModel::new([
+        Scripted::Events(first),
+        Scripted::Events(text_reply(&[
+            "They planned a Fourier course (topic_id t42).",
+        ])),
+        Scripted::Events(claude_text_reply(&["Question 1: …"])),
+    ]);
+    let sink = Sink {
+        no_server_compaction: true,
+        ..Default::default()
+    };
+    let mut history = sink.claude_user_message("Teach me about Fourier series");
+    history.push(claude_assistant(
+        json!({"type": "thinking", "thinking": "old thoughts", "signature": "s"}),
+    ));
+    history.push(claude_text_entry("Here is an outline (topic_id t42)."));
+    history.extend(sink.claude_user_message("Now quiz me"));
+    let outcome = run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    assert_eq!(outcome, TurnOutcome::Finished { steps: 2 });
+
+    let (instructions, opts, transcript) = model.text_calls()[0].clone();
+    assert!(instructions.starts_with("You condense"));
+    assert_eq!(opts.route, margin_shared::pipeline::Route::Small);
+    assert!(
+        transcript.contains("Owner: Teach me about Fourier series"),
+        "{transcript}"
+    );
+    assert!(transcript.contains("Assistant: Here is an outline (topic_id t42)."));
+    assert!(!transcript.contains("Now quiz me"));
+    assert!(!transcript.contains("old thoughts"));
+
+    let step = model.model_requests()[1].history.clone();
+    assert_eq!(step.len(), 3, "{step:?}");
+    let user = step[0]["content"].as_array().unwrap();
+    let note = user[0]["text"].as_str().unwrap();
+    assert!(note.starts_with("Margin: The earlier part of this chat was condensed"));
+    assert!(note.contains("Fourier course"));
+    assert_eq!(user[2]["text"], "Now quiz me");
+    assert_eq!(
+        step[1]["content"],
+        json!([{"type": "tool_use", "id": "toolu_1", "name": "list_topics", "input": {}}])
+    );
+    assert_eq!(step[2]["content"][0]["tool_use_id"], "toolu_1");
+    // Replay starts at the condensed note, the same way.
+    let (_, messages) = sink.claude_history();
+    assert_eq!(messages[..3], step[..]);
+}
+
+/// R1's pictures on Claude: inside the call's `tool_result`, not a message of their
+/// own, and still not output bytes.
+#[tokio::test]
+async fn claude_tool_results_carry_their_pictures() {
+    let log = Log::default();
+    let jpeg = margin_ai::Image {
+        media_type: "image/jpeg".into(),
+        data: vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3],
+    };
+    let mut view = FakeTool::new("view_picture", ToolKind::Read, &log);
+    view.output = "Page 3 of notes/paper.pdf.".into();
+    view.images = vec![jpeg.clone()];
+    let tools = registry(vec![view]);
+    let model = ScriptedModel::new([
+        Scripted::Events(claude_tool_calls_reply(
+            "Look.",
+            &[("toolu_p", "view_picture", "{}")],
+        )),
+        Scripted::Events(claude_text_reply(&["Figure 2 shows it."])),
+    ]);
+    let sink = Sink::default();
+    let history = sink.claude_user_message("show me page 3");
+    run(
+        &model,
+        &tools,
+        &sink,
+        Arc::new(NoDevices),
+        claude_input(history),
+    )
+    .await;
+    let result = sink
+        .items()
+        .into_iter()
+        .find(|i| matches!(i.kind, ChatItemKind::ToolResult { .. }))
+        .unwrap();
+    assert!(matches!(&result.kind,
+        ChatItemKind::ToolResult { output_bytes, .. } if *output_bytes == "Page 3 of notes/paper.pdf.".len() as u64));
+    let stored = sink.model_items(&result.id);
+    assert_eq!(
+        stored,
+        vec![claude::tool_result(
+            "toolu_p",
+            "Page 3 of notes/paper.pdf.",
+            true,
+            &[jpeg]
+        )]
+    );
+    let sent = &model.model_requests()[1].history;
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2]["content"][0]["content"][1]["type"], "image");
+    assert_eq!(
+        sent[2]["content"][0]["content"][1]["source"]["media_type"],
+        "image/jpeg"
     );
 }

@@ -1,6 +1,7 @@
 //! How the loop hands its items to the service.
 
 use chrono::{DateTime, Utc};
+use margin_ai::ModelWindow;
 use margin_shared::{ChatItem, ChatItemKind, Decision, ItemStatus, Usage};
 use serde_json::Value;
 
@@ -14,11 +15,13 @@ pub struct SinkError(pub String);
 /// What the service stores with an item besides the wire `ChatItem`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ItemRecord {
-    /// The Responses API items this chat item stands for, verbatim, replayed as `input`
-    /// on later calls: the `output_item.done` item for model output (message,
-    /// reasoning, function_call, compaction), the `function_call_output` for a tool
-    /// result, the `user_message_input` items for a user message. `None` leaves what
-    /// was stored unchanged.
+    /// The provider's wire items this chat item stands for, verbatim, replayed on later
+    /// calls (`replay::history`). On OpenAI and ChatGPT, Responses items: the
+    /// `output_item.done` item for model output (message, reasoning, function_call,
+    /// web_search_call, compaction), the `function_call_output` for a tool result, the
+    /// `user_message_input` items for a user message. On Claude, content blocks with
+    /// their role (`{"role":…,"block":…}`, `replay::claude`). `None` leaves what was
+    /// stored unchanged.
     pub model_items: Option<Vec<Value>>,
     /// A tool result's whole output as the model saw it (served by
     /// `routes::chat_item_output`). `None` leaves it unchanged.
@@ -85,5 +88,32 @@ pub trait TurnSink: Send + Sync {
     /// `Event::ChatChanged`. The service also clears it when the turn ends.
     fn clear_waiting(&self) -> BoxFuture<'_, Result<(), SinkError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// The chat model's context window (`ModelChoice.window`, D13). The loop asks the
+    /// server to compact at `min(COMPACT_THRESHOLD_TOKENS, 0.6 × window.input)`, and
+    /// condenses here past the same threshold when the server can't. `None`: the
+    /// constant alone.
+    fn model_window(&self) -> Option<ModelWindow> {
+        None
+    }
+
+    /// Whether to ask the server for compaction: false once this provider and base URL
+    /// rejected it (the service remembers that per `(provider, base_url)`, D3).
+    fn server_compaction(&self) -> bool {
+        true
+    }
+
+    /// The model API rejected server-side compaction (OpenAI: an unknown
+    /// `context_management`; Claude: a 400 naming the beta); the loop condenses here
+    /// for the rest of the run. The service remembers it for the provider and base URL.
+    fn compaction_rejected(&self) {}
+
+    /// One agent step's model call ended (`Completed` or `Incomplete`): its step number
+    /// (from 1, per run), the model that answered (empty when the provider didn't say),
+    /// the stop reason as the provider sent it, and its usage (also given to
+    /// [`TurnSink::add_usage`]). For the trace row (D14).
+    fn model_called(&self, step: u32, model: &str, stop_reason: &str, usage: &Usage) {
+        let _ = (step, model, stop_reason, usage);
     }
 }
