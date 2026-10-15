@@ -25,6 +25,12 @@ realfft = "=3.5.0"
 pdfium-render = "=0.9.4"
 image = "=0.25.10"
 parakeet-rs = { version = "=0.4.1", default-features = false, features = ["cpu", "api-28"] }
+# Office files (`src/office/`), pure Rust, no program on the guest: `zip` + `quick-xml`
+# read .docx and .pptx, `calamine` (which brings the same `zip` and `quick-xml`) reads
+# .xlsx. All MIT.
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+quick-xml = "=0.41.0"
+calamine = { version = "=0.36.1", features = ["dates"] }
 
 [features]
 default = ["heic"]
