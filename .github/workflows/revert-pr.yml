@@ -1,0 +1,94 @@
+# Revert-on-red (docs/plan-deploy.md §4a): when a merged PR breaks dev (smoke-dev fails, or
+# it misbehaves on devmargin), revert it first and fix forward in a new PR, so dev stays
+# shippable. Run by hand (Actions → revert-pr → Run workflow) with the PR number: opens a
+# PR into dev, labelled `revert`, that reverts the PR's commit on dev. Nothing is merged.
+#
+# Token: PROMOTE_TOKEN when set (its PR triggers CI), else GITHUB_TOKEN (then CI is
+# dispatched on the branch; reverting a PR that changed .github/workflows/ needs
+# PROMOTE_TOKEN, since GITHUB_TOKEN can't push workflow changes).
+name: revert-pr
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Number of the merged dev PR to revert"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: revert-pr-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  revert:
+    runs-on: [self-hosted, Linux, ARM64, margin]
+    timeout-minutes: 10
+    permissions:
+      contents: write       # push the revert branch
+      pull-requests: write  # open the revert PR
+      issues: write         # create the `revert` label if missing
+      actions: write        # dispatch CI on the branch
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
+      PR: ${{ inputs.pr }}
+    steps:
+      - name: Which commit the PR put on dev
+        id: pr
+        run: |
+          set -euo pipefail
+          case "$PR" in ""|*[!0-9]*) echo "::error::not a PR number: $PR"; exit 1 ;; esac
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,mergeCommit,title > "$RUNNER_TEMP/pr.json"
+          state="$(jq -r .state "$RUNNER_TEMP/pr.json")"
+          base="$(jq -r .baseRefName "$RUNNER_TEMP/pr.json")"
+          sha="$(jq -r '.mergeCommit.oid // empty' "$RUNNER_TEMP/pr.json")"
+          [ "$state" = MERGED ] && [ "$base" = dev ] && [ -n "$sha" ] \
+            || { echo "::error::#$PR is not a PR merged into dev (state $state, base $base)"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "#$PR put $sha on dev."
+
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+
+      - name: Open the revert PR
+        env:
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          set -euo pipefail
+          title="$(jq -r .title "$RUNNER_TEMP/pr.json")"
+          branch="revert/pr-$PR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -B "$branch" origin/dev
+          # A squash commit has one parent; PRs merged before squash merging have two.
+          mainline=""
+          [ "$(git rev-list --parents -n 1 "$SHA" | wc -w)" -gt 2 ] && mainline="-m 1"
+          if ! git revert --no-commit $mainline "$SHA"; then
+            git revert --abort || true
+            echo "::error::#$PR doesn't revert cleanly on today's dev (later PRs changed the same lines); revert it by hand."
+            exit 1
+          fi
+          git commit -q -m "Revert \"$title\" (#$PR)" -m "This reverts commit $SHA (#$PR), which broke dev. Fix forward in a new PR."
+          git push -q -f origin "$branch"
+          gh label create revert --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Reverts a PR that broke dev" > /dev/null 2>&1 || true
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --base dev --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing" ]; then
+            echo "Updated $existing"
+          else
+            url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base dev --head "$branch" --label revert \
+              --title "Revert \"$title\" (#$PR)" \
+              --body "Reverts #$PR (\`${SHA:0:7}\`) so dev is shippable again (revert-on-red, docs/plan-deploy.md §4a). Squash-merge it once CI passes; the fix comes back as a new PR.")"
+            echo "Opened $url"
+            echo "### [Revert #$PR]($url)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$HAS_PROMOTE_TOKEN" != true ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+            echo "Dispatched CI on $branch."
+          fi
