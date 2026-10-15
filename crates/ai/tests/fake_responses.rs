@@ -13,14 +13,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use margin_ai::evals::{self, QuestionKind, Rubric, SynthRequest, Winner};
-use margin_ai::prompts::{LESSON_CONSTANT, SCENE_CONSTANT};
+use margin_ai::prompts::{LESSON_CONSTANT, RERANK_CONSTANT, REWRITE_CONSTANT, SCENE_CONSTANT};
 use margin_ai::{
     AiError, Backoff, CallOptions, DocumentContents, FailedScene, Image, LessonContext, Passage,
     PlanRequest, Ranked, ReasoningConfig, ReasoningSummary, RerankCandidate, ResponseRequest,
-    ResponseStream, ResponsesClient, ResponsesToolChoice, SceneRequest, StreamEvent, plan_course,
-    rerank, write_lesson, write_lesson_with, write_scene, write_scene_with,
+    ResponseStream, ResponsesClient, ResponsesToolChoice, RewriteInput, SceneRequest, StreamEvent,
+    plan_course, rerank, rewrite_queries, write_lesson, write_lesson_with, write_scene,
+    write_scene_with,
 };
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
+use margin_shared::routes::{REWRITE_MAX_ADDED, REWRITE_MAX_OUTPUT_TOKENS};
 use margin_shared::{Level, OutlineLesson, ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
@@ -916,6 +918,159 @@ async fn rerank_returns_every_candidate_once() {
             .is_empty()
     );
     assert_eq!(all_requests(&fake).len(), 1);
+}
+
+fn rewrite_input(query: &str, purpose: RetrievalPurpose, names: &[&str]) -> RewriteInput {
+    RewriteInput {
+        query: query.into(),
+        purpose,
+        scope_names: names.iter().map(|n| n.to_string()).collect(),
+        max_added: REWRITE_MAX_ADDED,
+    }
+}
+
+#[tokio::test]
+async fn rewrite_queries_asks_for_strict_json_and_completes_the_answer() {
+    let (client, fake) = spawn(vec![
+        json_reply(json!({"queries": [
+            "  Gibbs ",
+            "gibbs phenomenon ringing",
+            "",
+            "Gibbs phenomenon  ringing?",
+            "overshoot near a jump",
+            "a third one",
+        ]})),
+        json_reply(json!({"queries": []})),
+        whole(text_stream(&["not json"])),
+    ])
+    .await;
+    let input = rewrite_input("gibbs", RetrievalPurpose::Agent, &["notes/dsp.pdf"]);
+    let opts = CallOptions::new(Route::Small);
+    let out = rewrite_queries(&client, &input, &opts).await.unwrap().value;
+    assert_eq!(out, ["gibbs phenomenon ringing", "overshoot near a jump"]);
+    let (_, body) = last_request(&fake);
+    assert_eq!(body["prompt_cache_key"], "rewrite:rewrite-v1");
+    assert_eq!(body["max_output_tokens"], REWRITE_MAX_OUTPUT_TOKENS);
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert_eq!(body["text"]["format"]["strict"], true);
+    assert_eq!(body["text"]["format"]["name"], "rewrite");
+    assert_eq!(body["instructions"], REWRITE_CONSTANT);
+    let sent = body["input"].as_str().unwrap();
+    assert!(sent.starts_with("Query: gibbs\n"), "{sent}");
+    assert!(sent.contains("At most 2 alternative queries."));
+    assert!(sent.contains("Documents searched:\n- notes/dsp.pdf\n"));
+
+    // The caller's options win; an empty answer is no alternatives.
+    let opts = CallOptions::new(Route::Small)
+        .with_cache_key("rewrite:other")
+        .with_max_output_tokens(50);
+    assert!(
+        rewrite_queries(&client, &input, &opts)
+            .await
+            .unwrap()
+            .value
+            .is_empty()
+    );
+    let (_, body) = last_request(&fake);
+    assert_eq!(body["prompt_cache_key"], "rewrite:other");
+    assert_eq!(body["max_output_tokens"], 50);
+    assert!(matches!(
+        rewrite_queries(&client, &input, &CallOptions::new(Route::Small)).await,
+        Err(AiError::Parse(m)) if m.contains("rewrite answer isn't the JSON")
+    ));
+
+    // Nothing to rewrite, or nothing asked for: no call.
+    let blank = rewrite_input("  ", RetrievalPurpose::Agent, &[]);
+    let none = RewriteInput {
+        max_added: 0,
+        ..input.clone()
+    };
+    for input in [blank, none] {
+        assert!(
+            rewrite_queries(&client, &input, &CallOptions::new(Route::Small))
+                .await
+                .unwrap()
+                .value
+                .is_empty()
+        );
+    }
+    assert_eq!(all_requests(&fake).len(), 3);
+}
+
+/// The prefix identity of R1's gate for the two R2 prompts on the Responses client:
+/// across varied queries, purposes, scopes and candidates, every rerank and rewrite
+/// request's instructions are its version's constant block byte for byte (neither has
+/// a variable part), the cache key is the one per version, and the constant block is
+/// sent nowhere else.
+#[tokio::test]
+async fn rerank_and_rewrite_prefixes_are_byte_identical_across_calls() {
+    let rewrites = [
+        rewrite_input("gibbs", RetrievalPurpose::Agent, &["notes/dsp.pdf"]),
+        rewrite_input("a_n", RetrievalPurpose::Context, &[]),
+        rewrite_input(
+            "Fourier series: projecting onto sines",
+            RetrievalPurpose::Lesson,
+            &["dsp.pdf", "lecture 4.mp4", "board.jpg"],
+        ),
+        rewrite_input("Signals", RetrievalPurpose::Plan, &["a.md"]),
+    ];
+    let rerank_queries = [
+        "why does the window leak",
+        "Fourier coefficients\nAlso asked: what is a_n\nAlso asked: why 2/T",
+    ];
+    let candidates: Vec<RerankCandidate> = (1..=3)
+        .map(|i| {
+            RerankCandidate::new(
+                format!("p{i}"),
+                "dsp.pdf",
+                Some(i),
+                "Fourier series > Coefficients",
+                format!("passage {i}"),
+            )
+        })
+        .collect();
+    let replies = rewrites
+        .iter()
+        .map(|_| json_reply(json!({"queries": ["x"]})))
+        .chain(
+            rerank_queries
+                .iter()
+                .map(|_| json_reply(json!({"ranking": []}))),
+        )
+        .collect();
+    let (client, fake) = spawn(replies).await;
+    let opts = CallOptions::new(Route::Small);
+    for input in &rewrites {
+        rewrite_queries(&client, input, &opts).await.unwrap();
+    }
+    for (i, q) in rerank_queries.iter().enumerate() {
+        rerank(&client, q, &candidates[i..], &opts).await.unwrap();
+    }
+    let sent = all_requests(&fake);
+    assert_eq!(sent.len(), rewrites.len() + rerank_queries.len());
+    for (i, body) in sent.iter().enumerate() {
+        let (constant, key) = if i < rewrites.len() {
+            (REWRITE_CONSTANT, "rewrite:rewrite-v1")
+        } else {
+            (RERANK_CONSTANT, "rerank:rerank-v1")
+        };
+        assert_eq!(body["instructions"], constant, "request {i}");
+        assert_eq!(body["prompt_cache_key"], key, "request {i}");
+        let input = body["input"].to_string();
+        assert!(
+            !input.contains(&constant[..80]),
+            "request {i}: the constant block is in the input"
+        );
+    }
+    // The inputs really differ, so the identity isn't vacuous.
+    assert_ne!(sent[0]["input"], sent[1]["input"]);
+    assert_ne!(sent[4]["input"], sent[5]["input"]);
+    assert!(
+        sent[5]["input"]
+            .as_str()
+            .unwrap()
+            .contains("[p2] dsp.pdf, p. 2, Fourier series > Coefficients:")
+    );
 }
 
 #[tokio::test]

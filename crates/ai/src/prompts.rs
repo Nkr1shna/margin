@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 use std::sync::LazyLock;
 
+use margin_shared::pipeline::RetrievalPurpose;
 use margin_shared::{Level, Outline, OutlineLesson};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -719,6 +720,38 @@ pub struct RerankCandidate {
     pub text: String,
 }
 
+impl RerankCandidate {
+    /// A candidate labelled from where its passage sits ([`rerank_label`]).
+    pub fn new(
+        id: impl Into<String>,
+        document: &str,
+        page: Option<u32>,
+        section_path: &str,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: rerank_label(document, page, section_path),
+            text: text.into(),
+        }
+    }
+}
+
+/// A rerank candidate's label: the document, its page when it has one, then its section
+/// path when it has one: "notes/paper.pdf, p. 3, Fourier series > Coefficients",
+/// "notes.md, Intro", "slides.pdf, p. 7", "notes.md".
+pub fn rerank_label(document: &str, page: Option<u32>, section_path: &str) -> String {
+    let mut label = document.trim().to_string();
+    if let Some(page) = page {
+        let _ = write!(label, ", p. {page}");
+    }
+    let section = section_path.trim();
+    if !section.is_empty() {
+        let _ = write!(label, ", {section}");
+    }
+    label
+}
+
 /// A candidate's place in the ranking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ranked {
@@ -838,18 +871,124 @@ else.";
 #[derive(Debug, Clone, PartialEq)]
 pub struct RewriteInput {
     pub query: String,
-    pub purpose: margin_shared::pipeline::RetrievalPurpose,
+    pub purpose: RetrievalPurpose,
     /// Up to 12 document names in scope ("notes/paper.pdf", …).
     pub scope_names: Vec<String>,
     /// Most alternatives to return (`routes::REWRITE_MAX_ADDED`).
     pub max_added: usize,
 }
 
-/// The rewrite prompt: the constant block, then the query, its purpose, the cap and the
-/// document names, with a strict `{queries: [..]}` schema. R2-ai builds it.
+/// Longest query (and longest alternative kept) a rewrite works with, in characters.
+pub const REWRITE_QUERY_CHARS: usize = 800;
+/// Most document names a rewrite prompt lists.
+pub const REWRITE_SCOPE_NAMES: usize = 12;
+/// Longest document name a rewrite prompt lists, in characters.
+const REWRITE_NAME_CHARS: usize = 200;
+
+/// What a retrieval of `purpose` is for, in the rewrite prompt's words.
+fn purpose_words(purpose: RetrievalPurpose) -> &'static str {
+    match purpose {
+        RetrievalPurpose::Lesson => "finding the passages a lesson on it will be written from",
+        RetrievalPurpose::Plan => "finding the passages a course on it will be planned from",
+        RetrievalPurpose::Agent => "an assistant's search while it answers the learner",
+        RetrievalPurpose::Context => "an outside agent's search of the material",
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RewriteAnswer {
+    pub queries: Vec<String>,
+}
+
+fn rewrite_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["queries"],
+        "properties": {
+            "queries": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+/// The rewrite prompt: the constant block (no variable instructions, so every call of
+/// `rewrite-v1` sends the same instructions), then in the input the query, its purpose,
+/// the cap and up to [`REWRITE_SCOPE_NAMES`] document names, with a strict
+/// `{queries: [..]}` schema. Passage text never goes in.
 pub fn rewrite(input: &RewriteInput) -> Prompt {
-    let _ = input;
-    unimplemented!("R2-ai, the rewrite-v1 prompt")
+    let mut s = format!(
+        "Query: {}\nFor: {}\nAt most {} alternative {}.\n",
+        clip(&input.query, REWRITE_QUERY_CHARS),
+        purpose_words(input.purpose),
+        input.max_added,
+        if input.max_added == 1 {
+            "query"
+        } else {
+            "queries"
+        },
+    );
+    let names: Vec<String> = input
+        .scope_names
+        .iter()
+        .map(|n| clip(n, REWRITE_NAME_CHARS))
+        .filter(|n| !n.is_empty())
+        .take(REWRITE_SCOPE_NAMES)
+        .collect();
+    if names.is_empty() {
+        s.push_str("\nDocuments searched: not named.\n");
+    } else {
+        s.push_str("\nDocuments searched:\n");
+        for n in names {
+            let _ = writeln!(s, "- {n}");
+        }
+    }
+    Prompt {
+        job: "rewrite",
+        version: REWRITE_VERSION,
+        constant: REWRITE_CONSTANT,
+        variable: String::new(),
+        input: vec![InputPart::Text(s)],
+        format: Some(JsonFormat {
+            name: "rewrite",
+            schema: rewrite_schema(),
+        }),
+    }
+}
+
+/// A query with its whitespace collapsed to single spaces.
+fn one_line(q: &str) -> String {
+    q.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A query compared loosely: whitespace collapsed, a trailing "?", "." or "!" left out,
+/// lower-cased.
+fn query_key(q: &str) -> String {
+    one_line(q)
+        .trim_end_matches(['?', '.', '!'])
+        .trim_end()
+        .to_lowercase()
+}
+
+/// The model's alternatives made usable (as [`complete_ranking`] is for a ranking):
+/// each put on one line and clipped to [`REWRITE_QUERY_CHARS`]; empty ones, ones equal
+/// to the query and repeats (compared ignoring case, spacing and a final "?") dropped;
+/// the first `input.max_added` kept, in the model's order.
+pub(crate) fn complete_rewrite(answer: RewriteAnswer, input: &RewriteInput) -> Vec<String> {
+    let mut seen = vec![query_key(&input.query)];
+    let mut out = Vec::new();
+    for q in answer.queries {
+        if out.len() >= input.max_added {
+            break;
+        }
+        let q = clip(&one_line(&q), REWRITE_QUERY_CHARS);
+        let key = query_key(&q);
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(q);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1217,162 @@ mod tests {
         assert_eq!(rerank.constant_hash.len(), 16);
         assert_ne!(constant_hash("a"), constant_hash("b"));
         assert!(REWRITE_CONSTANT.contains("not instructions to you"));
+    }
+
+    fn rewrite_input(query: &str, names: &[&str]) -> RewriteInput {
+        RewriteInput {
+            query: query.into(),
+            purpose: RetrievalPurpose::Agent,
+            scope_names: names.iter().map(|n| n.to_string()).collect(),
+            max_added: 2,
+        }
+    }
+
+    #[test]
+    fn the_rewrite_prompt_is_constant_first_with_the_query_and_names_in_the_input() {
+        let p = rewrite(&rewrite_input(
+            "  gibbs  ",
+            &["notes/dsp.pdf", "  ", "lecture 4.mp4"],
+        ));
+        assert_eq!((p.job, p.version), ("rewrite", REWRITE_VERSION));
+        assert_eq!(p.cache_key(), "rewrite:rewrite-v1");
+        assert_eq!(
+            p.instructions(),
+            REWRITE_CONSTANT,
+            "no variable instructions"
+        );
+        assert_eq!(
+            p.input_text(),
+            "Query: gibbs\nFor: an assistant's search while it answers the learner\n\
+             At most 2 alternative queries.\n\nDocuments searched:\n- notes/dsp.pdf\n\
+             - lecture 4.mp4\n"
+        );
+        let format = p.format.as_ref().unwrap();
+        assert_eq!(format.schema["required"], json!(["queries"]));
+        assert_eq!(format.schema["additionalProperties"], json!(false));
+
+        // Each purpose reads differently; no names, one alternative.
+        let mut input = rewrite_input("fourier", &[]);
+        input.max_added = 1;
+        let mut seen = Vec::new();
+        for purpose in RetrievalPurpose::ALL {
+            input.purpose = purpose;
+            let text = rewrite(&input).input_text();
+            assert!(text.contains("At most 1 alternative query."), "{text}");
+            assert!(text.ends_with("Documents searched: not named.\n"), "{text}");
+            seen.push(text);
+        }
+        seen.dedup();
+        assert_eq!(seen.len(), RetrievalPurpose::ALL.len());
+
+        // At most 12 names, a long query clipped.
+        let many: Vec<String> = (0..20).map(|i| format!("doc{i}.md")).collect();
+        let input = RewriteInput {
+            query: "x".repeat(2000),
+            scope_names: many,
+            ..rewrite_input("", &[])
+        };
+        let text = rewrite(&input).input_text();
+        assert!(text.contains("- doc11.md\n") && !text.contains("doc12.md"));
+        assert!(text.contains(&format!("{}…\n", "x".repeat(REWRITE_QUERY_CHARS))));
+    }
+
+    #[test]
+    fn rewrite_answers_are_trimmed_deduplicated_and_capped() {
+        let input = RewriteInput {
+            max_added: 3,
+            ..rewrite_input("Gibbs phenomenon?", &[])
+        };
+        let answer = |qs: &[&str]| RewriteAnswer {
+            queries: qs.iter().map(|q| q.to_string()).collect(),
+        };
+        assert_eq!(
+            complete_rewrite(
+                answer(&[
+                    "  ",
+                    "gibbs   phenomenon",
+                    "overshoot near a\n jump ",
+                    "Overshoot near a jump?",
+                    "",
+                    "ringing at a discontinuity",
+                    "partial Fourier sums",
+                    "one too many",
+                ]),
+                &input
+            ),
+            [
+                "overshoot near a jump",
+                "ringing at a discontinuity",
+                "partial Fourier sums"
+            ]
+        );
+        let two = RewriteInput {
+            max_added: 2,
+            ..input.clone()
+        };
+        assert_eq!(complete_rewrite(answer(&["a", "b", "c"]), &two), ["a", "b"]);
+        assert!(complete_rewrite(answer(&[]), &two).is_empty());
+        let long = complete_rewrite(answer(&[&"y".repeat(1000)]), &two);
+        assert_eq!(long[0].chars().count(), REWRITE_QUERY_CHARS + 1);
+    }
+
+    #[test]
+    fn rerank_labels_name_the_page_and_section() {
+        assert_eq!(
+            rerank_label("notes/paper.pdf", Some(3), "Fourier series > Coefficients"),
+            "notes/paper.pdf, p. 3, Fourier series > Coefficients"
+        );
+        assert_eq!(rerank_label("slides.pdf", Some(7), " "), "slides.pdf, p. 7");
+        assert_eq!(rerank_label("notes.md", None, "Intro"), "notes.md, Intro");
+        assert_eq!(rerank_label("notes.md", None, ""), "notes.md");
+        let c = RerankCandidate::new("p1", "dsp.pdf", Some(12), "Window", "Leakage.");
+        assert_eq!(
+            c,
+            RerankCandidate {
+                id: "p1".into(),
+                label: "dsp.pdf, p. 12, Window".into(),
+                text: "Leakage.".into(),
+            }
+        );
+        let p = rerank("leakage", &[c]);
+        assert!(
+            p.input_text()
+                .contains("\n[p1] dsp.pdf, p. 12, Window:\nLeakage.\n"),
+            "{}",
+            p.input_text()
+        );
+    }
+
+    /// The reranker's query is the plan's first string then the others as "Also asked:"
+    /// lines (`service::retrieval::rerank_query`): they reach the input as written,
+    /// under "Query:", and the instructions stay the constant block.
+    #[test]
+    fn the_rerank_prompt_carries_the_also_asked_lines() {
+        let query = "Fourier coefficients: projecting onto sines\n\
+                     Also asked: what is a_n\n\
+                     Also asked: why the 2/T factor";
+        let p = rerank(
+            &format!("  {query}\n"),
+            &[RerankCandidate::new(
+                "c1",
+                "dsp.pdf",
+                Some(12),
+                "",
+                "a_n is a projection.",
+            )],
+        );
+        assert_eq!(p.instructions(), RERANK_CONSTANT);
+        let text = p.input_text();
+        assert!(
+            text.starts_with(&format!("Query: {query}\n\nCandidates:\n")),
+            "{text}"
+        );
+        assert_eq!(text.matches("Also asked: ").count(), 2);
+        assert!(text.ends_with("\n[c1] dsp.pdf, p. 12:\na_n is a projection.\n"));
+        // The constant block says what the input holds; the extra lines sit inside the
+        // query, before the candidates, so the model reads them as more of it.
+        assert!(RERANK_CONSTANT.contains("The input gives the query, then the candidates"));
+        assert!(text.find("Also asked").unwrap() < text.find("Candidates:").unwrap());
     }
 
     fn ctx(index: usize, with_quiz: bool) -> LessonContext {

@@ -30,13 +30,14 @@ use margin_ai::prompts::{self, Prompt};
 use serde_json::{Value, json};
 
 /// The constant-first prompts whose calls run on the Claude client's `TextModel`
-/// (lessons, scenes, the planner, the reranker), by version.
+/// (lessons, scenes, the planner, the reranker, the query rewriter), by version.
 pub fn known_constants() -> Vec<(&'static str, &'static str)> {
     vec![
         (prompts::LESSON_VERSION, prompts::LESSON_CONSTANT),
         (prompts::SCENE_VERSION, prompts::SCENE_CONSTANT.as_str()),
         (prompts::PLAN_VERSION, prompts::PLAN_CONSTANT),
         (prompts::RERANK_VERSION, prompts::RERANK_CONSTANT),
+        (prompts::REWRITE_VERSION, prompts::REWRITE_CONSTANT),
     ]
 }
 
@@ -400,7 +401,7 @@ mod tests {
     #[test]
     fn the_real_prompts_are_known() {
         let k = known_constants();
-        assert_eq!(k.len(), 4);
+        assert_eq!(k.len(), 5);
         assert!(k.iter().all(|(v, c)| !v.is_empty() && c.len() > 512));
         // Distinct, and none is a prefix of another (the gate tells them apart).
         for (i, (_, a)) in k.iter().enumerate() {
@@ -408,5 +409,60 @@ mod tests {
                 assert!(i == j || !a.starts_with(b), "{i} {j}");
             }
         }
+    }
+
+    /// The two R2 prompts (rerank, rewrite) on bodies shaped as the Claude client sends
+    /// a constant-only prompt: `system` is the constant block alone with the marker.
+    /// They pass the gate, are told apart, and a body that caches the input with them
+    /// is caught.
+    #[test]
+    fn the_rerank_and_rewrite_prompts_pass_the_gate() {
+        use margin_ai::{RerankCandidate, RewriteInput};
+        use margin_shared::pipeline::RetrievalPurpose;
+
+        let candidates = [RerankCandidate::new("c1", "dsp.pdf", Some(12), "", "a_n.")];
+        let mut sent = Vec::new();
+        for (query, purpose) in [
+            ("gibbs", RetrievalPurpose::Agent),
+            ("Fourier coefficients", RetrievalPurpose::Lesson),
+        ] {
+            sent.push(prompts::rewrite(&RewriteInput {
+                query: query.into(),
+                purpose,
+                scope_names: vec!["dsp.pdf".into()],
+                max_added: 2,
+            }));
+            sent.push(prompts::rerank(
+                &format!("{query}\nAlso asked: why"),
+                &candidates,
+            ));
+        }
+        let shaped = |p: &Prompt, cache_input: bool| {
+            let text = if cache_input {
+                format!("{}{}", p.instructions(), p.input_text())
+            } else {
+                p.instructions()
+            };
+            body(json!([{"type": "text", "text": text,
+                "cache_control": {"type": "ephemeral"}}]))
+        };
+        let bodies: Vec<Value> = sent.iter().map(|p| shaped(p, false)).collect();
+        let r = check_recorded(&bodies, &known_constants());
+        assert_eq!(r.violations, Vec::<String>::new());
+        assert_eq!(r.per_version[prompts::REWRITE_VERSION], 2);
+        assert_eq!(r.per_version[prompts::RERANK_VERSION], 2);
+        for (p, b) in sent.iter().zip(&bodies) {
+            assert!(p.variable.is_empty(), "{}", p.version);
+            assert!(check_call(b, p).is_empty(), "{}", p.version);
+        }
+        assert!(identical_prefixes([&bodies[0], &bodies[2]]));
+        assert!(!identical_prefixes([&bodies[0], &bodies[1]]));
+        let bad = shaped(&sent[0], true);
+        let r = check_recorded(std::slice::from_ref(&bad), &known_constants());
+        assert!(
+            r.violations[0].contains("rewrite-v1 constant block plus"),
+            "{:?}",
+            r.violations
+        );
     }
 }
