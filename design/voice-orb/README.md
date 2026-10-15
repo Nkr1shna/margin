@@ -1,6 +1,6 @@
 # Voice orb study
 
-A prototype of Margin's voice agent as a single liquid-glass object, kept for the voice UI work (slice S6/S7 in `docs/ROADMAP.md`). It is a design reference, not app code: plain HTML and WebGL2, no build step needed to view.
+A prototype of Margin's voice agent as a single liquid-glass object, kept for the voice UI work (slices S6/S7 in `docs/later.md`). It is a design reference, not app code: plain HTML and WebGL2, no build step needed to view.
 
 Open `index.html` in a browser. The object cycles idle, listening, thinking and speaking on its own; a tap moves to the next mode, `t` switches light and dark, and the number keys switch forms:
 
