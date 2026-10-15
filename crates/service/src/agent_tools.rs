@@ -38,6 +38,7 @@ use margin_agent::{
 use margin_shared::context::{self, ContextQuery, Modality, Scope};
 use margin_shared::pipeline::Route;
 use margin_shared::routes::{TOOL_OUTPUT_PASSAGE_CHARS, TOOL_READ_PASSAGES_MAX, TOOL_SEARCH_K_MAX};
+use margin_shared::text::for_model;
 use margin_shared::{
     AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
     NewTopic, Note, NotePatch, Outline, OutlineCard, OutlineChips, OutlineLesson, PassagesCard,
@@ -861,12 +862,17 @@ fn search_output(
     for (i, p) in packed.iter().enumerate() {
         let n = i as u32 + 1;
         let hit = retrieval::packed_hit(p);
-        rows.push(passage_json(n, &p.citation, &hit));
-        // `image_url` stays a bare media file name; chats sign it on the way out.
+        let row = passage_json(n, &p.citation, &hit);
+        // The card shows the text the model read (D2.5): the whole packed passage as
+        // cut for the output, not only its first hit, so an instruction in a merged
+        // neighbour is visible to the owner too. `image_url` stays a bare media file
+        // name; chats sign it on the way out.
         citations.push(Citation {
             n,
+            excerpt: row["text"].as_str().unwrap_or_default().to_string(),
             ..p.citation.clone()
         });
+        rows.push(row);
     }
     let lib: Vec<Value> = library
         .iter()
@@ -1239,11 +1245,12 @@ impl TypedTool for ViewPicture {
                 return internal(e);
             }
             let p = &packed[0];
+            let text_in_picture = excerpt_keep_lines(&p.text, TOOL_OUTPUT_PASSAGE_CHARS);
             let output = json!({
                 "document_id": args.document_id,
                 "source": p.citation.source_name,
                 "page": p.citation.page,
-                "text_in_picture": excerpt_keep_lines(&p.text, TOOL_OUTPUT_PASSAGE_CHARS),
+                "text_in_picture": text_in_picture,
                 "shown_to_owner": true,
             });
             let summary = match p.citation.page {
@@ -1253,8 +1260,10 @@ impl TypedTool for ViewPicture {
             let out = ToolOutput::ok(output.to_string(), summary).with_card(Card::Passages(
                 PassagesCard {
                     query: summary_query(&p.citation),
+                    // The card shows the text the model read (D2.5).
                     passages: vec![Citation {
                         n: 1,
+                        excerpt: text_in_picture,
                         ..p.citation.clone()
                     }],
                 },
@@ -1401,13 +1410,24 @@ fn attached_workspace<'a>(ctx: &'a ToolContext, id: &str) -> Result<&'a Workspac
 
 /// The folder `path` names inside a folder ("" for its root), or the error output.
 fn folder_path(path: Option<&str>) -> Result<String, ToolOutput> {
-    let path = path.unwrap_or("");
+    let path = for_model(path.unwrap_or(""));
+    let path = path.as_str();
     match margin_shared::relative_components(path) {
         Ok(parts) => Ok(parts.join("/")),
         Err(_) => Err(ToolOutput::error(format!(
             "“{path}” isn't a path inside the folder."
         ))),
     }
+}
+
+/// A folder's files with their paths as the model reads them (`text::for_model`: NFC,
+/// no bidi or invisible characters). The listing tools match the model's `path` and
+/// `pattern` against these, since what they list is what the model passes back.
+fn normalised_paths(mut files: Vec<folders::FileView>) -> Vec<folders::FileView> {
+    for f in &mut files {
+        f.row.path = for_model(&f.row.path);
+    }
+    files
 }
 
 /// One file as `list_files` and `find_files` show it; `under` is the folder listed.
@@ -1551,7 +1571,7 @@ impl TypedTool for ListFiles {
                 Err(e) => return internal(e),
             };
             let files = match folders::files_of(state, &ws.id).await {
-                Ok(f) => f,
+                Ok(f) => normalised_paths(f),
                 Err(e) => return internal(e),
             };
             if !folders::has_folder(&files, &under) {
@@ -1621,10 +1641,10 @@ impl TypedTool for FindFiles {
                 Err(e) => return internal(e),
             };
             let files = match folders::files_of(state, &ws.id).await {
-                Ok(f) => f,
+                Ok(f) => normalised_paths(f),
                 Err(e) => return internal(e),
             };
-            let found = match folders::find(files, &under, args.pattern.trim()) {
+            let found = match folders::find(files, &under, for_model(&args.pattern).trim()) {
                 Ok(f) => f,
                 Err(message) => return ToolOutput::error(message),
             };
@@ -1638,7 +1658,7 @@ impl TypedTool for FindFiles {
                 &ws,
                 &under,
                 rows,
-                Some(("pattern", args.pattern.trim())),
+                Some(("pattern", for_model(&args.pattern).trim())),
             );
             let summary = match n {
                 0 => "No files match".to_string(),
@@ -1784,7 +1804,7 @@ impl TypedTool for CreateTopic {
         Box::pin(to_the_end(&self.0, ctx, async move {
             let req = NewTopic {
                 parent_id: args.parent_id,
-                title: args.title,
+                title: for_model(&args.title),
             };
             let topic = match library::new_topic(&state, req).await {
                 Ok(t) => t,
@@ -1841,7 +1861,7 @@ impl TypedTool for RenameTopic {
                 Err(e) => return failed(e),
             };
             let patch = TopicPatch {
-                title: Some(args.title),
+                title: Some(for_model(&args.title)),
                 ..TopicPatch::default()
             };
             let topic = match library::update_topic(&state, &args.topic_id, patch).await {
@@ -1956,7 +1976,7 @@ impl TypedTool for EditLessonTitle {
                 Err(e) => return failed(e),
             };
             let patch = LessonPatch {
-                title: Some(args.title),
+                title: Some(for_model(&args.title)),
                 ..LessonPatch::default()
             };
             let lesson =
@@ -2008,7 +2028,7 @@ impl TypedTool for CreateNote {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let title = match library::clean_title(&args.title, "note") {
+            let title = match library::clean_title(&for_model(&args.title), "note") {
                 Ok(t) => t,
                 Err(e) => return failed(e),
             };
@@ -2016,7 +2036,7 @@ impl TypedTool for CreateNote {
                 topic_id: args.topic_id,
                 lesson_id: args.lesson_id,
                 title,
-                body_md: args.body_md,
+                body_md: for_model(&args.body_md),
                 quote: None,
             };
             let note = match library::new_note(&state, req, Author::Agent).await {
@@ -2068,7 +2088,8 @@ impl TypedTool for AppendToNote {
     fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         let state = self.0.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
-            let text = args.text.trim();
+            let text = for_model(&args.text);
+            let text = text.trim();
             if text.is_empty() {
                 return ToolOutput::error("Give some text to add.");
             }
@@ -2145,7 +2166,7 @@ impl TypedTool for ReplaceNoteBody {
         Box::pin(to_the_end(&self.0, ctx, async move {
             let patch = NotePatch {
                 title: None,
-                body_md: Some(args.body_md),
+                body_md: Some(for_model(&args.body_md)),
             };
             let note = match library::update_note(&state, &args.note_id, patch, Author::Agent).await
             {
@@ -2226,8 +2247,10 @@ impl TypedTool for ProposeCourse {
         let chat_id = ctx.chat_id.clone();
         let turn_id = ctx.turn_id.clone();
         Box::pin(to_the_end(&self.0, ctx, async move {
+            // Everything here is the model's writing, which may echo what a file said:
+            // stored and shown normalised (`text::for_model`).
             let request = AskRequest {
-                prompt: args.prompt,
+                prompt: for_model(&args.prompt),
                 lesson_count: args.lessons.len() as u32,
                 level: args.level.into(),
                 with_videos: args.with_videos,
@@ -2236,14 +2259,14 @@ impl TypedTool for ProposeCourse {
                 source_ids: args.source_ids,
             };
             let outline = Outline {
-                topic_title: args.topic_title,
-                subject_title: args.subject_title,
+                topic_title: for_model(&args.topic_title),
+                subject_title: for_model(&args.subject_title),
                 lessons: args
                     .lessons
                     .into_iter()
                     .map(|l| OutlineLesson {
-                        title: l.title,
-                        summary: l.summary,
+                        title: for_model(&l.title),
+                        summary: for_model(&l.summary),
                         minutes: l.minutes,
                     })
                     .collect(),
