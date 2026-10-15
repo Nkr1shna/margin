@@ -9,15 +9,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// The Linux readers' programs and library, for Settings → Tools and the service's
+/// warnings: `find_tesseract` (OCR; without it pictures ingest without text),
+/// `find_ffmpeg` (audio and video), `find_pdfium` (PDFs; `set_tools_dir` adds the
+/// service's tools folder to where the library is looked for).
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+pub use av_ffmpeg::{FFMPEG, FFPROBE, Ffmpeg, find_ffmpeg};
 pub use backend::{Backend, OnnxDtype, UnknownBackend, embedder_version};
 /// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+pub use ocr_tesseract::{TESSERACT, find_tesseract};
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+pub use pdf_pdfium::{find_pdfium, pdfium_library_name, set_tools_dir};
 pub use transcript::{FLUIDAUDIOCLI, Transcript, Word, find_fluidaudiocli, transcribe};
 
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
 mod av;
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+mod av_ffmpeg;
 mod backend;
 mod chunk;
 #[cfg(target_os = "macos")]
@@ -27,14 +39,22 @@ mod extract;
 pub mod fake;
 #[cfg(target_os = "macos")]
 mod image;
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+mod image_linux;
 #[cfg(all(test, target_os = "macos"))]
 mod media_tests;
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+mod ocr_tesseract;
 #[cfg(any(target_os = "linux", feature = "onnx"))]
 pub mod onnx;
 #[cfg(target_os = "macos")]
 mod pdf;
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+mod pdf_pdfium;
 mod rank;
 mod transcript;
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+pub mod transcript_parakeet;
 #[cfg(target_os = "macos")]
 mod vision;
 
@@ -691,9 +711,17 @@ pub fn pdf_page_picture(path: &Path, page: u32, out: &Path) -> Result<(), EmbedE
     pdf::page_picture(path, page, out)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// On Linux with pdfium (`pdf_pdfium.rs`), at the same 144 dpi and 2048 px cap.
+#[cfg(target_os = "linux")]
+pub fn pdf_page_picture(path: &Path, page: u32, out: &Path) -> Result<(), EmbedError> {
+    pdf_pdfium::page_picture(path, page, out)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn pdf_page_picture(_path: &Path, _page: u32, _out: &Path) -> Result<(), EmbedError> {
-    Err(EmbedError::Extract("reading PDFs needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading PDFs needs macOS or Linux".into(),
+    ))
 }
 
 /// Splits 16 kHz mono samples into the windows the audio encoder embeds: consecutive
@@ -728,9 +756,17 @@ pub fn jpeg_for_model(path: &Path, max_side: usize) -> Result<Vec<u8>, EmbedErro
     image::jpeg(path, max_side, 0.85)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// On Linux with `image` (+ libheif), EXIF orientation applied (`image_linux.rs`).
+#[cfg(target_os = "linux")]
+pub fn jpeg_for_model(path: &Path, max_side: usize) -> Result<Vec<u8>, EmbedError> {
+    image_linux::jpeg(path, max_side, image_linux::MODEL_JPEG_QUALITY)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn jpeg_for_model(_path: &Path, _max_side: usize) -> Result<Vec<u8>, EmbedError> {
-    Err(EmbedError::Extract("reading images needs macOS".into()))
+    Err(EmbedError::Extract(
+        "reading images needs macOS or Linux".into(),
+    ))
 }
 
 /// A piece of a source small enough to embed.

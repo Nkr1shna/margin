@@ -29,7 +29,29 @@ pub(crate) trait TextGraph: Send {
         rows: usize,
         cols: usize,
     ) -> Result<Vec<Vec<f32>>, EmbedError>;
+
+    /// One sequence (`ids`, all attended) whose placeholder tokens take `media`'s feature
+    /// rows (`vision.rs`, `audio.rs`). Returns its embedding. Graphs without media inputs
+    /// refuse.
+    fn run_media(&mut self, ids: &[i64], media: MediaRows<'_>) -> Result<Vec<f32>, EmbedError> {
+        let _ = (ids, media);
+        Err(EmbedError::Embed("this graph takes no media".into()))
+    }
 }
+
+/// Encoder rows for one of the text graph's media inputs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MediaRows<'a> {
+    /// `IMAGE_FEATURES` or `AUDIO_FEATURES`.
+    pub input: &'a str,
+    /// `count × FEATURE_WIDTH`, row-major.
+    pub rows: &'a [f32],
+    pub count: usize,
+}
+
+/// The text graph's media inputs.
+pub(crate) const IMAGE_FEATURES: &str = "image_features";
+pub(crate) const AUDIO_FEATURES: &str = "audio_features";
 
 /// One input or output of a graph, as `describe` reports it.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +65,7 @@ pub struct GraphPort {
 
 /// The process's ONNX Runtime environment: `ort` allows one per process, so it is made
 /// once and kept.
-fn environment() -> Result<&'static Environment, EmbedError> {
+pub(crate) fn environment() -> Result<&'static Environment, EmbedError> {
     static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
     ENV.get_or_init(|| {
         ort::init()
@@ -210,14 +232,45 @@ fn read_rows(value: &DynValue, rows: usize) -> Result<Vec<Vec<f32>>, EmbedError>
     Ok(data.chunks_exact(width).map(<[f32]>::to_vec).collect())
 }
 
-impl TextGraph for OrtTextGraph {
-    fn run(
+/// Reads any float output (f32 or f16) as its shape and values.
+pub(crate) fn read_floats(value: &DynValue) -> Result<(Vec<i64>, Vec<f32>), EmbedError> {
+    match value.try_extract_tensor::<f32>() {
+        Ok((shape, data)) => Ok((shape.to_vec(), data.to_vec())),
+        Err(_) => {
+            let (shape, data) = value.try_extract_tensor::<f16>().map_err(run_error)?;
+            Ok((shape.to_vec(), data.iter().map(|x| x.to_f32()).collect()))
+        }
+    }
+}
+
+impl OrtTextGraph {
+    /// Runs `rows × cols` ids with their mask; the media inputs are empty except the one
+    /// `media` fills.
+    fn run_inputs(
         &mut self,
         ids: &[i64],
         mask: &[i64],
         rows: usize,
         cols: usize,
+        media: Option<MediaRows<'_>>,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if let Some(m) = media {
+            let Some(input) = self.empty.iter().find(|e| e.name == m.input) else {
+                return Err(EmbedError::Embed(format!(
+                    "the text graph has no {} input",
+                    m.input
+                )));
+            };
+            if m.rows.len() != m.count * input.width {
+                return Err(EmbedError::Embed(format!(
+                    "{} has {} values for {} rows of {}",
+                    m.input,
+                    m.rows.len(),
+                    m.count,
+                    input.width
+                )));
+            }
+        }
         let mut inputs: Vec<(String, ort::session::SessionInputValue<'_>)> = vec![
             (
                 INPUT_IDS.into(),
@@ -233,11 +286,18 @@ impl TextGraph for OrtTextGraph {
             ),
         ];
         for e in &self.empty {
+            let (count, data): (usize, &[f32]) = match media {
+                Some(m) if m.input == e.name => (m.count, m.rows),
+                _ => (0, &[]),
+            };
             let value = match e.ty {
-                TensorElementType::Float16 => Tensor::from_array(([0, e.width], Vec::<f16>::new()))
-                    .map_err(run_error)?
-                    .into_dyn(),
-                _ => Tensor::from_array(([0, e.width], Vec::<f32>::new()))
+                TensorElementType::Float16 => Tensor::from_array((
+                    [count, e.width],
+                    data.iter().map(|x| f16::from_f32(*x)).collect::<Vec<f16>>(),
+                ))
+                .map_err(run_error)?
+                .into_dyn(),
+                _ => Tensor::from_array(([count, e.width], data.to_vec()))
                     .map_err(run_error)?
                     .into_dyn(),
             };
@@ -248,5 +308,24 @@ impl TextGraph for OrtTextGraph {
             .get(SENTENCE_EMBEDDING)
             .ok_or_else(|| EmbedError::Embed(format!("no {SENTENCE_EMBEDDING} output")))?;
         read_rows(value, rows)
+    }
+}
+
+impl TextGraph for OrtTextGraph {
+    fn run(
+        &mut self,
+        ids: &[i64],
+        mask: &[i64],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.run_inputs(ids, mask, rows, cols, None)
+    }
+
+    fn run_media(&mut self, ids: &[i64], media: MediaRows<'_>) -> Result<Vec<f32>, EmbedError> {
+        let mask = vec![1i64; ids.len()];
+        let mut rows = self.run_inputs(ids, &mask, 1, ids.len(), Some(media))?;
+        rows.pop()
+            .ok_or_else(|| EmbedError::Embed("the model returned no vector".into()))
     }
 }

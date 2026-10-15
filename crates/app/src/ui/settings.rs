@@ -1,15 +1,16 @@
 //! Settings: service, account and devices, AI provider and key, the three model slots
-//! and the retrieval pipeline's stages and budget, the embedding model for sources, voice, render
-//! size, tools on the service Mac, trace retention, and appearance.
+//! and the retrieval pipeline's stages and budget, the embedding model for sources (and the
+//! speech model a Linux service downloads), voice, render
+//! size, tools on the service, trace retention, and appearance.
 
 use dioxus::prelude::*;
 use margin_shared::pipeline::{
     Budget, NamedVariant, PipelineConfig, PipelineVariants, Route, STAGE_KINDS,
 };
 use margin_shared::{
-    Device, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id, ReasoningEffort, SOURCE_KINDS,
-    Settings, SettingsPatch, Source, SourceKind, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile,
-    Workspace, WorkspaceSync,
+    Device, EmbeddingModel, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id,
+    ReasoningEffort, ReindexProgress, SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind,
+    SpeechModel, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
 };
 
 use crate::config::{Appearance, normalize_service_url};
@@ -261,7 +262,7 @@ fn ServiceSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Service" }
-            p { class: "help", "Where your library lives: the Margin service on the service Mac." }
+            p { class: "help", "Where your library lives: the Margin service." }
             if *editing.read() {
                 form {
                     style: "display: grid; gap: 14px",
@@ -698,11 +699,11 @@ fn AiSection(settings: Settings) -> Element {
                             button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                         }
                     }
-                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and stored in the service Mac's Keychain. It is never shown again." }
+                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its secret store (the Keychain on a Mac, a private file on Linux). It is never shown again." }
                 } else {
                     div { class: "key-saved",
                         Icon { name: "check" }
-                        span { class: "grow", style: "white-space: normal", "Saved in the service Mac's Keychain" }
+                        span { class: "grow", style: "white-space: normal", "Saved in the service's secret store" }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| replacing.set(true), "Replace" }
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                     }
@@ -715,7 +716,7 @@ fn AiSection(settings: Settings) -> Element {
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the API key?",
-                message: "The key is deleted from the service Mac's Keychain. Asking and generating stop working until you add a key again.",
+                message: "The key is deleted from the service's secret store. Asking and generating stop working until you add a key again.",
                 confirm_label: "Remove key",
                 busy: *key_busy.read(),
                 on_cancel: move |_| confirm_remove.set(false),
@@ -1060,10 +1061,11 @@ pub fn parse_budget(fields: &[String; 4]) -> Result<Budget, (BudgetField, &'stat
 }
 
 /// `cfg` with its stages, prompts and budget back to the defaults; the model slots (its
-/// routes) are kept, since Models sets them.
+/// routes) are kept, since Models sets them, and so is the embedder (the service's).
 pub fn reset_pipeline(cfg: &PipelineConfig) -> PipelineConfig {
     PipelineConfig {
         routes: cfg.routes.clone(),
+        embedder: cfg.embedder.clone(),
         ..PipelineConfig::default()
     }
 }
@@ -1072,6 +1074,7 @@ pub fn reset_pipeline(cfg: &PipelineConfig) -> PipelineConfig {
 pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
     vec![
         ("Chunker", cfg.chunker.name.clone()),
+        ("Embedder", cfg.embedder.name.clone()),
         ("Retriever", cfg.retriever.name.clone()),
         ("Fusion", cfg.fusion.name.clone()),
         ("Reranker", cfg.reranker.name.clone()),
@@ -1085,6 +1088,7 @@ pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
 pub fn stage_label(kind: &str) -> &'static str {
     match kind {
         "chunker" => "Chunker",
+        "embedder" => "Embedder",
         "retriever" => "Retriever",
         "fusion" => "Fusion",
         "reranker" => "Reranker",
@@ -1099,6 +1103,9 @@ pub fn stage_help(kind: &str) -> &'static str {
     match kind {
         "chunker" => {
             "How sources are cut into passages. A new chunker applies as sources are read again."
+        }
+        "embedder" => {
+            "The model passages are embedded with. It is set in the service's config (embedder in service.toml), not here; changing it there re-indexes every source once."
         }
         "retriever" => "How passages are found: by meaning, by words, or both.",
         "fusion" => "How the meaning and word results are merged into one list.",
@@ -1278,6 +1285,18 @@ fn StageForm(cfg: PipelineConfig, variants: PipelineVariants, saved_note: Signal
             }
             div { class: "grid2",
                 for kind in STAGE_KINDS {
+                    if kind == "embedder" {
+                        div { key: "{kind}", class: "field",
+                            span { class: "label", {stage_label(kind)} }
+                            span {
+                                id: "pl-stage-{kind}",
+                                class: "mono",
+                                "aria-describedby": "pl-stage-{kind}-help",
+                                {d.stage_name(kind).unwrap_or_default().to_string()}
+                            }
+                            span { id: "pl-stage-{kind}-help", class: "faint", style: "font-size: 13px", {stage_help(kind)} }
+                        }
+                    } else {
                     div { key: "{kind}", class: "field",
                         label { r#for: "pl-stage-{kind}", {stage_label(kind)} }
                         select {
@@ -1299,6 +1318,7 @@ fn StageForm(cfg: PipelineConfig, variants: PipelineVariants, saved_note: Signal
                             }
                         }
                         span { id: "pl-stage-{kind}-help", class: "faint", style: "font-size: 13px", {stage_help(kind)} }
+                    }
                     }
                 }
             }
@@ -1604,13 +1624,15 @@ fn SourcesSection() -> Element {
         section { class: "set-sec",
             h2 { "Embedding model" }
             p { class: "help",
-                "EmbeddingGemma 2 runs on the service Mac. It reads your sources ({SOURCE_KINDS}) and finds the passages, pages, pictures and clips that outlines and lessons draw on."
+                "EmbeddingGemma 2 runs on the service. It reads your sources ({SOURCE_KINDS}) and finds the passages, pages, pictures and clips that outlines and lessons draw on."
             }
             match (model, load.read().clone()) {
                 (Some(model), _) => rsx! {
                     div { class: "kv",
                         span { "Model" }
                         span { class: "mono", "{model.repo}" }
+                        span { "Runs on" }
+                        span { {model_runtime(&model.repo)} }
                         span { "Parts" }
                         span { "Text, image and audio encoders" }
                         span { "Status" }
@@ -1662,11 +1684,17 @@ fn SourcesSection() -> Element {
             if let Some(err) = error.read().clone() {
                 span { class: "save-state error", "{err}" }
             }
+            if let Some(progress) = app.lib.read().embedding.as_ref().and_then(|m| m.reindex) {
+                ReindexLine { progress }
+            }
+        }
+        if let Some(speech) = app.lib.read().embedding.as_ref().and_then(|m| m.speech.clone()) {
+            SpeechModelSection { speech }
         }
         if *confirm_remove.read() {
             ConfirmDialog {
                 title: "Remove the embedding model?",
-                message: "Its files are deleted from the service Mac. New sources wait in the queue until you download it again.",
+                message: "Its files are deleted from the service. New sources wait in the queue until you download it again.",
                 confirm_label: "Remove model",
                 busy: *busy.read(),
                 on_cancel: move |_| confirm_remove.set(false),
@@ -1681,6 +1709,130 @@ fn SourcesSection() -> Element {
                         }
                         Err(e) => error.set(Some(app.failure(&e))),
                     }
+                    busy.set(false);
+                    confirm_remove.set(false);
+                },
+            }
+        }
+    }
+}
+
+/// The one pass that re-embeds every source after the service's embedder changed.
+#[component]
+fn ReindexLine(progress: ReindexProgress) -> Element {
+    let ReindexProgress { done, total } = progress;
+    let pct = (done.min(total) * 100).checked_div(total).unwrap_or(0);
+    rsx! {
+        div { class: "progress", "aria-label": "Re-indexing",
+            div {
+                class: "bar wide",
+                role: "progressbar",
+                "aria-label": "Re-indexing the sources with the new embedder",
+                "aria-valuemin": "0",
+                "aria-valuemax": "100",
+                "aria-valuenow": "{pct}",
+                "aria-valuetext": "{done} of {total} documents",
+                i { style: "width: {pct}%" }
+            }
+            span { class: "faint", "Re-indexing {done} of {total} documents with the new embedder. Until a document is done, search finds it by its words." }
+        }
+    }
+}
+
+/// Shows the model a request answered with, or why it failed.
+fn apply_model(
+    app: crate::state::AppCtx,
+    mut error: Signal<Option<String>>,
+    result: crate::api::ApiResult<EmbeddingModel>,
+) {
+    match result {
+        Ok(model) => {
+            let mut lib = app.lib;
+            lib.write().apply(Event::EmbeddingModelChanged { model });
+            error.set(None);
+        }
+        Err(e) => error.set(Some(app.failure(&e))),
+    }
+}
+
+/// The speech model a Linux service transcribes recordings with: its state, download
+/// progress, and removal (`EmbeddingModel.speech`; a Mac service has none).
+#[component]
+fn SpeechModelSection(speech: SpeechModel) -> Element {
+    let app = use_app();
+    let mut busy = use_signal(|| false);
+    let error = use_signal(|| None::<String>);
+    let mut confirm_remove = use_signal(|| false);
+    let download = move || async move {
+        let Some(api) = app.api() else { return };
+        busy.set(true);
+        apply_model(app, error, api.download_speech().await);
+        busy.set(false);
+    };
+    rsx! {
+        section { class: "set-sec",
+            h2 { "Speech model" }
+            p { class: "help",
+                "Parakeet runs on the service and writes the transcripts of audio and video sources, word by word, so lessons can quote what's said. Without it, recordings are read without a transcript."
+            }
+            div { class: "kv",
+                span { "Model" }
+                span { class: "mono", "{speech.repo}" }
+                span { "Runs on" }
+                span { "ONNX Runtime, on the CPU" }
+                span { "Status" }
+                span {
+                    match &speech.state {
+                        EmbeddingModelState::NotDownloaded { .. } => "Not downloaded".to_string(),
+                        EmbeddingModelState::Downloading { .. } => "Downloading…".to_string(),
+                        EmbeddingModelState::Ready { bytes } => format!("Ready · {} on disk", human_bytes(*bytes)),
+                        EmbeddingModelState::Failed { .. } => "Download failed".to_string(),
+                    }
+                }
+            }
+            match speech.state.clone() {
+                EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                    div { class: "row-actions",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: *busy.read(),
+                            onclick: move |_| download(),
+                            if *busy.read() { span { class: "spinner" } }
+                            "Download · {human_bytes(download_bytes)}"
+                        }
+                        span { class: "faint", style: "font-size: 13px", "Downloads once, from Hugging Face. Recordings read before it's there can be read again after." }
+                    }
+                },
+                EmbeddingModelState::Downloading { received, total } => rsx! {
+                    Progress { received, total, label: "Downloading the speech model".to_string() }
+                },
+                EmbeddingModelState::Ready { .. } => rsx! {
+                    div { class: "row-actions",
+                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
+                    }
+                },
+                EmbeddingModelState::Failed { error: message } => rsx! {
+                    ErrorNotice {
+                        message: "The download failed. {message}",
+                        on_retry: move |_| { spawn(download()); },
+                    }
+                },
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", "{err}" }
+            }
+        }
+        if *confirm_remove.read() {
+            ConfirmDialog {
+                title: "Remove the speech model?",
+                message: "Its files are deleted from the service. Recordings are read without a transcript until you download it again.",
+                confirm_label: "Remove model",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_remove.set(false),
+                on_confirm: move |_| async move {
+                    let Some(api) = app.api() else { return };
+                    busy.set(true);
+                    apply_model(app, error, api.delete_speech().await);
                     busy.set(false);
                     confirm_remove.set(false);
                 },
@@ -2313,7 +2465,7 @@ fn ToolsSection() -> Element {
     rsx! {
         section { class: "set-sec",
             div { class: "set-sec-head",
-                h2 { "Tools on the service Mac" }
+                h2 { "Tools on the service" }
                 button {
                     class: "btn btn-ghost btn-sm",
                     onclick: move |_| tools.restart(),
@@ -2321,7 +2473,7 @@ fn ToolsSection() -> Element {
                     "Check again"
                 }
             }
-            p { class: "help", "ManimGX renders videos. The FluidAudio CLI (fluidaudiocli) voices their narration and transcribes audio and video sources; without it, recordings are read without a transcript. Both run on the service Mac, and Margin never installs them for you." }
+            p { class: "help", "The programs the service runs to render videos, voice their narration and read sources. Each one says what it does; a missing one turns off only that part. They run on the service machine, and Margin never installs them for you." }
             match list {
                 None => rsx! { div { class: "skel", style: "width: 50%" } },
                 Some(Err(err)) => rsx! { ErrorNotice { message: err, on_retry: move |_| tools.restart() } },
@@ -2337,12 +2489,45 @@ fn ToolsSection() -> Element {
     }
 }
 
+/// The runtime the service's embedding model repo is for: the Core ML conversion runs on
+/// a Mac's Neural Engine, the ONNX export on the CPU with ONNX Runtime (a Linux service).
+fn model_runtime(repo: &str) -> &'static str {
+    if repo.to_ascii_lowercase().contains("onnx") {
+        "ONNX Runtime, on the CPU"
+    } else {
+        "Core ML, on the Neural Engine and GPU"
+    }
+}
+
+/// What a tool the service reports (Settings → Tools) is for, by its name.
+fn tool_purpose(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "manimgx" => "Renders lesson videos.",
+        "fluidaudiocli" => {
+            "Voices video narration and transcribes audio and video sources; without it, recordings are read without a transcript."
+        }
+        "margin-tts" => "Voices video narration.",
+        "tesseract" => {
+            "Reads text in images and scanned PDF pages; without it, they are read without their text."
+        }
+        "ffmpeg" => {
+            "Reads the sound and frames of audio and video sources (with ffprobe, from the same package)."
+        }
+        "bwrap" => {
+            "Runs the scene code of a video in a sandbox with no network; without it, videos don't render."
+        }
+        "pdfium" => "Reads PDF text and draws PDF pages.",
+        _ => return None,
+    })
+}
+
 #[component]
 fn ToolRow(tool: ToolStatus) -> Element {
     let mut copied = use_signal(|| None::<Result<(), String>>);
     // Bumped per copy, so only the latest one's timer resets the label.
     let mut copies = use_signal(|| 0u64);
     let commands = tool.install_commands.join("\n");
+    let purpose = tool_purpose(&tool.name);
     rsx! {
         div { class: "tool",
             div { class: "tool-h",
@@ -2358,8 +2543,11 @@ fn ToolRow(tool: ToolStatus) -> Element {
                     }
                 }
             }
+            if let Some(purpose) = purpose {
+                span { class: "muted", style: "font-size: 13px", "{purpose}" }
+            }
             if !tool.found && !tool.install_commands.is_empty() {
-                span { class: "muted", style: "font-size: 13px", "Install it on the service Mac with:" }
+                span { class: "muted", style: "font-size: 13px", "Install it on the service machine with:" }
                 div { class: "copy-wrap",
                     pre { class: "code", style: "padding-right: 90px", code { "{commands}" } }
                     button {
@@ -2649,6 +2837,71 @@ mod tests {
     }
 
     #[test]
+    fn sources_pane_shows_the_speech_model_and_the_reindex_where_the_service_has_them() {
+        use crate::store::LibraryState;
+        let sources = |model: EmbeddingModel| {
+            let mut lib = LibraryState::from_library(crate::fake::sample_library());
+            lib.embedding = Some(model);
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Sources))
+        };
+        let mac = EmbeddingModel {
+            repo: crate::fake::EMBEDDING_REPO.into(),
+            state: EmbeddingModelState::Ready { bytes: 1_000 },
+            speech: None,
+            reindex: None,
+        };
+        let html = sources(mac.clone());
+        assert!(html.contains("<h2>Embedding model</h2>"), "{html}");
+        assert!(!html.contains("Speech model"));
+        assert!(!html.contains("Re-indexing"));
+
+        let linux = EmbeddingModel {
+            speech: Some(SpeechModel {
+                repo: crate::fake::SPEECH_REPO.into(),
+                state: EmbeddingModelState::NotDownloaded {
+                    download_bytes: crate::fake::SPEECH_DOWNLOAD_BYTES,
+                },
+            }),
+            reindex: Some(ReindexProgress {
+                done: 212,
+                total: 1480,
+            }),
+            ..mac
+        };
+        let html = sources(linux.clone());
+        assert!(html.contains("<h2>Speech model</h2>"), "{html}");
+        assert!(html.contains(crate::fake::SPEECH_REPO));
+        let size = human_bytes(crate::fake::SPEECH_DOWNLOAD_BYTES);
+        assert!(html.contains(&format!("Download · {size}")), "{html}");
+        assert!(html.contains("Re-indexing 212 of 1480 documents"), "{html}");
+        assert!(html.contains(r#"aria-valuenow="14""#), "{html}");
+        let downloading = EmbeddingModel {
+            speech: Some(SpeechModel {
+                repo: crate::fake::SPEECH_REPO.into(),
+                state: EmbeddingModelState::Downloading {
+                    received: 335_000_000,
+                    total: crate::fake::SPEECH_DOWNLOAD_BYTES,
+                },
+            }),
+            ..linux.clone()
+        };
+        assert!(sources(downloading).contains(r#"aria-label="Downloading the speech model""#));
+        let ready = EmbeddingModel {
+            speech: Some(SpeechModel {
+                repo: crate::fake::SPEECH_REPO.into(),
+                state: EmbeddingModelState::Ready { bytes: 670_000_000 },
+            }),
+            ..linux
+        };
+        let html = sources(ready);
+        assert!(
+            html.contains(&format!("Ready · {}", human_bytes(670_000_000))),
+            "{html}"
+        );
+        assert_eq!(html.matches("Remove…").count(), 2, "{html}");
+    }
+
+    #[test]
     fn ai_pane_has_three_model_slots() {
         let mut settings = crate::fake::FakeState::new().settings;
         settings.agent_model = Some("gpt-6.1-sol".into());
@@ -2749,6 +3002,12 @@ mod tests {
             assert!(html.contains(&format!(r#"id="pl-stage-{kind}""#)), "{kind}");
             assert!(html.contains(&format!(">{}<", stage_label(kind))));
             assert!(html.contains(&stage_help(kind).replace('\'', "&#39;")));
+            if kind == "embedder" {
+                // The service's own, shown without a picker.
+                assert!(!html.contains(r#"<select id="pl-stage-embedder""#));
+                assert!(html.contains(&format!(">{}<", settings.pipeline.embedder.name)));
+                continue;
+            }
             for name in &variants.stages[kind] {
                 assert!(
                     html.contains(&format!(r#"<option value="{name}""#)),

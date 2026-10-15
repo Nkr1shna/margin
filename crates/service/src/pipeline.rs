@@ -225,7 +225,16 @@ impl StageCtor {
 pub struct Registry {
     deps: StageDeps,
     ctors: HashMap<(&'static str, String), StageCtor>,
+    /// The `embedder` stage's known names. The stage builds nothing here: it names whose
+    /// vectors a pipeline is measured with (the service embeds with `service.toml`'s
+    /// `embedder`; the eval runner loads the backend a variant names).
+    embedders: std::collections::BTreeSet<String>,
 }
+
+/// The `embedder` names besides the backends: the eval runner's recorded vectors and
+/// the test fake.
+pub const EMBEDDER_RECORDED: &str = "recorded";
+pub const EMBEDDER_FAKE: &str = "fake";
 
 impl Registry {
     /// An empty registry.
@@ -233,16 +242,23 @@ impl Registry {
         Self {
             deps,
             ctors: HashMap::new(),
+            embedders: Default::default(),
         }
     }
 
     /// Every variant the service ships: the trivial ones here, the rest from the areas'
-    /// files.
+    /// files, and every embedding backend (`margin_embed::Backend`) whether or not this
+    /// build runs it, since a pipeline names the vectors it's measured with.
     pub fn standard(deps: StageDeps) -> Self {
         let mut reg = Self::new(deps);
         register_trivial(&mut reg);
         crate::ingest::register(&mut reg);
         crate::retrieval::register(&mut reg);
+        for b in margin_embed::Backend::ALL {
+            reg.register_embedder(b.name());
+        }
+        reg.register_embedder(EMBEDDER_RECORDED);
+        reg.register_embedder(EMBEDDER_FAKE);
         reg
     }
 
@@ -251,8 +267,17 @@ impl Registry {
         self.ctors.insert((ctor.kind(), name.to_string()), ctor);
     }
 
-    /// The registered names of one kind of stage ("chunker", "retriever", …), sorted.
+    /// Adds `name` to the `embedder` stage's known names.
+    pub fn register_embedder(&mut self, name: &str) {
+        self.embedders.insert(name.to_string());
+    }
+
+    /// The registered names of one kind of stage ("chunker", "retriever", …,
+    /// "embedder"), sorted.
     pub fn names(&self, kind: &str) -> Vec<String> {
+        if kind == "embedder" {
+            return self.embedders.iter().cloned().collect();
+        }
         let mut names: Vec<String> = self
             .ctors
             .keys()
@@ -261,6 +286,18 @@ impl Registry {
             .collect();
         names.sort();
         names
+    }
+
+    /// An error naming the stage when `cfg` isn't a known embedder.
+    fn check_embedder(&self, cfg: &StageCfg) -> anyhow::Result<()> {
+        if self.embedders.contains(&cfg.name) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "the pipeline's embedder \"{}\" isn't a known embedder (known: {})",
+            cfg.name,
+            self.names("embedder").join(", ")
+        )
     }
 
     fn get(&self, kind: &'static str, cfg: &StageCfg) -> anyhow::Result<&StageCtor> {
@@ -292,6 +329,7 @@ impl Pipeline {
     /// Builds every stage `cfg` names; an unknown name is an error naming the stage.
     pub fn build(cfg: &PipelineConfig, reg: &Registry) -> anyhow::Result<Self> {
         let deps = &reg.deps;
+        reg.check_embedder(&cfg.embedder)?;
         let prompts_cfg = StageCfg::named(&cfg.prompts);
         macro_rules! stage {
             ($kind:literal, $variant:ident, $cfg:expr) => {
@@ -558,6 +596,36 @@ mod tests {
         let p = Pipeline::build(&trivial(), &reg).unwrap();
         assert_eq!(p.retriever.name(), "dense");
         assert_eq!(p.packer.name(), "take-k");
+    }
+
+    #[tokio::test]
+    async fn the_embedder_stage_must_be_a_known_name() {
+        let reg = registry().await;
+        let names = reg.names("embedder");
+        for n in [
+            "coreml",
+            "onnx-q8",
+            "onnx-fp32",
+            "onnx-fp16",
+            "recorded",
+            "fake",
+        ] {
+            assert!(names.contains(&n.to_string()), "{n} in {names:?}");
+            let cfg = PipelineConfig {
+                embedder: StageCfg::named(n),
+                ..PipelineConfig::default()
+            };
+            // Known whether or not this build runs it: the service embeds with its own
+            // config; the pipeline only names the vectors it's measured with.
+            Pipeline::build(&cfg, &reg).unwrap();
+        }
+        let cfg = PipelineConfig {
+            embedder: StageCfg::named("word2vec"),
+            ..PipelineConfig::default()
+        };
+        let err = Pipeline::build(&cfg, &reg).err().unwrap().to_string();
+        assert!(err.contains("embedder \"word2vec\""), "{err}");
+        assert!(err.contains("onnx-q8"), "{err}");
     }
 
     #[tokio::test]

@@ -1039,7 +1039,7 @@ fn VideoView(lesson_id: Id) -> Element {
                         h2 { "No video for this lesson" }
                         p {
                             if lesson_ready {
-                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on the service Mac."
+                                "Make video writes a ManimGX scene from this lesson, voices the narration with PocketTTS, and renders it on the service."
                             } else {
                                 "You can make a video once the lesson has finished writing."
                             }

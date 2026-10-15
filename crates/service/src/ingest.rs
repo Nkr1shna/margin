@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use margin_embed::{
-    CHUNK_TOKENS, Chunk, Embedder, Extracted, FLUIDAUDIOCLI, ImageTokens, Page, Purpose,
-    SourceKind, Transcript, audio_windows, sample_ms,
+    CHUNK_TOKENS, Chunk, Embedder, Extracted, ImageTokens, Page, Purpose, SourceKind, Transcript,
+    audio_windows, sample_ms,
 };
 use margin_shared::context::{
     ACCESS_COMPANY, ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality,
@@ -72,7 +72,7 @@ pub const DOCUMENTS_DIR: &str = "documents";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 /// What a source whose file is gone says after the migration couldn't read it again.
-pub const FILE_GONE: &str = "Its file is missing on the service Mac, so it couldn't be read \
+pub const FILE_GONE: &str = "Its file is missing on the service, so it couldn't be read \
      into the new search index. Read it again once the file is back, or upload it again.";
 
 /// Something to (re)index.
@@ -739,6 +739,22 @@ fn split<T>(
     (kept, fresh, gone)
 }
 
+/// Splits `gone` rows into those really gone and the ids of those a new item replaces
+/// under the same id (same chunk hash, another embedder version): their vectors are
+/// rewritten in place instead.
+fn stale_rows(gone: Vec<PassageRow>, new: &[Item]) -> (Vec<PassageRow>, HashSet<String>) {
+    let new_ids: HashSet<&str> = new.iter().map(|i| i.row.id.as_str()).collect();
+    let mut revectored = HashSet::new();
+    let mut really_gone = Vec::new();
+    for row in gone {
+        if new_ids.contains(row.id.as_str()) && revectored.insert(row.id.clone()) {
+            continue;
+        }
+        really_gone.push(row);
+    }
+    (really_gone, revectored)
+}
+
 /// The chunker `sections-v2` (§2.1, `margin_embed::chunk_sections`): Markdown/reST/
 /// HTML/LaTeX headings, section paths, line ranges, sentence overlap, atomic tables and
 /// fences. Params: `target_tokens` (default `margin_embed::CHUNK_TARGET_TOKENS`); the
@@ -916,12 +932,7 @@ async fn prepare(
                 match tokio::task::spawn_blocking(move || tools.transcribe(&samples, &work)).await?
                 {
                     Ok(Some(t)) => transcript = Some(t),
-                    Ok(None) => {
-                        no_transcript = Some(format!(
-                            "{FLUIDAUDIOCLI} isn't installed on the service Mac (Settings → \
-                             Tools shows how to install it)"
-                        ))
-                    }
+                    Ok(None) => no_transcript = Some(state.source_tools.no_transcriber()),
                     Err(e) => no_transcript = Some(e.to_string()),
                 }
                 if let Some(why) = &no_transcript {
@@ -945,7 +956,17 @@ async fn prepare(
         }
     };
     let pages = extracted.pages.iter().filter_map(|p| p.number).max();
-    let warning = no_transcript.map(|why| sources::transcript_warning(kind, &why));
+    let no_ocr = needs_ocr(kind, &extracted)
+        .then(|| state.source_tools.ocr_missing())
+        .flatten()
+        .map(|why| sources::ocr_warning(kind, &why));
+    let warning = [
+        no_transcript.map(|why| sources::transcript_warning(kind, &why)),
+        no_ocr,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|a, b| format!("{a} {b}"));
     let sound = extracted.sound.clone().map(Arc::new);
 
     let (tools, counter, doc_c) = (state.source_tools.clone(), embedder.clone(), doc.clone());
@@ -974,6 +995,21 @@ async fn prepare(
         warning,
         sound,
     })
+}
+
+/// Whether reading `doc` needed OCR: an image, or a PDF with a page whose text layer is
+/// (nearly) empty, a scan, which the PDF reader OCRs.
+fn needs_ocr(kind: SourceKind, doc: &Extracted) -> bool {
+    /// The PDF reader OCRs pages with fewer non-space characters than this.
+    const SCAN_CHARS: usize = 16;
+    match kind {
+        SourceKind::Image => true,
+        SourceKind::Pdf => doc
+            .pages
+            .iter()
+            .any(|p| p.text.chars().filter(|c| !c.is_whitespace()).count() < SCAN_CHARS),
+        _ => false,
+    }
 }
 
 fn bytes_hash(path: &Path) -> anyhow::Result<String> {
@@ -1527,6 +1563,10 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         |i| i.row.chunk_hash.as_str(),
         embedder.version(),
     );
+    // Rows of another embedder version whose chunk is unchanged (same hash, so same id)
+    // get their vector rewritten in place (`Store::rewrite_vectors`) rather than being
+    // deleted and inserted again: a re-embed never takes them out of the index.
+    let (gone, revectored) = stale_rows(gone, &new);
     report.chunks_kept = kept.len() as u32;
     report.chunks_new = new.len() as u32;
     report.chunks_deleted = gone.len() as u32;
@@ -1618,12 +1658,17 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
             })
             .collect();
         written_count += rows.len();
+        let count = rows.len();
+        let (rewrite, insert): (Vec<PassageRow>, Vec<PassageRow>) =
+            rows.into_iter().partition(|r| revectored.contains(&r.id));
         let store = &state.store;
         let written = while_exists(state, id, async || {
-            store.insert_many(db::PASSAGE, &rows).await
+            store.rewrite_vectors(&rewrite).await?;
+            store.insert_many(db::PASSAGE, &insert).await
         })
         .await?;
-        if written.is_none() || !progress.add(state, id, rows.len()).await? {
+        let rows = count;
+        if written.is_none() || !progress.add(state, id, rows).await? {
             // The thread stops at its next batch, its channel being closed.
             drop(rx);
             let _ = embedding.await;
@@ -1699,6 +1744,9 @@ pub async fn run_worker(state: AppState) {
     if let Err(e) = migrate(&state).await {
         tracing::error!("the move to the passage index failed: {e:#}");
     }
+    if let Err(e) = reembed(&state).await {
+        tracing::error!("the re-embed with the new embedder failed: {e:#}");
+    }
     let mut pending: VecDeque<Id> = VecDeque::new();
     loop {
         if pending.is_empty() {
@@ -1723,6 +1771,9 @@ pub async fn run_worker(state: AppState) {
         if id.is_empty() {
             if let Err(e) = migrate(&state).await {
                 tracing::error!("the move to the passage index failed: {e:#}");
+            }
+            if let Err(e) = reembed(&state).await {
+                tracing::error!("the re-embed with the new embedder failed: {e:#}");
             }
             continue;
         }
@@ -1868,9 +1919,124 @@ pub async fn migrate(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The prefix of the `SettingsRow.migrations` entry that records which embedder version
+/// the passages were last brought to: `embedder-<version>`. One entry at a time, so
+/// switching back to an earlier backend runs the pass again.
+pub const EMBEDDER_MIGRATION_PREFIX: &str = "embedder-";
+
+/// The migration entry for `version`.
+pub fn embedder_migration(version: &str) -> String {
+    format!("{EMBEDDER_MIGRATION_PREFIX}{version}")
+}
+
+/// The one-pass re-embed when the embedder changes (`docs/plan-linux-service.md` §2.1,
+/// "Switch = re-embed, one pass"): at the first start with another `embedder` than the
+/// passages were made with, every Ready document holding passages of another version
+/// is read again, oldest first. Unchanged chunks keep their rows and get new vectors
+/// (`Store::rewrite_vectors`); text that changed (another OCR engine) is a new chunk.
+/// Until a document is done, the dense leg skips its old vectors (`embedder =
+/// $embedder`) and BM25 still finds it.
+///
+/// Needs the model: without it the pass waits and runs when the download finishes
+/// (`IngestQueue::kick`). Recorded in `SettingsRow.migrations` as `embedder-<version>`.
+pub async fn reembed(state: &AppState) -> anyhow::Result<()> {
+    let configured = state.model_files.backend.embedder_version();
+    let marker = embedder_migration(configured);
+    if state.settings_row().await?.migrations.contains(&marker) {
+        return Ok(());
+    }
+    if !state
+        .store
+        .documents_with_other_embedder(configured)
+        .await?
+        .is_empty()
+    {
+        let embedder = match embedding::embedder(state).await {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                tracing::info!("the re-embed with {configured} waits for the embedding model");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // What the loaded model stamps (a test fake may differ from the backend's).
+        let version = embedder.version().to_string();
+        let stale = state.store.documents_with_other_embedder(&version).await?;
+        let mut docs: Vec<Document> = Vec::new();
+        for doc_id in &stale {
+            if let Some(d) = document(state, doc_id).await?
+                && matches!(d.status, DocumentStatus::Ready { .. })
+            {
+                docs.push(d);
+            }
+        }
+        docs.sort_by_key(|d| d.created_at);
+        let total = docs.len();
+        if total > 0 {
+            tracing::info!("re-embedding {total} document(s) with {version}");
+        }
+        for (i, d) in docs.iter().enumerate() {
+            tracing::info!("re-indexing {} of {total} documents ({})", i + 1, d.name);
+            // Settings → Sources: "Re-indexing 3 of 12 documents".
+            embedding::set_reindex(
+                state,
+                Some(margin_shared::ReindexProgress {
+                    done: i as u64,
+                    total: total as u64,
+                }),
+            )
+            .await;
+            if let Err(e) = ingest(state, &d.id).await {
+                tracing::warn!("document {} couldn't be re-embedded: {e:#}", d.id);
+            }
+        }
+        if total > 0 {
+            embedding::set_reindex(state, None).await;
+            tracing::info!("every document is embedded with {version}");
+        }
+    }
+    let _w = state.write_lock.lock().await;
+    let mut row = state.settings_row().await?;
+    row.migrations
+        .retain(|m| !m.starts_with(EMBEDDER_MIGRATION_PREFIX));
+    row.migrations.push(marker);
+    state.store.put(db::SETTINGS, SETTINGS_ID, &row).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_rows_are_rewritten_not_deleted() {
+        let item = |id: &str| Item {
+            row: PassageRow {
+                id: id.into(),
+                ..stored(id, "h", 0, EMBEDDER_VERSION)
+            },
+            input: Input::Text {
+                title: String::new(),
+            },
+        };
+        let gone = vec![
+            stored("d:h1", "h1", 0, "older-embedder"),
+            stored("d:h2", "h2", 1, "older-embedder"),
+        ];
+        let (really_gone, revectored) = stale_rows(gone, &[item("d:h1")]);
+        assert_eq!(
+            really_gone
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["d:h2"]
+        );
+        assert_eq!(revectored.into_iter().collect::<Vec<_>>(), ["d:h1"]);
+        assert_eq!(
+            embedder_migration("embeddinggemma-2-onnx-q8/title-prefix-v1"),
+            "embedder-embeddinggemma-2-onnx-q8/title-prefix-v1"
+        );
+    }
 
     fn stored(id: &str, hash: &str, ord: i64, embedder: &str) -> PassageRow {
         PassageRow {

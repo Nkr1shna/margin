@@ -86,8 +86,8 @@ use chrono::Utc;
 use dioxus::history::{History, MemoryHistory};
 use dioxus::prelude::*;
 use margin_shared::{
-    Device, EmbeddingModel, EmbeddingModelState, Me, ReasoningEffort, Settings, SourceKind,
-    SourceStatus,
+    Device, EmbeddingModel, EmbeddingModelState, Me, ReasoningEffort, ReindexProgress, Settings,
+    SourceKind, SourceStatus, SpeechModel,
 };
 
 use crate::api::Api;
@@ -186,6 +186,17 @@ fn Harness(props: HarnessProps) -> Element {
                         download_bytes: fake::EMBEDDING_DOWNLOAD_BYTES,
                     },
                 },
+                // A Linux service's speech model, and its re-index after a new embedder.
+                speech: std::env::var_os("RENDER_SPEECH").map(|_| SpeechModel {
+                    repo: fake::SPEECH_REPO.into(),
+                    state: EmbeddingModelState::NotDownloaded {
+                        download_bytes: fake::SPEECH_DOWNLOAD_BYTES,
+                    },
+                }),
+                reindex: std::env::var_os("RENDER_REINDEX").map(|_| ReindexProgress {
+                    done: 212,
+                    total: 1480,
+                }),
             });
         let uploads = match std::env::var("RENDER_SOURCES") {
             Ok(topic_id) if std::env::var_os("RENDER_UPLOADS").is_some() => {

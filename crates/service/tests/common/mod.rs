@@ -27,7 +27,7 @@ use margin_embed::{
 };
 use margin_service::config::Config;
 use margin_service::db::Store;
-use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools};
+use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools, SpeechModel};
 use margin_service::pipeline::{Chunker, ChunkerCfg};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::server::{Options, Service};
@@ -437,6 +437,10 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
     let hf = Arc::new(FakeHf::default());
     let app = Router::new()
         .route(&format!("/api/models/{}", margin_embed::REPO), get(size))
+        .route(
+            &format!("/api/models/{}", margin_embed::ONNX_REPO),
+            get(size),
+        )
         .route(&model_path(), get(file))
         .with_state(hf.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -474,6 +478,71 @@ pub struct FakeSourceTools {
     pub page_renders: AtomicU32,
     /// What each fake sound says, by `sound_key`.
     spoken: Mutex<std::collections::HashMap<u64, String>>,
+    /// When set, the service downloads a speech model (as on Linux): `speech`.
+    pub has_speech_model: AtomicBool,
+    pub speech: FakeSpeechModel,
+    /// When set, pictures are read without OCR (as on Linux without tesseract).
+    pub no_ocr: AtomicBool,
+}
+
+/// A speech model of `FAKE_SPEECH_BYTES` "downloaded" in two progress steps, kept in
+/// memory.
+#[derive(Default)]
+pub struct FakeSpeechModel {
+    pub downloaded: AtomicBool,
+    pub downloads: AtomicU32,
+    pub removes: AtomicU32,
+    /// The next download fails.
+    pub fail: AtomicBool,
+}
+
+pub const FAKE_SPEECH_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+pub const FAKE_SPEECH_BYTES: u64 = 670;
+
+impl SpeechModel for FakeSpeechModel {
+    fn repo(&self) -> String {
+        FAKE_SPEECH_REPO.into()
+    }
+    fn is_complete(&self) -> bool {
+        self.downloaded.load(Ordering::SeqCst)
+    }
+    fn size_on_disk(&self) -> u64 {
+        if self.is_complete() {
+            FAKE_SPEECH_BYTES
+        } else {
+            0
+        }
+    }
+    fn remote_size<'a>(
+        &'a self,
+        _: &'a reqwest::Client,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+        Box::pin(async { Ok(FAKE_SPEECH_BYTES) })
+    }
+    fn download<'a>(
+        &'a self,
+        _: &'a reqwest::Client,
+        _: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>> {
+        Box::pin(async move {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(EmbedError::Download("offline".into()));
+            }
+            progress(FAKE_SPEECH_BYTES / 2, FAKE_SPEECH_BYTES);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            progress(FAKE_SPEECH_BYTES, FAKE_SPEECH_BYTES);
+            self.downloaded.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn remove(&self) -> Result<(), EmbedError> {
+        self.removes.fetch_add(1, Ordering::SeqCst);
+        self.downloaded.store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Identifies fake sound by its samples.
@@ -510,11 +579,12 @@ impl SourceTools for FakeSourceTools {
 
     fn remote_size<'a>(
         &'a self,
+        files: &'a ModelFiles,
         http: &'a reqwest::Client,
         hf_base: &'a str,
     ) -> BoxFuture<'a, Result<u64, EmbedError>> {
         Box::pin(async move {
-            let url = format!("{hf_base}/api/models/{}", margin_embed::REPO);
+            let url = format!("{hf_base}/api/models/{}", files.backend.repo());
             let v: serde_json::Value = http
                 .get(url)
                 .send()
@@ -665,7 +735,9 @@ impl SourceTools for FakeSourceTools {
         _work_dir: &Path,
     ) -> Result<Option<Transcript>, EmbedError> {
         self.transcribes.fetch_add(1, Ordering::SeqCst);
-        if self.no_transcriber.load(Ordering::SeqCst) {
+        if self.no_transcriber.load(Ordering::SeqCst)
+            || (self.has_speech_model.load(Ordering::SeqCst) && !self.speech.is_complete())
+        {
             return Ok(None);
         }
         let said = self
@@ -688,6 +760,27 @@ impl SourceTools for FakeSourceTools {
                 })
                 .collect(),
         }))
+    }
+
+    fn no_transcriber(&self) -> String {
+        if self.has_speech_model.load(Ordering::SeqCst) {
+            "the speech model isn't downloaded (Settings → Sources downloads it)".into()
+        } else {
+            "fluidaudiocli isn't installed on the service (Settings → Tools shows how to install it)".into()
+        }
+    }
+
+    fn speech_model(&self) -> Option<&dyn SpeechModel> {
+        self.has_speech_model
+            .load(Ordering::SeqCst)
+            .then_some(&self.speech as &dyn SpeechModel)
+    }
+
+    fn ocr_missing(&self) -> Option<String> {
+        self.no_ocr.load(Ordering::SeqCst).then(|| {
+            "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
+                .to_string()
+        })
     }
 
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {
@@ -866,6 +959,7 @@ pub async fn start_with(setup: Setup) -> Harness {
     let generator = Arc::new(FakeGenerator::default());
     let renderer = Arc::new(FakeRenderer::default());
     let source_tools = Arc::new(FakeSourceTools::default());
+    let models_dir = config.models_dir();
     let service = Service::start(Options {
         config,
         store,
@@ -873,7 +967,7 @@ pub async fn start_with(setup: Setup) -> Harness {
         generator: generator.clone(),
         renderer: renderer.clone(),
         source_tools: match setup.real_model {
-            Some(_) => Arc::new(margin_service::engines::EmbedTools),
+            Some(_) => Arc::new(margin_service::engines::EmbedTools::new(&models_dir)),
             None => source_tools.clone(),
         },
         hf_base,

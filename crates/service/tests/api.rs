@@ -1014,6 +1014,18 @@ async fn settings_store_the_key_but_never_return_it() {
             400
         );
     }
+    // pocket-tts voices licensed for non-commercial use only are refused.
+    for voice in ["cosette", " Jean "] {
+        let r = h
+            .patch(&t, "/api/settings")
+            .json(&json!({ "voice": voice }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{voice}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "voice_not_allowed", "{body}");
+    }
     let s: Settings = h
         .patch(&t, "/api/settings")
         .json(&json!({"openai_api_key": "", "voice": ""}))

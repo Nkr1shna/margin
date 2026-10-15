@@ -24,7 +24,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// sending more than it reads.
 pub const WRITER_IMAGE_SIDE: usize = 1536;
 
-/// Where and how to call the Responses API. Built per job from Settings + Keychain.
+/// Where and how to call the Responses API. Built per job from Settings and the secret store.
 #[derive(Clone)]
 pub struct AiConfig {
     pub base_url: String,
@@ -134,7 +134,12 @@ impl Generator for AiGenerator {
 pub struct VideoRenderer;
 
 impl Renderer for VideoRenderer {
+    /// On Linux the source readers' rows (tesseract, ffmpeg, pdfium) say where
+    /// `margin_embed` finds them, which also looks in the service's tools folder.
     fn detect_tools(&self) -> BoxFuture<'_, Vec<ToolStatus>> {
+        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
+        return Box::pin(margin_video::detect_tools_with(reader_tools()));
+        #[cfg(not(any(target_os = "linux", feature = "linux-readers")))]
         Box::pin(margin_video::detect_tools())
     }
 
@@ -148,6 +153,16 @@ impl Renderer for VideoRenderer {
     }
 }
 
+/// Where `margin_embed`'s Linux readers find their programs and library.
+#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+pub fn reader_tools() -> margin_video::ReaderTools {
+    margin_video::ReaderTools {
+        tesseract: margin_embed::find_tesseract(),
+        ffmpeg: margin_embed::find_ffmpeg().map(|f| (f.ffmpeg, f.ffprobe)),
+        pdfium: margin_embed::find_pdfium(),
+    }
+}
+
 /// The service's seam to `margin-embed`: the embedding model's files, loading it, and
 /// reading, cutting and ranking sources. `EmbedTools` forwards to the crate; tests plug
 /// in fakes (with a fake Hugging Face server).
@@ -156,9 +171,10 @@ pub trait SourceTools: Send + Sync + 'static {
     fn is_complete(&self, files: &ModelFiles) -> bool;
     /// Bytes the downloaded model takes on disk.
     fn size_on_disk(&self, files: &ModelFiles) -> u64;
-    /// Bytes a download would fetch.
+    /// Bytes a download of `files` (its backend's files) would fetch.
     fn remote_size<'a>(
         &'a self,
+        files: &'a ModelFiles,
         http: &'a reqwest::Client,
         hf_base: &'a str,
     ) -> BoxFuture<'a, Result<u64, EmbedError>>;
@@ -194,12 +210,34 @@ pub trait SourceTools: Send + Sync + 'static {
         self.extract(path, kind, media_dir)
     }
     /// What is said in 16 kHz mono `samples`, word by word, using `work_dir` for
-    /// temporary files. `Ok(None)` when no speech recognizer is installed. Blocking.
+    /// temporary files. `Ok(None)` when no speech recognizer is installed (or its model
+    /// isn't downloaded); `no_transcriber` says what to do about it. Blocking.
     fn transcribe(
         &self,
         samples: &[f32],
         work_dir: &Path,
     ) -> Result<Option<Transcript>, EmbedError>;
+    /// Why `transcribe` gives `Ok(None)`: what is missing and where to get it.
+    fn no_transcriber(&self) -> String {
+        format!(
+            "{} isn't installed on the service (Settings → Tools shows how to install it)",
+            margin_embed::FLUIDAUDIOCLI
+        )
+    }
+    /// The speech model this service downloads and transcribes with (Parakeet on ONNX
+    /// Runtime, Linux); `None` where an installed program transcribes (`fluidaudiocli`
+    /// on a Mac).
+    fn speech_model(&self) -> Option<&dyn SpeechModel> {
+        None
+    }
+    /// Why pictures (images, scanned PDF pages) are read without their text on this
+    /// service, when they are: no OCR program installed. `None` when OCR works.
+    fn ocr_missing(&self) -> Option<String> {
+        None
+    }
+    /// Unloads what has been unused for a while (the speech model). The service calls it
+    /// every minute. Blocking.
+    fn sweep(&self) {}
     /// An image file as the lesson writer is shown it: (media type, bytes), at most
     /// `WRITER_IMAGE_SIDE` px. Blocking.
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError>;
@@ -234,8 +272,119 @@ pub trait SourceTools: Send + Sync + 'static {
     ) -> f32;
 }
 
-/// `margin_embed`: EmbeddingGemma 2 on Core ML, PDFKit + Vision OCR.
-pub struct EmbedTools;
+/// A speech model the service downloads (`SourceTools::speech_model`), shown in Settings
+/// → Sources beside the embedding model.
+pub trait SpeechModel: Send + Sync {
+    /// Its Hugging Face repo.
+    fn repo(&self) -> String;
+    /// Whether a finished download is on disk. Blocking.
+    fn is_complete(&self) -> bool;
+    /// Bytes the download takes on disk. Blocking.
+    fn size_on_disk(&self) -> u64;
+    /// Bytes a download would fetch.
+    fn remote_size<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>>;
+    /// Downloads it, calling `progress(received, total)`.
+    fn download<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>>;
+    /// Unloads it and deletes its files. Blocking.
+    fn remove(&self) -> Result<(), EmbedError>;
+}
+
+/// `margin_embed`: EmbeddingGemma 2 on the configured backend (Core ML on macOS, ONNX
+/// Runtime on Linux) and the platform's readers. On Linux speech is recognized
+/// in-process by Parakeet (`margin_embed::transcript_parakeet`), whose model is
+/// downloaded into `data_dir/models` like the embedder's; on a Mac by `fluidaudiocli`.
+pub struct EmbedTools {
+    #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+    speech: ParakeetModel,
+}
+
+impl EmbedTools {
+    /// The tools for a service keeping its models in `models_dir` (`data_dir/models`).
+    pub fn new(models_dir: &Path) -> Self {
+        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
+        let _ = models_dir;
+        Self {
+            #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+            speech: ParakeetModel::new(models_dir),
+        }
+    }
+}
+
+/// Parakeet TDT 0.6B v3 (int8) on ONNX Runtime: loaded on first use, dropped after
+/// `SPEECH_IDLE` unused.
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+struct ParakeetModel {
+    parakeet: margin_embed::transcript_parakeet::Parakeet,
+}
+
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+impl ParakeetModel {
+    /// Threads the recognizer runs on: half the cores (at least 1, at most 4), so
+    /// transcribing leaves room for the embedder and the service.
+    fn threads() -> usize {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        (cores / 2).clamp(1, 4)
+    }
+
+    fn new(models_dir: &Path) -> Self {
+        use margin_embed::transcript_parakeet::{Parakeet, SpeechDtype, SpeechModelFiles};
+        let files = SpeechModelFiles::in_models_dir(models_dir, SpeechDtype::Int8);
+        Self {
+            parakeet: Parakeet::new(files, Self::threads()),
+        }
+    }
+
+    fn files(&self) -> &margin_embed::transcript_parakeet::SpeechModelFiles {
+        self.parakeet.files()
+    }
+}
+
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+impl SpeechModel for ParakeetModel {
+    fn repo(&self) -> String {
+        margin_embed::transcript_parakeet::PARAKEET_REPO.to_string()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.files().is_complete()
+    }
+
+    fn size_on_disk(&self) -> u64 {
+        self.files().size_on_disk()
+    }
+
+    fn remote_size<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+    ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+        Box::pin(self.files().remote_bytes(http, hf_base))
+    }
+
+    fn download<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        hf_base: &'a str,
+        progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    ) -> BoxFuture<'a, Result<(), EmbedError>> {
+        Box::pin(self.files().download(http, hf_base, progress))
+    }
+
+    fn remove(&self) -> Result<(), EmbedError> {
+        // Unloaded first: `sweep` drops it only when idle, so it is forced here.
+        self.parakeet.unload();
+        self.files().remove()
+    }
+}
 
 impl SourceTools for EmbedTools {
     fn is_complete(&self, files: &ModelFiles) -> bool {
@@ -248,10 +397,11 @@ impl SourceTools for EmbedTools {
 
     fn remote_size<'a>(
         &'a self,
+        files: &'a ModelFiles,
         http: &'a reqwest::Client,
         hf_base: &'a str,
     ) -> BoxFuture<'a, Result<u64, EmbedError>> {
-        Box::pin(ModelFiles::remote_size(http, hf_base))
+        Box::pin(files.remote_bytes(http, hf_base))
     }
 
     fn download<'a>(
@@ -268,16 +418,10 @@ impl SourceTools for EmbedTools {
         files.remove()
     }
 
-    #[cfg(target_os = "macos")]
+    /// The backend `files.backend` names (`service.toml`'s `embedder`): Core ML on
+    /// macOS, ONNX Runtime on Linux; an error for one this build can't run.
     fn load(&self, files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
-        Ok(Arc::new(margin_embed::CoreMlEmbedder::load(files)?))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn load(&self, _files: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
-        Err(EmbedError::Load(
-            "the embedding model runs on Core ML, which needs macOS".into(),
-        ))
+        margin_embed::load_embedder(files)
     }
 
     fn extract(
@@ -298,16 +442,64 @@ impl SourceTools for EmbedTools {
         margin_embed::extract_lazy(path, kind, media_dir)
     }
 
-    /// With `fluidaudiocli` (Parakeet), found like the video pipeline finds it.
+    /// Linux: Parakeet in-process, once its model is downloaded. macOS: with
+    /// `fluidaudiocli` (Parakeet on Core ML), found like the video pipeline finds it.
     fn transcribe(
         &self,
         samples: &[f32],
         work_dir: &Path,
     ) -> Result<Option<Transcript>, EmbedError> {
-        let Some(cli) = margin_embed::find_fluidaudiocli() else {
-            return Ok(None);
-        };
-        margin_embed::transcribe(&cli, samples, work_dir).map(Some)
+        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+        {
+            let _ = work_dir;
+            if !self.speech.is_complete() {
+                return Ok(None);
+            }
+            self.speech.parakeet.transcribe(samples).map(Some)
+        }
+        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
+        {
+            let Some(cli) = margin_embed::find_fluidaudiocli() else {
+                return Ok(None);
+            };
+            margin_embed::transcribe(&cli, samples, work_dir).map(Some)
+        }
+    }
+
+    fn no_transcriber(&self) -> String {
+        if self.speech_model().is_some() {
+            "the speech model isn't downloaded (Settings → Sources downloads it)".to_string()
+        } else {
+            format!(
+                "{} isn't installed on the service (Settings → Tools shows how to install it)",
+                margin_embed::FLUIDAUDIOCLI
+            )
+        }
+    }
+
+    fn speech_model(&self) -> Option<&dyn SpeechModel> {
+        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+        return Some(&self.speech);
+        #[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
+        None
+    }
+
+    fn ocr_missing(&self) -> Option<String> {
+        #[cfg(any(target_os = "linux", feature = "linux-readers"))]
+        if cfg!(target_os = "linux") && margin_embed::find_tesseract().is_none() {
+            return Some(
+                "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    fn sweep(&self) {
+        #[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+        if self.speech.parakeet.sweep() {
+            tracing::info!("the speech model was unloaded after being unused");
+        }
     }
 
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {
@@ -356,5 +548,385 @@ impl SourceTools for EmbedTools {
         chunk_text: &str,
     ) -> f32 {
         margin_embed::score(query_vec, query_text, chunk_vec, chunk_text)
+    }
+}
+
+/// `margin-service download-model`: the embedding model downloaded from the command line,
+/// for a box without the app (the Linux provisioning script runs it). The same download
+/// as Settings → Sources, into the same folder (`Config::model_files`).
+pub mod model_download {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, bail};
+    use margin_embed::{Backend, ModelFiles};
+
+    use super::{SourceTools, SpeechModel};
+    use crate::config::Config;
+
+    /// Progress lines are printed at most this often.
+    const PRINT_INTERVAL: Duration = Duration::from_secs(2);
+
+    /// `[--embedder NAME]`: the backend to download instead of the configured one.
+    pub fn parse_args(args: &[String]) -> Result<Option<Backend>, String> {
+        let mut embedder = None;
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let value = match a.as_str() {
+                "--embedder" => it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| "--embedder needs a name".to_string())?,
+                other => match other.strip_prefix("--embedder=") {
+                    Some(v) => v.to_string(),
+                    None => return Err(format!("unknown option {other}")),
+                },
+            };
+            embedder = Some(value.parse::<Backend>().map_err(|e| e.to_string())?);
+        }
+        Ok(embedder)
+    }
+
+    /// The files to download: the configured backend's, or `embedder`'s (into its own
+    /// folder under `data_dir/models`). A backend this build can't run is refused.
+    pub fn files_for(config: &Config, embedder: Option<Backend>) -> anyhow::Result<ModelFiles> {
+        let backend = match embedder {
+            Some(b) => b,
+            None => config.embedder_backend()?,
+        };
+        if !backend.is_built() {
+            bail!("this build of margin-service can't run the {backend} embedder");
+        }
+        Ok(ModelFiles::with_backend(
+            config.data_dir.join("models").join(backend.dir_name()),
+            backend,
+        ))
+    }
+
+    /// Downloads `files` from `hf_base` unless they are complete, reporting progress
+    /// lines through `report`.
+    pub async fn run(
+        tools: &dyn SourceTools,
+        files: &ModelFiles,
+        hf_base: &str,
+        report: &(dyn Fn(&str) + Send + Sync),
+    ) -> anyhow::Result<()> {
+        let name = files.backend.label();
+        if tools.is_complete(files) {
+            report(&format!(
+                "{name} is already downloaded in {} ({}).",
+                files.dir.display(),
+                mb(tools.size_on_disk(files))
+            ));
+            return Ok(());
+        }
+        let http = http_client()?;
+        report(&format!(
+            "Downloading {name} from {} into {}…",
+            files.backend.repo(),
+            files.dir.display()
+        ));
+        let progress = Printer::new(report);
+        let progress = |received: u64, total: u64| progress.print(received, total);
+        tools
+            .download(files, &http, hf_base, &progress)
+            .await
+            .with_context(|| format!("couldn't download {name}"))?;
+        anyhow::ensure!(
+            tools.is_complete(files),
+            "the download of {name} finished but isn't complete in {}",
+            files.dir.display()
+        );
+        report(&format!(
+            "{name} is downloaded ({}). The service loads it on first use.",
+            mb(tools.size_on_disk(files))
+        ));
+        Ok(())
+    }
+
+    /// Downloads the speech model (`SourceTools::speech_model`) unless it is complete,
+    /// reporting progress lines through `report`.
+    pub async fn run_speech(
+        model: &dyn SpeechModel,
+        hf_base: &str,
+        report: &(dyn Fn(&str) + Send + Sync),
+    ) -> anyhow::Result<()> {
+        let repo = model.repo();
+        if model.is_complete() {
+            report(&format!(
+                "The speech model {repo} is already downloaded ({}).",
+                mb(model.size_on_disk())
+            ));
+            return Ok(());
+        }
+        let http = http_client()?;
+        report(&format!("Downloading the speech model {repo}…"));
+        let progress = Printer::new(report);
+        let progress = |received: u64, total: u64| progress.print(received, total);
+        model
+            .download(&http, hf_base, &progress)
+            .await
+            .with_context(|| format!("couldn't download the speech model {repo}"))?;
+        anyhow::ensure!(
+            model.is_complete(),
+            "the download of the speech model {repo} finished but isn't complete"
+        );
+        report(&format!(
+            "The speech model is downloaded ({}). The service loads it when it first transcribes.",
+            mb(model.size_on_disk())
+        ));
+        Ok(())
+    }
+
+    fn http_client() -> anyhow::Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(60))
+            .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
+            .build()?)
+    }
+
+    /// Prints download progress at most every `PRINT_INTERVAL`, and at the end.
+    struct Printer<'a> {
+        report: &'a (dyn Fn(&str) + Send + Sync),
+        last: Mutex<Option<Instant>>,
+    }
+
+    impl<'a> Printer<'a> {
+        fn new(report: &'a (dyn Fn(&str) + Send + Sync)) -> Self {
+            Self {
+                report,
+                last: Mutex::new(None),
+            }
+        }
+
+        fn print(&self, received: u64, total: u64) {
+            let mut last = self.last.lock().unwrap();
+            let due = last.is_none_or(|t| t.elapsed() >= PRINT_INTERVAL);
+            if due || (total > 0 && received >= total) {
+                *last = Some(Instant::now());
+                if total > 0 {
+                    (self.report)(&format!(
+                        "  {} of {} ({}%)",
+                        mb(received),
+                        mb(total),
+                        received * 100 / total
+                    ));
+                } else {
+                    (self.report)(&format!("  {}", mb(received)));
+                }
+            }
+        }
+    }
+
+    fn mb(bytes: u64) -> String {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        use margin_embed::{Chunk, EmbedError, Embedder, Extracted, OnnxDtype, Transcript};
+        use margin_shared::SourceKind;
+
+        use super::*;
+        use crate::engines::BoxFuture;
+        use crate::pipeline::{Chunker, ChunkerCfg};
+
+        /// Writes one file of 10 bytes as "the model", in two progress steps.
+        struct Fake;
+
+        impl SourceTools for Fake {
+            fn is_complete(&self, files: &ModelFiles) -> bool {
+                files.dir.join("model").is_file()
+            }
+            fn size_on_disk(&self, files: &ModelFiles) -> u64 {
+                std::fs::metadata(files.dir.join("model")).map_or(0, |m| m.len())
+            }
+            fn remote_size<'a>(
+                &'a self,
+                _: &'a ModelFiles,
+                _: &'a reqwest::Client,
+                _: &'a str,
+            ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+                Box::pin(async { Ok(10) })
+            }
+            fn download<'a>(
+                &'a self,
+                files: &'a ModelFiles,
+                _: &'a reqwest::Client,
+                hf_base: &'a str,
+                progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+            ) -> BoxFuture<'a, Result<(), EmbedError>> {
+                Box::pin(async move {
+                    if hf_base == "fail" {
+                        return Err(EmbedError::Download("offline".into()));
+                    }
+                    progress(5, 10);
+                    std::fs::create_dir_all(&files.dir)?;
+                    std::fs::write(files.dir.join("model"), b"0123456789")?;
+                    progress(10, 10);
+                    Ok(())
+                })
+            }
+            fn remove(&self, _: &ModelFiles) -> Result<(), EmbedError> {
+                unreachable!()
+            }
+            fn load(&self, _: &ModelFiles) -> Result<Arc<dyn Embedder>, EmbedError> {
+                unreachable!()
+            }
+            fn extract(&self, _: &Path, _: SourceKind, _: &Path) -> Result<Extracted, EmbedError> {
+                unreachable!()
+            }
+            fn transcribe(&self, _: &[f32], _: &Path) -> Result<Option<Transcript>, EmbedError> {
+                unreachable!()
+            }
+            fn image_for_model(&self, _: &Path) -> Result<(String, Vec<u8>), EmbedError> {
+                unreachable!()
+            }
+            fn chunk(
+                &self,
+                _: &dyn Chunker,
+                _: &Extracted,
+                _: SourceKind,
+                _: &dyn Fn(&str) -> usize,
+                _: &ChunkerCfg,
+            ) -> Vec<Chunk> {
+                unreachable!()
+            }
+            fn pdf_page_picture(&self, _: &Path, _: u32, _: &Path) -> Result<PathBuf, EmbedError> {
+                unreachable!()
+            }
+            fn score(&self, _: &[f32], _: &str, _: &[f32], _: &str) -> f32 {
+                unreachable!()
+            }
+        }
+
+        /// A speech model of 20 bytes, kept in memory.
+        #[derive(Default)]
+        struct FakeSpeech(std::sync::atomic::AtomicBool);
+
+        impl SpeechModel for FakeSpeech {
+            fn repo(&self) -> String {
+                "speech/repo".into()
+            }
+            fn is_complete(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            fn size_on_disk(&self) -> u64 {
+                if self.is_complete() { 20 } else { 0 }
+            }
+            fn remote_size<'a>(
+                &'a self,
+                _: &'a reqwest::Client,
+                _: &'a str,
+            ) -> BoxFuture<'a, Result<u64, EmbedError>> {
+                Box::pin(async { Ok(20) })
+            }
+            fn download<'a>(
+                &'a self,
+                _: &'a reqwest::Client,
+                hf_base: &'a str,
+                progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+            ) -> BoxFuture<'a, Result<(), EmbedError>> {
+                Box::pin(async move {
+                    if hf_base == "fail" {
+                        return Err(EmbedError::Download("offline".into()));
+                    }
+                    progress(20, 20);
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            fn remove(&self) -> Result<(), EmbedError> {
+                unreachable!()
+            }
+        }
+
+        #[tokio::test]
+        async fn the_speech_model_downloads_once_and_reports() {
+            let speech = FakeSpeech::default();
+            let lines = Mutex::new(Vec::<String>::new());
+            let report = |l: &str| lines.lock().unwrap().push(l.to_string());
+            let err = run_speech(&speech, "fail", &report).await.unwrap_err();
+            assert!(format!("{err:#}").contains("offline"), "{err:#}");
+            run_speech(&speech, "http://hf", &report).await.unwrap();
+            let out = lines.lock().unwrap().join("\n");
+            assert!(
+                out.contains("Downloading the speech model speech/repo"),
+                "{out}"
+            );
+            assert!(out.contains("100%"), "{out}");
+            assert!(out.contains("is downloaded (0.0 MB)"), "{out}");
+            run_speech(&speech, "fail", &report).await.unwrap();
+            assert!(
+                lines
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .contains("already downloaded")
+            );
+        }
+
+        #[test]
+        fn arguments_name_a_backend() {
+            let args =
+                |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert_eq!(args(&[]), Ok(None));
+            assert_eq!(
+                args(&["--embedder", "onnx-q8"]),
+                Ok(Some(Backend::Onnx(OnnxDtype::Q8)))
+            );
+            assert_eq!(args(&["--embedder=coreml"]), Ok(Some(Backend::CoreMl)));
+            assert!(args(&["--embedder"]).unwrap_err().contains("needs a name"));
+            assert!(args(&["--embedder", "tf"]).unwrap_err().contains("onnx-q8"));
+            assert!(args(&["--force"]).unwrap_err().contains("unknown option"));
+        }
+
+        #[test]
+        fn files_are_the_configured_backends_or_the_named_one() {
+            let c = Config {
+                data_dir: PathBuf::from("/data"),
+                ..Config::default()
+            };
+            let f = files_for(&c, None).unwrap();
+            assert_eq!(f.backend, Backend::default());
+            assert_eq!(f.dir, c.model_files().dir);
+            for b in Backend::ALL {
+                let r = files_for(&c, Some(b));
+                assert_eq!(r.is_ok(), b.is_built(), "{b}");
+                if let Ok(f) = r {
+                    assert_eq!(f.dir, Path::new("/data/models").join(b.dir_name()));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn it_downloads_once_and_reports() {
+            let dir = std::env::temp_dir().join(format!("margin-dl-{}", uuid::Uuid::new_v4()));
+            let files = ModelFiles::with_backend(dir.join("m"), Backend::default());
+            let lines = Mutex::new(Vec::<String>::new());
+            let report = |l: &str| lines.lock().unwrap().push(l.to_string());
+            assert!(run(&Fake, &files, "fail", &report).await.is_err());
+            run(&Fake, &files, "http://hf", &report).await.unwrap();
+            let out = lines.lock().unwrap().join("\n");
+            assert!(out.contains("Downloading"), "{out}");
+            assert!(out.contains("100%"), "{out}");
+            assert!(out.contains("is downloaded (0.0 MB)"), "{out}");
+            run(&Fake, &files, "fail", &report).await.unwrap();
+            assert!(
+                lines
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .contains("already downloaded"),
+                "a complete download isn't fetched again"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
