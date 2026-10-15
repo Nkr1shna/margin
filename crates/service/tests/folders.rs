@@ -1479,3 +1479,22 @@ async fn view_picture_sends_the_picture_to_the_model() {
         "no picture in the next request"
     );
 }
+
+/// The manifest route takes up to `MANIFEST_MAX_BYTES` (64 MB; the 2 MB of every other
+/// JSON route would cap a folder at about 10 000 files): at the limit the body is read
+/// (junk is then a 400), one byte more is a 413 (phase 5, D7).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_manifest_body_stops_at_its_limit() {
+    use margin_service::folders::MANIFEST_MAX_BYTES;
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let send = |n: usize| {
+        h.post(&t, "/api/workspaces/no-such-folder/sync")
+            .header("content-type", "application/json")
+            .body(vec![b'x'; n])
+            .send()
+    };
+    assert_eq!(send(MANIFEST_MAX_BYTES).await.unwrap().status(), 400);
+    assert_eq!(send(MANIFEST_MAX_BYTES + 1).await.unwrap().status(), 413);
+    const { assert!(MANIFEST_MAX_BYTES > routes::JSON_BODY_MAX_BYTES) };
+}
