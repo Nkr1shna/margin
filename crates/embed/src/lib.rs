@@ -902,30 +902,40 @@ impl RerankerFiles {
         self.dir.join(RERANKER_GRAPH)
     }
 
-    /// Total bytes the download fetches (from the Hugging Face API). R2-xenc.
+    /// Total bytes the download fetches (from the Hugging Face API, at the pinned
+    /// `RerankerModel::revision`).
     pub async fn remote_size(
         &self,
         client: &reqwest::Client,
         hf_base: &str,
     ) -> Result<u64, EmbedError> {
-        let _ = (client, hf_base);
-        unimplemented!("R2-xenc, RerankerFiles::remote_size")
+        let files =
+            download::remote_files(client, hf_base, download::Manifest::Reranker(self.model))
+                .await?;
+        Ok(files.iter().map(|f| f.size).sum())
     }
 
-    /// Fetches the files, reporting `(received, total)`. R2-xenc.
+    /// Fetches the files (keeping any already complete from an interrupted download),
+    /// reporting `(received, total)`.
     pub async fn download(
         &self,
         client: &reqwest::Client,
         hf_base: &str,
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<(), EmbedError> {
-        let _ = (client, hf_base, progress);
-        unimplemented!("R2-xenc, RerankerFiles::download")
+        download::download(
+            &self.dir,
+            download::Manifest::Reranker(self.model),
+            client,
+            hf_base,
+            progress,
+        )
+        .await
     }
 
-    /// Deletes the folder. R2-xenc.
+    /// Deletes the folder. Nothing there is fine.
     pub fn remove(&self) -> Result<(), EmbedError> {
-        unimplemented!("R2-xenc, RerankerFiles::remove")
+        download::remove(&self.dir)
     }
 }
 
