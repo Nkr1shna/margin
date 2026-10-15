@@ -11,10 +11,12 @@ pub mod chat;
 pub mod context;
 pub mod device;
 pub mod pipeline;
+pub mod providers;
 pub mod routes;
 
 pub use chat::*;
 pub use device::*;
+pub use providers::*;
 
 /// Serde for `Option<Option<T>>` patch fields: a missing field is `None` (unchanged),
 /// `null` is `Some(None)` (clear), and a value is `Some(Some(v))`. Use with
@@ -600,11 +602,15 @@ pub struct SearchHit {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SettingsWire")]
 pub struct Settings {
     /// Base URL of an OpenAI-compatible Responses API, e.g. "https://api.openai.com/v1".
     pub openai_base_url: String,
+    /// The OpenAI provider's writing model before the slots existed; kept on the wire
+    /// for older apps (it mirrors `openai_models.write`).
     pub openai_model: String,
-    /// Whether an API key is stored in the service Mac's Keychain. The key itself is never returned.
+    /// Whether an OpenAI API key is stored in the service Mac's Keychain. The key itself
+    /// is never returned.
     pub has_api_key: bool,
     /// PocketTTS voice name passed to `fluidaudiocli tts --voice`; `None` uses the default voice.
     pub voice: Option<String>,
@@ -612,19 +618,121 @@ pub struct Settings {
     pub render_width: u32,
     pub render_height: u32,
     pub render_fps: u32,
-    /// How hard the agent thinks before answering (Responses API `reasoning.effort`).
+    /// How hard the agent thinks before answering, shared by every provider (Responses
+    /// `reasoning.effort`, Messages `output_config.effort`).
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
-    /// The model chats use; `None` uses `openai_model` (which lessons, outlines and
-    /// scenes always use).
+    /// Deprecated: the OpenAI chat model before the slots existed. Read once into
+    /// `openai_models.chat` when a stored `Settings` has no slots; kept on the wire,
+    /// never removed.
     #[serde(default)]
     pub agent_model: Option<String>,
-    /// The retrieval and generation pipeline: stages by name, budgets, model routes.
+    /// The retrieval and generation pipeline: stages by name, budgets, model routes
+    /// (`pipeline.routes` is the eval variants' override, not the product's slots).
     #[serde(default)]
     pub pipeline: pipeline::PipelineConfig,
     /// Raw trace rows older than this are deleted; rollups stay.
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
+    /// The provider new chats, lessons, videos, outlines and the small calls use. A
+    /// chat keeps the provider it was created on.
+    #[serde(default)]
+    pub default_provider: Provider,
+    /// The OpenAI provider's three slots (chats, writing, small tasks).
+    pub openai_models: RouteModels,
+    /// The ChatGPT provider's three slots.
+    pub chatgpt_models: RouteModels,
+    /// The Claude provider's three slots.
+    pub claude_models: RouteModels,
+    /// Whether an Anthropic API key is stored in the service Mac's Keychain.
+    #[serde(default)]
+    pub has_claude_api_key: bool,
+    /// The ChatGPT account Margin is signed in with, if any.
+    #[serde(default)]
+    pub chatgpt: Option<ChatGptAccount>,
+}
+
+impl Settings {
+    /// The slots of `provider`.
+    pub fn models(&self, provider: Provider) -> &RouteModels {
+        match provider {
+            Provider::OpenAi => &self.openai_models,
+            Provider::ChatGpt => &self.chatgpt_models,
+            Provider::Claude => &self.claude_models,
+        }
+    }
+
+    /// Whether `provider` has what it needs to make calls (a key, or a sign-in).
+    pub fn has_credential(&self, provider: Provider) -> bool {
+        match provider {
+            Provider::OpenAi => self.has_api_key,
+            Provider::ChatGpt => self.chatgpt.is_some(),
+            Provider::Claude => self.has_claude_api_key,
+        }
+    }
+}
+
+/// `Settings` as it may arrive: from an older service, without the provider slots.
+/// Missing slots get their defaults, the OpenAI ones from `openai_model` and the
+/// deprecated `agent_model` (`RouteModels::openai_from`).
+#[derive(Deserialize)]
+struct SettingsWire {
+    openai_base_url: String,
+    openai_model: String,
+    has_api_key: bool,
+    voice: Option<String>,
+    render_width: u32,
+    render_height: u32,
+    render_fps: u32,
+    #[serde(default)]
+    reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    agent_model: Option<String>,
+    #[serde(default)]
+    pipeline: pipeline::PipelineConfig,
+    #[serde(default = "default_trace_retention_days")]
+    trace_retention_days: u32,
+    #[serde(default)]
+    default_provider: Provider,
+    #[serde(default)]
+    openai_models: Option<RouteModels>,
+    #[serde(default)]
+    chatgpt_models: Option<RouteModels>,
+    #[serde(default)]
+    claude_models: Option<RouteModels>,
+    #[serde(default)]
+    has_claude_api_key: bool,
+    #[serde(default)]
+    chatgpt: Option<ChatGptAccount>,
+}
+
+impl From<SettingsWire> for Settings {
+    fn from(w: SettingsWire) -> Self {
+        let openai_models = w
+            .openai_models
+            .unwrap_or_else(|| RouteModels::openai_from(&w.openai_model, w.agent_model.as_deref()));
+        Settings {
+            openai_base_url: w.openai_base_url,
+            openai_model: w.openai_model,
+            has_api_key: w.has_api_key,
+            voice: w.voice,
+            render_width: w.render_width,
+            render_height: w.render_height,
+            render_fps: w.render_fps,
+            reasoning_effort: w.reasoning_effort,
+            agent_model: w.agent_model,
+            pipeline: w.pipeline,
+            trace_retention_days: w.trace_retention_days,
+            default_provider: w.default_provider,
+            openai_models,
+            chatgpt_models: w
+                .chatgpt_models
+                .unwrap_or_else(RouteModels::chatgpt_default),
+            claude_models: w.claude_models.unwrap_or_else(RouteModels::claude_default),
+            has_claude_api_key: w.has_claude_api_key,
+            chatgpt: w.chatgpt,
+        }
+    }
 }
 
 /// `Settings.trace_retention_days` unless changed.
@@ -702,6 +810,19 @@ pub struct SettingsPatch {
     pub pipeline: Option<pipeline::PipelineConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_retention_days: Option<u32>,
+    /// The default provider for new chats and the job routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<Provider>,
+    /// Replaces the OpenAI slots (an empty id is refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_models: Option<RouteModels>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_models: Option<RouteModels>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_models: Option<RouteModels>,
+    /// `Some(key)` stores the Anthropic key in the Keychain; `Some("")` deletes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -786,6 +907,9 @@ pub struct Me {
 // Live events, sent over the /api/events WebSocket as JSON text frames
 // ---------------------------------------------------------------------------
 
+// `SettingsChanged` carries the whole `Settings` (three providers' slots): events are
+// short-lived and sent once, so its size isn't worth boxing the wire type for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -938,6 +1062,48 @@ mod tests {
         assert!(warned.can_read_again());
         assert!(SourceStatus::Failed { error: "x".into() }.can_read_again());
         assert!(!SourceStatus::Queued.can_read_again());
+    }
+
+    #[test]
+    fn settings_without_slots_get_the_defaults_and_migrate_agent_model() {
+        let stored = serde_json::json!({
+            "openai_base_url": "https://api.openai.com/v1", "openai_model": "gpt-w",
+            "has_api_key": true, "voice": null, "agent_model": "gpt-c",
+            "render_width": 1920, "render_height": 1080, "render_fps": 30
+        });
+        let s: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(s.default_provider, Provider::OpenAi);
+        assert_eq!(s.openai_models.chat, "gpt-c");
+        assert_eq!(s.openai_models.write, "gpt-w");
+        assert_eq!(s.openai_models.small, OPENAI_SMALL_MODEL);
+        assert_eq!(s.claude_models, RouteModels::claude_default());
+        assert_eq!(s.claude_models.write, "claude-opus-5-5");
+        assert_eq!(s.claude_models.small, "claude-haiku-5-5");
+        assert_eq!(s.chatgpt_models, RouteModels::chatgpt_default());
+        assert!(!s.has_claude_api_key && s.chatgpt.is_none());
+        assert!(s.has_credential(Provider::OpenAi));
+        assert!(!s.has_credential(Provider::Claude));
+        // Once written with slots, they win over `agent_model`.
+        let mut changed = s.clone();
+        changed.openai_models.chat = "gpt-x".into();
+        changed.default_provider = Provider::Claude;
+        let json = serde_json::to_value(&changed).unwrap();
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, changed);
+        assert_eq!(back.models(Provider::OpenAi).chat, "gpt-x");
+        assert_eq!(back.models(Provider::Claude).chat, "claude-opus-5-5");
+
+        let patch = SettingsPatch {
+            default_provider: Some(Provider::Claude),
+            claude_models: Some(RouteModels::claude_default()),
+            anthropic_api_key: Some(String::new()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        assert_eq!(serde_json::from_str::<SettingsPatch>(&json).unwrap(), patch);
+        let empty: SettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.default_provider, None);
+        assert_eq!(empty.anthropic_api_key, None);
     }
 
     #[test]

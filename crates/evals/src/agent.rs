@@ -197,10 +197,10 @@ pub struct TaskResult {
     pub output_tokens: u64,
 }
 
-/// Runs one task through the agent loop.
-pub async fn run_task(
-    model: &dyn ModelClient,
-    model_id: Option<String>,
+/// Runs one task through the agent loop, on `model` (whose chat slot names the model;
+/// its plain text side condenses).
+pub async fn run_task<M: ModelClient + margin_ai::TextModel>(
+    model: &M,
     index: Arc<EvalIndex<'static>>,
     task: &AgentTask,
     retry: RetryPolicy,
@@ -231,6 +231,7 @@ pub async fn run_task(
     let outcome = run_turn(
         TurnDeps {
             model,
+            small: model,
             tools: &tools,
             sink: &sink,
             devices: Arc::new(NoDevices),
@@ -240,7 +241,7 @@ pub async fn run_task(
             chat_id: format!("eval-{}", task.id),
             turn_id: "turn".into(),
             origin_device: device,
-            model: model_id,
+            provider: model.kind(),
             reasoning_effort: ReasoningEffort::Medium,
             history,
             workspaces: Vec::new(),
@@ -251,7 +252,7 @@ pub async fn run_task(
     let answer = items
         .iter()
         .filter_map(|i| match &i.kind {
-            ChatItemKind::AssistantText { text } => Some(text.as_str()),
+            ChatItemKind::AssistantText { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -347,7 +348,7 @@ mod tests {
                 "It stays near 9 percent of the jump.[^1]",
             ])),
         ]);
-        let r = run_task(&model, None, index.clone(), task, RetryPolicy::immediate()).await;
+        let r = run_task(&model, index.clone(), task, RetryPolicy::immediate()).await;
         assert!(r.finished, "{:?}", r.error);
         assert_eq!(r.steps, 2);
         assert_eq!(r.searches, 1);
@@ -377,13 +378,12 @@ mod tests {
         let model = ScriptedModel::new([Scripted::Events(text_reply(&[
             "Your sources don't cover CRISPR.",
         ]))]);
-        let r = run_task(&model, None, index, &task, RetryPolicy::immediate()).await;
+        let r = run_task(&model, index, &task, RetryPolicy::immediate()).await;
         assert_eq!(r.abstained, Some(true));
         assert_eq!(r.anchors_cited, 1.0);
         let failing = ScriptedModel::default();
         let r = run_task(
             &failing,
-            None,
             index_again().await,
             &task,
             RetryPolicy::immediate(),

@@ -21,7 +21,7 @@ mod device;
 mod model;
 mod prompt;
 mod registry;
-mod replay;
+pub mod replay;
 pub mod scripted;
 mod sink;
 mod tool;
@@ -32,14 +32,14 @@ pub use device::{
     device_output_text, device_tools,
 };
 pub use model::ModelClient;
-pub use prompt::{MessageContext, system_prompt, user_message_input};
+pub use prompt::{AGENT_PROMPT_VERSION, MessageContext, system_prompt, user_message_input};
 pub use registry::ToolRegistry;
 pub use replay::{
     CONDENSED_HISTORY_PREFIX, ReplayItem, TOOL_PICTURES_PREFIX, action_input,
     cancelled_call_output, function_call_output, replay_input, tool_pictures_input,
     unanswered_calls,
 };
-pub use scripted::{Scripted, ScriptedModel};
+pub use scripted::{Recorded, Scripted, ScriptedModel};
 pub use sink::{ItemRecord, SinkError, TurnSink};
 pub use tool::{
     ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool,

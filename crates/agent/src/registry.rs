@@ -55,6 +55,18 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
+    /// The tools as the provider seam takes them, in the registry's fixed order.
+    pub fn tool_defs(&self) -> Vec<margin_ai::ToolDef> {
+        self.tools
+            .iter()
+            .map(|t| margin_ai::ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect()
+    }
+
     /// The Responses API `tools` array: one
     /// `{"type":"function","name","description","parameters","strict":true}` per tool.
     pub fn definitions(&self) -> Vec<Value> {

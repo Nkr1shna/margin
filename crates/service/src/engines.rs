@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use margin_agent::ModelClient;
 use margin_ai::{
-    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, ResponsesClient,
-    SceneRequest,
+    AiError, CallOptions, ClaudeClient, CoursePlan, Generated, LessonContext, ModelWindow,
+    PlanRequest, Provider, ProviderConfig, ProviderKind, ResponsesClient, SceneRequest, TextModel,
 };
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{SourceKind, ToolStatus};
@@ -24,33 +23,27 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// sending more than it reads.
 pub const WRITER_IMAGE_SIDE: usize = 1536;
 
-/// Where and how to call the Responses API. Built per job from Settings and the secret store.
-#[derive(Clone)]
-pub struct AiConfig {
-    pub base_url: String,
-    pub api_key: String,
+/// The provider, model and window a call on one route uses (`AppState::model_for`,
+/// `docs/agent-providers-brief.md` D10). `config.models.get(route)` is `model`. Its
+/// `Debug` prints no credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub config: ProviderConfig,
     pub model: String,
+    /// The model's context window and output cap (D13).
+    pub window: ModelWindow,
 }
 
-impl std::fmt::Debug for AiConfig {
-    // Never print the key.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AiConfig")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-/// The model work jobs need. Every call takes its `CallOptions` (the route it runs on,
-/// the prompt cache key, an output cap) and returns the answer with its usage, which the
-/// caller records as a `model_call` trace row. Course outlines are the agent's
-/// `propose_course` arguments (through `agent_model`); `plan_course` turns one into the
-/// planned outline with per-lesson questions when the course has sources (§2.5).
+/// The model work jobs need. Every call takes the `ModelChoice` of its route and its
+/// `CallOptions` (the route, the prompt cache key, an output cap, the constant prefix's
+/// length) and returns the answer with its usage, which the caller records as a
+/// `model_call` trace row. Course outlines are the agent's `propose_course` arguments
+/// (through `agent_model`); `plan_course` turns one into the planned outline with
+/// per-lesson questions when the course has sources (§2.5).
 pub trait Generator: Send + Sync + 'static {
     fn write_lesson<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         ctx: &'a LessonContext,
         opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
@@ -58,7 +51,7 @@ pub trait Generator: Send + Sync + 'static {
 
     fn write_scene<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         req: &'a SceneRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>>;
@@ -66,14 +59,18 @@ pub trait Generator: Send + Sync + 'static {
     /// The outline planner: one strict-JSON call, checked against `req`.
     fn plan_course<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         req: &'a PlanRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>>;
 
-    /// The model the agent loop calls for a chat turn. The turn picks the agent model
-    /// (Settings' `agent_model`, else `ai.model`) per request.
-    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient>;
+    /// The provider client the agent loop calls (one step per call; the model is the
+    /// config's slot for the request's route).
+    fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn Provider>;
+
+    /// The provider's plain text model (titles, condense summaries; lessons, scenes and
+    /// the planner once they move onto it).
+    fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel>;
 }
 
 pub trait Renderer: Send + Sync + 'static {
@@ -87,47 +84,69 @@ pub trait Renderer: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<RenderOutput, RenderError>>;
 }
 
-/// `margin_ai` against the configured Responses API.
+/// `margin_ai` against the configured providers.
 pub struct AiGenerator;
-
-fn client(ai: &AiConfig) -> ResponsesClient {
-    ResponsesClient::new(ai.base_url.clone(), ai.api_key.clone(), ai.model.clone())
-}
 
 impl Generator for AiGenerator {
     fn write_lesson<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         ctx: &'a LessonContext,
         opts: &'a CallOptions,
         on_delta: Box<dyn FnMut(&str) + Send + 'a>,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
-        Box::pin(
-            async move { margin_ai::write_lesson_with(&client(ai), ctx, opts, on_delta).await },
-        )
+        Box::pin(async move {
+            margin_ai::write_lesson_with(&*self.text_model(&m.config), ctx, opts, on_delta).await
+        })
     }
 
     fn write_scene<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         req: &'a SceneRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
-        Box::pin(async move { margin_ai::write_scene_with(&client(ai), req, opts).await })
+        Box::pin(async move {
+            margin_ai::write_scene_with(&*self.text_model(&m.config), req, opts).await
+        })
     }
 
     fn plan_course<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         req: &'a PlanRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
-        Box::pin(async move { margin_ai::plan_course(&client(ai), req, opts).await })
+        Box::pin(
+            async move { margin_ai::plan_course(&*self.text_model(&m.config), req, opts).await },
+        )
     }
 
-    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
-        Arc::new(client(ai))
+    fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn Provider> {
+        match config.provider {
+            ProviderKind::OpenAi | ProviderKind::ChatGpt => {
+                Arc::new(ResponsesClient::from_config(config))
+            }
+            ProviderKind::Claude => Arc::new(claude_client(config)),
+        }
     }
+
+    fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel> {
+        match config.provider {
+            ProviderKind::OpenAi | ProviderKind::ChatGpt => {
+                Arc::new(ResponsesClient::from_config(config))
+            }
+            ProviderKind::Claude => Arc::new(claude_client(config)),
+        }
+    }
+}
+
+fn claude_client(config: &ProviderConfig) -> ClaudeClient {
+    ClaudeClient::new(
+        config.base_url.clone(),
+        config.credential.secret(),
+        config.models.clone(),
+    )
 }
 
 /// `margin_video`'s ManimGX + FluidAudio pipeline.

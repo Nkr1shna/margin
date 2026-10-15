@@ -76,6 +76,15 @@ pub struct FakeState {
     pub folder_stamps: HashMap<Id, FileStamp>,
     /// Manifests received, for tests.
     pub manifests_received: Vec<(Id, SyncManifest)>,
+    /// Where "Sign in with ChatGPT" is (`routes::PROVIDERS_CHATGPT`).
+    pub chatgpt: ChatGptStatus,
+    /// How the waiting sign-in ends at the next status poll: `Ok(email)` signs in,
+    /// `Err(message)` fails it. Tests set it; manual runs sign in after a few polls.
+    pub chatgpt_finish: Option<Result<String, String>>,
+    /// Status polls while waiting, for manual runs (they sign in on the third).
+    pub chatgpt_polls: u32,
+    /// Sign-ins started, for tests.
+    pub chatgpt_starts: u32,
 }
 
 /// An upload in parts the fake is receiving.
@@ -516,6 +525,12 @@ fn default_settings() -> Settings {
         agent_model: None,
         pipeline: Default::default(),
         trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+        default_provider: Default::default(),
+        openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+        chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
+        claude_models: margin_shared::RouteModels::claude_default(),
+        has_claude_api_key: false,
+        chatgpt: None,
     }
 }
 
@@ -574,6 +589,10 @@ impl FakeState {
             manifests: HashMap::new(),
             folder_stamps: HashMap::new(),
             manifests_received: Vec::new(),
+            chatgpt: ChatGptStatus::SignedOut,
+            chatgpt_finish: None,
+            chatgpt_polls: 0,
+            chatgpt_starts: 0,
         };
         for (chat, items) in sample_chats() {
             for item in &items {
@@ -739,6 +758,12 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/search", get(search))
         .route("/api/settings", get(get_settings).patch(patch_settings))
         .route("/api/tools", get(tools))
+        .route("/api/providers/{provider}/models", get(provider_models))
+        .route(
+            routes::PROVIDERS_CHATGPT,
+            get(chatgpt_status).delete(chatgpt_sign_out),
+        )
+        .route(routes::PROVIDERS_CHATGPT_START, post(chatgpt_start))
         .route(routes::PIPELINE_VARIANTS, get(pipeline_variants))
         .route(routes::TRACES, get(traces))
         .route(routes::TRACES_ROLLUP, get(traces_rollup))
@@ -1769,6 +1794,27 @@ async fn patch_settings(
     {
         return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
     }
+    for (provider, models) in [
+        (Provider::OpenAi, &req.openai_models),
+        (Provider::ChatGpt, &req.chatgpt_models),
+        (Provider::Claude, &req.claude_models),
+    ] {
+        // As the service's `checked_slots`.
+        if let Some(models) = models
+            && margin_shared::pipeline::Route::ALL
+                .into_iter()
+                .any(|r| models.get(r).trim().is_empty())
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                error_code::NO_MODEL,
+                &format!(
+                    "Every {} slot needs a model: chats, writing and small tasks.",
+                    provider.label()
+                ),
+            );
+        }
+    }
     let settings = {
         let mut s = fake.state.lock().unwrap();
         if let Some(v) = req.trace_retention_days {
@@ -1803,6 +1849,33 @@ async fn patch_settings(
         }
         if let Some(v) = req.agent_model {
             s.settings.agent_model = v.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+            s.settings.openai_models.chat = s
+                .settings
+                .agent_model
+                .clone()
+                .unwrap_or_else(|| s.settings.openai_model.clone());
+        }
+        if let Some(v) = req.default_provider {
+            s.settings.default_provider = v;
+        }
+        let trimmed = |m: RouteModels| RouteModels {
+            chat: m.chat.trim().into(),
+            write: m.write.trim().into(),
+            small: m.small.trim().into(),
+        };
+        if let Some(v) = req.openai_models {
+            // `openai_model` mirrors the writing slot for older apps.
+            s.settings.openai_models = trimmed(v);
+            s.settings.openai_model = s.settings.openai_models.write.clone();
+        }
+        if let Some(v) = req.chatgpt_models {
+            s.settings.chatgpt_models = trimmed(v);
+        }
+        if let Some(v) = req.claude_models {
+            s.settings.claude_models = trimmed(v);
+        }
+        if let Some(key) = req.anthropic_api_key {
+            s.settings.has_claude_api_key = !key.trim().is_empty();
         }
         s.settings.has_api_key = s.has_api_key;
         s.settings.clone()
@@ -1923,6 +1996,182 @@ async fn traces_rollup(headers: HeaderMap) -> Response {
         return r;
     }
     Json(Vec::<margin_shared::context::TraceRollup>::new()).into_response()
+}
+
+/// The models the fake's providers offer: windows from the providers (Claude) or
+/// Margin's table (the GPT-6 family), and one OpenAI model with no known window.
+pub fn fake_models(provider: Provider) -> Vec<ModelInfo> {
+    let model = |id: &str, name: &str, window: Option<(u32, u32)>| ModelInfo {
+        id: id.into(),
+        display_name: Some(name.into()),
+        context_window: window.map(|w| w.0),
+        max_output_tokens: window.map(|w| w.1),
+    };
+    let gpt6 = Some((1_050_000, 128_000));
+    match provider {
+        Provider::OpenAi => vec![
+            model("gpt-6-astra", "GPT-6 Astra", gpt6),
+            model("gpt-6.1-sol", "GPT-6.1 Sol", gpt6),
+            model("gpt-6-luna", "GPT-6 Luna", gpt6),
+            model("gpt-5", "GPT-5", None),
+        ],
+        Provider::ChatGpt => vec![
+            model("gpt-6.1-sol", "GPT-6.1 Sol", gpt6),
+            model("gpt-6-astra", "GPT-6 Astra", gpt6),
+        ],
+        Provider::Claude => vec![
+            model(
+                "claude-haiku-5-5",
+                "Claude Haiku 5.5",
+                Some((200_000, 64_000)),
+            ),
+            model(
+                "claude-opus-5-5",
+                "Claude Opus 5.5",
+                Some((1_000_000, 128_000)),
+            ),
+            model(
+                "claude-sonnet-5-5",
+                "Claude Sonnet 5.5",
+                Some((1_000_000, 128_000)),
+            ),
+            model(
+                "claude-opus-4-1",
+                "Claude Opus 4.1",
+                Some((200_000, 32_000)),
+            ),
+        ],
+    }
+}
+
+/// Whether the fake's `provider` has a key or a sign-in.
+fn fake_has_credential(s: &FakeState, provider: Provider) -> bool {
+    match provider {
+        Provider::OpenAi => s.has_api_key,
+        Provider::ChatGpt => s.settings.chatgpt.is_some(),
+        Provider::Claude => s.settings.has_claude_api_key,
+    }
+}
+
+/// `GET /api/providers/{provider}/models`: 409 `not_configured` without a credential.
+async fn provider_models(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let Some(provider) = Provider::ALL.into_iter().find(|p| p.as_str() == provider) else {
+        return not_found();
+    };
+    if !fake_has_credential(&fake.state.lock().unwrap(), provider) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_configured",
+            &format!("{} isn't set up yet.", provider.label()),
+        );
+    }
+    Json(fake_models(provider)).into_response()
+}
+
+/// The ChatGPT account the fake signs in as.
+pub fn fake_account(email: &str) -> ChatGptAccount {
+    let now = Utc::now();
+    ChatGptAccount {
+        email: email.into(),
+        signed_in_at: now,
+        expires_at: Some(now + chrono::Duration::days(30)),
+    }
+}
+
+/// `GET /api/providers/chatgpt`. A waiting sign-in ends here, as `chatgpt_finish` says
+/// (or, in manual runs, signed in on the third poll).
+async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let (status, changed) = {
+        let mut s = fake.state.lock().unwrap();
+        let mut changed = None;
+        if matches!(s.chatgpt, ChatGptStatus::Waiting { .. }) {
+            s.chatgpt_polls += 1;
+            let finish = s.chatgpt_finish.take().or_else(|| {
+                (s.simulate && s.chatgpt_polls >= 3).then(|| Ok("owner@example.com".to_string()))
+            });
+            match finish {
+                Some(Ok(email)) => {
+                    let account = fake_account(&email);
+                    s.settings.chatgpt = Some(account.clone());
+                    s.chatgpt = ChatGptStatus::SignedIn {
+                        account,
+                        last_error: None,
+                    };
+                    s.settings.has_api_key = s.has_api_key;
+                    changed = Some(s.settings.clone());
+                }
+                // As the service: a failed attempt while signed in keeps the account.
+                Some(Err(message)) => {
+                    s.chatgpt = match s.settings.chatgpt.clone() {
+                        Some(account) => ChatGptStatus::SignedIn {
+                            account,
+                            last_error: Some(message),
+                        },
+                        None => ChatGptStatus::Failed { message },
+                    }
+                }
+                None => {}
+            }
+        }
+        (s.chatgpt.clone(), changed)
+    };
+    if let Some(settings) = changed {
+        publish(&fake, Event::SettingsChanged { settings });
+    }
+    Json(status).into_response()
+}
+
+/// `POST /api/providers/chatgpt/start`: a sign-in waits for the owner's browser.
+async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let mut s = fake.state.lock().unwrap();
+    s.chatgpt_starts += 1;
+    s.chatgpt_polls = 0;
+    let state = format!("st-{}", s.chatgpt_starts);
+    let authorize_url = format!(
+        "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client\
+         &agent_name_hint=Margin&response_type=code&state={state}\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
+    );
+    s.chatgpt = ChatGptStatus::Waiting {
+        authorize_url: authorize_url.clone(),
+    };
+    Json(ChatGptStart {
+        authorize_url,
+        state,
+    })
+    .into_response()
+}
+
+/// `DELETE /api/providers/chatgpt`: signs out (or gives up a waiting sign-in).
+async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&headers) {
+        return r;
+    }
+    let settings = {
+        let mut s = fake.state.lock().unwrap();
+        s.chatgpt = ChatGptStatus::SignedOut;
+        s.chatgpt_finish = None;
+        let was = s.settings.chatgpt.take();
+        s.settings.has_api_key = s.has_api_key;
+        was.map(|_| s.settings.clone())
+    };
+    if let Some(settings) = settings {
+        publish(&fake, Event::SettingsChanged { settings });
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn tools(headers: HeaderMap) -> Response {
@@ -2950,6 +3199,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
         id: id.into(),
         title: title.into(),
         title_by: Default::default(),
+        provider: Default::default(),
         state,
         workspace_ids: vec![],
         source_ids: vec![],
@@ -2960,6 +3210,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             output_tokens: 1_250,
             reasoning_tokens: 640,
             model_calls: 4,
+            ..Default::default()
         },
         waiting: None,
         created_at: ts(at),
@@ -3023,6 +3274,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             "t1",
             ChatItemKind::AssistantText {
                 text: "For a reasonably well-behaved periodic signal the partial sums\n\n$$S_N(t) = \\sum_{n=-N}^{N} c_n e^{i n \\omega_0 t}$$\n\nconverge to the signal wherever it is continuous, and to the **midpoint of the jump** where it isn't.\n\n- Your lesson *Why sums of sines?* walks through the square wave.\n- Your note *Whole-number multiples* has the key fact about frequencies.\n\nNear a jump the partial sums overshoot by about 9% however many terms you add (the Gibbs phenomenon).".into(),
+                citations: vec![],
             },
         ),
         item("c1", 6, "t2", user("Show me where my sources say that.")),
@@ -3104,6 +3356,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             "t2",
             ChatItemKind::AssistantText {
                 text: "Three of the topic's sources cover it: the textbook's chapter 3 [page 3], the script that plots the partial sums, and the square-wave figure.".into(),
+                citations: vec![],
             },
         ),
     ];
@@ -3113,6 +3366,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
         "t3",
         ChatItemKind::AssistantText {
             text: "Eigenvectors are the directions a matrix only stretches".into(),
+            citations: vec![],
         },
     );
     cancelled.status = ItemStatus::Cancelled;
@@ -3128,11 +3382,90 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             },
         ),
     ];
+    let web_call = |id: &str, name: &str, args: serde_json::Value, label: &str| {
+        call(id, name, &args.to_string(), label)
+    };
+    let (answer, citations) = sample_web_answer();
+    let c3 = vec![
+        item("c3", 1, "t4", user("What did Claude Shannon publish in 1948?")),
+        item(
+            "c3",
+            2,
+            "t4",
+            ChatItemKind::Reasoning {
+                summary: "**Looking it up on the web**\n\nThe library has nothing on Shannon, so a web search will find the paper and where it appeared.".into(),
+            },
+        ),
+        item(
+            "c3",
+            3,
+            "t4",
+            web_call(
+                "srvtoolu_01",
+                "web_search",
+                serde_json::json!({ "query": SAMPLE_WEB_QUERY }),
+                &format!("Searching the web for “{SAMPLE_WEB_QUERY}”"),
+            ),
+        ),
+        item("c3", 4, "t4", result("srvtoolu_01", "5 results")),
+        item(
+            "c3",
+            5,
+            "t4",
+            ChatItemKind::Card {
+                call_id: "srvtoolu_01".into(),
+                card: Card::WebResults(WebResultsCard {
+                    query: SAMPLE_WEB_QUERY.into(),
+                    results: sample_web_results(),
+                }),
+            },
+        ),
+        item(
+            "c3",
+            6,
+            "t4",
+            web_call(
+                "srvtoolu_02",
+                "web_fetch",
+                serde_json::json!({ "url": sample_web_results()[0].url }),
+                "Fetching en.wikipedia.org",
+            ),
+        ),
+        item(
+            "c3",
+            7,
+            "t4",
+            result("srvtoolu_02", "Fetched “A Mathematical Theory of Communication”"),
+        ),
+        item(
+            "c3",
+            8,
+            "t4",
+            ChatItemKind::AssistantText {
+                text: answer,
+                citations,
+            },
+        ),
+    ];
+    let mut on_claude = chat("c3", "Claude Shannon's 1948 paper", ChatState::Idle, 5);
+    on_claude.provider = Provider::Claude;
+    on_claude.title_by = TitleSource::Model;
+    on_claude.usage = Usage {
+        input_tokens: 24_800,
+        cached_input_tokens: 9_600,
+        output_tokens: 910,
+        reasoning_tokens: 220,
+        model_calls: 3,
+        cache_write_input_tokens: 4_100,
+        web_search_requests: 1,
+        web_fetch_requests: 1,
+    };
     vec![
         (
             chat("c1", "How do Fourier series converge?", ChatState::Idle, 40),
             c1,
         ),
+        (on_claude, c3),
         (
             chat(
                 "c2",
@@ -3145,6 +3478,202 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             c2,
         ),
     ]
+}
+
+/// What the sample web search looked for (chat `c3`, and the fake's own web searches).
+pub const SAMPLE_WEB_QUERY: &str = "Claude Shannon 1948 paper";
+
+/// What the sample web search found.
+pub fn sample_web_results() -> Vec<WebResult> {
+    let result = |url: &str, title: &str, age: Option<&str>| WebResult {
+        url: url.into(),
+        title: Some(title.into()),
+        page_age: age.map(String::from),
+    };
+    vec![
+        result(
+            "https://en.wikipedia.org/wiki/A_Mathematical_Theory_of_Communication",
+            "A Mathematical Theory of Communication",
+            Some("September 2, 2026"),
+        ),
+        result(
+            "https://ieeexplore.ieee.org/document/6773024",
+            "A Mathematical Theory of Communication | Bell System Technical Journal",
+            Some("July 1948"),
+        ),
+        result(
+            "https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf",
+            "A Mathematical Theory of Communication (PDF)",
+            None,
+        ),
+        result(
+            "https://www.britannica.com/biography/Claude-Shannon",
+            "Claude Shannon | Biography, Information Theory, & Facts",
+            Some("August 14, 2026"),
+        ),
+        result(
+            "https://www.quantamagazine.org/how-claude-shannons-information-theory-invented-the-future-20201222/",
+            "How Claude Shannon Invented the Future",
+            Some("December 22, 2020"),
+        ),
+    ]
+}
+
+/// The sample answer and the pages it cites, with offsets into its text (each citation
+/// ends where its sentence does).
+pub fn sample_web_answer() -> (String, Vec<WebCitation>) {
+    let first = "In 1948 Claude Shannon published **A Mathematical Theory of Communication** in \
+                 the *Bell System Technical Journal*, in two parts (July and October).";
+    let second = " It defined the entropy of a source and the capacity of a noisy channel, and \
+                  brought the word *bit* into print.";
+    let third = "\n\nA year later it came out as a book, *The Mathematical Theory of \
+                 Communication*, with an introduction by Warren Weaver.";
+    let text = format!("{first}{second}{third}");
+    let results = sample_web_results();
+    let cite = |r: &WebResult, quote: &str, start: usize, end: usize| WebCitation {
+        url: r.url.clone(),
+        title: r.title.clone(),
+        cited_text: Some(quote.into()),
+        start: Some(start as u32),
+        end: Some(end as u32),
+    };
+    let a = first.len();
+    let b = a + second.len();
+    let citations = vec![
+        cite(
+            &results[0],
+            "published in two parts in the July and October 1948 issues of the Bell System \
+             Technical Journal",
+            0,
+            a,
+        ),
+        cite(
+            &results[1],
+            "The fundamental problem of communication is that of reproducing at one point \
+             either exactly or approximately a message selected at another point.",
+            a + 1,
+            b,
+        ),
+        cite(
+            &results[0],
+            "It was later published in 1949 as a book titled The Mathematical Theory of \
+             Communication",
+            b + 2,
+            text.len(),
+        ),
+    ];
+    (text, citations)
+}
+
+/// A web search's output as the service keeps it: each result's title, address and age.
+fn web_output(results: &[WebResult]) -> String {
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut line = format!(
+                "{}. {}\n   {}",
+                i + 1,
+                r.title.as_deref().unwrap_or("(untitled)"),
+                r.url
+            );
+            if let Some(age) = &r.page_age {
+                line.push_str(&format!("\n   {age}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a message asks for something from the web.
+fn wants_web(lower: &str) -> bool {
+    [
+        "search the web",
+        "on the web",
+        "web search",
+        "latest",
+        "news",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+/// A hosted web search (the provider's, not Margin's): its row, the results card, and
+/// an answer citing the pages, with the search counted in the chat's usage.
+async fn web_search_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str) {
+    let query = prompt.trim().trim_end_matches('?').to_string();
+    let results = sample_web_results();
+    let Some(call_id) = tool_call(
+        fake,
+        chat_id,
+        turn_id,
+        "web_search",
+        serde_json::json!({ "query": query }),
+        format!("Searching the web for “{query}”"),
+        format!("{} results", results.len()),
+        web_output(&results),
+    )
+    .await
+    else {
+        return;
+    };
+    if step(fake, chat_id, turn_id, |s| {
+        let card = s.add_item(
+            chat_id,
+            turn_id,
+            ItemStatus::Done,
+            ChatItemKind::Card {
+                call_id,
+                card: Card::WebResults(WebResultsCard {
+                    query: query.clone(),
+                    results: results.clone(),
+                }),
+            },
+        );
+        (vec![Event::ChatItemChanged { item: card }], ())
+    })
+    .is_none()
+    {
+        return;
+    }
+    let (answer, citations) = sample_web_answer();
+    let Some(item) = streamed_item(
+        fake,
+        chat_id,
+        turn_id,
+        ChatItemKind::AssistantText {
+            text: String::new(),
+            citations: vec![],
+        },
+        &answer,
+    )
+    .await
+    else {
+        return;
+    };
+    // The citations arrive with the finished answer.
+    if step(fake, chat_id, turn_id, |s| {
+        let mut events = Vec::new();
+        if let Some(item) = s.update_item(chat_id, &item.id, |i| {
+            if let ChatItemKind::AssistantText { citations: c, .. } = &mut i.kind {
+                *c = citations.clone();
+            }
+        }) {
+            events.push(Event::ChatItemChanged { item });
+        }
+        if let Some(chat) = s.chat_mut(chat_id) {
+            chat.usage.add(&Usage {
+                web_search_requests: 1,
+                ..Default::default()
+            });
+        }
+        (events, ())
+    })
+    .is_some()
+    {
+        finish_turn(fake, chat_id, turn_id).await;
+    }
 }
 
 /// A course the agent proposed in chat `chat_id` (`p-sample`), Ready, or created as the
@@ -3246,6 +3775,10 @@ pub fn sample_tool_output(call_id: &str) -> String {
             "shown_to_owner": true,
         })
         .to_string(),
+        "srvtoolu_01" => web_output(&sample_web_results()),
+        "srvtoolu_02" => "Fetched https://en.wikipedia.org/wiki/A_Mathematical_Theory_of_Communication\n\
+                          Title: A Mathematical Theory of Communication"
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -3919,6 +4452,7 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -3996,6 +4530,7 @@ async fn accept_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, proposal: Pro
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4061,6 +4596,7 @@ async fn result_and_answer(
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4255,21 +4791,91 @@ fn capitalized(text: &str) -> String {
 async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry: bool) {
     let (chat_id, turn_id) = (chat_id.as_str(), turn_id.as_str());
     let lower = prompt.to_lowercase();
-    let (no_key, no_model) = {
+    let (provider, no_key, no_model) = {
         let s = fake.state.lock().unwrap();
-        let model = s
-            .settings
-            .agent_model
-            .as_deref()
-            .unwrap_or(&s.settings.openai_model);
-        (!s.has_api_key, model.trim().is_empty())
+        let provider = s
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .map(|c| c.provider)
+            .unwrap_or_default();
+        let model = s.settings.models(provider).chat.clone();
+        (
+            provider,
+            !fake_has_credential(&s, provider),
+            model.trim().is_empty(),
+        )
     };
+    // The provider refusing: "auth failed", "spend limit", "plan limit", "plan
+    // ineligible" in a message (not retryable; Settings fixes them).
+    let refusal = [
+        (
+            "auth failed",
+            error_code::AUTH_FAILED,
+            "The model provider refused the credential (401).",
+        ),
+        (
+            "spend limit",
+            error_code::SPEND_LIMIT_REACHED,
+            "Your Claude organization has reached its spend limit.",
+        ),
+        (
+            "plan limit",
+            error_code::PLAN_LIMIT_REACHED,
+            "Margin's share of your ChatGPT plan is used up. Raise it in ChatGPT → Settings → \
+             Usage, or start a new chat on another provider.",
+        ),
+        (
+            "plan ineligible",
+            error_code::PLAN_INELIGIBLE,
+            "Your ChatGPT plan can't be used by apps like Margin.",
+        ),
+    ]
+    .into_iter()
+    .find(|(trigger, ..)| lower.contains(trigger));
+    if let Some((_, code, message)) = refusal.filter(|_| !retry) {
+        step(&fake, chat_id, turn_id, |s| {
+            let error = s.add_item(
+                chat_id,
+                turn_id,
+                ItemStatus::Done,
+                ChatItemKind::Error {
+                    message: message.into(),
+                    retryable: false,
+                    code: Some(code.into()),
+                },
+            );
+            let chat = s.set_chat_state(
+                chat_id,
+                ChatState::Failed {
+                    turn_id: turn_id.into(),
+                    error: message.into(),
+                },
+            );
+            let mut events = vec![Event::ChatItemChanged { item: error }];
+            events.extend(chat.map(|chat| Event::ChatChanged { chat }));
+            (events, ())
+        });
+        start_pending(&fake, chat_id).await;
+        return;
+    }
     if no_key || no_model || (lower.contains("fail") && !retry) {
         let (message, code) = if no_key {
-            (
-                "Add an OpenAI API key in Settings first.",
-                error_code::NO_API_KEY,
-            )
+            match provider {
+                Provider::OpenAi => (
+                    "Add an OpenAI API key in Settings first.",
+                    error_code::NO_API_KEY,
+                ),
+                Provider::Claude => (
+                    "Add a Claude API key in Settings first.",
+                    error_code::NO_API_KEY,
+                ),
+                // Signed out of ChatGPT: the sign-in ended.
+                Provider::ChatGpt => (
+                    "Margin isn't signed in with ChatGPT. Sign in again in Settings.",
+                    error_code::AUTH_FAILED,
+                ),
+            }
         } else if no_model {
             ("Choose a model in Settings first.", error_code::NO_MODEL)
         } else {
@@ -4349,6 +4955,10 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
         return;
     };
 
+    if wants_web(&lower) {
+        web_search_in_turn(&fake, chat_id, turn_id, &prompt).await;
+        return;
+    }
     if wants_lesson(&lower) {
         write_lesson_in_turn(&fake, chat_id, turn_id, &prompt).await;
         return;
@@ -4542,6 +5152,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
                 ItemStatus::InProgress,
                 ChatItemKind::AssistantText {
                     text: "Here's what".into(),
+                    citations: vec![],
                 },
             );
             (vec![Event::ChatItemChanged { item }], ())
@@ -4554,6 +5165,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4575,6 +5187,7 @@ async fn finish_turn(fake: &Fake, chat_id: &str, turn_id: &str) {
                 output_tokens: 310,
                 reasoning_tokens: 120,
                 model_calls: 2,
+                ..Default::default()
             });
             chat.state = ChatState::Idle;
             chat.waiting = None;
@@ -4716,6 +5329,7 @@ async fn create_chat(
             waiting: None,
             created_at: now,
             updated_at: now,
+            provider: req.provider.unwrap_or(s.settings.default_provider),
         };
         let id = chat.id.clone();
         s.chats.push(chat.clone());
@@ -5209,6 +5823,7 @@ async fn confirm(
                 &turn_id,
                 ChatItemKind::AssistantText {
                     text: String::new(),
+                    citations: vec![],
                 },
                 text,
             )

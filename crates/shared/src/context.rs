@@ -324,6 +324,8 @@ pub struct TraceUsage {
     pub output: u64,
     pub reasoning: u64,
     pub web_searches: u64,
+    /// Hosted web page fetches (Claude's `web_fetch_requests`).
+    pub web_fetches: u64,
 }
 
 /// Per-leg timings of a retrieval.
