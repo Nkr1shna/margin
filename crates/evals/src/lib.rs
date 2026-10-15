@@ -73,6 +73,8 @@ pub struct Prices {
     pub models: BTreeMap<String, ModelPrice>,
 }
 
+/// One model's prices (frozen in the providers phase's first commit: P-evals reads
+/// them, the service's `trace::ModelPrice` mirrors them).
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct ModelPrice {
     pub provider: Provider,
@@ -82,11 +84,28 @@ pub struct ModelPrice {
     #[serde(default)]
     pub cache_write: f64,
     pub output: f64,
+    /// USD per 1 000 hosted web searches.
+    #[serde(default)]
+    pub web_search: f64,
+    /// A higher tier for prompts over `over` input tokens (Claude Haiku 5.5).
+    #[serde(default)]
+    pub long_context: Option<LongContextPrice>,
 }
 
+/// The prices that apply when a call's input passes `over` tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct LongContextPrice {
+    pub over: u64,
+    pub input: f64,
+    pub output: f64,
+}
+
+/// Who bills a model. `Chatgpt` groups ChatGPT-plan models apart in reports (they are
+/// never priced: plan-billed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     Openai,
     Anthropic,
+    Chatgpt,
 }

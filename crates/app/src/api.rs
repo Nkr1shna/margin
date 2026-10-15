@@ -966,6 +966,7 @@ mod tests {
                     "Make me a course on control theory with videos, 3 lessons",
                 )),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1069,6 +1070,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Teach me about sampling, advanced")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1247,6 +1249,7 @@ mod tests {
                     source_ids: vec![source.id.clone()],
                 }),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1516,6 +1519,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("  ")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -1528,6 +1532,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Sums of sines\nand more")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1610,6 +1615,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Fourier")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1665,6 +1671,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("make it fail")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1704,6 +1711,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Delete my first note")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1775,6 +1783,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Delete my first note")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -2069,6 +2078,7 @@ mod tests {
                     source_ids: vec!["nope".into()],
                 }),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -2083,6 +2093,7 @@ mod tests {
                     source_ids: vec![source.id.clone()],
                 }),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -2168,6 +2179,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("How do Fourier series converge?\nIn detail")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -2207,6 +2219,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Please slow down")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -2232,6 +2245,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Hello")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -2274,6 +2288,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("Write a lesson on the Gibbs phenomenon in Fourier")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -2353,6 +2368,7 @@ mod tests {
             .create_chat(&NewChat {
                 message: Some(message("A course on control theory")),
                 workspace_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()

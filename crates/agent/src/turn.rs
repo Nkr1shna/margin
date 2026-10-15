@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use margin_ai::{
-    AiError, ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
-    StreamEvent, ToolChoice,
+    AiError, CallOptions, Delta, ItemView, ModelEvent, ModelRequest, ModelStream, StartKind,
+    TextModel, ToolChoice, ToolDef, WebTools,
 };
+use margin_shared::pipeline::Route;
 use margin_shared::{
-    Card, ChatItem, ChatItemKind, ConfirmationCard, Decision, DeviceRef, Id, ItemStatus,
+    Card, ChatItem, ChatItemKind, ConfirmationCard, Decision, DeviceRef, Id, ItemStatus, Provider,
     ReasoningEffort, Usage, Workspace, error_code,
 };
 use serde_json::{Value, json};
@@ -25,13 +26,18 @@ use crate::{
     COMPACT_THRESHOLD_TOKENS, ConfirmationPrompt, DeviceBridge, ItemRecord, MAX_STEPS,
     MODEL_RETRIES, ModelClient, RETRY_BASE_DELAY, RETRY_MAX_DELAY, SinkError,
     TOOL_OUTPUT_MAX_BYTES, TURN_OUTPUT_MAX_BYTES, ToolContext, ToolKind, ToolOutput, ToolRegistry,
-    TurnSink, action_input, error_output, function_call_output, system_prompt, tool_pictures_input,
+    TurnSink, error_output, function_call_output, system_prompt, tool_pictures_input,
     truncate_output,
 };
 
 /// What a turn runs with.
 pub struct TurnDeps<'a> {
+    /// The chat's provider, on the chat model.
     pub model: &'a dyn ModelClient,
+    /// The default provider's text model on its small-tasks slot, for the condense
+    /// summary (`docs/agent-providers-brief.md` D3; the loop moves the summary onto it in
+    /// area P-agent).
+    pub small: &'a dyn TextModel,
     pub tools: &'a ToolRegistry,
     pub sink: &'a dyn TurnSink,
     pub devices: Arc<dyn DeviceBridge>,
@@ -98,8 +104,9 @@ pub struct TurnInput {
     pub turn_id: Id,
     /// The device whose message started the turn.
     pub origin_device: DeviceRef,
-    /// Settings' agent model; `None` uses the client's model.
-    pub model: Option<String>,
+    /// The provider the chat runs on (`Chat.provider`); `deps.model` is its client. The
+    /// model is the client's chat slot: nothing here overrides it.
+    pub provider: Provider,
     pub reasoning_effort: ReasoningEffort,
     /// `replay_input` of the chat's stored items, ending with this turn's user message
     /// (or with whatever the interrupted/failed run left).
@@ -269,9 +276,16 @@ impl CallError {
     }
 }
 
-/// The `error_code` an `AiError` ends a turn with.
+/// The `error_code` an `AiError` ends a turn with. A refused credential (401, 403, and
+/// Anthropic's 402) is `auth_failed` (owner decision), so the app can offer Settings.
 fn ai_error_code(e: &AiError) -> &'static str {
+    if let Some(code) = e.code().and_then(account_error_code) {
+        return code;
+    }
     match e {
+        AiError::Http {
+            status: 401..=403, ..
+        } => error_code::AUTH_FAILED,
         AiError::Http { status: 429, .. } => error_code::RATE_LIMITED,
         AiError::Http { status, .. } if *status >= 500 => error_code::SERVER_ERROR,
         AiError::Http { .. } => error_code::BAD_REQUEST,
@@ -286,10 +300,26 @@ fn ai_error_code(e: &AiError) -> &'static str {
 /// `rate_limited`, a request the API refused (an invalid request or prompt, an image it
 /// can't use) as `bad_request`, anything else as `server_error`.
 fn stream_error_code(code: Option<&str>) -> &'static str {
+    if let Some(code) = code.and_then(account_error_code) {
+        return code;
+    }
     match code {
         Some("rate_limit_exceeded" | "insufficient_quota") => error_code::RATE_LIMITED,
         Some(c) if c.starts_with("invalid_") || c.contains("image") => error_code::BAD_REQUEST,
         _ => error_code::SERVER_ERROR,
+    }
+}
+
+/// The codes of an account limit no retry gets past: a spend cap, Margin's share of a
+/// ChatGPT plan used up, a plan apps can't use.
+fn account_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        "enforced_spend_limit_reached" => Some(error_code::SPEND_LIMIT_REACHED),
+        "subscription_sharing_usage_limit_exceeded" | "subscription_sharing_usage_unavailable" => {
+            Some(error_code::PLAN_LIMIT_REACHED)
+        }
+        "subscription_sharing_user_not_eligible" => Some(error_code::PLAN_INELIGIBLE),
+        _ => None,
     }
 }
 
@@ -334,13 +364,12 @@ fn error_text(e: &AiError) -> String {
 struct Open {
     item: ChatItem,
     text: String,
-    summary_index: u32,
 }
 
 struct Turn<'t, 'a> {
     deps: &'t TurnDeps<'a>,
     input: &'t TurnInput,
-    tools: Vec<Value>,
+    tools: Vec<ToolDef>,
     history: Vec<Value>,
     steps: u32,
     /// Tool output bytes the model got in this run, plus `TOOL_OUTPUT_MAX_BYTES` for
@@ -376,7 +405,7 @@ impl<'t, 'a> Turn<'t, 'a> {
         Self {
             deps,
             input,
-            tools: deps.tools.definitions(),
+            tools: deps.tools.tool_defs(),
             history: input.history.clone(),
             steps: 0,
             output_bytes: AtomicUsize::new(0),
@@ -476,36 +505,24 @@ impl<'t, 'a> Turn<'t, 'a> {
         } else if allowed.is_empty() {
             ToolChoice::None
         } else {
-            ToolChoice::AllowedTools {
-                required: false,
-                names: allowed,
-            }
+            ToolChoice::Allowed(allowed)
         })
     }
 
-    fn request(&self, tool_choice: Option<ToolChoice>) -> ResponseRequest {
-        let mut input = Vec::with_capacity(self.history.len() + 1);
-        input.push(action_input(system_prompt()));
-        input.extend(self.history.iter().cloned());
-        ResponseRequest {
-            model: self.input.model.clone(),
-            instructions: None,
-            input,
+    /// One step's request: the system prompt, the history, every tool (the list is
+    /// constant; `tool_choice` narrows it), the chat id as cache key, server compaction
+    /// unless the API rejected it. Web tools stay off until area P-agent turns them on.
+    fn request(&self, tool_choice: Option<ToolChoice>) -> ModelRequest {
+        ModelRequest {
+            opts: CallOptions::new(Route::Chat).with_cache_key(self.input.chat_id.clone()),
+            system: system_prompt().to_string(),
+            history: self.history.clone(),
             tools: self.tools.clone(),
-            tool_choice,
-            reasoning: Some(ReasoningConfig {
-                effort: self.input.reasoning_effort,
-                summary: Some(ReasoningSummary::Auto),
-            }),
-            include_encrypted_reasoning: true,
-            max_output_tokens: None,
-            prompt_cache_key: Some(self.input.chat_id.clone()),
-            context_management: self
-                .server_compaction
-                .then_some(ContextManagement::Compaction {
-                    compact_threshold: COMPACT_THRESHOLD_TOKENS,
-                }),
-            parallel_tool_calls: (!self.tools.is_empty()).then_some(true),
+            tool_choice: tool_choice.unwrap_or(ToolChoice::Auto),
+            web: WebTools::default(),
+            effort: self.input.reasoning_effort,
+            compaction: self.server_compaction.then_some(COMPACT_THRESHOLD_TOKENS),
+            parallel_tool_calls: true,
         }
     }
 
@@ -582,10 +599,10 @@ impl<'t, 'a> Turn<'t, 'a> {
     }
 
     /// Streams one response into items.
-    async fn consume(&mut self, mut stream: ResponseStream) -> Result<Attempt, SinkError> {
+    async fn consume(&mut self, mut stream: ModelStream) -> Result<Attempt, SinkError> {
         let sink = self.sink();
         let mut open: BTreeMap<u32, Open> = BTreeMap::new();
-        let mut done: Vec<(u32, Value)> = Vec::new();
+        let mut done: Vec<(u32, Vec<Value>)> = Vec::new();
         let mut calls: Vec<Call> = Vec::new();
         let mut started = false;
         loop {
@@ -611,18 +628,19 @@ impl<'t, 'a> Turn<'t, 'a> {
                 }
             };
             match event {
-                StreamEvent::OutputItemAdded { output_index, item } => {
+                ModelEvent::Started { index, kind } => {
                     started = true;
-                    let kind = match item_type(&item) {
-                        Some("reasoning") => Some(ChatItemKind::Reasoning {
+                    let kind = match kind {
+                        StartKind::Reasoning => Some(ChatItemKind::Reasoning {
                             summary: String::new(),
                         }),
-                        Some("message") => Some(ChatItemKind::AssistantText {
+                        StartKind::Text => Some(ChatItemKind::AssistantText {
                             text: String::new(),
+                            citations: vec![],
                         }),
-                        Some("function_call") => Some(ChatItemKind::ToolCall {
-                            call_id: str_field(&item, "call_id"),
-                            name: str_field(&item, "name"),
+                        StartKind::ToolCall { call_id, name } => Some(ChatItemKind::ToolCall {
+                            call_id,
+                            name,
                             arguments: String::new(),
                             label: String::new(),
                             device: None,
@@ -634,53 +652,45 @@ impl<'t, 'a> Turn<'t, 'a> {
                             .add_item(ItemStatus::InProgress, kind, ItemRecord::default())
                             .await?;
                         open.insert(
-                            output_index,
+                            index,
                             Open {
                                 item,
                                 text: String::new(),
-                                summary_index: 0,
                             },
                         );
                     }
                 }
-                StreamEvent::OutputTextDelta {
-                    output_index,
-                    delta,
-                    ..
+                ModelEvent::Delta { index, delta } => {
+                    let (Delta::Text(text) | Delta::Reasoning(text) | Delta::Arguments(text)) =
+                        &delta;
+                    self.delta(&mut open, index, text);
                 }
-                | StreamEvent::FunctionCallArgumentsDelta {
-                    output_index,
-                    delta,
-                    ..
-                } => self.delta(&mut open, output_index, &delta, None),
-                StreamEvent::ReasoningSummaryTextDelta {
-                    output_index,
-                    summary_index,
-                    delta,
-                    ..
-                } => self.delta(&mut open, output_index, &delta, Some(summary_index)),
-                StreamEvent::FunctionCallArgumentsDone { .. } => {}
-                StreamEvent::OutputItemDone { output_index, item } => {
+                ModelEvent::Done { index, item } => {
                     started = true;
-                    let existing = open.remove(&output_index);
-                    match item_type(&item) {
-                        Some("reasoning") => {
-                            let kind = ChatItemKind::Reasoning {
-                                summary: reasoning_summary(&item),
-                            };
-                            self.finish_item(existing, kind, &item).await?;
+                    let existing = open.remove(&index);
+                    let stored = item.stored;
+                    match item.view {
+                        ItemView::Reasoning { summary } => {
+                            let kind = ChatItemKind::Reasoning { summary };
+                            self.finish_item(existing, kind, &stored).await?;
                         }
-                        Some("message") => {
-                            let kind = ChatItemKind::AssistantText {
-                                text: message_text(&item),
-                            };
-                            self.finish_item(existing, kind, &item).await?;
+                        ItemView::Text { text, citations } => {
+                            let kind = ChatItemKind::AssistantText { text, citations };
+                            self.finish_item(existing, kind, &stored).await?;
                         }
-                        Some("function_call") => {
-                            calls.push(self.finish_call(existing, &item).await?);
+                        ItemView::ToolCall {
+                            call_id,
+                            name,
+                            arguments,
+                        } => {
+                            let call = self
+                                .finish_call(existing, call_id, name, arguments, &stored)
+                                .await?;
+                            calls.push(call);
                         }
-                        other => {
-                            let text = if other == Some("compaction") {
+                        view => {
+                            // Web search and fetch rows come with area P-agent.
+                            let text = if view == ItemView::Compaction {
                                 CONDENSED_ACTION
                             } else {
                                 ""
@@ -689,16 +699,16 @@ impl<'t, 'a> Turn<'t, 'a> {
                                 ItemStatus::Done,
                                 ChatItemKind::Action { text: text.into() },
                                 ItemRecord {
-                                    model_items: Some(vec![item.clone()]),
+                                    model_items: Some(stored.clone()),
                                     full_output: None,
                                 },
                             )
                             .await?;
                         }
                     }
-                    done.push((output_index, item));
+                    done.push((index, stored));
                 }
-                StreamEvent::Completed { usage, .. } => {
+                ModelEvent::Completed { usage, .. } => {
                     sink.add_usage(&usage).await?;
                     self.note_usage(&usage);
                     // An item that started but never finished isn't part of the answer.
@@ -707,11 +717,11 @@ impl<'t, 'a> Turn<'t, 'a> {
                     }
                     done.sort_by_key(|(index, _)| *index);
                     return Ok(Attempt::Step(Step::Done {
-                        items: done.into_iter().map(|(_, item)| item).collect(),
+                        items: done.into_iter().flat_map(|(_, stored)| stored).collect(),
                         calls,
                     }));
                 }
-                StreamEvent::Incomplete { reason, usage } => {
+                ModelEvent::Incomplete { reason, usage } => {
                     sink.add_usage(&usage).await?;
                     let message =
                         format!("The answer was cut off ({}).", incomplete_reason(&reason));
@@ -719,7 +729,7 @@ impl<'t, 'a> Turn<'t, 'a> {
                         .abandon(open, &calls, message, true, error_code::INCOMPLETE)
                         .await;
                 }
-                StreamEvent::Failed { code, message } | StreamEvent::Error { code, message } => {
+                ModelEvent::Failed { code, message } => {
                     let too_long = code.as_deref() == Some("context_length_exceeded")
                         || is_too_long(&message.to_lowercase());
                     if !started && too_long {
@@ -744,26 +754,10 @@ impl<'t, 'a> Turn<'t, 'a> {
         }
     }
 
-    fn delta(
-        &self,
-        open: &mut BTreeMap<u32, Open>,
-        output_index: u32,
-        text: &str,
-        summary_index: Option<u32>,
-    ) {
-        let Some(o) = open.get_mut(&output_index) else {
+    fn delta(&self, open: &mut BTreeMap<u32, Open>, index: u32, text: &str) {
+        let Some(o) = open.get_mut(&index) else {
             return;
         };
-        if let Some(index) = summary_index
-            && index != o.summary_index
-        {
-            // A new summary part: separate it as the finished item will.
-            o.summary_index = index;
-            if !o.text.is_empty() {
-                self.sink().delta(&o.item, "\n\n");
-                o.text.push_str("\n\n");
-            }
-        }
         if text.is_empty() {
             return;
         }
@@ -776,10 +770,10 @@ impl<'t, 'a> Turn<'t, 'a> {
         &self,
         existing: Option<Open>,
         kind: ChatItemKind,
-        model_item: &Value,
+        stored: &[Value],
     ) -> Result<ChatItem, SinkError> {
         let record = ItemRecord {
-            model_items: Some(vec![model_item.clone()]),
+            model_items: Some(stored.to_vec()),
             full_output: None,
         };
         self.store(existing, ItemStatus::Done, kind, record).await
@@ -810,11 +804,11 @@ impl<'t, 'a> Turn<'t, 'a> {
     async fn finish_call(
         &self,
         existing: Option<Open>,
-        model_item: &Value,
+        call_id: String,
+        name: String,
+        arguments: String,
+        stored: &[Value],
     ) -> Result<Call, SinkError> {
-        let call_id = str_field(model_item, "call_id");
-        let name = str_field(model_item, "name");
-        let arguments = str_field(model_item, "arguments");
         let args: Value = serde_json::from_str(&arguments).unwrap_or(Value::Null);
         let (label, device) = match self.deps.tools.get(&name) {
             Some(tool) => {
@@ -835,7 +829,7 @@ impl<'t, 'a> Turn<'t, 'a> {
             device,
         };
         let record = ItemRecord {
-            model_items: Some(vec![model_item.clone()]),
+            model_items: Some(stored.to_vec()),
             full_output: None,
         };
         let item = self
@@ -1179,18 +1173,18 @@ impl<'t, 'a> Turn<'t, 'a> {
     /// Asks the model (without tools) for a summary of `transcript`. `None` when it
     /// fails.
     async fn summarize(&self, transcript: &str) -> Result<Option<String>, SinkError> {
-        let request = ResponseRequest {
-            model: self.input.model.clone(),
-            input: vec![
-                action_input(SUMMARY_INSTRUCTIONS),
+        let request = ModelRequest {
+            opts: CallOptions::new(Route::Chat).with_cache_key(self.input.chat_id.clone()),
+            system: SUMMARY_INSTRUCTIONS.to_string(),
+            history: vec![
                 json!({"role": "user", "content": [{"type": "input_text", "text": transcript}]}),
             ],
-            reasoning: Some(ReasoningConfig {
-                effort: ReasoningEffort::Low,
-                summary: None,
-            }),
-            prompt_cache_key: Some(self.input.chat_id.clone()),
-            ..Default::default()
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            web: WebTools::default(),
+            effort: ReasoningEffort::Low,
+            compaction: None,
+            parallel_tool_calls: false,
         };
         let mut attempt = 0;
         loop {
@@ -1211,22 +1205,25 @@ impl<'t, 'a> Turn<'t, 'a> {
             let mut text = String::new();
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::OutputTextDelta { delta, .. }) => text.push_str(&delta),
-                    Ok(StreamEvent::OutputItemDone { item, .. })
-                        if item_type(&item) == Some("message") =>
-                    {
-                        text = message_text(&item);
+                    Ok(ModelEvent::Delta {
+                        delta: Delta::Text(delta),
+                        ..
+                    }) => text.push_str(&delta),
+                    Ok(ModelEvent::Done { item, .. }) => {
+                        if let ItemView::Text { text: done, .. } = item.view {
+                            text = done;
+                        }
                     }
-                    Ok(StreamEvent::Completed { usage, .. }) => {
+                    Ok(ModelEvent::Completed { usage, .. }) => {
                         self.sink().add_usage(&usage).await?;
                         let text = text.trim();
                         return Ok((!text.is_empty()).then(|| text.to_string()));
                     }
-                    Ok(StreamEvent::Incomplete { usage, .. }) => {
+                    Ok(ModelEvent::Incomplete { usage, .. }) => {
                         self.sink().add_usage(&usage).await?;
                         return Ok(None);
                     }
-                    Ok(StreamEvent::Failed { .. } | StreamEvent::Error { .. }) | Err(_) => {
+                    Ok(ModelEvent::Failed { .. }) | Err(_) => {
                         return Ok(None);
                     }
                     Ok(_) => {}
@@ -1237,45 +1234,12 @@ impl<'t, 'a> Turn<'t, 'a> {
     }
 }
 
-fn str_field(value: &Value, key: &str) -> String {
-    value[key].as_str().unwrap_or_default().to_string()
-}
-
-/// A reasoning item's summary parts, joined by blank lines.
-fn reasoning_summary(item: &Value) -> String {
-    item["summary"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .unwrap_or_default()
-}
-
-/// A message item's text: its `output_text` parts, or its refusal.
-fn message_text(item: &Value) -> String {
-    item["content"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| match p["type"].as_str() {
-                    Some("output_text") => p["text"].as_str(),
-                    Some("refusal") => p["refusal"].as_str(),
-                    _ => None,
-                })
-                .collect::<String>()
-        })
-        .unwrap_or_default()
-}
-
 /// `kind` with its streaming text replaced by what arrived.
 fn with_streamed_text(kind: ChatItemKind, text: String) -> ChatItemKind {
     match kind {
-        ChatItemKind::AssistantText { .. } => ChatItemKind::AssistantText { text },
+        ChatItemKind::AssistantText { citations, .. } => {
+            ChatItemKind::AssistantText { text, citations }
+        }
         ChatItemKind::Reasoning { .. } => ChatItemKind::Reasoning { summary: text },
         ChatItemKind::ToolCall {
             call_id,
@@ -1487,10 +1451,36 @@ mod tests {
             status,
             message: "m".into(),
             retry_after: None,
+            code: None,
         };
         assert_eq!(ai_error_code(&http(429)), error_code::RATE_LIMITED);
         assert_eq!(ai_error_code(&http(503)), error_code::SERVER_ERROR);
-        assert_eq!(ai_error_code(&http(401)), error_code::BAD_REQUEST);
+        assert_eq!(ai_error_code(&http(400)), error_code::BAD_REQUEST);
+        for status in [401, 402, 403] {
+            assert_eq!(ai_error_code(&http(status)), error_code::AUTH_FAILED);
+        }
+        let coded = |status, code: &str| AiError::Http {
+            status,
+            message: "m".into(),
+            retry_after: None,
+            code: Some(code.into()),
+        };
+        assert_eq!(
+            ai_error_code(&coded(429, "enforced_spend_limit_reached")),
+            error_code::SPEND_LIMIT_REACHED
+        );
+        assert_eq!(
+            ai_error_code(&coded(429, "subscription_sharing_usage_limit_exceeded")),
+            error_code::PLAN_LIMIT_REACHED
+        );
+        assert_eq!(
+            ai_error_code(&coded(403, "subscription_sharing_user_not_eligible")),
+            error_code::PLAN_INELIGIBLE
+        );
+        assert_eq!(
+            stream_error_code(Some("subscription_sharing_usage_unavailable")),
+            error_code::PLAN_LIMIT_REACHED
+        );
         assert_eq!(
             stream_error_code(Some("rate_limit_exceeded")),
             error_code::RATE_LIMITED
@@ -1520,6 +1510,7 @@ mod tests {
             status: 400,
             message: "This model's maximum context length is 400000 tokens.".into(),
             retry_after: None,
+            code: None,
         };
         assert_eq!(
             CallError::from_ai(&too_long).code,
@@ -1539,12 +1530,6 @@ mod tests {
         );
         assert_eq!(incomplete_reason("steered"), "the model API ended it early");
         assert_eq!(incomplete_reason("something_new"), "something_new");
-    }
-
-    #[test]
-    fn message_text_reads_refusals() {
-        let item = json!({"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]});
-        assert_eq!(message_text(&item), "I can't help with that.");
     }
 
     #[test]

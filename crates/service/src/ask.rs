@@ -298,7 +298,7 @@ pub async fn accept_proposal(
     req: AcceptProposal,
 ) -> AppResult<(Topic, Proposal)> {
     let outline = validate_outline(&req.outline)?;
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
 
     let (topic, events, lesson_ids, proposal) = {
         let _w = state.write_lock.lock().await;
@@ -458,7 +458,7 @@ pub async fn regenerate(
 /// /api/lessons/{id}/regenerate` and the agent's `regenerate_lesson`). Its body stays
 /// until the new one is done, and comes back if writing fails.
 pub async fn regenerate_lesson(state: &AppState, id: &str) -> AppResult<Lesson> {
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
         let mut row = library::lesson(state, id).await?;
@@ -497,7 +497,7 @@ pub struct NewLesson {
 /// follows it (`make_video` asks for one).
 pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson> {
     let title = library::clean_title(&req.title, "lesson")?;
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
     let lesson = {
         let _w = state.write_lock.lock().await;
         library::topic(state, &req.topic_id).await?;
@@ -848,7 +848,7 @@ pub async fn plan_course(
         return Ok(None);
     };
     let ai = state
-        .route_ai_config(Route::Write)
+        .model_for(Route::Write, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
     let opts = CallOptions::new(Route::Write);
@@ -858,7 +858,7 @@ pub async fn plan_course(
             trace_id,
             Route::Write,
             &ai.model,
-            trace::provider_of(&ai.base_url),
+            ai.config.provider.as_str(),
             margin_ai::prompts::PLAN_VERSION.to_string(),
         ),
         state,
@@ -889,7 +889,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         else {
             return Ok(());
         };
-        let ai = match state.route_ai_config(Route::Write).await {
+        let ai = match state.model_for(Route::Write, None).await {
             Ok(ai) => ai,
             Err(e) => {
                 row.lesson.status = LessonStatus::Failed { error: e.message };
@@ -941,7 +941,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
             lesson_id,
             Route::Write,
             &ai.model,
-            trace::provider_of(&ai.base_url),
+            ai.config.provider.as_str(),
             margin_ai::prompts::LESSON_VERSION.to_string(),
         ),
         state,

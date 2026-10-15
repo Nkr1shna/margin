@@ -1099,12 +1099,20 @@ pub(crate) mod tests {
             waiting: None,
             created_at: ts(0),
             updated_at: ts(0),
+            provider: Default::default(),
         };
         s.apply(Event::ChatChanged { chat: chat.clone() });
         assert_eq!(s.chats["c1"], chat);
 
         // Not loaded: item events are ignored (the transcript is fetched on open).
-        let text = chat_item("i2", 2, ChatItemKind::AssistantText { text: "Hi".into() });
+        let text = chat_item(
+            "i2",
+            2,
+            ChatItemKind::AssistantText {
+                text: "Hi".into(),
+                citations: vec![],
+            },
+        );
         s.apply(Event::ChatItemChanged { item: text.clone() });
         assert!(!s.chat_items.contains_key("c1"));
 
@@ -1142,13 +1150,15 @@ pub(crate) mod tests {
         assert_eq!(
             items[1].kind,
             ChatItemKind::AssistantText {
-                text: "Hi there".into()
+                text: "Hi there".into(),
+                citations: vec![],
             }
         );
         let mut done = text;
         done.status = ItemStatus::Done;
         done.kind = ChatItemKind::AssistantText {
             text: "Hi there!".into(),
+            citations: vec![],
         };
         s.apply(Event::ChatItemChanged { item: done.clone() });
         assert_eq!(s.chat_items["c1"][1], done);
@@ -1170,11 +1180,19 @@ pub(crate) mod tests {
             waiting: None,
             created_at: ts(0),
             updated_at: ts(updated),
+            provider: Default::default(),
         }
     }
 
     fn text(id: &str, seq: u64, status: ItemStatus, text: &str, updated: i64) -> ChatItem {
-        let mut item = chat_item(id, seq, ChatItemKind::AssistantText { text: text.into() });
+        let mut item = chat_item(
+            id,
+            seq,
+            ChatItemKind::AssistantText {
+                text: text.into(),
+                citations: vec![],
+            },
+        );
         item.status = status;
         item.updated_at = ts(updated);
         item
@@ -1429,6 +1447,12 @@ pub(crate) mod tests {
             agent_model: None,
             pipeline: Default::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+            default_provider: Default::default(),
+            openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+            chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
+            claude_models: margin_shared::RouteModels::claude_default(),
+            has_claude_api_key: false,
+            chatgpt: None,
         };
         s.apply(Event::SettingsChanged {
             settings: settings.clone(),

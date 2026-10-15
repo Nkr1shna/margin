@@ -54,7 +54,7 @@ pub async fn request_video(
             "Make a video once the lesson is ready.",
         ));
     }
-    state.ai_config().await?;
+    state.model_for(Route::Write, None).await?;
     let video = enqueue(&state, &lesson_id).await?;
     Ok(Json(state.public_video(&video)))
 }
@@ -268,7 +268,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
     if let Some(why) = settings.voice.as_deref().and_then(voice_refused) {
         return fail(state, id, &why, None).await;
     }
-    let ai = match state.route_ai_config(Route::Write).await {
+    let ai = match state.model_for(Route::Write, None).await {
         Ok(ai) => ai,
         Err(e) => return fail(state, id, &e.message, None).await,
     };
@@ -312,7 +312,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
                 id,
                 Route::Write,
                 &ai.model,
-                trace::provider_of(&ai.base_url),
+                ai.config.provider.as_str(),
                 SCENE_PROMPT_VERSION.to_string(),
             ),
             state,

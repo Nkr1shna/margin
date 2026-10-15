@@ -21,7 +21,7 @@ mod device;
 mod model;
 mod prompt;
 mod registry;
-mod replay;
+pub mod replay;
 pub mod scripted;
 mod sink;
 mod tool;
@@ -39,7 +39,7 @@ pub use replay::{
     cancelled_call_output, function_call_output, replay_input, tool_pictures_input,
     unanswered_calls,
 };
-pub use scripted::{Scripted, ScriptedModel};
+pub use scripted::{Recorded, Scripted, ScriptedModel};
 pub use sink::{ItemRecord, SinkError, TurnSink};
 pub use tool::{
     ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool,

@@ -341,6 +341,9 @@ pub async fn create_chat(
         pending: None,
         usage: Usage::default(),
         waiting: None,
+        // OpenAI until area P-service honours `NewChat.provider` (and Settings' default):
+        // the service calls no other provider before then.
+        provider: margin_shared::Provider::OpenAi,
         created_at: now,
         updated_at: now,
     };
@@ -375,7 +378,7 @@ pub async fn get_chat(
         }
         if let Some(text) = live.get(&item.id) {
             match &mut item.kind {
-                ChatItemKind::AssistantText { text: t }
+                ChatItemKind::AssistantText { text: t, .. }
                 | ChatItemKind::Reasoning { summary: t }
                 | ChatItemKind::ToolCall { arguments: t, .. } => *t = text.clone(),
                 _ => {}

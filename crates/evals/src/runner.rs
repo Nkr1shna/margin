@@ -497,11 +497,11 @@ pub async fn run_courses(
 
 /// `run --suite agent`.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_agent(
+pub async fn run_agent<M: margin_agent::ModelClient + margin_ai::TextModel>(
     env: &Env<'_>,
     variant: &str,
     index: Arc<EvalIndex<'static>>,
-    model: &dyn margin_agent::ModelClient,
+    model: &M,
     model_id: &str,
     judges: &[&dyn Judge],
     retry: margin_agent::RetryPolicy,
@@ -522,7 +522,7 @@ pub async fn run_agent(
     let mut rows = Vec::new();
     let mut judged = Vec::new();
     for t in env.paths.agent_tasks()? {
-        let r = run_task(model, Some(model_id.to_string()), index.clone(), &t, retry).await;
+        let r = run_task(model, index.clone(), &t, retry).await;
         let mut put = |m: &str, v: f64| rows.push(result(&run, &t.id, "agent", m, v, None));
         put("finished", f64::from(u8::from(r.finished)));
         put("steps", f64::from(r.steps));

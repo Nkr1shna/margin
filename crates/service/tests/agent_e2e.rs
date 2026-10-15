@@ -287,7 +287,7 @@ fn line(item: &ChatItem) -> String {
     };
     let what = match &item.kind {
         ChatItemKind::UserMessage { text, .. } => format!("user: {text}"),
-        ChatItemKind::AssistantText { text } => format!("assistant: {text}"),
+        ChatItemKind::AssistantText { text, .. } => format!("assistant: {text}"),
         ChatItemKind::Reasoning { summary } => format!("reasoning: {summary}"),
         ChatItemKind::ToolCall { name, label, .. } => format!("call {name}: {label}"),
         ChatItemKind::ToolResult { ok, summary, .. } => {

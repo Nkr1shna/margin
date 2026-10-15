@@ -1,15 +1,20 @@
-//! Text generation for Margin through an OpenAI-compatible **Responses API**
-//! (`POST {base_url}/responses`). No other API shape is supported.
+//! Text generation and agent steps for Margin, on two API shapes behind one seam
+//! ([`model`]: [`TextModel`], [`Provider`], [`CallOptions`]):
+//! - an OpenAI-compatible **Responses API** (`POST {base_url}/responses`,
+//!   [`ResponsesClient`]): OpenAI with an API key, ChatGPT with a plan token;
+//! - Anthropic's **Messages API** (`POST {base_url}/v1/messages`, [`ClaudeClient`]).
 //!
-//! The service owns configuration and the API key; this crate is stateless and
+//! The service owns configuration and the credentials; this crate is stateless and
 //! knows nothing about storage.
 //!
-//! Every request is sent with `store: false` and streamed (Server-Sent Events).
+//! Every request is streamed (Server-Sent Events); Responses calls are sent with
+//! `store: false`.
 //!
-//! Generation calls take [`CallOptions`] (the model route, the `prompt_cache_key`, an
-//! output cap) and their instructions are laid out for prompt caching: a versioned
-//! constant block first, byte-identical across calls, then the variable part, then the
-//! input (`docs/agent-rag-architecture.md` §2.6). The prompts live in [`prompts`].
+//! Generation calls take [`CallOptions`] (the model route, the cache key, an output cap,
+//! the constant prefix's length) and their instructions are laid out for prompt caching:
+//! a versioned constant block first, byte-identical across calls, then the variable
+//! part, then the input (`docs/agent-rag-architecture.md` §2.6). The prompts live in
+//! [`prompts`].
 
 use std::time::Duration;
 
@@ -21,9 +26,12 @@ use serde_json::{Value, json};
 
 mod citations;
 mod clean;
+mod messages;
+pub mod model;
 pub mod prompts;
 mod responses;
 mod sse;
+pub mod windows;
 
 pub use prompts::evals;
 pub use prompts::{
@@ -31,20 +39,42 @@ pub use prompts::{
     RerankCandidate, SectionRef,
 };
 
+pub use messages::{
+    ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, CLAUDE_BETAS, CLAUDE_MAX_OUTPUT_TOKENS,
+    CLAUDE_TEXT_MAX_OUTPUT_TOKENS, ClaudeClient, WEB_FETCH_MAX_CONTENT_TOKENS, WEB_FETCH_MAX_USES,
+    WEB_FETCH_TOOL, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL,
+};
+pub use model::{
+    CallOptions, Credential, Delta, ItemView, MODEL_WINDOW_FALLBACK, ModelEvent, ModelInfo,
+    ModelItem, ModelRequest, ModelStream, ModelWindow, Next, Provider, ProviderConfig,
+    ProviderKind, RouteModels, StartKind, TextModel, TextOutput, ToolChoice, ToolDef, WebTools,
+};
 pub use responses::{
     Backoff, ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
-    StreamEvent, ToolChoice,
+    ResponsesToolChoice, StreamEvent, function_tool, model_events, responses_request,
+    to_model_events,
 };
+
+/// 429 codes that waiting doesn't cure: Anthropic's spend limit and Margin's share of a
+/// ChatGPT plan used up (the docs say not to infer a reset time).
+pub const NOT_RETRYABLE_429: [&str; 2] = [
+    "enforced_spend_limit_reached",
+    "subscription_sharing_usage_limit_exceeded",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
     /// The API answered with a non-2xx status. `message` is the API's error message
-    /// when it sent one; `retry_after` is the `Retry-After` header (seconds) when sent.
+    /// when it sent one; `retry_after` is the `Retry-After` header (seconds) when sent;
+    /// `code` is the API's machine-readable code: `error.details.error_code` when
+    /// present (`enforced_spend_limit_reached`), else OpenAI's `error.code`, else
+    /// Anthropic's `error.type`.
     #[error("the model API returned {status}: {message}")]
     Http {
         status: u16,
         message: String,
         retry_after: Option<Duration>,
+        code: Option<String>,
     },
     #[error("couldn't reach the model API: {0}")]
     Network(String),
@@ -57,13 +87,28 @@ pub enum AiError {
 }
 
 impl AiError {
-    /// Worth retrying after a pause: rate limits (429), server errors (5xx) and network
-    /// failures. Everything else (bad key, bad request, refusals) fails the same way again.
+    /// Worth retrying after a pause: rate limits (429, except the codes waiting doesn't
+    /// cure: `NOT_RETRYABLE_429`), server errors (5xx, Anthropic's 529 overloaded among
+    /// them) and network failures. Everything else (bad key, bad request, refusals)
+    /// fails the same way again.
     pub fn is_retryable(&self) -> bool {
         match self {
-            AiError::Http { status, .. } => *status == 429 || *status >= 500,
+            AiError::Http {
+                status: 429, code, ..
+            } => !code
+                .as_deref()
+                .is_some_and(|c| NOT_RETRYABLE_429.contains(&c)),
+            AiError::Http { status, .. } => *status >= 500,
             AiError::Network(_) => true,
             AiError::Parse(_) | AiError::Incomplete(_) => false,
+        }
+    }
+
+    /// The API's error code, when it sent one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            AiError::Http { code, .. } => code.as_deref(),
+            _ => None,
         }
     }
 
@@ -89,6 +134,11 @@ pub struct ResponsesClient {
     url: String,
     api_key: String,
     model: String,
+    /// The model of each route, when built from a `ProviderConfig`; `None` calls `model`
+    /// on every route.
+    models: Option<RouteModels>,
+    /// OpenAI, or ChatGPT under a plan token.
+    kind: ProviderKind,
 }
 
 impl std::fmt::Debug for ResponsesClient {
@@ -96,6 +146,7 @@ impl std::fmt::Debug for ResponsesClient {
         f.debug_struct("ResponsesClient")
             .field("url", &self.url)
             .field("model", &self.model)
+            .field("kind", &self.kind)
             .finish_non_exhaustive()
     }
 }
@@ -118,7 +169,35 @@ impl ResponsesClient {
             url: format!("{}/responses", base_url.trim().trim_end_matches('/')),
             api_key: api_key.into(),
             model: model.into(),
+            models: None,
+            kind: ProviderKind::OpenAi,
         }
+    }
+
+    /// The client of an OpenAI or ChatGPT `ProviderConfig`: each call's model is
+    /// `config.models.get(opts.route)`.
+    pub fn from_config(config: &ProviderConfig) -> Self {
+        let mut client = Self::new(
+            config.base_url.clone(),
+            config.credential.secret(),
+            config.models.chat.clone(),
+        );
+        client.models = Some(config.models.clone());
+        client.kind = config.provider;
+        client
+    }
+
+    /// The model `route` calls.
+    pub fn model_for(&self, route: Route) -> &str {
+        match &self.models {
+            Some(models) => models.get(route),
+            None => &self.model,
+        }
+    }
+
+    /// OpenAI, or ChatGPT.
+    pub fn kind(&self) -> ProviderKind {
+        self.kind
     }
 
     fn request(&self, body: &Value) -> Result<reqwest::RequestBuilder, AiError> {
@@ -147,7 +226,7 @@ impl ResponsesClient {
         format: Option<&JsonFormat>,
     ) -> Value {
         let mut body = json!({
-            "model": self.model,
+            "model": self.model_for(opts.route),
             "instructions": instructions,
             "input": input_json(input),
             "stream": true,
@@ -184,25 +263,9 @@ impl ResponsesClient {
         opts: &CallOptions,
         on_delta: impl FnMut(&str) + Send,
     ) -> Result<String, AiError> {
-        self.stream_parts(
-            instructions,
-            &[InputPart::Text(input.to_string())],
-            opts,
-            on_delta,
-        )
-        .await
-    }
-
-    /// `stream_text` with an input of text and images, in order.
-    pub async fn stream_parts(
-        &self,
-        instructions: &str,
-        input: &[InputPart],
-        opts: &CallOptions,
-        on_delta: impl FnMut(&str) + Send,
-    ) -> Result<String, AiError> {
-        let body = self.body(instructions, input, opts, None);
-        Ok(self.stream_body(&body, on_delta).await?.value)
+        let input = [InputPart::Text(input.to_string())];
+        let body = self.body(instructions, &input, opts, None);
+        Ok(self.stream_body(&body, on_delta).await?.text)
     }
 
     /// Streams the answer to a [`Prompt`]: its instructions (constant block, then the
@@ -216,7 +279,7 @@ impl ResponsesClient {
     ) -> Result<Generated<String>, AiError> {
         let opts = opts.keyed(prompt);
         let body = self.body(&prompt.instructions(), &prompt.input, &opts, None);
-        self.stream_body(&body, on_delta).await
+        Ok(self.stream_body(&body, on_delta).await?.generated())
     }
 
     /// Asks for a structured answer (`text.format`: the prompt's strict JSON schema)
@@ -232,7 +295,7 @@ impl ResponsesClient {
         })?;
         let opts = opts.keyed(prompt);
         let body = self.body(&prompt.instructions(), &prompt.input, &opts, Some(format));
-        let Generated { value: text, usage } = self.stream_body(&body, |_| {}).await?;
+        let Generated { value: text, usage } = self.stream_body(&body, |_| {}).await?.generated();
         let value = serde_json::from_str(json_answer(&text)).map_err(|e| {
             AiError::Parse(format!(
                 "the {} answer isn't the JSON asked for: {e}",
@@ -246,7 +309,7 @@ impl ResponsesClient {
         &self,
         body: &Value,
         mut on_delta: impl FnMut(&str) + Send,
-    ) -> Result<Generated<String>, AiError> {
+    ) -> Result<TextOutput, AiError> {
         let resp = self.request(body)?.send().await.map_err(network)?;
         let resp = check_status(resp).await?;
 
@@ -272,58 +335,36 @@ impl ResponsesClient {
     }
 }
 
-/// How one generation call is made (§2.6): the model slot it runs on, the
-/// `prompt_cache_key` that groups calls sharing a prefix, and an output cap.
-///
-/// `route` is not sent: the service resolves it to a model (`AppState::model_for`) and
-/// builds the client for that model; it travels with the call so traces and evals can
-/// record which slot a call used.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallOptions {
-    pub route: Route,
-    /// `prompt_cache_key`. `None` lets [`ResponsesClient::generate`] use the prompt's
-    /// own key (`lesson:lesson-v2`, `scene:scene-v2`, …); plain `stream_*` calls then
-    /// send none.
-    pub cache_key: Option<String>,
-    /// `max_output_tokens`; `None` leaves it to the model.
-    pub max_output_tokens: Option<u32>,
-}
-
-impl CallOptions {
-    pub fn new(route: Route) -> Self {
-        Self {
-            route,
-            cache_key: None,
-            max_output_tokens: None,
-        }
-    }
-
-    pub fn with_cache_key(mut self, key: impl Into<String>) -> Self {
-        self.cache_key = Some(key.into());
-        self
-    }
-
-    pub fn with_max_output_tokens(mut self, max: u32) -> Self {
-        self.max_output_tokens = Some(max);
-        self
-    }
-
-    /// These options with the prompt's cache key when none was given.
-    fn keyed(&self, prompt: &Prompt) -> CallOptions {
-        let mut opts = self.clone();
-        if opts.cache_key.is_none() {
-            opts.cache_key = Some(prompt.cache_key());
-        }
-        opts
-    }
-}
-
 /// A call's answer and what it cost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generated<T> {
     pub value: T,
     /// `response.usage` (zeros when the server sent none); `model_calls` is 1.
     pub usage: Usage,
+}
+
+impl TextOutput {
+    fn generated(self) -> Generated<String> {
+        Generated {
+            value: self.text,
+            usage: self.usage,
+        }
+    }
+}
+
+impl TextModel for ResponsesClient {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> model::BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let body = self.body(instructions, input, opts, None);
+            self.stream_body(&body, on_delta).await
+        })
+    }
 }
 
 /// The JSON of a structured answer: the text itself, or the inside of a code fence a
@@ -459,25 +500,37 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
     }
     let retry_after = retry_after(resp.headers(), std::time::SystemTime::now());
     let body = resp.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|v| error_message(&v))
-        .unwrap_or_else(|| {
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                status
-                    .canonical_reason()
-                    .unwrap_or("no message")
-                    .to_string()
-            } else {
-                truncate(trimmed, 500)
-            }
-        });
+    let parsed = serde_json::from_str::<Value>(&body).ok();
+    let code = parsed.as_ref().and_then(error_code);
+    let message = parsed.as_ref().and_then(error_message).unwrap_or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            status
+                .canonical_reason()
+                .unwrap_or("no message")
+                .to_string()
+        } else {
+            truncate(trimmed, 500)
+        }
+    });
     Err(AiError::Http {
         status: status.as_u16(),
         message,
         retry_after,
+        code,
     })
+}
+
+/// The machine-readable code of an error body: `error.details.error_code` (Anthropic's
+/// spend limit), else `error.code` (OpenAI), else `error.type` (Anthropic:
+/// `rate_limit_error`, `overloaded_error`, `authentication_error`, …).
+fn error_code(v: &Value) -> Option<String> {
+    let e = v.get("error").filter(|e| e.is_object())?;
+    e.pointer("/details/error_code")
+        .and_then(Value::as_str)
+        .or_else(|| e.get("code").and_then(Value::as_str))
+        .or_else(|| e.get("type").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// The pause a 429/503 asks for: OpenAI's `retry-after-ms` when sent (it is more
@@ -627,7 +680,7 @@ impl StreamState {
         &mut self,
         event: &sse::SseEvent,
         on_delta: &mut (impl FnMut(&str) + Send),
-    ) -> Result<Option<Generated<String>>, AiError> {
+    ) -> Result<Option<TextOutput>, AiError> {
         let data = event.data.trim();
         if data.is_empty() || data == "[DONE]" {
             return Ok(None);
@@ -666,17 +719,32 @@ impl StreamState {
                 }
                 let response = v.get("response").unwrap_or(&Value::Null);
                 let usage = responses::usage(response);
+                let field = |key: &str| {
+                    response
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let (model, stop_reason) = (field("model"), field("status"));
                 if self.text.is_empty() && !response.is_null() {
                     // Some compatible servers send the text only in the final object.
                     let text = response_text(response)?;
                     if !text.is_empty() {
                         on_delta(&text);
                     }
-                    return Ok(Some(Generated { value: text, usage }));
+                    return Ok(Some(TextOutput {
+                        text,
+                        usage,
+                        model,
+                        stop_reason,
+                    }));
                 }
-                return Ok(Some(Generated {
-                    value: std::mem::take(&mut self.text),
+                return Ok(Some(TextOutput {
+                    text: std::mem::take(&mut self.text),
                     usage,
+                    model,
+                    stop_reason,
                 }));
             }
             "response.incomplete" => {
@@ -903,6 +971,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_codes_and_retries() {
+        let anthropic = json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}});
+        assert_eq!(error_code(&anthropic).as_deref(), Some("overloaded_error"));
+        let spend = json!({"type": "error", "error": {"type": "rate_limit_error", "message": "m",
+            "details": {"error_code": "enforced_spend_limit_reached"}}});
+        assert_eq!(
+            error_code(&spend).as_deref(),
+            Some("enforced_spend_limit_reached")
+        );
+        let openai = json!({"error": {"message": "bad key", "type": "invalid_request_error", "code": "invalid_api_key"}});
+        assert_eq!(error_code(&openai).as_deref(), Some("invalid_api_key"));
+        assert_eq!(error_code(&json!({"error": "plain"})), None);
+        let http = |status, code: Option<&str>| AiError::Http {
+            status,
+            message: "m".into(),
+            retry_after: None,
+            code: code.map(str::to_string),
+        };
+        assert!(http(429, Some("rate_limit_error")).is_retryable());
+        assert!(http(429, None).is_retryable());
+        assert!(!http(429, Some("enforced_spend_limit_reached")).is_retryable());
+        assert!(!http(429, Some("subscription_sharing_usage_limit_exceeded")).is_retryable());
+        assert!(http(529, Some("overloaded_error")).is_retryable());
+        assert!(http(504, None).is_retryable());
+        assert!(!http(401, Some("authentication_error")).is_retryable());
+        assert_eq!(http(401, Some("x")).code(), Some("x"));
+    }
+
+    #[test]
     fn error_messages() {
         let v = json!({"error": {"message": "bad key", "type": "invalid_request_error", "code": "invalid_api_key"}});
         assert_eq!(error_message(&v).as_deref(), Some("bad key"));
@@ -986,6 +1083,7 @@ mod tests {
             status: 503,
             message: "busy".into(),
             retry_after: None,
+            code: None,
         };
         assert_eq!(b.delay(0, &busy), Some(Duration::from_secs(2)));
         assert_eq!(b.delay(1, &busy), Some(Duration::from_secs(4)));
@@ -995,6 +1093,7 @@ mod tests {
             status: 429,
             message: "slow".into(),
             retry_after: Some(Duration::from_secs(9)),
+            code: None,
         };
         // Retry-After is honoured up to the cap.
         assert_eq!(b.delay(0, &limited), Some(Duration::from_secs(5)));
@@ -1002,6 +1101,7 @@ mod tests {
             status: 429,
             message: "slow".into(),
             retry_after: Some(Duration::from_secs(3)),
+            code: None,
         };
         assert_eq!(b.delay(0, &soon), Some(Duration::from_secs(3)));
         assert_eq!(
@@ -1012,6 +1112,7 @@ mod tests {
             status: 400,
             message: "bad".into(),
             retry_after: None,
+            code: None,
         };
         assert_eq!(b.delay(0, &bad), None);
         assert_eq!(b.delay(0, &AiError::Parse("x".into())), None);

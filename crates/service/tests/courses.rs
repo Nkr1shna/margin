@@ -162,7 +162,7 @@ async fn say(h: &Harness, token: &str, chat_id: Option<&str>, text: &str) -> Str
 fn line(item: &ChatItem) -> String {
     let what = match &item.kind {
         ChatItemKind::UserMessage { text, .. } => format!("user: {text}"),
-        ChatItemKind::AssistantText { text } => format!("assistant: {text}"),
+        ChatItemKind::AssistantText { text, .. } => format!("assistant: {text}"),
         ChatItemKind::Reasoning { summary } => format!("reasoning: {summary}"),
         ChatItemKind::ToolCall { name, .. } => format!("call {name}"),
         ChatItemKind::ToolResult { ok, summary, .. } => {
@@ -173,6 +173,7 @@ fn line(item: &ChatItem) -> String {
             Card::Result(r) => format!("card result: {}", r.title),
             Card::Passages(p) => format!("card passages: {}", p.passages.len()),
             Card::Confirmation(c) => format!("card confirm: {}", c.title),
+            Card::WebResults(w) => format!("card web results: {}", w.query),
         },
         ChatItemKind::Action { text } => format!("action: {text}"),
         ChatItemKind::Error { message, .. } => format!("error: {message}"),

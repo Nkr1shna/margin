@@ -130,7 +130,7 @@ fn line(item: &ChatItem) -> String {
     };
     let what = match &item.kind {
         ChatItemKind::UserMessage { text, .. } => format!("user: {text}"),
-        ChatItemKind::AssistantText { text } => format!("assistant: {text}"),
+        ChatItemKind::AssistantText { text, .. } => format!("assistant: {text}"),
         ChatItemKind::Reasoning { summary } => format!("reasoning: {summary}"),
         ChatItemKind::ToolCall { name, .. } => format!("call {name}"),
         ChatItemKind::ToolResult { ok, summary, .. } => {
@@ -141,6 +141,7 @@ fn line(item: &ChatItem) -> String {
             Card::Result(_) => "card result".into(),
             Card::Passages(p) => format!("card passages: {}", p.passages.len()),
             Card::Confirmation(c) => format!("card confirm: {:?}", c.decision),
+            Card::WebResults(w) => format!("card web results: {}", w.query),
         },
         ChatItemKind::Action { text } => format!("action: {text}"),
         ChatItemKind::Error {
@@ -339,7 +340,11 @@ async fn a_message_starts_a_turn_that_streams_and_finishes() {
     assert_eq!(reqs.len(), 1);
     let req = &reqs[0];
     assert_eq!(req.prompt_cache_key.as_deref(), Some(chat_id.as_str()));
-    assert_eq!(req.model, None, "no agent model: the client's model");
+    assert_eq!(
+        req.model.as_deref(),
+        Some("test-model"),
+        "no agent model: the main model's slot"
+    );
     assert_eq!(
         req.input[0]["role"], "developer",
         "the system prompt comes first"
@@ -449,7 +454,10 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         .push(Scripted::Events(text_reply(&["ok"])));
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     wait_chat(&h, &t, &chat.id, |d| idle(d) && d.items.len() == 4).await;
-    assert_eq!(h.generator.agent.requests()[1].model, None);
+    assert_eq!(
+        h.generator.agent.requests()[1].model.as_deref(),
+        Some("test-model")
+    );
 
     // An agent model alone is enough for chats.
     let r = h
@@ -1052,6 +1060,7 @@ async fn a_failed_turn_can_be_continued() {
         status: 400,
         message: "bad request".into(),
         retry_after: None,
+        code: None,
     }));
     assert_eq!(send(&h, &t, &chat.id, "again").await.status(), 200);
     let d = wait_chat(&h, &t, &chat.id, |d| {
@@ -1468,6 +1477,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
         waiting: None,
         created_at: now,
         updated_at: now,
+        provider: Default::default(),
     };
     store.put(db::CHAT, "c1", &chat).await.unwrap();
     let user_input =
@@ -1496,6 +1506,7 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
             ItemStatus::InProgress,
             ChatItemKind::AssistantText {
                 text: "Half".into(),
+                citations: vec![],
             },
         ),
         vec![],
@@ -2175,6 +2186,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
             ItemStatus::InProgress,
             ChatItemKind::AssistantText {
                 text: String::new(),
+                citations: vec![],
             },
             ItemRecord::default(),
         )
@@ -2200,6 +2212,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     done.status = ItemStatus::Done;
     done.kind = ChatItemKind::AssistantText {
         text: "Über".into(),
+        citations: vec![],
     };
     sink.update_item(
         &done,
@@ -2227,6 +2240,7 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
         output_tokens: 3,
         reasoning_tokens: 1,
         model_calls: 1,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -2972,6 +2986,7 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         status: 400,
         message: "your prompt mentions the secret pelican".into(),
         retry_after: None,
+        code: None,
     }));
     let chat = ask(&h, &t, "Hello").await.chat;
     let d = wait_chat(&h, &t, &chat.id, |d| {

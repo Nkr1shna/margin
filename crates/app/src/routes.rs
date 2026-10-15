@@ -264,6 +264,7 @@ mod tests {
             waiting: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            provider: Default::default(),
         };
         // A chat is named by its first message; until then it's a new chat.
         lib.chats.insert("c1".into(), chat(""));

@@ -141,6 +141,12 @@ fn Harness(props: HarnessProps) -> Element {
             agent_model: None,
             pipeline: Default::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+            default_provider: Default::default(),
+            openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+            chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
+            claude_models: margin_shared::RouteModels::claude_default(),
+            has_claude_api_key: false,
+            chatgpt: None,
         });
         if std::env::var("RENDER_PIPELINE").as_deref() == Ok("changed")
             && let Some(settings) = lib.settings.as_mut()

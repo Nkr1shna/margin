@@ -2561,7 +2561,7 @@ impl TypedTool for MakeVideo {
                     lesson_status(&row.lesson.status)
                 ));
             }
-            if let Err(e) = state.ai_config().await {
+            if let Err(e) = state.model_for(Route::Write, None).await {
                 return failed(e);
             }
             let already = match library::video_for_lesson(&state, &args.lesson_id).await {

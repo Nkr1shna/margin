@@ -15,7 +15,10 @@ use margin_agent::{
     RetryPolicy, SinkError, TOOL_OUTPUT_MAX_BYTES, Tool, ToolContext, ToolKind, ToolOutput,
     ToolRegistry, TurnDeps, TurnInput, TurnOutcome, TurnSink,
 };
-use margin_ai::{AiError, ReasoningConfig, ResponseRequest, ResponseStream, StreamEvent};
+use margin_ai::{
+    AiError, CallOptions, Delta, ItemView, ModelEvent, ModelInfo, ModelRequest, ModelStream,
+    ProviderConfig, ProviderKind, ToolChoice, WebTools,
+};
 use margin_shared::context::TraceKind;
 use margin_shared::pipeline::Route;
 use margin_shared::{
@@ -86,10 +89,10 @@ pub struct Turns {
     /// Chats Stop is finishing (it waits for their writes without `write_lock`), so a
     /// second Stop meanwhile doesn't finish the turn twice.
     pub stopping: Mutex<HashSet<Id>>,
-    /// The model chat titles are written with; `None` uses the agent model. Tests give
-    /// it a `ScriptedModel` of its own, so title calls never take the replies queued for
-    /// turns.
-    pub title_model: Mutex<Option<Arc<dyn ModelClient>>>,
+    /// Makes the client chat titles are written with from the small-tasks config;
+    /// `None` uses the generator's. Tests give it a `ScriptedModel` of its own, so title
+    /// calls never take the replies queued for turns.
+    pub title_model: Mutex<Option<TitleModel>>,
     /// Chats whose title call was made since the service started: one per chat, while
     /// its title is still the first line.
     pub titled: Mutex<HashSet<Id>>,
@@ -475,21 +478,6 @@ async fn run_turn(
     slot: Slot,
     trace: &TurnTrace,
 ) -> Result<TurnOutcome, Early> {
-    // A missing key or model ends the turn like a failed model call. The chat route
-    // (`pipeline.routes.chat`) when set, else the agent model, else the main model.
-    let ai = state
-        .route_ai_config(Route::Chat)
-        .await
-        .map_err(|e| Early {
-            code: match e.code {
-                error_code::NO_API_KEY => error_code::NO_API_KEY,
-                error_code::NO_MODEL => error_code::NO_MODEL,
-                // The settings couldn't be read.
-                _ => error_code::STORAGE,
-            },
-            message: e.message,
-            retryable: true,
-        })?;
     let internal = |e: anyhow::Error| {
         tracing::error!(chat = %chat_id, "couldn't start the turn: {e:#}");
         Early {
@@ -507,6 +495,22 @@ async fn run_turn(
             code: error_code::INTERRUPTED,
         });
     };
+    // A missing key or model ends the turn like a failed model call. The chat's
+    // provider, on its chat slot (`pipeline.routes.chat` when set).
+    let choice = state
+        .model_for(Route::Chat, Some(chat.provider))
+        .await
+        .map_err(|e| Early {
+            code: match e.code {
+                error_code::NO_API_KEY => error_code::NO_API_KEY,
+                error_code::NO_MODEL => error_code::NO_MODEL,
+                error_code::AUTH_FAILED => error_code::AUTH_FAILED,
+                // The settings couldn't be read.
+                _ => error_code::STORAGE,
+            },
+            message: e.message,
+            retryable: true,
+        })?;
     let rows = chats::items(state, chat_id).await.map_err(internal)?;
     let replay: Vec<ReplayItem<'_>> = rows
         .iter()
@@ -520,24 +524,25 @@ async fn run_turn(
         .await
         .map_err(internal)?;
     let tools = traced_tools(&agent_tools::registry(state), trace);
+    // The loop's condense calls run on the small route; without a small slot they stay
+    // on the chat model.
+    let mut config = choice.config.clone();
+    if config.models.small.trim().is_empty() {
+        config.models.small = choice.model.clone();
+    }
     let mut model = TracedModel::new(
-        state.generator.agent_model(&ai),
+        state.generator.agent_model(&config),
         trace.clone(),
-        &ai.model,
-        trace::provider_of(&ai.base_url),
+        &choice.model,
+        choice.config.provider.as_str(),
         None,
     );
-    // Condensing the history is a small task: `pipeline.routes.small` when set.
+    // Condensing the history is a small task: the default provider's small slot.
     if let Some(small) = small_route(state).await {
         model = model.with_small(small);
     }
-    // The model the requests name: the routed chat model when Settings routes chat
-    // turns, else the agent model as before.
-    let chat_model = if routed(state, Route::Chat) {
-        Some(ai.model.clone())
-    } else {
-        settings.agent_model.clone()
-    };
+    // The small text model (`TurnDeps.small`): the default provider's.
+    let small_text = state.generator.text_model(&config);
     let sink = ServiceSink {
         state: state.clone(),
         chat_id: chat_id.to_string(),
@@ -547,6 +552,7 @@ async fn run_turn(
     let retry = *state.turns.retry.lock().unwrap();
     let deps = TurnDeps {
         model: &model,
+        small: small_text.as_ref(),
         tools: &tools,
         sink: &sink,
         devices: state.devices.clone(),
@@ -556,7 +562,7 @@ async fn run_turn(
         chat_id: chat_id.to_string(),
         turn_id: turn_id.to_string(),
         origin_device: origin,
-        model: chat_model,
+        provider: chat.provider,
         reasoning_effort: settings.reasoning_effort,
         history,
         workspaces,
@@ -567,25 +573,15 @@ async fn run_turn(
     Ok(outcome)
 }
 
-/// Whether Settings routes `route` to a model of its own (`pipeline.routes`).
-fn routed(state: &AppState, route: Route) -> bool {
-    state
-        .pipeline
-        .load()
-        .routes
-        .get(route)
-        .is_some_and(|m| !m.trim().is_empty())
-}
-
-/// The small-tasks route (titles, condensing): `route_ai_config(Route::Small)`, i.e.
-/// `pipeline.routes.small` or else the main model. `None` (logged) when it can't be
-/// configured; the caller then stays on the turn's model.
+/// The small-tasks route (titles, condensing): `model_for(Route::Small, None)`, i.e. the
+/// default provider's small slot (`pipeline.routes.small` when set). `None` (logged) when
+/// it can't be configured; the caller then stays on the turn's model.
 async fn small_route(state: &AppState) -> Option<SmallRoute> {
-    match state.route_ai_config(Route::Small).await {
-        Ok(ai) => Some(SmallRoute {
-            client: state.generator.agent_model(&ai),
-            provider: trace::provider_of(&ai.base_url),
-            model: ai.model,
+    match state.model_for(Route::Small, None).await {
+        Ok(m) => Some(SmallRoute {
+            client: state.generator.agent_model(&m.config),
+            provider: m.config.provider.as_str(),
+            model: m.model,
         }),
         Err(e) => {
             tracing::warn!("the small-tasks model isn't configured: {}", e.message);
@@ -1290,7 +1286,7 @@ async fn add_result_locked(
 /// `ToolCall.arguments`).
 fn set_streaming_text(kind: &mut ChatItemKind, text: String) {
     match kind {
-        ChatItemKind::AssistantText { text: t }
+        ChatItemKind::AssistantText { text: t, .. }
         | ChatItemKind::Reasoning { summary: t }
         | ChatItemKind::ToolCall { arguments: t, .. } => *t = text,
         _ => {}
@@ -1627,7 +1623,7 @@ async fn ask_title(
         .iter()
         .rev()
         .find_map(|r| match &r.item.kind {
-            ChatItemKind::AssistantText { text }
+            ChatItemKind::AssistantText { text, .. }
                 if r.item.turn_id == turn_id && r.item.status == ItemStatus::Done =>
             {
                 Some(text.as_str())
@@ -1636,57 +1632,56 @@ async fn ask_title(
         })
         .unwrap_or_default();
     let override_model = state.turns.title_model.lock().unwrap().clone();
-    // A title is a small task: `pipeline.routes.small`, else the main model.
-    let ai = state
-        .route_ai_config(Route::Small)
+    // A title is a small task: the default provider's small slot.
+    let small = state
+        .model_for(Route::Small, None)
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
     let model = match override_model {
-        Some(m) => m,
-        None => state.generator.agent_model(&ai),
+        Some(make) => make(&small.config),
+        None => state.generator.agent_model(&small.config),
     };
     let model = TracedModel::new(
         model,
         TurnTrace::new(state, chat_id, turn_id, None),
-        &ai.model,
-        trace::provider_of(&ai.base_url),
+        &small.model,
+        small.config.provider.as_str(),
         Some(Purpose::Title),
     );
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
-    let request = ResponseRequest {
-        model: Some(ai.model.clone()),
-        input: vec![
-            margin_agent::action_input(TITLE_INSTRUCTIONS),
-            json!({"role": "user", "content": [{"type": "input_text", "text": data}]}),
-        ],
-        reasoning: Some(ReasoningConfig {
-            effort: ReasoningEffort::Low,
-            summary: None,
-        }),
-        max_output_tokens: Some(TITLE_MAX_OUTPUT_TOKENS),
-        prompt_cache_key: Some(chat_id.to_string()),
-        ..Default::default()
+    let request = ModelRequest {
+        opts: CallOptions::new(Route::Small)
+            .with_cache_key(chat_id)
+            .with_max_output_tokens(TITLE_MAX_OUTPUT_TOKENS),
+        system: TITLE_INSTRUCTIONS.to_string(),
+        history: vec![json!({"role": "user", "content": [{"type": "input_text", "text": data}]})],
+        tools: Vec::new(),
+        tool_choice: ToolChoice::Auto,
+        web: WebTools::default(),
+        effort: ReasoningEffort::Low,
+        compaction: None,
+        parallel_tool_calls: false,
     };
     let mut stream = model.stream(request).await?;
     let mut text = String::new();
     while let Some(event) = stream.next().await {
         match event? {
-            StreamEvent::OutputTextDelta { delta, .. } => text.push_str(&delta),
-            StreamEvent::OutputItemDone { item, .. } if item["type"] == "message" => {
-                text = item["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part["text"].as_str())
-                    .collect();
+            ModelEvent::Delta {
+                delta: Delta::Text(delta),
+                ..
+            } => text.push_str(&delta),
+            ModelEvent::Done { item, .. } => {
+                if let ItemView::Text { text: done, .. } = item.view {
+                    text = done;
+                }
             }
-            StreamEvent::Completed { usage, .. } => {
+            ModelEvent::Completed { usage, .. } => {
                 return Ok((model_title(&text), Some(usage)));
             }
             // Cut off: a half title is worse than the first line.
-            StreamEvent::Incomplete { usage, .. } => return Ok((None, Some(usage))),
-            StreamEvent::Failed { message, .. } | StreamEvent::Error { message, .. } => {
+            ModelEvent::Incomplete { usage, .. } => return Ok((None, Some(usage))),
+            ModelEvent::Failed { message, .. } => {
                 anyhow::bail!("the title call failed: {message}");
             }
             _ => {}
@@ -1745,6 +1740,9 @@ impl TurnTrace {
     }
 }
 
+/// Makes the title client from the small-tasks config (`Turns::title_model`).
+pub type TitleModel = Arc<dyn Fn(&ProviderConfig) -> Arc<dyn ModelClient> + Send + Sync>;
+
 /// Which side call a traced model makes when it isn't an agent step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
@@ -1799,17 +1797,17 @@ impl TracedModel {
     }
 
     /// A condense call of the loop: no tools, not the title.
-    fn is_condense(&self, req: &ResponseRequest) -> bool {
+    fn is_condense(&self, req: &ModelRequest) -> bool {
         self.purpose.is_none() && req.tools.is_empty()
     }
 
     /// The call's row: route, model, provider, prompt version (a hash of the fixed
-    /// instructions: the system prompt for steps, the first input item for condense,
-    /// `TITLE_INSTRUCTIONS` for the title), step.
-    fn span(&self, req: &ResponseRequest) -> TraceSpan {
+    /// instructions: the system prompt for steps, the condense instructions as their
+    /// developer message for condense, `TITLE_INSTRUCTIONS` for the title), step.
+    fn span(&self, req: &ModelRequest) -> TraceSpan {
         let mut span = self.trace.span(TraceKind::ModelCall);
         let row = &mut span.row;
-        row.model = Some(req.model.clone().unwrap_or_else(|| self.model.clone()));
+        row.model = Some(self.model.clone());
         row.provider = Some(self.provider.to_string());
         match self.purpose {
             Some(Purpose::Title) => {
@@ -1825,9 +1823,9 @@ impl TracedModel {
                 row.step = Some(self.steps.fetch_add(1, Ordering::Relaxed) + 1);
             }
             None => {
-                // The loop's condense call: its first input item is its fixed
-                // instructions.
-                let fixed = req.input.first().map(Value::to_string).unwrap_or_default();
+                // The loop's condense call: its system prompt is its fixed
+                // instructions (hashed as the developer message it is sent as).
+                let fixed = margin_agent::action_input(&req.system).to_string();
                 row.route = Some(Route::Small);
                 row.prompt_version = Some(trace::prompt_version("condense", &fixed));
             }
@@ -1837,23 +1835,23 @@ impl TracedModel {
 }
 
 impl ModelClient for TracedModel {
-    fn stream(&self, mut req: ResponseRequest) -> BoxFuture<'_, Result<ResponseStream, AiError>> {
+    fn kind(&self) -> ProviderKind {
+        self.inner.kind()
+    }
+
+    fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
         Box::pin(async move {
-            let client = match &self.small {
-                Some(small) if self.is_condense(&req) => {
-                    req.model = Some(small.model.clone());
-                    &small.client
-                }
-                _ => &self.inner,
-            };
+            let small = self.small.as_ref().filter(|_| self.is_condense(&req));
+            let client = small.map_or(&self.inner, |s| &s.client);
             let mut span = self.span(&req);
-            if let Some(small) = self.small.as_ref().filter(|_| self.is_condense(&req)) {
+            if let Some(small) = small {
+                span.row.model = Some(small.model.clone());
                 span.row.provider = Some(small.provider.to_string());
             }
             match client.stream(req).await {
                 Ok(stream) => Ok(
                     Box::pin(TracedStream::new(stream, span, self.trace.state.clone()))
-                        as ResponseStream,
+                        as ModelStream,
                 ),
                 Err(e) => {
                     span.fail(&self.trace.state.tracer, trace::ai_error_code(&e));
@@ -1861,6 +1859,10 @@ impl ModelClient for TracedModel {
                 }
             }
         })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
+        self.inner.list_models()
     }
 }
 

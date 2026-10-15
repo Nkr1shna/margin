@@ -18,7 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
 use margin_ai::{
-    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, SceneRequest,
+    AiError, CallOptions, CoursePlan, Generated, LessonContext, PlanRequest, ProviderConfig,
+    SceneRequest, TextModel,
 };
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
@@ -27,7 +28,9 @@ use margin_embed::{
 };
 use margin_service::config::Config;
 use margin_service::db::Store;
-use margin_service::engines::{AiConfig, BoxFuture, Generator, Renderer, SourceTools, SpeechModel};
+use margin_service::engines::{
+    BoxFuture, Generator, ModelChoice, Renderer, SourceTools, SpeechModel,
+};
 use margin_service::pipeline::{Chunker, ChunkerCfg};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore, OPENAI_API_KEY, SecretStore};
 use margin_service::server::{Options, Service};
@@ -150,6 +153,7 @@ pub fn fake_usage() -> margin_shared::Usage {
         output_tokens: 200,
         reasoning_tokens: 0,
         model_calls: 1,
+        ..Default::default()
     }
 }
 
@@ -170,7 +174,7 @@ pub fn outline_for(req: &AskRequest) -> Outline {
 impl Generator for FakeGenerator {
     fn write_lesson<'a>(
         &'a self,
-        _ai: &'a AiConfig,
+        _m: &'a ModelChoice,
         ctx: &'a LessonContext,
         opts: &'a CallOptions,
         mut on_delta: Box<dyn FnMut(&str) + Send + 'a>,
@@ -219,7 +223,7 @@ impl Generator for FakeGenerator {
 
     fn write_scene<'a>(
         &'a self,
-        _ai: &'a AiConfig,
+        _m: &'a ModelChoice,
         req: &'a SceneRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<String>, AiError>> {
@@ -238,7 +242,7 @@ impl Generator for FakeGenerator {
 
     fn plan_course<'a>(
         &'a self,
-        ai: &'a AiConfig,
+        m: &'a ModelChoice,
         req: &'a PlanRequest,
         opts: &'a CallOptions,
     ) -> BoxFuture<'a, Result<Generated<CoursePlan>, AiError>> {
@@ -249,9 +253,9 @@ impl Generator for FakeGenerator {
                 .push((req.clone(), opts.clone()));
             if self.agent_over_http.load(Ordering::SeqCst) {
                 let client = margin_ai::ResponsesClient::new(
-                    ai.base_url.clone(),
-                    ai.api_key.clone(),
-                    ai.model.clone(),
+                    m.config.base_url.clone(),
+                    m.config.credential.secret(),
+                    m.model.clone(),
                 );
                 return margin_ai::plan_course(&client, req, opts).await;
             }
@@ -266,16 +270,20 @@ impl Generator for FakeGenerator {
         })
     }
 
-    fn agent_model(&self, ai: &AiConfig) -> Arc<dyn ModelClient> {
-        assert_eq!(ai.api_key, API_KEY);
+    fn agent_model(&self, config: &ProviderConfig) -> Arc<dyn ModelClient> {
+        assert_eq!(config.credential.secret(), API_KEY);
         if self.agent_over_http.load(Ordering::SeqCst) {
-            return Arc::new(margin_ai::ResponsesClient::new(
-                ai.base_url.clone(),
-                ai.api_key.clone(),
-                ai.model.clone(),
-            ));
+            return Arc::new(margin_ai::ResponsesClient::from_config(config));
         }
-        self.agent.clone()
+        self.agent.on_models(config.models.clone())
+    }
+
+    fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel> {
+        assert_eq!(config.credential.secret(), API_KEY);
+        if self.agent_over_http.load(Ordering::SeqCst) {
+            return Arc::new(margin_ai::ResponsesClient::from_config(config));
+        }
+        self.titles.clone()
     }
 }
 
@@ -976,7 +984,10 @@ pub async fn start_with(setup: Setup) -> Harness {
     .await
     .unwrap();
     let state = service.state.clone();
-    *state.turns.title_model.lock().unwrap() = Some(generator.titles.clone());
+    let titles = generator.titles.clone();
+    *state.turns.title_model.lock().unwrap() = Some(Arc::new(move |config: &ProviderConfig| {
+        titles.on_models(config.models.clone())
+    }));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         service

@@ -244,8 +244,8 @@ fn output_sent(h: &Harness, call_id: &str) -> Value {
 /// else every tool in `tools`.
 fn offered(req: &margin_ai::ResponseRequest) -> Vec<String> {
     match &req.tool_choice {
-        Some(margin_ai::ToolChoice::AllowedTools { names, .. }) => names.clone(),
-        Some(margin_ai::ToolChoice::Auto) | None => req
+        Some(margin_ai::ResponsesToolChoice::AllowedTools { names, .. }) => names.clone(),
+        Some(margin_ai::ResponsesToolChoice::Auto) | None => req
             .tools
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))

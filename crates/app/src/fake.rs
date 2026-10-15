@@ -516,6 +516,12 @@ fn default_settings() -> Settings {
         agent_model: None,
         pipeline: Default::default(),
         trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
+        default_provider: Default::default(),
+        openai_models: margin_shared::RouteModels::openai_from("gpt-5", None),
+        chatgpt_models: margin_shared::RouteModels::chatgpt_default(),
+        claude_models: margin_shared::RouteModels::claude_default(),
+        has_claude_api_key: false,
+        chatgpt: None,
     }
 }
 
@@ -2950,6 +2956,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
         id: id.into(),
         title: title.into(),
         title_by: Default::default(),
+        provider: Default::default(),
         state,
         workspace_ids: vec![],
         source_ids: vec![],
@@ -2960,6 +2967,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             output_tokens: 1_250,
             reasoning_tokens: 640,
             model_calls: 4,
+            ..Default::default()
         },
         waiting: None,
         created_at: ts(at),
@@ -3023,6 +3031,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             "t1",
             ChatItemKind::AssistantText {
                 text: "For a reasonably well-behaved periodic signal the partial sums\n\n$$S_N(t) = \\sum_{n=-N}^{N} c_n e^{i n \\omega_0 t}$$\n\nconverge to the signal wherever it is continuous, and to the **midpoint of the jump** where it isn't.\n\n- Your lesson *Why sums of sines?* walks through the square wave.\n- Your note *Whole-number multiples* has the key fact about frequencies.\n\nNear a jump the partial sums overshoot by about 9% however many terms you add (the Gibbs phenomenon).".into(),
+                citations: vec![],
             },
         ),
         item("c1", 6, "t2", user("Show me where my sources say that.")),
@@ -3104,6 +3113,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
             "t2",
             ChatItemKind::AssistantText {
                 text: "Three of the topic's sources cover it: the textbook's chapter 3 [page 3], the script that plots the partial sums, and the square-wave figure.".into(),
+                citations: vec![],
             },
         ),
     ];
@@ -3113,6 +3123,7 @@ pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
         "t3",
         ChatItemKind::AssistantText {
             text: "Eigenvectors are the directions a matrix only stretches".into(),
+            citations: vec![],
         },
     );
     cancelled.status = ItemStatus::Cancelled;
@@ -3919,6 +3930,7 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -3996,6 +4008,7 @@ async fn accept_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, proposal: Pro
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4061,6 +4074,7 @@ async fn result_and_answer(
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4542,6 +4556,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
                 ItemStatus::InProgress,
                 ChatItemKind::AssistantText {
                     text: "Here's what".into(),
+                    citations: vec![],
                 },
             );
             (vec![Event::ChatItemChanged { item }], ())
@@ -4554,6 +4569,7 @@ async fn run_answer(fake: Fake, chat_id: Id, turn_id: Id, prompt: String, retry:
         turn_id,
         ChatItemKind::AssistantText {
             text: String::new(),
+            citations: vec![],
         },
         &answer,
     )
@@ -4575,6 +4591,7 @@ async fn finish_turn(fake: &Fake, chat_id: &str, turn_id: &str) {
                 output_tokens: 310,
                 reasoning_tokens: 120,
                 model_calls: 2,
+                ..Default::default()
             });
             chat.state = ChatState::Idle;
             chat.waiting = None;
@@ -4716,6 +4733,7 @@ async fn create_chat(
             waiting: None,
             created_at: now,
             updated_at: now,
+            provider: Default::default(),
         };
         let id = chat.id.clone();
         s.chats.push(chat.clone());
@@ -5209,6 +5227,7 @@ async fn confirm(
                 &turn_id,
                 ChatItemKind::AssistantText {
                     text: String::new(),
+                    citations: vec![],
                 },
                 text,
             )

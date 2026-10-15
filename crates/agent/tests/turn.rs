@@ -17,10 +17,13 @@ use margin_agent::{
     check_strict_schema, device_tools, replay_input, run_turn, system_prompt, unanswered_calls,
     user_message_input,
 };
-use margin_ai::{AiError, ContextManagement, ResponseRequest, StreamEvent, ToolChoice};
+use margin_ai::{
+    AiError, ContextManagement, ModelEvent, ResponseRequest, ResponsesToolChoice as ToolChoice,
+    StreamEvent, to_model_events,
+};
 use margin_shared::{
     Card, ChatItem, ChatItemKind, Decision, DeviceRef, DeviceToolOutput, ItemStatus, Platform,
-    ReasoningEffort, ResultCard, ResultTarget, Usage, Workspace, error_code,
+    Provider, ReasoningEffort, ResultCard, ResultTarget, Usage, Workspace, error_code,
 };
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
@@ -439,7 +442,7 @@ fn input(history: Vec<Value>) -> TurnInput {
             device_id: "phone".into(),
             name: "iPhone".into(),
         },
-        model: Some("agent-model".into()),
+        provider: Provider::OpenAi,
         reasoning_effort: ReasoningEffort::High,
         history,
         workspaces: vec![],
@@ -455,6 +458,7 @@ async fn run(
 ) -> TurnOutcome {
     let deps = TurnDeps {
         model,
+        small: model,
         tools,
         sink,
         devices,
@@ -508,7 +512,13 @@ fn http(status: u16, message: &str) -> AiError {
         status,
         message: message.into(),
         retry_after: None,
+        code: None,
     }
+}
+
+/// Responses-shaped events as the scripted model streams them.
+fn ev(events: Vec<StreamEvent>) -> Vec<ModelEvent> {
+    to_model_events(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +553,8 @@ async fn a_text_answer_streams_into_one_item() {
                 id.clone(),
                 ItemStatus::InProgress,
                 ChatItemKind::AssistantText {
-                    text: String::new()
+                    text: String::new(),
+                    citations: vec![],
                 }
             ),
             Ev::Delta(id.clone(), 0, "Hel".into()),
@@ -552,7 +563,8 @@ async fn a_text_answer_streams_into_one_item() {
                 id.clone(),
                 ItemStatus::Done,
                 ChatItemKind::AssistantText {
-                    text: "Hello".into()
+                    text: "Hello".into(),
+                    citations: vec![],
                 }
             ),
             Ev::Usage(usage(100, 20)),
@@ -561,7 +573,10 @@ async fn a_text_answer_streams_into_one_item() {
     assert_eq!(sink.model_items(&id), vec![message_item("msg_1", "Hello")]);
 
     let req = &model.requests()[0];
-    assert_eq!(req.model.as_deref(), Some("agent-model"));
+    assert_eq!(
+        req.model, None,
+        "the client names the model (its chat slot)"
+    );
     assert_eq!(req.input[0]["role"], "developer");
     assert_eq!(req.input[0]["content"][0]["text"], system_prompt());
     assert_eq!(req.input[1..], history[..]);
@@ -668,9 +683,11 @@ async fn reasoning_summaries_and_refusals_are_items() {
         StreamEvent::Completed {
             response_id: "r".into(),
             usage: usage(1, 1),
+            model: String::new(),
+            status: "completed".into(),
         },
     ];
-    let model = ScriptedModel::new([Scripted::Events(events)]);
+    let model = ScriptedModel::new([Scripted::Events(ev(events))]);
     let sink = Sink::default();
     let history = sink.user_message("hi");
     let outcome = run(
@@ -1038,6 +1055,7 @@ async fn stop_while_parked_leaves_the_call_for_the_service() {
     let history = sink.user_message("delete fourier");
     let deps = TurnDeps {
         model: &model,
+        small: &model,
         tools: &tools,
         sink: &sink,
         devices: Arc::new(NoDevices),
@@ -1066,6 +1084,7 @@ async fn retryable_errors_before_output_are_retried() {
             status: 429,
             message: "slow down".into(),
             retry_after: Some(Duration::from_secs(1)),
+            code: None,
         }),
         // The connection dropped before anything came.
         Scripted::EventsThenError(vec![], AiError::Network("reset".into())),
@@ -1114,6 +1133,7 @@ async fn timed_turn(model: &ScriptedModel, sink: &Sink) -> (TurnOutcome, Duratio
     let tools = ToolRegistry::new();
     let deps = TurnDeps {
         model,
+        small: model,
         tools: &tools,
         sink,
         devices: Arc::new(NoDevices),
@@ -1131,6 +1151,7 @@ async fn retries_wait_as_asked() {
             status: 429,
             message: "slow down".into(),
             retry_after: Some(Duration::from_secs(7)),
+            code: None,
         }),
         Scripted::Fail(http(500, "oops")),
         Scripted::Events(text_reply(&["fine"])),
@@ -1161,6 +1182,7 @@ async fn retry_after_is_not_capped() {
             status: 429,
             message: "slow down".into(),
             retry_after: Some(Duration::from_secs(600)),
+            code: None,
         }),
         Scripted::Events(text_reply(&["fine"])),
     ]);
@@ -1254,7 +1276,8 @@ async fn client_errors_are_not_retried() {
             retryable: false
         }
     );
-    assert_eq!(sink.error_code().as_deref(), Some(error_code::BAD_REQUEST));
+    // A refused key is `auth_failed` (the app offers Settings).
+    assert_eq!(sink.error_code().as_deref(), Some(error_code::AUTH_FAILED));
     assert!(sink.waiting_events().is_empty());
 }
 
@@ -1264,16 +1287,18 @@ async fn a_failure_after_output_cancels_and_does_not_retry() {
     let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
     let mut events = tool_calls_reply(&[("call_1", "list_topics", "{}")]);
     events.pop(); // no Completed
-    events.push(StreamEvent::OutputItemAdded {
-        output_index: 1,
-        item: json!({"type": "message", "id": "msg_1", "role": "assistant", "content": []}),
-    });
-    events.push(StreamEvent::OutputTextDelta {
-        output_index: 1,
-        item_id: "msg_1".into(),
-        content_index: 0,
-        delta: "Half an ans".into(),
-    });
+    events.extend(ev(vec![
+        StreamEvent::OutputItemAdded {
+            output_index: 1,
+            item: json!({"type": "message", "id": "msg_1", "role": "assistant", "content": []}),
+        },
+        StreamEvent::OutputTextDelta {
+            output_index: 1,
+            item_id: "msg_1".into(),
+            content_index: 0,
+            delta: "Half an ans".into(),
+        },
+    ]));
     let model = ScriptedModel::new([
         Scripted::EventsThenError(events, AiError::Network("reset".into())),
         Scripted::Events(text_reply(&["never asked"])),
@@ -1330,7 +1355,7 @@ async fn a_failure_after_output_cancels_and_does_not_retry() {
 async fn an_incomplete_answer_fails_retryably() {
     let mut events = text_reply(&["The answer is"]);
     events.pop();
-    events.push(StreamEvent::Incomplete {
+    events.push(ModelEvent::Incomplete {
         reason: "max_output_tokens".into(),
         usage: usage(10, 10),
     });
@@ -1366,7 +1391,7 @@ async fn every_incomplete_reason_is_said_in_words() {
         ("steered", "the model API ended it early"),
         ("something_new", "something_new"),
     ] {
-        let model = ScriptedModel::new([Scripted::Events(vec![StreamEvent::Incomplete {
+        let model = ScriptedModel::new([Scripted::Events(vec![ModelEvent::Incomplete {
             reason: reason.into(),
             usage: usage(10, 0),
         }])]);
@@ -1398,7 +1423,7 @@ async fn every_incomplete_reason_is_said_in_words() {
 
 #[tokio::test]
 async fn failed_events_are_not_retried() {
-    let model = ScriptedModel::new([Scripted::Events(vec![StreamEvent::Failed {
+    let model = ScriptedModel::new([Scripted::Events(vec![ModelEvent::Failed {
         code: Some("server_error".into()),
         message: "Something broke".into(),
     }])]);
@@ -1577,7 +1602,7 @@ async fn calls_are_never_run_twice() {
 async fn replays_are_byte_identical_to_what_was_sent() {
     let log = Log::default();
     let tools = registry(vec![FakeTool::new("list_topics", ToolKind::Read, &log)]);
-    let mut first = vec![
+    let mut first = ev(vec![
         StreamEvent::OutputItemAdded {
             output_index: 0,
             item: json!({"type": "reasoning", "id": "rs_1", "summary": []}),
@@ -1586,31 +1611,12 @@ async fn replays_are_byte_identical_to_what_was_sent() {
             output_index: 0,
             item: reasoning_item("rs_1", "Look first."),
         },
-    ];
+    ]);
     for e in tool_calls_reply(&[("call_1", "list_topics", "{}")]) {
         first.push(match e {
-            StreamEvent::OutputItemAdded { item, .. } => StreamEvent::OutputItemAdded {
-                output_index: 1,
-                item,
-            },
-            StreamEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
-                StreamEvent::FunctionCallArgumentsDelta {
-                    output_index: 1,
-                    item_id,
-                    delta,
-                }
-            }
-            StreamEvent::FunctionCallArgumentsDone {
-                item_id, arguments, ..
-            } => StreamEvent::FunctionCallArgumentsDone {
-                output_index: 1,
-                item_id,
-                arguments,
-            },
-            StreamEvent::OutputItemDone { item, .. } => StreamEvent::OutputItemDone {
-                output_index: 1,
-                item,
-            },
+            ModelEvent::Started { kind, .. } => ModelEvent::Started { index: 1, kind },
+            ModelEvent::Delta { delta, .. } => ModelEvent::Delta { index: 1, delta },
+            ModelEvent::Done { item, .. } => ModelEvent::Done { index: 1, item },
             other => other,
         });
     }
@@ -1816,7 +1822,7 @@ async fn device_calls_go_through_the_bridge() {
 #[tokio::test]
 async fn server_compaction_items_are_stored_and_replace_earlier_input() {
     let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "zzz"});
-    let mut first = vec![
+    let mut first = ev(vec![
         StreamEvent::OutputItemAdded {
             output_index: 0,
             item: json!({"type": "compaction", "id": "cmp_1"}),
@@ -1825,24 +1831,12 @@ async fn server_compaction_items_are_stored_and_replace_earlier_input() {
             output_index: 0,
             item: compaction.clone(),
         },
-    ];
+    ]);
     for e in tool_calls_reply(&[("call_1", "list_topics", "{}")]) {
         first.push(match e {
-            StreamEvent::OutputItemAdded { item, .. } => StreamEvent::OutputItemAdded {
-                output_index: 1,
-                item,
-            },
-            StreamEvent::OutputItemDone { item, .. } => StreamEvent::OutputItemDone {
-                output_index: 1,
-                item,
-            },
-            StreamEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
-                StreamEvent::FunctionCallArgumentsDelta {
-                    output_index: 1,
-                    item_id,
-                    delta,
-                }
-            }
+            ModelEvent::Started { kind, .. } => ModelEvent::Started { index: 1, kind },
+            ModelEvent::Delta { delta, .. } => ModelEvent::Delta { index: 1, delta },
+            ModelEvent::Done { item, .. } => ModelEvent::Done { index: 1, item },
             other => other,
         });
     }
@@ -1904,14 +1898,11 @@ fn long_history(sink: &Sink) -> Vec<Value> {
     history
 }
 
-fn big_usage() -> StreamEvent {
-    StreamEvent::Completed {
-        response_id: "r".into(),
-        usage: Usage {
-            input_tokens: 250_000,
-            ..usage(0, 10)
-        },
-    }
+fn big_usage() -> ModelEvent {
+    margin_agent::scripted::completed(Usage {
+        input_tokens: 250_000,
+        ..usage(0, 10)
+    })
 }
 
 #[tokio::test]

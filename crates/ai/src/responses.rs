@@ -14,6 +14,10 @@ use futures_util::{Stream, StreamExt};
 use margin_shared::{ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
+use crate::model::{
+    BoxFuture, Delta, ItemView, ModelEvent, ModelInfo, ModelItem, ModelRequest, ModelStream, Next,
+    Provider, ProviderKind, StartKind, ToolChoice, ToolDef,
+};
 use crate::sse::{SseEvent, SseParser};
 use crate::{AiError, ResponsesClient, check_status, error_chain, error_message, network};
 
@@ -31,7 +35,7 @@ pub struct ResponseRequest {
     /// `tools`: function tool definitions verbatim, e.g.
     /// `{"type":"function","name":…,"description":…,"parameters":…,"strict":true}`.
     pub tools: Vec<Value>,
-    pub tool_choice: Option<ToolChoice>,
+    pub tool_choice: Option<ResponsesToolChoice>,
     pub reasoning: Option<ReasoningConfig>,
     /// Adds `"include": ["reasoning.encrypted_content"]`, so reasoning items can be
     /// replayed with `store: false`.
@@ -45,7 +49,7 @@ pub struct ResponseRequest {
 
 /// `tool_choice`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolChoice {
+pub enum ResponsesToolChoice {
     /// `"auto"`.
     Auto,
     /// `"none"`: answer with text only.
@@ -63,15 +67,15 @@ pub enum ToolChoice {
     },
 }
 
-impl ToolChoice {
+impl ResponsesToolChoice {
     /// The JSON value of `tool_choice`.
     pub fn to_json(&self) -> Value {
         match self {
-            ToolChoice::Auto => json!("auto"),
-            ToolChoice::None => json!("none"),
-            ToolChoice::Required => json!("required"),
-            ToolChoice::Function(name) => json!({"type": "function", "name": name}),
-            ToolChoice::AllowedTools { required, names } => json!({
+            ResponsesToolChoice::Auto => json!("auto"),
+            ResponsesToolChoice::None => json!("none"),
+            ResponsesToolChoice::Required => json!("required"),
+            ResponsesToolChoice::Function(name) => json!({"type": "function", "name": name}),
+            ResponsesToolChoice::AllowedTools { required, names } => json!({
                 "type": "allowed_tools",
                 "mode": if *required { "required" } else { "auto" },
                 "tools": names
@@ -166,8 +170,14 @@ pub enum StreamEvent {
         summary_index: u32,
         delta: String,
     },
-    /// `response.completed`. Terminal. `usage.model_calls` is 1.
-    Completed { response_id: String, usage: Usage },
+    /// `response.completed`. Terminal. `usage.model_calls` is 1; `model` and `status`
+    /// are the response's (empty when the server sent none).
+    Completed {
+        response_id: String,
+        usage: Usage,
+        model: String,
+        status: String,
+    },
     /// `response.incomplete` (e.g. `max_output_tokens`). Terminal. Items done so far were
     /// yielded and are valid.
     Incomplete { reason: String, usage: Usage },
@@ -455,14 +465,21 @@ fn parse_event(event: &SseEvent) -> Result<Option<StreamEvent>, AiError> {
             summary_index: index("summary_index"),
             delta: text("delta"),
         },
-        "response.completed" => StreamEvent::Completed {
-            response_id: response
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            usage: usage(response),
-        },
+        "response.completed" => {
+            let field = |key: &str| {
+                response
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            StreamEvent::Completed {
+                response_id: field("id"),
+                usage: usage(response),
+                model: field("model"),
+                status: field("status"),
+            }
+        }
         "response.incomplete" => StreamEvent::Incomplete {
             reason: response
                 .pointer("/incomplete_details/reason")
@@ -499,6 +516,284 @@ fn parse_event(event: &SseEvent) -> Result<Option<StreamEvent>, AiError> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// The provider seam (`model::Provider`) on the Responses API
+// ---------------------------------------------------------------------------
+
+impl ResponsesClient {
+    /// The Responses request of an agent step on this client: `responses_request` on
+    /// the route's model.
+    pub fn agent_request(&self, req: &ModelRequest) -> ResponseRequest {
+        responses_request(req, self.model_for(req.opts.route))
+    }
+}
+
+/// The Responses request of an agent step on `model`: the system prompt as a leading
+/// developer message, then the history; the function tools (strict), reasoning with
+/// summaries and its encrypted content, the chat's cache key, server compaction when
+/// asked.
+///
+/// Not yet here (area P-ai-openai): the hosted `web_search` tool for `req.web`, and the
+/// parameters a ChatGPT bearer token must not send.
+pub fn responses_request(req: &ModelRequest, model: &str) -> ResponseRequest {
+    let mut input = Vec::with_capacity(req.history.len() + 1);
+    input.push(
+        json!({"role": "developer", "content": [{"type": "input_text", "text": req.system}]}),
+    );
+    input.extend(req.history.iter().cloned());
+    let tools: Vec<Value> = req.tools.iter().map(function_tool).collect();
+    let tool_choice = (!tools.is_empty()).then(|| match &req.tool_choice {
+        ToolChoice::Auto => ResponsesToolChoice::Auto,
+        ToolChoice::None => ResponsesToolChoice::None,
+        ToolChoice::Allowed(names) => ResponsesToolChoice::AllowedTools {
+            required: false,
+            names: names.clone(),
+        },
+    });
+    ResponseRequest {
+        model: Some(model.to_string()),
+        instructions: None,
+        input,
+        parallel_tool_calls: (!tools.is_empty()).then_some(req.parallel_tool_calls),
+        tools,
+        tool_choice,
+        reasoning: Some(ReasoningConfig {
+            effort: req.effort,
+            summary: Some(ReasoningSummary::Auto),
+        }),
+        include_encrypted_reasoning: true,
+        max_output_tokens: req.opts.max_output_tokens,
+        prompt_cache_key: req.opts.cache_key.clone(),
+        context_management: req
+            .compaction
+            .map(|compact_threshold| ContextManagement::Compaction { compact_threshold }),
+    }
+}
+
+/// A `ToolDef` as a Responses function tool.
+pub fn function_tool(tool: &ToolDef) -> Value {
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": true,
+    })
+}
+
+impl Provider for ResponsesClient {
+    fn kind(&self) -> ProviderKind {
+        ResponsesClient::kind(self)
+    }
+
+    fn stream(&self, req: ModelRequest) -> BoxFuture<'_, Result<ModelStream, AiError>> {
+        Box::pin(async move {
+            let events = self.stream_response(&self.agent_request(&req)).await?;
+            Ok(model_events(events))
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AiError>> {
+        unimplemented!("providers, P-ai-openai")
+    }
+}
+
+/// A Responses stream as neutral `ModelEvent`s.
+pub fn model_events(events: ResponseStream) -> ModelStream {
+    let mut adapter = Adapter::default();
+    Box::pin(events.filter_map(move |event| {
+        let out = match event {
+            Ok(event) => adapter.event(event).map(Ok),
+            Err(e) => Some(Err(e)),
+        };
+        std::future::ready(out)
+    }))
+}
+
+/// Responses events as the `ModelEvent`s `model_events` would stream (for tests that
+/// script a Responses-shaped reply).
+pub fn to_model_events(events: Vec<StreamEvent>) -> Vec<ModelEvent> {
+    let mut adapter = Adapter::default();
+    events
+        .into_iter()
+        .filter_map(|e| adapter.event(e))
+        .collect()
+}
+
+/// Per-stream state of the adaptation: the reasoning summary part each item is on.
+#[derive(Default)]
+struct Adapter {
+    /// By output index: the summary part last streamed, and whether text came yet.
+    summaries: std::collections::HashMap<u32, (u32, bool)>,
+}
+
+impl Adapter {
+    fn event(&mut self, event: StreamEvent) -> Option<ModelEvent> {
+        Some(match event {
+            StreamEvent::OutputItemAdded { output_index, item } => ModelEvent::Started {
+                index: output_index,
+                kind: start_kind(&item),
+            },
+            StreamEvent::OutputTextDelta {
+                output_index,
+                delta,
+                ..
+            } => ModelEvent::Delta {
+                index: output_index,
+                delta: Delta::Text(delta),
+            },
+            StreamEvent::FunctionCallArgumentsDelta {
+                output_index,
+                delta,
+                ..
+            } => ModelEvent::Delta {
+                index: output_index,
+                delta: Delta::Arguments(delta),
+            },
+            StreamEvent::ReasoningSummaryTextDelta {
+                output_index,
+                summary_index,
+                delta,
+                ..
+            } => {
+                let (part, any) = self.summaries.entry(output_index).or_default();
+                let mut text = String::new();
+                if summary_index != *part {
+                    // A new summary part: separated as the finished item's summary is.
+                    *part = summary_index;
+                    if *any {
+                        text.push_str("\n\n");
+                    }
+                }
+                text.push_str(&delta);
+                *any |= !text.is_empty();
+                if text.is_empty() {
+                    return None;
+                }
+                ModelEvent::Delta {
+                    index: output_index,
+                    delta: Delta::Reasoning(text),
+                }
+            }
+            StreamEvent::FunctionCallArgumentsDone { .. } => return None,
+            StreamEvent::OutputItemDone { output_index, item } => ModelEvent::Done {
+                index: output_index,
+                item: ModelItem {
+                    view: item_view(&item),
+                    stored: vec![item],
+                },
+            },
+            StreamEvent::Completed {
+                usage,
+                model,
+                status,
+                ..
+            } => ModelEvent::Completed {
+                usage,
+                model,
+                stop_reason: status,
+                next: Next::Finished,
+            },
+            StreamEvent::Incomplete { reason, usage } => ModelEvent::Incomplete { reason, usage },
+            StreamEvent::Failed { code, message } | StreamEvent::Error { code, message } => {
+                ModelEvent::Failed { code, message }
+            }
+        })
+    }
+}
+
+fn item_type(item: &Value) -> Option<&str> {
+    item.get("type").and_then(Value::as_str)
+}
+
+fn str_field(item: &Value, key: &str) -> String {
+    item[key].as_str().unwrap_or_default().to_string()
+}
+
+fn start_kind(item: &Value) -> StartKind {
+    match item_type(item) {
+        Some("reasoning") => StartKind::Reasoning,
+        Some("message") => StartKind::Text,
+        Some("function_call") => StartKind::ToolCall {
+            call_id: str_field(item, "call_id"),
+            name: str_field(item, "name"),
+        },
+        Some("web_search_call") => StartKind::WebSearch {
+            id: str_field(item, "id"),
+        },
+        _ => StartKind::Other,
+    }
+}
+
+/// What a finished output item shows.
+fn item_view(item: &Value) -> ItemView {
+    match item_type(item) {
+        Some("reasoning") => ItemView::Reasoning {
+            summary: item["summary"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default(),
+        },
+        Some("message") => {
+            let parts = item["content"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let mut text = String::new();
+            let mut citations = Vec::new();
+            for p in parts {
+                match p["type"].as_str() {
+                    Some("output_text") => {
+                        let offset = text.len() as u32;
+                        text.push_str(p["text"].as_str().unwrap_or_default());
+                        for a in p["annotations"].as_array().into_iter().flatten() {
+                            if a["type"] != "url_citation" {
+                                continue;
+                            }
+                            let at = |key: &str| a[key].as_u64().map(|n| offset + n as u32);
+                            citations.push(margin_shared::WebCitation {
+                                url: str_field(a, "url"),
+                                title: a["title"].as_str().map(str::to_string),
+                                cited_text: None,
+                                start: at("start_index"),
+                                end: at("end_index"),
+                            });
+                        }
+                    }
+                    Some("refusal") => text.push_str(p["refusal"].as_str().unwrap_or_default()),
+                    _ => {}
+                }
+            }
+            ItemView::Text { text, citations }
+        }
+        Some("function_call") => ItemView::ToolCall {
+            call_id: str_field(item, "call_id"),
+            name: str_field(item, "name"),
+            arguments: str_field(item, "arguments"),
+        },
+        Some("web_search_call") => ItemView::WebSearchResult {
+            id: str_field(item, "id"),
+            results: item
+                .pointer("/action/sources")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|s| margin_shared::WebResult {
+                    url: str_field(s, "url"),
+                    title: s["title"].as_str().map(str::to_string),
+                    page_age: None,
+                })
+                .collect(),
+            error: None,
+        },
+        Some("compaction") => ItemView::Compaction,
+        _ => ItemView::Other,
+    }
+}
+
 /// `response.usage` of a finished response, as one model call.
 pub(crate) fn usage(response: &Value) -> Usage {
     let n = |path: &str| {
@@ -513,6 +808,7 @@ pub(crate) fn usage(response: &Value) -> Usage {
         output_tokens: n("output_tokens"),
         reasoning_tokens: n("output_tokens_details/reasoning_tokens"),
         model_calls: 1,
+        ..Default::default()
     }
 }
 
@@ -535,7 +831,7 @@ mod tests {
         let body = c.response_body(&ResponseRequest {
             model: Some("agent-model".into()),
             tools: vec![json!({"type": "function", "name": "a"})],
-            tool_choice: Some(ToolChoice::AllowedTools {
+            tool_choice: Some(ResponsesToolChoice::AllowedTools {
                 required: false,
                 names: vec!["a".into()],
             }),
@@ -570,14 +866,130 @@ mod tests {
     }
 
     #[test]
-    fn tool_choices() {
-        assert_eq!(ToolChoice::None.to_json(), json!("none"));
+    fn an_agent_step_renders_as_today_and_its_events_adapt() {
+        use crate::model::{CallOptions, WebTools};
+        use margin_shared::pipeline::Route;
+        let config = crate::ProviderConfig {
+            provider: ProviderKind::OpenAi,
+            base_url: "https://example.test/v1".into(),
+            credential: crate::Credential::ApiKey("k".into()),
+            models: crate::RouteModels {
+                chat: "chat-m".into(),
+                write: "write-m".into(),
+                small: "small-m".into(),
+            },
+        };
+        let c = ResponsesClient::from_config(&config);
+        let req = ModelRequest {
+            opts: CallOptions::new(Route::Chat).with_cache_key("chat-1"),
+            system: "You are Margin.".into(),
+            history: vec![json!({"role": "user", "content": "hi"})],
+            tools: vec![ToolDef {
+                name: "search".into(),
+                description: "Search.".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            tool_choice: ToolChoice::Allowed(vec!["search".into()]),
+            web: WebTools::default(),
+            effort: ReasoningEffort::High,
+            compaction: Some(200_000),
+            parallel_tool_calls: true,
+        };
+        let body = c.response_body(&c.agent_request(&req));
+        assert_eq!(body["model"], "chat-m");
         assert_eq!(
-            ToolChoice::Function("x".into()).to_json(),
+            body["input"][0],
+            json!({"role": "developer", "content": [{"type": "input_text", "text": "You are Margin."}]})
+        );
+        assert_eq!(body["input"][1]["content"], "hi");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tool_choice"]["type"], "allowed_tools");
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "high", "summary": "auto"})
+        );
+        assert_eq!(body["prompt_cache_key"], "chat-1");
+        assert_eq!(body["context_management"][0]["compact_threshold"], 200_000);
+        assert_eq!(body["parallel_tool_calls"], true);
+        let small = ModelRequest {
+            opts: CallOptions::new(Route::Small),
+            tools: vec![],
+            ..req
+        };
+        let body = c.response_body(&c.agent_request(&small));
+        assert_eq!(body["model"], "small-m");
+        assert!(body.get("tools").is_none() && body.get("tool_choice").is_none());
+
+        let message = json!({"type": "message", "content": [{"type": "output_text", "text": "Rust 1.99.",
+            "annotations": [{"type": "url_citation", "url": "https://r.example", "title": "R", "start_index": 0, "end_index": 4}]}]});
+        let events = to_model_events(vec![
+            StreamEvent::OutputItemAdded {
+                output_index: 0,
+                item: json!({"type": "reasoning"}),
+            },
+            StreamEvent::ReasoningSummaryTextDelta {
+                output_index: 0,
+                item_id: "rs".into(),
+                summary_index: 0,
+                delta: "a".into(),
+            },
+            StreamEvent::ReasoningSummaryTextDelta {
+                output_index: 0,
+                item_id: "rs".into(),
+                summary_index: 1,
+                delta: "b".into(),
+            },
+            StreamEvent::OutputItemDone {
+                output_index: 1,
+                item: message.clone(),
+            },
+            StreamEvent::Completed {
+                response_id: "r".into(),
+                usage: Usage::default(),
+                model: "gpt-x".into(),
+                status: "completed".into(),
+            },
+        ]);
+        assert_eq!(
+            events[0],
+            ModelEvent::Started {
+                index: 0,
+                kind: StartKind::Reasoning
+            }
+        );
+        assert_eq!(
+            events[2],
+            ModelEvent::Delta {
+                index: 0,
+                delta: Delta::Reasoning("\n\nb".into())
+            }
+        );
+        let ModelEvent::Done { item, .. } = &events[3] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(item.stored, vec![message]);
+        let ItemView::Text { text, citations } = &item.view else {
+            panic!("{item:?}");
+        };
+        assert_eq!(text, "Rust 1.99.");
+        assert_eq!(citations[0].url, "https://r.example");
+        assert_eq!((citations[0].start, citations[0].end), (Some(0), Some(4)));
+        assert!(matches!(
+            &events[4],
+            ModelEvent::Completed { model, stop_reason, next: Next::Finished, .. }
+                if model == "gpt-x" && stop_reason == "completed"
+        ));
+    }
+
+    #[test]
+    fn tool_choices() {
+        assert_eq!(ResponsesToolChoice::None.to_json(), json!("none"));
+        assert_eq!(
+            ResponsesToolChoice::Function("x".into()).to_json(),
             json!({"type": "function", "name": "x"})
         );
         assert_eq!(
-            ToolChoice::AllowedTools {
+            ResponsesToolChoice::AllowedTools {
                 required: true,
                 names: vec![]
             }

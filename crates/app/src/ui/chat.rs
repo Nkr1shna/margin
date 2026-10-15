@@ -435,6 +435,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                         let body = NewChat {
                             message: Some(message),
                             workspace_ids: app.ask_workspaces.peek().clone(),
+                            ..Default::default()
                         };
                         match api.create_chat(&body).await {
                             Ok(detail) => {
@@ -1060,7 +1061,7 @@ fn ChatRow(row: Row, chat: Chat, on_retry: EventHandler<()>) -> Element {
     match row {
         Row::User(item) => rsx! { UserMessage { item } },
         Row::Text(item) => {
-            let ChatItemKind::AssistantText { text } = &item.kind else {
+            let ChatItemKind::AssistantText { text, .. } = &item.kind else {
                 return rsx! {};
             };
             rsx! {
@@ -1356,6 +1357,9 @@ fn CardRow(item: ChatItem, chat: Chat) -> Element {
             rsx! { ConfirmationView { item: item.clone(), card, chat } }
         }
         Card::Outline(card) => rsx! { OutlineView { proposal_id: card.proposal_id } },
+        // Web results are drawn by area P-app (`docs/agent-providers-brief.md` D8); no
+        // provider sends them before then.
+        Card::WebResults(_) => rsx! {},
     }
 }
 
@@ -2627,6 +2631,7 @@ mod tests {
             output_tokens: 1_250,
             reasoning_tokens: 640,
             model_calls: 1,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(short, "18k tokens in · 1.3k out · 1 model call");

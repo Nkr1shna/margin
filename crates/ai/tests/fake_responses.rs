@@ -17,8 +17,8 @@ use margin_ai::prompts::{LESSON_CONSTANT, SCENE_CONSTANT};
 use margin_ai::{
     AiError, Backoff, CallOptions, DocumentContents, FailedScene, Image, LessonContext, Passage,
     PlanRequest, Ranked, ReasoningConfig, ReasoningSummary, RerankCandidate, ResponseRequest,
-    ResponseStream, ResponsesClient, SceneRequest, StreamEvent, ToolChoice, plan_course, rerank,
-    write_lesson, write_lesson_with, write_scene, write_scene_with,
+    ResponseStream, ResponsesClient, ResponsesToolChoice, SceneRequest, StreamEvent, plan_course,
+    rerank, write_lesson, write_lesson_with, write_scene, write_scene_with,
 };
 use margin_shared::pipeline::Route;
 use margin_shared::{Level, OutlineLesson, ReasoningEffort, Usage};
@@ -726,6 +726,7 @@ async fn call_options_set_the_cache_key_and_output_cap_and_usage_comes_back() {
             output_tokens: 300,
             reasoning_tokens: 0,
             model_calls: 1,
+            ..Default::default()
         }
     );
     let (_, body) = last_request(&fake);
@@ -1007,7 +1008,7 @@ fn agent_request() -> ResponseRequest {
                            "required": ["query"], "additionalProperties": false},
             "strict": true
         })],
-        tool_choice: Some(ToolChoice::Auto),
+        tool_choice: Some(ResponsesToolChoice::Auto),
         reasoning: Some(ReasoningConfig {
             effort: ReasoningEffort::Medium,
             summary: Some(ReasoningSummary::Auto),
@@ -1039,6 +1040,7 @@ fn usage_1200() -> Usage {
         output_tokens: 300,
         reasoning_tokens: 200,
         model_calls: 1,
+        ..Default::default()
     }
 }
 
@@ -1106,6 +1108,8 @@ async fn stream_response_yields_a_text_answer_split_anywhere() {
     expected.push(Ok(StreamEvent::Completed {
         response_id: "resp_1".into(),
         usage: usage_1200(),
+        model: String::new(),
+        status: "completed".into(),
     }));
     for size in [3, 13, 4096] {
         let (client, fake) = spawn(vec![chunked(&body, size)]).await;
@@ -1191,6 +1195,8 @@ async fn stream_response_yields_parallel_function_calls() {
     expected.push(Ok(StreamEvent::Completed {
         response_id: "resp_tools".into(),
         usage: usage_1200(),
+        model: String::new(),
+        status: "completed".into(),
     }));
     let (client, _) = spawn(vec![chunked(&body, 7)]).await;
     let events = drain(client.stream_response(&agent_request()).await.unwrap()).await;
@@ -1252,7 +1258,9 @@ async fn stream_response_yields_reasoning_summaries_and_keeps_encrypted_content(
             }),
             Ok(StreamEvent::Completed {
                 response_id: "resp_1".into(),
-                usage: usage_1200()
+                usage: usage_1200(),
+                model: String::new(),
+                status: "completed".into(),
             }),
         ]
     );
@@ -1486,7 +1494,9 @@ async fn stream_response_ignores_done_markers_and_unknown_events() {
             Ok(text_delta_event("x")),
             Ok(StreamEvent::Completed {
                 response_id: "resp_1".into(),
-                usage: usage_1200()
+                usage: usage_1200(),
+                model: String::new(),
+                status: "completed".into(),
             })
         ]
     );
@@ -1530,7 +1540,7 @@ async fn stream_response_http_errors_carry_retry_after() {
     assert!(err.is_retryable());
     let err = client.stream_response(&req).await.err().unwrap();
     assert!(
-        matches!(&err, AiError::Http { status: 400, message, retry_after: None } if message.contains("context_management"))
+        matches!(&err, AiError::Http { status: 400, message, retry_after: None, .. } if message.contains("context_management"))
     );
     assert!(!err.is_retryable());
 }

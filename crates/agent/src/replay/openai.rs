@@ -1,4 +1,4 @@
-//! Rebuilding a chat's model input from its stored items.
+//! Replay on the Responses API (OpenAI, ChatGPT): a chat's stored items, verbatim, as `input`.
 
 use std::collections::HashSet;
 

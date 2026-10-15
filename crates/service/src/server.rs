@@ -33,8 +33,8 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    ask, chats, context_api, embedding, events, folders, ingest, library, media, retrieval, search,
-    settings, sources, trace, turns, uploads, version, video, workspaces,
+    ask, chats, context_api, embedding, events, folders, ingest, library, media, providers,
+    retrieval, search, settings, sources, trace, turns, uploads, version, video, workspaces,
 };
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -230,6 +230,15 @@ pub fn router(state: AppState) -> Router {
         .route(routes::TOOLS, get(settings::tools))
         // `routes::PIPELINE_VARIANTS` once crates/shared names it.
         .route(routes::PIPELINE_VARIANTS, get(settings::pipeline_variants))
+        .route("/api/providers/{provider}/models", get(providers::models))
+        .route(
+            routes::PROVIDERS_CHATGPT,
+            get(providers::chatgpt_status).delete(providers::chatgpt_sign_out),
+        )
+        .route(
+            routes::PROVIDERS_CHATGPT_START,
+            post(providers::chatgpt_start),
+        )
         .route(routes::DEVICES, get(auth::list_devices))
         .route("/api/devices/{id}", delete(auth::revoke_device))
         // Upload bodies are streamed to disk, each against its kind's limit.
