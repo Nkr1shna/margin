@@ -44,6 +44,7 @@ use crate::state::{
 };
 use crate::trace::{self, SpanGuard};
 use crate::{audience, db, sources, video};
+use margin_shared::sync::Locked;
 
 pub const MAX_LESSONS: usize = 12;
 /// How often a streaming lesson's partial body is saved.
@@ -527,7 +528,7 @@ pub async fn regenerate_lesson(state: &AppState, p: &Principal, id: &str) -> App
         let _w = state.write_lock.lock().await;
         let mut row = library::lesson(state, p, id).await?;
         check_owner(p, &row)?;
-        let running = state.lesson_jobs.lock().unwrap().contains_key(id);
+        let running = state.lesson_jobs.locked().contains_key(id);
         if is_busy(&row.lesson.status) && running {
             return Err(AppError::conflict(
                 "lesson_busy",
@@ -629,7 +630,7 @@ pub async fn append_lesson(state: &AppState, p: &Principal, req: NewLesson) -> A
 /// `first_write` lessons queue a video afterwards when their proposal asked for one.
 pub fn spawn_lesson_job(state: &AppState, lesson_id: Id, first_write: bool) {
     // Hold the map while spawning so the job can't remove its entry before it exists.
-    let mut jobs = state.lesson_jobs.lock().unwrap();
+    let mut jobs = state.lesson_jobs.locked();
     let handle = tokio::spawn(run_lesson_job(
         state.clone(),
         lesson_id.clone(),
@@ -648,7 +649,7 @@ async fn run_lesson_job(state: AppState, lesson_id: Id, first_write: bool) {
         tracing::error!("lesson job {lesson_id} failed: {e:#}");
     }
     let me = tokio::task::id();
-    let mut jobs = state.lesson_jobs.lock().unwrap();
+    let mut jobs = state.lesson_jobs.locked();
     if jobs.get(&lesson_id).is_some_and(|h| h.id() == me) {
         jobs.remove(&lesson_id);
     }
@@ -1081,7 +1082,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
             if text.is_empty() {
                 return;
             }
-            partial.lock().unwrap().push_str(text);
+            partial.locked().push_str(text);
             state.emit_row(
                 &audience,
                 Event::LessonDelta {
@@ -1155,7 +1156,7 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
                         restore_audience(&mut row, &before);
                     }
                     (None, _) => {
-                        let streamed = partial.lock().unwrap().clone();
+                        let streamed = partial.locked().clone();
                         (row.lesson.body_md, row.lesson.citations) =
                             retrieval::cite(&streamed, &retrieved);
                     }
@@ -1271,7 +1272,7 @@ fn restore_audience(row: &mut StoredLesson, before: &Before) {
 
 /// The retry policy of job calls: the agent loop's (`Turns.retry`, the one `Backoff`).
 pub fn job_backoff(state: &AppState) -> margin_ai::Backoff {
-    *state.turns.retry.lock().unwrap()
+    *state.turns.retry.locked()
 }
 
 /// A lesson job's waits, shown as its progress text: while the call waits to retry
@@ -1288,8 +1289,7 @@ fn lesson_waits(state: &AppState, lesson: &Lesson) -> JobWait {
         let current = job.is_some_and(|me| {
             state
                 .lesson_jobs
-                .lock()
-                .unwrap()
+                .locked()
                 .get(&lesson.id)
                 .is_some_and(|h| h.id() == me)
         });
@@ -1350,7 +1350,7 @@ async fn save_partial_bodies(state: AppState, lesson_id: Id, partial: Arc<Mutex<
     tick.tick().await;
     loop {
         tick.tick().await;
-        let text = partial.lock().unwrap().clone();
+        let text = partial.locked().clone();
         if text.len() == saved_len {
             continue;
         }

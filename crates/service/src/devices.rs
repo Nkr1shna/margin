@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use margin_agent::{BoxFuture, DeviceBridge, DeviceCall, DeviceError};
+use margin_shared::sync::Locked;
 use margin_shared::{DeviceToolOutput, DeviceToolResult, DirectedFrame, Id, ToolRequest};
 use tokio::sync::{mpsc, oneshot};
 
@@ -50,12 +51,12 @@ impl DeviceHub {
         device_id: &str,
     ) -> (Conn, mpsc::UnboundedReceiver<DirectedFrame>, bool) {
         let conn = {
-            let mut next = self.next_conn.lock().unwrap();
+            let mut next = self.next_conn.locked();
             *next += 1;
             *next
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut sockets = self.sockets.lock().unwrap();
+        let mut sockets = self.sockets.locked();
         let list = sockets.entry(device_id.to_string()).or_default();
         let came_online = list.is_empty();
         list.push((conn, tx));
@@ -66,7 +67,7 @@ impl DeviceHub {
     /// device just went offline (emit `DeviceChanged`).
     pub fn unregister(&self, device_id: &str, conn: Conn) -> bool {
         let went_offline = {
-            let mut sockets = self.sockets.lock().unwrap();
+            let mut sockets = self.sockets.locked();
             let Some(list) = sockets.get_mut(device_id) else {
                 return false;
             };
@@ -80,31 +81,28 @@ impl DeviceHub {
         };
         // Dropping the answer senders wakes their callers with Offline.
         self.pending
-            .lock()
-            .unwrap()
+            .locked()
             .retain(|_, p| !(p.device_id == device_id && p.conn == conn.0));
         went_offline
     }
 
     pub fn is_online(&self, device_id: &str) -> bool {
         self.sockets
-            .lock()
-            .unwrap()
+            .locked()
             .get(device_id)
             .is_some_and(|l| !l.is_empty())
     }
 
     /// Ids of the devices online now.
     pub fn online(&self) -> Vec<Id> {
-        self.sockets.lock().unwrap().keys().cloned().collect()
+        self.sockets.locked().keys().cloned().collect()
     }
 
     /// Closes the sockets of a revoked device's calls (they fail as Offline).
     pub fn forget_device(&self, device_id: &str) {
-        self.sockets.lock().unwrap().remove(device_id);
+        self.sockets.locked().remove(device_id);
         self.pending
-            .lock()
-            .unwrap()
+            .locked()
             .retain(|_, p| p.device_id != device_id);
     }
 
@@ -112,7 +110,7 @@ impl DeviceHub {
     /// for unknown or cancelled requests, or from another device, are ignored.
     pub fn deliver(&self, device_id: &str, request_id: &str, result: DeviceToolResult) {
         let call = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.locked();
             match pending.get(request_id) {
                 Some(p) if p.device_id == device_id => pending.remove(request_id),
                 Some(_) => {
@@ -130,15 +128,14 @@ impl DeviceHub {
     /// The newest socket of `device_id`.
     fn newest(&self, device_id: &str) -> Option<(u64, FrameSender)> {
         self.sockets
-            .lock()
-            .unwrap()
+            .locked()
             .get(device_id)
             .and_then(|l| l.last().cloned())
     }
 
     /// Sends `frame` on socket `conn` of `device_id`, if it is still open.
     fn send_on(&self, device_id: &str, conn: u64, frame: DirectedFrame) {
-        let sockets = self.sockets.lock().unwrap();
+        let sockets = self.sockets.locked();
         if let Some((_, tx)) = sockets
             .get(device_id)
             .and_then(|l| l.iter().find(|(c, _)| *c == conn))
@@ -163,13 +160,7 @@ impl Drop for Outstanding<'_> {
         if self.answered {
             return;
         }
-        let was_pending = self
-            .hub
-            .pending
-            .lock()
-            .unwrap()
-            .remove(&self.request_id)
-            .is_some();
+        let was_pending = self.hub.pending.locked().remove(&self.request_id).is_some();
         if was_pending {
             self.hub.send_on(
                 self.device_id,
@@ -203,7 +194,7 @@ impl DeviceBridge for DeviceHub {
             let deadline = chrono::Utc::now()
                 + chrono::Duration::from_std(call.timeout).unwrap_or(chrono::Duration::MAX);
             let (answer, answered) = oneshot::channel();
-            self.pending.lock().unwrap().insert(
+            self.pending.locked().insert(
                 request_id.clone(),
                 PendingCall {
                     device_id: device_id.to_string(),

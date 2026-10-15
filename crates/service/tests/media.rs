@@ -6,7 +6,6 @@
 mod common;
 
 use common::*;
-use margin_service::sources::{ChunkRow, MediaKind, MediaRow};
 use margin_shared::{
     Citation, Event, Lesson, LessonStatus, Library, ProposalStatus, Source, SourceKind,
     SourceStatus, Topic,
@@ -54,8 +53,36 @@ async fn settled(h: &Harness, token: &str, id: &str) -> Source {
     .await
 }
 
-/// A source's picture and sound passages, in order, in the shape the old `media` table
-/// had.
+/// What a `MediaRow` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Page,
+    Frame,
+    Audio,
+}
+
+/// A source's picture or sound passage, flattened for these assertions.
+#[derive(Debug, Clone)]
+struct MediaRow {
+    kind: MediaKind,
+    file: Option<String>,
+    page: Option<u32>,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+    text: String,
+    vector: Vec<f32>,
+}
+
+/// A source's text passage, flattened for these assertions.
+#[derive(Debug, Clone)]
+struct ChunkRow {
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+    text: String,
+}
+
+/// A source's picture and sound passages, in order.
 async fn media_rows(h: &Harness, source_id: &str) -> Vec<MediaRow> {
     h.state
         .store
@@ -64,17 +91,13 @@ async fn media_rows(h: &Harness, source_id: &str) -> Vec<MediaRow> {
         .unwrap()
         .into_iter()
         .filter(|p| p.modality != "text")
-        .enumerate()
-        .map(|(i, p)| MediaRow {
+        .map(|p| MediaRow {
             kind: match (p.modality.as_str(), p.file.as_deref()) {
                 ("sound", _) => MediaKind::Audio,
                 ("frame", _) => MediaKind::Frame,
                 (_, Some("original")) => MediaKind::Image,
                 _ => MediaKind::Page,
             },
-            source_id: p.document_id,
-            topic_id: p.scope_ids.first().cloned(),
-            ord: i as u32,
             file: p.file,
             page: p.page.map(|v| v as u32),
             start_ms: p.start_ms.map(|v| v as u64),
@@ -85,7 +108,7 @@ async fn media_rows(h: &Harness, source_id: &str) -> Vec<MediaRow> {
         .collect()
 }
 
-/// A source's text passages, in order, in the shape the old `chunk` table had.
+/// A source's text passages, in order.
 async fn chunk_rows(h: &Harness, source_id: &str) -> Vec<ChunkRow> {
     h.state
         .store
@@ -94,16 +117,10 @@ async fn chunk_rows(h: &Harness, source_id: &str) -> Vec<ChunkRow> {
         .unwrap()
         .into_iter()
         .filter(|p| p.modality == "text")
-        .enumerate()
-        .map(|(i, p)| ChunkRow {
-            source_id: p.document_id,
-            topic_id: p.scope_ids.first().cloned(),
-            ord: i as u32,
-            page: p.page.map(|v| v as u32),
+        .map(|p| ChunkRow {
             start_ms: p.start_ms.map(|v| v as u64),
             end_ms: p.end_ms.map(|v| v as u64),
             text: p.text,
-            vector: p.vector,
         })
         .collect()
 }

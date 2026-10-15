@@ -28,6 +28,7 @@ use crate::state::{
     AppState, CAPTIONS_FILE, MP4_FILE, POSTER_FILE, STORYBOARD_FILE, StoredVideo, new_id,
 };
 use crate::trace::{self, SpanGuard};
+use margin_shared::sync::Locked;
 
 pub const LOG_LINES: usize = 200;
 /// Progress-only updates are saved and sent at most this often.
@@ -158,7 +159,7 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
 pub async fn run_worker(state: AppState, mut queue: mpsc::UnboundedReceiver<Id>) {
     while let Some(id) = queue.recv().await {
         let task = {
-            let mut slot = state.render_job.lock().unwrap();
+            let mut slot = state.render_job.locked();
             let task = tokio::spawn(process(state.clone(), id.clone()));
             *slot = Some((id.clone(), task.abort_handle()));
             task
@@ -168,7 +169,7 @@ pub async fn run_worker(state: AppState, mut queue: mpsc::UnboundedReceiver<Id>)
             Err(e) if e.is_cancelled() => tracing::info!("render of video {id} was stopped"),
             Err(e) => tracing::error!("render of video {id} panicked: {e}"),
         }
-        let mut slot = state.render_job.lock().unwrap();
+        let mut slot = state.render_job.locked();
         if slot.as_ref().is_some_and(|(cur, _)| cur == &id) {
             *slot = None;
         }

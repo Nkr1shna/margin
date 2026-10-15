@@ -827,15 +827,12 @@ const WRITERS: &[(&str, &str)] = &[
     ("db.rs", "next_generation"),
     // Ingest's diff and the re-stamp: a document's own passages, by id.
     ("db.rs", "passages_of"),
-    ("db.rs", "has_passages"),
     // Re-embedding: documents whose vectors came from another embedder.
     ("db.rs", "documents_with_other_embedder"),
     // Ingest's upsert: the document for an origin.
     ("ingest.rs", "find_by_origin"),
     // The cache key's generation: counts and sums, no rows.
     ("retrieval.rs", "index_generation"),
-    // Whether pre-`passages-v1` rows remain: a count.
-    ("retrieval.rs", "legacy_sources"),
 ];
 
 /// A string literal and the function it is in.

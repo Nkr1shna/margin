@@ -20,6 +20,7 @@ use crate::pipeline::{
 };
 use crate::rerank::{purposes_param, secs_param, usize_param};
 use crate::retrieval::QueryPlan;
+use margin_shared::sync::Locked;
 
 /// The stage name.
 pub const SMALL_EXPAND_V1: &str = "small-expand-v1";
@@ -103,7 +104,7 @@ impl RewriteCache {
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<String>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.locked();
         inner.tick += 1;
         let tick = inner.tick;
         let (used, added) = inner.entries.get_mut(key)?;
@@ -112,7 +113,7 @@ impl RewriteCache {
     }
 
     pub fn insert(&self, key: String, added: Vec<String>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.locked();
         inner.tick += 1;
         let tick = inner.tick;
         if !inner.entries.contains_key(&key)
@@ -129,7 +130,7 @@ impl RewriteCache {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().entries.len()
+        self.inner.locked().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {

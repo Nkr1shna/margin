@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use margin_shared::sync::Locked;
 
 pub const GITHUB_CLIENT_SECRET: &str = "github-client-secret";
 pub const OPENAI_API_KEY: &str = "openai-api-key";
@@ -120,14 +121,14 @@ impl SecretStore for FileStore {
     }
 
     fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_lock.locked();
         let mut map = self.read()?;
         map.insert(name.into(), value.into());
         self.write(&map)
     }
 
     fn delete(&self, name: &str) -> anyhow::Result<()> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_lock.locked();
         let mut map = self.read()?;
         if map.remove(name).is_some() {
             self.write(&map)?;
@@ -152,21 +153,21 @@ impl MemoryStore {
     }
 
     pub fn with(self, name: &str, value: &str) -> Self {
-        self.map.lock().unwrap().insert(name.into(), value.into());
+        self.map.locked().insert(name.into(), value.into());
         self
     }
 }
 
 impl SecretStore for MemoryStore {
     fn get(&self, name: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.map.lock().unwrap().get(name).cloned())
+        Ok(self.map.locked().get(name).cloned())
     }
     fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {
-        self.map.lock().unwrap().insert(name.into(), value.into());
+        self.map.locked().insert(name.into(), value.into());
         Ok(())
     }
     fn delete(&self, name: &str) -> anyhow::Result<()> {
-        self.map.lock().unwrap().remove(name);
+        self.map.locked().remove(name);
         Ok(())
     }
 }

@@ -40,6 +40,7 @@ use crate::error::{AppError, AppResult};
 use crate::principal::RequireAdmin;
 use crate::secrets::CHATGPT_TOKENS;
 use crate::state::{App, AppState, random_token};
+use margin_shared::sync::Locked;
 
 /// Where ChatGPT's OAuth server is.
 pub const CHATGPT_AUTH_URL: &str = "https://auth.openai.com";
@@ -153,32 +154,31 @@ impl Providers {
     }
 
     pub fn endpoints(&self) -> Endpoints {
-        self.endpoints.lock().unwrap().clone()
+        self.endpoints.locked().clone()
     }
 
     pub fn set_endpoints(&self, endpoints: Endpoints) {
-        *self.endpoints.lock().unwrap() = endpoints;
+        *self.endpoints.locked() = endpoints;
         self.forget_models();
     }
 
     /// Drops every cached model list: the next `model_for` fetches again. Called
     /// whenever the settings or a credential change (`SettingsChanged`).
     pub fn forget_models(&self) {
-        self.models.lock().unwrap().clear();
+        self.models.locked().clear();
     }
 
     /// The model list cached for `provider`, when one was fetched.
     pub fn cached_models(&self, provider: Provider) -> Option<Arc<Vec<ModelInfo>>> {
         self.models
-            .lock()
-            .unwrap()
+            .locked()
             .get(&provider)
             .filter(|c| c.ok)
             .map(|c| c.models.clone())
     }
 
     fn remember_models(&self, provider: Provider, models: Arc<Vec<ModelInfo>>, ok: bool) {
-        self.models.lock().unwrap().insert(
+        self.models.locked().insert(
             provider,
             CachedModels {
                 models,
@@ -191,7 +191,7 @@ impl Providers {
     /// Logs a model whose window isn't known, once per model.
     fn warn_window(&self, provider: Provider, model: &str) {
         let key = format!("{provider}/{model}");
-        if self.warned.lock().unwrap().insert(key) {
+        if self.warned.locked().insert(key) {
             tracing::warn!(
                 %provider, %model,
                 "the model's context window isn't known; using {} input / {} output tokens",
@@ -236,7 +236,7 @@ pub async fn window(state: &App, config: &ProviderConfig, model: &str) -> ModelW
 /// last fetch failed more than `MODELS_RETRY` ago). Empty when it can't be fetched.
 async fn cached_list(state: &App, config: &ProviderConfig) -> Arc<Vec<ModelInfo>> {
     {
-        let cache = state.providers.models.lock().unwrap();
+        let cache = state.providers.models.locked();
         if let Some(c) = cache.get(&config.provider)
             && (c.ok || c.fetched.elapsed() < MODELS_RETRY)
         {
@@ -660,7 +660,7 @@ pub async fn chatgpt_start(
     }
     // A sign-in already waiting is replaced (its listener closes, freeing the port).
     if let Flow::Waiting { task, .. } =
-        std::mem::replace(&mut *state.providers.flow.lock().unwrap(), Flow::Idle)
+        std::mem::replace(&mut *state.providers.flow.locked(), Flow::Idle)
     {
         task.abort();
     }
@@ -706,7 +706,7 @@ pub async fn chatgpt_start(
         done: Notify::new(),
     });
     let task = tokio::spawn(serve_callback(listener, cb));
-    *state.providers.flow.lock().unwrap() = Flow::Waiting {
+    *state.providers.flow.locked() = Flow::Waiting {
         authorize_url: authorize_url.clone(),
         state: flow_state.clone(),
         task: task.abort_handle(),
@@ -757,7 +757,7 @@ async fn serve_callback(listener: tokio::net::TcpListener, cb: Arc<Callback>) {
 
 /// Sets the flow's outcome, unless another sign-in replaced it meanwhile.
 fn set_flow(app: &App, flow_state: &str, next: Flow) {
-    let mut flow = app.providers.flow.lock().unwrap();
+    let mut flow = app.providers.flow.locked();
     if matches!(&*flow, Flow::Waiting { state, .. } if state == flow_state) {
         *flow = next;
     }
@@ -913,7 +913,7 @@ async fn complete(
     // sign-out or a newer sign-in that came meanwhile wins.
     let _one = app.providers.refresh.lock().await;
     let current = matches!(
-        &*app.providers.flow.lock().unwrap(),
+        &*app.providers.flow.locked(),
         Flow::Waiting { state, .. } if *state == cb.state
     );
     if !current {
@@ -995,7 +995,7 @@ pub async fn chatgpt_status(
     State(state): State<AppState>,
     _admin: RequireAdmin,
 ) -> AppResult<Json<ChatGptStatus>> {
-    let (waiting, failed) = match &*state.providers.flow.lock().unwrap() {
+    let (waiting, failed) = match &*state.providers.flow.locked() {
         Flow::Waiting { authorize_url, .. } => (Some(authorize_url.clone()), None),
         Flow::Failed(message) => (None, Some(message.clone())),
         Flow::Idle => (None, None),
@@ -1020,11 +1020,11 @@ pub async fn chatgpt_sign_out(
     _admin: RequireAdmin,
 ) -> AppResult<StatusCode> {
     if let Flow::Waiting { task, .. } =
-        std::mem::replace(&mut *state.providers.flow.lock().unwrap(), Flow::Idle)
+        std::mem::replace(&mut *state.providers.flow.locked(), Flow::Idle)
     {
         task.abort();
     }
-    *state.providers.flow.lock().unwrap() = Flow::Idle;
+    *state.providers.flow.locked() = Flow::Idle;
     let _one = state.providers.refresh.lock().await;
     let tokens = load_tokens(&state).await?;
     if let Some(refresh) = &tokens.refresh_token {

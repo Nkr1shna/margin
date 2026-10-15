@@ -1,6 +1,7 @@
 //! R1 end to end (`docs/agent-rag-architecture.md` §6.4, tests 1–6): a course on the
-//! fixture corpus, the ingest diff, the context API, a turn's traces, the passage
-//! migration and ⌘K, through the real router with the harness's fakes.
+//! fixture corpus, the ingest diff, the context API, a turn's traces and ⌘K, through
+//! the real router with the harness's fakes (test 5, the passage migration, went with
+//! the migration).
 //!
 //! The corpus documents are read with `FakeSourceTools` and embedded with the harness's
 //! `FakeEmbedder` (bag of words, deterministic). §6.4 asks for `RecordedEmbedder`, but no
@@ -15,10 +16,8 @@ use chrono::Utc;
 use common::*;
 use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{NoDevices, RetryPolicy, Scripted, ToolContext};
-use margin_embed::{Embedder, Purpose, fake::FakeEmbedder};
 use margin_service::ask::{CoursePlan, PlannedLesson, StoredProposal};
-use margin_service::db::{self, PassageRow, Store};
-use margin_service::sources::{ChunkRow, MediaKind, MediaRow};
+use margin_service::db::{self, PassageRow};
 use margin_shared::context::{
     ContextChanges, Document, DocumentOutline, DocumentStatus, Hit, LibraryKind, Origin, Scope,
     TraceKind, TraceRollup, TraceRow,
@@ -26,7 +25,7 @@ use margin_shared::context::{
 use margin_shared::pipeline::Route;
 use margin_shared::{
     ApiError, Card, ChatDetail, ChatItemKind, ChatState, DeviceRef, Event, Lesson, LessonStatus,
-    Library, Note, Proposal, SearchHit, SearchKind, Source, SourceKind, SourceStatus, Topic,
+    Library, Note, Proposal, SearchHit, SearchKind, Source, SourceStatus, Topic,
 };
 use serde_json::{Value, json};
 
@@ -1020,132 +1019,6 @@ async fn a_turn_that_searches_is_traced_under_one_id_without_content() {
             .0
             .len() as u64
     );
-}
-
-// ---------------------------------------------------------------------------
-// 5. The passage migration
-// ---------------------------------------------------------------------------
-
-const FOURIER: &str = "Fourier series write a periodic signal as a sum of sines.\n\n\
-The coefficient a_n is the projection onto cos(n x).\n\n\
-Gibbs ringing overshoots near jumps by about nine percent.";
-
-/// A store as an older build left it: a Ready source with `chunk` and `media` rows,
-/// attached to a chat (so the unattached clean-up keeps it).
-async fn old_store(id: &str) -> Store {
-    let store = Store::memory().await.unwrap();
-    let now = Utc::now();
-    let s = Source {
-        access: Vec::new(),
-        deny: Vec::new(),
-        owner: None,
-        media_url: None,
-        id: id.into(),
-        topic_id: None,
-        name: format!("{id}.md"),
-        folder: None,
-        kind: SourceKind::Text,
-        bytes: FOURIER.len() as u64,
-        status: SourceStatus::Ready {
-            chunks: 1,
-            pages: None,
-            warning: None,
-        },
-        created_at: now,
-        workspace_id: None,
-        modified: None,
-    };
-    store.put(db::SOURCE, id, &s).await.unwrap();
-    let text = "old passage about Gibbs ringing".to_string();
-    let chunk = ChunkRow {
-        source_id: id.into(),
-        topic_id: None,
-        ord: 0,
-        page: None,
-        start_ms: None,
-        end_ms: None,
-        vector: FakeEmbedder
-            .embed(std::slice::from_ref(&text), Purpose::DOCUMENT)
-            .unwrap()
-            .remove(0),
-        text,
-    };
-    store
-        .put(db::CHUNK, &format!("{id}-0"), &chunk)
-        .await
-        .unwrap();
-    let media = MediaRow {
-        source_id: id.into(),
-        topic_id: None,
-        ord: 0,
-        kind: MediaKind::Audio,
-        file: None,
-        page: None,
-        start_ms: Some(0),
-        end_ms: Some(10_000),
-        text: String::new(),
-        vector: vec![0.0; margin_embed::DIM],
-    };
-    store
-        .put(db::MEDIA, &format!("{id}-m0"), &media)
-        .await
-        .unwrap();
-    let chat: margin_shared::Chat = serde_json::from_value(json!({
-        "id": "c1", "title": "Old", "state": {"state": "idle"},
-        "source_ids": [id], "created_at": now, "updated_at": now
-    }))
-    .unwrap();
-    store.put(db::CHAT, "c1", &chat).await.unwrap();
-    store
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_first_start_moves_old_rows_to_passages_while_the_library_is_served() {
-    let h = start_with(Setup {
-        store: Some(old_store("s-old").await),
-        files: vec![("sources/s-old/file".into(), FOURIER.as_bytes().to_vec())],
-        ..Setup::default()
-    })
-    .await;
-    let t = h.sign_in("Mac").await;
-    // The library answers on every look while the pass runs.
-    eventually(|| async {
-        let lib = library(&h, &t).await;
-        let row = h.state.settings_row().await.unwrap();
-        let done = row
-            .migrations
-            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string());
-        let ready = lib
-            .sources
-            .iter()
-            .any(|s| s.id == "s-old" && matches!(s.status, SourceStatus::Ready { chunks: 3, .. }));
-        (done && ready).then_some(())
-    })
-    .await;
-    assert_eq!(
-        margin_service::ingest::PASSAGES_MIGRATION,
-        "passages-v1",
-        "the name Settings records"
-    );
-    let rows = h.state.store.passages_of("s-old").await.unwrap();
-    assert_eq!(rows.len(), 3);
-    assert!(
-        rows.iter()
-            .all(|r| r.scope_ids == ["c1"] && r.chunk_hash.len() == 64)
-    );
-    assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
-    assert!(!h.state.store.table_exists(db::MEDIA).await.unwrap());
-    // The source is a document now, readable through the context API.
-    let outline: DocumentOutline = h
-        .get(&t, "/api/context/documents/s-old/outline")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(outline.sections.last().unwrap().to_ord, 2);
-    library(&h, &t).await;
 }
 
 // ---------------------------------------------------------------------------

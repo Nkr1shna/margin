@@ -20,6 +20,7 @@ use margin_shared::{SourceKind, ToolStatus};
 use margin_video::{RenderConfig, RenderError, RenderJob, RenderOutput, RenderProgress};
 
 use crate::pipeline::{Chunker, ChunkerCfg};
+use margin_shared::sync::Locked;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -264,7 +265,7 @@ pub fn job_model(model: Arc<dyn TextModel>) -> Retrying<Attempts> {
         Box::new(move |wait| {
             // A wait starts: the attempt before it failed and is retried.
             if wait.is_some()
-                && let Some((code, took)) = last.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && let Some((code, took)) = last.locked().take()
             {
                 on_failed(code, took);
             }
@@ -301,8 +302,7 @@ impl Attempts {
             clock.provider_took(started.elapsed());
         }
         if let Err(e) = result {
-            *self.last.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some((crate::trace::ai_error_code(e), started.elapsed()));
+            *self.last.locked() = Some((crate::trace::ai_error_code(e), started.elapsed()));
         }
     }
 }
@@ -791,6 +791,7 @@ pub mod model_download {
 
     use anyhow::Context;
     use margin_embed::{Backend, ModelFiles};
+    use margin_shared::sync::Locked;
 
     use super::{SourceTools, SpeechModel};
     use crate::config::Config;
@@ -929,7 +930,7 @@ pub mod model_download {
         }
 
         fn print(&self, received: u64, total: u64) {
-            let mut last = self.last.lock().unwrap();
+            let mut last = self.last.locked();
             let due = last.is_none_or(|t| t.elapsed() >= PRINT_INTERVAL);
             if due || (total > 0 && received >= total) {
                 *last = Some(Instant::now());

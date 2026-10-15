@@ -26,6 +26,7 @@ use crate::engines::{BoxFuture, JobCalls, ModelChoice, failed_attempts};
 use crate::pipeline::{SmallCall, SmallModel, SmallModels};
 use crate::state::{App, AppState};
 use crate::trace::{self, SpanGuard};
+use margin_shared::sync::Locked;
 
 /// `SmallModels` over the running service's settings and generator.
 #[derive(Default)]
@@ -182,7 +183,7 @@ impl SmallModels for StateModels {
                 model.name()
             );
         }
-        let mut encoders = self.encoders.lock().unwrap();
+        let mut encoders = self.encoders.locked();
         let encoder = encoders
             .entry(model)
             .or_insert_with(|| Arc::new(LazyEncoder::new(self.state.clone(), model)));
@@ -209,7 +210,7 @@ impl LazyEncoder {
     }
 
     fn get(&self) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
-        let mut loaded = self.loaded.lock().unwrap();
+        let mut loaded = self.loaded.locked();
         if let Some(m) = loaded.as_ref() {
             return Ok(m.clone());
         }

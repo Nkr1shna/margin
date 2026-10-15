@@ -69,7 +69,7 @@ if [ "${1:-}" = "--in-guest" ]; then
     i=0
     until curl -fsS -m 2 "http://$bind/health" >/dev/null 2>&1; do
       i=$((i + 1))
-      # Migrations (the passages-v1 re-embed) run at start, and a build with a higher
+      # Migrations (an embedder re-embed) run at start, and a build with a higher
       # schema version first backs the data up itself (the schema guard): give them time.
       [ "$i" -le 600 ] || return 1
       sleep 1

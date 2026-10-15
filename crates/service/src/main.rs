@@ -14,6 +14,7 @@ use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
 use margin_service::{export, restore, version};
+use margin_shared::sync::Locked;
 
 const USAGE: &str = "\
 Usage:
@@ -301,7 +302,7 @@ async fn download_reranker(
     ));
     let last = std::sync::Mutex::new(None::<std::time::Instant>);
     let progress = |received: u64, total: u64| {
-        let mut last = last.lock().unwrap();
+        let mut last = last.locked();
         let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
         if due || received == total {
             *last = Some(std::time::Instant::now());

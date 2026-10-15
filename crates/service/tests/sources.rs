@@ -10,7 +10,6 @@ use common::*;
 use margin_service::db::PassageRow;
 use margin_service::db::{self, Store};
 use margin_service::secrets::{GITHUB_CLIENT_SECRET, MemoryStore};
-use margin_service::sources::ChunkRow;
 use margin_shared::routes::{self, MAX_MEDIA_SOURCE_BYTES, MAX_OTHER_SOURCE_BYTES};
 use margin_shared::{
     ApiError, EmbeddingModel, EmbeddingModelState, Event, Library, Proposal, ProposalStatus,
@@ -909,19 +908,6 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     for s in &rows {
         store.put(db::SOURCE, &s.id, s).await.unwrap();
     }
-    // A chunk left by the interrupted run.
-    let leftover = ChunkRow {
-        source_id: "s-proc".into(),
-        topic_id: Some("t1".into()),
-        ord: 0,
-        page: None,
-        start_ms: None,
-        end_ms: None,
-        text: "stale".into(),
-        vector: vec![0.0; margin_embed::DIM],
-    };
-    store.put(db::CHUNK, "s-proc-0", &leftover).await.unwrap();
-    store.put(db::CHUNK, "s-old-0", &leftover).await.unwrap();
 
     let files = ["s-proc", "s-queued", "s-old"]
         .iter()
@@ -947,7 +933,6 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
     );
     let rows = chunks(&h, "s-proc").await;
     assert_eq!(rows.len(), 3);
-    assert!(rows.iter().all(|c| c.text != "stale"));
     wait_source(&h, &t, "s-queued", is_ready).await;
 
     let lib = library(&h, &t).await;
@@ -960,7 +945,6 @@ async fn startup_rereads_interrupted_sources_and_drops_old_unattached_ones() {
 // R1: the passage index (ingest, documents, migration)
 // ---------------------------------------------------------------------------
 
-use margin_embed::Embedder as _;
 use margin_shared::Note;
 use margin_shared::context::{
     ContextIngest, Document, DocumentStatus, LibraryKind, Origin, Project,
@@ -1546,179 +1530,36 @@ async fn folder_files_are_folder_documents_searchable_from_their_folder() {
     );
 }
 
-/// A store as the service left it before the passage index: Ready sources with `chunk`
-/// and `media` rows, attached to a chat (so the unattached clean-up keeps them).
-async fn old_store(ids: &[&str]) -> Store {
-    let store = Store::memory().await.unwrap();
-    let now = Utc::now();
-    for (i, id) in ids.iter().enumerate() {
-        let s = Source {
-            access: Vec::new(),
-            deny: Vec::new(),
-            owner: None,
-            media_url: None,
-            id: id.to_string(),
-            topic_id: None,
-            name: format!("{id}.md"),
-            folder: None,
-            kind: SourceKind::Text,
-            bytes: FOURIER.len() as u64,
-            status: SourceStatus::Ready {
-                chunks: 2,
-                pages: None,
-                warning: None,
-            },
-            created_at: now - chrono::Duration::minutes(10 - i as i64),
-            workspace_id: None,
-            modified: None,
-        };
-        store.put(db::SOURCE, id, &s).await.unwrap();
-        let text = format!("old passage of {id} about Gibbs ringing");
-        let old = ChunkRow {
-            source_id: id.to_string(),
-            topic_id: None,
-            ord: 0,
-            page: None,
-            start_ms: None,
-            end_ms: None,
-            vector: margin_embed::fake::FakeEmbedder
-                .embed(std::slice::from_ref(&text), margin_embed::Purpose::DOCUMENT)
-                .unwrap()
-                .remove(0),
-            text,
-        };
-        store
-            .put(db::CHUNK, &format!("{id}-0"), &old)
-            .await
-            .unwrap();
-        let media = margin_service::sources::MediaRow {
-            source_id: id.to_string(),
-            topic_id: None,
-            ord: 0,
-            kind: margin_service::sources::MediaKind::Audio,
-            file: None,
-            page: None,
-            start_ms: Some(0),
-            end_ms: Some(10_000),
-            text: String::new(),
-            vector: vec![0.0; margin_embed::DIM],
-        };
-        store
-            .put(db::MEDIA, &format!("{id}-m0"), &media)
-            .await
-            .unwrap();
-    }
-    let chat: margin_shared::Chat = serde_json::from_value(json!({
-        "id": "c1", "title": "Old", "state": {"state": "idle"},
-        "source_ids": ids,
-        "created_at": now, "updated_at": now
-    }))
-    .unwrap();
-    store.put(db::CHAT, "c1", &chat).await.unwrap();
-    store
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn the_first_start_moves_old_sources_to_the_passage_index_in_one_pass() {
-    let store = old_store(&["s-a", "s-gone"]).await;
-    let h = start_with(Setup {
-        store: Some(store),
-        // Only s-a's file is still there.
-        files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
-        ..Setup::default()
-    })
-    .await;
-    let t = h.sign_in("Mac").await;
-    // The library is served meanwhile.
-    let r = h.get(&t, "/api/library").send().await.unwrap();
-    assert_eq!(r.status(), 200);
-
-    eventually(|| async {
-        let row = h.state.settings_row().await.unwrap();
-        row.migrations
-            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
-            .then_some(())
-    })
-    .await;
-    let a = wait_source(&h, &t, "s-a", is_ready).await;
-    assert_eq!(
-        a.status,
-        SourceStatus::Ready {
-            chunks: 3,
-            pages: None,
-            warning: None,
-        }
-    );
-    let rows = chunks(&h, "s-a").await;
-    assert_eq!(rows.len(), 3);
-    assert!(rows.iter().all(|r| r.scope_ids == ["c1"]));
-    // A source whose file is gone is Failed, to be read again.
-    let gone = wait_source(&h, &t, "s-gone", |s| {
-        matches!(s, SourceStatus::Failed { .. })
-    })
-    .await;
-    assert_eq!(
-        gone.status,
-        SourceStatus::Failed {
-            error: margin_service::ingest::FILE_GONE.into()
-        }
-    );
-    // The old tables are gone.
-    assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
-    assert!(!h.state.store.table_exists(db::MEDIA).await.unwrap());
-    // Retrieval reads the passages.
-    let found = margin_service::sources::passages(&h.state, &["s-a".into()], "Gibbs").await;
-    assert!(!found.is_empty());
-    assert!(
-        found
-            .iter()
-            .all(|p| !p.passage.text.starts_with("old passage"))
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows() {
-    let store = old_store(&["s-a"]).await;
-    let h = start_with(Setup {
-        store: Some(store),
-        model_downloaded: false,
-        files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
-        ..Setup::default()
-    })
-    .await;
-    let t = h.sign_in("Mac").await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !h.state
-            .settings_row()
-            .await
-            .unwrap()
-            .migrations
-            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
-    );
-    assert!(h.state.store.table_exists(db::CHUNK).await.unwrap());
-    assert!(h.state.store.passages_of("s-a").await.unwrap().is_empty());
-    // The old rows still answer, as passages without a document.
-    let old = margin_service::sources::candidates(&h.state, "s-a")
-        .await
-        .unwrap();
-    assert_eq!(
-        old.iter().map(|p| p.modality.as_str()).collect::<Vec<_>>(),
-        ["text", "sound"]
-    );
-
-    // Once the model is there, the pass runs.
-    let r = h.post(&t, "/api/embedding/download").send().await.unwrap();
-    assert_eq!(r.status(), 200);
-    eventually(|| async {
-        let row = h.state.settings_row().await.unwrap();
-        row.migrations
-            .contains(&margin_service::ingest::PASSAGES_MIGRATION.to_string())
-            .then_some(())
-    })
-    .await;
-    assert_eq!(chunks(&h, "s-a").await.len(), 3);
-    assert!(!h.state.store.table_exists(db::CHUNK).await.unwrap());
+async fn a_slow_model_load_holds_no_lock_others_wait_on_and_runs_once() {
+    let h = start().await;
+    // Unloaded, as before first use; the next load takes a while.
+    h.state.embedder.lock().await.take();
+    let before = h.source_tools.loads.load(Ordering::SeqCst);
+    h.source_tools.load_ms.store(1_500, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let state = h.state.clone();
+        async move { margin_service::embedding::embedder(&state).await }
+    });
+    eventually(|| async { (h.source_tools.loads.load(Ordering::SeqCst) > before).then_some(()) })
+        .await;
+    let second = tokio::spawn({
+        let state = h.state.clone();
+        async move { margin_service::embedding::embedder(&state).await }
+    });
+    // Mid-load, the slot answers at once.
+    let slot = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        h.state.embedder.lock(),
+    )
+    .await
+    .expect("the slot isn't held across the load");
+    assert!(slot.is_none());
+    drop(slot);
+    assert!(first.await.unwrap().unwrap().is_some());
+    assert!(second.await.unwrap().unwrap().is_some());
+    // The caller that waited reused the first load.
+    assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), before + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
