@@ -6,8 +6,9 @@
 #   deploy/ci/linux-ci.sh [--release]      from the repository root, in the Linux image
 #
 # Format, clippy and the tests for the workspace minus margin-app (the app builds on the
-# Mac host). --release also builds margin-service as build-service does. Uses
-# $CARGO_TARGET_DIR when set.
+# Mac host), then the deploy scripts' offline test. --release also builds margin-service as
+# build-service does, into $MARGIN_RELEASE_TARGET_DIR when set. Uses $CARGO_TARGET_DIR when
+# set.
 set -eu
 
 release=0
@@ -54,8 +55,16 @@ step "Tests"
 cargo test --locked --workspace --exclude margin-app
 endstep
 
+step "Deploy script tests"
+sh deploy/scripts/release-snapshot-test.sh
+endstep
+
 if [ "$release" = 1 ]; then
   step "Release build (margin-service)"
-  cargo build --release --locked -p margin-service
+  if [ -n "${MARGIN_RELEASE_TARGET_DIR:-}" ]; then
+    cargo build --release --locked -p margin-service --target-dir "$MARGIN_RELEASE_TARGET_DIR"
+  else
+    cargo build --release --locked -p margin-service
+  fi
   endstep
 fi

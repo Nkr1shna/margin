@@ -1,0 +1,3 @@
+# The self-hosted runners' custom label (docs/plan-deploy.md), so actionlint knows it.
+self-hosted-runner:
+  labels: [margin]

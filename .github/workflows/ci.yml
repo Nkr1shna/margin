@@ -21,6 +21,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every PR, whatever it touches: `cargo fmt` (the Linux job formats only PRs that reach
+  # it, so an app-only PR was never checked) and actionlint when a workflow changes. On a
+  # GitHub-hosted runner, so it takes a minute and never queues behind the self-hosted jobs.
+  check:
+    name: Format and workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Does this PR change a workflow?
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          workflows=false
+          files=""
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            workflows=true
+          else
+            # Fail closed: if the file list can't be read, the job fails instead of passing empty.
+            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')" || {
+              echo "::error::could not list this PR's files; failing rather than skipping the checks"; exit 1; }
+            [ -n "$files" ] || { echo "::error::this PR lists no files; failing rather than skipping the checks"; exit 1; }
+          fi
+          for f in $files; do
+            case "$f" in
+              .github/workflows/*|.github/actionlint.yaml) workflows=true ;;
+            esac
+          done
+          echo "workflows=$workflows" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustfmt alone, at the pinned toolchain's version (rust-toolchain.toml): installing
+      # the whole toolchain file would also fetch clippy and the iOS target.
+      - name: Format
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          [ -n "$toolchain" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --no-self-update
+          RUSTUP_TOOLCHAIN="$toolchain" cargo fmt --all --check
+      # A pinned release, checked against its published sha256. Uses the runner's shellcheck
+      # for `run:` scripts, as a local `actionlint` does.
+      - name: actionlint
+        if: steps.scope.outputs.workflows == 'true'
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/rhysd/actionlint/releases/download/v$VERSION/$archive"
+          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
   # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
   # Linux build now (docs/plan-linux-service.md).
   linux:
@@ -40,23 +95,35 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           run=false
+          release=false
           files=""
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             run=true
+            release=true
           else
             # Fail closed: if the file list can't be read, the job fails instead of passing empty.
             files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')" || {
               echo "::error::could not list this PR's files; failing rather than skipping the checks"; exit 1; }
             [ -n "$files" ] || { echo "::error::this PR lists no files; failing rather than skipping the checks"; exit 1; }
           fi
+          # The service compiles in files under the root evals/ (variants, prices); deploy/
+          # holds the scripts linux-ci.sh runs and tests.
           for f in $files; do
             case "$f" in
               crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
-              crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|deploy/ci/linux-ci.sh|deploy/ci/prune-cache.sh) run=true ;;
+              crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|evals/*|deploy/*) run=true ;;
+            esac
+            # The release build (as build-service does on merge) only for what changes how
+            # it builds without changing the test build's code: dependencies, the toolchain,
+            # the image and the build scripts. Other PRs skip it; build-service still builds
+            # them on merge, before deploy-dev installs anything.
+            case "$f" in
+              Cargo.toml|Cargo.lock|rust-toolchain.toml|deploy/ci/*|deploy/image/*|.github/workflows/build-service.yml) release=true ;;
             esac
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
-          [ "$run" = true ] && echo "Checking Linux." || echo "Nothing for Linux in this PR; passing."
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          [ "$run" = true ] && echo "Checking Linux (release build: $release)." || echo "Nothing for Linux in this PR; passing."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.scope.outputs.run == 'true'
         with:
@@ -75,12 +142,21 @@ jobs:
           env_id="$(rustc -V | cut -d' ' -f2)-$(cat /etc/margin-image 2>/dev/null || echo noimage)"
           cache="$HOME/.cache/margin-ci"
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
+          # build-service's cache: a release build here starts from the last merge's.
+          echo "MARGIN_RELEASE_TARGET_DIR=$cache/target-release-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           sh deploy/ci/prune-cache.sh "$cache/target-test-$env_id"
       # The same steps the local check runs (deploy/local/linux-check.sh).
       - name: Format, clippy, tests
         if: steps.scope.outputs.run == 'true'
-        run: sh deploy/ci/linux-ci.sh
+        env:
+          RELEASE: ${{ steps.scope.outputs.release }}
+        run: |
+          if [ "$RELEASE" = true ]; then
+            sh deploy/ci/linux-ci.sh --release
+          else
+            sh deploy/ci/linux-ci.sh
+          fi
 
   # The app (desktop, iOS) on the Mac host runner. (The service is a Linux build, checked
   # above.)
