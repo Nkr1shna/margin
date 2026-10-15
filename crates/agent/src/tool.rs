@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use margin_shared::{Card, DeviceRef, Id, Workspace};
+use margin_shared::text::for_model;
+use margin_shared::{Card, DeviceRef, Id, WebResult, Workspace};
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use serde::Deserialize;
@@ -74,12 +75,16 @@ pub struct ToolOutput {
     pub images: Vec<margin_ai::Image>,
 }
 
+/// Every constructor normalises its text with `margin_shared::text::for_model`
+/// (`docs/phase5-brief.md` D2.1): a tool's output, summary and cards carry text from
+/// files, sources, devices and the web, and reach the model and the owner only that
+/// way. The loop normalises once more when it records the result (idempotent).
 impl ToolOutput {
     pub fn ok(output: impl Into<String>, summary: impl Into<String>) -> Self {
         Self {
             ok: true,
-            output: output.into(),
-            summary: summary.into(),
+            output: for_model(&output.into()),
+            summary: for_model(&summary.into()),
             cards: Vec::new(),
             images: Vec::new(),
         }
@@ -87,7 +92,7 @@ impl ToolOutput {
 
     /// A failed call: the model gets [`error_output`]`(message)`, the row shows `message`.
     pub fn error(message: impl Into<String>) -> Self {
-        let message = message.into();
+        let message = for_model(&message.into());
         Self {
             ok: false,
             output: error_output(&message),
@@ -98,7 +103,7 @@ impl ToolOutput {
     }
 
     pub fn with_card(mut self, card: Card) -> Self {
-        self.cards.push(card);
+        self.cards.push(clean_card(card));
         self
     }
 
@@ -106,6 +111,49 @@ impl ToolOutput {
     pub fn with_image(mut self, image: margin_ai::Image) -> Self {
         self.images.push(image);
         self
+    }
+}
+
+/// A web result with its text normalised (`text::for_model`).
+pub fn clean_web_result(r: WebResult) -> WebResult {
+    WebResult {
+        url: for_model(&r.url),
+        title: r.title.map(|t| for_model(&t)),
+        page_age: r.page_age.map(|a| for_model(&a)),
+    }
+}
+
+/// A card with every text from outside the owner (passages, titles, questions)
+/// normalised (`text::for_model`); ids, numbers and decisions as they are.
+pub fn clean_card(card: Card) -> Card {
+    match card {
+        Card::Passages(mut c) => {
+            c.query = for_model(&c.query);
+            for p in &mut c.passages {
+                p.source_name = for_model(&p.source_name);
+                p.excerpt = for_model(&p.excerpt);
+                p.section_path = p.section_path.as_deref().map(for_model);
+                if let Some(file) = &mut p.file {
+                    file.path = for_model(&file.path);
+                }
+            }
+            Card::Passages(c)
+        }
+        Card::Result(mut c) => {
+            c.title = for_model(&c.title);
+            Card::Result(c)
+        }
+        Card::Confirmation(mut c) => {
+            c.title = for_model(&c.title);
+            c.detail = for_model(&c.detail);
+            Card::Confirmation(c)
+        }
+        Card::WebResults(mut c) => {
+            c.query = for_model(&c.query);
+            c.results = c.results.into_iter().map(clean_web_result).collect();
+            Card::WebResults(c)
+        }
+        Card::Outline(c) => Card::Outline(c),
     }
 }
 
@@ -470,6 +518,27 @@ mod tests {
     use super::*;
     use crate::NoDevices;
     use schemars::JsonSchema;
+
+    #[test]
+    fn outputs_are_normalised_when_made() {
+        let topic = |id: &str, title: &str| {
+            Card::Result(margin_shared::ResultCard {
+                target: margin_shared::ResultTarget::Topic {
+                    topic_id: id.into(),
+                },
+                title: title.into(),
+            })
+        };
+        let out = ToolOutput::ok("de\u{200B}lete\u{202E}", "read\u{2066} x")
+            .with_card(topic("t\u{200B}1", "Ti\u{200B}des"));
+        assert_eq!(out.output, "delete");
+        assert_eq!(out.summary, "read x");
+        // Text is normalised; ids are left as they are.
+        assert_eq!(out.cards[0], topic("t\u{200B}1", "Tides"));
+        let err = ToolOutput::error("no \u{FEFF}file");
+        assert_eq!(err.summary, "no file");
+        assert_eq!(err.output, r#"{"error":"no file"}"#);
+    }
     use serde::Deserialize;
     use serde_json::json;
 
