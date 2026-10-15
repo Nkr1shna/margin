@@ -13,20 +13,21 @@ use std::sync::Arc;
 use anyhow::Context;
 use chrono::Utc;
 use margin_service::db::Store;
-use margin_service::pipeline::{PackBudget, Registry};
-use margin_shared::pipeline::{Budget, PipelineConfig};
+use margin_service::pipeline::{PackBudget, Pipeline, Registry, SmallModels, StageDeps};
+use margin_shared::context::Scope;
+use margin_shared::pipeline::{Budget, PipelineConfig, RetrievalPurpose};
 use margin_shared::routes::RETRIEVAL_K_FUSED;
 
 use crate::agent::{TaskResult, run_task};
 use crate::compare::{Allow, Comparison, compare, providers_of};
 use crate::corpus::{CorpusDoc, EXTRACTED_FILE, Extraction, corpus_hash, documents};
 use crate::courses::{
-    Generation, LessonScore, generate_lesson, generations_dir, load_generations, save_generation,
-    score,
+    Generation, LessonScore, generate_lesson, generations_dir, load_generations, query_plan,
+    save_generation, score,
 };
 use crate::gates::{BASELINE_FILE, Baseline};
 use crate::golden::{AgentTask, CourseRequest, QueryKind, RetrievalQuery, read_jsonl};
-use crate::index::{EvalIndex, sha256_hex};
+use crate::index::{EvalIndex, scope_of, sha256_hex};
 use crate::judge::{
     Agreement, CanaryReport, Judge, QuestionCase, Span, grader_agreement, judge_agreement,
     lesson_canaries, pass_agreement, question_canaries,
@@ -35,6 +36,7 @@ use crate::model::EvalModel;
 use crate::recorded::{EMBEDDINGS_FILE, Recording, RecordingVectors, Vectors};
 use crate::report::{ReportSection, Table, judging_section, questions_section, retrieval_sections};
 use crate::retrieval::{RetrievalReport, kind_name};
+use crate::small::{Meter, SmallKind, SmallStages, recorded_rewrite_queries};
 use crate::store::{EvalResult, EvalRun, EvalStore};
 
 #[derive(Debug, Clone)]
@@ -132,6 +134,10 @@ pub struct Env<'a> {
     pub register: &'a (dyn Fn(&mut Registry) + Sync),
     /// `retrieval::pack_budget` in the runner.
     pub pack_budget: &'a (dyn Fn(&Budget, usize, usize) -> PackBudget + Sync),
+    /// The small-tasks models the model-backed stages call (R2: the listwise rerank, the
+    /// query rewriter): the runner's clients over the owner's keys (`live::small_models`).
+    /// `None` in CI and tests: those stages replay `evals/recorded/{reranks,rewrites}.jsonl`.
+    pub models: Option<Arc<dyn SmallModels>>,
 }
 
 impl<'a> Env<'a> {
@@ -139,17 +145,83 @@ impl<'a> Env<'a> {
         documents(&self.paths.corpus())
     }
 
+    /// Where the small-stage recordings are read from: `out`, then `evals`.
+    pub fn recording_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.paths.out.clone()];
+        if self.paths.evals != self.paths.out {
+            dirs.push(self.paths.evals.clone());
+        }
+        dirs
+    }
+
+    /// The small-stage recordings and models for an index.
+    pub fn small_stages(&self) -> anyhow::Result<SmallStages> {
+        SmallStages::open(&self.recording_dirs(), self.models.clone())
+    }
+
+    /// `cfg`'s pipeline over the corpus. Its model-backed stages replay the recordings
+    /// without `models`, and with them are served from the recordings where they have
+    /// the answer and called live otherwise.
     pub async fn index(&self, cfg: &PipelineConfig) -> anyhow::Result<EvalIndex<'a>> {
-        EvalIndex::build(
-            Store::memory().await?,
-            cfg,
-            |r| (self.register)(r),
+        self.index_with(cfg, &self.small_stages()?).await
+    }
+
+    /// `index` with these recordings (what `record-*` extends and saves).
+    pub async fn index_with(
+        &self,
+        cfg: &PipelineConfig,
+        stages: &SmallStages,
+    ) -> anyhow::Result<EvalIndex<'a>> {
+        let store = Store::memory().await?;
+        let live = stages.models.is_some();
+        let meter = Arc::new(if live { Meter::traced() } else { Meter::new() });
+        let deps = StageDeps {
+            store: store.clone(),
+            models: stages.models.clone(),
+            tracer: meter.tracer(),
+        };
+        let mut reg = Registry::standard(deps);
+        (self.register)(&mut reg);
+        let small = SmallKind::Reranks.is_small(cfg) || SmallKind::Rewrites.is_small(cfg);
+        // With models, the real stages are built to be wrapped by the recording ones.
+        let real = if live && small {
+            Some(Pipeline::build(cfg, &reg)?)
+        } else {
+            None
+        };
+        stages.register(&mut reg, cfg, &meter, real.as_ref());
+        let pipeline = Pipeline::build(cfg, &reg)?;
+        EvalIndex::build_with(
+            store,
+            pipeline,
+            meter,
             self.vectors,
             &self.paths.corpus(),
             &self.docs()?,
             &self.extraction,
         )
         .await
+    }
+}
+
+/// Sorted, each once.
+fn sorted_versions(v: impl IntoIterator<Item = String>) -> Vec<String> {
+    v.into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The folder a variant's recorded lessons go in under `recorded/generations/`: the
+/// prompt version for the baseline (what the citation gate reads), `<version>+<variant>`
+/// for any other, so a variant's lessons never overwrite the baseline's and `judge
+/// --against recorded/generations/lesson-v2` compares them.
+pub fn generations_set(prompt_version: &str, variant: &str) -> String {
+    if variant == "baseline" {
+        prompt_version.to_string()
+    } else {
+        format!("{prompt_version}+{variant}")
     }
 }
 
@@ -179,6 +251,7 @@ fn new_run(
         finished_at: None,
         judges: Vec::new(),
         providers: Vec::new(),
+        prompt_versions: Vec::new(),
         valid: true,
         notes: Vec::new(),
         summary: serde_json::Value::Null,
@@ -262,6 +335,9 @@ pub async fn record_embeddings(env: &Env<'_>) -> anyhow::Result<RecordSummary> {
             queries.extend(crate::courses::query_plan(&c, i));
         }
     }
+    // Every string the recorded rewrites retrieve with (R2), so a rewriting variant
+    // replays in CI.
+    queries.extend(recorded_rewrite_queries(&env.recording_dirs())?);
     queries.sort();
     queries.dedup();
     recording.texts(&queries, &margin_embed::Purpose::Query)?;
@@ -274,6 +350,92 @@ pub async fn record_embeddings(env: &Env<'_>) -> anyhow::Result<RecordSummary> {
         embedded,
         chunkers: chunkers.into_iter().collect(),
     })
+}
+
+/// What `record-rewrites` or `record-reranks` did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmallRecordSummary {
+    pub file: PathBuf,
+    /// Searches run: every golden query (the retrieval suite's purpose) and every golden
+    /// lesson's plan (purpose lesson).
+    pub searches: usize,
+    /// Stage calls made live now (the rest were served from the recording).
+    pub called: usize,
+    /// Records in the file written.
+    pub records: usize,
+    /// Searches the reranker applies to that it left in the fused order (a timeout, a
+    /// refusal, bad JSON): the CI gate fails on them, so re-record.
+    pub fallbacks: usize,
+    /// USD of the small-route calls made now.
+    pub cost_usd: f64,
+}
+
+/// `record-rewrites` / `record-reranks` (R2, `docs/r2-brief.md` §6): runs `variant`'s
+/// rewriter or reranker on the small-tasks model for every golden query (as the
+/// retrieval suite searches it) and every golden lesson's plan (as the courses suite
+/// does), and records each answer in `recorded/{rewrites,reranks}.jsonl` under `out`.
+/// Answers already recorded are reused, not paid for again.
+pub async fn record_small(
+    env: &Env<'_>,
+    variant: &str,
+    kind: SmallKind,
+) -> anyhow::Result<SmallRecordSummary> {
+    let (cfg, _) = env.paths.variant(variant)?;
+    anyhow::ensure!(
+        kind.is_small(&cfg),
+        "variant {variant}'s {} is \"{}\", which doesn't run on the small-tasks model; `{}` \
+         records {}",
+        kind.stage(),
+        kind.cfg(&cfg).name,
+        kind.command(),
+        kind.names().join(", ")
+    );
+    anyhow::ensure!(
+        env.models.is_some(),
+        "`{}` calls the small-tasks model once per golden query and lesson plan: it needs a \
+         model key in the service's secret store",
+        kind.command()
+    );
+    let stages = env.small_stages()?;
+    let index = env.index_with(&cfg, &stages).await?;
+    let mut s = SmallRecordSummary {
+        file: env.paths.out.join(kind.file()),
+        searches: 0,
+        called: 0,
+        records: 0,
+        fallbacks: 0,
+        cost_usd: 0.0,
+    };
+    let mut count = |r: &crate::index::Ranked| {
+        s.searches += 1;
+        s.fallbacks += usize::from(r.stages.rerank_fallback);
+    };
+    let purpose = index.retrieval_purpose();
+    for q in env.paths.retrieval_golden()? {
+        let r = index
+            .search_as(std::slice::from_ref(&q.query), &scope_of(q.scope), purpose)
+            .await
+            .map_err(|e| e.context(format!("query {}", q.id)))?;
+        count(&r);
+    }
+    for c in env.paths.courses()? {
+        let scope = Scope::Sources {
+            ids: c.documents.clone(),
+        };
+        for i in 0..c.themes.len() {
+            let r = index
+                .search_as(&query_plan(&c, i), &scope, RetrievalPurpose::Lesson)
+                .await
+                .map_err(|e| e.context(format!("course {} lesson {i}", c.id)))?;
+            count(&r);
+        }
+    }
+    s.records = stages.save(kind, &cfg, &env.paths.out)?;
+    (s.called, s.cost_usd) = match kind {
+        SmallKind::Rewrites => (stages.rewrites.fresh(), stages.rewrites.fresh_cost()),
+        SmallKind::Reranks => (stages.reranks.fresh(), stages.reranks.fresh_cost()),
+    };
+    Ok(s)
 }
 
 /// `run --suite retrieval`.
@@ -310,10 +472,14 @@ async fn run_retrieval_suite(
 ) -> anyhow::Result<(EvalRun, RetrievalReport)> {
     let (cfg, toml) = env.paths.variant(variant)?;
     let corpus = corpus_hash(&env.paths.corpus())?;
-    let run = new_run(suite, variant, &cfg, &toml, env.vectors.version(), &corpus);
+    let mut run = new_run(suite, variant, &cfg, &toml, env.vectors.version(), &corpus);
     let index = env.index(&cfg).await?;
     let queries = env.paths.retrieval_golden()?;
     let report = crate::retrieval::run(&index, &queries).await?;
+    // The model-backed stages' calls (R2): their prompt versions and providers.
+    run.prompt_versions = index.meter.prompt_versions();
+    run.providers = index.meter.providers();
+    let reranks = report.stages.reranker != "none";
     let mut rows = Vec::new();
     for q in &report.queries {
         let g = kind_name(q.kind);
@@ -335,6 +501,18 @@ async fn run_retrieval_suite(
                 .then(|| f64::from(u8::from(q.top_cosine >= report.fp_threshold))),
         );
         put("latency_ms", Some(q.ms));
+        let s = &q.stages;
+        put("queries", Some(s.queries as f64));
+        put("rewrite_ms", Some(s.rewrite_ms));
+        put("rerank_ms", Some(s.rerank_ms));
+        put("small_cost_usd", Some(s.small_cost_usd));
+        if reranks {
+            put("rerank_moved_at_10", s.rerank_moved_at_10);
+            put(
+                "rerank_fallback",
+                Some(f64::from(u8::from(s.rerank_fallback))),
+            );
+        }
     }
     store.add_results(&rows).await?;
     if write_baseline {
@@ -429,11 +607,13 @@ pub async fn run_courses(
         env.vectors.version(),
         &corpus,
     );
+    let set = generations_set(&cfg.prompts, variant);
+    let mut stage_versions = Vec::new();
     let gens: Vec<Generation> = match writer {
         Some(w) => {
             let index = env.index(&cfg).await?;
             let budget = (env.pack_budget)(&cfg.budget, window_tokens, RETRIEVAL_K_FUSED);
-            let dir = generations_dir(&env.paths.out, &cfg.prompts, &w.id());
+            let dir = generations_dir(&env.paths.out, &set, &w.id());
             let mut gens = Vec::new();
             for c in env.paths.courses()? {
                 for i in 0..c.themes.len() {
@@ -447,6 +627,7 @@ pub async fn run_courses(
                 w.id(),
                 dir.display()
             ));
+            stage_versions = index.meter.prompt_versions();
             gens
         }
         None => {
@@ -454,7 +635,7 @@ pub async fn run_courses(
                 .paths
                 .out
                 .join(crate::courses::GENERATIONS_DIR)
-                .join(&cfg.prompts);
+                .join(&set);
             let gens = load_generations(&dir)?;
             anyhow::ensure!(
                 !gens.is_empty(),
@@ -470,6 +651,11 @@ pub async fn run_courses(
         }
     };
     run.providers = providers_of(gens.iter().map(|g| g.model.as_str()));
+    run.prompt_versions = sorted_versions(
+        gens.iter()
+            .map(|g| g.prompt_version.clone())
+            .chain(stage_versions),
+    );
     let canary_reports = canaries(judges, false).await?;
     run.judges = judges.iter().map(|j| j.id()).collect();
     run.valid = canary_reports.iter().all(CanaryReport::valid);
@@ -586,6 +772,10 @@ pub async fn run_agent<M: margin_agent::ModelClient + margin_ai::TextModel>(
     let canary_reports = canaries(judges, false).await?;
     run.judges = judges.iter().map(|j| j.id()).collect();
     run.valid = canary_reports.iter().all(CanaryReport::valid);
+    run.prompt_versions = sorted_versions(
+        std::iter::once(margin_agent::AGENT_PROMPT_VERSION.to_string())
+            .chain(index.meter.prompt_versions()),
+    );
     store.add_results(&rows).await?;
     let table = Table {
         title: "Agent tasks".into(),
@@ -981,6 +1171,7 @@ pub async fn write_report(
         serde_json::from_value(run.summary["sections"].clone()).unwrap_or_default();
     if let Some(e) = efficiency {
         sections.push(crate::report::efficiency_section(e));
+        sections.push(crate::report::alerts_section(e));
     }
     let dir = paths.out.join("reports");
     std::fs::create_dir_all(&dir)?;
@@ -1069,6 +1260,7 @@ mod tests {
             vectors,
             register: &register,
             pack_budget: &budget,
+            models: None,
         }
     }
 
@@ -1125,6 +1317,254 @@ mod tests {
         std::fs::remove_dir_all(&out).unwrap();
     }
 
+    fn register_small(reg: &mut Registry) {
+        register(reg);
+        crate::small::testing::register_fake_small(reg);
+    }
+
+    /// R2: `record-reranks` and `record-rewrites` call the (fake) small model once per
+    /// golden query and lesson plan and record the answers; `record-embeddings` embeds the
+    /// recorded rewrites; a run without models replays them (never calling the model),
+    /// with the stages' metrics, prompt versions and providers; the CI gate passes on the
+    /// replay; a search that wasn't recorded fails loudly.
+    #[tokio::test]
+    async fn small_stages_record_then_replay() {
+        use crate::small::testing::{CountingModel, FakeSmall};
+        use std::sync::atomic::Ordering;
+        let out = temp("small");
+        let model = Arc::new(CountingModel::default());
+        // As the runner records: the vectors served from the embeddings recording (f16,
+        // what CI replays), so the candidates recorded are the ones replayed.
+        let e0 = env(&out, &FAKE);
+        record_embeddings(&e0).await.unwrap();
+        let seeded =
+            RecordingVectors::new(&FAKE, Recording::load(&out.join(EMBEDDINGS_FILE)).unwrap())
+                .unwrap();
+        let mut e = env(&out, &seeded);
+        e.register = &register_small;
+        e.models = Some(Arc::new(FakeSmall {
+            model: model.clone(),
+        }));
+        let golden = e.paths.retrieval_golden().unwrap().len();
+        let lessons: usize = e
+            .paths
+            .courses()
+            .unwrap()
+            .iter()
+            .map(|c| c.themes.len())
+            .sum();
+
+        // Recording the reranks: every search; the rerank applies to lessons (the variant's
+        // params.purpose for the golden queries, and the lesson plans).
+        let s = record_small(&e, "rerank-small", SmallKind::Reranks)
+            .await
+            .unwrap();
+        assert_eq!(s.searches, golden + lessons);
+        // One call per distinct search (a repeated one is served from the recording).
+        assert!(s.called > golden, "{s:?}");
+        assert_eq!(s.records, s.called);
+        assert_eq!(s.fallbacks, 0);
+        assert!(s.cost_usd > 0.0, "priced from the trace rows");
+        assert!(out.join(crate::small::RERANKS_FILE).is_file());
+        let calls = model.calls.load(Ordering::SeqCst);
+        assert_eq!(calls, s.called);
+        // Again: served from the recording, nothing called.
+        let again = record_small(&e, "rerank-small", SmallKind::Reranks)
+            .await
+            .unwrap();
+        assert_eq!((again.called, again.records), (0, s.records));
+        assert_eq!(model.calls.load(Ordering::SeqCst), calls);
+        // A variant without the stage is refused.
+        let err = record_small(&e, "baseline", SmallKind::Reranks)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("doesn't run on the small-tasks model"),
+            "{err}"
+        );
+
+        // Recording the rewrites: only plans whose first string is short are rewritten.
+        let s = record_small(&e, "rewrite-small", SmallKind::Rewrites)
+            .await
+            .unwrap();
+        assert_eq!(s.records, s.searches);
+        assert!(model.calls.load(Ordering::SeqCst) > calls);
+        // record-embeddings embeds the recorded rewrites.
+        record_embeddings(&e0).await.unwrap();
+        let rec = Recording::load(&out.join(EMBEDDINGS_FILE)).unwrap();
+        let rewrites = crate::small::recorded_rewrite_queries(std::slice::from_ref(&out)).unwrap();
+        let added: Vec<&String> = rewrites
+            .iter()
+            .filter(|q| q.ends_with(" explained"))
+            .collect();
+        assert!(!added.is_empty());
+        for q in added {
+            assert!(
+                rec.get_input(&crate::recorded::model_input(
+                    &margin_embed::Purpose::Query,
+                    q
+                ))
+                .is_some(),
+                "{q} not embedded"
+            );
+        }
+
+        // Replay: no models; the recorded stages stand in under the real names.
+        let calls = model.calls.load(Ordering::SeqCst);
+        let replay = crate::recorded::RecordedVectors::open(&out.join(EMBEDDINGS_FILE)).unwrap();
+        let mut r = env(&out, &replay);
+        r.extraction = Extraction::load(&out.join(EXTRACTED_FILE)).unwrap();
+        r.register = &register_small;
+        let store = EvalStore::memory().await.unwrap();
+        let (run, rep) = run_retrieval(&r, "rerank-small", &store, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            calls,
+            "replayed, not called"
+        );
+        let st = &rep.stages;
+        assert_eq!(
+            (st.reranker.as_str(), st.purpose.as_str()),
+            ("listwise-small", "lesson")
+        );
+        assert_eq!(st.reranked, golden);
+        // The fake reverses the first three: places 1 and 3 change (of 10, or of fewer).
+        assert!(
+            st.rerank_moved_at_10 >= 20.0 - 1e-6 && st.rerank_moved_at_10 < 60.0,
+            "{st:?}"
+        );
+        assert_eq!(st.rerank_fallback_rate, 0.0);
+        assert!(st.rerank_ms_p95 >= st.rerank_ms_p50);
+        assert!(st.small_cost_usd > 0.0, "the recording's cost");
+        assert_eq!(st.small_calls as usize, golden);
+        assert_eq!(run.prompt_versions, ["rerank-v1"]);
+        assert_eq!(run.providers, ["claude"]);
+        let rows = store.results(&run.id).await.unwrap();
+        assert!(rows.iter().any(|x| x.metric == "rerank_moved_at_10"));
+        let (md, _) = write_report(&Paths::same(&out), &store, Some(&run.id), None)
+            .await
+            .unwrap();
+        let md = std::fs::read_to_string(md).unwrap();
+        assert!(md.contains("## Reranking"), "{md}");
+        assert!(md.contains("**Prompt versions:** rerank-v1"), "{md}");
+        let (_, rw) = run_retrieval(&r, "rewrite-small", &store, false)
+            .await
+            .unwrap();
+        assert!(rw.stages.queries_mean > 1.0, "{:?}", rw.stages);
+        assert_eq!(model.calls.load(Ordering::SeqCst), calls);
+        // The baseline compares with the variant: it adds a job, it doesn't change one.
+        let (base, _) = run_retrieval(&r, "baseline", &store, false).await.unwrap();
+        assert!(base.prompt_versions.is_empty());
+        let c = compare_runs(&store, &base.id, &run.id, Allow::default())
+            .await
+            .unwrap();
+        assert!(c.deltas.iter().any(|d| d.metric == "ndcg_at_10"));
+
+        // The CI gate on the replay.
+        let gates: crate::Gates =
+            toml::from_str(&std::fs::read_to_string(evals_dir().join("gates.toml")).unwrap())
+                .unwrap();
+        for v in ["rerank-small", "rewrite-small"] {
+            let o = crate::ci::run_small_gates(&r, &gates, v).await.unwrap();
+            assert_eq!(o.violations, Vec::<String>::new(), "{v}");
+        }
+        let strict = crate::Gates {
+            rerank: crate::RerankGates {
+                moved_at_10_max: 10.0,
+                ..gates.rerank
+            },
+            ..gates.clone()
+        };
+        let o = crate::ci::run_small_gates(&r, &strict, "rerank-small")
+            .await
+            .unwrap();
+        assert!(
+            o.violations[0].contains("is a bug, not a win"),
+            "{:?}",
+            o.violations
+        );
+
+        // A search that wasn't recorded (another variant's reranker settings) fails loudly.
+        let err = run_retrieval(&r, "r2-full", &store, false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("re-run `margin-eval record-reranks"),
+            "{err:#}"
+        );
+        // Without a recording or a model, the real stage won't build.
+        let empty = temp("small-empty");
+        let none = SmallStages::open(std::slice::from_ref(&empty), None).unwrap();
+        let (cfg, _) = r.paths.variant("rerank-small").unwrap();
+        let err = r.index_with(&cfg, &none).await.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("needs a small-tasks model"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(&empty).unwrap();
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
+    /// R2: a recorded rerank that failed (the stage kept the fused order) replays as a
+    /// fallback, which the gate fails.
+    #[tokio::test]
+    async fn a_recorded_fallback_fails_the_gate() {
+        use crate::small::testing::{CountingModel, FakeSmall};
+        let out = temp("small-fallback");
+        let mut e = env(&out, &FAKE);
+        e.register = &register_small;
+        e.models = Some(Arc::new(FakeSmall {
+            model: Arc::new(CountingModel::default()),
+        }));
+        // Golden questions whose rerank the fake refuses.
+        let mut golden = e.paths.retrieval_golden().unwrap();
+        golden.truncate(3);
+        golden[0].query = format!("{} fail", golden[0].query);
+        let file = out.join("golden/retrieval.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut text = String::new();
+        for q in &golden {
+            text.push_str(&serde_json::to_string(q).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&file, text).unwrap();
+        let s = record_small(&e, "rerank-small", SmallKind::Reranks)
+            .await
+            .unwrap();
+        assert_eq!(s.fallbacks, 1);
+        let records = crate::small::Records::<crate::small::RerankRecord>::read(
+            &out.join(crate::small::RERANKS_FILE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            records
+                .by_key
+                .values()
+                .filter(|r| r.error.as_deref() == Some("the model refused"))
+                .count(),
+            1
+        );
+        e.models = None;
+        let gates: crate::Gates =
+            toml::from_str(&std::fs::read_to_string(evals_dir().join("gates.toml")).unwrap())
+                .unwrap();
+        let o = crate::ci::run_small_gates(&e, &gates, "rerank-small")
+            .await
+            .unwrap();
+        assert!(
+            o.violations
+                .iter()
+                .any(|v| v.contains("kept the fused order")),
+            "{:?}",
+            o.violations
+        );
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
     /// The dogfood suite: the retrieval suite over a `docs/` folder with the promoted
     /// questions an agent asked, stored as its own suite.
     #[tokio::test]
@@ -1172,6 +1612,7 @@ mod tests {
             vectors: &FAKE,
             register: &register,
             pack_budget: &budget,
+            models: None,
         };
         let store = EvalStore::memory().await.unwrap();
         let (run, report) = run_dogfood(&e, "baseline", &store).await.unwrap();

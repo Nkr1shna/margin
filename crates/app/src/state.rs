@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use dioxus::prelude::*;
 use margin_shared::{
-    Citation, DeviceFrame, DeviceToolCall, DeviceToolResult, Id, Me, TranscriptSegment,
+    Citation, DeviceFrame, DeviceToolCall, DeviceToolResult, Id, Me, Person, TranscriptSegment,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -95,6 +95,18 @@ pub struct AppCtx {
     pub ask_workspaces: Signal<Vec<Id>>,
 }
 
+/// What the sign-in screen says after the service refused this device's token: the
+/// service's own sentence when it gave a reason (a disabled person), else that the device
+/// was signed out.
+pub fn signed_out_reason(failure: &ApiFailure) -> String {
+    if failure.status == Some(401) && failure.code != "unauthorized" && !failure.message.is_empty()
+    {
+        failure.message.clone()
+    } else {
+        "This device was signed out by the service. Sign in again.".into()
+    }
+}
+
 /// An app-control tool call for the shell to run, and where its answer goes.
 #[derive(Debug)]
 pub struct AgentCommand {
@@ -118,11 +130,56 @@ fn foreground_channel() -> &'static watch::Sender<bool> {
 #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 pub fn set_foreground(foreground: bool) {
     foreground_channel().send_replace(foreground);
+    update_active();
 }
 
 /// Follows `set_foreground`, starting from the current state.
 pub fn foreground_changes() -> watch::Receiver<bool> {
     foreground_channel().subscribe()
+}
+
+/// Whether the system runs Margin's background task (`background::Work`): set by the
+/// platform when the task starts running, cleared when it ends or expires.
+fn continued_channel() -> &'static watch::Sender<bool> {
+    static CHANNEL: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    CHANNEL.get_or_init(|| watch::Sender::new(false))
+}
+
+/// `foreground || continued`, kept by `set_foreground` and `set_continued`.
+fn active_channel() -> &'static watch::Sender<bool> {
+    static CHANNEL: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    CHANNEL.get_or_init(|| watch::Sender::new(true))
+}
+
+fn update_active() {
+    let active = *foreground_channel().borrow() || *continued_channel().borrow();
+    active_channel().send_if_modified(|now| std::mem::replace(now, active) != active);
+}
+
+/// Report the system running Margin's background task (`true`) or the task ending or
+/// expiring (`false`). Any thread (the iOS task's handlers call it).
+#[allow(dead_code)] // 5-ios calls it from the task's handlers.
+pub fn set_continued(continued: bool) {
+    continued_channel().send_replace(continued);
+    update_active();
+}
+
+/// Whether the system runs Margin's background task now.
+pub fn continued() -> bool {
+    *continued_channel().borrow()
+}
+
+/// Whether the app is active: in the foreground, or kept running in the background by
+/// its task (`docs/phase5-brief.md` D1). While active the events socket stays open and
+/// the sync engine doesn't pause.
+pub fn active() -> bool {
+    *active_channel().borrow()
+}
+
+/// Follows `active`, starting from the current state.
+#[allow(dead_code)]
+pub fn active_changes() -> watch::Receiver<bool> {
+    active_channel().subscribe()
 }
 
 /// Which citation the source viewer shows.
@@ -151,11 +208,39 @@ impl AppCtx {
     /// Returns the message to show.
     pub fn failure(&self, failure: &ApiFailure) -> String {
         if failure.is_unauthorized() {
-            self.forget_session(Some(
-                "This device was signed out by the service. Sign in again.".into(),
-            ));
+            self.forget_session(Some(signed_out_reason(failure)));
         }
         failure.message.clone()
+    }
+
+    /// The signed-in person (from `GET /api/me`), once known. Reading it subscribes.
+    pub fn person(&self) -> Option<Person> {
+        self.session
+            .read()
+            .as_ref()
+            .and_then(|s| s.me.as_ref())
+            .and_then(|m| m.person.clone())
+    }
+
+    /// Whether the signed-in person is an organisation admin (or the owner). Until `me`
+    /// has loaded nobody is: a member never sees an admin's controls (or offers the
+    /// service would refuse), and an admin's appear once their role is known.
+    pub fn is_admin(&self) -> bool {
+        self.person().is_some_and(|p| p.org_role.is_admin())
+    }
+
+    /// Change the signed-in person as the session holds them (their own row came back
+    /// from a request, or an event changed it).
+    pub fn update_person(&self, update: impl FnOnce(&mut Person)) {
+        let mut session = self.session;
+        if let Some(person) = session
+            .write()
+            .as_mut()
+            .and_then(|s| s.me.as_mut())
+            .and_then(|m| m.person.as_mut())
+        {
+            update(person);
+        }
     }
 
     /// Drop the local token and session without calling the service.
@@ -185,8 +270,14 @@ impl AppCtx {
         let session = self.session.peek().clone();
         if let Some(session) = session {
             let device = match &session.me {
-                Some(me) => Some(me.device.id.clone()),
-                None => session.api.me().await.ok().map(|me| me.device.id),
+                Some(me) => me.device.as_ref().map(|d| d.id.clone()),
+                None => session
+                    .api
+                    .me()
+                    .await
+                    .ok()
+                    .and_then(|me| me.device)
+                    .map(|d| d.id),
             };
             if let Some(device) = device {
                 let _ = session.api.revoke_device(&device).await;
@@ -202,5 +293,32 @@ impl AppCtx {
         let result = config::save(&next);
         this.config.set(next);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_signed_out_reason_is_the_services_sentence_when_it_gave_one() {
+        // The service still answers 401 `person_disabled` with the sentence in the moment
+        // before a disabled person's devices are deleted (D10).
+        let disabled = ApiFailure {
+            status: Some(401),
+            code: margin_shared::access_code::PERSON_DISABLED.into(),
+            message: "The GitHub account @bob is disabled on this Margin. Ask an admin.".into(),
+        };
+        assert!(signed_out_reason(&disabled).contains("@bob is disabled"));
+        // Once the device is gone it's a plain 401: signed out, no reason given.
+        let gone = ApiFailure {
+            status: Some(401),
+            code: "unauthorized".into(),
+            message: "Sign in again: this device isn't signed in.".into(),
+        };
+        assert_eq!(
+            signed_out_reason(&gone),
+            "This device was signed out by the service. Sign in again."
+        );
     }
 }

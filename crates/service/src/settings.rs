@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::pipeline::Pipeline;
+use crate::principal::RequireAdmin;
 use crate::secrets::{ANTHROPIC_API_KEY, OPENAI_API_KEY};
 use crate::state::{App, AppState, SETTINGS_ID};
 
@@ -26,8 +27,11 @@ fn check_dimension(name: &str, v: u32) -> AppResult<()> {
     Ok(())
 }
 
+/// `PATCH /api/settings`: organisation admins only (403 `admin_required`); everyone
+/// reads them (`GET`, no secrets in them), so members can pick a configured provider.
 pub async fn patch_settings(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     ApiJson(patch): ApiJson<SettingsPatch>,
 ) -> AppResult<Json<Settings>> {
     {
@@ -194,6 +198,38 @@ pub const BUILTIN_VARIANTS: &[(&str, &str)] = &[
         "hybrid",
         include_str!("../../../evals/variants/hybrid.toml"),
     ),
+    // R2 (`docs/r2-brief.md` D6): listed everywhere, unavailable where the service has
+    // no small-tasks model or no reranker download.
+    (
+        "r2-full",
+        include_str!("../../../evals/variants/r2-full.toml"),
+    ),
+    (
+        "rerank-small",
+        include_str!("../../../evals/variants/rerank-small.toml"),
+    ),
+    (
+        "rerank-xenc",
+        include_str!("../../../evals/variants/rerank-xenc.toml"),
+    ),
+    (
+        "rerank-xenc-bge",
+        include_str!("../../../evals/variants/rerank-xenc-bge.toml"),
+    ),
+    (
+        "rewrite-small",
+        include_str!("../../../evals/variants/rewrite-small.toml"),
+    ),
+];
+
+/// The built-in variants that need a model-backed stage (R2): unavailable in a registry
+/// without `StageDeps.models` or the reranker download.
+pub const MODEL_BACKED_VARIANTS: &[&str] = &[
+    "r2-full",
+    "rerank-small",
+    "rerank-xenc",
+    "rerank-xenc-bge",
+    "rewrite-small",
 ];
 
 /// A folder of more variants: `MARGIN_EVALS_DIR`, when set (its `variants/*.toml` add to
@@ -295,6 +331,46 @@ pub async fn pipeline_variants(State(state): State<AppState>) -> Json<PipelineVa
     Json(PipelineVariants { stages, variants })
 }
 
+/// Every prompt the service sends (R2, `docs/r2-brief.md` D4.1): `margin_ai`'s catalog
+/// plus the service's own (`agent` with `AGENT_PROMPT_VERSION`, `title` and `condense`
+/// with their `trace::prompt_version` names), sorted by job.
+pub fn prompts_catalog() -> Vec<margin_shared::context::PromptInfo> {
+    let mut catalog = margin_ai::prompts::catalog();
+    catalog.extend(service_prompts());
+    catalog.sort_by(|a, b| a.job.cmp(&b.job));
+    catalog
+}
+
+/// The prompts the service itself sends, beside `margin_ai`'s: the agent's system
+/// prompt, the chat title (versioned by its hash, `trace::prompt_version`) and the
+/// agent loop's condense call.
+fn service_prompts() -> Vec<margin_shared::context::PromptInfo> {
+    vec![
+        margin_ai::prompts::prompt_info(
+            "agent",
+            margin_agent::AGENT_PROMPT_VERSION,
+            margin_agent::system_prompt(),
+        ),
+        margin_ai::prompts::prompt_info(
+            "title",
+            &crate::trace::prompt_version("title", crate::turns::TITLE_INSTRUCTIONS),
+            crate::turns::TITLE_INSTRUCTIONS,
+        ),
+        margin_ai::prompts::prompt_info(
+            "condense",
+            margin_agent::SUMMARY_PROMPT_VERSION,
+            margin_agent::SUMMARY_INSTRUCTIONS,
+        ),
+    ]
+}
+
+/// `GET /api/pipeline/prompts` → `prompts_catalog()`.
+pub async fn pipeline_prompts(
+    State(_state): State<AppState>,
+) -> Json<Vec<margin_shared::context::PromptInfo>> {
+    Json(prompts_catalog())
+}
+
 #[cfg(test)]
 mod variant_tests {
     use super::*;
@@ -303,22 +379,43 @@ mod variant_tests {
     #[tokio::test]
     async fn the_repositorys_variants_are_listed_and_buildable() {
         let store = crate::db::Store::memory().await.unwrap();
-        let reg = Registry::standard(StageDeps { store });
+        let reg = Registry::standard(StageDeps::new(store));
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
         let variants = named_variants(Some(&repo), &reg);
         let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
         for n in ["baseline", "bm25", "dense", "hybrid"] {
             assert!(names.contains(&n), "{n} missing from {names:?}");
         }
+        // R2's model-backed variants can't be built without small-tasks models (or the
+        // reranker download); every other one can.
         for v in &variants {
-            assert_eq!(v.unavailable, None, "{}", v.name);
+            if MODEL_BACKED_VARIANTS.contains(&v.name.as_str()) {
+                assert!(v.unavailable.is_some(), "{}", v.name);
+            } else {
+                assert_eq!(v.unavailable, None, "{}", v.name);
+            }
         }
         // A deployed service has no evals folder: the built-in variants are still there.
+        let all: Vec<&str> = BUILTIN_VARIANTS.iter().map(|(n, _)| *n).collect();
         for dir in [None, Some(std::path::Path::new("/nonexistent"))] {
             let built_in = named_variants(dir, &reg);
             let names: Vec<&str> = built_in.iter().map(|v| v.name.as_str()).collect();
-            assert_eq!(names, ["baseline", "bm25", "dense", "hybrid"]);
-            assert!(built_in.iter().all(|v| v.unavailable.is_none()));
+            assert_eq!(names, all);
+            assert!(
+                built_in
+                    .iter()
+                    .filter(|v| !MODEL_BACKED_VARIANTS.contains(&v.name.as_str()))
+                    .all(|v| v.unavailable.is_none())
+            );
+        }
+        // With small-tasks models (and the reranker download), they build too.
+        let mut deps = StageDeps::new(crate::db::Store::memory().await.unwrap());
+        deps.models = Some(std::sync::Arc::new(
+            crate::rerank::fakes::FakeModels::default(),
+        ));
+        let with_models = Registry::standard(deps);
+        for v in named_variants(Some(&repo), &with_models) {
+            assert_eq!(v.unavailable, None, "{}", v.name);
         }
         // Every variant file in the repository is built in.
         let files = std::fs::read_dir(repo.join("variants")).unwrap().count();
@@ -327,5 +424,52 @@ mod variant_tests {
             reg.names("retriever")
                 .contains(&"hybrid-linear".to_string())
         );
+        for (kind, name) in [
+            ("reranker", "listwise-small"),
+            ("reranker", "onnx-crossencoder"),
+            ("rewriter", "small-expand-v1"),
+        ] {
+            assert!(reg.names(kind).contains(&name.to_string()), "{kind} {name}");
+        }
+    }
+
+    /// The `[job]` tables of `evals/prompts.lock`: job → (version, constant_hash).
+    fn lock() -> std::collections::BTreeMap<String, (String, String)> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/prompts.lock");
+        let text = std::fs::read_to_string(path).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        table
+            .into_iter()
+            .map(|(job, v)| {
+                let s = |k: &str| v[k].as_str().unwrap().to_string();
+                (job, (s("version"), s("constant_hash")))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_catalog_lists_every_prompt_once_and_matches_the_lock() {
+        let catalog = prompts_catalog();
+        let jobs: Vec<&str> = catalog.iter().map(|p| p.job.as_str()).collect();
+        for job in ["agent", "lesson", "plan", "rerank", "rewrite", "scene"] {
+            assert!(jobs.contains(&job), "{job} missing from {jobs:?}");
+        }
+        let mut sorted = jobs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, jobs, "sorted by job, each once");
+        let agent = catalog.iter().find(|p| p.job == "agent").unwrap();
+        assert_eq!(agent.version, margin_agent::AGENT_PROMPT_VERSION);
+        // The same version means the same bytes: every locked job matches.
+        let lock = lock();
+        for p in &catalog {
+            if let Some((version, hash)) = lock.get(&p.job)
+                && *version == p.version
+            {
+                assert_eq!(*hash, p.constant_hash, "{} {}", p.job, p.version);
+            }
+        }
+        assert!(lock.contains_key("agent"));
     }
 }

@@ -10,7 +10,8 @@ use margin_shared::context::{
     DocumentOutline, Hit,
 };
 use margin_shared::{
-    ApiError, LoginState, PollLoginRequest, StartLogin, StartLoginRequest, routes,
+    AGENT_TOKEN_PREFIX, ApiError, LoginState, Me, PollLoginRequest, StartLogin, StartLoginRequest,
+    routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -18,6 +19,16 @@ use serde::de::DeserializeOwned;
 /// `DELETE /api/context/documents/{id}`: removes a document an agent ingested, with its
 /// passages; `purge` and `ingest-dir` use it.
 pub use routes::context_document;
+
+/// How often a call the service rate-limited (429) is tried again, after the pause its
+/// `Retry-After` asks for (`docs/phase5-brief.md` §7: the per-device limits answer 429,
+/// and an `ingest-dir` of a few hundred files runs into them).
+pub const RATE_LIMIT_RETRIES: u32 = 5;
+/// The pause when a 429 names none: doubling from this.
+const RATE_LIMIT_BASE_WAIT: Duration = Duration::from_secs(1);
+/// The longest pause taken; a service asking for more fails the call (an agent is
+/// waiting on it).
+pub const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct Client {
@@ -44,6 +55,64 @@ impl Client {
         &self.base
     }
 
+    /// Sends `req`; a 429 is sent again after its `Retry-After` (seconds), up to
+    /// `RATE_LIMIT_RETRIES` times and `RATE_LIMIT_MAX_WAIT` a pause.
+    async fn send(&self, req: RequestBuilder) -> reqwest::Result<Response> {
+        let mut attempt = 0;
+        loop {
+            let Some(again) = req.try_clone() else {
+                return req.send().await;
+            };
+            let resp = again.send().await?;
+            if resp.status() != StatusCode::TOO_MANY_REQUESTS || attempt >= RATE_LIMIT_RETRIES {
+                return Ok(resp);
+            }
+            let wait = retry_after(&resp)
+                .unwrap_or_else(|| RATE_LIMIT_BASE_WAIT.saturating_mul(1 << attempt.min(6)));
+            if wait > RATE_LIMIT_MAX_WAIT {
+                return Ok(resp);
+            }
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
+    /// Whether the client signs in with an `mga_` agent token.
+    pub fn is_agent(&self) -> bool {
+        self.token
+            .as_deref()
+            .is_some_and(|t| t.starts_with(AGENT_TOKEN_PREFIX))
+    }
+
+    async fn json<T: DeserializeOwned>(
+        &self,
+        resp: reqwest::Result<Response>,
+    ) -> anyhow::Result<T> {
+        let resp = checked(resp, self.is_agent()).await?;
+        let bytes = resp.bytes().await.context("Margin's answer was cut off")?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("Margin's answer didn't parse: {e}"))
+    }
+
+    /// `GET routes::ME`: who the token signs in as (a device's person, or an agent and
+    /// its owner).
+    pub async fn me(&self) -> Result<Me, CallError> {
+        let resp = checked(
+            self.send(self.request(Method::GET, routes::ME)).await,
+            self.is_agent(),
+        )
+        .await?;
+        let bytes = resp.bytes().await.map_err(|e| CallError {
+            status: None,
+            code: "unreachable".into(),
+            message: format!("Margin's answer was cut off: {e}"),
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| CallError {
+            status: Some(StatusCode::OK),
+            code: "bad_answer".into(),
+            message: format!("Margin's answer didn't parse: {e}"),
+        })
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         // Names the agent, so the service's trace rows of its searches and reads say
         // `actor: agent:claude-code`, `via: mcp` (the dogfood eval feed).
@@ -62,13 +131,13 @@ impl Client {
         let req = self
             .request(Method::POST, routes::CONTEXT_SEARCH)
             .json(query);
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::context_document_outline(id)`.
     pub async fn outline(&self, document_id: &str) -> anyhow::Result<DocumentOutline> {
         let req = self.request(Method::GET, &routes::context_document_outline(document_id));
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::context_document_passages(id)?from&to` (inclusive `ord`s).
@@ -81,13 +150,13 @@ impl Client {
         let req = self
             .request(Method::GET, &routes::context_document_passages(document_id))
             .query(&[("from", from), ("to", to)]);
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// `POST routes::CONTEXT_INGEST`.
     pub async fn ingest(&self, doc: &ContextIngest) -> anyhow::Result<Document> {
         let req = self.request(Method::POST, routes::CONTEXT_INGEST).json(doc);
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// `GET routes::CONTEXT_CHANGES?since`.
@@ -95,7 +164,7 @@ impl Client {
         let req = self
             .request(Method::GET, routes::CONTEXT_CHANGES)
             .query(&[("since", since), ("limit", limit as u64)]);
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// Every change after `since`, page by page (`CHANGES_PAGE_MAX` at a time), as one.
@@ -127,10 +196,9 @@ impl Client {
     /// `DELETE context_document(id)`. A document that is already gone is not an error.
     pub async fn delete_document(&self, document_id: &str) -> anyhow::Result<()> {
         let resp = self
-            .request(Method::DELETE, &context_document(document_id))
-            .send()
+            .send(self.request(Method::DELETE, &context_document(document_id)))
             .await;
-        match checked(resp).await {
+        match checked(resp, self.is_agent()).await {
             Ok(_) => Ok(()),
             Err(e) if e.status == Some(StatusCode::NOT_FOUND) && e.code == "not_found" => Ok(()),
             Err(e) => Err(e.into()),
@@ -144,7 +212,7 @@ impl Client {
             .json(&StartLoginRequest {
                 device_name: device_name.into(),
             });
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 
     /// `POST routes::AUTH_POLL`.
@@ -155,7 +223,7 @@ impl Client {
                 login_id: login.login_id.clone(),
                 poll_secret: login.poll_secret.clone(),
             });
-        json(req.send().await).await
+        self.json(self.send(req).await).await
     }
 }
 
@@ -203,6 +271,18 @@ fn is_loopback(rest: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// A response's `Retry-After` in whole seconds.
+fn retry_after(resp: &Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 /// A failed call: the service's `ApiError` when it sent one.
 #[derive(Debug)]
 pub struct CallError {
@@ -226,7 +306,7 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
-async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError> {
+async fn checked(resp: reqwest::Result<Response>, agent: bool) -> Result<Response, CallError> {
     let resp = resp.map_err(|e| CallError {
         status: None,
         code: "unreachable".into(),
@@ -248,7 +328,14 @@ async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError>
             },
         ),
     };
-    let message = if status == StatusCode::UNAUTHORIZED {
+    let message = if status == StatusCode::UNAUTHORIZED && agent {
+        format!(
+            "{message} (the agent token was revoked or rotated, or the agent or its owner is \
+             disabled: mint a new token in Settings → Organisation → Agents and run \
+             `margin-mcp token -` and paste it, or `margin-mcp token --forget` to use \
+             `margin-mcp login` instead)"
+        )
+    } else if status == StatusCode::UNAUTHORIZED {
         format!("{message} (sign in again with `margin-mcp login`)")
     } else {
         message
@@ -258,12 +345,6 @@ async fn checked(resp: reqwest::Result<Response>) -> Result<Response, CallError>
         code,
         message,
     })
-}
-
-async fn json<T: DeserializeOwned>(resp: reqwest::Result<Response>) -> anyhow::Result<T> {
-    let resp = checked(resp).await?;
-    let bytes = resp.bytes().await.context("Margin's answer was cut off")?;
-    serde_json::from_slice(&bytes).map_err(|e| anyhow!("Margin's answer didn't parse: {e}"))
 }
 
 #[cfg(test)]
@@ -292,5 +373,58 @@ mod tests {
         assert!(normalize_url("http://127.0.0.1@evil.com").is_err());
         assert!(normalize_url("http://").is_err());
         assert_eq!(context_document("d1"), "/api/context/documents/d1");
+    }
+
+    /// A 429 with `Retry-After` is waited out and sent again; one asking for longer
+    /// than `RATE_LIMIT_MAX_WAIT` fails at once.
+    #[tokio::test]
+    async fn rate_limits_are_waited_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route(
+            routes::CONTEXT_CHANGES,
+            axum::routing::get(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    let long = headers.get("x-test-long").is_some();
+                    if n == 0 || long {
+                        let after = if long { "3600" } else { "0" };
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", after)],
+                            axum::Json(serde_json::json!({
+                                "code": "rate_limited", "message": "Slow down."
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "generation": 3, "changed": [], "deleted": [], "more": false
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(&format!("http://{addr}"), Some("t".into())).unwrap();
+        let page = client.changes_page(0, 10).await.unwrap();
+        assert_eq!(page.generation, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let req = client
+            .request(Method::GET, routes::CONTEXT_CHANGES)
+            .header("x-test-long", "1");
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

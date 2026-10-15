@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::{Backend, EmbedError, OnnxDtype};
+use crate::{Backend, EmbedError, OnnxDtype, RerankerModel};
 
 /// The ONNX export's graphs: the text model (which also takes the encoders' feature
 /// rows), the image encoder and the audio encoder.
@@ -44,37 +44,58 @@ fn is_graph_file(path: &str, graph: &str, dtype: OnnxDtype) -> bool {
             .is_some_and(|rest| rest == "_data" || rest.starts_with("_data_"))
 }
 
-/// Which repo files a backend downloads and which it can't do without.
+/// Which repo files a download fetches and which it can't do without: the embedding
+/// model of a backend, or a reranker model (R2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Manifest(pub Backend);
+pub(crate) enum Manifest {
+    Model(Backend),
+    Reranker(RerankerModel),
+}
 
 impl Manifest {
     fn repo(self) -> &'static str {
-        self.0.repo()
+        match self {
+            Manifest::Model(backend) => backend.repo(),
+            Manifest::Reranker(model) => model.repo(),
+        }
     }
 
-    fn dtype(self) -> OnnxDtype {
-        let Backend::Onnx(dtype) = self.0;
-        dtype
+    /// The repo revision files are listed and fetched at: the embedding model follows
+    /// `main`; a reranker is pinned (`RerankerModel::revision`).
+    fn revision(self) -> &'static str {
+        match self {
+            Manifest::Model(_) => "main",
+            Manifest::Reranker(model) => model.revision(),
+        }
     }
 
     /// Whether a download fetches `path`.
     fn wanted(self, path: &str) -> bool {
-        ONNX_TOP_FILES.contains(&path)
-            || ONNX_OPTIONAL_FILES.contains(&path)
-            || ONNX_GRAPHS
-                .iter()
-                .any(|g| is_graph_file(path, g, self.dtype()))
+        match self {
+            Manifest::Model(Backend::Onnx(dtype)) => {
+                ONNX_TOP_FILES.contains(&path)
+                    || ONNX_OPTIONAL_FILES.contains(&path)
+                    || ONNX_GRAPHS.iter().any(|g| is_graph_file(path, g, dtype))
+            }
+            Manifest::Reranker(model) => model.files().contains(&path),
+        }
     }
 
     /// The first required file `files` lacks.
     fn missing(self, files: &[RemoteFile]) -> Option<String> {
         let listed = |name: &str| files.iter().any(|f| f.path == name);
-        ONNX_TOP_FILES
-            .iter()
-            .map(|f| f.to_string())
-            .chain(ONNX_GRAPHS.iter().map(|g| onnx_graph(g, self.dtype())))
-            .find(|f| !listed(f))
+        match self {
+            Manifest::Model(Backend::Onnx(dtype)) => ONNX_TOP_FILES
+                .iter()
+                .map(|f| f.to_string())
+                .chain(ONNX_GRAPHS.iter().map(|g| onnx_graph(g, dtype)))
+                .find(|f| !listed(f)),
+            Manifest::Reranker(model) => model
+                .files()
+                .iter()
+                .find(|f| !listed(f))
+                .map(|f| f.to_string()),
+        }
     }
 }
 
@@ -96,15 +117,16 @@ struct TreeEntry {
     size: u64,
 }
 
-/// The files the model needs, from `{hf_base}/api/models/{repo}/tree/main`.
+/// The files the model needs, from `{hf_base}/api/models/{repo}/tree/{revision}`.
 pub(crate) async fn remote_files(
     client: &reqwest::Client,
     hf_base: &str,
     manifest: Manifest,
 ) -> Result<Vec<RemoteFile>, EmbedError> {
     let repo = manifest.repo();
+    let revision = manifest.revision();
     let url = format!(
-        "{}/api/models/{repo}/tree/main?recursive=true",
+        "{}/api/models/{repo}/tree/{revision}?recursive=true",
         base(hf_base)
     );
     let response = client
@@ -162,7 +184,12 @@ pub(crate) async fn download(
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let url = format!("{}/{repo}/resolve/main/{}", base(hf_base), file.path);
+        let url = format!(
+            "{}/{repo}/resolve/{}/{}",
+            base(hf_base),
+            manifest.revision(),
+            file.path
+        );
         let partial = part_path(&target);
         let start = received;
         let result = fetch(client, &url, &partial, |n| {
@@ -289,6 +316,26 @@ fn part_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+impl RerankerModel {
+    /// The commit of `repo()` its files are fetched at: the Xenova exports checked for
+    /// R2 (2026-10-14), each with `onnx/model_quantized.onnx` (dynamic int8, 23.1 MB and
+    /// 279.3 MB), `tokenizer.json` and `config.json`. Pinned so a re-export upstream
+    /// can't change the scores under an unchanged `version()`.
+    pub fn revision(self) -> &'static str {
+        match self {
+            RerankerModel::MsMarcoMiniLmL6 => "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+            RerankerModel::BgeRerankerBase => "280bcc27a84e0b898c251e06fddb25171bd9b101",
+        }
+    }
+}
+
+impl crate::RerankerFiles {
+    /// Bytes the download takes on disk (0 when there is none).
+    pub fn size_on_disk(&self) -> u64 {
+        size_on_disk(&self.dir)
+    }
+}
+
 async fn remove_if_exists(path: &Path) -> Result<(), EmbedError> {
     let result = match tokio::fs::metadata(path).await {
         Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(path).await,
@@ -345,9 +392,21 @@ mod tests {
             let found = repo.files.iter().find(|(p, _)| *p == path);
             found.map(|(_, b)| b.clone()).ok_or(StatusCode::NOT_FOUND)
         }
+        // Answers only at the revision the download should ask for: a reranker's pinned
+        // commit, `main` for the embedding model.
+        let revision = RerankerModel::ALL
+            .into_iter()
+            .find(|m| m.repo() == repo.name)
+            .map_or("main", |m| m.revision());
         let app = Router::new()
-            .route(&format!("/api/models/{}/tree/main", repo.name), get(tree))
-            .route(&format!("/{}/resolve/main/{{*path}}", repo.name), get(file))
+            .route(
+                &format!("/api/models/{}/tree/{revision}", repo.name),
+                get(tree),
+            )
+            .route(
+                &format!("/{}/resolve/{revision}/{{*path}}", repo.name),
+                get(file),
+            )
             .with_state(repo);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -471,8 +530,8 @@ mod tests {
 
     #[test]
     fn the_onnx_manifest_takes_one_format_and_its_data() {
-        let q8 = Manifest(Backend::Onnx(OnnxDtype::Q8));
-        let fp32 = Manifest(Backend::Onnx(OnnxDtype::Fp32));
+        let q8 = Manifest::Model(Backend::Onnx(OnnxDtype::Q8));
+        let fp32 = Manifest::Model(Backend::Onnx(OnnxDtype::Fp32));
         assert_eq!(
             onnx_graph("model", OnnxDtype::Q8),
             "onnx/model_quantized.onnx"
@@ -504,7 +563,7 @@ mod tests {
         let client = reqwest::Client::new();
         let backend = Backend::Onnx(OnnxDtype::Q8);
         let files = ModelFiles::with_backend(temp_dir("onnx-download"), backend);
-        let manifest = Manifest(backend);
+        let manifest = Manifest::Model(backend);
         let wanted: Vec<(String, Vec<u8>)> = fake_onnx_files()
             .into_iter()
             .filter(|(p, _)| manifest.wanted(p))
@@ -579,6 +638,150 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A Xenova cross-encoder export: every format, the tokenizer files and the card.
+    fn fake_reranker_files() -> Vec<(String, Vec<u8>)> {
+        [
+            ("config.json", b"{\"pad_token_id\": 0}".to_vec()),
+            ("tokenizer.json", vec![b't'; 2000]),
+            ("tokenizer_config.json", b"{}".to_vec()),
+            ("special_tokens_map.json", b"{}".to_vec()),
+            ("vocab.txt", vec![b'v'; 300]),
+            ("README.md", b"# card".to_vec()),
+            ("onnx/model.onnx", vec![1u8; 9000]),
+            ("onnx/model_quantized.onnx", vec![2u8; 2300]),
+            ("onnx/model_int8.onnx", vec![3u8; 2300]),
+            ("onnx/model_fp16.onnx", vec![4u8; 4500]),
+        ]
+        .into_iter()
+        .map(|(p, b)| (p.to_string(), b))
+        .collect()
+    }
+
+    #[test]
+    fn the_reranker_manifest_takes_the_int8_graph_and_the_tokenizer() {
+        for model in RerankerModel::ALL {
+            let m = Manifest::Reranker(model);
+            assert_eq!(m.repo(), model.repo());
+            assert_eq!(m.revision().len(), 40, "pinned to a commit");
+            assert!(m.wanted("onnx/model_quantized.onnx"));
+            assert!(m.wanted("tokenizer.json"));
+            assert!(m.wanted("config.json"));
+            assert!(!m.wanted("onnx/model.onnx"));
+            assert!(!m.wanted("onnx/model_int8.onnx"));
+            assert!(!m.wanted("README.md"));
+        }
+        assert_eq!(
+            Manifest::Model(Backend::Onnx(OnnxDtype::Q8)).revision(),
+            "main"
+        );
+        assert_eq!(
+            Manifest::Reranker(RerankerModel::MsMarcoMiniLmL6).missing(&[RemoteFile {
+                path: "config.json".into(),
+                size: 1
+            }]),
+            Some("tokenizer.json".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reranker_downloads_at_its_pinned_revision_and_is_removed() {
+        use crate::RerankerFiles;
+        let model = RerankerModel::MsMarcoMiniLmL6;
+        let repo = Arc::new(Repo {
+            files: fake_reranker_files(),
+            missing: vec![],
+            fetches: 0.into(),
+            name: model.repo(),
+        });
+        let base = serve(repo.clone()).await;
+        let client = reqwest::Client::new();
+        let models = temp_dir("reranker-download");
+        let files = RerankerFiles::new(&models, model);
+        assert_eq!(files.dir, models.join("reranker-ms-marco-minilm-l6-v2"));
+        assert_eq!((files.is_complete(), files.size_on_disk()), (false, 0));
+        // config.json + tokenizer.json + the int8 graph.
+        let bytes: u64 = fake_reranker_files()
+            .iter()
+            .filter(|(p, _)| model.files().contains(&p.as_str()))
+            .map(|(_, b)| b.len() as u64)
+            .sum();
+        assert_eq!(bytes, 19 + 2000 + 2300);
+        assert_eq!(files.remote_size(&client, &base).await.unwrap(), bytes);
+
+        let seen = Mutex::new(Vec::new());
+        files
+            .download(&client, &base, &|r, t| seen.lock().unwrap().push((r, t)))
+            .await
+            .unwrap();
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.first(), Some(&(0, bytes)));
+        assert_eq!(seen.last(), Some(&(bytes, bytes)));
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(files.is_complete());
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(files.graph_path()).unwrap(), vec![2u8; 2300]);
+        assert!(files.tokenizer_path().is_file());
+        assert!(!files.dir.join("onnx/model.onnx").exists());
+        assert!(files.size_on_disk() >= bytes);
+        // The other model's folder is untouched and incomplete.
+        assert!(!RerankerFiles::new(&models, RerankerModel::BgeRerankerBase).is_complete());
+
+        // A lost graph: the next download fetches only it.
+        std::fs::remove_file(files.graph_path()).unwrap();
+        assert!(!files.is_complete());
+        files.download(&client, &base, &|_, _| {}).await.unwrap();
+        assert!(files.is_complete());
+        assert_eq!(repo.fetches.load(Ordering::SeqCst), 4);
+
+        files.remove().unwrap();
+        assert!(!files.is_complete());
+        assert!(!files.dir.exists());
+        files.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reranker_repo_without_the_int8_graph_or_unreachable_is_an_error() {
+        use crate::RerankerFiles;
+        let model = RerankerModel::BgeRerankerBase;
+        let repo = Arc::new(Repo {
+            files: fake_reranker_files()
+                .into_iter()
+                .filter(|(p, _)| p != "onnx/model_quantized.onnx")
+                .collect(),
+            missing: vec![],
+            fetches: 0.into(),
+            name: model.repo(),
+        });
+        let base = serve(repo).await;
+        let files = RerankerFiles::new(&temp_dir("reranker-missing"), model);
+        let client = reqwest::Client::new();
+        let err = files.remote_size(&client, &base).await.unwrap_err();
+        assert!(
+            err.to_string().contains("onnx/model_quantized.onnx"),
+            "{err}"
+        );
+        assert!(files.download(&client, &base, &|_, _| {}).await.is_err());
+        assert!(!files.is_complete());
+
+        // A file the listing promised but the server can't give leaves no partial file
+        // and no finished download.
+        let repo = Arc::new(Repo {
+            files: fake_reranker_files(),
+            missing: vec!["onnx/model_quantized.onnx".into()],
+            fetches: 0.into(),
+            name: model.repo(),
+        });
+        let base = serve(repo).await;
+        let err = files
+            .download(&client, &base, &|_, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EmbedError::Download(_)), "{err}");
+        assert!(!files.is_complete());
+        assert!(!files.dir.join("onnx/model_quantized.onnx.part").exists());
+        files.remove().unwrap();
     }
 
     #[test]

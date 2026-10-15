@@ -10,9 +10,9 @@ use margin_shared::pipeline::{
 };
 use margin_shared::{
     CLAUDE_LISTED_MODELS, ChatGptStatus, Device, EmbeddingModel, EmbeddingModelState, Event,
-    FOLDER_FILE_TYPES_TEXT, Id, ModelInfo, Provider, ReasoningEffort, ReindexProgress, RouteModels,
-    SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind, SpeechModel, TRACE_RETENTION_DAYS,
-    ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
+    FOLDER_FILE_TYPES_TEXT, Id, ModelInfo, Provider, ReasoningEffort, ReindexProgress,
+    RerankerModelState, RouteModels, SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind,
+    SpeechModel, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
 };
 
 use crate::config::{APP_NAME, Appearance, PINNED_SERVICE_URL, normalize_service_url};
@@ -21,6 +21,10 @@ use crate::sources::{Tone, human_bytes, status_text};
 use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
     ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js, open_external,
+};
+use crate::ui::organisation::{
+    EveryonesDevices, MySettingsSection, OrganisationPane, PersonLine, ReadOnlyAdvanced,
+    ReadOnlyAi, ReadOnlyVideo, devices_by_person,
 };
 use crate::ui::sources::kind_icon;
 
@@ -66,6 +70,7 @@ use crate::ui::sources::{
 pub enum SettingsPane {
     General,
     Account,
+    Organisation,
     Service,
     Ai,
     Sources,
@@ -76,9 +81,10 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    pub const ALL: [SettingsPane; 9] = [
+    pub const ALL: [SettingsPane; 10] = [
         SettingsPane::General,
         SettingsPane::Account,
+        SettingsPane::Organisation,
         SettingsPane::Service,
         SettingsPane::Ai,
         SettingsPane::Sources,
@@ -92,6 +98,7 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "General",
             SettingsPane::Account => "Account",
+            SettingsPane::Organisation => "Organisation",
             SettingsPane::Service => "Service",
             SettingsPane::Ai => "AI",
             SettingsPane::Sources => "Sources",
@@ -102,10 +109,20 @@ impl SettingsPane {
         }
     }
 
+    /// A pane whose controls only an organisation admin has (a member reads its values):
+    /// no fix to send a member to.
+    pub fn admin_only(self) -> bool {
+        matches!(
+            self,
+            SettingsPane::Ai | SettingsPane::Video | SettingsPane::Advanced
+        )
+    }
+
     fn icon(self) -> &'static str {
         match self {
             SettingsPane::General => "half",
             SettingsPane::Account => "user",
+            SettingsPane::Organisation => "users",
             SettingsPane::Service => "server",
             SettingsPane::Ai => "spark",
             SettingsPane::Sources => "clip",
@@ -140,6 +157,7 @@ pub fn SettingsDialog() -> Element {
         }
     });
     let settings = app.lib.read().settings.clone();
+    let admin = app.is_admin();
     // Panes backed by the service's settings: their content, or the load state.
     let service_settings =
         |body: fn(Settings) -> Element| match (settings.clone(), settings_error.read().clone()) {
@@ -226,7 +244,18 @@ pub fn SettingsDialog() -> Element {
                                 TextSizeSection {}
                             },
                             SettingsPane::Account => rsx! { AccountSection {} },
+                            SettingsPane::Organisation => rsx! { OrganisationPane {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
+                            // A member reads the organisation's settings; admins change them.
+                            SettingsPane::Ai if !admin => service_settings(|s| rsx! {
+                                ReadOnlyAi { settings: s }
+                            }),
+                            SettingsPane::Video if !admin => service_settings(|s| rsx! {
+                                ReadOnlyVideo { settings: s }
+                            }),
+                            SettingsPane::Advanced if !admin => service_settings(|s| rsx! {
+                                ReadOnlyAdvanced { settings: s }
+                            }),
                             SettingsPane::Ai => service_settings(|s| rsx! {
                                 ProvidersSection { settings: s.clone() }
                                 OpenAiSection { settings: s.clone() }
@@ -391,9 +420,13 @@ pub fn presence_text(device: &Device) -> String {
 #[component]
 fn AccountSection() -> Element {
     let app = use_app();
-    // The list comes from the service once; DeviceChanged / DeviceDeleted keep it (and
-    // who is online) current from then on.
+    // Whether the list is everyone's: it changes when an event promotes or demotes the
+    // signed-in person, and the list is fetched again then (an admin's has everyone's).
+    let admin_now = use_memo(move || app.is_admin());
+    // The list comes from the service once (again on a change of role); DeviceChanged /
+    // DeviceDeleted keep it (and who is online) current from then on.
     let mut devices = use_resource(move || async move {
+        let _admin = admin_now();
         let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
         let list = api.devices().await.map_err(|e| app.failure(&e))?;
         let mut lib = app.lib;
@@ -409,8 +442,14 @@ fn AccountSection() -> Element {
     // Presence comes from live events, and the list is fetched again on reconnecting.
     let connected = *app.live.read() == LiveStatus::Live;
     // This device is the one signed in here (events don't say which is whose).
-    let my_id = me.as_ref().map(|m| m.device.id.clone());
-    let known: Vec<Device> = app
+    let my_id = me
+        .as_ref()
+        .and_then(|m| m.device.as_ref())
+        .map(|d| d.id.clone());
+    // The person's own devices here; an admin's list also has everyone else's, shown
+    // below by person.
+    let person = me.as_ref().and_then(|m| m.person.clone());
+    let all: Vec<Device> = app
         .lib
         .read()
         .devices
@@ -420,6 +459,20 @@ fn AccountSection() -> Element {
             ..d.clone()
         })
         .collect();
+    let (known, others): (Vec<Device>, Vec<Device>) =
+        all.into_iter()
+            .partition(|d| match (&person, &d.person_id) {
+                (Some(p), Some(owner)) => *owner == p.id,
+                _ => true,
+            });
+    let everyone = match (&person, app.is_admin()) {
+        (Some(p), true) => Some(devices_by_person(
+            &others,
+            &p.id,
+            &app.lib.read().people.values().cloned().collect::<Vec<_>>(),
+        )),
+        _ => None,
+    };
     let list = match devices.read().clone() {
         Some(Ok(())) => Some(Ok(devices_in_order(&known))),
         Some(Err(e)) => Some(Err(e)),
@@ -431,18 +484,30 @@ fn AccountSection() -> Element {
     rsx! {
         section { class: "set-sec",
             h2 { "Account" }
-            div { class: "kv",
-                span { "GitHub" }
-                span { {me.as_ref().map(|m| m.github_login.clone()).unwrap_or_else(|| "Loading…".into())} }
-                span { "This device" }
-                span { {me.as_ref().map(|m| m.device.name.clone()).unwrap_or_else(|| "Loading…".into())} }
-            }
-            div { class: "row-actions",
-                button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+            if let Some(p) = person.clone() {
+                PersonLine {
+                    person: p,
+                    device: me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_default(),
+                    on_sign_out: move |_| confirm_signout.set(true),
+                }
+            } else {
+                // A service before L1 (or `me` still loading).
+                div { class: "kv",
+                    span { "GitHub" }
+                    span { {me.as_ref().map(|m| m.github_login.clone()).unwrap_or_else(|| "Loading…".into())} }
+                    span { "This device" }
+                    span { {me.as_ref().and_then(|m| m.device.as_ref()).map(|d| d.name.clone()).unwrap_or_else(|| "Loading…".into())} }
+                }
+                div { class: "row-actions",
+                    button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+                }
             }
         }
+        if let Some(p) = person.clone() {
+            MySettingsSection { person: p }
+        }
         section { class: "set-sec",
-            h2 { "Devices" }
+            h2 { if everyone.is_some() { "My devices" } else { "Devices" } }
             p { class: "help", "Every signed-in device has its own key. Revoke one to sign it out. A device is online while Margin runs on it; the agent can only use it then." }
             if !connected {
                 p { class: "help", "This device isn't connected to the service, so who is online may be out of date. It updates when the connection is back." }
@@ -486,6 +551,9 @@ fn AccountSection() -> Element {
                     }
                 },
             }
+        }
+        if let Some(groups) = everyone {
+            EveryonesDevices { groups, on_revoke: move |d: Device| confirm_revoke.set(Some(d)) }
         }
         if let Some(device) = confirm_revoke.read().clone() {
             ConfirmDialog {
@@ -593,7 +661,9 @@ pub fn slot_help(route: Route) -> &'static str {
     match route {
         Route::Chat => "Answers in chats and uses the agent's tools.",
         Route::Write => "Writes lessons, video scenes and course outlines.",
-        Route::Small => "Names chats and condenses long ones.",
+        Route::Small => {
+            "Names chats and condenses long ones. Small tasks also runs query rewriting and reranking when the pipeline uses them."
+        }
     }
 }
 
@@ -1548,6 +1618,7 @@ pub fn pipeline_rows(cfg: &PipelineConfig) -> Vec<(&'static str, String)> {
     vec![
         ("Chunker", cfg.chunker.name.clone()),
         ("Embedder", cfg.embedder.name.clone()),
+        ("Rewriter", cfg.rewriter.name.clone()),
         ("Retriever", cfg.retriever.name.clone()),
         ("Fusion", cfg.fusion.name.clone()),
         ("Reranker", cfg.reranker.name.clone()),
@@ -1562,6 +1633,7 @@ pub fn stage_label(kind: &str) -> &'static str {
     match kind {
         "chunker" => "Chunker",
         "embedder" => "Embedder",
+        "rewriter" => "Rewriter",
         "retriever" => "Retriever",
         "fusion" => "Fusion",
         "reranker" => "Reranker",
@@ -1580,9 +1652,14 @@ pub fn stage_help(kind: &str) -> &'static str {
         "embedder" => {
             "The model passages are embedded with. It is set in the service's config (embedder in service.toml), not here; changing it there re-indexes every source once."
         }
+        "rewriter" => {
+            "Extra phrasings of a query, tried beside it. small-expand-v1 asks the model for small tasks for them."
+        }
         "retriever" => "How passages are found: by meaning, by words, or both.",
         "fusion" => "How the meaning and word results are merged into one list.",
-        "reranker" => "Whether the merged list is reordered before packing.",
+        "reranker" => {
+            "Whether the merged list is reordered before packing. listwise-small asks the model for small tasks; onnx-crossencoder runs the reranker model (Settings → Sources)."
+        }
         "packer" => "How the best passages are chosen to fit the budget below.",
         "prompts" => "The version of the instructions lessons and outlines are written with.",
         _ => "",
@@ -1748,12 +1825,23 @@ fn StageForm(cfg: PipelineConfig, variants: PipelineVariants, saved_note: Signal
                             selected: current.as_deref() == Some(v.name.as_str()),
                             disabled: v.unavailable.is_some(),
                             title: v.unavailable.clone().unwrap_or_default(),
-                            if v.unavailable.is_some() { "{v.name} (not on this service)" } else { "{v.name}" }
+                            if v.unavailable.is_some() { "{v.name} (unavailable)" } else { "{v.name}" }
                         }
                     }
                 }
                 span { id: "pl-variant-help", class: "faint", style: "font-size: 13px",
                     "Sets every stage at once, as the evals compare them. The models above and the budget below stay."
+                }
+                if named.iter().any(|v| v.unavailable.is_some()) {
+                    ul { class: "faint variant-why", style: "font-size: 13px; margin: 0; padding-left: 18px; overflow-wrap: anywhere",
+                        "aria-label": "Unavailable variants",
+                        for v in named.iter().filter(|v| v.unavailable.is_some()) {
+                            li { key: "{v.name}",
+                                span { class: "mono", "{v.name}" }
+                                ": {v.unavailable.clone().unwrap_or_default()}"
+                            }
+                        }
+                    }
                 }
             }
             div { class: "grid2",
@@ -2078,6 +2166,10 @@ fn TracesSection(settings: Settings) -> Element {
     }
 }
 
+/// What a member reads where an admin has the model's Download and Remove controls.
+pub const MODELS_ADMIN_ONLY: &str =
+    "Only an organisation admin downloads or removes the models the service runs.";
+
 /// The embedding model sources are read with: its state, download progress, and removal.
 #[component]
 fn SourcesSection() -> Element {
@@ -2087,6 +2179,9 @@ fn SourcesSection() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut confirm_remove = use_signal(|| false);
     let model = app.lib.read().embedding.clone();
+    // The models are the organisation's: a member reads their state, an admin changes it
+    // (the service answers 403 `admin_required` otherwise).
+    let admin = app.is_admin();
     let download = move || async move {
         busy.set(true);
         error.set(download_embedding(app).await.err());
@@ -2119,7 +2214,7 @@ fn SourcesSection() -> Element {
                         }
                     }
                     match model.state {
-                        EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                        EmbeddingModelState::NotDownloaded { download_bytes } if admin => rsx! {
                             div { class: "row-actions",
                                 button {
                                     class: "btn btn-primary btn-sm",
@@ -2134,16 +2229,22 @@ fn SourcesSection() -> Element {
                         EmbeddingModelState::Downloading { received, total } => rsx! {
                             Progress { received, total }
                         },
-                        EmbeddingModelState::Ready { .. } => rsx! {
+                        EmbeddingModelState::Ready { .. } if admin => rsx! {
                             div { class: "row-actions",
                                 button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                             }
                         },
-                        EmbeddingModelState::Failed { error: message } => rsx! {
+                        EmbeddingModelState::Failed { error: message } if admin => rsx! {
                             ErrorNotice {
                                 message: "The download failed. {message}",
                                 on_retry: move |_| { spawn(download()); },
                             }
+                        },
+                        EmbeddingModelState::Failed { error: message } => rsx! {
+                            p { class: "help", "The download failed. {message} {MODELS_ADMIN_ONLY}" }
+                        },
+                        _ => rsx! {
+                            p { class: "help", "{MODELS_ADMIN_ONLY}" }
                         },
                     }
                 },
@@ -2163,6 +2264,9 @@ fn SourcesSection() -> Element {
         }
         if let Some(speech) = app.lib.read().embedding.as_ref().and_then(|m| m.speech.clone()) {
             SpeechModelSection { speech }
+        }
+        if let Some(reranker) = app.lib.read().embedding.as_ref().and_then(|m| m.reranker.clone()) {
+            RerankerModelSection { reranker }
         }
         if *confirm_remove.read() {
             ConfirmDialog {
@@ -2236,6 +2340,8 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
     let mut busy = use_signal(|| false);
     let error = use_signal(|| None::<String>);
     let mut confirm_remove = use_signal(|| false);
+    // Admins download and remove it; a member reads its state.
+    let admin = app.is_admin();
     let download = move || async move {
         let Some(api) = app.api() else { return };
         busy.set(true);
@@ -2264,7 +2370,7 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
                 }
             }
             match speech.state.clone() {
-                EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                EmbeddingModelState::NotDownloaded { download_bytes } if admin => rsx! {
                     div { class: "row-actions",
                         button {
                             class: "btn btn-primary btn-sm",
@@ -2279,16 +2385,22 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
                 EmbeddingModelState::Downloading { received, total } => rsx! {
                     Progress { received, total, label: "Downloading the speech model".to_string() }
                 },
-                EmbeddingModelState::Ready { .. } => rsx! {
+                EmbeddingModelState::Ready { .. } if admin => rsx! {
                     div { class: "row-actions",
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                     }
                 },
-                EmbeddingModelState::Failed { error: message } => rsx! {
+                EmbeddingModelState::Failed { error: message } if admin => rsx! {
                     ErrorNotice {
                         message: "The download failed. {message}",
                         on_retry: move |_| { spawn(download()); },
                     }
+                },
+                EmbeddingModelState::Failed { error: message } => rsx! {
+                    p { class: "help", "The download failed. {message} {MODELS_ADMIN_ONLY}" }
+                },
+                _ => rsx! {
+                    p { class: "help", "{MODELS_ADMIN_ONLY}" }
                 },
             }
             if let Some(err) = error.read().clone() {
@@ -2314,6 +2426,120 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
     }
 }
 
+/// What the reranker model row says of its state.
+pub fn reranker_status(state: &EmbeddingModelState) -> String {
+    match state {
+        EmbeddingModelState::NotDownloaded { .. } => {
+            "Not downloaded; the onnx-crossencoder variant needs it".to_string()
+        }
+        EmbeddingModelState::Downloading { .. } => "Downloading…".to_string(),
+        EmbeddingModelState::Ready { bytes } => format!("Ready · {} on disk", human_bytes(*bytes)),
+        EmbeddingModelState::Failed { .. } => "Download failed".to_string(),
+    }
+}
+
+/// The cross-encoder the `onnx-crossencoder` reranker runs (R2, a Linux service): its
+/// name, size, download progress and removal (`EmbeddingModel.reranker`).
+#[component]
+fn RerankerModelSection(reranker: RerankerModelState) -> Element {
+    let app = use_app();
+    let mut busy = use_signal(|| false);
+    let error = use_signal(|| None::<String>);
+    let mut confirm_remove = use_signal(|| false);
+    let download = move || async move {
+        let Some(api) = app.api() else { return };
+        busy.set(true);
+        apply_model(app, error, api.download_reranker().await);
+        busy.set(false);
+    };
+    // Removing the model the saved pipeline reranks with is allowed, but said.
+    let in_use = app
+        .lib
+        .read()
+        .settings
+        .as_ref()
+        .is_some_and(|s| s.pipeline.reranker.name == "onnx-crossencoder");
+    let remove_message = if in_use {
+        "Its files are deleted from the service. Your pipeline reranks with it now: until you download it again, pick another reranker in Settings → AI."
+    } else {
+        "Its files are deleted from the service. The onnx-crossencoder reranker can't be picked until you download it again."
+    };
+    rsx! {
+        section { class: "set-sec", "aria-label": "Reranker model",
+            h2 { "Reranker model" }
+            p { class: "help",
+                "A small cross-encoder that runs on the service and reorders the passages a search finds by how well each answers the question. Only the onnx-crossencoder reranker uses it (the rerank-xenc variant, Settings → AI → Pipeline)."
+            }
+            div { class: "kv",
+                span { "Model" }
+                span { class: "mono", "{reranker.name}" }
+                span { "From" }
+                span { class: "mono", style: "overflow-wrap: anywhere", "{reranker.repo}" }
+                span { "Runs on" }
+                span { "ONNX Runtime, on the CPU" }
+                span { "Size" }
+                span {
+                    match &reranker.state {
+                        EmbeddingModelState::NotDownloaded { download_bytes } => human_bytes(*download_bytes),
+                        EmbeddingModelState::Downloading { total, .. } => human_bytes(*total),
+                        EmbeddingModelState::Ready { bytes } => human_bytes(*bytes),
+                        EmbeddingModelState::Failed { .. } => "—".to_string(),
+                    }
+                }
+                span { "Status" }
+                span { {reranker_status(&reranker.state)} }
+            }
+            match reranker.state.clone() {
+                EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                    div { class: "row-actions",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: *busy.read(),
+                            onclick: move |_| download(),
+                            if *busy.read() { span { class: "spinner" } }
+                            "Download · {human_bytes(download_bytes)}"
+                        }
+                        span { class: "faint", style: "font-size: 13px", "Downloads once, from Hugging Face." }
+                    }
+                },
+                EmbeddingModelState::Downloading { received, total } => rsx! {
+                    Progress { received, total, label: "Downloading the reranker model".to_string() }
+                },
+                EmbeddingModelState::Ready { .. } => rsx! {
+                    div { class: "row-actions",
+                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
+                    }
+                },
+                EmbeddingModelState::Failed { error: message } => rsx! {
+                    ErrorNotice {
+                        message: "The download failed. {message}",
+                        on_retry: move |_| { spawn(download()); },
+                    }
+                },
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+        }
+        if *confirm_remove.read() {
+            ConfirmDialog {
+                title: "Remove the reranker model?",
+                message: remove_message,
+                confirm_label: "Remove model",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_remove.set(false),
+                on_confirm: move |_| async move {
+                    let Some(api) = app.api() else { return };
+                    busy.set(true);
+                    apply_model(app, error, api.delete_reranker().await);
+                    busy.set(false);
+                    confirm_remove.set(false);
+                },
+            }
+        }
+    }
+}
+
 /// What the Folders pane and the menus say about what a folder sync takes.
 pub fn folders_help() -> String {
     format!(
@@ -2327,7 +2553,7 @@ pub fn folders_platform_help() -> Option<&'static str> {
         Some("macOS may ask once before Margin reads Desktop, Documents or Downloads.")
     } else if cfg!(target_os = "ios") {
         Some(
-            "Files that iCloud hasn't downloaded to this device are downloaded as they're sent. Sending happens while Margin is open.",
+            "Files that iCloud hasn't downloaded to this device are downloaded as they're sent. Sending keeps going after you leave Margin; iOS shows its progress and can end it to save power — open Margin to continue.",
         )
     } else if cfg!(target_os = "android") {
         Some("Sending happens while Margin is open.")
@@ -2434,11 +2660,11 @@ fn FoldersSection() -> Element {
     let mut attaching = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
 
-    let me = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let me = app.session.read().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|m| m.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let lib = app.lib.read();
     let all: Vec<Workspace> = lib
         .workspaces_in_order(me.as_deref())
@@ -3322,6 +3548,7 @@ mod tests {
             state: EmbeddingModelState::Ready { bytes: 1_000 },
             speech: None,
             reindex: None,
+            reranker: None,
         };
         let html = sources(mac.clone());
         assert!(html.contains("<h2>Embedding model</h2>"), "{html}");
@@ -3650,10 +3877,22 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"<option value="hybrid""#));
-        let listwise = html.find(r#"<option value="listwise""#).unwrap();
-        let tag = &html[listwise..listwise + html[listwise..].find('>').unwrap()];
+        let xenc = html.find(r#"<option value="rerank-xenc""#).unwrap();
+        let tag = &html[xenc..xenc + html[xenc..].find('>').unwrap()];
         assert!(tag.contains("disabled"), "{tag}");
-        assert!(html.contains("listwise (not on this service)"));
+        assert!(html.contains("rerank-xenc (unavailable)"));
+        // Why, under the picker.
+        assert!(
+            html.contains(r#"aria-label="Unavailable variants""#),
+            "{html}"
+        );
+        assert!(html.contains("download the reranker model in Settings → Sources first"));
+        // R2's model-backed variants the service can build are offered.
+        for name in ["rerank-small", "rewrite-small", "r2-full"] {
+            let at = html.find(&format!(r#"<option value="{name}""#)).unwrap();
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(!tag.contains("disabled"), "{tag}");
+        }
         assert!(!html.contains(">Custom<"));
         // A picker per stage with every registered name, the current one chosen.
         for kind in STAGE_KINDS {
@@ -3750,6 +3989,126 @@ mod tests {
         // The picker's key ignores routes and budget.
         assert_eq!(stages_key(&saved), stages_key(&PipelineConfig::default()));
         assert_ne!(stages_key(&saved), stages_key(&draft));
+
+        // The Rewriter (R2): its choices, and picking one sends it with the rest kept.
+        let opts = stage_options("rewriter", "none", &variants);
+        assert_eq!(
+            opts.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+            ["none", "small-expand-v1"]
+        );
+        let rewrite = saved.with_stage("rewriter", "small-expand-v1");
+        assert_eq!(current_variant(&rewrite, &variants), None);
+        let sent = stages_patch(&saved, &rewrite).unwrap().pipeline.unwrap();
+        assert_eq!(sent.rewriter.name, "small-expand-v1");
+        assert_eq!(
+            (sent.budget, sent.routes.clone()),
+            (saved.budget, saved.routes.clone())
+        );
+        assert_ne!(sent.hash(), saved.hash());
+        // rewrite-small's stages are the variant's.
+        let small = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rewrite-small")
+            .unwrap();
+        let picked = saved.with_stages_of(&small.config);
+        assert_eq!(
+            current_variant(&picked, &variants).map(|v| v.name.as_str()),
+            Some("rewrite-small")
+        );
+        assert_eq!(picked.rewriter.params["max_added"], 2);
+        assert!(pipeline_rows(&picked).contains(&("Rewriter", "small-expand-v1".to_string())));
+    }
+
+    #[test]
+    fn the_small_tasks_slot_says_it_rewrites_and_reranks() {
+        assert!(
+            slot_help(Route::Small).contains("Small tasks also runs query rewriting and reranking")
+        );
+        assert_eq!(stage_label("rewriter"), "Rewriter");
+        assert!(stage_help("rewriter").starts_with("Extra phrasings of a query, tried beside it."));
+        assert!(STAGE_KINDS.contains(&"rewriter"));
+    }
+
+    #[test]
+    fn sources_pane_shows_the_reranker_model() {
+        use crate::fake::{RERANKER_DOWNLOAD_BYTES, RERANKER_NAME, RERANKER_REPO};
+        use crate::store::LibraryState;
+        let sources = |reranker: Option<EmbeddingModelState>, pipeline: Option<PipelineConfig>| {
+            let mut lib = LibraryState::from_library(crate::fake::sample_library());
+            let mut settings = crate::fake::FakeState::new().settings;
+            if let Some(p) = pipeline {
+                settings.pipeline = p;
+            }
+            lib.settings = Some(settings);
+            lib.embedding = Some(EmbeddingModel {
+                repo: crate::fake::EMBEDDING_REPO.into(),
+                state: EmbeddingModelState::Ready { bytes: 1_000 },
+                speech: None,
+                reindex: None,
+                reranker: reranker.map(|state| RerankerModelState {
+                    name: RERANKER_NAME.into(),
+                    repo: RERANKER_REPO.into(),
+                    state,
+                }),
+            });
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Sources))
+        };
+        // A service that offers none: no row.
+        assert!(!sources(None, None).contains("Reranker model"));
+
+        let size = human_bytes(RERANKER_DOWNLOAD_BYTES);
+        let html = sources(
+            Some(EmbeddingModelState::NotDownloaded {
+                download_bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(html.contains("<h2>Reranker model</h2>"), "{html}");
+        assert!(html.contains(RERANKER_NAME) && html.contains(RERANKER_REPO));
+        assert!(html.contains("Not downloaded; the onnx-crossencoder variant needs it"));
+        assert!(html.contains(&format!(">{size}<")), "{html}");
+        assert!(html.contains(&format!("Download · {size}")), "{html}");
+
+        let html = sources(
+            Some(EmbeddingModelState::Downloading {
+                received: RERANKER_DOWNLOAD_BYTES / 2,
+                total: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(
+            html.contains(r#"aria-label="Downloading the reranker model""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-valuenow="50""#), "{html}");
+        assert!(!html.contains("Download ·"));
+
+        let html = sources(
+            Some(EmbeddingModelState::Ready {
+                bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
+            None,
+        );
+        assert!(html.contains(&format!("Ready · {size} on disk")), "{html}");
+        // The embedding model's Remove and the reranker's.
+        assert_eq!(html.matches("Remove…").count(), 2, "{html}");
+
+        let html = sources(
+            Some(EmbeddingModelState::Failed {
+                error: "Hugging Face answered 503.".into(),
+            }),
+            None,
+        );
+        assert!(
+            html.contains("The download failed. Hugging Face answered 503."),
+            "{html}"
+        );
+        assert!(html.contains(">Try again<"));
+        assert_eq!(
+            reranker_status(&EmbeddingModelState::Failed { error: "x".into() }),
+            "Download failed"
+        );
     }
 
     #[test]
@@ -3846,6 +4205,7 @@ mod tests {
     fn device(id: &str, name: &str, online: bool, current: bool) -> Device {
         use chrono::TimeZone;
         Device {
+            person_id: None,
             id: id.into(),
             name: name.into(),
             created_at: chrono::Utc.timestamp_opt(1_760_000_000, 0).unwrap(),

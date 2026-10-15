@@ -23,6 +23,14 @@ pub struct PipelineConfig {
         skip_serializing_if = "is_default_embedder"
     )]
     pub embedder: StageCfg,
+    /// Query rewriting before retrieval (R2, `docs/r2-brief.md` D3): `"none"` or
+    /// `"small-expand-v1"`. Left out of the JSON (and so of `hash()`) while it is
+    /// `"none"`, so every hash stored before it existed keeps its meaning.
+    #[serde(
+        default = "default_rewriter",
+        skip_serializing_if = "is_default_rewriter"
+    )]
+    pub rewriter: StageCfg,
     #[serde(default = "default_chunker")]
     pub chunker: StageCfg,
     #[serde(default = "default_retriever")]
@@ -141,6 +149,12 @@ fn is_default_embedder(cfg: &StageCfg) -> bool {
 /// (the service stamps its own ONNX backend); the name stays so stored hashes keep their
 /// meaning.
 pub const DEFAULT_EMBEDDER: &str = "coreml";
+fn default_rewriter() -> StageCfg {
+    StageCfg::named("none")
+}
+fn is_default_rewriter(cfg: &StageCfg) -> bool {
+    *cfg == default_rewriter()
+}
 fn default_chunker() -> StageCfg {
     StageCfg::named("sections-v2")
 }
@@ -164,6 +178,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             embedder: default_embedder(),
+            rewriter: default_rewriter(),
             chunker: default_chunker(),
             retriever: default_retriever(),
             fusion: default_fusion(),
@@ -195,9 +210,10 @@ impl PipelineConfig {
 /// "embedder" is the service's own (`service.toml`'s `embedder`): the service sets it on
 /// every pipeline it runs, Settings shows it without a picker, and `with_stages_of` keeps
 /// it; the eval runner loads the one a variant names.
-pub const STAGE_KINDS: [&str; 7] = [
+pub const STAGE_KINDS: [&str; 8] = [
     "chunker",
     "embedder",
+    "rewriter",
     "retriever",
     "fusion",
     "reranker",
@@ -211,6 +227,7 @@ impl PipelineConfig {
         Some(match kind {
             "chunker" => &self.chunker.name,
             "embedder" => &self.embedder.name,
+            "rewriter" => &self.rewriter.name,
             "retriever" => &self.retriever.name,
             "fusion" => &self.fusion.name,
             "reranker" => &self.reranker.name,
@@ -228,6 +245,7 @@ impl PipelineConfig {
         let stage = match kind {
             "chunker" => &mut cfg.chunker,
             "embedder" => &mut cfg.embedder,
+            "rewriter" => &mut cfg.rewriter,
             "retriever" => &mut cfg.retriever,
             "fusion" => &mut cfg.fusion,
             "reranker" => &mut cfg.reranker,
@@ -264,6 +282,40 @@ impl PipelineConfig {
     /// Whether the stages and prompts are `variant`'s (routes, budget and embedder aside).
     pub fn has_stages_of(&self, variant: &PipelineConfig) -> bool {
         self.with_stages_of(variant) == *self
+    }
+}
+
+/// Why a retrieval runs (R2, `docs/r2-brief.md` D1): stages may behave differently per
+/// purpose (a listwise rerank is worth a model call for a lesson, not for every agent
+/// search).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalPurpose {
+    /// Retrieval for a lesson (`ask::write_lesson`).
+    Lesson,
+    /// Retrieval for the outline planner.
+    Plan,
+    /// The agent's `search` tool.
+    Agent,
+    /// The context API (`POST /api/context/search`, MCP).
+    Context,
+}
+
+impl RetrievalPurpose {
+    pub const ALL: [RetrievalPurpose; 4] = [
+        RetrievalPurpose::Lesson,
+        RetrievalPurpose::Plan,
+        RetrievalPurpose::Agent,
+        RetrievalPurpose::Context,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetrievalPurpose::Lesson => "lesson",
+            RetrievalPurpose::Plan => "plan",
+            RetrievalPurpose::Agent => "agent",
+            RetrievalPurpose::Context => "context",
+        }
     }
 }
 
@@ -379,6 +431,46 @@ mod tests {
         let explicit: PipelineConfig =
             serde_json::from_value(json!({"embedder": {"name": "coreml"}})).unwrap();
         assert_eq!(explicit.hash(), cfg.hash());
+    }
+
+    #[test]
+    fn the_rewriter_stage_defaults_to_none_and_hashes_only_when_changed() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.rewriter.name, "none");
+        assert!(
+            serde_json::to_value(&cfg)
+                .unwrap()
+                .get("rewriter")
+                .is_none()
+        );
+        // A config without the key, or naming "none", hashes as before R2.
+        let absent: PipelineConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.hash(), "c39a244aa537f0c2");
+        let none: PipelineConfig =
+            serde_json::from_value(json!({"rewriter": {"name": "none"}})).unwrap();
+        assert_eq!(none.hash(), "c39a244aa537f0c2");
+        let expand: PipelineConfig =
+            serde_json::from_value(json!({"rewriter": {"name": "small-expand-v1"}})).unwrap();
+        assert_eq!(expand.rewriter.name, "small-expand-v1");
+        assert_ne!(expand.hash(), cfg.hash());
+        let back: PipelineConfig =
+            serde_json::from_value(serde_json::to_value(&expand).unwrap()).unwrap();
+        assert_eq!(back, expand);
+        assert_eq!(
+            cfg.with_stage("rewriter", "small-expand-v1").rewriter.name,
+            "small-expand-v1"
+        );
+    }
+
+    #[test]
+    fn retrieval_purposes() {
+        assert_eq!(
+            serde_json::to_value(RetrievalPurpose::Context).unwrap(),
+            json!("context")
+        );
+        for p in RetrievalPurpose::ALL {
+            assert_eq!(serde_json::to_value(p).unwrap(), json!(p.as_str()));
+        }
     }
 
     #[test]

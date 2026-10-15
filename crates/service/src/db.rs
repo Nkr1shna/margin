@@ -56,6 +56,11 @@ pub const TRACE: &str = "trace";
 /// Hourly and daily rollups of `trace`, as table views.
 pub const TRACE_HOURLY: &str = "trace_hourly";
 pub const TRACE_DAILY: &str = "trace_daily";
+/// The version of the stored data's shape this build writes (`SettingsRow.schema_version`):
+/// bumped when a `DEFINE` or a one-pass migration changes. A store with a higher one
+/// refuses to serve; a lower one is backed up, then migrated (`docs/phase5-brief.md` D5).
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
 
@@ -67,8 +72,18 @@ const OLD_TABLES: [&str; 2] = [CHUNK, MEDIA];
 /// rows, so the hourly and daily numbers outlive them (R1-trace).
 pub const TRACE_HOURLY_KEPT: &str = "trace_hourly_kept";
 pub const TRACE_DAILY_KEPT: &str = "trace_daily_kept";
+/// Everyone who may sign in (`people::PersonRow`, L1).
+pub const PERSON: &str = "person";
+/// Groups (`groups::GroupRow`), keyed by path.
+pub const GROUP: &str = "group";
+/// Direct memberships (`groups::MembershipRow`): `person_id`, `group_path`, `source`.
+pub const MEMBERSHIP: &str = "membership";
+/// Agents (`agents::AgentRow`) and their hashed tokens.
+pub const AGENT: &str = "agent";
+/// Invitations by GitHub login (`invitations::InvitationRow`).
+pub const INVITATION: &str = "invitation";
 
-const TABLES: [&str; 17] = [
+const TABLES: [&str; 22] = [
     TOPIC,
     LESSON,
     NOTE,
@@ -86,6 +101,11 @@ const TABLES: [&str; 17] = [
     DOCUMENT_DELETED,
     TRACE_HOURLY_KEPT,
     TRACE_DAILY_KEPT,
+    PERSON,
+    GROUP,
+    MEMBERSHIP,
+    AGENT,
+    INVITATION,
 ];
 
 /// The `passage` and `trace` tables and their plain indexes. Idempotent (`IF NOT
@@ -98,6 +118,23 @@ DEFINE INDEX IF NOT EXISTS document_generation ON document FIELDS doc.generation
 DEFINE INDEX IF NOT EXISTS document_deleted_generation ON document_deleted FIELDS doc.generation;
 DEFINE INDEX IF NOT EXISTS folder_file_workspace ON folder_file FIELDS doc.workspace_id;
 DEFINE INDEX IF NOT EXISTS source_workspace ON source FIELDS doc.workspace_id;
+
+DEFINE INDEX IF NOT EXISTS person_login      ON person FIELDS doc.login_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS person_handle     ON person FIELDS doc.handle UNIQUE;
+DEFINE INDEX IF NOT EXISTS agent_token       ON agent FIELDS doc.token_hash;
+DEFINE INDEX IF NOT EXISTS agent_owner       ON agent FIELDS doc.owner_id;
+DEFINE INDEX IF NOT EXISTS device_person     ON device FIELDS doc.person_id;
+DEFINE INDEX IF NOT EXISTS membership_person ON membership FIELDS doc.person_id;
+DEFINE INDEX IF NOT EXISTS membership_group  ON membership FIELDS doc.group_path;
+DEFINE INDEX IF NOT EXISTS invitation_login  ON invitation FIELDS doc.login_key;
+DEFINE INDEX IF NOT EXISTS topic_access      ON topic FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS lesson_access     ON lesson FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS note_access       ON note FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS chat_access       ON chat FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS source_access     ON source FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS workspace_access  ON workspace FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS proposal_access   ON proposal FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS document_owner    ON document FIELDS doc.owner;
 
 DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
@@ -138,6 +175,7 @@ DEFINE FIELD IF NOT EXISTS turn_id        ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS job_id         ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS document_id    ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS actor          ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS principal      ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS pipeline_hash  ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS prompt_version ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS route          ON trace TYPE option<string>;
@@ -166,6 +204,11 @@ DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
 DEFINE FIELD IF NOT EXISTS via            ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS query          ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS read_range     ON trace TYPE option<array<int>>;
+DEFINE FIELD IF NOT EXISTS queries        ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS reranked       ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS reranker       ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS compaction     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS provider_ms    ON trace TYPE option<number>;
 DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 
@@ -296,6 +339,102 @@ impl Store {
             .await
             .context("couldn't start the in-memory database")?;
         Self::init(db).await
+    }
+
+    /// Opens the on-disk database in `dir` as it is: no `DEFINE`, no index or view
+    /// change, no row written. For reading the stored schema version before this build
+    /// decides whether it may migrate the data (`restore::open_guarded`), and for
+    /// checking a copy of a backup (`restore::check_data`). `None` when `dir` holds no
+    /// Margin database (no namespace and database `margin`).
+    pub async fn open_existing(dir: &Path) -> anyhow::Result<Option<Self>> {
+        let db = Surreal::new::<SurrealKv>(dir.to_path_buf())
+            .await
+            .context("couldn't open the database")?;
+        let mut res = db
+            .query("INFO FOR ROOT")
+            .await
+            .context("couldn't read the database's namespaces")?
+            .check()
+            .context("couldn't read the database's namespaces")?;
+        let root: surrealdb::types::Value = res.take(0)?;
+        if !has_key(&root.into_json_value(), "namespaces", "margin") {
+            return Ok(None);
+        }
+        db.use_ns("margin")
+            .await
+            .context("couldn't select the namespace")?;
+        let mut res = db
+            .query("INFO FOR NS")
+            .await
+            .context("couldn't read the namespace")?
+            .check()
+            .context("couldn't read the namespace")?;
+        let ns: surrealdb::types::Value = res.take(0)?;
+        if !has_key(&ns.into_json_value(), "databases", "margin") {
+            return Ok(None);
+        }
+        db.use_ns("margin")
+            .use_db("margin")
+            .await
+            .context("couldn't select the database")?;
+        Ok(Some(Self { db }))
+    }
+
+    /// The tables defined in the database.
+    pub async fn table_names(&self) -> anyhow::Result<Vec<String>> {
+        let info: Vec<serde_json::Value> = self.query_rows("INFO FOR DB", vec![]).await?;
+        let mut names: Vec<String> = info
+            .first()
+            .and_then(|i| i.get("tables"))
+            .and_then(|t| t.as_object())
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        Ok(names)
+    }
+
+    /// The settings row's `schema_version` as stored: `None` without a settings row (a
+    /// new store), 0 for a row written before the field existed.
+    pub async fn stored_schema_version(&self) -> anyhow::Result<Option<u32>> {
+        if !self.table_names().await?.iter().any(|t| t == SETTINGS) {
+            return Ok(None);
+        }
+        let Some(found) = self
+            .get::<serde_json::Value>(SETTINGS, crate::state::SETTINGS_ID)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let version = found
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(Some(u32::try_from(version).unwrap_or(u32::MAX)))
+    }
+
+    /// Stamps `SCHEMA_VERSION` on the settings row when there is one (a new store gets
+    /// it with its first settings row, `SettingsRow::default`).
+    pub async fn record_schema_version(&self) -> anyhow::Result<()> {
+        if self
+            .get::<serde_json::Value>(SETTINGS, crate::state::SETTINGS_ID)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.retrying(|| {
+            self.db
+                .query("UPDATE $rid SET doc.schema_version = $v RETURN NONE")
+                .bind((
+                    "rid",
+                    RecordId::new(SETTINGS, crate::state::SETTINGS_ID.to_string()),
+                ))
+                .bind(("v", SCHEMA_VERSION))
+                .into_future()
+        })
+        .await
+        .context("couldn't record the schema version")?;
+        Ok(())
     }
 
     async fn init(db: Surreal<Db>) -> anyhow::Result<Self> {
@@ -871,6 +1010,13 @@ impl Store {
     }
 }
 
+/// Whether an `INFO FOR …` result lists `name` under `section`.
+fn has_key(info: &serde_json::Value, section: &str, name: &str) -> bool {
+    info.get(section)
+        .and_then(|s| s.as_object())
+        .is_some_and(|s| s.contains_key(name))
+}
+
 /// `table:[$f0, …]..=[$t0, …]` and the parameters it names.
 fn range_expr<'a>(
     table: &str,
@@ -960,6 +1106,43 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// The L1 tables (`group` is a SurrealQL keyword: `docs/l1-brief.md` §6) are
+    /// defined, written, listed and filtered like the others, and the unique login
+    /// index refuses a second person with the same login.
+    #[tokio::test]
+    async fn principal_tables_round_trip() {
+        let s = Store::memory().await.unwrap();
+        for table in [PERSON, GROUP, MEMBERSHIP, AGENT, INVITATION] {
+            assert!(s.list::<serde_json::Value>(table).await.unwrap().is_empty());
+        }
+        let group = serde_json::json!({"path": "company/eng", "name": "Engineering"});
+        s.put(GROUP, "company/eng", &group).await.unwrap();
+        assert_eq!(
+            s.get::<serde_json::Value>(GROUP, "company/eng")
+                .await
+                .unwrap(),
+            Some(group.clone())
+        );
+        assert_eq!(
+            s.list::<serde_json::Value>(GROUP).await.unwrap(),
+            vec![group.clone()]
+        );
+        assert_eq!(
+            s.list_where::<serde_json::Value>(GROUP, "name", "Engineering")
+                .await
+                .unwrap(),
+            vec![group]
+        );
+        s.delete(GROUP, "company/eng").await.unwrap();
+        assert!(s.list::<serde_json::Value>(GROUP).await.unwrap().is_empty());
+
+        let p1 = serde_json::json!({"id": "p1", "login_key": "bob", "handle": "bob"});
+        let p2 = serde_json::json!({"id": "p2", "login_key": "bob", "handle": "bob-2"});
+        s.put(PERSON, "p1", &p1).await.unwrap();
+        assert!(s.put(PERSON, "p2", &p2).await.is_err());
+        assert_eq!(s.list::<serde_json::Value>(PERSON).await.unwrap(), vec![p1]);
     }
 
     #[tokio::test]

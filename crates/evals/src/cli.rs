@@ -33,7 +33,19 @@ Commands:
                         (evals/recorded/{extracted.json,embeddings.bin})
   record-generations [--variant NAME]
                         Write and record every golden lesson with the writing model
-                        (evals/recorded/generations/<prompt version>/<model>/)
+                        (evals/recorded/generations/<prompt version>/<model>/; another
+                        variant's under <prompt version>+<variant>/)
+  record-rewrites [--variant NAME]
+                        Run the variant's query rewriter (default rewrite-small) on the
+                        small-tasks model once per golden query and lesson plan and record
+                        each answer (evals/recorded/rewrites.jsonl); CI replays them. Then
+                        run record-embeddings, which embeds the recorded rewrites too
+  record-reranks [--variant NAME]
+                        Run the variant's listwise reranker (default rerank-small) on the
+                        small-tasks model once per golden query and lesson plan over its
+                        fused candidates and record each answer
+                        (evals/recorded/reranks.jsonl); CI replays them. For a variant
+                        that also rewrites, record-rewrites and record-embeddings first
   synth-questions [--variant NAME] [--per N] [--limit N]
                         Generate serious questions per section, check their spans, grade
                         them on the other provider, append those graded >= 2 to
@@ -42,13 +54,15 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent|dogfood [--service-url URL] [--variant NAME]
-      [--write-baseline] [--no-judge]
+  run --suite retrieval|courses|agent|dogfood|injection [--service-url URL]
+      [--variant NAME] [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
-                        beside the dev service at URL (required for courses and agent;
-                        retrieval and dogfood need no service); dogfood runs the
-                        retrieval suite over the repository's docs/ with
-                        evals/golden/dogfood.jsonl
+                        beside the dev service at URL (required for courses, agent and
+                        injection; retrieval and dogfood need no service); dogfood runs
+                        the retrieval suite over the repository's docs/ with
+                        evals/golden/dogfood.jsonl; injection asks
+                        evals/golden/injection.jsonl over the canaries in
+                        evals/corpus/injection/ on each configured provider
   harvest --service-url URL [--since T] [--out FILE]
                         Turn agents' context-API searches and the passages they read
                         after them (trace rows with via \"mcp\") into candidate questions,
@@ -58,14 +72,26 @@ Commands:
                         Judge recorded generations (default: the baseline's prompt
                         version), with canaries; --against compares pairwise
   compare RUN_A RUN_B [--allow-embedder-change] [--allow-provider-change]
+      [--allow-prompt-change]
                         Per-metric deltas with paired bootstrap 95% intervals; runs
                         whose models came from different providers (OpenAI, ChatGPT,
-                        Claude) are refused without --allow-provider-change
+                        Claude) are refused without --allow-provider-change, runs that
+                        ran one prompt under two versions without --allow-prompt-change
+  prompts [--write-lock]
+                        Every prompt's version and constant-block hash, and whether
+                        evals/prompts.lock agrees; --write-lock rewrites the lock (with a
+                        bumped version, in the same change as the prompt)
   report [RUN] [--traces FILE | --service --service-url URL]
                         Write evals/reports/RUN.md and RUN.html (latest run by default),
                         with efficiency from exported traces or the service at URL
   export --service-url URL [--kind K] [--from T] [--to T] [--trace-id ID] [--out FILE]
                         Export the service's trace rows over GET /api/traces to JSONL
+  alerts --service-url URL
+                        The service's active alerts and the last day's rises and clears
+  perf --service-url URL
+                        Measure the service against evals/budgets.toml (ingest, retrieval,
+                        context search, agent step overhead, cache share, title, memory)
+                        and print each budget as met or missed
   runs                  List the runs in the runner's database
 
 Options for every command:
@@ -83,6 +109,18 @@ pub enum Command {
     RecordEmbeddings,
     RecordGenerations {
         variant: String,
+    },
+    /// R2: the rewriter's answers on the small-tasks model.
+    RecordRewrites {
+        variant: String,
+    },
+    /// R2: the listwise reranker's answers on the small-tasks model.
+    RecordReranks {
+        variant: String,
+    },
+    /// R2: the prompt catalog against `evals/prompts.lock`.
+    Prompts {
+        write_lock: bool,
     },
     SynthQuestions {
         variant: String,
@@ -107,6 +145,7 @@ pub enum Command {
         b: String,
         allow_embedder_change: bool,
         allow_provider_change: bool,
+        allow_prompt_change: bool,
     },
     Report {
         run: Option<String>,
@@ -122,6 +161,10 @@ pub enum Command {
         since: Option<DateTime<Utc>>,
         out: Option<PathBuf>,
     },
+    /// `docs/phase5-brief.md` D6.
+    Alerts,
+    /// `docs/phase5-brief.md` D8.
+    Perf,
     Runs,
     Help,
 }
@@ -133,6 +176,8 @@ pub enum Suite {
     Agent,
     /// The retrieval suite over `docs/` with the questions agents really asked.
     Dogfood,
+    /// Prompt-injection resistance over `corpus/injection/` (`docs/phase5-brief.md` D2).
+    Injection,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,13 +192,15 @@ pub struct Cli {
 
 impl Command {
     /// Whether it reads the service, so `--service-url` is required: `run` of the
-    /// courses and agent suites, `export`, `harvest` and `report --service`. The
-    /// retrieval and dogfood suites run on the runner's own index and embedder only, so
-    /// for them it is optional (checked when given).
+    /// courses, agent and injection suites, `export`, `harvest`, `alerts`, `perf` and
+    /// `report --service`. The retrieval and dogfood suites run on the runner's own index
+    /// and embedder only, so for them it is optional (checked when given).
     pub fn needs_service_url(&self) -> bool {
         match self {
             Command::Run { suite, .. } => !matches!(suite, Suite::Retrieval | Suite::Dogfood),
-            Command::Export { .. } | Command::Harvest { .. } => true,
+            Command::Export { .. } | Command::Harvest { .. } | Command::Alerts | Command::Perf => {
+                true
+            }
             Command::Report { service, .. } => *service,
             _ => false,
         }
@@ -169,9 +216,12 @@ impl Command {
         !matches!(
             self,
             Command::Compare { .. }
+                | Command::Prompts { .. }
                 | Command::Report { .. }
                 | Command::Export { .. }
                 | Command::Harvest { .. }
+                | Command::Alerts
+                | Command::Perf
                 | Command::Runs
                 | Command::Help
         )
@@ -185,6 +235,8 @@ const FLAGS: &[&str] = &[
     "--no-judge",
     "--allow-embedder-change",
     "--allow-provider-change",
+    "--allow-prompt-change",
+    "--write-lock",
     "--service",
 ];
 
@@ -214,7 +266,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         i += 1;
     }
     let mut take = |k: &str| opts.remove(k);
-    let variant = take("variant").unwrap_or_else(|| "baseline".into());
+    let variant_given = take("variant");
+    let variant = variant_given.clone().unwrap_or_else(|| "baseline".into());
     let flag = |o: Option<String>| o.is_some();
     let time = |o: Option<String>| -> anyhow::Result<Option<DateTime<Utc>>> {
         o.map(|t| {
@@ -234,6 +287,15 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         None | Some("help") => Command::Help,
         Some("record-embeddings") => Command::RecordEmbeddings,
         Some("record-generations") => Command::RecordGenerations { variant },
+        Some("record-rewrites") => Command::RecordRewrites {
+            variant: variant_given.unwrap_or_else(|| "rewrite-small".into()),
+        },
+        Some("record-reranks") => Command::RecordReranks {
+            variant: variant_given.unwrap_or_else(|| "rerank-small".into()),
+        },
+        Some("prompts") => Command::Prompts {
+            write_lock: flag(take("write-lock")),
+        },
         Some("synth-questions") => Command::SynthQuestions {
             variant,
             per: take("per").map(|v| v.parse()).transpose()?.unwrap_or(4),
@@ -251,10 +313,11 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 Some("courses") => Suite::Courses,
                 Some("agent") => Suite::Agent,
                 Some("dogfood") => Suite::Dogfood,
+                Some("injection") => Suite::Injection,
                 Some(other) => {
-                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood)")
+                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood, injection)")
                 }
-                None => bail!("run needs --suite retrieval|courses|agent|dogfood"),
+                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection"),
             },
             variant,
             write_baseline: flag(take("write-baseline")),
@@ -270,6 +333,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 b: b.clone(),
                 allow_embedder_change: flag(take("allow-embedder-change")),
                 allow_provider_change: flag(take("allow-provider-change")),
+                allow_prompt_change: flag(take("allow-prompt-change")),
             },
             _ => bail!("compare needs two run ids (see `margin-eval runs`)"),
         },
@@ -300,6 +364,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
             since: time(take("since"))?,
             out: take("out").map(PathBuf::from),
         },
+        Some("alerts") => Command::Alerts,
+        Some("perf") => Command::Perf,
         Some("runs") => Command::Runs,
         Some(other) => bail!("no command \"{other}\""),
     };
@@ -396,6 +462,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_phase5_commands() {
+        let url = "--service-url http://127.0.0.1:8787";
+        assert_eq!(
+            p(&format!("run --suite injection --variant v {url}"))
+                .unwrap()
+                .command,
+            Command::Run {
+                suite: Suite::Injection,
+                variant: "v".into(),
+                write_baseline: false,
+                judge: true
+            }
+        );
+        for (args, cmd) in [("alerts", Command::Alerts), ("perf", Command::Perf)] {
+            let c = p(&format!("{args} {url}")).unwrap();
+            assert_eq!(c.command, cmd);
+            assert!(!c.command.is_live());
+            // Both read the service.
+            assert!(p(args).is_err());
+            assert!(p(&format!("{args} --service-url https://{PROD_HOST}")).is_err());
+        }
+    }
+
+    #[test]
     fn parses_every_command() {
         assert_eq!(p("").unwrap().command, Command::Help);
         assert_eq!(
@@ -438,7 +528,8 @@ mod tests {
                 a: "a".into(),
                 b: "b".into(),
                 allow_embedder_change: true,
-                allow_provider_change: false
+                allow_provider_change: false,
+                allow_prompt_change: false
             }
         );
         assert_eq!(
@@ -447,7 +538,8 @@ mod tests {
                 a: "a".into(),
                 b: "b".into(),
                 allow_embedder_change: false,
-                allow_provider_change: true
+                allow_provider_change: true,
+                allow_prompt_change: false
             }
         );
         let c = p("export --kind model_call --from 2026-10-01T00:00:00Z --out x.jsonl --data /tmp/d --token t --service-url http://127.0.0.1:8787").unwrap();
@@ -480,7 +572,43 @@ mod tests {
             Some("https://devmargin.krishnanelloore.com")
         );
         assert!(p("record-embeddings").unwrap().command.is_live());
+        // R2: the small-stage recordings (default variants), the prompt lock, and
+        // compare across prompt versions.
+        assert_eq!(
+            p("record-rewrites").unwrap().command,
+            Command::RecordRewrites {
+                variant: "rewrite-small".into()
+            }
+        );
+        assert_eq!(
+            p("record-reranks --variant r2-full").unwrap().command,
+            Command::RecordReranks {
+                variant: "r2-full".into()
+            }
+        );
+        assert!(p("record-reranks").unwrap().command.is_live());
+        assert_eq!(
+            p("prompts --write-lock").unwrap().command,
+            Command::Prompts { write_lock: true }
+        );
+        assert!(!p("prompts").unwrap().command.is_live());
+        assert_eq!(
+            p("compare a b --allow-prompt-change").unwrap().command,
+            Command::Compare {
+                a: "a".into(),
+                b: "b".into(),
+                allow_embedder_change: false,
+                allow_provider_change: false,
+                allow_prompt_change: true
+            }
+        );
         assert!(!p("runs").unwrap().command.is_live());
+        assert!(
+            p("run --suite injection --service-url http://127.0.0.1:8787")
+                .unwrap()
+                .command
+                .is_live()
+        );
         // The dogfood feed (plan-dogfood §6).
         assert_eq!(
             p("run --suite dogfood --service-url http://127.0.0.1:8787")

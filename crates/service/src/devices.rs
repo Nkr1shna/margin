@@ -234,8 +234,10 @@ impl DeviceBridge for DeviceHub {
                 Ok(Ok(result)) => {
                     outstanding.answered = true;
                     match result {
-                        DeviceToolResult::Ok { output } => Ok(output),
-                        DeviceToolResult::Err { message } => Err(DeviceError::Failed(message)),
+                        DeviceToolResult::Ok { output } => Ok(normalised(output)),
+                        DeviceToolResult::Err { message } => Err(DeviceError::Failed(
+                            margin_shared::text::for_model(&message),
+                        )),
                     }
                 }
                 // The socket closed (or the device was revoked) before it answered.
@@ -246,6 +248,32 @@ impl DeviceBridge for DeviceHub {
                 Err(_) => Err(DeviceError::TimedOut),
             }
         })
+    }
+}
+
+/// A device's answer with the text it wrote normalised (`text::for_model`) before it
+/// becomes a tool output. File paths stay as the device sent them: the sync matches
+/// them against the device's own files.
+fn normalised(output: DeviceToolOutput) -> DeviceToolOutput {
+    use margin_shared::text::for_model;
+    match output {
+        DeviceToolOutput::Done { message } => DeviceToolOutput::Done {
+            message: for_model(&message),
+        },
+        DeviceToolOutput::FileText {
+            path,
+            start_line,
+            end_line,
+            total_lines,
+            text,
+        } => DeviceToolOutput::FileText {
+            path,
+            start_line,
+            end_line,
+            total_lines,
+            text: for_model(&text),
+        },
+        other => other,
     }
 }
 
@@ -327,6 +355,54 @@ mod tests {
         // Answered: no cancel follows.
         assert!(new_rx.try_recv().is_err());
         assert!(hub.pending.lock().unwrap().is_empty());
+    }
+
+    /// What a device writes reaches the model normalised (`docs/phase5-brief.md`
+    /// D2.1); a manifest's paths stay as the device sent them.
+    #[tokio::test]
+    async fn device_answers_are_normalised() {
+        let hub = std::sync::Arc::new(DeviceHub::new());
+        let (_c, mut rx, _) = hub.register("d1");
+        for (answer, expected) in [
+            (
+                done("Opened \u{202E}“Tides”\u{200B}."),
+                Ok(DeviceToolOutput::Done {
+                    message: "Opened “Tides”.".into(),
+                }),
+            ),
+            (
+                DeviceToolResult::Err {
+                    message: "No ac\u{200B}cess.\u{2066}".into(),
+                },
+                Err(DeviceError::Failed("No access.".into())),
+            ),
+            (
+                DeviceToolResult::Ok {
+                    output: DeviceToolOutput::FileText {
+                        path: "a\u{200B}.md".into(),
+                        start_line: 1,
+                        end_line: 1,
+                        total_lines: 1,
+                        text: "de\u{200B}lete".into(),
+                    },
+                },
+                Ok(DeviceToolOutput::FileText {
+                    path: "a\u{200B}.md".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    total_lines: 1,
+                    text: "delete".into(),
+                }),
+            ),
+        ] {
+            let call = {
+                let hub = hub.clone();
+                tokio::spawn(async move { hub.call("d1", sidebar(5_000)).await })
+            };
+            let id = request_id(rx.recv().await.unwrap());
+            hub.deliver("d1", &id, answer);
+            assert_eq!(call.await.unwrap(), expected);
+        }
     }
 
     #[tokio::test]

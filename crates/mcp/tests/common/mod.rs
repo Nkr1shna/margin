@@ -1,5 +1,6 @@
 //! An in-process fake of the service's context API and device sign-in, over the wire
-//! types of `margin_shared`. Passages are a document's paragraphs; search scores by the
+//! types of `margin_shared`, with a device token (`TOKEN`, the owner's) and an agent token
+//! (`AGENT_TOKEN`, agent `claude-code` of `@krishna`). Passages are a document's paragraphs; search scores by the
 //! query words a passage contains. Never the real service.
 
 #![allow(dead_code, reason = "each test file uses part of it")]
@@ -19,12 +20,19 @@ use margin_shared::context::{
 };
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
 use margin_shared::{
-    ApiError, LoginState, PollLoginRequest, SourceKind, StartLogin, StartLoginRequest, routes,
+    Agent, AgentKind, AgentTokenInfo, ApiError, Device, LoginState, Me, OrgRole, Person,
+    PersonSettings, PersonState, PollLoginRequest, SourceKind, StartLogin, StartLoginRequest,
+    routes,
 };
 use serde::Deserialize;
 
 pub const TOKEN: &str = "device-token-1";
 pub const POLL_SECRET: &str = "poll-secret";
+/// The agent token of `claude-code` (owner `person1`, ceiling `company`,
+/// `company/engineering`).
+pub const AGENT_TOKEN: &str = "mga_fake-agent-token-1";
+pub const AGENT_ID: &str = "agent1";
+pub const OWNER_ID: &str = "person1";
 
 #[derive(Clone)]
 pub struct Passage {
@@ -48,6 +56,10 @@ pub struct Inner {
     pub agents: Vec<Option<String>>,
     /// `(since, limit)` of every change-feed request.
     pub changes_pages: Vec<(u64, Option<usize>)>,
+    /// The bearer token of every authorized request, in order.
+    pub bearers: Vec<String>,
+    /// Agent tokens the service no longer accepts (revoked or rotated).
+    pub revoked: Vec<String>,
     pub base: String,
 }
 
@@ -72,11 +84,90 @@ fn agent_of(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
+fn bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {TOKEN}"))
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
+/// A known device or (unrevoked) agent token; records it.
+fn authenticated(fake: &Fake, headers: &HeaderMap) -> Option<String> {
+    let token = bearer(headers)?;
+    let mut s = fake.lock();
+    let known = token == TOKEN || (token == AGENT_TOKEN && !s.revoked.contains(&token));
+    if !known {
+        return None;
+    }
+    s.bearers.push(token.clone());
+    Some(token)
+}
+
+fn authorized_by(fake: &Fake, headers: &HeaderMap) -> bool {
+    authenticated(fake, headers).is_some()
+}
+
+fn owner() -> Person {
+    Person {
+        id: OWNER_ID.into(),
+        github_login: "Krishna".into(),
+        github_id: Some(42),
+        handle: "krishna".into(),
+        name: "Krishna".into(),
+        avatar_url: None,
+        org_role: OrgRole::Owner,
+        state: PersonState::Active,
+        groups: vec!["company/engineering".into()],
+        settings: PersonSettings::default(),
+        created_at: Utc::now(),
+    }
+}
+
+/// `GET /api/me` as the service answers it per token (D3).
+async fn me(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let Some(token) = authenticated(&fake, &headers) else {
+        return unauthorized();
+    };
+    let now = Utc::now();
+    let me = if token == AGENT_TOKEN {
+        Me {
+            github_login: "Krishna".into(),
+            device: None,
+            person: Some(owner()),
+            agent: Some(Agent {
+                id: AGENT_ID.into(),
+                owner_id: OWNER_ID.into(),
+                name: "claude-code".into(),
+                kind: AgentKind::External,
+                ceiling: vec!["company".into(), "company/engineering".into()],
+                disabled: false,
+                token: Some(AgentTokenInfo {
+                    prefix: "mga_fake".into(),
+                    created_at: now,
+                    last_used_at: Some(now),
+                    expires_at: None,
+                }),
+                created_at: now,
+            }),
+        }
+    } else {
+        Me {
+            github_login: "Krishna".into(),
+            device: Some(Device {
+                id: "device1".into(),
+                name: "Claude Code (test-mac)".into(),
+                created_at: now,
+                last_seen_at: Some(now),
+                current: true,
+                online: false,
+                person_id: Some(OWNER_ID.into()),
+            }),
+            person: Some(owner()),
+            agent: None,
+        }
+    };
+    Json(me).into_response()
 }
 
 fn unauthorized() -> Response {
@@ -161,6 +252,7 @@ impl Fake {
         let passages = split(text);
         let now = Utc::now();
         let doc = Document {
+            owner: None,
             id: id.clone(),
             project_id: "project1".into(),
             origin,
@@ -197,6 +289,7 @@ impl Fake {
         let app = Router::new()
             .route(routes::AUTH_START, post(auth_start))
             .route(routes::AUTH_POLL, post(auth_poll))
+            .route(routes::ME, get(me))
             .route("/fake-github", get(fake_github))
             .route(routes::CONTEXT_SEARCH, post(search))
             .route("/api/context/documents/{id}/outline", get(outline))
@@ -270,7 +363,7 @@ async fn search(
     headers: HeaderMap,
     Json(q): Json<ContextQuery>,
 ) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     if q.scope != Scope::Library {
@@ -306,7 +399,7 @@ async fn search(
 }
 
 async fn outline(State(fake): State<Fake>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     let s = fake.lock();
@@ -350,7 +443,7 @@ async fn passages(
     Path(id): Path<String>,
     Query(q): Query<FromTo>,
 ) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     if q.to < q.from || (q.to - q.from + 1) as usize > TOOL_READ_PASSAGES_MAX {
@@ -376,7 +469,7 @@ async fn ingest(
     headers: HeaderMap,
     Json(req): Json<ContextIngest>,
 ) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     let Origin::Agent { name: agent } = &req.origin else {
@@ -426,7 +519,7 @@ struct Since {
 }
 
 async fn changes(State(fake): State<Fake>, headers: HeaderMap, Query(q): Query<Since>) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     let mut s = fake.lock();
@@ -463,7 +556,7 @@ async fn changes(State(fake): State<Fake>, headers: HeaderMap, Query(q): Query<S
 }
 
 async fn remove(State(fake): State<Fake>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    if !authorized(&headers) {
+    if !authorized_by(&fake, &headers) {
         return unauthorized();
     }
     let mut s = fake.lock();

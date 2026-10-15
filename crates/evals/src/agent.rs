@@ -84,7 +84,11 @@ impl Tool for SearchTool {
             let k = args.k.map_or(8, |k| k as usize).clamp(1, TOOL_SEARCH_K_MAX);
             let ranked = match self
                 .index
-                .search(std::slice::from_ref(&args.query), &self.scope)
+                .search_as(
+                    std::slice::from_ref(&args.query),
+                    &self.scope,
+                    margin_shared::pipeline::RetrievalPurpose::Agent,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -241,6 +245,7 @@ pub async fn run_task<M: ModelClient + margin_ai::TextModel>(
             chat_id: format!("eval-{}", task.id),
             turn_id: "turn".into(),
             origin_device: device,
+            actor: margin_shared::person_id("eval"),
             provider: model.kind(),
             reasoning_effort: ReasoningEffort::Medium,
             history,

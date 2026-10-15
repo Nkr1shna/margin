@@ -78,7 +78,7 @@ async fn condense_calls_go_to_the_small_route() {
     small.push(Scripted::Events(text_reply(&["summary"])));
     let model = TracedModel::new(
         chat.clone(),
-        TurnTrace::new(&h.state, "c", "turn", None),
+        TurnTrace::new(&h.state, "c", "turn", None, "person/bootstrap"),
         "chat-model",
         "openai",
         None,
@@ -136,6 +136,7 @@ async fn the_pipeline_variants_are_listed() {
     let v: PipelineVariants = r.json().await.unwrap();
     for kind in [
         "chunker",
+        "rewriter",
         "retriever",
         "fusion",
         "reranker",
@@ -147,5 +148,22 @@ async fn the_pipeline_variants_are_listed() {
     assert!(v.stages["retriever"].contains(&"hybrid-linear".to_string()));
     let hybrid = v.variants.iter().find(|n| n.name == "hybrid").unwrap();
     assert_eq!(hybrid.config.retriever.name, "hybrid-linear");
-    assert!(v.variants.iter().all(|n| n.unavailable.is_none()));
+    // R2's model-backed variants are listed: the small-tasks ones run on the service's
+    // models; the cross-encoder ones are unavailable until the reranker model is
+    // downloaded, and say so.
+    for n in &v.variants {
+        if n.config.reranker.name == "onnx-crossencoder" {
+            let why = n.unavailable.as_deref().unwrap_or_default();
+            assert!(
+                why.contains("download the reranker model"),
+                "{}: {why}",
+                n.name
+            );
+        } else {
+            assert_eq!(n.unavailable, None, "{}", n.name);
+        }
+    }
+    for name in ["rerank-small", "rewrite-small", "r2-full", "rerank-xenc"] {
+        assert!(v.variants.iter().any(|n| n.name == name), "{name} missing");
+    }
 }

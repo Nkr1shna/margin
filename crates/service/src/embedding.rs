@@ -5,17 +5,21 @@
 //! handled the same way, and the re-index after the embedder changed reports its
 //! progress here.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::State;
-use margin_embed::{EmbedError, Embedder};
-use margin_shared::{EmbeddingModel, EmbeddingModelState, Event, SpeechModel};
+use axum::extract::{Query, State};
+use margin_embed::{EmbedError, Embedder, RerankerFiles, RerankerModel};
+use margin_shared::{EmbeddingModel, EmbeddingModelState, Event, RerankerModelState, SpeechModel};
+use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::principal::RequireAdmin;
 use crate::state::AppState;
-use crate::{ingest, sources};
+use crate::{ingest, rerank, sources};
 
 /// Download progress is sent at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -94,6 +98,7 @@ pub async fn model(state: &AppState) -> EmbeddingModel {
         repo: state.model_files.backend.repo().into(),
         state: model_state,
         speech: speech(state).await,
+        reranker: Some(reranker(state).await),
         reindex: *state.reindex.lock().unwrap(),
     };
     *state.last_model.lock().unwrap() = Some(model.clone());
@@ -188,8 +193,12 @@ pub async fn get_model(State(state): State<AppState>) -> Json<EmbeddingModel> {
 }
 
 /// Starts downloading the model in the background. Asking again while it downloads, or
-/// once it's downloaded, changes nothing.
-pub async fn start_download(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// once it's downloaded, changes nothing. The models are the organisation's: admins
+/// only (403 `admin_required`), like `PATCH /api/settings`.
+pub async fn start_download(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     let started = {
         // Serializes with deleting the model.
         let _w = state.write_lock.lock().await;
@@ -263,8 +272,11 @@ async fn run_download(state: AppState) {
     }
 }
 
-/// Deletes the downloaded model and unloads it. Not while it downloads.
-pub async fn delete_model(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// Deletes the downloaded model and unloads it. Not while it downloads. Admins only.
+pub async fn delete_model(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     {
         let _w = state.write_lock.lock().await;
         if matches!(
@@ -295,6 +307,7 @@ pub async fn delete_model(State(state): State<AppState>) -> AppResult<Json<Embed
 /// source tools have no speech model (a test fake).
 pub async fn start_speech_download(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
 ) -> AppResult<Json<EmbeddingModel>> {
     no_speech_model(&state)?;
     let started = {
@@ -316,6 +329,320 @@ pub async fn start_speech_download(
         emit_model(&state, &current);
         tokio::spawn(run_speech_download(state.clone()));
     }
+    Ok(Json(current))
+}
+
+// ---------------------------------------------------------------------------
+// The reranker model (R2, `docs/r2-brief.md` D5)
+// ---------------------------------------------------------------------------
+
+/// The reranker downloads' state, by the model's folder (`RerankerFiles::dir`, so one
+/// entry per model per service): a download running or how the last one failed, and the
+/// bytes a download fetches once Hugging Face has said. Lives on `App`
+/// (`App::reranker_jobs`).
+#[derive(Default)]
+pub struct RerankerJobs {
+    jobs: HashMap<PathBuf, ModelJob>,
+    download_bytes: HashMap<PathBuf, u64>,
+}
+
+fn reranker_jobs(state: &AppState) -> std::sync::MutexGuard<'_, RerankerJobs> {
+    state
+        .reranker_jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn reranker_job(state: &AppState, files: &RerankerFiles) -> ModelJob {
+    reranker_jobs(state)
+        .jobs
+        .get(&files.dir)
+        .cloned()
+        .unwrap_or(ModelJob::Idle)
+}
+
+fn set_reranker_job(state: &AppState, files: &RerankerFiles, job: ModelJob) {
+    let mut jobs = reranker_jobs(state);
+    if job == ModelJob::Idle {
+        jobs.jobs.remove(&files.dir);
+    } else {
+        jobs.jobs.insert(files.dir.clone(), job);
+    }
+}
+
+/// `model`'s download in this service's `data_dir/models`.
+pub fn reranker_files(state: &AppState, model: RerankerModel) -> RerankerFiles {
+    RerankerFiles::new(&state.config.models_dir(), model)
+}
+
+/// The model the pipeline's `"onnx-crossencoder"` reranker runs (`params.model`, its
+/// default when unnamed); `None` when another reranker is picked.
+fn pipeline_reranker(state: &AppState) -> Option<RerankerModel> {
+    let pipeline = state.pipeline.load();
+    let cfg = &pipeline.config.reranker;
+    if cfg.name != rerank::ONNX_CROSSENCODER {
+        return None;
+    }
+    match cfg.params.get("model").and_then(|v| v.as_str()) {
+        Some(name) => RerankerModel::from_name(name),
+        None => Some(RerankerModel::DEFAULT),
+    }
+}
+
+/// The reranker model `EmbeddingModel.reranker` shows: one downloading (or whose
+/// download failed), else the one the pipeline runs, else one on disk, else the
+/// default.
+async fn shown_reranker(state: &AppState) -> RerankerModel {
+    let models_dir = state.config.models_dir();
+    let busy = {
+        let jobs = reranker_jobs(state);
+        RerankerModel::ALL.into_iter().find(|m| {
+            jobs.jobs
+                .contains_key(&RerankerFiles::new(&models_dir, *m).dir)
+        })
+    };
+    if let Some(model) = busy.or_else(|| pipeline_reranker(state)) {
+        return model;
+    }
+    tokio::task::spawn_blocking(move || {
+        RerankerModel::ALL
+            .into_iter()
+            .find(|m| RerankerFiles::new(&models_dir, *m).is_complete())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(RerankerModel::DEFAULT)
+}
+
+/// Whether `files` holds a finished download, and its size.
+async fn reranker_on_disk(files: &RerankerFiles) -> (bool, u64) {
+    let files = files.clone();
+    tokio::task::spawn_blocking(move || {
+        if files.is_complete() {
+            (true, files.size_on_disk())
+        } else {
+            (false, 0)
+        }
+    })
+    .await
+    .unwrap_or((false, 0))
+}
+
+/// Bytes `files`' download fetches: asked of Hugging Face once, then remembered. 0
+/// while it can't be reached.
+async fn reranker_download_bytes(state: &AppState, files: &RerankerFiles) -> u64 {
+    if let Some(bytes) = reranker_jobs(state).download_bytes.get(&files.dir) {
+        return *bytes;
+    }
+    match files.remote_size(&state.http, &state.hf_base).await {
+        Ok(bytes) => {
+            reranker_jobs(state)
+                .download_bytes
+                .insert(files.dir.clone(), bytes);
+            bytes
+        }
+        Err(e) => {
+            tracing::info!(
+                "couldn't get the reranker model {}'s download size: {e}",
+                files.model.name()
+            );
+            0
+        }
+    }
+}
+
+/// The reranker part of `EmbeddingModel`.
+async fn reranker(state: &AppState) -> RerankerModelState {
+    let model = shown_reranker(state).await;
+    reranker_state(state, model).await
+}
+
+async fn reranker_state(state: &AppState, model: RerankerModel) -> RerankerModelState {
+    let files = reranker_files(state, model);
+    let model_state = match reranker_job(state, &files) {
+        ModelJob::Downloading { received, total } => {
+            EmbeddingModelState::Downloading { received, total }
+        }
+        ModelJob::Failed { error } => EmbeddingModelState::Failed { error },
+        ModelJob::Idle => match reranker_on_disk(&files).await {
+            (true, bytes) => EmbeddingModelState::Ready { bytes },
+            (false, _) => EmbeddingModelState::NotDownloaded {
+                download_bytes: reranker_download_bytes(state, &files).await,
+            },
+        },
+    };
+    RerankerModelState {
+        name: model.name().into(),
+        repo: model.repo().into(),
+        state: model_state,
+    }
+}
+
+/// `?model=NAME` on the reranker routes: which cross-encoder (`RerankerModel::name`);
+/// without it, the one `EmbeddingModel.reranker` shows.
+#[derive(Debug, Default, Deserialize)]
+pub struct RerankerQuery {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+async fn pick_reranker(state: &AppState, query: &RerankerQuery) -> AppResult<RerankerModel> {
+    match query.model.as_deref() {
+        None | Some("") => Ok(shown_reranker(state).await),
+        Some(name) => RerankerModel::from_name(name).ok_or_else(|| {
+            let known: Vec<&str> = RerankerModel::ALL.iter().map(|m| m.name()).collect();
+            AppError::bad_request(format!(
+                "There is no reranker model named \"{name}\" (known: {}).",
+                known.join(", ")
+            ))
+        }),
+    }
+}
+
+/// The whole `EmbeddingModel` with `model` as its reranker part.
+async fn model_showing(state: &AppState, model: RerankerModel) -> EmbeddingModel {
+    let mut current = self::model(state).await;
+    if current.reranker.as_ref().map(|r| r.name.as_str()) != Some(model.name()) {
+        current.reranker = Some(reranker_state(state, model).await);
+        *state.last_model.lock().unwrap() = Some(current.clone());
+    }
+    current
+}
+
+/// `GET routes::RERANKER_MODEL[?model=NAME]` (R2): the `EmbeddingModel`, its
+/// `reranker` part for `model` (or the one it shows).
+pub async fn get_reranker(
+    State(state): State<AppState>,
+    Query(query): Query<RerankerQuery>,
+) -> AppResult<Json<EmbeddingModel>> {
+    let model = pick_reranker(&state, &query).await?;
+    Ok(Json(model_showing(&state, model).await))
+}
+
+/// `POST routes::RERANKER_MODEL_DOWNLOAD[?model=NAME]` (R2): starts downloading the
+/// reranker model in the background. Asking again while it downloads, or once it's
+/// downloaded, changes nothing; one reranker downloads at a time (409
+/// "model_downloading" while another does). The models are the organisation's: admins
+/// only (403 `admin_required`), like the embedding and speech models.
+pub async fn start_reranker_download(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+    Query(query): Query<RerankerQuery>,
+) -> AppResult<Json<EmbeddingModel>> {
+    let model = pick_reranker(&state, &query).await?;
+    let files = reranker_files(&state, model);
+    let started = {
+        let _w = state.write_lock.lock().await;
+        let models_dir = state.config.models_dir();
+        let other = RerankerModel::ALL.into_iter().find(|m| {
+            *m != model
+                && matches!(
+                    reranker_job(&state, &RerankerFiles::new(&models_dir, *m)),
+                    ModelJob::Downloading { .. }
+                )
+        });
+        if let Some(other) = other {
+            return Err(AppError::conflict(
+                "model_downloading",
+                format!(
+                    "The reranker model {} is still downloading. Download {} once it finishes.",
+                    other.name(),
+                    model.name()
+                ),
+            ));
+        }
+        let downloading = matches!(reranker_job(&state, &files), ModelJob::Downloading { .. });
+        if downloading || reranker_on_disk(&files).await.0 {
+            false
+        } else {
+            let total = reranker_jobs(&state)
+                .download_bytes
+                .get(&files.dir)
+                .copied()
+                .unwrap_or(0);
+            set_reranker_job(&state, &files, ModelJob::Downloading { received: 0, total });
+            true
+        }
+    };
+    let current = model_showing(&state, model).await;
+    if started {
+        emit_model(&state, &current);
+        tokio::spawn(run_reranker_download(state.clone(), files));
+    }
+    Ok(Json(current))
+}
+
+async fn run_reranker_download(state: AppState, files: RerankerFiles) {
+    let name = files.model.name();
+    let last_sent = Mutex::new(Instant::now());
+    let progress = |received: u64, total: u64| {
+        if !matches!(reranker_job(&state, &files), ModelJob::Downloading { .. }) {
+            return;
+        }
+        set_reranker_job(&state, &files, ModelJob::Downloading { received, total });
+        let mut last = last_sent.lock().unwrap();
+        if last.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        *last = Instant::now();
+        emit_changed(&state, |m| {
+            if let Some(r) = m.reranker.as_mut().filter(|r| r.name == name) {
+                r.state = EmbeddingModelState::Downloading { received, total };
+            }
+        });
+    };
+    let result = files
+        .download(&state.download_http, &state.hf_base, &progress)
+        .await;
+    match &result {
+        Ok(()) => {
+            tracing::info!("the reranker model {name} is downloaded");
+            set_reranker_job(&state, &files, ModelJob::Idle);
+        }
+        Err(e) => {
+            tracing::warn!("reranker model {name} download failed: {e}");
+            set_reranker_job(
+                &state,
+                &files,
+                ModelJob::Failed {
+                    error: e.to_string(),
+                },
+            );
+        }
+    }
+    emit_model(&state, &model_showing(&state, files.model).await);
+}
+
+/// `DELETE routes::RERANKER_MODEL[?model=NAME]` (R2): removes the reranker model's
+/// files (and forgets a failed download). Not while it downloads. A pipeline running
+/// it fails its reranking from then on, which keeps the fused order (traced
+/// `rerank_failed`), until it is downloaded again or another reranker is picked. Admins
+/// only.
+pub async fn delete_reranker(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+    Query(query): Query<RerankerQuery>,
+) -> AppResult<Json<EmbeddingModel>> {
+    let model = pick_reranker(&state, &query).await?;
+    let files = reranker_files(&state, model);
+    {
+        let _w = state.write_lock.lock().await;
+        if matches!(reranker_job(&state, &files), ModelJob::Downloading { .. }) {
+            return Err(AppError::conflict(
+                "model_downloading",
+                "The reranker model is still downloading. Delete it once the download finishes.",
+            ));
+        }
+        let removing = files.clone();
+        tokio::task::spawn_blocking(move || removing.remove())
+            .await
+            .map_err(AppError::internal)?
+            .map_err(AppError::internal)?;
+        set_reranker_job(&state, &files, ModelJob::Idle);
+    }
+    let current = model_showing(&state, model).await;
+    emit_model(&state, &current);
     Ok(Json(current))
 }
 
@@ -370,8 +697,12 @@ async fn run_speech_download(state: AppState) {
     emit_model(&state, &model(&state).await);
 }
 
-/// Deletes the downloaded speech model and unloads it. Not while it downloads.
-pub async fn delete_speech(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// Deletes the downloaded speech model and unloads it. Not while it downloads. Admins
+/// only.
+pub async fn delete_speech(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     no_speech_model(&state)?;
     {
         let _w = state.write_lock.lock().await;

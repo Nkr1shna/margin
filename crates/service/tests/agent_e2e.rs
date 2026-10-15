@@ -832,7 +832,7 @@ async fn a_course_a_delete_and_an_overwrite_run_through_the_real_client() {
         .json()
         .await
         .unwrap();
-    let phone_id = me.device.id;
+    let phone_id = me.device.unwrap().id;
     let r = h
         .patch(&t, "/api/settings")
         .json(&json!({"openai_base_url": openai, "openai_model": "test-model"}))

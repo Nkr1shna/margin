@@ -363,6 +363,6 @@ pub fn forget(handle: &FolderHandle) {
         Ok(())
     });
     if let Err(error) = released {
-        eprintln!("folders: couldn't release a folder's grant: {error}");
+        tracing::warn!("folders: couldn't release a folder's grant: {error}");
     }
 }

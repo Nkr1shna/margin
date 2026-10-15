@@ -343,7 +343,20 @@ mod tests {
         }
         names.sort_by(|a, b| a.0.cmp(&b.0));
         let stems: Vec<&str> = names.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(stems, ["baseline", "bm25", "dense", "hybrid"]);
+        assert_eq!(
+            stems,
+            [
+                "baseline",
+                "bm25",
+                "dense",
+                "hybrid",
+                "r2-full",
+                "rerank-small",
+                "rerank-xenc",
+                "rerank-xenc-bge",
+                "rewrite-small"
+            ]
+        );
         let baseline = &names[0].1;
         assert_eq!(
             baseline,
@@ -351,7 +364,7 @@ mod tests {
             "baseline is the shipped default"
         );
         let hashes: HashSet<String> = names.iter().map(|(_, c)| c.hash()).collect();
-        assert_eq!(hashes.len(), 4, "every variant differs");
+        assert_eq!(hashes.len(), names.len(), "every variant differs");
     }
 
     #[test]

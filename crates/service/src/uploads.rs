@@ -7,17 +7,17 @@
 
 use std::path::PathBuf;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use margin_shared::{Id, Source, SourceUpload, routes::UPLOAD_PART_BYTES};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::CurrentDevice;
 use crate::error::{AppError, AppResult};
+use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentDevice, CurrentPrincipal, Principal};
 use crate::sources::{self, FILE_NAME, Upload, UploadQuery, content_length, receive, remove_dir};
 use crate::state::{AppState, new_id};
 
@@ -59,7 +59,17 @@ fn dir(state: &AppState, id: &str) -> AppResult<PathBuf> {
     Ok(state.config.uploads_dir().join(id))
 }
 
-async fn meta(state: &AppState, id: &str) -> AppResult<(PathBuf, Meta)> {
+/// The upload, when it is `p`'s (404 for anyone else's: it doesn't exist for them).
+async fn meta(state: &AppState, p: &Principal, id: &str) -> AppResult<(PathBuf, Meta)> {
+    let (dir, meta) = any_meta(state, id).await?;
+    let owner = meta.upload.owner.as_deref().unwrap_or(BOOTSTRAP_PERSON_ID);
+    if owner != p.person_id {
+        return Err(AppError::not_found("upload"));
+    }
+    Ok((dir, meta))
+}
+
+async fn any_meta(state: &AppState, id: &str) -> AppResult<(PathBuf, Meta)> {
     let dir = dir(state, id)?;
     let bytes = match tokio::fs::read(dir.join(META_FILE)).await {
         Ok(b) => b,
@@ -118,7 +128,8 @@ impl Drop for Busy<'_> {
 /// kind's limit; a folder's files have none) and starts an upload in parts.
 pub async fn start(
     State(state): State<AppState>,
-    Extension(CurrentDevice(device)): Extension<CurrentDevice>,
+    CurrentPrincipal(p): CurrentPrincipal,
+    CurrentDevice(device): CurrentDevice,
     query: Result<Query<StartQuery>, QueryRejection>,
 ) -> AppResult<Json<SourceUpload>> {
     let Query(q) =
@@ -130,7 +141,7 @@ pub async fn start(
         workspace_id: q.workspace_id,
         modified: q.modified,
     };
-    let upload = Upload::check(&state, source, &device).await?;
+    let upload = Upload::check(&state, source, &p, &device).await?;
     if q.bytes > upload.limit() {
         return Err(upload.too_large());
     }
@@ -161,9 +172,10 @@ pub async fn start(
 /// `GET /api/source-uploads/{id}`: how much of it the service has.
 pub async fn get(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<SourceUpload>> {
-    let (dir, meta) = meta(&state, &id).await?;
+    let (dir, meta) = meta(&state, &p, &id).await?;
     Ok(Json(SourceUpload {
         id,
         bytes: meta.bytes,
@@ -176,6 +188,7 @@ pub async fn get(
 /// otherwise; `GET` says where to go on).
 pub async fn put_part(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
     headers: HeaderMap,
     query: Result<Query<PartQuery>, QueryRejection>,
@@ -183,7 +196,7 @@ pub async fn put_part(
 ) -> AppResult<Json<SourceUpload>> {
     let Query(q) =
         query.map_err(|rej| AppError::new(rej.status(), "bad_request", rej.body_text()))?;
-    let (dir, meta) = meta(&state, &id).await?;
+    let (dir, meta) = meta(&state, &p, &id).await?;
     let _busy = Busy::claim(&state, &id)?;
     let have = received(&dir).await?;
     if q.offset != have {
@@ -235,8 +248,12 @@ fn part_too_large(meta: &Meta, have: u64) -> AppError {
 
 /// `POST /api/source-uploads/{id}/finish`: the whole file is there; it becomes a Queued
 /// source (409 "incomplete_upload" while parts are missing).
-pub async fn finish(State(state): State<AppState>, Path(id): Path<Id>) -> AppResult<Json<Source>> {
-    let (dir, meta) = meta(&state, &id).await?;
+pub async fn finish(
+    State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
+    Path(id): Path<Id>,
+) -> AppResult<Json<Source>> {
+    let (dir, meta) = meta(&state, &p, &id).await?;
     let _busy = Busy::claim(&state, &id)?;
     let have = received(&dir).await?;
     if have != meta.bytes {
@@ -285,8 +302,12 @@ pub async fn finish(State(state): State<AppState>, Path(id): Path<Id>) -> AppRes
 }
 
 /// `DELETE /api/source-uploads/{id}`: gives an upload up.
-pub async fn cancel(State(state): State<AppState>, Path(id): Path<Id>) -> AppResult<StatusCode> {
-    let (dir, _) = meta(&state, &id).await?;
+pub async fn cancel(
+    State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
+    Path(id): Path<Id>,
+) -> AppResult<StatusCode> {
+    let (dir, _) = meta(&state, &p, &id).await?;
     let _busy = Busy::claim(&state, &id)?;
     remove_dir(&dir).await;
     Ok(StatusCode::NO_CONTENT)

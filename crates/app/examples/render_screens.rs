@@ -31,6 +31,13 @@
 //!   stages with `take-k` packing ("Custom" in the variant picker). Settings → AI always
 //!   shows the stage pickers, over the fake's variants, and each provider's models (with
 //!   their windows) where it has a credential.
+//!   `RENDER_PIPELINE=r2` sets the r2-full variant's stages (the Rewriter and the
+//!   listwise reranker).
+//! - `RENDER_RERANKER=missing|downloading|ready|failed` (with `RENDER_EMBEDDING`) adds the
+//!   reranker model to Settings → Sources in that state; `ready` also makes the
+//!   cross-encoder's variants available in Settings → AI.
+//! - The sample lessons say what wrote them in their details line (`/lesson/l1`: Claude,
+//!   `/lesson/l2`: OpenAI); `l3` failed, so it has none.
 //! - `RENDER_PROVIDER=claude` makes Claude the default provider, with its key set (the new
 //!   chat's picker preset to it; `RENDER_PROVIDER=claude-nokey` without the key, so the
 //!   new chat says to set it up). Chat `c3` is on Claude, with a web search, its results
@@ -38,6 +45,10 @@
 //! - `RENDER_CHATGPT=waiting|signed_in|failed` sets where "Sign in with ChatGPT" is
 //!   (Settings → AI); signed in, ChatGPT can be picked for a new chat.
 //! - `RENDER_SETTINGS=advanced` shows trace retention.
+//! - `RENDER_SETTINGS=organisation` shows people, invitations, groups and agents (and
+//!   `account` the person, My settings and devices per person) as the owner;
+//!   `RENDER_AS=member` signs in as Bob, a member, instead (Settings → AI, Voice & video
+//!   and Advanced then show the organisation's values read-only).
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
@@ -63,6 +74,8 @@ mod citations;
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/diagnostics.rs"]
+mod diagnostics;
 #[path = "../src/drafts.rs"]
 mod drafts;
 #[path = "../src/fake.rs"]
@@ -71,6 +84,8 @@ mod fake;
 mod folders;
 #[path = "../src/markdown.rs"]
 mod markdown;
+#[path = "../src/org.rs"]
+mod org;
 #[path = "../src/picker/mod.rs"]
 mod picker;
 #[path = "../src/routes.rs"]
@@ -215,7 +230,21 @@ fn Harness(props: HarnessProps) -> Element {
                 }
             }
         }
-        lib.pipeline_variants = Some(fake::fake_pipeline_variants());
+        if std::env::var("RENDER_PIPELINE").as_deref() == Ok("r2")
+            && let Some(settings) = lib.settings.as_mut()
+        {
+            let variants = fake::fake_pipeline_variants();
+            if let Some(full) = variants.variants.iter().find(|v| v.name == "r2-full") {
+                settings.pipeline = settings.pipeline.with_stages_of(&full.config);
+            }
+        }
+        // The cross-encoder's variants are available once its model is downloaded.
+        lib.pipeline_variants = Some(match std::env::var("RENDER_RERANKER").as_deref() {
+            Ok("ready") => fake::pipeline_variants_with(Some(&EmbeddingModelState::Ready {
+                bytes: fake::RERANKER_DOWNLOAD_BYTES,
+            })),
+            _ => fake::fake_pipeline_variants(),
+        });
         // The text and code sources' originals, so the viewer shows their cited lines
         // (the fetch it would make doesn't run here).
         for source in lib.sources.values() {
@@ -254,6 +283,28 @@ fn Harness(props: HarnessProps) -> Element {
                     done: 212,
                     total: 1480,
                 }),
+                // R2's reranker model (Settings → Sources).
+                reranker: std::env::var("RENDER_RERANKER").ok().map(|state| {
+                    margin_shared::RerankerModelState {
+                        name: fake::RERANKER_NAME.into(),
+                        repo: fake::RERANKER_REPO.into(),
+                        state: match state.as_str() {
+                            "downloading" => EmbeddingModelState::Downloading {
+                                received: 9_400_000,
+                                total: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                            "ready" => EmbeddingModelState::Ready {
+                                bytes: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                            "failed" => EmbeddingModelState::Failed {
+                                error: "Hugging Face answered 503.".into(),
+                            },
+                            _ => EmbeddingModelState::NotDownloaded {
+                                download_bytes: fake::RERANKER_DOWNLOAD_BYTES,
+                            },
+                        },
+                    }
+                }),
             });
         let uploads = match std::env::var("RENDER_SOURCES") {
             Ok(topic_id) if std::env::var_os("RENDER_UPLOADS").is_some() => {
@@ -287,19 +338,33 @@ fn Harness(props: HarnessProps) -> Element {
                 .into_iter()
                 .find(|p| format!("{p:?}").eq_ignore_ascii_case(&name))
         });
+        // The organisation: Alice (owner) and Bob (member), their groups, agents and
+        // devices; RENDER_AS=member signs in as Bob, who sees only his own agents and
+        // devices and no invitations.
+        let member = std::env::var("RENDER_AS").as_deref() == Ok("member");
+        let org = fake::FakeState::new();
+        lib.replace_people(org.people.clone());
+        lib.replace_groups(org.groups.clone());
+        lib.replace_agents(org.agents.clone());
+        lib.replace_invitations(org.invitations.clone());
+        lib.replace_devices(org.devices.clone());
+        if member {
+            lib.agents.retain(|_, a| a.owner_id == fake::BOB);
+            lib.invitations.clear();
+            lib.devices
+                .retain(|_, d| d.person_id.as_deref() == Some(fake::BOB));
+        }
+        let mut me = fake::sample_me(if member { fake::TOKEN_BOB } else { fake::TOKEN });
+        if let Some(device) = me.device.as_mut()
+            && !member
+        {
+            device.name = "Krishna's MacBook".into();
+            device.last_seen_at = Some(Utc::now());
+            device.online = true;
+        }
         let session = (!connect).then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
-            me: Some(Me {
-                github_login: "Nkr1shna".into(),
-                device: Device {
-                    id: "d1".into(),
-                    name: "Krishna's MacBook".into(),
-                    created_at: Utc::now(),
-                    last_seen_at: Some(Utc::now()),
-                    current: true,
-                    online: true,
-                },
-            }),
+            me: Some(me),
         });
         AppCtx {
             config: Signal::new(config::LocalConfig {
@@ -462,6 +527,9 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
     };
     let done = |mut upload: Upload, id: &str, status: SourceStatus, lib: &mut LibraryState| {
         let source = margin_shared::Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: None,
             id: id.into(),
             topic_id: Some(topic_id.to_string()),
@@ -475,7 +543,7 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
             modified: None,
         };
         lib.sources.insert(source.id.clone(), source.clone());
-        upload.state = UploadState::Done(source);
+        upload.state = UploadState::Done(Box::new(source));
         upload
     };
     let mut failed = file("scan.pdf", None, 9_800_000);

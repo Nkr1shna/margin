@@ -12,14 +12,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use margin_ai::LessonContext;
+use margin_ai::{
+    CallOptions, LessonContext, ModelWindow, Ranked, RerankCandidate, RewriteInput, TextModel,
+};
 use margin_embed::{Chunk, Extracted, SourceKind};
-use margin_shared::Citation;
 use margin_shared::context::{Modality, Scope};
-use margin_shared::pipeline::{PipelineConfig, RouteTable, StageCfg};
+use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose, RouteTable, StageCfg};
+use margin_shared::text::for_model;
+use margin_shared::{Citation, Provider};
 
 use crate::db::{PassageRow, Store};
 use crate::engines::BoxFuture;
+use crate::retrieval::QueryPlan;
+use crate::trace::Tracer;
 
 // ---------------------------------------------------------------------------
 // What flows between stages
@@ -169,9 +174,159 @@ pub trait Fusion: Send + Sync {
     fn fuse(&self, legs: Vec<Vec<Hit>>, cfg: &FusionCfg) -> Vec<Hit>;
 }
 
+/// What a reranker is reranking for (R2, `docs/r2-brief.md` D1).
+#[derive(Debug, Clone, Copy)]
+pub struct RerankRequest<'a> {
+    /// The plan's first string, then the others as "Also asked:" lines
+    /// (`routes::RERANK_QUERY_CHARS`).
+    pub query: &'a str,
+    pub purpose: RetrievalPurpose,
+    /// The chat's provider for agent searches; `None` = the default provider (jobs, the
+    /// context API).
+    pub provider: Option<Provider>,
+    pub trace_id: &'a str,
+    /// `job_id` for the model-call trace row (lesson or proposal id), when there is one.
+    pub job_id: Option<&'a str>,
+}
+
+/// Reorders fused candidates. A reranker sets `rerank = Some(grade or score)` on every
+/// hit it saw and rewrites `score` to `grade + fused score min-max scaled into [0, 1)`
+/// (logits scaled to `[0, 4)` for a cross-encoder), keeping `dense_rank`/`lex_rank`, and
+/// returns the list sorted by `score` descending; hits it didn't see keep their fused
+/// score and follow. On a failure the caller keeps the fused order.
 pub trait Reranker: Send + Sync {
     fn name(&self) -> &'static str;
-    fn rerank<'a>(&'a self, q: &'a str, hits: Vec<Hit>) -> BoxFuture<'a, anyhow::Result<Vec<Hit>>>;
+    fn rerank<'a>(
+        &'a self,
+        req: &'a RerankRequest<'a>,
+        hits: Vec<Hit>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Hit>>>;
+}
+
+/// What a query rewriter is rewriting for (R2, `docs/r2-brief.md` D3).
+#[derive(Debug, Clone, Copy)]
+pub struct RewriteRequest<'a> {
+    pub purpose: RetrievalPurpose,
+    pub provider: Option<Provider>,
+    pub trace_id: &'a str,
+    pub job_id: Option<&'a str>,
+    /// What the scope holds, for the prompt: up to 12 document names ("notes/paper.pdf",
+    /// …). Never passage text.
+    pub scope_names: &'a [String],
+}
+
+/// Turns a job's query strings into more strings to retrieve with (before embedding).
+/// On a failure the caller keeps the plan as it was.
+pub trait Rewriter: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn rewrite<'a>(
+        &'a self,
+        req: &'a RewriteRequest<'a>,
+        plan: QueryPlan,
+    ) -> BoxFuture<'a, anyhow::Result<QueryPlan>>;
+}
+
+/// What a model-backed stage calls: the small-tasks model of a provider, as a
+/// `TextModel`, plus what the trace row needs. The service backs it with
+/// `model_for(Route::Small, provider)` + `Generator::text_model` (`small.rs`); the eval
+/// runner with its own clients (`live.rs`); tests with a fake.
+pub trait SmallModels: Send + Sync {
+    /// `None` = the default provider.
+    fn small<'a>(&'a self, provider: Option<Provider>)
+    -> BoxFuture<'a, anyhow::Result<SmallModel>>;
+
+    /// The listwise rerank call (`margin_ai::rerank`) on `small`. The service routes it
+    /// through `Generator::rerank` and records its `model_call` row (`small.rs`); the
+    /// default calls `small.model` directly, untraced (the eval runner's clients).
+    fn rerank<'a>(
+        &'a self,
+        small: &'a SmallModel,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+        call: SmallCall<'a>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Ranked>>> {
+        let _ = call;
+        Box::pin(async move {
+            Ok(margin_ai::rerank(&*small.model, query, candidates, opts)
+                .await?
+                .value)
+        })
+    }
+
+    /// The query rewrite call (`margin_ai::rewrite_queries`) on `small`; routed and
+    /// traced by the service as `rerank` is.
+    fn rewrite_queries<'a>(
+        &'a self,
+        small: &'a SmallModel,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+        call: SmallCall<'a>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        let _ = call;
+        Box::pin(async move {
+            Ok(margin_ai::rewrite_queries(&*small.model, input, opts)
+                .await?
+                .value)
+        })
+    }
+
+    /// The local cross-encoder `model` (`"onnx-crossencoder"`), loaded on its first
+    /// `score`. An error when it isn't downloaded, so the stage's constructor fails and
+    /// Settings shows the variant as unavailable. The default has none.
+    fn cross_encoder(
+        &self,
+        model: margin_embed::RerankerModel,
+    ) -> anyhow::Result<Arc<dyn margin_embed::Reranker>> {
+        anyhow::bail!(
+            "the reranker model \"{}\" isn't available here; download the reranker model in Settings → Sources first",
+            model.name()
+        )
+    }
+}
+
+/// Where a stage's small-model call sits in the trace: the retrieval's `trace_id`, the
+/// job it serves (the lesson id) and the retrieval row it is a child of.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SmallCall<'a> {
+    pub trace_id: &'a str,
+    pub job_id: Option<&'a str>,
+    /// The retrieval row's id (`parent_id` of the `model_call` row).
+    pub parent_id: Option<&'a str>,
+}
+
+/// What a model-backed stage needs from the retrieval it runs in, set by `retrieve`
+/// around the rewriter and the reranker (`with_retrieval`): the retrieval row's id (the
+/// `parent_id` of their `model_call` rows) and the budget's `passages_min` (a grade-0
+/// drop never goes below it). Outside a retrieval (the eval index) it is absent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RetrievalCtx {
+    pub row_id: String,
+    pub passages_min: usize,
+}
+
+tokio::task_local! {
+    static RETRIEVAL: RetrievalCtx;
+}
+
+/// Runs `f` with `ctx` as the current retrieval's context.
+pub async fn with_retrieval<F: std::future::Future>(ctx: RetrievalCtx, f: F) -> F::Output {
+    RETRIEVAL.scope(ctx, f).await
+}
+
+/// The current retrieval's context, when a stage runs inside `retrieve`.
+pub fn retrieval_ctx() -> Option<RetrievalCtx> {
+    RETRIEVAL.try_with(Clone::clone).ok()
+}
+
+/// A provider's small-tasks model, resolved.
+#[derive(Clone)]
+pub struct SmallModel {
+    pub model: Arc<dyn TextModel>,
+    pub provider: Provider,
+    /// The model id, for the trace row.
+    pub id: String,
+    pub window: ModelWindow,
 }
 
 pub trait Packer: Send + Sync {
@@ -190,10 +345,28 @@ pub trait PromptSet: Send + Sync {
 // Registry and Pipeline
 // ---------------------------------------------------------------------------
 
-/// What stage constructors may use.
+/// What stage constructors may use. A stage that needs a model and finds `models`
+/// `None` fails in its constructor ("the reranker \"listwise-small\" needs a small-tasks
+/// model; none is configured here"), so `Pipeline::build` and Settings show it as
+/// unavailable.
 #[derive(Clone)]
 pub struct StageDeps {
     pub store: Store,
+    /// The small-tasks models (R2); `None` in tests and wherever no model is configured.
+    pub models: Option<Arc<dyn SmallModels>>,
+    /// Where model-backed stages record their `model_call` rows (R2); `None` = untraced.
+    pub tracer: Option<Arc<Tracer>>,
+}
+
+impl StageDeps {
+    /// Just the store: no models, no tracer.
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            models: None,
+            tracer: None,
+        }
+    }
 }
 
 type Ctor<T> = Arc<dyn Fn(&StageCfg, &StageDeps) -> anyhow::Result<Arc<T>> + Send + Sync>;
@@ -206,6 +379,7 @@ pub enum StageCtor {
     Reranker(Ctor<dyn Reranker>),
     Packer(Ctor<dyn Packer>),
     Prompts(Ctor<dyn PromptSet>),
+    Rewriter(Ctor<dyn Rewriter>),
 }
 
 impl StageCtor {
@@ -217,6 +391,7 @@ impl StageCtor {
             StageCtor::Reranker(_) => "reranker",
             StageCtor::Packer(_) => "packer",
             StageCtor::Prompts(_) => "prompts",
+            StageCtor::Rewriter(_) => "rewriter",
         }
     }
 }
@@ -259,6 +434,8 @@ impl Registry {
         register_trivial(&mut reg);
         crate::ingest::register(&mut reg);
         crate::retrieval::register(&mut reg);
+        crate::rerank::register(&mut reg);
+        crate::rewrite::register(&mut reg);
         for b in margin_embed::Backend::ALL {
             reg.register_embedder(b.name());
         }
@@ -328,6 +505,7 @@ pub struct Pipeline {
     pub reranker: Arc<dyn Reranker>,
     pub packer: Arc<dyn Packer>,
     pub prompts: Arc<dyn PromptSet>,
+    pub rewriter: Arc<dyn Rewriter>,
     pub routes: RouteTable,
 }
 
@@ -356,6 +534,7 @@ impl Pipeline {
             reranker: stage!("reranker", Reranker, &cfg.reranker),
             packer: stage!("packer", Packer, &cfg.packer),
             prompts: stage!("prompts", Prompts, &prompts_cfg),
+            rewriter: stage!("rewriter", Rewriter, &cfg.rewriter),
             routes: cfg.routes.clone(),
         })
     }
@@ -377,6 +556,10 @@ fn register_trivial(reg: &mut Registry) {
     reg.register(
         "none",
         StageCtor::Reranker(Arc::new(|_, _| Ok(Arc::new(NoRerank)))),
+    );
+    reg.register(
+        "none",
+        StageCtor::Rewriter(Arc::new(|_, _| Ok(Arc::new(NoRewrite)))),
     );
     reg.register(
         "take-k",
@@ -429,10 +612,26 @@ impl Reranker for NoRerank {
     }
     fn rerank<'a>(
         &'a self,
-        _q: &'a str,
+        _req: &'a RerankRequest<'a>,
         hits: Vec<Hit>,
     ) -> BoxFuture<'a, anyhow::Result<Vec<Hit>>> {
         Box::pin(async move { Ok(hits) })
+    }
+}
+
+/// Retrieves with the plan as it is.
+pub struct NoRewrite;
+
+impl Rewriter for NoRewrite {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+    fn rewrite<'a>(
+        &'a self,
+        _req: &'a RewriteRequest<'a>,
+        plan: QueryPlan,
+    ) -> BoxFuture<'a, anyhow::Result<QueryPlan>> {
+        Box::pin(async move { Ok(plan) })
     }
 }
 
@@ -486,6 +685,30 @@ impl Packer for TakeK {
             })
             .collect()
     }
+}
+
+/// The hits as the rerank prompt's candidates (ids are passage ids), labelled by
+/// `RerankCandidate::new`: "notes/paper.pdf, p. 3, Fourier series > Coefficients" (the
+/// document's name from `names`, else its id; then the page and the section when it
+/// has them). Name, section and text pass `text::for_model` (phase 5) as every passage
+/// does before a model reads it.
+pub fn rerank_candidates(hits: &[Hit], names: &HashMap<String, String>) -> Vec<RerankCandidate> {
+    hits.iter()
+        .map(|h| {
+            let p = &h.passage;
+            let document = names
+                .get(&p.document_id)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(&p.document_id);
+            RerankCandidate::new(
+                &p.id,
+                &for_model(document),
+                p.page.and_then(|n| u32::try_from(n).ok()),
+                &for_model(&p.section_path),
+                for_model(&p.text),
+            )
+        })
+        .collect()
 }
 
 /// The constant-first lesson, planner and rerank prompts of `margin_ai::prompts`
@@ -550,19 +773,10 @@ impl PromptSet for LessonV2 {
         };
         from_ai(margin_ai::prompts::plan(&req))
     }
+    /// Candidates labelled by document id; the `"listwise-small"` stage labels them by
+    /// document name (`rerank_candidates` with the names it looked up).
     fn rerank(&self, query: &str, hits: &[Hit]) -> Prompt {
-        let candidates: Vec<margin_ai::RerankCandidate> = hits
-            .iter()
-            .map(|h| margin_ai::RerankCandidate {
-                id: h.passage.id.clone(),
-                label: if h.passage.section_path.is_empty() {
-                    h.passage.document_id.clone()
-                } else {
-                    format!("{}, {}", h.passage.document_id, h.passage.section_path)
-                },
-                text: h.passage.text.clone(),
-            })
-            .collect();
+        let candidates = rerank_candidates(hits, &HashMap::new());
         from_ai(margin_ai::prompts::rerank(query, &candidates))
     }
 }
@@ -572,9 +786,7 @@ mod tests {
     use super::*;
 
     async fn registry() -> Registry {
-        Registry::standard(StageDeps {
-            store: Store::memory().await.unwrap(),
-        })
+        Registry::standard(StageDeps::new(Store::memory().await.unwrap()))
     }
 
     fn trivial() -> PipelineConfig {
@@ -724,7 +936,24 @@ mod tests {
         let reg = registry().await;
         let p = Pipeline::build(&trivial(), &reg).unwrap();
         let hits = vec![hit("alpha", 0, 0.9), hit("beta", 1, 0.5)];
-        let hits = p.reranker.rerank("alpha", hits).await.unwrap();
+        let req = RerankRequest {
+            query: "alpha",
+            purpose: RetrievalPurpose::Agent,
+            provider: None,
+            trace_id: "t",
+            job_id: None,
+        };
+        let hits = p.reranker.rerank(&req, hits).await.unwrap();
+        assert_eq!(p.rewriter.name(), "none");
+        let rw = RewriteRequest {
+            purpose: RetrievalPurpose::Agent,
+            provider: None,
+            trace_id: "t",
+            job_id: None,
+            scope_names: &[],
+        };
+        let plan = QueryPlan::single("gibbs");
+        assert_eq!(p.rewriter.rewrite(&rw, plan.clone()).await.unwrap(), plan);
         let fused = p.fusion.fuse(
             vec![hits],
             &FusionCfg {

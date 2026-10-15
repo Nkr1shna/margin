@@ -174,11 +174,212 @@ pub fn check_citations(
     out
 }
 
+// ---------------------------------------------------------------------------
+// The prompt lock (R2, `docs/r2-brief.md` D4.2)
+// ---------------------------------------------------------------------------
+
+/// `evals/prompts.lock`.
+pub const PROMPT_LOCK_FILE: &str = "prompts.lock";
+
+/// One job's line in the lock: the version and the hash of its constant block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedPrompt {
+    pub version: String,
+    pub constant_hash: String,
+}
+
+/// `evals/prompts.lock`: one table per job.
+pub type PromptLock = BTreeMap<String, LockedPrompt>;
+
+/// Every prompt with a hand-bumped version: `margin_ai`'s catalog plus the agent's
+/// system prompt (`AGENT_PROMPT_VERSION`) and its condense call
+/// (`SUMMARY_PROMPT_VERSION`). The chat title versions itself by hash
+/// (`trace::prompt_version` in the service), so it needs no lock.
+pub fn locked_catalog() -> Vec<margin_shared::context::PromptInfo> {
+    let mut catalog = margin_ai::prompts::catalog();
+    catalog.push(margin_ai::prompts::prompt_info(
+        "agent",
+        margin_agent::AGENT_PROMPT_VERSION,
+        margin_agent::system_prompt(),
+    ));
+    catalog.push(margin_ai::prompts::prompt_info(
+        "condense",
+        margin_agent::SUMMARY_PROMPT_VERSION,
+        margin_agent::SUMMARY_INSTRUCTIONS,
+    ));
+    catalog
+}
+
+/// The lock's text for `catalog` (what `margin-eval prompts --write-lock` writes).
+pub fn prompt_lock_toml(catalog: &[margin_shared::context::PromptInfo]) -> String {
+    let lock: PromptLock = catalog
+        .iter()
+        .map(|p| {
+            (
+                p.job.clone(),
+                LockedPrompt {
+                    version: p.version.clone(),
+                    constant_hash: p.constant_hash.clone(),
+                },
+            )
+        })
+        .collect();
+    format!(
+        "# Every prompt's version and the FNV-1a 64 hash of its constant block \
+         (docs/r2-brief.md D4.2).\n# A changed constant block needs a new version; \
+         rewrite this file with `margin-eval prompts --write-lock`.\n\n{}",
+        toml::to_string(&lock).expect("a lock is TOML")
+    )
+}
+
+/// What differs between the lock and the catalog, one line each; empty when they agree.
+/// The same version with another hash is the failure the lock exists for: a constant
+/// block changed without a version bump.
+pub fn check_prompt_lock(
+    lock: &PromptLock,
+    catalog: &[margin_shared::context::PromptInfo],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in catalog {
+        match lock.get(&p.job) {
+            None => out.push(format!(
+                "the {} prompt ({}) isn't in evals/prompts.lock; add it with \
+                 `margin-eval prompts --write-lock`",
+                p.job, p.version
+            )),
+            Some(l) if l.version == p.version && l.constant_hash != p.constant_hash => {
+                out.push(format!(
+                    "the {} prompt's constant block changed under {}; bump its version and \
+                     update evals/prompts.lock (`margin-eval prompts --write-lock`)",
+                    p.job, p.version
+                ))
+            }
+            Some(l) if l.version != p.version => out.push(format!(
+                "the {} prompt is {} but evals/prompts.lock says {}; update the lock \
+                 (`margin-eval prompts --write-lock`)",
+                p.job, p.version, l.version
+            )),
+            Some(_) => {}
+        }
+    }
+    for job in lock.keys() {
+        if !catalog.iter().any(|p| &p.job == job) {
+            out.push(format!(
+                "evals/prompts.lock names a {job} prompt the catalog doesn't have"
+            ));
+        }
+    }
+    out
+}
+
+/// `margin-eval prompts [--write-lock]`: every locked prompt's job, version and
+/// constant-block hash beside what `prompts.lock` says (read from `paths.out`, else
+/// `paths.evals`), and whether they agree. With `write_lock` the lock under `paths.out`
+/// is rewritten from the catalog first (do it with the version bump, in the same
+/// change). Returns the text and whether the lock now agrees.
+pub fn prompts_command(
+    paths: &crate::runner::Paths,
+    write_lock: bool,
+) -> anyhow::Result<(String, bool)> {
+    let catalog = locked_catalog();
+    let out = paths.out.join(PROMPT_LOCK_FILE);
+    let mut text = String::new();
+    if write_lock {
+        std::fs::write(&out, prompt_lock_toml(&catalog))
+            .with_context(|| format!("couldn't write {}", out.display()))?;
+        text.push_str(&format!("wrote {}\n\n", out.display()));
+    }
+    let path = if out.is_file() {
+        out
+    } else {
+        paths.evals.join(PROMPT_LOCK_FILE)
+    };
+    let lock: PromptLock = match std::fs::read_to_string(&path) {
+        Ok(t) => toml::from_str(&t).with_context(|| format!("bad {}", path.display()))?,
+        Err(_) => PromptLock::new(),
+    };
+    text.push_str(&format!(
+        "{:<14} {:<16} {:<18} {:>9}  lock\n",
+        "job", "version", "constant hash", "chars"
+    ));
+    for p in &catalog {
+        let state = match lock.get(&p.job) {
+            None => "missing".to_string(),
+            Some(l) if l.version != p.version => format!("lock says {}", l.version),
+            Some(l) if l.constant_hash != p.constant_hash => {
+                "CHANGED under this version".to_string()
+            }
+            Some(_) => "ok".to_string(),
+        };
+        text.push_str(&format!(
+            "{:<14} {:<16} {:<18} {:>9}  {state}\n",
+            p.job, p.version, p.constant_hash, p.constant_chars
+        ));
+    }
+    let violations = check_prompt_lock(&lock, &catalog);
+    for v in &violations {
+        text.push_str(&format!("\n{v}"));
+    }
+    if !violations.is_empty() {
+        text.push('\n');
+    }
+    Ok((text, violations.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::golden::evals_dir;
     use crate::retrieval::IndexSummary;
+
+    #[test]
+    fn the_prompts_command_reads_and_writes_the_lock() {
+        let out = std::env::temp_dir().join(format!(
+            "margin-evals-prompts-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&out).unwrap();
+        let paths = crate::runner::Paths {
+            out: out.clone(),
+            ..crate::runner::Paths::same(&evals_dir())
+        };
+        // A lock with the lesson prompt changed under its version.
+        let mut lock: PromptLock = toml::from_str(&prompt_lock_toml(&locked_catalog())).unwrap();
+        lock.get_mut("lesson").unwrap().constant_hash = "0000000000000000".into();
+        std::fs::write(out.join(PROMPT_LOCK_FILE), toml::to_string(&lock).unwrap()).unwrap();
+        let (text, ok) = prompts_command(&paths, false).unwrap();
+        assert!(!ok);
+        assert!(text.contains("CHANGED under this version"), "{text}");
+        assert!(text.contains("bump its version"), "{text}");
+        // --write-lock rewrites it from the catalog.
+        let (text, ok) = prompts_command(&paths, true).unwrap();
+        assert!(ok, "{text}");
+        assert!(text.starts_with("wrote "), "{text}");
+        assert!(text.contains("rerank-v1"), "{text}");
+        let written: PromptLock =
+            toml::from_str(&std::fs::read_to_string(out.join(PROMPT_LOCK_FILE)).unwrap()).unwrap();
+        assert!(check_prompt_lock(&written, &locked_catalog()).is_empty());
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    fn the_prompt_lock_catches_a_changed_constant_under_one_version() {
+        let catalog = locked_catalog();
+        let lock: PromptLock = toml::from_str(&prompt_lock_toml(&catalog)).unwrap();
+        assert!(check_prompt_lock(&lock, &catalog).is_empty());
+        let mut changed = catalog.clone();
+        changed[0].constant_hash = "0000000000000000".into();
+        let v = check_prompt_lock(&lock, &changed);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("bump its version"), "{v:?}");
+        let mut bumped = catalog.clone();
+        bumped[0].version = "lesson-v9".into();
+        bumped[0].constant_hash = "0000000000000000".into();
+        assert!(check_prompt_lock(&lock, &bumped)[0].contains("update the lock"));
+        assert_eq!(check_prompt_lock(&lock, &catalog[1..]).len(), 1);
+        assert!(catalog.iter().any(|p| p.job == "agent"));
+    }
 
     fn gates() -> Gates {
         toml::from_str(&std::fs::read_to_string(evals_dir().join("gates.toml")).unwrap()).unwrap()
@@ -207,6 +408,7 @@ mod tests {
             dedup_rate: 0.0,
             latency_p50_ms: 1.0,
             latency_p95_ms: p95,
+            stages: Default::default(),
             queries: vec![],
         }
     }

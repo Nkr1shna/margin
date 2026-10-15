@@ -140,7 +140,7 @@ fn query(text: &str, vector: Vec<f32>, scope: Scope) -> Query {
 }
 
 fn retriever(s: &Store, name: &str) -> Arc<dyn Retriever> {
-    let reg = Registry::standard(StageDeps { store: s.clone() });
+    let reg = Registry::standard(StageDeps::new(s.clone()));
     let cfg = PipelineConfig {
         retriever: StageCfg::named(name),
         ..PipelineConfig::default()
@@ -156,6 +156,9 @@ async fn put_topic(s: &Store, id: &str, parent: Option<&str>) {
         db::TOPIC,
         id,
         &Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(str::to_string),
             title: id.into(),
@@ -173,6 +176,9 @@ async fn put_source(s: &Store, id: &str, topic: Option<&str>, workspace: Option<
         db::SOURCE,
         id,
         &Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: topic.map(str::to_string),
             name: format!("{id}.md"),
@@ -269,7 +275,7 @@ async fn hybrid_linear_weighs_both_legs_inside_the_scope() {
     assert!(hits[0].score >= 1.0 - 1e-4);
     assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
     // The weights come from the retriever's params.
-    let reg = Registry::standard(StageDeps { store: s.clone() });
+    let reg = Registry::standard(StageDeps::new(s.clone()));
     let mut cfg = PipelineConfig {
         retriever: StageCfg::named("hybrid-linear"),
         ..PipelineConfig::default()
@@ -452,6 +458,7 @@ async fn scopes_resolve_to_keys_and_unknown_ids_are_bad() {
     .await
     .unwrap();
     let doc = Document {
+        owner: None,
         id: "doc-s1".into(),
         project_id: DEFAULT_PROJECT_ID.into(),
         origin: Origin::Source {
@@ -1010,4 +1017,80 @@ async fn the_dense_leg_only_compares_vectors_of_the_query_embedder() {
     let hits = retriever(&s, "hybrid-rrf").search(&q).await.unwrap();
     assert_eq!(ids(&hits), ["c"]);
     assert!(hits.iter().all(|h| h.dense_rank.is_none()));
+}
+
+#[test]
+fn the_trace_counts_what_the_reranker_saw_and_dropped() {
+    let fused = vec![
+        hit("a", "d1", 0, 0.9, unit(0)),
+        hit("b", "d1", 1, 0.5, unit(1)),
+        hit("c", "d2", 0, 0.1, unit(2)),
+    ];
+    // "none", or a purpose passed through: nothing.
+    assert_eq!(reranked_count(&fused, &fused), None);
+    // Two graded, one dropped (grade 0).
+    let mut out = vec![fused[1].clone(), fused[0].clone()];
+    out[0].rerank = Some(3.0);
+    out[1].rerank = Some(1.0);
+    assert_eq!(reranked_count(&fused, &out), Some(3));
+}
+
+#[tokio::test]
+async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
+    let s = Store::memory().await.unwrap();
+    for (id, name, access) in [
+        ("d1", "b-notes.pdf", ACCESS_COMPANY),
+        ("d2", "a-paper.pdf", "company/eng"),
+        ("d3", "other.md", "person/p"),
+    ] {
+        let now = Utc::now();
+        s.put(
+            db::DOCUMENT,
+            id,
+            &Document {
+                owner: None,
+                id: id.into(),
+                project_id: DEFAULT_PROJECT_ID.into(),
+                origin: Origin::Agent { name: "t".into() },
+                name: name.into(),
+                kind: SourceKind::Text,
+                status: margin_shared::context::DocumentStatus::Ready { passages: 1 },
+                generation: 1,
+                bytes: 1,
+                actor: "owner".into(),
+                access: vec![access.into()],
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let resolved = Resolved {
+        keys: vec!["d1".into(), "d2".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        scope_names(&s, &resolved, None).await,
+        ["a-paper.pdf", "b-notes.pdf"]
+    );
+    let library = Resolved {
+        library: true,
+        ..Default::default()
+    };
+    assert_eq!(scope_names(&s, &library, None).await.len(), 3);
+    // A reader's access (L1) keeps the names of documents they can't read out of the
+    // rewriter's prompt: "company" sees company/eng, not person/p.
+    let company = vec![ACCESS_COMPANY.to_string()];
+    assert_eq!(
+        scope_names(&s, &library, Some(&company)).await,
+        ["a-paper.pdf", "b-notes.pdf"]
+    );
+    let eng = vec!["company/eng".to_string()];
+    assert_eq!(
+        scope_names(&s, &resolved, Some(&eng)).await,
+        ["a-paper.pdf"]
+    );
+    let nobody: Vec<String> = Vec::new();
+    assert!(scope_names(&s, &library, Some(&nobody)).await.is_empty());
 }

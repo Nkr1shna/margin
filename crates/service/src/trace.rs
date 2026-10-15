@@ -15,6 +15,10 @@
 //!   characters); anything else is recorded as `other`, so an error message (which can
 //!   quote a prompt) never lands in a trace.
 //! - A job step's name (`render`, …) is in `tool`.
+//! - `principal` is who the work is for (`person/<id>` or `agent/<id>`, L1): a row
+//!   recorded inside `with_principal` gets it when it doesn't name one, so a request
+//!   handler or a turn task scopes itself once and every row under it is stamped.
+//!   `GET /api/traces` and the rollups are for organisation admins only.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -40,7 +44,30 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::db::{self, Store};
 use crate::error::{AppError, AppResult};
+use crate::principal::RequireAdmin;
 use crate::state::AppState;
+
+tokio::task_local! {
+    /// The principal id the current task works for (`with_principal`).
+    static PRINCIPAL: String;
+}
+
+/// Runs `f` with `principal` (`person/<id>` or `agent/<id>`) as the principal of every
+/// trace row recorded inside it that doesn't name one.
+pub async fn with_principal<F: std::future::Future>(principal: String, f: F) -> F::Output {
+    PRINCIPAL.scope(principal, f).await
+}
+
+/// The principal `with_principal` set for this task, if any.
+pub fn current_principal() -> Option<String> {
+    PRINCIPAL.try_with(Clone::clone).ok()
+}
+
+/// Whether a row's `actor` is an outside agent's: `agent:<name>` (a device token naming
+/// its agent) or `agent/<id>` (an agent token).
+fn is_agent_actor(actor: &str) -> bool {
+    actor.starts_with("agent:") || actor.starts_with(margin_shared::AGENT_PREFIX)
+}
 
 /// Rows waiting for the writer; when it is full new rows are dropped (and counted), so
 /// tracing never slows a turn.
@@ -172,12 +199,11 @@ impl Tracer {
         {
             row.cost_usd = cost_usd(&self.prices.load(), row.provider.as_deref(), model, usage);
         }
+        if row.principal.is_none() {
+            row.principal = current_principal();
+        }
         // A query is kept only for an agent's context-API search, and only so long.
-        let agent = row.via.is_some()
-            && row
-                .actor
-                .as_deref()
-                .is_some_and(|a| a.starts_with("agent:"));
+        let agent = row.via.is_some() && row.actor.as_deref().is_some_and(is_agent_actor);
         row.query = row.query.filter(|_| agent).map(|q| {
             q.chars()
                 .take(margin_shared::context::TRACE_QUERY_MAX)
@@ -203,6 +229,8 @@ impl Tracer {
     pub fn span(&self, kind: TraceKind, trace_id: &str) -> TraceSpan {
         let mut row = TraceRow::new(kind, new_row_id(), Utc::now());
         row.trace_id = trace_id.to_string();
+        // Spans can finish in another task (a stream dropped elsewhere): stamp now.
+        row.principal = current_principal();
         TraceSpan {
             row,
             started: Instant::now(),
@@ -293,11 +321,46 @@ impl TraceSpan {
     }
 }
 
+/// The attempts of one job model call (`engines::job_model`): when the latest retried
+/// attempt began and how long the provider took on the latest attempt. A [`SpanGuard`]
+/// holding one times only the last attempt (each failed attempt before it has a row of
+/// its own) and records the provider's share of it as `provider_ms`.
+#[derive(Debug, Default)]
+pub struct AttemptClock {
+    retried_at: Mutex<Option<Instant>>,
+    provider: Mutex<Option<Duration>>,
+}
+
+impl AttemptClock {
+    /// A retried attempt begins now: the call's row is timed from here.
+    pub fn retry_started(&self) {
+        *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// The latest attempt's call to the provider took `took`.
+    pub fn provider_took(&self, took: Duration) {
+        *self.provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(took);
+    }
+
+    /// Restarts `span`'s timer at the latest retry and sets its `provider_ms`.
+    fn apply(&self, span: &mut TraceSpan) {
+        if let Some(at) = *self.retried_at.lock().unwrap_or_else(|e| e.into_inner()) {
+            span.started = at;
+            span.row.at =
+                Utc::now() - chrono::TimeDelta::from_std(at.elapsed()).unwrap_or_default();
+        }
+        if let Some(took) = *self.provider.lock().unwrap_or_else(|e| e.into_inner()) {
+            span.row.provider_ms = Some(took.as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 /// A span that records itself as failed with `cancelled` if it is dropped unfinished
 /// (a stopped turn drops the futures it was running).
 pub struct SpanGuard {
     span: Option<TraceSpan>,
     state: AppState,
+    clock: Option<std::sync::Arc<AttemptClock>>,
 }
 
 impl SpanGuard {
@@ -305,6 +368,7 @@ impl SpanGuard {
         Self {
             span: Some(span),
             state: state.clone(),
+            clock: None,
         }
     }
 
@@ -313,14 +377,28 @@ impl SpanGuard {
         &mut self.span.as_mut().expect("an unfinished span").row
     }
 
+    /// The clock of this call's attempts, for `engines::JobCalls`: the row is timed
+    /// from the last retried attempt's start and gets the provider's share of it.
+    pub fn clock(&mut self) -> std::sync::Arc<AttemptClock> {
+        self.clock.get_or_insert_with(Default::default).clone()
+    }
+
+    fn take(&mut self) -> Option<TraceSpan> {
+        let mut span = self.span.take()?;
+        if let Some(clock) = &self.clock {
+            clock.apply(&mut span);
+        }
+        Some(span)
+    }
+
     pub fn finish(mut self, ok: bool) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.finish(&self.state.tracer, ok);
         }
     }
 
     pub fn fail(mut self, code: &str) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.fail(&self.state.tracer, code);
         }
     }
@@ -328,7 +406,7 @@ impl SpanGuard {
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
-        if let Some(span) = self.span.take() {
+        if let Some(span) = self.take() {
             span.fail(&self.state.tracer, "cancelled");
         }
     }
@@ -401,8 +479,9 @@ pub fn sanitize_code(code: &str) -> String {
 // Writer and retention
 // ---------------------------------------------------------------------------
 
-/// Starts the writer and the retention job and loads the price table. Called once at
-/// startup (`server::Service::start`); later calls do nothing.
+/// Starts the writer, the retention job and the alert job (`alerts::run`), and loads
+/// the price table. Called once at startup (`server::Service::start`); later calls do
+/// nothing.
 pub fn start(state: &AppState) {
     let Some(rx) = state.tracer.take_receiver() else {
         return;
@@ -418,6 +497,7 @@ pub fn start(state: &AppState) {
     }
     tokio::spawn(run_writer(state.clone(), rx));
     tokio::spawn(run_retention(state.clone()));
+    tokio::spawn(crate::alerts::run(state.clone()));
 }
 
 /// The writer task: batches rows into `trace:[kind, at, ulid]` records.
@@ -545,6 +625,20 @@ pub async fn apply_retention(state: &AppState, now: DateTime<Utc>) -> anyhow::Re
     Ok(())
 }
 
+/// The 95th percentile of `duration_ms` over the raw rows of rollup row `row` (a
+/// SurrealQL expression for a view row) in a bucket `width` wide (`1h`, `1d`): the
+/// views can't keep a percentile (SurrealDB 3.3.4 refuses `math::percentile` in a
+/// materialized aggregate view), so it is computed from the rows, by id range, when
+/// a rollup is read and when retention carries a bucket into the kept tables.
+/// SurrealDB interpolates between ranks.
+fn p95_of(row: &str, width: &str) -> String {
+    format!(
+        "math::percentile((SELECT VALUE duration_ms FROM \
+           trace:[{row}.kind, time::nano({row}.bucket), '']..[{row}.kind, time::nano({row}.bucket + {width}), ''] \
+           WHERE route = {row}.route AND provider = {row}.provider AND model = {row}.model), 95)"
+    )
+}
+
 /// Deletes raw rows before `cutoff` (carrying their rollups into the kept tables) and
 /// kept hourly rollups before `hourly_keep`, in one transaction.
 pub async fn delete_before(
@@ -559,15 +653,18 @@ pub async fn delete_before(
          LET $cut = <datetime>$cut_text; \
          LET $year = <datetime>$year_text;",
     );
-    for (view, kept) in [
-        (db::TRACE_HOURLY, TRACE_HOURLY_KEPT),
-        (db::TRACE_DAILY, TRACE_DAILY_KEPT),
+    for (view, kept, width) in [
+        (db::TRACE_HOURLY, TRACE_HOURLY_KEPT, "1h"),
+        (db::TRACE_DAILY, TRACE_DAILY_KEPT, "1d"),
     ] {
+        let p95 = p95_of("$r", width);
         sql.push_str(&format!(
             "FOR $r IN (SELECT * FROM {view} WHERE bucket < $cut AND calls > 0) {{ \
                LET $key = record::id($r.id); \
+               LET $new_p95 = {p95}; \
                LET $old = (SELECT * FROM type::record('{kept}', $key))[0]; \
                LET $calls = ($old.calls ?? 0) + $r.calls; \
+               LET $p95 = IF $old.p95_ms != NONE THEN math::max([$old.p95_ms, $new_p95]) ELSE $new_p95 END; \
                UPSERT type::record('{kept}', $key) CONTENT {{ \
                  kind: $r.kind, route: $r.route, provider: $r.provider, model: $r.model, \
                  bucket: $r.bucket, calls: $calls, \
@@ -575,7 +672,8 @@ pub async fn delete_before(
                  cached: ($old.cached ?? 0) + ($r.cached ?? 0), \
                  output: ($old.output ?? 0) + ($r.output ?? 0), \
                  cost_usd: ($old.cost_usd ?? 0) + ($r.cost_usd ?? 0), \
-                 mean_ms: (($old.mean_ms ?? 0) * ($old.calls ?? 0) + ($r.mean_ms ?? 0) * $r.calls) / $calls \
+                 mean_ms: (($old.mean_ms ?? 0) * ($old.calls ?? 0) + ($r.mean_ms ?? 0) * $r.calls) / $calls, \
+                 p95_ms: $p95 \
                }} RETURN NONE; \
              }};"
         ));
@@ -655,10 +753,11 @@ fn bad_range() -> AppError {
     )
 }
 
-/// `GET routes::TRACES`: JSON lines, oldest first. Rows recorded before the request
-/// are written first (up to 2 s), so a reader sees its own calls.
+/// `GET routes::TRACES` (admins): JSON lines, oldest first. Rows recorded before the
+/// request are written first (up to 2 s), so a reader sees its own calls.
 pub async fn list_traces(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(q): Query<TracesQuery>,
 ) -> AppResult<Response> {
     state.tracer.flush(READ_FLUSH_WAIT).await;
@@ -883,12 +982,15 @@ struct StoredRollup {
     cost_usd: Option<f64>,
     #[serde(default)]
     mean_ms: Option<f64>,
+    #[serde(default)]
+    p95_ms: Option<f64>,
 }
 
 /// `GET routes::TRACES_ROLLUP`: the view's buckets plus those kept from rows retention
-/// deleted, oldest first.
+/// deleted, oldest first. Admins only.
 pub async fn rollup(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(q): Query<RollupQuery>,
 ) -> AppResult<Json<Vec<TraceRollup>>> {
     state.tracer.flush(READ_FLUSH_WAIT).await;
@@ -907,9 +1009,9 @@ pub async fn read_rollup(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> anyhow::Result<Vec<TraceRollup>> {
-    let (view, kept) = match bucket {
-        RollupBucket::Hour => (db::TRACE_HOURLY, TRACE_HOURLY_KEPT),
-        RollupBucket::Day => (db::TRACE_DAILY, TRACE_DAILY_KEPT),
+    let (view, kept, width) = match bucket {
+        RollupBucket::Hour => (db::TRACE_HOURLY, TRACE_HOURLY_KEPT, "1h"),
+        RollupBucket::Day => (db::TRACE_DAILY, TRACE_DAILY_KEPT, "1d"),
     };
     type Key = (
         TraceKind,
@@ -920,12 +1022,18 @@ pub async fn read_rollup(
     );
     let mut merged: HashMap<Key, TraceRollup> = HashMap::new();
     for table in [view, kept] {
+        // The view's p95 from its raw rows; the kept table's as carried.
+        let fields = if table == view {
+            format!("*, {} AS p95_ms", p95_of("$parent", width))
+        } else {
+            "*".to_string()
+        };
         let rows: Vec<StoredRollup> = store
             .query_rows(
                 &format!(
                     "DEFINE TABLE IF NOT EXISTS {kept} SCHEMALESS; \
                      LET $from = <datetime>$from_text; LET $to = <datetime>$to_text; \
-                     SELECT * OMIT id FROM {table} WHERE bucket >= $from AND bucket <= $to;"
+                     SELECT {fields} OMIT id FROM {table} WHERE bucket >= $from AND bucket <= $to;"
                 ),
                 vec![
                     ("from_text", json!(time_text(from))),
@@ -959,6 +1067,7 @@ pub async fn read_rollup(
                 output: int(r.output),
                 cost_usd: r.cost_usd.filter(|c| c.is_finite()).unwrap_or(0.0),
                 mean_ms: mean,
+                p95_ms: r.p95_ms.filter(|p| p.is_finite()),
             };
             match merged.get_mut(&key) {
                 Some(have) => {
@@ -971,6 +1080,12 @@ pub async fn read_rollup(
                     have.cached += add.cached;
                     have.output += add.output;
                     have.cost_usd += add.cost_usd;
+                    // A bucket split between the view and the kept table: the larger
+                    // p95 of the two (a bound, never an understatement).
+                    have.p95_ms = match (have.p95_ms, add.p95_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
                 None => {
                     merged.insert(key, add);
@@ -999,19 +1114,53 @@ pub async fn read_rollup(
 /// A model call's stream that records its span when the call ends: usage and stop
 /// reason from the terminal event, `ok: false` with a code when it fails, ends early or
 /// is dropped (a stopped turn).
+///
+/// `provider_ms` is the provider's share of the span: the time until the stream was
+/// handed over (the request and its response headers, timed from the span's start), plus
+/// every wait for the provider's next event (from a poll that found nothing ready to the
+/// poll that got the event) and the polls themselves. What is left of `duration_ms` is
+/// Margin's: building the request, and handling each event between polls.
 pub struct TracedStream {
     inner: margin_ai::ModelStream,
     span: Option<TraceSpan>,
     state: AppState,
+    provider: Duration,
+    /// When a poll last found nothing ready, until the next event arrives.
+    waiting_since: Option<Instant>,
+    /// Whether the stream brought a finished item yet.
+    output: bool,
+    /// Set when the stream fails before any finished item (the agent loop retries
+    /// that step), cleared when it ends otherwise.
+    failed_without_output: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TracedStream {
     pub fn new(inner: margin_ai::ModelStream, span: TraceSpan, state: AppState) -> Self {
+        let provider = span.started.elapsed();
         Self {
             inner,
             span: Some(span),
             state,
+            provider,
+            waiting_since: None,
+            output: false,
+            failed_without_output: None,
         }
+    }
+
+    /// Sets `flag` when the stream fails before any finished item and clears it when
+    /// it ends otherwise.
+    pub fn flag_failure_without_output(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.failed_without_output = Some(flag);
+        self
+    }
+
+    /// The provider's time so far, in ms.
+    pub fn provider_ms(&self) -> f64 {
+        self.provider.as_secs_f64() * 1000.0
     }
 
     fn end(
@@ -1025,6 +1174,15 @@ impl TracedStream {
         let Some(mut span) = self.span.take() else {
             return;
         };
+        if let Some(flag) = &self.failed_without_output {
+            flag.store(!ok && !self.output, Ordering::Relaxed);
+        }
+        // Dropped while waiting for the provider: that wait was the provider's.
+        if let Some(since) = self.waiting_since.take() {
+            self.provider += since.elapsed();
+        }
+        let provider_ms = self.provider_ms();
+        span.row.provider_ms = Some(provider_ms);
         // What the provider answered with, when it said.
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             span.row.model = Some(model.to_string());
@@ -1043,9 +1201,35 @@ impl Stream for TracedStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         use margin_ai::ModelEvent as E;
+        let polled_at = Instant::now();
         let polled = self.inner.as_mut().poll_next(cx);
+        if self.span.is_some() {
+            let poll = polled_at.elapsed();
+            let add = match (&polled, self.waiting_since) {
+                (Poll::Pending, None) => {
+                    self.waiting_since = Some(polled_at);
+                    Duration::ZERO
+                }
+                // Still waiting: the wait counts once, when the event arrives.
+                (Poll::Pending, Some(_)) => Duration::ZERO,
+                (Poll::Ready(_), Some(since)) => {
+                    self.waiting_since = None;
+                    polled_at.duration_since(since) + poll
+                }
+                (Poll::Ready(_), None) => poll,
+            };
+            self.provider += add;
+        }
         match &polled {
             Poll::Ready(Some(Ok(event))) => match event {
+                E::Done { item, .. } => {
+                    let compacted = item.view == margin_ai::ItemView::Compaction;
+                    self.output = true;
+                    // The provider compacted the history in this call (D3).
+                    if compacted && let Some(span) = self.span.as_mut() {
+                        span.row.compaction = Some(margin_shared::context::Compaction::Server);
+                    }
+                }
                 E::Completed {
                     usage,
                     model,
@@ -1131,6 +1315,52 @@ mod tests {
         let mut r = TraceRow::new(kind, new_row_id(), at(at_text));
         r.trace_id = trace_id.into();
         r
+    }
+
+    #[tokio::test]
+    async fn rows_inside_with_principal_are_stamped() {
+        let tracer = Tracer::new();
+        let mut rx = tracer.take_receiver().unwrap();
+        tracer.record(row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t0"));
+        let span = with_principal("agent/a1".into(), async {
+            tracer.record(row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t1"));
+            let mut named = row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t2");
+            named.principal = Some("person/p".into());
+            tracer.record(named);
+            assert_eq!(current_principal().as_deref(), Some("agent/a1"));
+            tracer.span(TraceKind::ModelCall, "t3")
+        })
+        .await;
+        // Finished outside the scope: stamped when it started.
+        span.finish(&tracer, true);
+        let got: Vec<Option<String>> = (0..4).map(|_| rx.try_recv().unwrap().principal).collect();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("agent/a1".into()),
+                Some("person/p".into()),
+                Some("agent/a1".into())
+            ]
+        );
+        assert!(current_principal().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_agent_tokens_query_is_kept() {
+        let tracer = Tracer::new();
+        let mut rx = tracer.take_receiver().unwrap();
+        for actor in ["agent/a1", "agent:claude-code", "owner"] {
+            let mut r = row(TraceKind::Retrieval, "2026-10-14T08:00:00Z", "t");
+            r.actor = Some(actor.into());
+            r.via = Some(margin_shared::context::VIA_MCP.into());
+            r.query = Some("carnot".into());
+            tracer.record(r);
+        }
+        let kept: Vec<bool> = (0..3)
+            .map(|_| rx.try_recv().unwrap().query.is_some())
+            .collect();
+        assert_eq!(kept, vec![true, true, false]);
     }
 
     #[test]
@@ -1407,6 +1637,14 @@ mod tests {
             (2, 40, 2, 4)
         );
         assert!((jan.cost_usd - 0.5).abs() < 1e-9 && (jan.mean_ms - 200.0).abs() < 1e-9);
+        // The p95 (interpolated over 100 and 300 ms) computed while the rows lived, and
+        // carried into the kept rollup when they went.
+        let p95 = jan.p95_ms.expect("a p95");
+        assert!((p95 - 290.0).abs() < 1e-9, "{p95}");
+        assert!(
+            daily_before.iter().all(|r| r.p95_ms.is_some()),
+            "{daily_before:#?}"
+        );
         // Hourly rollups older than the hourly keep are gone; the rest are whole.
         let hourly = read_rollup(&s, RollupBucket::Hour, window.0, window.1)
             .await

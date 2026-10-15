@@ -11,17 +11,20 @@ pub mod chat;
 pub mod context;
 pub mod device;
 pub mod pipeline;
+pub mod principal;
 pub mod providers;
 pub mod routes;
+pub mod text;
 
 pub use chat::*;
 pub use device::*;
+pub use principal::*;
 pub use providers::*;
 
 /// Serde for `Option<Option<T>>` patch fields: a missing field is `None` (unchanged),
 /// `null` is `Some(None)` (clear), and a value is `Some(Some(v))`. Use with
 /// `#[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]`.
-mod double_option {
+pub(crate) mod double_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<T: Serialize, S: Serializer>(
@@ -58,6 +61,17 @@ pub struct Topic {
     pub title: String,
     /// Sort order among siblings, ascending.
     pub position: i64,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -98,11 +112,38 @@ pub struct Lesson {
     /// when the lesson was generated with a quiz.
     pub body_md: String,
     pub status: LessonStatus,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The sources the body cites with `[^n]` footnote references.
     #[serde(default)]
     pub citations: Vec<Citation>,
+    /// The prompt, pipeline and model that wrote the body (R2); `None` for lessons
+    /// written before R2 and for pending ones. Regenerating overwrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_with: Option<WrittenWith>,
+}
+
+/// What wrote a lesson, a proposal's outline or a scene (R2, `docs/r2-brief.md` D4.3):
+/// the prompt version (`lesson-v2`, `plan-v1`, `scene-v2`), the pipeline's `hash()`, and
+/// the provider and model of the call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WrittenWith {
+    pub prompt_version: String,
+    pub pipeline_hash: String,
+    pub provider: Provider,
+    pub model: String,
+    pub at: DateTime<Utc>,
 }
 
 /// A note. Margin notes carry the lesson text they were taken from in `quote`.
@@ -115,6 +156,17 @@ pub struct Note {
     pub body_md: String,
     /// The selected lesson text this note annotates, if it is a margin note.
     pub quote: Option<String>,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -239,11 +291,25 @@ pub struct Proposal {
     pub request: AskRequest,
     pub status: ProposalStatus,
     pub outline: Option<Outline>,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     /// The chat whose `propose_course` call made it; accepting it records an
     /// `ChatItemKind::Action` there so the agent knows the course exists.
     #[serde(default)]
     pub chat_id: Option<Id>,
+    /// The planner call that wrote the outline (R2); `None` before R2 or while drafting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_with: Option<WrittenWith>,
 }
 
 /// Accept a proposal, optionally with an edited outline and the outline card's chips.
@@ -331,6 +397,17 @@ pub struct Source {
     /// Size of the uploaded file.
     pub bytes: u64,
     pub status: SourceStatus,
+    /// The person whose row this is (L1); `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
+    /// Who may read it: principal ids and group paths (`principal`). Never empty once
+    /// written; read empty, it is private to `owner`.
+    #[serde(default)]
+    pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them (L2
+    /// evaluates it; L1 writes and reads it back).
+    #[serde(default)]
+    pub deny: Vec<String>,
     pub created_at: DateTime<Utc>,
     /// Signed URL of the original file, for viewing it (images, PDFs, audio, video).
     #[serde(default)]
@@ -534,6 +611,10 @@ pub struct EmbeddingModel {
     /// service transcribed with an installed program).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech: Option<SpeechModel>,
+    /// The cross-encoder the `onnx-crossencoder` reranker runs (R2, a Linux service),
+    /// downloaded on demand. `None` where the service has no reranker model to offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranker: Option<RerankerModelState>,
     /// The one pass that re-embeds every source after `service.toml`'s `embedder`
     /// changed, while it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,6 +626,18 @@ pub struct EmbeddingModel {
 pub struct SpeechModel {
     /// Hugging Face repo, "istupakov/parakeet-tdt-0.6b-v3-onnx".
     pub repo: String,
+    pub state: EmbeddingModelState,
+}
+
+/// The reranker model the service downloads (`EmbeddingModel.reranker`,
+/// `routes::RERANKER_MODEL`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankerModelState {
+    /// The `params.model` name, "ms-marco-minilm-l6-v2".
+    pub name: String,
+    /// Hugging Face repo, "Xenova/ms-marco-MiniLM-L-6-v2".
+    pub repo: String,
+    /// Its download state; the sizes are in it (`download_bytes`, `bytes`).
     pub state: EmbeddingModelState,
 }
 
@@ -849,6 +942,9 @@ pub struct Device {
     /// and can answer device tools.
     #[serde(default)]
     pub online: bool,
+    /// The person the device signed in as (L1); `None` from a service before L1.
+    #[serde(default)]
+    pub person_id: Option<Id>,
 }
 
 // ---------------------------------------------------------------------------
@@ -899,8 +995,18 @@ pub enum LoginState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Me {
+    /// The person's GitHub login (an agent token: its owner's).
     pub github_login: String,
-    pub device: Device,
+    /// The calling device; `None` for an agent token.
+    #[serde(default)]
+    pub device: Option<Device>,
+    /// The signed-in person (an agent token: its owner, without `settings`). `None` from
+    /// a service before L1.
+    #[serde(default)]
+    pub person: Option<Person>,
+    /// The agent, for an agent token.
+    #[serde(default)]
+    pub agent: Option<Agent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,9 +1110,44 @@ pub enum Event {
     DocumentChanged {
         document: context::Document,
     },
-    /// A trace row, sent only to sockets that subscribed with `?traces=1`.
+    /// A trace row, sent only to sockets that subscribed with `?traces=1` (admins only).
     Trace {
         row: Box<context::TraceRow>,
+    },
+    /// A person was invited in, edited, enabled or disabled (L1). Carries the whole
+    /// person; `settings` only to the person themself.
+    PersonChanged {
+        person: Person,
+    },
+    /// A group was created or renamed.
+    GroupChanged {
+        group: Group,
+    },
+    GroupDeleted {
+        path: String,
+    },
+    /// A person's direct memberships were replaced.
+    MembershipChanged {
+        person_id: Id,
+        groups: Vec<String>,
+    },
+    /// An agent was created or changed (to its owner and admins).
+    AgentChanged {
+        agent: Agent,
+    },
+    AgentDeleted {
+        id: Id,
+    },
+    /// An invitation was made, accepted or revoked (to admins).
+    InvitationChanged {
+        invitation: Invitation,
+    },
+    InvitationDeleted {
+        id: Id,
+    },
+    /// What `person_id` may read changed (memberships, role): reload the library.
+    AccessChanged {
+        person_id: Id,
     },
 }
 
@@ -1062,6 +1203,54 @@ mod tests {
         assert!(warned.can_read_again());
         assert!(SourceStatus::Failed { error: "x".into() }.can_read_again());
         assert!(!SourceStatus::Queued.can_read_again());
+    }
+
+    #[test]
+    fn written_with_and_the_reranker_model_are_additive() {
+        let lesson: Lesson = serde_json::from_value(serde_json::json!({
+            "id": "l", "topic_id": "t", "title": "T", "summary": "s", "position": 0,
+            "level": "intro", "minutes": 5, "body_md": "", "status": {"state": "ready"},
+            "created_at": "2025-10-09T08:53:20Z", "updated_at": "2025-10-09T08:53:20Z"
+        }))
+        .unwrap();
+        assert_eq!(lesson.written_with, None);
+        assert!(
+            serde_json::to_value(&lesson)
+                .unwrap()
+                .get("written_with")
+                .is_none()
+        );
+        let mut written = lesson.clone();
+        written.written_with = Some(WrittenWith {
+            prompt_version: "lesson-v2".into(),
+            pipeline_hash: "c39a244aa537f0c2".into(),
+            provider: Provider::Claude,
+            model: "claude-sonnet-5-5".into(),
+            at: lesson.created_at,
+        });
+        let json = serde_json::to_value(&written).unwrap();
+        assert_eq!(json["written_with"]["provider"], "claude");
+        assert_eq!(serde_json::from_value::<Lesson>(json).unwrap(), written);
+
+        let model = EmbeddingModel {
+            repo: "r".into(),
+            state: EmbeddingModelState::Ready { bytes: 1 },
+            speech: None,
+            reranker: Some(RerankerModelState {
+                name: "ms-marco-minilm-l6-v2".into(),
+                repo: "Xenova/ms-marco-MiniLM-L-6-v2".into(),
+                state: EmbeddingModelState::NotDownloaded {
+                    download_bytes: 23_000_000,
+                },
+            }),
+            reindex: None,
+        };
+        let json = serde_json::to_value(&model).unwrap();
+        assert_eq!(json["reranker"]["state"]["state"], "not_downloaded");
+        assert_eq!(
+            serde_json::from_value::<EmbeddingModel>(json).unwrap(),
+            model
+        );
     }
 
     #[test]

@@ -653,6 +653,10 @@ async fn read_tools_answer_from_the_library() {
     let now = Utc::now();
     let lesson = StoredLesson {
         lesson: Lesson {
+            // Filed under the topic: its owner and audience (D6).
+            access: topic.access.clone(),
+            deny: Vec::new(),
+            owner: topic.owner.clone(),
             id: "l1".into(),
             topic_id: topic.id.clone(),
             title: "Coefficients".into(),
@@ -680,6 +684,7 @@ async fn read_tools_answer_from_the_library() {
                 file: None,
                 section_path: None,
             }],
+            written_with: None,
         },
         proposal_id: None,
         previous_body: None,
@@ -843,7 +848,10 @@ async fn a_message_sent_while_busy_waits_and_goes_next() {
     assert_eq!(sent.item, None);
     let pending = sent.chat.pending.clone().unwrap();
     assert_eq!(pending.text, "second");
-    assert_eq!(pending.device_id, me(&h, &phone).await.device.id);
+    assert_eq!(
+        pending.device_id,
+        me(&h, &phone).await.device.as_ref().unwrap().id
+    );
 
     let (status, err) = api_error(send(&h, &t, &chat.id, "third").await).await;
     assert_eq!((status, err.code.as_str()), (409, "already_pending"));
@@ -1183,7 +1191,7 @@ async fn fake_turn(h: &Harness, chat_id: &str, device_id: &str) -> Arc<ServiceSi
     let now = Utc::now();
     {
         let _w = h.state.write_lock.lock().await;
-        let mut chat = chats::chat(&h.state, chat_id).await.unwrap();
+        let mut chat = chats::chat_row(&h.state, chat_id).await.unwrap();
         chat.state = ChatState::Running {
             turn_id: turn_id.clone(),
             device_id: device_id.into(),
@@ -1275,8 +1283,8 @@ async fn park_on_card(
 async fn any_device_answers_a_confirmation() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let mac_id = me(&h, &t).await.device.id;
-    let phone_id = me(&h, &phone).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     assert_eq!(chat.title, "");
     assert_eq!(chat.state, ChatState::Idle);
@@ -1329,7 +1337,7 @@ async fn any_device_answers_a_confirmation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn turns_waiting_on_the_owner_leave_their_slot() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let a = create_chat(&h, &t, json!({})).await.chat;
     let b = create_chat(&h, &t, json!({})).await.chat;
     let (sink_a, card_a, waiting_a) = park_on_card(&h, &a.id, &mac_id).await;
@@ -1369,7 +1377,7 @@ async fn turns_waiting_on_the_owner_leave_their_slot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deny_answers_a_confirmation() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let (_sink, card, waiting) = park_on_card(&h, &chat.id, &mac_id).await;
     wait_chat(&h, &t, &chat.id, |d| {
@@ -1396,8 +1404,8 @@ async fn deny_answers_a_confirmation() {
 async fn stop_denies_a_waiting_confirmation() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let mac_id = me(&h, &t).await.device.id;
-    let phone_id = me(&h, &phone).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let (_sink, card, _waiting) = park_on_card(&h, &chat.id, &mac_id).await;
     wait_chat(&h, &t, &chat.id, |d| {
@@ -1468,6 +1476,9 @@ async fn a_restart_interrupts_running_turns_and_continue_resumes() {
     let store = Store::memory().await.unwrap();
     let now = Utc::now();
     let chat = Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "c1".into(),
         title: "Fourier".into(),
         title_by: Default::default(),
@@ -1931,7 +1942,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
     let h = start().await;
     let mac = h.sign_in("Mac").await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let mut watcher = h.socket(&mac).await;
     assert!(
         !devices(&h, &mac)
@@ -1965,7 +1976,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
             .iter()
             .any(|d| d.id == phone_id && d.online)
     );
-    assert!(me(&h, &phone).await.device.online);
+    assert!(me(&h, &phone).await.device.unwrap().online);
 
     // A request reaches only that device; its answer completes the call.
     let call = {
@@ -2043,7 +2054,7 @@ async fn devices_are_online_while_their_socket_is_open_and_answer_tool_requests(
 async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
     let (h, mac) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let r = h
         .post(&phone, "/api/workspaces")
         .json(&json!({"name": " notes ", "platform": "ios", "location": "iCloud Drive/notes"}))
@@ -2162,12 +2173,12 @@ async fn folders_belong_to_their_device_and_leave_chats_when_removed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let now = Utc::now();
     {
         let _w = h.state.write_lock.lock().await;
-        let mut c = chats::chat(&h.state, &chat.id).await.unwrap();
+        let mut c = chats::chat_row(&h.state, &chat.id).await.unwrap();
         c.state = ChatState::Running {
             turn_id: "turn-1".into(),
             device_id: mac_id,
@@ -2339,7 +2350,7 @@ async fn stop_waits_for_started_writes_and_records_their_real_results() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(500);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2450,7 +2461,7 @@ async fn stop_waits_for_started_writes_and_records_their_real_results() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(400);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2488,7 +2499,7 @@ async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     *h.state.turns.stop_wait.lock().unwrap() = Duration::from_millis(300);
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
@@ -2522,7 +2533,7 @@ async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_finishes_a_write_the_loop_was_still_recording() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
     open_call(&sink, "call_topic", "create_topic").await;
@@ -2614,7 +2625,7 @@ async fn a_failed_turn_records_the_writes_it_finished() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_shows_while_its_turn_waits_to_retry() {
     let (h, t) = signed_in().await;
-    let mac_id = me(&h, &t).await.device.id;
+    let mac_id = me(&h, &t).await.device.unwrap().id;
     let chat = create_chat(&h, &t, json!({})).await.chat;
     let sink = fake_turn(&h, &chat.id, &mac_id).await;
     let mut sock = h.socket(&t).await;
@@ -2855,7 +2866,12 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         assert_eq!(c.model.as_deref(), Some("test-model"));
         assert_eq!(c.provider.as_deref(), Some("openai"));
         assert_eq!(c.stop_reason.as_deref(), Some("completed"));
-        assert_eq!(c.actor.as_deref(), Some("owner"));
+        // The chat owner's principal (L1).
+        assert!(
+            c.actor.as_deref().is_some_and(|a| a.starts_with("person/")),
+            "{c:?}"
+        );
+        assert_eq!(c.principal, c.actor);
         let u = c.usage.expect("usage");
         assert!(u.input == 100 && u.output > 0, "{u:?}");
         let cost = c.cost_usd.expect("priced at write time");
@@ -2870,6 +2886,12 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         steps.iter().map(|c| c.step).collect::<Vec<_>>(),
         [Some(1), Some(2)]
     );
+    // The provider's share of each step: within the step, so the overhead
+    // (`duration_ms − provider_ms`) is never negative.
+    for c in &steps {
+        let p = c.provider_ms.expect("provider_ms on a step");
+        assert!(p >= 0.0 && p <= c.duration_ms, "{p} of {}", c.duration_ms);
+    }
     assert!(steps.iter().all(|c| c.prompt_version.as_deref()
         == Some(margin_agent::AGENT_PROMPT_VERSION)
         && c.parent_id.as_deref() == Some(turn[0].id.as_str())));
@@ -2967,6 +2989,11 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         .collect();
     assert_eq!(model_calls.iter().map(|r| r.calls).sum::<u64>(), 3);
     assert_eq!(model_calls.iter().map(|r| r.input).sum::<u64>(), 300);
+    // Each bucket's p95 of its rows' durations (computed from the raw rows on read).
+    for r in &model_calls {
+        let p95 = r.p95_ms.expect("a p95 per bucket");
+        assert!(p95 >= 0.0 && p95 <= calls.iter().map(|c| c.duration_ms).fold(0.0, f64::max));
+    }
     let cost: f64 = model_calls.iter().map(|r| r.cost_usd).sum();
     let recorded: f64 = calls.iter().map(|c| c.cost_usd.unwrap()).sum();
     assert!((cost - recorded).abs() < 1e-12, "{cost} vs {recorded}");
@@ -3060,4 +3087,113 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         assert!(!r.ok);
         assert_eq!(r.error_code.as_deref(), Some("cancelled"), "{r:#?}");
     }
+}
+
+/// `docs/phase5-brief.md` D6: failed calls in the window raise `error_rate`, which
+/// `GET /api/alerts`, `GET /api/version` and an `alert` trace row show; it clears once
+/// `clear_after_minutes` pass without a breach.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_calls_raise_an_alert_that_clears() {
+    use margin_service::alerts;
+    use margin_service::version::VersionInfo;
+    use margin_shared::context::AlertList;
+    let (h, t) = signed_in().await;
+    let now = Utc::now();
+    let rows: Vec<TraceRow> = (0..20)
+        .map(|i| {
+            let mut r = TraceRow::new(
+                TraceKind::ModelCall,
+                trace::new_row_id(),
+                now - chrono::Duration::seconds(60 + i),
+            );
+            r.ok = false;
+            r.error_code = Some("server_error".into());
+            r.duration_ms = 50.0;
+            r
+        })
+        .collect();
+    trace::write_rows(&h.state.store, &rows).await.unwrap();
+
+    let events = alerts::tick(&h.state, now).await.unwrap();
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let list: AlertList = h
+        .get(&t, routes::ALERTS)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.active.len(), 1);
+    let a = &list.active[0];
+    assert_eq!(
+        (a.name.as_str(), a.kind, a.value, a.threshold),
+        ("error_rate", Some(TraceKind::ModelCall), 1.0, 0.2)
+    );
+    assert_eq!(list.recent.len(), 1);
+    assert!(list.recent[0].raised);
+    // Public, and a count only.
+    let v: VersionInfo = h
+        .http
+        .get(h.u(routes::VERSION))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v.alerts_active, 1);
+    assert_eq!(v.alerts_since, Some(a.since));
+    let r = h.http.get(h.u(routes::ALERTS)).send().await.unwrap();
+    assert_eq!(r.status(), 401, "the list needs a device token");
+    // Admins only, like the traces the alerts come from.
+    h.invite(&t, "bob-dev", margin_shared::OrgRole::Member, &[])
+        .await;
+    let bob = h.sign_in_as(BOB_CODE, "Laptop").await;
+    let r = h.get(&bob, routes::ALERTS).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A second tick still sees it: nothing new.
+    assert!(alerts::tick(&h.state, now).await.unwrap().is_empty());
+    // 31 minutes on, the window holds nothing: it clears.
+    let later = now + chrono::Duration::minutes(31);
+    let events = alerts::tick(&h.state, later).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].raised);
+    let list: AlertList = h
+        .get(&t, routes::ALERTS)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.active.is_empty());
+    assert_eq!(
+        list.recent.iter().map(|e| e.raised).collect::<Vec<_>>(),
+        [false, true],
+        "newest first"
+    );
+    // Both are trace rows.
+    h.state.tracer.flush(Duration::from_secs(5)).await;
+    let (alert_rows, _) = traces(
+        &h,
+        &t,
+        &[
+            ("kind", "alert".into()),
+            ("to", (later + chrono::Duration::hours(1)).to_rfc3339()),
+        ],
+    )
+    .await;
+    assert_eq!(alert_rows.len(), 2);
+    assert!(
+        alert_rows
+            .iter()
+            .all(|r| r.error_code.as_deref() == Some("error_rate")
+                && r.tool.as_deref() == Some("model_call"))
+    );
+    assert_eq!(
+        alert_rows.iter().map(|r| r.ok).collect::<Vec<_>>(),
+        [false, true]
+    );
 }

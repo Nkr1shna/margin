@@ -10,10 +10,10 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use common::{Fake, TOKEN};
+use common::{AGENT_TOKEN, Fake, TOKEN};
 use margin_mcp::client::Client;
-use margin_mcp::config::{TokenStore, require_token};
-use margin_mcp::{ingest, login, serve};
+use margin_mcp::config::{TokenStore, agent_key, require_token};
+use margin_mcp::{ingest, login, serve, token};
 use margin_shared::context::{LibraryKind, Origin};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
@@ -28,6 +28,9 @@ impl TokenStore for MemoryStore {
     fn set(&self, url: &str, token: &str) -> anyhow::Result<()> {
         self.0.lock().unwrap().insert(url.into(), token.into());
         Ok(())
+    }
+    fn delete(&self, url: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().remove(url).is_some())
     }
 }
 
@@ -290,6 +293,123 @@ async fn a_bad_token_says_to_sign_in_again() {
         .await;
     assert!(is_error);
     assert!(text.contains("margin-mcp login"), "{text}");
+}
+
+/// L1 e2e 7: `margin-mcp token` checks and stores the agent token (never echoing it),
+/// `whoami` reports the agent, `serve` runs on it ahead of a device sign-in, and
+/// `token --forget` falls back to the device token.
+#[tokio::test]
+async fn an_agent_token_is_stored_reported_and_used_first() {
+    let (fake, base) = Fake::start().await;
+    let store = MemoryStore::default();
+    let mut said = Vec::new();
+
+    // Not an agent token, and a revoked one: refused, nothing stored, never echoed.
+    let err = token::store_agent_token(&base, "device-token-1", &store, &mut |l| {
+        said.push(l.to_string())
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("mga_"), "{err}");
+    assert!(!err.contains("device-token-1"), "{err}");
+    let err = token::store_agent_token(&base, "mga_with space", &store, &mut |l| {
+        said.push(l.to_string())
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("malformed"), "{err}");
+    fake.lock().revoked.push(AGENT_TOKEN.into());
+    let err = token::store_agent_token(&base, AGENT_TOKEN, &store, &mut |l| {
+        said.push(l.to_string())
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("wasn't stored"), "{err}");
+    assert!(!err.contains(AGENT_TOKEN), "{err}");
+    assert!(store.0.lock().unwrap().is_empty());
+    fake.lock().revoked.clear();
+
+    // A device sign-in first, then the agent token (pasted with a trailing newline).
+    store.set(&base, TOKEN).unwrap();
+    let me = token::store_agent_token(&base, &format!("{AGENT_TOKEN}\n"), &store, &mut |l| {
+        said.push(l.to_string())
+    })
+    .await
+    .unwrap();
+    assert_eq!(me.agent.unwrap().name, "claude-code");
+    assert_eq!(
+        store.get(&agent_key(&base)).unwrap().as_deref(),
+        Some(AGENT_TOKEN)
+    );
+    assert!(said.iter().all(|l| !l.contains(AGENT_TOKEN)), "{said:?}");
+    assert!(said.iter().any(|l| l.contains("used first")), "{said:?}");
+
+    let who = token::whoami(&base, &store).await.unwrap();
+    assert!(
+        who.starts_with("agent claude-code of @krishna, may read: company, company/engineering"),
+        "{who}"
+    );
+    assert!(who.contains("with the agent token"), "{who}");
+    assert!(!who.contains(AGENT_TOKEN), "{who}");
+
+    // The binary's `signed_in_client` takes `require_token`: the agent token wins.
+    let token = require_token(&store, &base).unwrap();
+    assert_eq!(token, AGENT_TOKEN);
+    fake.lock().bearers.clear();
+    let mut mcp = Mcp::start(Client::new(&base, Some(token)).unwrap()).await;
+    fake.add(
+        "notes",
+        Origin::Agent {
+            name: "repo".into(),
+        },
+        "agent:repo",
+        "# Notes\n\nThe agent token reads the engineering notes.\n",
+    );
+    let (is_error, text) = mcp
+        .tool("search_context", json!({"query": "engineering notes"}))
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("engineering notes"), "{text}");
+    let (is_error, text) = mcp.tool("recent_changes", json!({})).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("\"notes\""), "{text}");
+    {
+        let s = fake.lock();
+        assert!(!s.bearers.is_empty());
+        assert!(
+            s.bearers.iter().all(|b| b == AGENT_TOKEN),
+            "{:?}",
+            s.bearers
+        );
+    }
+
+    // Revoked in Settings: the error says to mint a new token, not to `login`.
+    fake.lock().revoked.push(AGENT_TOKEN.into());
+    let (is_error, text) = mcp.tool("search_context", json!({"query": "notes"})).await;
+    assert!(is_error);
+    assert!(text.contains("margin-mcp token"), "{text}");
+    fake.lock().revoked.clear();
+
+    // Forget: back to the device sign-in.
+    said.clear();
+    assert!(token::forget_agent_token(&base, &store, &mut |l| said.push(l.to_string())).unwrap());
+    assert!(said[0].contains("device sign-in"), "{said:?}");
+    assert_eq!(require_token(&store, &base).unwrap(), TOKEN);
+    let who = token::whoami(&base, &store).await.unwrap();
+    assert!(
+        who.starts_with("@krishna (owner) on the device \"Claude Code (test-mac)\""),
+        "{who}"
+    );
+    assert!(who.contains("with the device sign-in"), "{who}");
+    assert!(!token::forget_agent_token(&base, &store, &mut |l| said.push(l.to_string())).unwrap());
+
+    // Nothing stored: whoami says how to sign in.
+    store.delete(&base).unwrap();
+    let err = token::whoami(&base, &store).await.unwrap_err().to_string();
+    assert!(err.contains("margin-mcp token"), "{err}");
 }
 
 fn git(dir: &Path, args: &[&str]) {

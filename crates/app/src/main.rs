@@ -1,20 +1,25 @@
 //! The Margin app (desktop, iOS, Android): a thin, live client of the Margin service.
 
 mod api;
+mod background;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
 mod citations;
 mod commands;
 mod config;
+mod diagnostics;
 mod drafts;
 mod events;
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod guard_tests;
 // `StdDir` and some `DirError`s are used by the platforms' `open` (4a, 4b, 4c), which
 // aren't built on every platform yet.
 #[allow(dead_code)]
 mod folders;
 mod markdown;
+mod org;
 mod picker;
 mod routes;
 #[cfg(target_os = "ios")]
@@ -86,6 +91,8 @@ const INDEX_HTML: &str = concat!(
 );
 
 fn main() {
+    // First, so a panic anywhere after leaves a report (src/diagnostics.rs).
+    diagnostics::init();
     picker::clear_staging();
     // The folders this device holds, before anything syncs them.
     folders::store::load();
@@ -310,7 +317,7 @@ fn menu_bar() -> dioxus::desktop::muda::Menu {
         })
         .and_then(|_| menu.append_items(&[&app, &file, &edit, &view, &go, &window]));
     if let Err(error) = built {
-        eprintln!("couldn't build the menu bar: {error}");
+        tracing::warn!("couldn't build the menu bar: {error}");
     }
     menu
 }
@@ -416,6 +423,32 @@ fn App() -> Element {
         }
     });
 
+    // Keeps the platform's background task (iOS 26's continued processing) going while
+    // a held folder syncs or a chat reading one runs (`background`, D1). Polled: the
+    // inputs are signals the coordinator only peeks at.
+    use_future(move || async move {
+        let mut coordinator = background::Coordinator::new(background::platform());
+        loop {
+            let want = {
+                let lib = ctx.lib.peek();
+                background::wanted(
+                    &ctx.folder_sync.peek(),
+                    lib.chats.values(),
+                    &ctx.folders.peek(),
+                    &lib.workspaces,
+                )
+            };
+            coordinator.observe(background::Inputs {
+                // Read from the channel, not the signal copied from it above: the
+                // signal lags a tick, and a start as the owner leaves would be refused.
+                foreground: *state::foreground_changes().borrow(),
+                continued: state::continued(),
+                want,
+            });
+            tokio::time::sleep(BACKGROUND_TICK).await;
+        }
+    });
+
     // View > Zoom In / Zoom Out / Actual Size change the saved zoom level.
     #[cfg(feature = "desktop")]
     dioxus::desktop::use_muda_event_handler(move |event| {
@@ -445,6 +478,11 @@ fn App() -> Element {
          @font-face {{ font-family: 'Albert Sans'; font-style: italic; font-weight: 100 900; font-display: swap; src: url('{FONTS}/AlbertSans-Italic-wght.ttf') format('truetype'); }}"
     );
     let signed_in = ctx.session.read().is_some();
+    if !signed_in {
+        diagnostics::set_screen("sign-in");
+    }
+    // A panic that quit the app last time (src/diagnostics.rs), shown once.
+    let last_crash = use_hook(diagnostics::take_last_crash);
 
     rsx! {
         if cfg!(debug_assertions) {
@@ -465,6 +503,7 @@ fn App() -> Element {
             document::Title { "Sign in — Margin" }
             ui::signin::ConnectScreen {}
         }
+        ui::crash::CrashNoticeHost { report: last_crash }
     }
 }
 
@@ -509,6 +548,7 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             drafts::resume(ctx, api);
             load_workspaces(ctx, api).await;
             load_chats(ctx, api).await;
+            let _ = ui::organisation::load_org(ctx, api).await;
             true
         }
         Err(e) => {
@@ -521,6 +561,35 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             load_chats(ctx, api).await;
             false
         }
+    }
+}
+
+/// What an event says about the signed-in person: their row and groups follow it, and
+/// a change to what they may read reloads the library.
+fn follow_me(ctx: AppCtx, event: &Event) {
+    let me = ctx
+        .session
+        .peek()
+        .as_ref()
+        .and_then(|s| s.me.as_ref())
+        .and_then(|m| m.person.as_ref())
+        .map(|p| p.id.clone());
+    let Some(me) = me else { return };
+    match event {
+        // Events don't carry anyone's own settings: they're fetched again, so a change
+        // (or a reset) made on another device shows here.
+        Event::PersonChanged { person } if person.id == me => {
+            ui::organisation::follow_own_person(ctx, person.clone())
+        }
+        Event::MembershipChanged { person_id, groups } if *person_id == me => {
+            ctx.update_person(|p| p.groups = groups.clone())
+        }
+        Event::AccessChanged { person_id } if *person_id == me => {
+            let mut reload = ctx.reload;
+            let next = *reload.peek() + 1;
+            reload.set(next);
+        }
+        _ => {}
     }
 }
 
@@ -578,6 +647,9 @@ async fn load_chats(ctx: AppCtx, api: &Api) -> bool {
 /// foreground state while connected or waiting.
 const LIVE_TICK: Duration = Duration::from_millis(250);
 
+/// How often the background-task coordinator looks at the syncs and chats.
+const BACKGROUND_TICK: Duration = Duration::from_secs(1);
+
 /// The devices again, with who is online now (`DeviceChanged` only says what changes
 /// while the socket is live). Settings shows the ones known before if this fails.
 async fn load_devices(ctx: AppCtx, api: &Api) {
@@ -596,11 +668,11 @@ async fn load_devices(ctx: AppCtx, api: &Api) {
 /// online exactly while its socket is live.
 fn set_self_online(ctx: AppCtx, online: bool) {
     let mut lib = ctx.lib;
-    let me = ctx
-        .session
-        .peek()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|me| me.device.id.clone()));
+    let me = ctx.session.peek().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|me| me.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let id = me.or_else(|| {
         lib.peek()
             .devices
@@ -622,8 +694,8 @@ fn set_self_online(ctx: AppCtx, online: bool) {
 /// Keeps the library live over the events socket and runs the device tools the service
 /// sends this device. The loop owns both halves of the socket: frames for the service
 /// (tool answers) come to it through `AppCtx::device_frames`. On iOS, iPadOS and Android
-/// the socket is closed while the app is in the background and opened again when it
-/// comes back.
+/// the socket is closed while the app isn't active (in the background with no
+/// background task running, `state::active`) and opened again when it is.
 async fn live_loop(ctx: AppCtx) {
     let Some(api) = ctx.api() else { return };
     let Some(token) = api.token().map(str::to_string) else {
@@ -642,11 +714,12 @@ async fn live_loop(ctx: AppCtx) {
     let mut attempt: u32 = 0;
     let mut connected_before = false;
     loop {
-        if !*ctx.foreground.peek() {
-            // Uploads stop with the app (iOS, iPadOS, Android); parts resume later.
+        if !state::active() {
+            // Uploads stop with the app (iOS, iPadOS, Android) unless its background
+            // task keeps it active; parts resume later.
             engine.pause();
             live.set(LiveStatus::Background);
-            while !*ctx.foreground.peek() {
+            while !state::active() {
                 tokio::time::sleep(LIVE_TICK).await;
             }
             attempt = 0;
@@ -687,6 +760,7 @@ async fn live_loop(ctx: AppCtx) {
                                 {
                                     device_frames.set(Some(tx));
                                 }
+                                follow_me(ctx, &event);
                                 lib.write().apply(event);
                             }
                             // Device-tool requests for this device and their cancellations.
@@ -703,7 +777,7 @@ async fn live_loop(ctx: AppCtx) {
                             }
                         }
                         _ = tick.tick() => {
-                            if !*ctx.foreground.peek() {
+                            if !state::active() {
                                 engine.pause();
                                 events::close(&mut sender).await;
                                 break String::new();
@@ -734,15 +808,21 @@ async fn live_loop(ctx: AppCtx) {
                 error
             }
             Err(ConnectError::Unauthorized) => {
-                ctx.forget_session(Some(
-                    "This device was signed out by the service. Sign in again.".into(),
-                ));
+                // The service's reason (a disabled person) comes with a request.
+                match api.me().await {
+                    Err(e) if e.is_unauthorized() => {
+                        ctx.forget_session(Some(state::signed_out_reason(&e)))
+                    }
+                    _ => ctx.forget_session(Some(
+                        "This device was signed out by the service. Sign in again.".into(),
+                    )),
+                }
                 return;
             }
             Err(ConnectError::Other(message)) => message,
         };
         // Gone to the background: wait for the app to come back, not for a retry.
-        if !*ctx.foreground.peek() {
+        if !state::active() {
             continue;
         }
         let delay = events::backoff(attempt);
@@ -753,7 +833,7 @@ async fn live_loop(ctx: AppCtx) {
         });
         // Wait, but honor a manual reload request (Retry) in the meantime.
         let deadline = tokio::time::Instant::now() + delay;
-        while tokio::time::Instant::now() < deadline && *ctx.foreground.peek() {
+        while tokio::time::Instant::now() < deadline && state::active() {
             tokio::time::sleep(LIVE_TICK).await;
             set_self_online(ctx, false);
             let wanted = *ctx.reload.peek();

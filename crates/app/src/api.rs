@@ -15,6 +15,10 @@ use margin_shared::{
     SourceUpload, StartLogin, StartLoginRequest, SyncManifest, SyncPlan, ToolOutputText,
     ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
 };
+use margin_shared::{
+    Agent, AgentPatch, AgentToken, Group, GroupPatch, Invitation, NewAgent, NewGroup,
+    NewInvitation, Person, PersonPatch, PersonSettings,
+};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -201,6 +205,14 @@ impl Api {
             .await
     }
 
+    async fn put<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> ApiResult<T> {
+        self.json(self.request(Method::PUT, path).json(body)).await
+    }
+
     async fn delete(&self, path: &str) -> ApiResult<()> {
         self.send(self.request(Method::DELETE, path))
             .await
@@ -347,6 +359,86 @@ impl Api {
         self.delete(&routes::device(id)).await
     }
 
+    // Accounts and principals (L1): people, invitations, groups, agents.
+
+    pub async fn people(&self) -> ApiResult<Vec<Person>> {
+        self.get(routes::PEOPLE).await
+    }
+
+    pub async fn person(&self, id: &str) -> ApiResult<Person> {
+        self.get(&routes::person(id)).await
+    }
+
+    pub async fn patch_person(&self, id: &str, body: &PersonPatch) -> ApiResult<Person> {
+        self.patch(&routes::person(id), body).await
+    }
+
+    /// Replace a person's direct group memberships (admins).
+    pub async fn put_person_groups(&self, id: &str, groups: &[String]) -> ApiResult<Person> {
+        self.put(&routes::person_groups(id), groups).await
+    }
+
+    pub async fn my_settings(&self) -> ApiResult<PersonSettings> {
+        self.get(routes::ME_SETTINGS).await
+    }
+
+    pub async fn patch_my_settings(&self, body: &PersonSettings) -> ApiResult<PersonSettings> {
+        self.patch(routes::ME_SETTINGS, body).await
+    }
+
+    pub async fn invitations(&self) -> ApiResult<Vec<Invitation>> {
+        self.get(routes::INVITATIONS).await
+    }
+
+    pub async fn create_invitation(&self, body: &NewInvitation) -> ApiResult<Invitation> {
+        self.post(routes::INVITATIONS, body).await
+    }
+
+    pub async fn delete_invitation(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::invitation(id)).await
+    }
+
+    pub async fn groups(&self) -> ApiResult<Vec<Group>> {
+        self.get(routes::GROUPS).await
+    }
+
+    pub async fn create_group(&self, body: &NewGroup) -> ApiResult<Group> {
+        self.post(routes::GROUPS, body).await
+    }
+
+    pub async fn patch_group(&self, path: &str, body: &GroupPatch) -> ApiResult<Group> {
+        self.patch(&routes::group(path), body).await
+    }
+
+    pub async fn delete_group(&self, path: &str) -> ApiResult<()> {
+        self.delete(&routes::group(path)).await
+    }
+
+    pub async fn agents(&self) -> ApiResult<Vec<Agent>> {
+        self.get(routes::AGENTS).await
+    }
+
+    pub async fn create_agent(&self, body: &NewAgent) -> ApiResult<Agent> {
+        self.post(routes::AGENTS, body).await
+    }
+
+    pub async fn patch_agent(&self, id: &str, body: &AgentPatch) -> ApiResult<Agent> {
+        self.patch(&routes::agent(id), body).await
+    }
+
+    pub async fn delete_agent(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::agent(id)).await
+    }
+
+    /// Mint (or rotate) the agent's token: the token comes back this once.
+    pub async fn mint_agent_token(&self, id: &str) -> ApiResult<AgentToken> {
+        self.post_empty(&routes::agent_token(id)).await
+    }
+
+    pub async fn revoke_agent_token(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::agent_token(id)).await
+    }
+
     /// Upload the file at `path` as a source, streaming it from disk (never all of it in
     /// memory). `name` is the file name, or its path inside the folder it was added with;
     /// without `topic_id` it waits to be attached (to a chat's message or a topic). A file over its
@@ -491,6 +583,24 @@ impl Api {
     /// Delete the downloaded speech model.
     pub async fn delete_speech(&self) -> ApiResult<EmbeddingModel> {
         self.json(self.request(Method::DELETE, routes::SPEECH_MODEL))
+            .await
+    }
+
+    /// The model files with the reranker model's state (R2); 409 "no_reranker_model" on a
+    /// service that offers none.
+    pub async fn reranker_model(&self) -> ApiResult<EmbeddingModel> {
+        self.get(routes::RERANKER_MODEL).await
+    }
+
+    /// Start downloading the reranker model the `onnx-crossencoder` reranker runs;
+    /// progress arrives as `EmbeddingModelChanged` events.
+    pub async fn download_reranker(&self) -> ApiResult<EmbeddingModel> {
+        self.post_empty(routes::RERANKER_MODEL_DOWNLOAD).await
+    }
+
+    /// Delete the downloaded reranker model.
+    pub async fn delete_reranker(&self) -> ApiResult<EmbeddingModel> {
+        self.json(self.request(Method::DELETE, routes::RERANKER_MODEL))
             .await
     }
 
@@ -793,7 +903,7 @@ mod tests {
                 github_login,
             } => {
                 assert_eq!(token, crate::fake::TOKEN);
-                assert_eq!(github_login, "Nkr1shna");
+                assert_eq!(github_login, "alice");
             }
             other => panic!("expected approval, got {other:?}"),
         }
@@ -924,8 +1034,8 @@ mod tests {
         crate::fake::rebase_media(&mut expected, |path| format!("{}{path}", fake.url));
         assert_eq!(lib, expected);
         let me = api.me().await.unwrap();
-        assert_eq!(me.github_login, "Nkr1shna");
-        assert!(me.device.current);
+        assert_eq!(me.github_login, "alice");
+        assert!(me.device.unwrap().current);
 
         let topic = api
             .create_topic(&NewTopic {
@@ -982,7 +1092,7 @@ mod tests {
         let api = Api::with_token(&fake.url, "wrong");
         let err = api.library().await.unwrap_err();
         assert!(err.is_unauthorized());
-        assert_eq!(err.message, "Sign in again.");
+        assert_eq!(err.message, "Sign in again: this device isn't signed in.");
     }
 
     #[tokio::test]
@@ -1180,9 +1290,9 @@ mod tests {
                 .any(|t| !t.found && !t.install_commands.is_empty())
         );
         let devices = api.devices().await.unwrap();
-        assert_eq!(devices.len(), 2);
+        assert_eq!(devices.len(), 3);
         api.revoke_device(&devices[1].id).await.unwrap();
-        assert_eq!(api.devices().await.unwrap().len(), 1);
+        assert_eq!(api.devices().await.unwrap().len(), 2);
         let video = api.make_video("l1").await.unwrap();
         assert_eq!(video.status, margin_shared::VideoStatus::Queued);
         assert_eq!(api.video(&video.id).await.unwrap().id, video.id);
@@ -1461,6 +1571,117 @@ mod tests {
             removed.speech.unwrap().state,
             EmbeddingModelState::NotDownloaded { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn reranker_model_download_and_delete() {
+        use margin_shared::{EmbeddingModelState, Event};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let mut events = fake.events.subscribe();
+        // A Linux service offers it, not downloaded.
+        let model = api.reranker_model().await.unwrap();
+        let reranker = model.reranker.clone().unwrap();
+        assert_eq!(reranker.name, crate::fake::RERANKER_NAME);
+        assert_eq!(reranker.repo, crate::fake::RERANKER_REPO);
+        assert_eq!(
+            reranker.state,
+            EmbeddingModelState::NotDownloaded {
+                download_bytes: crate::fake::RERANKER_DOWNLOAD_BYTES
+            }
+        );
+        assert_eq!(api.embedding().await.unwrap(), model);
+        // A member may look, not download or remove (L1: the models are the
+        // organisation's).
+        let bob = Api::with_token(&fake.url, crate::fake::TOKEN_BOB);
+        assert_eq!(bob.reranker_model().await.unwrap(), model);
+        for err in [
+            bob.download_reranker().await.unwrap_err(),
+            bob.delete_reranker().await.unwrap_err(),
+        ] {
+            assert_eq!(err.code, margin_shared::access_code::ADMIN_REQUIRED);
+        }
+
+        let downloading = api.download_reranker().await.unwrap();
+        assert!(matches!(
+            downloading.reranker.as_ref().unwrap().state,
+            EmbeddingModelState::Downloading { received: 0, .. }
+        ));
+        // The embedding model's part is unchanged, and the change is sent.
+        assert_eq!(downloading.state, model.state);
+        match events.recv().await.unwrap() {
+            Event::EmbeddingModelChanged { model } => assert_eq!(model, downloading),
+            other => panic!("{other:?}"),
+        }
+        // Asking again while it downloads changes nothing.
+        assert_eq!(api.download_reranker().await.unwrap(), downloading);
+        fake.state.lock().unwrap().reranker = Some(EmbeddingModelState::Ready {
+            bytes: crate::fake::RERANKER_DOWNLOAD_BYTES,
+        });
+        let removed = api.delete_reranker().await.unwrap();
+        assert!(matches!(
+            removed.reranker.unwrap().state,
+            EmbeddingModelState::NotDownloaded { .. }
+        ));
+
+        // A service with none answers 409.
+        fake.state.lock().unwrap().reranker = None;
+        assert_eq!(api.embedding().await.unwrap().reranker, None);
+        for err in [
+            api.reranker_model().await.unwrap_err(),
+            api.download_reranker().await.unwrap_err(),
+            api.delete_reranker().await.unwrap_err(),
+        ] {
+            assert_eq!(
+                (err.status, err.code.as_str()),
+                (Some(409), "no_reranker_model")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lessons_carry_what_wrote_them() {
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let lib = api.library().await.unwrap();
+        let l1 = lib.lessons.iter().find(|l| l.id == "l1").unwrap();
+        let w = l1.written_with.as_ref().unwrap();
+        assert_eq!(w.prompt_version, "lesson-v2");
+        assert_eq!(w.model, "claude-sonnet-5-5");
+        assert_eq!(w.provider, margin_shared::Provider::Claude);
+        // A lesson that failed was written by nothing.
+        let l3 = lib.lessons.iter().find(|l| l.id == "l3").unwrap();
+        assert_eq!(l3.written_with, None);
+
+        // A regenerate is written with the pipeline and the default provider's writing
+        // model as they are now.
+        api.patch_settings(&margin_shared::SettingsPatch {
+            default_provider: Some(margin_shared::Provider::Claude),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let settings = api.settings().await.unwrap();
+        fake.state.lock().unwrap().simulate = true;
+        let mut events = fake.events.subscribe();
+        api.regenerate_lesson("l3").await.unwrap();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Ok(margin_shared::Event::LessonChanged { lesson }) = events.recv().await
+                    && lesson.id == "l3"
+                    && lesson.status == margin_shared::LessonStatus::Ready
+                {
+                    return lesson;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let w = done.written_with.unwrap();
+        assert_eq!(w.provider, margin_shared::Provider::Claude);
+        assert_eq!(w.model, settings.claude_models.write);
+        assert_eq!(w.prompt_version, settings.pipeline.prompts);
+        assert_eq!(w.pipeline_hash, settings.pipeline.hash());
     }
 
     #[tokio::test]
@@ -2014,18 +2235,72 @@ mod tests {
         assert_eq!(settings.pipeline.fusion.name, "linear");
         assert_eq!(settings.pipeline.packer.name, "take-k");
         assert_eq!(settings.openai_models.get(Route::Write), "gpt-6-astra");
-        // A variant naming a stage the service lacks is refused like any other.
-        let listwise = variants
-            .variants
-            .iter()
-            .find(|v| v.name == "listwise")
-            .unwrap();
-        assert!(listwise.unavailable.is_some());
+        // A stage the service lacks is refused.
         let err = api
-            .patch_settings(&stages_patch(&settings.pipeline, &listwise.config).unwrap())
+            .patch_settings(
+                &stages_patch(
+                    &settings.pipeline,
+                    &settings.pipeline.with_stage("reranker", "cross-v9"),
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, "bad_pipeline");
+        // So is a variant the service can't build until its model is downloaded.
+        let xenc = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rerank-xenc")
+            .unwrap();
+        assert!(xenc.unavailable.is_some());
+        let err = api
+            .patch_settings(&stages_patch(&settings.pipeline, &xenc.config).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "bad_pipeline");
+        assert!(
+            err.message.contains("Settings → Sources"),
+            "{}",
+            err.message
+        );
+
+        // The Rewriter (R2) saves like any stage, and keeps the others.
+        let settings = api
+            .patch_settings(
+                &stages_patch(
+                    &settings.pipeline,
+                    &settings.pipeline.with_stage("rewriter", "small-expand-v1"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.rewriter.name, "small-expand-v1");
+        assert_eq!(settings.pipeline.packer.name, "take-k");
+        assert_eq!(
+            api.settings().await.unwrap().pipeline.rewriter.name,
+            "small-expand-v1"
+        );
+
+        // Once the reranker model is downloaded, the cross-encoder's variant is offered
+        // and saves.
+        fake.state.lock().unwrap().reranker = Some(margin_shared::EmbeddingModelState::Ready {
+            bytes: crate::fake::RERANKER_DOWNLOAD_BYTES,
+        });
+        let variants = api.pipeline_variants().await.unwrap();
+        let xenc = variants
+            .variants
+            .iter()
+            .find(|v| v.name == "rerank-xenc")
+            .unwrap();
+        assert_eq!(xenc.unavailable, None);
+        let settings = api
+            .patch_settings(&stages_patch(&settings.pipeline, &xenc.config).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(settings.pipeline.reranker.name, "onnx-crossencoder");
+        assert_eq!(settings.pipeline.rewriter.name, "none");
 
         // Trace retention, in range or refused.
         let settings = api
@@ -2728,5 +3003,410 @@ mod tests {
                 Some(crate::ui::settings::SettingsPane::Ai)
             );
         }
+    }
+
+    /// Accounts and principals (L1) through the fake, which keeps the service's rules:
+    /// the owner (Alice) and a member (Bob), each on their own token.
+    #[tokio::test]
+    async fn people_groups_invitations_and_agents() {
+        use crate::fake::{ALICE, BOB, TOKEN_BOB};
+        use margin_shared::{
+            AgentKind, AgentPatch, GroupPatch, NewAgent, NewGroup, NewInvitation, OrgRole,
+            PersonPatch, PersonSettings, PersonState, ReasoningEffort, access_code,
+        };
+        let fake = FakeService::start().await;
+        let alice = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let bob = Api::with_token(&fake.url, TOKEN_BOB);
+
+        // Who each is; the directory lists both, settings only on one's own row.
+        let me = bob.me().await.unwrap();
+        let person = me.person.unwrap();
+        assert_eq!(
+            (person.id.as_str(), person.org_role),
+            (BOB, OrgRole::Member)
+        );
+        assert_eq!(me.device.unwrap().id, "d3");
+        alice
+            .patch_my_settings(&PersonSettings {
+                default_provider: Some(Provider::Claude),
+                reasoning_effort: Some(ReasoningEffort::High),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            alice.my_settings().await.unwrap().reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        let seen_by_bob = bob.person(ALICE).await.unwrap();
+        assert_eq!(seen_by_bob.settings, PersonSettings::default());
+        assert_eq!(bob.people().await.unwrap().len(), 2);
+
+        // Devices: Bob sees his own; Alice everyone's. Bob can't revoke Alice's (404).
+        assert_eq!(bob.devices().await.unwrap().len(), 1);
+        assert_eq!(alice.devices().await.unwrap().len(), 3);
+        assert_eq!(
+            bob.revoke_device(&"d2".to_string())
+                .await
+                .unwrap_err()
+                .status,
+            Some(404)
+        );
+
+        // Admin-only: settings, groups, invitations.
+        let refused = bob
+            .patch_settings(&SettingsPatch::default())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::ADMIN_REQUIRED);
+        assert!(bob.invitations().await.is_err());
+        let refused = bob
+            .create_group(&NewGroup {
+                path: "company/design".into(),
+                name: "Design".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, Some(403));
+
+        // Groups: created under a parent that exists, renamed, deleted once empty.
+        let design = alice
+            .create_group(&NewGroup {
+                path: "company/design".into(),
+                name: "Design".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(design.members, 0);
+        let orphan = alice
+            .create_group(&NewGroup {
+                path: "company/sales/emea".into(),
+                name: "EMEA".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(orphan.code, access_code::UNKNOWN_GROUP);
+        let renamed = alice
+            .patch_group(
+                "company/design",
+                &GroupPatch {
+                    name: Some("Design team".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, "Design team");
+        let busy = alice.delete_group("company/engineering").await.unwrap_err();
+        assert_eq!(busy.code, access_code::HAS_MEMBERS);
+        assert_eq!(
+            alice.delete_group("company").await.unwrap_err().code,
+            "root_group"
+        );
+        let bad = alice
+            .create_group(&NewGroup {
+                path: "company/Not OK".into(),
+                name: "x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((bad.status, bad.code.as_str()), (Some(400), "bad_path"));
+        let taken = alice
+            .create_group(&NewGroup {
+                path: "company/engineering".into(),
+                name: "Again".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((taken.status, taken.code.as_str()), (Some(409), "exists"));
+
+        // Memberships: Bob into design, then the group can't go.
+        let bob_now = alice
+            .put_person_groups(BOB, &["company/design".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(bob_now.groups, vec!["company/design"]);
+        let unknown = alice
+            .put_person_groups(BOB, &["company/nope".to_string()])
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code, access_code::UNKNOWN_GROUP);
+        let busy = alice.delete_group("company/design").await.unwrap_err();
+        assert_eq!(busy.code, access_code::HAS_MEMBERS);
+        alice.put_person_groups(BOB, &[]).await.unwrap();
+        alice.delete_group("company/design").await.unwrap();
+
+        // Invitations: by GitHub login; duplicates and members refused; revoked.
+        assert_eq!(alice.invitations().await.unwrap().len(), 2);
+        let invite = |login: &str, role: OrgRole| NewInvitation {
+            github_login: login.into(),
+            role,
+            groups: vec![],
+        };
+        let refused = alice
+            .create_invitation(&invite("carol-dev", OrgRole::Member))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::ALREADY_INVITED);
+        let refused = alice
+            .create_invitation(&invite("BOB", OrgRole::Member))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::ALREADY_MEMBER);
+        let dave = alice
+            .create_invitation(&invite("dave", OrgRole::Admin))
+            .await
+            .unwrap();
+        assert_eq!(dave.role, OrgRole::Admin);
+        alice.delete_invitation(&dave.id).await.unwrap();
+        let gone = alice.delete_invitation(&dave.id).await.unwrap_err();
+        assert_eq!(gone.status, Some(404));
+        // An expired invitation can still be revoked (204); an accepted one can't.
+        let expired = {
+            let mut s = fake.state.lock().unwrap();
+            let carol = s
+                .invitations
+                .iter_mut()
+                .find(|i| i.id == "inv-carol")
+                .unwrap();
+            carol.expires_at = chrono::Utc::now() - chrono::Duration::days(1);
+            carol.clone()
+        };
+        alice.delete_invitation(&expired.id).await.unwrap();
+        assert_eq!(
+            alice.delete_invitation("inv-bob").await.unwrap_err().status,
+            Some(404)
+        );
+        // Unknown groups are refused before a login already in use.
+        let refused = alice
+            .create_invitation(&NewInvitation {
+                github_login: "bob".into(),
+                role: OrgRole::Member,
+                groups: vec!["company/nope".into()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::UNKNOWN_GROUP);
+        // carol-dev is invited again for the sign-in below.
+        alice
+            .create_invitation(&invite("carol-dev", OrgRole::Member))
+            .await
+            .map(|_| ())
+            .unwrap();
+
+        // Roles: only the owner makes admins; the owner is fixed.
+        let role = |r: OrgRole| PersonPatch {
+            org_role: Some(r),
+            ..Default::default()
+        };
+        let state = |s: PersonState| PersonPatch {
+            state: Some(s),
+            ..Default::default()
+        };
+        let name = |n: &str| PersonPatch {
+            name: Some(n.into()),
+            ..Default::default()
+        };
+        let fixed = alice
+            .patch_person(ALICE, &role(OrgRole::Member))
+            .await
+            .unwrap_err();
+        assert_eq!(fixed.code, access_code::OWNER_FIXED);
+        // A patch that leaves the owner's role and state as they are is fine.
+        let same = PersonPatch {
+            org_role: Some(OrgRole::Owner),
+            state: Some(PersonState::Active),
+            ..Default::default()
+        };
+        assert_eq!(
+            alice.patch_person(ALICE, &same).await.unwrap().org_role,
+            OrgRole::Owner
+        );
+        // Names are 1 to 100 characters; a picture is an http(s) address.
+        let long = "x".repeat(101);
+        assert_eq!(
+            alice
+                .patch_person(ALICE, &name(&long))
+                .await
+                .unwrap_err()
+                .status,
+            Some(400)
+        );
+        alice
+            .patch_person(ALICE, &name(&"x".repeat(100)))
+            .await
+            .unwrap();
+        let picture = |u: &str| PersonPatch {
+            avatar_url: Some(Some(u.into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            alice
+                .patch_person(ALICE, &picture("javascript:alert(1)"))
+                .await
+                .unwrap_err()
+                .status,
+            Some(400)
+        );
+        alice
+            .patch_person(ALICE, &picture("https://example.com/a.png"))
+            .await
+            .unwrap();
+        let bob_admin = alice
+            .patch_person(BOB, &role(OrgRole::Admin))
+            .await
+            .unwrap();
+        assert_eq!(bob_admin.org_role, OrgRole::Admin);
+        // An admin invites members, not admins, and can't disable the owner.
+        let refused = bob
+            .create_invitation(&invite("erin", OrgRole::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, Some(403));
+        let refused = bob
+            .patch_person(ALICE, &state(PersonState::Disabled))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::OWNER_FIXED);
+        // Nobody disables themselves.
+        let refused = bob
+            .patch_person(BOB, &state(PersonState::Disabled))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str()),
+            (Some(400), "You can't disable yourself.")
+        );
+        // Names are one's own.
+        let refused = bob.patch_person(ALICE, &name("A")).await.unwrap_err();
+        assert_eq!(refused.code, access_code::NOT_OWNER);
+        assert_eq!(
+            bob.patch_person(BOB, &name("Robert")).await.unwrap().name,
+            "Robert"
+        );
+
+        // Agents: a default ceiling by kind, inside the owner's access; the token once.
+        let agent = alice
+            .create_agent(&NewAgent {
+                name: "notes-bot".into(),
+                kind: AgentKind::Margin,
+                ceiling: None,
+            })
+            .await
+            .unwrap();
+        assert!(agent.ceiling.contains(&format!("person/{ALICE}")));
+        let ceiling = |c: &str| AgentPatch {
+            ceiling: Some(vec![c.into()]),
+            ..Default::default()
+        };
+        let outside = alice
+            .patch_agent(&agent.id, &ceiling("company/sales"))
+            .await
+            .unwrap_err();
+        assert_eq!(outside.code, access_code::OUTSIDE_OWNER);
+        let narrowed = alice
+            .patch_agent(&agent.id, &ceiling("company/engineering"))
+            .await
+            .unwrap();
+        assert_eq!(narrowed.ceiling, vec!["company", "company/engineering"]);
+        let dup = alice
+            .create_agent(&NewAgent {
+                name: "notes-bot".into(),
+                kind: AgentKind::External,
+                ceiling: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(dup.status, Some(409));
+        let bad = alice
+            .create_agent(&NewAgent {
+                name: "Not OK".into(),
+                kind: AgentKind::External,
+                ceiling: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((bad.status, bad.code.as_str()), (Some(400), "bad_name"));
+        let minted = alice.mint_agent_token(&agent.id).await.unwrap();
+        assert!(minted.token.starts_with("mga_"));
+        let info = minted.agent.token.clone().unwrap();
+        assert!(minted.token.starts_with(&info.prefix));
+        let rotated = alice.mint_agent_token(&agent.id).await.unwrap();
+        assert_ne!(rotated.token, minted.token);
+        alice.revoke_agent_token(&agent.id).await.unwrap();
+        // Revoking again is 204 as well (the service's answer).
+        alice.revoke_agent_token(&agent.id).await.unwrap();
+        // Bob (an admin now) sees it and may only disable it.
+        let rename = AgentPatch {
+            name: Some("mine".into()),
+            ..Default::default()
+        };
+        assert!(bob.patch_agent(&agent.id, &rename).await.is_err());
+        let disable = AgentPatch {
+            disabled: Some(true),
+            ..Default::default()
+        };
+        assert!(bob.patch_agent(&agent.id, &disable).await.unwrap().disabled);
+        assert!(bob.delete_agent(&agent.id).await.is_err());
+        alice.delete_agent(&agent.id).await.unwrap();
+        assert!(
+            alice
+                .agents()
+                .await
+                .unwrap()
+                .iter()
+                .all(|a| a.id != agent.id)
+        );
+
+        // Disabling a person deletes their devices and so their tokens: their next
+        // request is a plain 401, as the service's (D10).
+        alice
+            .patch_person(BOB, &state(PersonState::Disabled))
+            .await
+            .unwrap();
+        let refused = bob.me().await.unwrap_err();
+        assert!(refused.is_unauthorized());
+        assert_eq!(refused.code, "unauthorized");
+        assert!(!fake.state.lock().unwrap().tokens.contains_key(TOKEN_BOB));
+        assert_eq!(alice.devices().await.unwrap().len(), 2);
+        // Signing in again is refused with the sentence, at the callback.
+        {
+            let mut s = fake.state.lock().unwrap();
+            s.login_as = BOB.into();
+            s.approve = true;
+        }
+        let anon = Api::anonymous(&fake.url);
+        let login = anon.start_login("Bob's laptop").await.unwrap();
+        match anon.poll_login(&login).await.unwrap() {
+            LoginState::Denied { reason } => assert!(reason.contains("@bob is disabled")),
+            other => panic!("{other:?}"),
+        }
+        // Enabled again, Bob signs in afresh on a new device.
+        alice
+            .patch_person(BOB, &state(PersonState::Active))
+            .await
+            .unwrap();
+        let login = anon.start_login("Bob's laptop").await.unwrap();
+        let LoginState::Approved { token, .. } = anon.poll_login(&login).await.unwrap() else {
+            panic!("not approved");
+        };
+        assert_ne!(token, TOKEN_BOB);
+        let bob_again = Api::with_token(&fake.url, &token);
+        assert_eq!(bob_again.me().await.unwrap().person.unwrap().id, BOB);
+        assert!(bob_again.library().await.is_ok());
+        // An invitation turns into a person at sign-in.
+        let (carol, token) = fake
+            .state
+            .lock()
+            .unwrap()
+            .accept_invitation("carol-dev", "Carol's Mac")
+            .unwrap();
+        let carol_api = Api::with_token(&fake.url, &token);
+        let carol_me = carol_api.me().await.unwrap().person.unwrap();
+        assert_eq!(carol_me.groups, carol.groups);
+        // Invited to no group, she is in `company` all the same.
+        assert_eq!(carol_me.groups, vec!["company"]);
+        assert_eq!(carol_me.org_role, OrgRole::Member);
+        // A token the fake minted works everywhere a sample one does.
+        assert!(carol_api.library().await.is_ok());
+        assert!(carol_api.chats().await.is_ok());
     }
 }

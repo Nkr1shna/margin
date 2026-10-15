@@ -716,6 +716,9 @@ mod tests {
                 name: "iPhone".into(),
             },
             workspaces: vec![Workspace {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: "w1".into(),
                 name: "notes".into(),
                 device_id: "mac".into(),

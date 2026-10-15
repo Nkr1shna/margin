@@ -20,7 +20,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use margin_shared::*;
 use tokio::sync::broadcast;
 
+/// Alice's device token (`d1`, "test-mac"): the organisation's owner.
 pub const TOKEN: &str = "test-device-token";
+/// Bob's device token (`d3`): a member.
+pub const TOKEN_BOB: &str = "test-device-token-bob";
+/// The owner's person id.
+pub const ALICE: &str = "p-alice";
+/// The member's person id.
+pub const BOB: &str = "p-bob";
 
 pub struct FakeState {
     pub device_name: String,
@@ -45,6 +52,9 @@ pub struct FakeState {
     pub embedding: EmbeddingModelState,
     /// The speech model, as a Linux service reports it; `None` as on a Mac.
     pub speech: Option<EmbeddingModelState>,
+    /// The cross-encoder the `onnx-crossencoder` reranker runs (R2), as a Linux service
+    /// reports it; `None` as on a service that offers none.
+    pub reranker: Option<EmbeddingModelState>,
     /// The re-index with a new embedder, while it runs.
     pub reindex: Option<ReindexProgress>,
     /// Uploaded sources' bytes, served as their originals.
@@ -55,6 +65,9 @@ pub struct FakeState {
     pub parts_received: u32,
     /// Fail the next this many parts with a 503, for tests of the retries.
     pub fail_parts: u32,
+    /// Say this much was received the next time an upload's state is asked for (a
+    /// service that over-reports), for tests that the client copes.
+    pub misreport_received: Option<u64>,
     /// Take this long over each part, for tests that stop an upload half way.
     pub part_delay: Option<Duration>,
     pub chats: Vec<Chat>,
@@ -85,6 +98,18 @@ pub struct FakeState {
     pub chatgpt_polls: u32,
     /// Sign-ins started, for tests.
     pub chatgpt_starts: u32,
+    /// Everyone who may sign in: Alice (owner) and Bob (member) to start with.
+    pub people: Vec<Person>,
+    /// Groups; `members` is counted from `people` when listed.
+    pub groups: Vec<Group>,
+    pub agents: Vec<Agent>,
+    /// The last token minted for each agent (the fake keeps it; the service keeps a hash).
+    pub agent_tokens: HashMap<Id, String>,
+    pub invitations: Vec<Invitation>,
+    /// Device tokens: the device and the person each signs in as.
+    pub tokens: HashMap<String, (Id, Id)>,
+    /// Who the next approved sign-in is (`ALICE` or `BOB`).
+    pub login_as: Id,
 }
 
 /// An upload in parts the fake is receiving.
@@ -107,6 +132,14 @@ pub const EMBEDDING_DOWNLOAD_BYTES: u64 = 1_480_000_000;
 pub const SPEECH_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 /// What the fake says the speech model download weighs.
 pub const SPEECH_DOWNLOAD_BYTES: u64 = 670_000_000;
+/// The reranker model a Linux service downloads (`params.model` of `onnx-crossencoder`).
+pub const RERANKER_NAME: &str = "ms-marco-minilm-l6-v2";
+/// Its Hugging Face repo.
+pub const RERANKER_REPO: &str = "Xenova/ms-marco-MiniLM-L-6-v2";
+/// What the fake says the reranker model download weighs.
+pub const RERANKER_DOWNLOAD_BYTES: u64 = 23_400_000;
+/// What `Pipeline::build` says of `onnx-crossencoder` while its model isn't downloaded.
+pub const RERANKER_MISSING: &str = "The reranker \"onnx-crossencoder\" needs the ms-marco-minilm-l6-v2 model: download the reranker model in Settings → Sources first.";
 
 #[derive(Clone)]
 pub struct Fake {
@@ -125,6 +158,35 @@ pub struct FakeService {
 
 fn ts(n: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_760_000_000 + n, 0).unwrap()
+}
+
+/// What wrote a sample lesson: `lesson-v2` with the default pipeline on `model`.
+pub fn sample_written_with(provider: Provider, model: &str, at: DateTime<Utc>) -> WrittenWith {
+    WrittenWith {
+        prompt_version: "lesson-v2".into(),
+        pipeline_hash: margin_shared::pipeline::PipelineConfig::default().hash(),
+        provider,
+        model: model.into(),
+        at,
+    }
+}
+
+/// What writes a lesson now, as the service resolves it: the pipeline's prompts on the
+/// default provider's writing model (or the variant's override of the route).
+fn written_with_now(settings: &Settings) -> WrittenWith {
+    let provider = settings.default_provider;
+    WrittenWith {
+        prompt_version: settings.pipeline.prompts.clone(),
+        pipeline_hash: settings.pipeline.hash(),
+        provider,
+        model: settings
+            .pipeline
+            .routes
+            .write
+            .clone()
+            .unwrap_or_else(|| settings.models(provider).write.clone()),
+        at: Utc::now(),
+    }
 }
 
 pub const LESSON_ONE: &str = r#"Any periodic signal that's reasonably well behaved can be rebuilt from sine and cosine waves. Their frequencies are whole-number multiples of one base frequency.[^1]
@@ -292,6 +354,9 @@ pub fn sample_citations() -> Vec<Citation> {
 
 pub fn sample_library() -> Library {
     let topic = |id: &str, parent: Option<&str>, title: &str, position| Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         parent_id: parent.map(Into::into),
         title: title.into(),
@@ -300,6 +365,9 @@ pub fn sample_library() -> Library {
         updated_at: ts(0),
     };
     let lesson = |id: &str, topic_id: &str, title: &str, position, status, body: &str| Lesson {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         citations: Vec::new(),
         id: id.into(),
         topic_id: topic_id.into(),
@@ -309,6 +377,9 @@ pub fn sample_library() -> Library {
         level: Level::Intro,
         minutes: 9,
         body_md: body.into(),
+        // Ready lessons say what wrote them, as the service's do since R2.
+        written_with: (status == LessonStatus::Ready)
+            .then(|| sample_written_with(Provider::OpenAi, "gpt-5", ts(position))),
         status,
         created_at: ts(position),
         updated_at: ts(position),
@@ -323,6 +394,11 @@ pub fn sample_library() -> Library {
         lessons: vec![
             Lesson {
                 citations: sample_citations(),
+                written_with: Some(sample_written_with(
+                    Provider::Claude,
+                    "claude-sonnet-5-5",
+                    ts(0),
+                )),
                 ..lesson(
                     "l1",
                     "fourier",
@@ -360,7 +436,7 @@ pub fn sample_library() -> Library {
             ),
         ],
         notes: vec![
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n1".into(),
                 topic_id: "fourier".into(),
                 lesson_id: Some("l1".into()),
@@ -370,7 +446,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(10),
                 updated_at: ts(10),
             },
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n2".into(),
                 topic_id: "fourier".into(),
                 lesson_id: None,
@@ -395,7 +471,7 @@ pub fn sample_library() -> Library {
             updated_at: ts(0),
         }],
         sources: vec![
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s1", "original")),
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
@@ -412,7 +488,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s2", "original")),
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
@@ -429,7 +505,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: None,
                 id: "s3".into(),
                 topic_id: Some("fourier".into()),
@@ -444,7 +520,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s7", "original")),
                 id: "s7".into(),
                 topic_id: Some("fourier".into()),
@@ -461,7 +537,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s4", "original")),
                 id: "s4".into(),
                 topic_id: Some("fourier".into()),
@@ -478,7 +554,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s5", "original")),
                 id: "s5".into(),
                 topic_id: Some("fourier".into()),
@@ -495,7 +571,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s6", "original")),
                 id: "s6".into(),
                 topic_id: Some("fourier".into()),
@@ -549,6 +625,7 @@ impl FakeState {
             settings: default_settings(),
             devices: vec![
                 Device {
+                    person_id: Some(ALICE.into()),
                     id: "d1".into(),
                     name: "test-mac".into(),
                     created_at: ts(0),
@@ -557,10 +634,20 @@ impl FakeState {
                     online: true,
                 },
                 Device {
+                    person_id: Some(ALICE.into()),
                     id: "d2".into(),
                     name: "iPhone".into(),
                     created_at: ts(5),
                     last_seen_at: None,
+                    current: false,
+                    online: false,
+                },
+                Device {
+                    person_id: Some(BOB.into()),
+                    id: "d3".into(),
+                    name: "Bob's laptop".into(),
+                    created_at: ts(12),
+                    last_seen_at: Some(ts(150)),
                     current: false,
                     online: false,
                 },
@@ -573,11 +660,15 @@ impl FakeState {
                 download_bytes: EMBEDDING_DOWNLOAD_BYTES,
             },
             speech: None,
+            reranker: Some(EmbeddingModelState::NotDownloaded {
+                download_bytes: RERANKER_DOWNLOAD_BYTES,
+            }),
             reindex: None,
             source_files: HashMap::new(),
             part_uploads: HashMap::new(),
             parts_received: 0,
             fail_parts: 0,
+            misreport_received: None,
             part_delay: None,
             chats: Vec::new(),
             chat_items: HashMap::new(),
@@ -593,6 +684,17 @@ impl FakeState {
             chatgpt_finish: None,
             chatgpt_polls: 0,
             chatgpt_starts: 0,
+            people: sample_people(),
+            groups: sample_groups(),
+            agents: sample_agents(),
+            agent_tokens: HashMap::new(),
+            invitations: sample_invitations(Utc::now()),
+            tokens: [
+                (TOKEN.to_string(), ("d1".to_string(), ALICE.to_string())),
+                (TOKEN_BOB.to_string(), ("d3".to_string(), BOB.to_string())),
+            ]
+            .into(),
+            login_as: ALICE.into(),
         };
         for (chat, items) in sample_chats() {
             for item in &items {
@@ -617,6 +719,11 @@ impl FakeState {
                 state,
             }),
             reindex: self.reindex,
+            reranker: self.reranker.clone().map(|state| RerankerModelState {
+                name: RERANKER_NAME.into(),
+                repo: RERANKER_REPO.into(),
+                state,
+            }),
         }
     }
 
@@ -792,6 +899,11 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/embedding/download", post(download_embedding))
         .route(routes::SPEECH_MODEL, axum::routing::delete(delete_speech))
         .route(routes::SPEECH_MODEL_DOWNLOAD, post(download_speech))
+        .route(
+            routes::RERANKER_MODEL,
+            get(get_reranker).delete(delete_reranker),
+        )
+        .route(routes::RERANKER_MODEL_DOWNLOAD, post(download_reranker))
         .route("/api/chats", get(list_chats).post(create_chat))
         .route(
             "/api/chats/{id}",
@@ -817,6 +929,39 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/workspaces/{id}/sync", post(sync_workspace))
         .route("/api/workspaces/{id}/files", get(workspace_files))
         .route("/api/events", get(events))
+        // Accounts and principals (L1).
+        .route(routes::PEOPLE, get(list_people))
+        .route("/api/people/{id}", get(get_person).patch(patch_person))
+        .route(
+            "/api/people/{id}/groups",
+            axum::routing::put(put_person_groups),
+        )
+        .route(
+            routes::ME_SETTINGS,
+            get(get_my_settings).patch(patch_my_settings),
+        )
+        .route(
+            routes::INVITATIONS,
+            get(list_invitations).post(create_invitation),
+        )
+        .route(
+            "/api/invitations/{id}",
+            axum::routing::delete(delete_invitation),
+        )
+        .route(routes::GROUPS, get(list_groups).post(create_group))
+        .route(
+            "/api/groups/{*path}",
+            axum::routing::patch(patch_group).delete(delete_group),
+        )
+        .route(routes::AGENTS, get(list_agents).post(create_agent))
+        .route(
+            "/api/agents/{id}",
+            axum::routing::patch(patch_agent).delete(delete_agent),
+        )
+        .route(
+            "/api/agents/{id}/token",
+            post(mint_agent_token).delete(revoke_agent_token),
+        )
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
         .with_state(fake)
@@ -833,21 +978,12 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// As the service's `require_principal`: a device token the fake handed out (the sample
+/// ones, or one minted at sign-in), on a device that still exists, of an active person.
 #[allow(clippy::result_large_err)]
-fn authorized(headers: &HeaderMap) -> Result<(), Response> {
-    let ok = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {TOKEN}"));
-    if ok {
-        Ok(())
-    } else {
-        Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Sign in again.",
-        ))
-    }
+fn authorized(fake: &Fake, headers: &HeaderMap) -> Result<(), Response> {
+    let s = fake.state.lock().unwrap();
+    caller(&s, headers).map(|_| ())
 }
 
 fn not_found() -> Response {
@@ -889,10 +1025,49 @@ async fn auth_poll(State(fake): State<Fake>, Json(req): Json<PollLoginRequest>) 
     }
     let auto = s.auto_approve_after.is_some_and(|n| s.polls > n);
     if s.approve || auto {
+        let login_as = s.login_as.clone();
+        let Some(person) = s.person(&login_as).cloned() else {
+            return Json(LoginState::Denied {
+                reason: "The GitHub account isn't allowed to use this Margin. Ask an admin to \
+                         invite you."
+                    .into(),
+            })
+            .into_response();
+        };
+        // As the service's admission: a disabled person is refused at the callback.
+        if person.state == PersonState::Disabled {
+            return Json(LoginState::Denied {
+                reason: format!(
+                    "The GitHub account @{} is disabled on this Margin. Ask an admin.",
+                    person.github_login
+                ),
+            })
+            .into_response();
+        }
         s.token_collected = true;
+        // The person's token while its device is still there; else a new device (a
+        // person disabled and enabled again signs in afresh).
+        let existing = s
+            .tokens
+            .iter()
+            .filter(|(_, (_, p))| *p == login_as)
+            .find(|(_, (device, _))| s.devices.iter().any(|d| d.id == *device))
+            .map(|(t, _)| t.clone());
+        let token = match existing {
+            Some(t) => t,
+            None => {
+                let name = if s.device_name.is_empty() {
+                    "New device".to_string()
+                } else {
+                    s.device_name.clone()
+                };
+                s.new_device_token(&login_as, &name)
+            }
+        };
+        let github_login = person.github_login;
         return Json(LoginState::Approved {
-            token: TOKEN.into(),
-            github_login: "Nkr1shna".into(),
+            token,
+            github_login,
         })
         .into_response();
     }
@@ -900,19 +1075,12 @@ async fn auth_poll(State(fake): State<Fake>, Json(req): Json<PollLoginRequest>) 
 }
 
 async fn me(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
     let s = fake.state.lock().unwrap();
-    let device = s.devices.iter().find(|d| d.current).cloned();
-    match device {
-        Some(device) => Json(Me {
-            github_login: "Nkr1shna".into(),
-            device,
-        })
-        .into_response(),
-        None => api_error(StatusCode::UNAUTHORIZED, "unauthorized", "Sign in again."),
-    }
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(s.me_for(&caller)).into_response()
 }
 
 fn with_media(s: &FakeState, mut video: Video) -> Video {
@@ -940,7 +1108,7 @@ fn fake_media(s: &FakeState, video_id: &Id) -> VideoMedia {
 }
 
 async fn library(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -954,7 +1122,7 @@ async fn create_topic(
     headers: HeaderMap,
     Json(req): Json<NewTopic>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let topic = {
@@ -967,6 +1135,9 @@ async fn create_topic(
             .filter(|t| t.parent_id == req.parent_id)
             .count() as i64;
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id,
             parent_id: req.parent_id,
             title: req.title,
@@ -992,7 +1163,7 @@ async fn patch_topic(
     Path(id): Path<String>,
     Json(req): Json<TopicPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let topic = {
@@ -1026,7 +1197,7 @@ async fn delete_topic(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1052,7 +1223,7 @@ async fn patch_lesson(
     Path(id): Path<String>,
     Json(req): Json<LessonPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let lesson = {
@@ -1085,7 +1256,7 @@ async fn delete_lesson(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1109,7 +1280,7 @@ async fn regenerate(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (lesson, simulate) = {
@@ -1175,11 +1346,13 @@ async fn simulate_lesson(fake: Fake, id: Id) {
         for url in citations.iter_mut().filter_map(|c| c.image_url.as_mut()) {
             *url = format!("{}{url}", s.public_url);
         }
+        let written_with = written_with_now(&s.settings);
         let Some(l) = s.library.lessons.iter_mut().find(|l| l.id == id) else {
             return;
         };
         l.status = LessonStatus::Ready;
         l.citations = citations;
+        l.written_with = Some(written_with);
         l.clone()
     };
     publish(&fake, Event::LessonChanged { lesson });
@@ -1190,7 +1363,7 @@ async fn make_video(
     headers: HeaderMap,
     Path(lesson_id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (video, simulate) = {
@@ -1300,7 +1473,7 @@ async fn get_video(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1315,12 +1488,15 @@ async fn create_note(
     headers: HeaderMap,
     Json(req): Json<NewNote>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let note = {
         let mut s = fake.state.lock().unwrap();
         let note = Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("note"),
             topic_id: req.topic_id,
             lesson_id: req.lesson_id,
@@ -1343,7 +1519,7 @@ async fn patch_note(
     Path(id): Path<String>,
     Json(req): Json<NotePatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let note = {
@@ -1369,7 +1545,7 @@ async fn delete_note(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1404,7 +1580,7 @@ async fn get_proposal(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1503,6 +1679,9 @@ impl FakeState {
                     Some(id) => id,
                     None => {
                         let subject = Topic {
+                            access: Vec::new(),
+                            deny: Vec::new(),
+                            owner: None,
                             id: self.id("topic"),
                             parent_id: None,
                             title: req.outline.subject_title.clone(),
@@ -1519,6 +1698,9 @@ impl FakeState {
             }
         };
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: self.id("topic"),
             parent_id: Some(parent),
             title: req.outline.topic_title.clone(),
@@ -1533,6 +1715,9 @@ impl FakeState {
         let mut lessons = Vec::new();
         for (i, l) in req.outline.lessons.iter().enumerate() {
             let lesson = Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: self.id("lesson"),
                 topic_id: topic.id.clone(),
@@ -1545,6 +1730,7 @@ impl FakeState {
                 status: LessonStatus::Queued,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                written_with: None,
             };
             self.library.lessons.push(lesson.clone());
             events.push(Event::LessonChanged {
@@ -1659,7 +1845,7 @@ async fn accept(
     Path(id): Path<String>,
     Json(req): Json<AcceptProposal>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let accepted = {
@@ -1691,7 +1877,7 @@ async fn search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1762,7 +1948,7 @@ async fn search(
 }
 
 async fn get_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1776,7 +1962,7 @@ async fn patch_settings(
     headers: HeaderMap,
     Json(req): Json<SettingsPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     // Checked as the service checks them, before anything changes.
@@ -1789,10 +1975,12 @@ async fn patch_settings(
             "Traces can be kept from 1 to 3650 days.",
         );
     }
-    if let Some(cfg) = &req.pipeline
-        && let Some(problem) = unknown_stage(cfg)
-    {
-        return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
+    if let Some(cfg) = &req.pipeline {
+        let reranker = fake.state.lock().unwrap().reranker.clone();
+        if let Some(problem) = unknown_stage(cfg).or_else(|| missing_model(cfg, reranker.as_ref()))
+        {
+            return api_error(StatusCode::BAD_REQUEST, "bad_pipeline", &problem);
+        }
     }
     for (provider, models) in [
         (Provider::OpenAi, &req.openai_models),
@@ -1894,12 +2082,13 @@ async fn patch_settings(
 pub const FAKE_STAGES: &[(&str, &[&str])] = &[
     ("chunker", &["pages-v1", "sections-v2"]),
     ("embedder", &["coreml"]),
+    ("rewriter", &["none", "small-expand-v1"]),
     (
         "retriever",
         &["bm25", "dense", "hybrid-linear", "hybrid-rrf"],
     ),
     ("fusion", &["first", "linear", "rrf"]),
-    ("reranker", &["none"]),
+    ("reranker", &["listwise-small", "none", "onnx-crossencoder"]),
     ("packer", &["mmr-v1", "take-k"]),
     ("prompts", &["lesson-v2"]),
 ];
@@ -1920,27 +2109,83 @@ fn unknown_stage(cfg: &margin_shared::pipeline::PipelineConfig) -> Option<String
         })
 }
 
-/// What `GET /api/pipeline/variants` serves: `FAKE_STAGES` and the repository's
-/// `evals/variants/*.toml` (baseline, bm25, dense, hybrid), plus one naming a reranker
-/// this service doesn't have.
+/// Why the service can't build `cfg` for want of a downloaded model: `onnx-crossencoder`
+/// needs the reranker model (`reranker`, the fake's state of it) and only
+/// `RERANKER_NAME` is offered for download.
+fn missing_model(
+    cfg: &margin_shared::pipeline::PipelineConfig,
+    reranker: Option<&EmbeddingModelState>,
+) -> Option<String> {
+    if cfg.reranker.name != "onnx-crossencoder" {
+        return None;
+    }
+    let model = cfg
+        .reranker
+        .params
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(RERANKER_NAME);
+    if model != RERANKER_NAME {
+        return Some(format!(
+            "The reranker \"onnx-crossencoder\" needs the {model} model: download it on the service first (margin-service download-model --reranker {model})."
+        ));
+    }
+    (!matches!(reranker, Some(EmbeddingModelState::Ready { .. })))
+        .then(|| RERANKER_MISSING.to_string())
+}
+
+/// What `GET /api/pipeline/variants` serves on a fresh fake (the reranker model not
+/// downloaded): see `pipeline_variants_with`.
 pub fn fake_pipeline_variants() -> margin_shared::pipeline::PipelineVariants {
-    use margin_shared::pipeline::{NamedVariant, PipelineConfig, PipelineVariants, StageCfg};
+    pipeline_variants_with(Some(&EmbeddingModelState::NotDownloaded {
+        download_bytes: RERANKER_DOWNLOAD_BYTES,
+    }))
+}
+
+/// One stage with its params (a JSON object).
+fn stage_with(name: &str, params: serde_json::Value) -> margin_shared::pipeline::StageCfg {
+    margin_shared::pipeline::StageCfg {
+        name: name.into(),
+        params: params.as_object().cloned().unwrap_or_default(),
+    }
+}
+
+/// What `GET /api/pipeline/variants` serves: `FAKE_STAGES` and the service's built-in
+/// variants (the repository's `evals/variants/*.toml`: baseline, bm25, dense, hybrid and
+/// R2's r2-full, rerank-small, rerank-xenc, rerank-xenc-bge, rewrite-small). The
+/// cross-encoder's are unavailable until the reranker model is downloaded (`reranker`);
+/// rerank-xenc-bge always, since this service offers only `RERANKER_NAME`.
+pub fn pipeline_variants_with(
+    reranker: Option<&EmbeddingModelState>,
+) -> margin_shared::pipeline::PipelineVariants {
+    use margin_shared::pipeline::{NamedVariant, PipelineConfig, PipelineVariants};
+    use serde_json::json;
     let baseline = PipelineConfig::default();
     let mut hybrid = baseline
         .with_stage("retriever", "hybrid-linear")
         .with_stage("fusion", "linear");
-    hybrid.retriever = StageCfg {
-        name: "hybrid-linear".into(),
-        params:
-            serde_json::json!({"dense_weight": 2.0, "lex_weight": 1.0, "normalisation": "minmax"})
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
+    hybrid.retriever = stage_with(
+        "hybrid-linear",
+        json!({"dense_weight": 2.0, "lex_weight": 1.0, "normalisation": "minmax"}),
+    );
+    let listwise = stage_with(
+        "listwise-small",
+        json!({"apply_to": ["lesson", "plan"], "max_candidates": 24, "drop_grade_0": true, "timeout_secs": 20}),
+    );
+    let expand = stage_with(
+        "small-expand-v1",
+        json!({"min_words": 5, "max_added": 2, "apply_to": ["agent", "context", "lesson", "plan"], "timeout_secs": 10}),
+    );
+    let xenc = |model: &str| {
+        stage_with(
+            "onnx-crossencoder",
+            json!({"model": model, "apply_to": ["agent", "context", "lesson", "plan"], "max_candidates": 24}),
+        )
     };
     let named = |name: &str, config: PipelineConfig| NamedVariant {
         name: name.into(),
+        unavailable: missing_model(&config, reranker),
         config,
-        unavailable: None,
     };
     PipelineVariants {
         stages: FAKE_STAGES
@@ -1962,25 +2207,59 @@ pub fn fake_pipeline_variants() -> margin_shared::pipeline::PipelineVariants {
                     .with_stage("fusion", "first"),
             ),
             named("hybrid", hybrid),
-            NamedVariant {
-                unavailable: Some("There is no reranker named \"listwise-v1\".".into()),
-                ..named("listwise", baseline.with_stage("reranker", "listwise-v1"))
-            },
+            named(
+                "r2-full",
+                PipelineConfig {
+                    rewriter: expand.clone(),
+                    reranker: listwise.clone(),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-small",
+                PipelineConfig {
+                    reranker: listwise,
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-xenc",
+                PipelineConfig {
+                    reranker: xenc(RERANKER_NAME),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rerank-xenc-bge",
+                PipelineConfig {
+                    reranker: xenc("bge-reranker-base"),
+                    ..baseline.clone()
+                },
+            ),
+            named(
+                "rewrite-small",
+                PipelineConfig {
+                    rewriter: expand,
+                    ..baseline
+                },
+            ),
         ],
     }
 }
 
 /// `GET /api/pipeline/variants`.
-async fn pipeline_variants(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn pipeline_variants(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
-    Json(fake_pipeline_variants()).into_response()
+    let reranker = fake.state.lock().unwrap().reranker.clone();
+    Json(pipeline_variants_with(reranker.as_ref())).into_response()
 }
 
 /// `GET /api/traces`: the fake records no traces, so none (JSON lines, oldest first).
-async fn traces(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn traces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    // Admins only (L1).
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     (
@@ -1991,8 +2270,8 @@ async fn traces(headers: HeaderMap) -> Response {
 }
 
 /// `GET /api/traces/rollup`: no traces, so no buckets.
-async fn traces_rollup(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn traces_rollup(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     Json(Vec::<margin_shared::context::TraceRollup>::new()).into_response()
@@ -2059,7 +2338,7 @@ async fn provider_models(
     headers: HeaderMap,
     Path(provider): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let Some(provider) = Provider::ALL.into_iter().find(|p| p.as_str() == provider) else {
@@ -2088,7 +2367,7 @@ pub fn fake_account(email: &str) -> ChatGptAccount {
 /// `GET /api/providers/chatgpt`. A waiting sign-in ends here, as `chatgpt_finish` says
 /// (or, in manual runs, signed in on the third poll).
 async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (status, changed) = {
@@ -2133,7 +2412,7 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
 
 /// `POST /api/providers/chatgpt/start`: a sign-in waits for the owner's browser.
 async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let mut s = fake.state.lock().unwrap();
@@ -2157,7 +2436,7 @@ async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response
 
 /// `DELETE /api/providers/chatgpt`: signs out (or gives up a waiting sign-in).
 async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let settings = {
@@ -2174,8 +2453,8 @@ async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Respo
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn tools(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn tools(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(vec![
@@ -2200,27 +2479,50 @@ async fn tools(headers: HeaderMap) -> Response {
     .into_response()
 }
 
+/// `GET /api/devices`: the caller's own; an admin's call lists everyone's.
 async fn devices(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
-    Json(fake.state.lock().unwrap().devices.clone()).into_response()
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let list: Vec<Device> = s
+        .devices
+        .iter()
+        .filter(|d| {
+            caller.person.org_role.is_admin() || d.person_id.as_deref() == Some(&caller.person.id)
+        })
+        .map(|d| Device {
+            current: d.id == caller.device_id,
+            ..d.clone()
+        })
+        .collect();
+    Json(list).into_response()
 }
 
+/// `DELETE /api/devices/{id}`: the caller's own device, or anyone's for an admin (404
+/// otherwise, so the id isn't confirmed).
 async fn revoke_device(
     State(fake): State<Fake>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
     let mut s = fake.state.lock().unwrap();
-    let before = s.devices.len();
-    s.devices.retain(|d| d.id != id);
-    if s.devices.len() == before {
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let allowed = s.devices.iter().any(|d| {
+        d.id == id
+            && (caller.person.org_role.is_admin()
+                || d.person_id.as_deref() == Some(&caller.person.id))
+    });
+    if !allowed {
         return not_found();
     }
+    s.devices.retain(|d| d.id != id);
+    drop(s);
+    publish(&fake, Event::DeviceDeleted { id });
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2239,7 +2541,7 @@ async fn upload_source(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let kind = match check_upload(&fake, &query, body.len() as u64) {
@@ -2367,6 +2669,9 @@ fn add_folder_source(
             .map(|w| w.name.clone());
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: None,
@@ -2417,6 +2722,9 @@ fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) 
         let mut s = fake.state.lock().unwrap();
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: query.topic_id,
@@ -2461,7 +2769,7 @@ async fn start_part_upload(
     headers: HeaderMap,
     Query(q): Query<StartPartsQuery>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let query = UploadQuery {
@@ -2501,15 +2809,16 @@ async fn get_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
-    let s = fake.state.lock().unwrap();
+    let mut s = fake.state.lock().unwrap();
+    let misreport = s.misreport_received.take();
     match s.part_uploads.get(&id) {
         Some(u) => Json(SourceUpload {
             id,
             bytes: u.bytes,
-            received: u.data.len() as u64,
+            received: misreport.unwrap_or(u.data.len() as u64),
         })
         .into_response(),
         None => not_found(),
@@ -2528,7 +2837,7 @@ async fn put_part(
     Query(q): Query<PartQuery>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let delay = fake.state.lock().unwrap().part_delay;
@@ -2568,7 +2877,7 @@ async fn finish_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let upload = {
@@ -2603,7 +2912,7 @@ async fn cancel_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     match fake.state.lock().unwrap().part_uploads.remove(&id) {
@@ -2619,7 +2928,7 @@ async fn reprocess_source(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (source, process, workspace) = {
@@ -2664,7 +2973,7 @@ async fn source_transcript(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -2760,7 +3069,7 @@ async fn delete_source(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -2777,7 +3086,7 @@ async fn delete_source(
 }
 
 async fn get_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(fake.state.lock().unwrap().embedding_model()).into_response()
@@ -2799,7 +3108,7 @@ fn set_embedding(fake: &Fake, state: EmbeddingModelState) -> EmbeddingModel {
 }
 
 async fn download_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -2865,7 +3174,7 @@ async fn simulate_download(fake: Fake) {
 }
 
 async fn delete_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let model = set_embedding(
@@ -2903,7 +3212,7 @@ fn no_speech_model() -> Response {
 }
 
 async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -2955,7 +3264,7 @@ async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Respon
 }
 
 async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     match set_speech(
@@ -2969,8 +3278,116 @@ async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response
     }
 }
 
+/// Sets the reranker model's state and sends the model; `None` when there is none.
+fn set_reranker(fake: &Fake, state: EmbeddingModelState) -> Option<EmbeddingModel> {
+    let model = {
+        let mut s = fake.state.lock().unwrap();
+        s.reranker.as_ref()?;
+        s.reranker = Some(state);
+        s.embedding_model()
+    };
+    publish(
+        fake,
+        Event::EmbeddingModelChanged {
+            model: model.clone(),
+        },
+    );
+    Some(model)
+}
+
+fn no_reranker_model() -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "no_reranker_model",
+        "This service has no reranker model to download.",
+    )
+}
+
+/// `GET routes::RERANKER_MODEL`.
+async fn get_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&fake, &headers) {
+        return r;
+    }
+    let s = fake.state.lock().unwrap();
+    if s.reranker.is_none() {
+        return no_reranker_model();
+    }
+    Json(s.embedding_model()).into_response()
+}
+
+/// `POST routes::RERANKER_MODEL_DOWNLOAD`: as the speech model's, a few steps of
+/// progress when simulating (tests drive the state themselves). Admins only (L1), as
+/// the service has it.
+async fn download_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
+        return r;
+    }
+    let (current, simulate) = {
+        let s = fake.state.lock().unwrap();
+        (s.reranker.clone(), s.simulate)
+    };
+    match current {
+        None => return no_reranker_model(),
+        Some(EmbeddingModelState::Downloading { .. } | EmbeddingModelState::Ready { .. }) => {
+            return Json(fake.state.lock().unwrap().embedding_model()).into_response();
+        }
+        Some(_) => {}
+    }
+    let model = set_reranker(
+        &fake,
+        EmbeddingModelState::Downloading {
+            received: 0,
+            total: RERANKER_DOWNLOAD_BYTES,
+        },
+    );
+    if simulate {
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            let total = RERANKER_DOWNLOAD_BYTES;
+            for step in 1..=4u64 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let downloading = matches!(
+                    fake.state.lock().unwrap().reranker,
+                    Some(EmbeddingModelState::Downloading { .. })
+                );
+                if !downloading {
+                    return;
+                }
+                set_reranker(
+                    &fake,
+                    if step == 4 {
+                        EmbeddingModelState::Ready { bytes: total }
+                    } else {
+                        EmbeddingModelState::Downloading {
+                            received: total * step / 4,
+                            total,
+                        }
+                    },
+                );
+            }
+        });
+    }
+    Json(model).into_response()
+}
+
+/// `DELETE routes::RERANKER_MODEL`. Admins only (L1).
+async fn delete_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
+        return r;
+    }
+    match set_reranker(
+        &fake,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: RERANKER_DOWNLOAD_BYTES,
+        },
+    ) {
+        Some(model) => Json(model).into_response(),
+        None => no_reranker_model(),
+    }
+}
+
 async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let rx = fake.events.subscribe();
@@ -3196,6 +3613,9 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
 /// screenshots. Media URLs are relative until `rebase_chat_media`.
 pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
     let chat = |id: &str, title: &str, state, at| Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         title: title.into(),
         title_by: Default::default(),
@@ -3705,6 +4125,9 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         lesson.summary = summary.into();
     }
     Proposal {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "p-sample".into(),
         request,
         status: match created {
@@ -3716,6 +4139,7 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         outline: Some(outline),
         created_at: ts(60),
         chat_id: Some(chat_id.into()),
+        written_with: None,
     }
 }
 
@@ -4371,12 +4795,16 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
     let Some(proposal) =
         step(fake, chat_id, turn_id, |s| {
             let proposal = Proposal {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: s.id("proposal"),
                 request: request.clone(),
                 status: ProposalStatus::Ready,
                 outline: Some(outline.clone()),
                 created_at: Utc::now(),
                 chat_id: Some(chat_id.into()),
+                written_with: None,
             };
             // Only the chat's newest outline can create a course.
             let mut events = Vec::new();
@@ -4633,6 +5061,9 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             .max()
             .unwrap_or(0);
         let lesson = Lesson {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             citations: Vec::new(),
             id: s.id("lesson"),
             topic_id: topic.id.clone(),
@@ -4645,6 +5076,7 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             status: LessonStatus::Queued,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            written_with: None,
         };
         s.library.lessons.push(lesson.clone());
         (
@@ -5288,7 +5720,7 @@ fn chat_detail(s: &FakeState, id: &str) -> Option<ChatDetail> {
 }
 
 async fn list_chats(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let mut chats = fake.state.lock().unwrap().chats.clone();
@@ -5301,7 +5733,7 @@ async fn create_chat(
     headers: HeaderMap,
     Json(req): Json<NewChat>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     if let Some(message) = &req.message
@@ -5318,6 +5750,9 @@ async fn create_chat(
         }
         let now = Utc::now();
         let chat = Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("chat"),
             title: String::new(),
             title_by: Default::default(),
@@ -5363,7 +5798,7 @@ async fn get_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     match chat_detail(&fake.state.lock().unwrap(), &id) {
@@ -5378,7 +5813,7 @@ async fn patch_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let chat = {
@@ -5462,7 +5897,7 @@ async fn delete_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let orphans = {
@@ -5506,7 +5941,7 @@ async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<NewMessage>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     if let Err(r) = check_message(&req) {
@@ -5569,7 +6004,7 @@ async fn drop_pending(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let chat = {
@@ -5590,7 +6025,7 @@ async fn stop_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (events, chat) = {
@@ -5639,7 +6074,7 @@ async fn continue_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (chat, turn_id, text) = {
@@ -5691,7 +6126,7 @@ async fn confirm(
     Path(id): Path<String>,
     Json(req): Json<ConfirmRequest>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (events, chat, turn_id) = {
@@ -5848,7 +6283,7 @@ async fn chat_item_output(
     headers: HeaderMap,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -5865,7 +6300,7 @@ async fn chat_item_output(
 }
 
 async fn list_workspaces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(fake.state.lock().unwrap().workspaces.clone()).into_response()
@@ -5876,13 +6311,16 @@ async fn create_workspace(
     headers: HeaderMap,
     Json(req): Json<NewWorkspace>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let workspace = {
         let mut s = fake.state.lock().unwrap();
         let (device_id, device_name) = s.current_device();
         let workspace = Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("workspace"),
             name: req.name,
             device_id,
@@ -5910,7 +6348,7 @@ async fn delete_workspace(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let gone: Vec<Id> = {
@@ -5947,6 +6385,9 @@ async fn delete_workspace(
 pub fn sample_workspaces() -> Vec<Workspace> {
     let ws =
         |id: &str, name: &str, device: (&str, &str), platform, location: &str, sync| Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             name: name.into(),
             device_id: device.0.into(),
@@ -6027,6 +6468,9 @@ pub fn sample_workspaces() -> Vec<Workspace> {
 /// The files of sample folder `w1` (“notes”), in every state.
 pub fn sample_folder_files() -> Vec<Source> {
     let file = |id: &str, name: &str, kind, bytes, status| Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         topic_id: None,
         name: name.into(),
@@ -6128,7 +6572,7 @@ async fn sync_workspace(
     Path(id): Path<String>,
     Json(manifest): Json<SyncManifest>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (plan, events) = {
@@ -6229,7 +6673,7 @@ async fn workspace_files(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -6244,6 +6688,1289 @@ async fn workspace_files(
         .collect();
     files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
     Json(files).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Accounts and principals (L1): people, invitations, groups, agents. The same rules as
+// the service (`docs/l1-brief.md` D3–D7); events carry no audience here (the fake is one
+// person per run), so the per-principal filter is the service's test.
+// ---------------------------------------------------------------------------
+
+/// Alice, the owner, and Bob, a member; both in `company` (everyone is, as the service's
+/// migration and admission make them) and in engineering.
+pub fn sample_people() -> Vec<Person> {
+    vec![
+        Person {
+            id: ALICE.into(),
+            github_login: "alice".into(),
+            github_id: Some(1001),
+            handle: "alice".into(),
+            name: "Alice Martin".into(),
+            avatar_url: None,
+            org_role: OrgRole::Owner,
+            state: PersonState::Active,
+            groups: vec![ROOT_GROUP.into(), "company/engineering".into()],
+            settings: PersonSettings::default(),
+            created_at: ts(0),
+        },
+        Person {
+            id: BOB.into(),
+            github_login: "bob".into(),
+            github_id: Some(1002),
+            handle: "bob".into(),
+            name: "Bob Chen".into(),
+            avatar_url: None,
+            org_role: OrgRole::Member,
+            state: PersonState::Active,
+            groups: vec![ROOT_GROUP.into(), "company/engineering".into()],
+            settings: PersonSettings::default(),
+            created_at: ts(10),
+        },
+    ]
+}
+
+pub fn sample_groups() -> Vec<Group> {
+    vec![
+        Group {
+            path: ROOT_GROUP.into(),
+            name: "Company".into(),
+            source: SOURCE_MANUAL.into(),
+            members: 2,
+            created_at: ts(0),
+        },
+        Group {
+            path: "company/engineering".into(),
+            name: "Engineering".into(),
+            source: SOURCE_MANUAL.into(),
+            members: 2,
+            created_at: ts(1),
+        },
+    ]
+}
+
+/// Alice's Claude Code agent (with a token) and Bob's triage bot (without one).
+pub fn sample_agents() -> Vec<Agent> {
+    vec![
+        Agent {
+            id: "a-claude".into(),
+            owner_id: ALICE.into(),
+            name: "claude-code".into(),
+            kind: AgentKind::External,
+            ceiling: vec![ROOT_GROUP.into(), "company/engineering".into()],
+            disabled: false,
+            token: Some(AgentTokenInfo {
+                prefix: "mga_7f3a".into(),
+                created_at: ts(20),
+                last_used_at: Some(ts(200)),
+                expires_at: None,
+            }),
+            created_at: ts(20),
+        },
+        Agent {
+            id: "a-triage".into(),
+            owner_id: BOB.into(),
+            name: "triage-bot".into(),
+            kind: AgentKind::External,
+            ceiling: vec![ROOT_GROUP.into()],
+            disabled: false,
+            token: None,
+            created_at: ts(30),
+        },
+    ]
+}
+
+/// Bob's accepted invitation, and one for carol-dev still open at `now`.
+pub fn sample_invitations(now: DateTime<Utc>) -> Vec<Invitation> {
+    let days = |n: i64| chrono::Duration::days(n);
+    vec![
+        Invitation {
+            id: "inv-bob".into(),
+            github_login: "bob".into(),
+            role: OrgRole::Member,
+            groups: vec!["company/engineering".into()],
+            invited_by: ALICE.into(),
+            created_at: ts(5),
+            expires_at: ts(5) + days(INVITATION_DAYS),
+            accepted_at: Some(ts(10)),
+            accepted_by: Some(BOB.into()),
+        },
+        Invitation {
+            id: "inv-carol".into(),
+            github_login: "carol-dev".into(),
+            role: OrgRole::Member,
+            groups: vec!["company/engineering".into()],
+            invited_by: ALICE.into(),
+            created_at: now - days(1),
+            expires_at: now - days(1) + days(INVITATION_DAYS),
+            accepted_at: None,
+            accepted_by: None,
+        },
+    ]
+}
+
+/// What `GET /api/me` answers for `token` in a fresh fake (render tests and the
+/// screenshots use it).
+pub fn sample_me(token: &str) -> Me {
+    let s = FakeState::new();
+    let (device_id, person_id) = s.tokens[token].clone();
+    let person = s.person(&person_id).unwrap().clone();
+    s.me_for(&Caller { person, device_id })
+}
+
+/// The device and person a request comes from.
+pub struct Caller {
+    pub person: Person,
+    pub device_id: Id,
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+fn unauthorized() -> Response {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "Sign in again: this device isn't signed in.",
+    )
+}
+
+/// The 401 `person_disabled` the service answers a disabled person's device in the moment
+/// before its devices are deleted (`principal_for_device_token`). The fake drops a
+/// disabled person's tokens with their devices, so it only answers this for a person
+/// disabled by hand in a test's `FakeState`.
+fn disabled(person: &Person) -> Response {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        access_code::PERSON_DISABLED,
+        &format!(
+            "The GitHub account @{} is disabled on this Margin. Ask an admin.",
+            person.github_login
+        ),
+    )
+}
+
+fn admin_required() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::ADMIN_REQUIRED,
+        "Only an organisation admin can do this.",
+    )
+}
+
+fn owner_required() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::ADMIN_REQUIRED,
+        "Only the organisation owner can make someone an admin or remove an admin.",
+    )
+}
+
+fn bad_request(code: &str, message: &str) -> Response {
+    api_error(StatusCode::BAD_REQUEST, code, message)
+}
+
+fn conflict(code: &str, message: &str) -> Response {
+    api_error(StatusCode::CONFLICT, code, message)
+}
+
+#[allow(clippy::result_large_err)]
+fn caller(s: &FakeState, headers: &HeaderMap) -> Result<Caller, Response> {
+    let token = bearer(headers).ok_or_else(unauthorized)?;
+    let (device_id, person_id) = s.tokens.get(token).cloned().ok_or_else(unauthorized)?;
+    let person = s.person(&person_id).cloned().ok_or_else(unauthorized)?;
+    if person.state == PersonState::Disabled {
+        return Err(disabled(&person));
+    }
+    if !s.devices.iter().any(|d| d.id == device_id) {
+        return Err(unauthorized());
+    }
+    Ok(Caller { person, device_id })
+}
+
+/// The caller, when they are an admin (or the owner).
+#[allow(clippy::result_large_err)]
+fn admin(s: &FakeState, headers: &HeaderMap) -> Result<Caller, Response> {
+    let caller = caller(s, headers)?;
+    if !caller.person.org_role.is_admin() {
+        return Err(admin_required());
+    }
+    Ok(caller)
+}
+
+/// A person as others see them: their own settings are theirs alone.
+fn public(person: &Person) -> Person {
+    Person {
+        settings: PersonSettings::default(),
+        ..person.clone()
+    }
+}
+
+impl FakeState {
+    pub fn person(&self, id: &str) -> Option<&Person> {
+        self.people.iter().find(|p| p.id == id)
+    }
+
+    fn person_mut(&mut self, id: &str) -> Option<&mut Person> {
+        self.people.iter_mut().find(|p| p.id == id)
+    }
+
+    fn me_for(&self, caller: &Caller) -> Me {
+        let device = self
+            .devices
+            .iter()
+            .find(|d| d.id == caller.device_id)
+            .map(|d| Device {
+                current: true,
+                ..d.clone()
+            });
+        Me {
+            github_login: caller.person.github_login.clone(),
+            device,
+            person: Some(caller.person.clone()),
+            agent: None,
+        }
+    }
+
+    /// The groups with their direct member counts.
+    fn groups_counted(&self) -> Vec<Group> {
+        let mut list: Vec<Group> = self
+            .groups
+            .iter()
+            .map(|g| Group {
+                members: self
+                    .people
+                    .iter()
+                    .filter(|p| p.groups.contains(&g.path))
+                    .count() as u32,
+                ..g.clone()
+            })
+            .collect();
+        list.sort_by(|a, b| a.path.cmp(&b.path));
+        list
+    }
+
+    fn group_counted(&self, path: &str) -> Option<Group> {
+        self.groups_counted().into_iter().find(|g| g.path == path)
+    }
+
+    /// The first of `paths` that isn't a group, if any.
+    fn unknown_group(&self, paths: &[String]) -> Option<String> {
+        paths
+            .iter()
+            .find(|p| !self.groups.iter().any(|g| g.path == **p))
+            .cloned()
+    }
+
+    /// An invitation for `login` accepted at sign-in, as the service's admission does: a
+    /// person with its role and groups, the invitation marked accepted, and a token for
+    /// a new device. Returns the person and the token.
+    pub fn accept_invitation(
+        &mut self,
+        login: &str,
+        device_name: &str,
+    ) -> Option<(Person, String)> {
+        let now = Utc::now();
+        let key = login.to_ascii_lowercase();
+        let i = self.invitations.iter().position(|i| {
+            i.github_login.to_ascii_lowercase() == key && crate::org::is_pending(i, now)
+        })?;
+        let id = self.id("p");
+        let mut handle = handle_for_login(login);
+        let mut n = 1;
+        while self.people.iter().any(|p| p.handle == handle) {
+            n += 1;
+            handle = format!("{}-{n}", handle_for_login(login));
+        }
+        let invitation = self.invitations[i].clone();
+        // The invited groups and `company`; groups deleted since the invitation are
+        // skipped (`people::admit`).
+        let groups: Vec<String> = invitation
+            .groups
+            .iter()
+            .cloned()
+            .chain([ROOT_GROUP.to_string()])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|g| self.groups.iter().any(|known| known.path == *g))
+            .collect();
+        let github_id = 2000 + self.people.len() as u64;
+        let person = Person {
+            id: id.clone(),
+            github_login: login.into(),
+            github_id: Some(github_id),
+            handle,
+            name: login.into(),
+            avatar_url: None,
+            org_role: match invitation.role {
+                OrgRole::Admin => OrgRole::Admin,
+                _ => OrgRole::Member,
+            },
+            state: PersonState::Active,
+            groups,
+            settings: PersonSettings::default(),
+            created_at: now,
+        };
+        self.people.push(person.clone());
+        self.invitations[i].accepted_at = Some(now);
+        self.invitations[i].accepted_by = Some(id.clone());
+        let token = self.new_device_token(&id, device_name);
+        Some((person, token))
+    }
+
+    /// A new device of `person_id` named `name`, and the token it signs in with.
+    pub fn new_device_token(&mut self, person_id: &str, name: &str) -> String {
+        let now = Utc::now();
+        let device = self.id("d");
+        self.devices.push(Device {
+            id: device.clone(),
+            name: name.into(),
+            created_at: now,
+            last_seen_at: Some(now),
+            current: false,
+            online: false,
+            person_id: Some(person_id.into()),
+        });
+        let token = format!("test-device-token-{device}");
+        self.tokens
+            .insert(token.clone(), (device, person_id.to_string()));
+        token
+    }
+}
+
+/// `GET /api/people`: the directory, by handle; `settings` only on the caller's own row.
+async fn list_people(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let mut list: Vec<Person> = s
+        .people
+        .iter()
+        .map(|p| {
+            if p.id == caller.person.id {
+                p.clone()
+            } else {
+                public(p)
+            }
+        })
+        .collect();
+    list.sort_by(|a, b| a.handle.cmp(&b.handle).then_with(|| a.id.cmp(&b.id)));
+    Json(list).into_response()
+}
+
+fn person_not_found() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "That person doesn't exist.",
+    )
+}
+
+async fn get_person(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match s.person(&id) {
+        Some(p) if p.id == caller.person.id => Json(p.clone()).into_response(),
+        Some(p) => Json(public(p)).into_response(),
+        None => person_not_found(),
+    }
+}
+
+/// The service's longest display name (`people::NAME_MAX`).
+const PERSON_NAME_MAX: usize = 100;
+/// The service's longest picture address (`people::AVATAR_URL_MAX`).
+const AVATAR_URL_MAX: usize = 2048;
+
+/// A display name as the service checks it (`people::check_name`).
+#[allow(clippy::result_large_err)]
+fn checked_person_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("bad_request", "Give a name."));
+    }
+    if name.chars().count() > PERSON_NAME_MAX {
+        return Err(bad_request(
+            "bad_request",
+            &format!("A name is at most {PERSON_NAME_MAX} characters."),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// A picture address as the service checks it (`people::check_avatar_url`).
+#[allow(clippy::result_large_err)]
+fn checked_avatar_url(url: &str) -> Result<String, Response> {
+    let url = url.trim();
+    let ok = url.len() <= AVATAR_URL_MAX
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && reqwest::Url::parse(url).is_ok();
+    if !ok {
+        return Err(bad_request(
+            "bad_request",
+            "A picture is an http(s) address of an image.",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn owner_fixed() -> Response {
+    bad_request(
+        access_code::OWNER_FIXED,
+        "The organisation owner's role and state can't change.",
+    )
+}
+
+/// `PATCH /api/people/{id}`, by field as the service (`people::patch_person`): self for
+/// name, picture and settings; admins for state and role; the owner alone for any role
+/// change; the owner's own role and state are fixed (a patch that leaves them as they
+/// are is fine); nobody disables themselves. Disabling deletes the person's devices and
+/// with them their tokens.
+async fn patch_person(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<PersonPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let is_self = id == caller.person.id;
+    let personal = patch.name.is_some() || patch.avatar_url.is_some() || patch.settings.is_some();
+    let governing = patch.org_role.is_some() || patch.state.is_some();
+    let name = match patch.name.as_deref().map(checked_person_name).transpose() {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let avatar_url = match &patch.avatar_url {
+        Some(Some(u)) => match checked_avatar_url(u) {
+            Ok(u) => Some(Some(u)),
+            Err(r) => return r,
+        },
+        Some(None) => Some(None),
+        None => None,
+    };
+    let Some(target) = s.person(&id).cloned() else {
+        return person_not_found();
+    };
+    if personal && !is_self {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            access_code::NOT_OWNER,
+            &format!(
+                "Only @{} changes their own name, picture and settings.",
+                target.handle
+            ),
+        );
+    }
+    let mut role_change = None;
+    let mut state_change = None;
+    if governing {
+        if !caller.person.org_role.is_admin() {
+            return admin_required();
+        }
+        role_change = patch.org_role.filter(|r| *r != target.org_role);
+        state_change = patch.state.filter(|st| *st != target.state);
+        if target.org_role == OrgRole::Owner && (role_change.is_some() || state_change.is_some()) {
+            return owner_fixed();
+        }
+        match role_change {
+            Some(OrgRole::Owner) => return owner_fixed(),
+            Some(_) if caller.person.org_role != OrgRole::Owner => return owner_required(),
+            _ => {}
+        }
+        match state_change {
+            Some(PersonState::Invited) => {
+                return bad_request("bad_request", "A person is either active or disabled.");
+            }
+            Some(PersonState::Disabled) if is_self => {
+                return bad_request("bad_request", "You can't disable yourself.");
+            }
+            _ => {}
+        }
+    }
+    let person = {
+        let p = s.person_mut(&id).unwrap();
+        if let Some(name) = name {
+            p.name = name;
+        }
+        if let Some(avatar) = avatar_url {
+            p.avatar_url = avatar;
+        }
+        if let Some(settings) = patch.settings {
+            p.settings = settings;
+        }
+        if let Some(role) = role_change {
+            p.org_role = role;
+        }
+        if let Some(state) = state_change {
+            p.state = state;
+        }
+        p.clone()
+    };
+    let mut revoked = Vec::new();
+    if state_change == Some(PersonState::Disabled) {
+        // Every device of a disabled person is deleted, and their tokens with them, so
+        // their next request is a plain 401 (`auth::revoke_person_devices`).
+        s.devices.retain(|d| {
+            let theirs = d.person_id.as_deref() == Some(&person.id);
+            if theirs {
+                revoked.push(d.id.clone());
+            }
+            !theirs
+        });
+        s.tokens.retain(|_, (_, owner)| *owner != person.id);
+    }
+    drop(s);
+    for id in revoked {
+        publish(&fake, Event::DeviceDeleted { id });
+    }
+    publish(
+        &fake,
+        Event::PersonChanged {
+            person: public(&person),
+        },
+    );
+    if role_change.is_some() || state_change.is_some() {
+        publish(
+            &fake,
+            Event::AccessChanged {
+                person_id: person.id.clone(),
+            },
+        );
+    }
+    Json(if is_self { person } else { public(&person) }).into_response()
+}
+
+/// The first of `paths` that isn't a group, as the 400 the service answers
+/// (`groups::check_groups_exist`).
+#[allow(clippy::result_large_err)]
+fn check_groups_exist(s: &FakeState, paths: &[String]) -> Result<(), Response> {
+    match paths
+        .iter()
+        .find(|p| !is_group_path(p) || !s.groups.iter().any(|g| g.path == **p))
+    {
+        Some(path) => Err(bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {path}. Create it first under Organisation → Groups."),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Trimmed, sorted and without repeats (`people::tidy_groups`).
+fn tidy_groups(groups: Vec<String>) -> Vec<String> {
+    groups
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// `PUT /api/people/{id}/groups` (admins): the person's direct memberships, replaced.
+/// The answer is the person as anyone sees them (no settings), as the service's.
+async fn put_person_groups(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(groups): Json<Vec<String>>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    if s.person(&id).is_none() {
+        return person_not_found();
+    }
+    let groups = tidy_groups(groups);
+    if let Err(r) = check_groups_exist(&s, &groups) {
+        return r;
+    }
+    let person = {
+        let p = s.person_mut(&id).unwrap();
+        p.groups = groups.clone();
+        p.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::MembershipChanged {
+            person_id: id.clone(),
+            groups,
+        },
+    );
+    publish(&fake, Event::AccessChanged { person_id: id });
+    Json(public(&person)).into_response()
+}
+
+async fn get_my_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    match caller(&s, &headers) {
+        Ok(c) => Json(c.person.settings).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn patch_my_settings(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(settings): Json<PersonSettings>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let person = {
+        let p = s.person_mut(&caller.person.id).unwrap();
+        p.settings = settings.clone();
+        p.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::PersonChanged {
+            person: public(&person),
+        },
+    );
+    Json(settings).into_response()
+}
+
+/// `GET /api/invitations` (admins): pending and accepted, newest first.
+async fn list_invitations(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let mut list = s.invitations.clone();
+    list.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    Json(list).into_response()
+}
+
+/// `POST /api/invitations` (admins; an admin invitation needs the owner), checked in the
+/// service's order (`invitations::create_invitation`).
+async fn create_invitation(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewInvitation>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let login = new.github_login.trim().trim_start_matches('@').to_string();
+    if !crate::org::is_github_login(&login) {
+        return bad_request(
+            "bad_request",
+            "Give the person's GitHub login, like octocat.",
+        );
+    }
+    match new.role {
+        OrgRole::Owner => {
+            return bad_request(
+                "bad_request",
+                "Invite someone as a member or an admin; there is one owner.",
+            );
+        }
+        OrgRole::Admin if caller.person.org_role != OrgRole::Owner => {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                access_code::ADMIN_REQUIRED,
+                "Only the organisation owner can invite an admin. Invite them as a member.",
+            );
+        }
+        _ => {}
+    }
+    let groups = tidy_groups(new.groups);
+    if let Err(r) = check_groups_exist(&s, &groups) {
+        return r;
+    }
+    let key = login.to_ascii_lowercase();
+    if s.people
+        .iter()
+        .any(|p| p.github_login.to_ascii_lowercase() == key)
+    {
+        return conflict(
+            access_code::ALREADY_MEMBER,
+            &format!(
+                "@{login} is already in this Margin. If they're disabled, enable them under \
+                 Organisation → People."
+            ),
+        );
+    }
+    let now = Utc::now();
+    if s.invitations
+        .iter()
+        .any(|i| i.github_login.to_ascii_lowercase() == key && crate::org::is_pending(i, now))
+    {
+        return conflict(
+            access_code::ALREADY_INVITED,
+            &format!("@{login} is already invited. Revoke that invitation to send a new one."),
+        );
+    }
+    let invitation = Invitation {
+        id: s.id("inv"),
+        github_login: login,
+        role: new.role,
+        groups,
+        invited_by: caller.person.id,
+        created_at: now,
+        expires_at: now + chrono::Duration::days(INVITATION_DAYS),
+        accepted_at: None,
+        accepted_by: None,
+    };
+    s.invitations.push(invitation.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::InvitationChanged {
+            invitation: invitation.clone(),
+        },
+    );
+    Json(invitation).into_response()
+}
+
+/// `DELETE /api/invitations/{id}` (admins): any invitation not yet accepted, an expired
+/// one included (204); an accepted or unknown one is 404.
+async fn delete_invitation(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let Some(i) = s
+        .invitations
+        .iter()
+        .position(|i| i.id == id && i.accepted_at.is_none())
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "That invitation doesn't exist.",
+        );
+    };
+    s.invitations.remove(i);
+    drop(s);
+    publish(&fake, Event::InvitationDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_groups(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    if let Err(r) = caller(&s, &headers) {
+        return r;
+    }
+    Json(s.groups_counted()).into_response()
+}
+
+/// The service's longest group name (`groups::GROUP_NAME_MAX`).
+const GROUP_NAME_MAX: usize = 80;
+
+/// A group's name as the service checks it (`groups::group_name`).
+#[allow(clippy::result_large_err)]
+fn checked_group_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("bad_request", "Give the group a name."));
+    }
+    if name.chars().count() > GROUP_NAME_MAX {
+        return Err(bad_request(
+            "bad_request",
+            &format!("A group's name is at most {GROUP_NAME_MAX} characters."),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn managed_by_source(source: &str) -> Response {
+    bad_request(
+        access_code::MANAGED_BY_SOURCE,
+        &format!("This group comes from {source}; change it there."),
+    )
+}
+
+fn group_not_found() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "That group doesn't exist.",
+    )
+}
+
+/// `POST /api/groups` (admins), checked in the service's order (`groups::create_group`):
+/// the path (400 `bad_path`), the name, a group already there (409 `exists`), then the
+/// parent (400 `unknown_group`).
+async fn create_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewGroup>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let path = new.path.trim().to_string();
+    if !is_group_path(&path) {
+        return bad_request(
+            "bad_path",
+            "A group's path is company/… in lowercase letters, digits and dashes, at most 8 levels deep.",
+        );
+    }
+    let name = match checked_group_name(&new.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if path == ROOT_GROUP || s.groups.iter().any(|g| g.path == path) {
+        return conflict("exists", &format!("There's already a group {path}."));
+    }
+    let parent = path
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_else(|| ROOT_GROUP.to_string());
+    if !s.groups.iter().any(|g| g.path == parent) {
+        return bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {parent} to put it under. Create that first."),
+        );
+    }
+    let group = Group {
+        path,
+        name,
+        source: SOURCE_MANUAL.into(),
+        members: 0,
+        created_at: Utc::now(),
+    };
+    s.groups.push(group.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::GroupChanged {
+            group: group.clone(),
+        },
+    );
+    Json(group).into_response()
+}
+
+/// `PATCH /api/groups/{*path}` (admins): rename.
+async fn patch_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    Json(patch): Json<GroupPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let Some(i) = s.groups.iter().position(|g| g.path == path) else {
+        return group_not_found();
+    };
+    if s.groups[i].source != SOURCE_MANUAL {
+        return managed_by_source(&s.groups[i].source);
+    }
+    if let Some(name) = patch.name {
+        match checked_group_name(&name) {
+            Ok(name) => s.groups[i].name = name,
+            Err(r) => return r,
+        }
+    }
+    let group = s.group_counted(&path).unwrap();
+    drop(s);
+    publish(
+        &fake,
+        Event::GroupChanged {
+            group: group.clone(),
+        },
+    );
+    Json(group).into_response()
+}
+
+/// `DELETE /api/groups/{*path}` (admins): only an empty group with nothing under it,
+/// never `company` (400 `root_group`).
+async fn delete_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    if path == ROOT_GROUP {
+        return bad_request(
+            "root_group",
+            "The company group holds everyone; it can't be deleted.",
+        );
+    }
+    let Some(group) = s.group_counted(&path) else {
+        return group_not_found();
+    };
+    if group.source != SOURCE_MANUAL {
+        return managed_by_source(&group.source);
+    }
+    let under = format!("{path}/");
+    let children = s
+        .groups
+        .iter()
+        .filter(|g| g.path.starts_with(&under))
+        .count();
+    if children > 0 {
+        return bad_request(
+            access_code::HAS_CHILDREN,
+            &format!(
+                "{path} has {children} group{} under it. Delete those first.",
+                if children == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    if group.members > 0 {
+        let members = group.members;
+        return bad_request(
+            access_code::HAS_MEMBERS,
+            &format!(
+                "{path} has {members} member{}. Take them out of it first.",
+                if members == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    s.groups.retain(|g| g.path != path);
+    drop(s);
+    publish(&fake, Event::GroupDeleted { path });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/agents`: the caller's; an admin sees everyone's. Never the tokens. Oldest
+/// first, as the service lists them.
+async fn list_agents(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let mut list: Vec<Agent> = s
+        .agents
+        .iter()
+        .filter(|a| caller.person.org_role.is_admin() || a.owner_id == caller.person.id)
+        .cloned()
+        .collect();
+    list.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    Json(list).into_response()
+}
+
+/// The ceiling to store, as the service's `agents::normalise_ceiling`: the kind's
+/// default when none is asked; else each asked entry (trimmed) must be inside the
+/// owner's access (400 `outside_owner`), groups with their ancestors; never empty.
+#[allow(clippy::result_large_err)]
+fn checked_ceiling(
+    owner: &Person,
+    kind: AgentKind,
+    asked: Option<Vec<String>>,
+) -> Result<Vec<String>, Response> {
+    let ceiling: Vec<String> = match asked {
+        None => crate::org::default_ceiling(kind, owner),
+        Some(asked) => {
+            let paths = crate::org::expansion(owner);
+            let mut out = std::collections::BTreeSet::new();
+            for entry in asked {
+                let entry = entry.trim().to_string();
+                if !paths.contains(&entry) {
+                    return Err(bad_request(
+                        access_code::OUTSIDE_OWNER,
+                        &format!(
+                            "{entry} is outside what you can read; an agent can only have access you have."
+                        ),
+                    ));
+                }
+                if is_group_path(&entry) {
+                    out.extend(ancestors(&entry));
+                } else {
+                    out.insert(entry);
+                }
+            }
+            out.into_iter().collect()
+        }
+    };
+    if ceiling.is_empty() {
+        return Err(bad_request(
+            "bad_request",
+            "Give the agent access to at least one thing: a group or your private notes.",
+        ));
+    }
+    Ok(ceiling)
+}
+
+/// An agent's name as the service checks it (`agents::check_name`): 400 `bad_name`.
+#[allow(clippy::result_large_err)]
+fn checked_agent_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if !margin_shared::context::is_agent_name(name) {
+        return Err(bad_request(
+            "bad_name",
+            "An agent's name is 1 to 40 lowercase letters, digits, - and _ (like claude-code).",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// 409 `exists` when another agent of `owner` (not `except`) has `name`.
+fn agent_name_taken(
+    s: &FakeState,
+    owner: &str,
+    name: &str,
+    except: Option<&str>,
+) -> Option<Response> {
+    s.agents
+        .iter()
+        .any(|a| a.owner_id == owner && a.name == name && Some(a.id.as_str()) != except)
+        .then(|| {
+            conflict(
+                "exists",
+                &format!("You already have an agent called {name}."),
+            )
+        })
+}
+
+/// `POST /api/agents`, checked in the service's order: the name, the ceiling, then a
+/// name already taken.
+async fn create_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewAgent>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let name = match checked_agent_name(&new.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let ceiling = match checked_ceiling(&caller.person, new.kind, new.ceiling) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Some(r) = agent_name_taken(&s, &caller.person.id, &name, None) {
+        return r;
+    }
+    let agent = Agent {
+        id: s.id("a"),
+        owner_id: caller.person.id,
+        name,
+        kind: new.kind,
+        ceiling,
+        disabled: false,
+        token: None,
+        created_at: Utc::now(),
+    };
+    s.agents.push(agent.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(agent).into_response()
+}
+
+/// The agent `id` for `caller`: `Ok(index, is_owner)`, 404 when they may not see it.
+#[allow(clippy::result_large_err)]
+fn agent_for(s: &FakeState, caller: &Caller, id: &str) -> Result<(usize, bool), Response> {
+    let not_found = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "That agent doesn't exist.",
+        )
+    };
+    let i = s
+        .agents
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or_else(not_found)?;
+    let owner = s.agents[i].owner_id == caller.person.id;
+    if !owner && !caller.person.org_role.is_admin() {
+        return Err(not_found());
+    }
+    Ok((i, owner))
+}
+
+fn not_agent_owner() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::NOT_OWNER,
+        "Only the agent's owner can do this; an admin can only disable it.",
+    )
+}
+
+/// `PATCH /api/agents/{id}`: its owner; an admin may only set `disabled`.
+async fn patch_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<AgentPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let (i, owner) = match agent_for(&s, &caller, &id) {
+        Ok(found) => found,
+        Err(r) => return r,
+    };
+    if !owner && (patch.name.is_some() || patch.ceiling.is_some()) {
+        return not_agent_owner();
+    }
+    let name = match patch.name.as_deref().map(checked_agent_name).transpose() {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let ceiling = match patch.ceiling {
+        Some(asked) => match checked_ceiling(&caller.person, s.agents[i].kind, Some(asked)) {
+            Ok(c) => Some(c),
+            Err(r) => return r,
+        },
+        None => None,
+    };
+    if let Some(name) = &name
+        && let Some(r) = agent_name_taken(&s, &s.agents[i].owner_id, name, Some(&id))
+    {
+        return r;
+    }
+    let agent = {
+        let a = &mut s.agents[i];
+        if let Some(name) = name {
+            a.name = name;
+        }
+        if let Some(ceiling) = ceiling {
+            a.ceiling = ceiling;
+        }
+        if let Some(disabled) = patch.disabled {
+            a.disabled = disabled;
+        }
+        a.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(agent).into_response()
+}
+
+async fn delete_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match agent_for(&s, &caller, &id) {
+        Ok((_, true)) => {}
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    }
+    s.agents.retain(|a| a.id != id);
+    s.agent_tokens.remove(&id);
+    drop(s);
+    publish(&fake, Event::AgentDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/agents/{id}/token`: a new token (any earlier one stops working), shown once.
+async fn mint_agent_token(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let i = match agent_for(&s, &caller, &id) {
+        Ok((i, true)) => i,
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    };
+    let n = s.next_id;
+    s.next_id += 1;
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
+    let token = format!(
+        "{AGENT_TOKEN_PREFIX}{:016x}{:016x}",
+        nanos,
+        n.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    );
+    let now = Utc::now();
+    s.agents[i].token = Some(AgentTokenInfo {
+        prefix: token.chars().take(8).collect(),
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+    });
+    s.agent_tokens.insert(id, token.clone());
+    let agent = s.agents[i].clone();
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(AgentToken { token, agent }).into_response()
+}
+
+async fn revoke_agent_token(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let i = match agent_for(&s, &caller, &id) {
+        Ok((i, true)) => i,
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    };
+    // As the service: revoking an agent without a token is 204 too.
+    s.agents[i].token = None;
+    s.agent_tokens.remove(&id);
+    let agent = s.agents[i].clone();
+    drop(s);
+    publish(&fake, Event::AgentChanged { agent });
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]

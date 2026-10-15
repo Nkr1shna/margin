@@ -1,5 +1,7 @@
 //! `margin-service setup` | `margin-service serve [--allow-unsandboxed-render]` |
-//! `margin-service download-model [--embedder NAME]` | `margin-service scrub-restored` |
+//! `margin-service download-model [--embedder NAME] [--reranker NAME]` |
+//! `margin-service scrub-restored` | `margin-service check-data <dir>` |
+//! `margin-service backup [--label NAME]` |
 //! `margin-service version`
 
 use std::process::ExitCode;
@@ -7,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use margin_service::config::{self, Config};
-use margin_service::db::Store;
 use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
@@ -21,9 +22,18 @@ Usage:
                                                      embedder, or NAME: onnx-q8,
                                                      onnx-fp32, onnx-fp16) without the app,
                                                      and the speech model
+  margin-service download-model --reranker NAME      Download a reranker model instead
+                                                     (ms-marco-minilm-l6-v2,
+                                                     bge-reranker-base) for the
+                                                     onnx-crossencoder reranker
+                                                     (bge-reranker-base needs ~1.3 GB
+                                                     of memory loaded)
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
+  margin-service check-data <dir>                    Check a data folder (a backup) on a copy:
+                                                     tables, migrations, source files
+  margin-service backup [--label NAME]               Back up the data folder now
   margin-service version                             Print the build's version and commit
 ";
 
@@ -41,13 +51,28 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("setup") if args.len() == 1 => config::run_setup(&config::config_path()),
         Some("scrub-restored") if args.len() == 1 => scrub_restored(),
-        Some("download-model") => match model_download::parse_args(&args[1..]) {
-            Ok(embedder) => download_model(embedder),
-            Err(e) => {
-                eprintln!("{e}\n\n{usage}");
+        Some("check-data") if args.len() == 2 => check_data(std::path::Path::new(&args[1])),
+        Some("backup") => match &args[1..] {
+            [] => backup(None),
+            [flag, label] if flag == "--label" => backup(Some(label)),
+            _ => {
+                eprintln!("{usage}");
                 return ExitCode::from(2);
             }
         },
+        Some("download-model") => {
+            let parsed = split_reranker(&args[1..]).and_then(|(reranker, rest)| {
+                let embedder = model_download::parse_args(&rest)?;
+                Ok((embedder, reranker))
+            });
+            match parsed {
+                Ok((embedder, reranker)) => download_model(embedder, reranker),
+                Err(e) => {
+                    eprintln!("{e}\n\n{usage}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         Some("version" | "--version") if args.len() == 1 => {
             println!(
                 "margin-service {} ({})",
@@ -117,7 +142,16 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         // Tools a user installed without root (the pdfium library) are looked for here.
         margin_embed::set_tools_dir(config.data_dir.join("tools"));
         let source_tools = Arc::new(EmbedTools::new(&config.models_dir()));
-        let store = Store::open(&config.db_dir()).await?;
+        // Refuses data a newer build wrote; backs up data an older one wrote before
+        // this build migrates it (`restore::open_guarded`).
+        let (store, backup) = restore::open_guarded(&config).await?;
+        if let Some(dir) = backup {
+            tracing::info!(
+                "backed up the data before migrating it to schema {}: {}",
+                margin_service::db::SCHEMA_VERSION,
+                dir.display()
+            );
+        }
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
             .with_context(|| format!("couldn't listen on {}", config.bind))?;
@@ -146,24 +180,124 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
     })
 }
 
+/// Takes `--reranker NAME` (or `--reranker=NAME`) out of `download-model`'s arguments:
+/// the cross-encoder to download (`margin_embed::RerankerModel::name`), and the rest.
+fn split_reranker(
+    args: &[String],
+) -> Result<(Option<margin_embed::RerankerModel>, Vec<String>), String> {
+    let mut reranker = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let name = match a.as_str() {
+            "--reranker" => it
+                .next()
+                .cloned()
+                .ok_or_else(|| "--reranker needs a name".to_string())?,
+            other => match other.strip_prefix("--reranker=") {
+                Some(v) => v.to_string(),
+                None => {
+                    rest.push(a.clone());
+                    continue;
+                }
+            },
+        };
+        let model = margin_embed::RerankerModel::from_name(&name).ok_or_else(|| {
+            let known: Vec<&str> = margin_embed::RerankerModel::ALL
+                .iter()
+                .map(|m| m.name())
+                .collect();
+            format!(
+                "there is no reranker model named {name} (known: {})",
+                known.join(", ")
+            )
+        })?;
+        reranker = Some(model);
+    }
+    Ok((reranker, rest))
+}
+
 /// Downloads the embedding model and the speech model into the data folder, printing
 /// progress: what the Settings buttons do, for a headless box (the provisioning script
-/// runs it).
-fn download_model(embedder: Option<margin_embed::Backend>) -> anyhow::Result<()> {
+/// runs it). With `--reranker NAME` it
+/// downloads that cross-encoder instead (and the embedder too when `--embedder` names
+/// one).
+fn download_model(
+    embedder: Option<margin_embed::Backend>,
+    reranker: Option<margin_embed::RerankerModel>,
+) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
         let config = Config::load(&config::config_path())?;
-        let files = model_download::files_for(&config, embedder)?;
         let report = |line: &str| eprintln!("{line}");
-        let tools = EmbedTools::new(&config.models_dir());
-        model_download::run(&tools, &files, margin_embed::HF_BASE, &report).await?;
-        if let Some(speech) = margin_service::engines::SourceTools::speech_model(&tools) {
-            model_download::run_speech(speech, margin_embed::HF_BASE, &report).await?;
+        if reranker.is_none() || embedder.is_some() {
+            let files = model_download::files_for(&config, embedder)?;
+            let tools = EmbedTools::new(&config.models_dir());
+            model_download::run(&tools, &files, margin_embed::HF_BASE, &report).await?;
+            if let Some(speech) = margin_service::engines::SourceTools::speech_model(&tools) {
+                model_download::run_speech(speech, margin_embed::HF_BASE, &report).await?;
+            }
+        }
+        if let Some(model) = reranker {
+            let files = margin_embed::RerankerFiles::new(&config.models_dir(), model);
+            download_reranker(&files, margin_embed::HF_BASE, &report).await?;
         }
         Ok(())
     })
+}
+
+/// Downloads a reranker model unless it is complete, reporting progress lines (at most
+/// every two seconds) through `report`.
+async fn download_reranker(
+    files: &margin_embed::RerankerFiles,
+    hf_base: &str,
+    report: &(dyn Fn(&str) + Send + Sync),
+) -> anyhow::Result<()> {
+    let name = files.model.name();
+    let mb = |bytes: u64| format!("{:.1} MB", bytes as f64 / 1_000_000.0);
+    if files.is_complete() {
+        report(&format!(
+            "The reranker model {name} is already downloaded in {} ({}).",
+            files.dir.display(),
+            mb(files.size_on_disk())
+        ));
+        return Ok(());
+    }
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    report(&format!(
+        "Downloading the reranker model {name} from {} (revision {}) into {}…",
+        files.model.repo(),
+        &files.model.revision()[..12],
+        files.dir.display()
+    ));
+    let last = std::sync::Mutex::new(None::<std::time::Instant>);
+    let progress = |received: u64, total: u64| {
+        let mut last = last.lock().unwrap();
+        let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
+        if due || received == total {
+            *last = Some(std::time::Instant::now());
+            report(&format!("  {} of {}", mb(received), mb(total)));
+        }
+    };
+    files
+        .download(&http, hf_base, &progress)
+        .await
+        .with_context(|| format!("couldn't download the reranker model {name}"))?;
+    anyhow::ensure!(
+        files.is_complete(),
+        "the download of the reranker model {name} finished but isn't complete in {}",
+        files.dir.display()
+    );
+    report(&format!(
+        "The reranker model {name} is downloaded ({}). Pick the rerank-xenc variant in Settings → AI → Pipeline to use it.",
+        mb(files.size_on_disk())
+    ));
+    Ok(())
 }
 
 /// Opens the database directly (the service must be stopped: SurrealKV takes a lock)
@@ -176,7 +310,7 @@ fn scrub_restored() -> anyhow::Result<()> {
     runtime.block_on(async {
         let config = Config::load(&config::config_path())?;
         restore::check_environment(&config)?;
-        let store = Store::open(&config.db_dir())
+        let (store, _) = restore::open_guarded(&config)
             .await
             .context("couldn't open the database; stop the service first")?;
         for done in restore::scrub(&store).await? {
@@ -184,4 +318,74 @@ fn scrub_restored() -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// Checks a data folder on a copy and prints the report (`count <table> <n>` lines,
+/// the problems, a last one-line verdict); fails on any problem. Needs no config.
+fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let check = restore::check_data(dir).await?;
+        print!("{}", check.report(dir));
+        anyhow::ensure!(
+            check.problems.is_empty(),
+            "{} has {} problem(s)",
+            dir.display(),
+            check.problems.len()
+        );
+        Ok(())
+    })
+}
+
+/// Backs up the configured data folder (the service must be stopped) and checks the
+/// copy; prints `BACKUP=<folder>` last, like `backup-margin.sh`.
+fn backup(label: Option<&str>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let config = Config::load(&config::config_path())?;
+        let dir = restore::backup(&config, label).await?;
+        println!("Backed up and checked {}.", config.data_dir.display());
+        println!("BACKUP={}", dir.display());
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn download_model_takes_a_reranker_beside_the_embedder() {
+        use margin_embed::RerankerModel;
+        assert_eq!(split_reranker(&[]).unwrap(), (None, vec![]));
+        assert_eq!(
+            split_reranker(&args(&["--reranker", "ms-marco-minilm-l6-v2"])).unwrap(),
+            (Some(RerankerModel::MsMarcoMiniLmL6), vec![])
+        );
+        assert_eq!(
+            split_reranker(&args(&[
+                "--embedder",
+                "onnx-q8",
+                "--reranker=bge-reranker-base"
+            ]))
+            .unwrap(),
+            (
+                Some(RerankerModel::BgeRerankerBase),
+                args(&["--embedder", "onnx-q8"])
+            )
+        );
+        assert!(split_reranker(&args(&["--reranker"])).is_err());
+        let err = split_reranker(&args(&["--reranker", "nope"])).unwrap_err();
+        assert!(err.contains("ms-marco-minilm-l6-v2"), "{err}");
+    }
 }

@@ -5,10 +5,14 @@
 //! the signed query string the service puts in `VideoMedia` URLs. Errors use `ApiError`
 //! as the body.
 //!
+//! An agent token (`mga_…`, `principal::AGENT_TOKEN_PREFIX`) may call only `/api/me`,
+//! `/api/projects` and `/api/context/*`; anything else answers 403 "agent_not_allowed".
+//! Admin-only routes answer 403 "admin_required" to members (L1, `docs/l1-brief.md`).
+//!
 //! | Method | Path                                   | Body               | Response            |
 //! |--------|----------------------------------------|--------------------|---------------------|
 //! | GET    | /health                                |                    | "ok"                |
-//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes } |
+//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes, alerts_active, alerts_since } |
 //! | POST   | /auth/start                            | StartLoginRequest  | StartLogin          |
 //! | POST   | /auth/poll                             | PollLoginRequest   | LoginState          |
 //! | GET    | /auth/github/callback?code&state       |                    | HTML page           |
@@ -74,13 +78,34 @@
 //! | GET    | /api/context/changes?since&limit       |                    | context::ContextChanges (one page by generation: limit 1-500, default 100; `more`; 400 outside) |
 //! | GET    | /api/traces?kind&from&to&trace_id      |                    | JSONL of context::TraceRow, oldest first (400 bad_range) |
 //! | GET    | /api/traces/rollup?bucket&from&to      |                    | Vec<context::TraceRollup> (400 bad_range) |
-//! | GET    | /api/events  (WebSocket upgrade; `?traces=1` adds Event::Trace) | DeviceFrame frames | ServerFrame frames  |
+//! | GET    | /api/alerts                            |                    | context::AlertList { active, recent } |
+//! | GET    | /api/events  (WebSocket upgrade, devices only; `?traces=1` adds Event::Trace for admins) | DeviceFrame frames | ServerFrame frames  |
+//! | GET    | /api/people                            |                    | Vec<Person> (`settings` only on the caller's own) |
+//! | GET    | /api/people/{id}                       |                    | Person (404)        |
+//! | PATCH  | /api/people/{id}                       | PersonPatch        | Person (self: name, avatar, settings; admin: state, role; owner: the Admin role; 400 owner_fixed) |
+//! | PUT    | /api/people/{id}/groups                | Vec<String>        | Person (admin; 400 unknown_group, managed_by_source) |
+//! | GET    | /api/me/settings                       |                    | PersonSettings      |
+//! | PATCH  | /api/me/settings                       | PersonSettings     | PersonSettings      |
+//! | GET    | /api/invitations                       |                    | Vec<Invitation> (admin; newest first) |
+//! | POST   | /api/invitations                       | NewInvitation      | Invitation (admin; role admin: owner; 409 already_member, already_invited; 400 unknown_group) |
+//! | DELETE | /api/invitations/{id}                  |                    | 204 (admin; 404)    |
+//! | GET    | /api/groups                            |                    | Vec<Group> (sorted by path) |
+//! | POST   | /api/groups                            | NewGroup           | Group (admin; 400 bad_request, unknown_group: no parent; 409 exists) |
+//! | PATCH  | /api/groups/{*path}                    | GroupPatch         | Group (admin; 404; 400 managed_by_source) |
+//! | DELETE | /api/groups/{*path}                    |                    | 204 (admin; 400 has_children, has_members, managed_by_source; `company` refused) |
+//! | GET    | /api/agents                            |                    | Vec<Agent> (own; admin: everyone's) |
+//! | POST   | /api/agents                            | NewAgent           | Agent (400 outside_owner; 409 exists) |
+//! | PATCH  | /api/agents/{id}                       | AgentPatch         | Agent (owner; admin: `disabled` only; 400 outside_owner) |
+//! | DELETE | /api/agents/{id}                       |                    | 204 (owner)         |
+//! | POST   | /api/agents/{id}/token                 |                    | AgentToken (owner; replaces any token; shown once) |
+//! | DELETE | /api/agents/{id}/token                 |                    | 204 (owner)         |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
 pub const HEALTH: &str = "/health";
-/// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes }`,
-/// without a token like `/health` (`docs/plan-deploy.md` §8).
+/// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes,
+/// alerts_active, alerts_since }`, without a token like `/health`
+/// (`docs/plan-deploy.md` §8). Alerts are a count only here: the route is public.
 pub const VERSION: &str = "/api/version";
 pub const AUTH_START: &str = "/auth/start";
 pub const AUTH_POLL: &str = "/auth/poll";
@@ -94,6 +119,9 @@ pub const SETTINGS: &str = "/api/settings";
 /// `GET` → `pipeline::PipelineVariants`: the stage names the service registers per kind
 /// and the named variants (`evals/variants/*.toml`) Settings can pick a pipeline from.
 pub const PIPELINE_VARIANTS: &str = "/api/pipeline/variants";
+/// `GET` → `Vec<context::PromptInfo>`: every prompt the service sends, with its version
+/// and the hash of its constant block (R2, `docs/r2-brief.md` D4.1).
+pub const PIPELINE_PROMPTS: &str = "/api/pipeline/prompts";
 /// The ChatGPT sign-in: `GET` → `ChatGptStatus`, `DELETE` signs out.
 pub const PROVIDERS_CHATGPT: &str = "/api/providers/chatgpt";
 /// `POST` → `ChatGptStart`: starts a "Sign in with ChatGPT" on the service Mac.
@@ -151,6 +179,9 @@ pub const TRACES: &str = "/api/traces";
 /// `GET ?bucket=hour|day&from&to` → `Vec<context::TraceRollup>` from the pre-computed
 /// views.
 pub const TRACES_ROLLUP: &str = "/api/traces/rollup";
+/// `GET` → `context::AlertList`: the alerts now active and the last rises and clears
+/// (`docs/phase5-brief.md` D6).
+pub const ALERTS: &str = "/api/alerts";
 pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
 /// `DELETE` removes the speech model's files; `POST SPEECH_MODEL_DOWNLOAD` starts its
 /// download. Both answer with the whole `EmbeddingModel` (its `speech` part changed),
@@ -159,6 +190,24 @@ pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
 /// is `None` there).
 pub const SPEECH_MODEL: &str = "/api/embedding/speech";
 pub const SPEECH_MODEL_DOWNLOAD: &str = "/api/embedding/speech/download";
+/// The `onnx-crossencoder` reranker's model (R2): `GET` → `EmbeddingModel`, `DELETE`
+/// removes its files, `POST RERANKER_MODEL_DOWNLOAD` starts its download; both answer
+/// with the whole `EmbeddingModel` (its `reranker` part changed) and progress arrives as
+/// `Event::EmbeddingModelChanged`, as for the speech model. 409 "no_reranker_model" on a
+/// service that offers none (`EmbeddingModel.reranker` is `None`).
+pub const RERANKER_MODEL: &str = "/api/embedding/reranker";
+pub const RERANKER_MODEL_DOWNLOAD: &str = "/api/embedding/reranker/download";
+/// `GET` → `Vec<Person>`: everyone who may sign in (a directory: handles, names, roles,
+/// groups; never content).
+pub const PEOPLE: &str = "/api/people";
+/// The caller's own `PersonSettings`: `GET`, and `PATCH` with the whole value.
+pub const ME_SETTINGS: &str = "/api/me/settings";
+/// `GET` → `Vec<Invitation>`; `POST NewInvitation` → `Invitation`. Admins only.
+pub const INVITATIONS: &str = "/api/invitations";
+/// `GET` → `Vec<Group>`; `POST NewGroup` → `Group` (admins).
+pub const GROUPS: &str = "/api/groups";
+/// `GET` → `Vec<Agent>`; `POST NewAgent` → `Agent`.
+pub const AGENTS: &str = "/api/agents";
 
 const MB: u64 = 1024 * 1024;
 /// Largest audio or video source.
@@ -168,6 +217,20 @@ pub const MAX_OTHER_SOURCE_BYTES: u64 = 50 * MB;
 /// Largest part of an upload in parts, and the size above which the app uploads in parts:
 /// well under the 100 MB a Cloudflare-proxied request body may be.
 pub const UPLOAD_PART_BYTES: u64 = 32 * MB;
+
+// Body and frame limits (`docs/agent-contract.md` §7; `docs/phase5-brief.md` D7).
+
+/// Largest `POST CONTEXT_INGEST` body: a long document an agent wrote.
+pub const CONTEXT_INGEST_MAX_BYTES: usize = 16 * MB as usize;
+/// Largest JSON body of every other API route (axum's default, set in code).
+pub const JSON_BODY_MAX_BYTES: usize = 2 * MB as usize;
+/// Largest frame a device sends on the events socket (tool outputs are capped before
+/// they're sent).
+pub const DEVICE_FRAME_MAX_BYTES: usize = MB as usize;
+/// Longest summary a local condense keeps (`docs/phase5-brief.md` D3).
+pub const CONDENSE_SUMMARY_MAX_CHARS: usize = 8_000;
+/// How often the service's alert job looks at the last window of traces.
+pub const ALERT_TICK_SECS: u64 = 60;
 
 /// The largest file of `kind` the service accepts as a source.
 pub fn max_source_bytes(kind: crate::SourceKind) -> u64 {
@@ -321,6 +384,32 @@ pub fn context_document_passages(id: &str) -> String {
     format!("/api/context/documents/{id}/passages")
 }
 
+/// `GET` one person; `PATCH PersonPatch`.
+pub fn person(id: &str) -> String {
+    format!("/api/people/{id}")
+}
+/// `PUT Vec<String>`: the person's direct memberships, replaced (admins).
+pub fn person_groups(id: &str) -> String {
+    format!("/api/people/{id}/groups")
+}
+/// `DELETE` revokes a pending invitation (admins).
+pub fn invitation(id: &str) -> String {
+    format!("/api/invitations/{id}")
+}
+/// `PATCH GroupPatch` renames; `DELETE` removes an empty group (admins). The path's
+/// slashes stay as they are ("/api/groups/company/engineering").
+pub fn group(path: &str) -> String {
+    format!("/api/groups/{path}")
+}
+/// `PATCH AgentPatch`; `DELETE`.
+pub fn agent(id: &str) -> String {
+    format!("/api/agents/{id}")
+}
+/// `POST` mints (or rotates) the agent's token → `AgentToken`; `DELETE` revokes it.
+pub fn agent_token(id: &str) -> String {
+    format!("/api/agents/{id}/token")
+}
+
 // Retrieval constants (`docs/agent-rag-architecture.md` §2.2, §2.3, §2.8). Defaults the
 // pipeline's stages start from; `PipelineConfig` params override them per variant.
 
@@ -341,6 +430,24 @@ pub const TOOL_SEARCH_K_MAX: usize = 12;
 pub const TOOL_OUTPUT_PASSAGE_CHARS: usize = 1_100;
 /// Most adjacent passages one `read_passage` returns.
 pub const TOOL_READ_PASSAGES_MAX: usize = 4;
+
+// Reranking and query rewriting (R2, `docs/r2-brief.md` D2, D3, D5).
+
+/// Most fused candidates a reranker sees.
+pub const RERANK_MAX_CANDIDATES: usize = 24;
+/// Longest query a reranker is given: the plan's first string, then the others as
+/// "Also asked:" lines.
+pub const RERANK_QUERY_CHARS: usize = 800;
+/// Output cap of the listwise rerank call.
+pub const RERANK_MAX_OUTPUT_TOKENS: u32 = 400;
+/// Most phrasings a rewrite adds to a query plan.
+pub const REWRITE_MAX_ADDED: usize = 2;
+/// An agent or context query with fewer words than this is rewritten.
+pub const REWRITE_MIN_WORDS: usize = 5;
+/// Output cap of the rewrite call.
+pub const REWRITE_MAX_OUTPUT_TOKENS: u32 = 120;
+/// Longest query+passage pair the cross-encoder scores, in tokens (the query kept whole).
+pub const RERANK_PAIR_TOKENS: usize = 512;
 
 #[cfg(test)]
 mod tests {
@@ -376,6 +483,17 @@ mod tests {
     }
 
     #[test]
+    fn phase5_limits() {
+        assert_eq!(CONTEXT_INGEST_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(JSON_BODY_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(DEVICE_FRAME_MAX_BYTES, 1024 * 1024);
+        const { assert!(JSON_BODY_MAX_BYTES < CONTEXT_INGEST_MAX_BYTES) };
+        assert_eq!(CONDENSE_SUMMARY_MAX_CHARS, 8_000);
+        assert_eq!(ALERT_TICK_SECS, 60);
+        assert_eq!(ALERTS, "/api/alerts");
+    }
+
+    #[test]
     fn provider_routes() {
         assert_eq!(
             providers_models(crate::Provider::Claude),
@@ -392,6 +510,20 @@ mod tests {
     fn workspace_routes() {
         assert_eq!(workspace_sync("w1"), "/api/workspaces/w1/sync");
         assert_eq!(workspace_files("w1"), "/api/workspaces/w1/files");
+    }
+
+    #[test]
+    fn principal_routes() {
+        assert_eq!(person("p1"), "/api/people/p1");
+        assert_eq!(person_groups("p1"), "/api/people/p1/groups");
+        assert_eq!(invitation("i1"), "/api/invitations/i1");
+        assert_eq!(group("company/eng"), "/api/groups/company/eng");
+        assert_eq!(agent("a1"), "/api/agents/a1");
+        assert_eq!(agent_token("a1"), "/api/agents/a1/token");
+        assert!(ME_SETTINGS.starts_with(ME));
+        for path in [PEOPLE, INVITATIONS, GROUPS, AGENTS] {
+            assert!(path.starts_with("/api/"), "{path}");
+        }
     }
 
     #[test]
@@ -416,5 +548,14 @@ mod tests {
         }
         const { assert!(RETRIEVAL_K_FUSED <= RETRIEVAL_K_DENSE + RETRIEVAL_K_LEX) };
         const { assert!(TOOL_SEARCH_K_MAX <= RETRIEVAL_K_FUSED) };
+    }
+
+    #[test]
+    fn r2_routes() {
+        assert!(PIPELINE_PROMPTS.starts_with("/api/pipeline/"));
+        assert!(RERANKER_MODEL.starts_with(EMBEDDING));
+        assert!(RERANKER_MODEL_DOWNLOAD.starts_with(RERANKER_MODEL));
+        const { assert!(RERANK_MAX_CANDIDATES == RETRIEVAL_K_FUSED) };
+        const { assert!(REWRITE_MAX_ADDED >= 1) };
     }
 }

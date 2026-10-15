@@ -50,6 +50,10 @@ pub struct Document {
     /// retrieval filters by it inside the index query. Not enforced yet (the seam only).
     #[serde(default = "company")]
     pub access: Vec<String>,
+    /// The person whose row the document indexes (an agent's documents: its owner).
+    /// `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -289,16 +293,21 @@ pub enum TraceKind {
     Ingest,
     JobStep,
     Turn,
+    /// An alert rising or clearing (`docs/phase5-brief.md` D6): `error_code` is the
+    /// alert's name, `ok: false` when it rose and `true` when it cleared,
+    /// `duration_ms` the value that crossed the threshold.
+    Alert,
 }
 
 impl TraceKind {
-    pub const ALL: [TraceKind; 6] = [
+    pub const ALL: [TraceKind; 7] = [
         TraceKind::ModelCall,
         TraceKind::Retrieval,
         TraceKind::ToolCall,
         TraceKind::Ingest,
         TraceKind::JobStep,
         TraceKind::Turn,
+        TraceKind::Alert,
     ];
 
     /// The first element of a trace row's array id.
@@ -310,8 +319,19 @@ impl TraceKind {
             TraceKind::Ingest => "ingest",
             TraceKind::JobStep => "job_step",
             TraceKind::Turn => "turn",
+            TraceKind::Alert => "alert",
         }
     }
+}
+
+/// How a model call's history was shortened (`TraceRow.compaction`): the provider
+/// compacted it server-side (its output carried a compaction item), or Margin condensed
+/// it locally before the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compaction {
+    Server,
+    Condensed,
 }
 
 /// Token counts of one model call.
@@ -336,6 +356,8 @@ pub struct RetrievalLegs {
     pub lex_ms: f64,
     pub fuse_ms: f64,
     pub rerank_ms: f64,
+    /// The `rewriter` stage (R2); 0 when it is `"none"` or the plan wasn't rewritten.
+    pub rewrite_ms: f64,
 }
 
 /// One trace row: ids, numbers and hashes only. Never prompt text, output text, tool
@@ -374,6 +396,9 @@ pub struct TraceRow {
     /// `owner` or `agent:<name>`.
     #[serde(default)]
     pub actor: Option<String>,
+    /// The principal the row was done for (`person/<id>` or `agent/<id>`, L1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     /// The way in when it isn't the app: `mcp` for the context API as `margin-mcp`
     /// calls it (dogfood plan §6). `route` stays the model slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +427,14 @@ pub struct TraceRow {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub step: Option<u32>,
+    /// Set on the step whose output carried a compaction item, or that followed a
+    /// local condense.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<Compaction>,
+    /// The provider's own time within `duration_ms` (first byte to last event), so
+    /// `duration_ms − provider_ms` is Margin's overhead per step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ms: Option<f64>,
 
     // Retrievals.
     #[serde(default)]
@@ -430,6 +463,15 @@ pub struct TraceRow {
     /// The passages a `read_passages` call read (`[from, to]` ords, inclusive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_range: Option<[u32; 2]>,
+    /// The strings a retrieval ran with, after the `rewriter` stage (R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<u32>,
+    /// The candidates the reranker saw (R2); `None` when it saw none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranked: Option<u32>,
+    /// The reranker stage's name, for reports without the pipeline table (R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranker: Option<String>,
 
     // Tool calls.
     #[serde(default)]
@@ -472,6 +514,7 @@ impl TraceRow {
             job_id: None,
             document_id: None,
             actor: None,
+            principal: None,
             via: None,
             pipeline_hash: None,
             prompt_version: None,
@@ -482,6 +525,8 @@ impl TraceRow {
             cost_usd: None,
             stop_reason: None,
             step: None,
+            compaction: None,
+            provider_ms: None,
             query_hash: None,
             scope: None,
             legs: None,
@@ -493,6 +538,9 @@ impl TraceRow {
             cache_hit: None,
             query: None,
             read_range: None,
+            queries: None,
+            reranked: None,
+            reranker: None,
             tool: None,
             output_bytes: None,
             device_id: None,
@@ -502,6 +550,21 @@ impl TraceRow {
             embed_ms: None,
         }
     }
+}
+
+/// One prompt the service or the eval runner sends (`GET routes::PIPELINE_PROMPTS`, R2
+/// `docs/r2-brief.md` D4.1): its job, its version, and the FNV-1a 64 hash of its
+/// constant block, so the same version always means the same bytes
+/// (`evals/prompts.lock`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptInfo {
+    /// "lesson", "scene", "plan", "rerank", "rewrite", "agent", "title", "condense", …
+    pub job: String,
+    /// "lesson-v2", "rerank-v1", …
+    pub version: String,
+    /// 16 hex digits.
+    pub constant_hash: String,
+    pub constant_chars: usize,
 }
 
 /// The longest query a trace row keeps (`TraceRow::query`).
@@ -553,6 +616,50 @@ pub struct TraceRollup {
     pub cost_usd: f64,
     #[serde(default)]
     pub mean_ms: f64,
+    /// The bucket's 95th percentile of `duration_ms`; `None` where the store can't
+    /// compute it (rollups kept from deleted rows, or before phase 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Alerts (`docs/phase5-brief.md` D6)
+// ---------------------------------------------------------------------------
+
+/// A threshold from `[alerts]` in `service.toml` that the last window crossed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    /// `error_rate`, `p95_ms`, `rate_limited_share`, `ingest_backlog`, `rss_bytes`,
+    /// `http_5xx`.
+    pub name: String,
+    /// The trace kind it's about; `None` for the service-wide ones (backlog, memory,
+    /// HTTP errors).
+    #[serde(default)]
+    pub kind: Option<TraceKind>,
+    pub value: f64,
+    pub threshold: f64,
+    /// When it rose.
+    pub since: DateTime<Utc>,
+    /// The last tick that still saw it crossed.
+    pub last_seen: DateTime<Utc>,
+}
+
+/// An alert rising (`raised: true`) or clearing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertEvent {
+    pub alert: Alert,
+    pub raised: bool,
+    pub at: DateTime<Utc>,
+}
+
+/// `GET routes::ALERTS`: the alerts now active and the last rises and clears, newest
+/// first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AlertList {
+    #[serde(default)]
+    pub active: Vec<Alert>,
+    #[serde(default)]
+    pub recent: Vec<AlertEvent>,
 }
 
 #[cfg(test)]
@@ -593,6 +700,7 @@ mod tests {
             },
         ] {
             let doc = Document {
+                owner: None,
                 id: "d".into(),
                 project_id: "p".into(),
                 origin,
@@ -692,6 +800,88 @@ mod tests {
             output: 1,
             cost_usd: 0.5,
             mean_ms: 12.5,
+            p95_ms: Some(40.0),
         });
+    }
+
+    #[test]
+    fn r2_trace_fields_and_prompt_infos_round_trip() {
+        let mut row = TraceRow::new(TraceKind::Retrieval, "01J1", at());
+        row.queries = Some(3);
+        row.reranked = Some(24);
+        row.reranker = Some("listwise-small".into());
+        row.legs = Some(RetrievalLegs {
+            rerank_ms: 900.0,
+            rewrite_ms: 300.0,
+            ..Default::default()
+        });
+        let json = round_trip(&row);
+        assert_eq!(json["reranker"], "listwise-small");
+        assert_eq!(json["legs"]["rewrite_ms"], 300.0);
+        // Rows written before R2 parse, and a row without them doesn't write them.
+        let legs: RetrievalLegs = serde_json::from_value(json!({"dense_ms": 1.0})).unwrap();
+        assert_eq!(legs.rewrite_ms, 0.0);
+        let bare = serde_json::to_value(TraceRow::new(TraceKind::Retrieval, "x", at())).unwrap();
+        assert!(bare.get("queries").is_none() && bare.get("reranker").is_none());
+        round_trip(&PromptInfo {
+            job: "rerank".into(),
+            version: "rerank-v1".into(),
+            constant_hash: "0123456789abcdef".into(),
+            constant_chars: 1200,
+        });
+    }
+
+    #[test]
+    fn phase5_trace_fields_are_additive() {
+        let mut row = TraceRow::new(TraceKind::ModelCall, "01J1", at());
+        row.compaction = Some(Compaction::Condensed);
+        row.provider_ms = Some(812.5);
+        let json = round_trip(&row);
+        assert_eq!(json["compaction"], "condensed");
+        let plain = serde_json::to_value(TraceRow::new(TraceKind::Turn, "x", at())).unwrap();
+        assert!(plain.get("compaction").is_none());
+        assert!(plain.get("provider_ms").is_none());
+        // A row written before phase 5 parses without them.
+        let old: TraceRow = serde_json::from_value(json!({
+            "id": "x", "kind": "model_call", "at": "2025-10-09T08:53:20Z",
+            "duration_ms": 10.0, "step": 2
+        }))
+        .unwrap();
+        assert_eq!((old.compaction, old.provider_ms), (None, None));
+        assert_eq!(TraceKind::Alert.as_str(), "alert");
+        assert_eq!(serde_json::to_value(TraceKind::Alert).unwrap(), "alert");
+        assert!(TraceKind::ALL.contains(&TraceKind::Alert));
+        let old_rollup: TraceRollup = serde_json::from_value(json!({
+            "kind": "retrieval", "bucket": "2025-10-09T08:00:00Z", "calls": 2
+        }))
+        .unwrap();
+        assert_eq!(old_rollup.p95_ms, None);
+    }
+
+    #[test]
+    fn alerts_round_trip() {
+        let alert = Alert {
+            name: "error_rate".into(),
+            kind: Some(TraceKind::ModelCall),
+            value: 0.4,
+            threshold: 0.2,
+            since: at(),
+            last_seen: at(),
+        };
+        let json = round_trip(&alert);
+        assert_eq!(json["kind"], "model_call");
+        round_trip(&AlertList {
+            active: vec![alert.clone()],
+            recent: vec![AlertEvent {
+                alert: Alert {
+                    kind: None,
+                    ..alert
+                },
+                raised: true,
+                at: at(),
+            }],
+        });
+        let empty: AlertList = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, AlertList::default());
     }
 }

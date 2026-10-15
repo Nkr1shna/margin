@@ -1,12 +1,13 @@
 //! The `margin-mcp` command. See `docs/plan-dogfood.md` §2 and `USAGE` below.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use margin_mcp::client::Client;
 use margin_mcp::config::{Keychain, config_path, require_token, service_url};
 use margin_mcp::ingest::{self, CLAUDE_CODE};
+use margin_mcp::token;
 use margin_mcp::{login, serve};
 
 const USAGE: &str = "\
@@ -14,7 +15,16 @@ margin-mcp: Margin as Claude Code's knowledge base
 
 USAGE:
   margin-mcp serve                     MCP server on stdin/stdout (for .mcp.json)
-  margin-mcp login                     sign in with GitHub; the token goes to the Keychain
+  margin-mcp token -                   use an agent token (Settings → Organisation → Agents),
+                                       read from stdin: paste it when asked, or pipe it in
+                                       (pbpaste | margin-mcp token -); checked with the
+                                       service, then kept in the secret store and used before
+                                       a device sign-in. `token <mga_…>` works too but leaves
+                                       the token in the shell history
+  margin-mcp token --forget            remove the stored agent token
+  margin-mcp whoami                    who margin-mcp signs in as, and what it may read
+  margin-mcp login                     sign in with GitHub as a device (your whole access);
+                                       the token goes to the secret store
   margin-mcp ingest --name <name> [--kind decision|handoff|note|text|code]
                     [--agent <name>] (<file> | -)
                                        add one document (default agent: claude-code)
@@ -29,6 +39,25 @@ OPTIONS:
   -h, --help    this text
 ";
 
+/// `margin-mcp token -`: the token from stdin. At a terminal it asks for it and reads
+/// one line (paste, then Enter); piped in, it reads everything.
+fn read_token_from_stdin() -> anyhow::Result<String> {
+    let stdin = std::io::stdin();
+    let mut text = String::new();
+    if stdin.is_terminal() {
+        eprint!("Paste the agent token (mga_…) and press Enter: ");
+        stdin
+            .read_line(&mut text)
+            .context("couldn't read the token")?;
+    } else {
+        stdin
+            .lock()
+            .read_to_string(&mut text)
+            .context("couldn't read stdin")?;
+    }
+    Ok(text)
+}
+
 #[derive(Default)]
 struct Args {
     command: String,
@@ -38,6 +67,7 @@ struct Args {
     agent: Option<String>,
     actor: Option<String>,
     dry_run: bool,
+    forget: bool,
     positional: Vec<String>,
 }
 
@@ -53,6 +83,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> anyhow::Result<Option<Args>>
             "--agent" => args.agent = Some(value("--agent")?),
             "--actor" => args.actor = Some(value("--actor")?),
             "--dry-run" | "-n" => args.dry_run = true,
+            "--forget" => args.forget = true,
             "-" => args.positional.push(arg),
             flag if flag.starts_with('-') => bail!("unknown option {flag}"),
             _ if args.command.is_empty() => args.command = arg,
@@ -80,6 +111,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "serve" => {
             let client = signed_in_client(args.url.as_deref()).await?;
             serve::run(client, tokio::io::stdin(), tokio::io::stdout()).await
+        }
+        "token" => {
+            let url = service_url(args.url.as_deref(), &config_path()?)?;
+            if args.forget {
+                if !args.positional.is_empty() {
+                    bail!("token --forget takes no token");
+                }
+                return token::forget_agent_token(&url, &Keychain, &mut say).map(|_| ());
+            }
+            let [source] = args.positional.as_slice() else {
+                bail!("token takes one agent token, or - to read it from stdin");
+            };
+            let raw = if source == "-" {
+                read_token_from_stdin()?
+            } else {
+                source.clone()
+            };
+            token::store_agent_token(&url, &raw, &Keychain, &mut say)
+                .await
+                .map(|_| ())
+        }
+        "whoami" => {
+            let url = service_url(args.url.as_deref(), &config_path()?)?;
+            println!("{}", token::whoami(&url, &Keychain).await?);
+            Ok(())
         }
         "login" => {
             let url = service_url(args.url.as_deref(), &config_path()?)?;

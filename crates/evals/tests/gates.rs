@@ -46,6 +46,7 @@ async fn ci_gates_on_the_recorded_corpus() {
     let gates: Gates =
         toml::from_str(&std::fs::read_to_string(evals.join("gates.toml")).unwrap()).unwrap();
     let env = Env {
+        models: None,
         paths: Paths::same(&evals),
         vectors: &vectors,
         extraction: Extraction::load(&evals.join(EXTRACTED_FILE)).unwrap(),
@@ -77,6 +78,100 @@ async fn ci_gates_on_the_recorded_corpus() {
     );
 }
 
+/// The R2 variants over the recorded corpus (`docs/r2-brief.md` §6): `rerank-small` and
+/// `rewrite-small` with their small-model stages replayed from
+/// `evals/recorded/{reranks,rewrites}.jsonl` (recorded by hand with the owner's key:
+/// `margin-eval record-reranks`, `record-rewrites`, then `record-embeddings`), checked
+/// against `[rerank]` in `evals/gates.toml` (top-10 places changed, fallbacks) and the
+/// tool-output size. A variant whose recording isn't committed yet is skipped with a
+/// message saying so; a recording without the vectors it needs fails.
+#[tokio::test]
+async fn r2_variants_on_the_recorded_small_calls() {
+    use margin_evals::ci::run_small_gates;
+    use margin_evals::small::SmallKind;
+    let evals = evals_dir();
+    let gates: Gates =
+        toml::from_str(&std::fs::read_to_string(evals.join("gates.toml")).unwrap()).unwrap();
+    let mut violations = Vec::new();
+    for (variant, kind) in [
+        ("rerank-small", SmallKind::Reranks),
+        ("rewrite-small", SmallKind::Rewrites),
+    ] {
+        let recording = evals.join(kind.file());
+        if !recording.is_file() {
+            eprintln!(
+                "SKIPPED the {variant} gate: {} isn't recorded yet (the owner runs `margin-eval \
+                 {} --variant {variant}`, then `margin-eval record-embeddings`, and commits \
+                 both)",
+                recording.display(),
+                kind.command()
+            );
+            continue;
+        }
+        let backend = margin_embed::Backend::Onnx(margin_embed::OnnxDtype::Q8);
+        let embeddings = evals.join(margin_evals::live::recording_file(backend));
+        let vectors = RecordedVectors::open(&embeddings).unwrap_or_else(|e| {
+            panic!(
+                "{} is recorded but the vectors it replays over aren't ({e:#}): run `margin-eval \
+                 record-embeddings` and commit it",
+                recording.display()
+            )
+        });
+        let env = Env {
+            models: None,
+            paths: Paths::same(&evals),
+            vectors: &vectors,
+            extraction: Extraction::load(&evals.join(EXTRACTED_FILE)).unwrap(),
+            register: &|_| {},
+            pack_budget: &margin_service::retrieval::pack_budget,
+        };
+        let o = run_small_gates(&env, &gates, variant).await.unwrap();
+        let (r, s) = (&o.retrieval, &o.retrieval.stages);
+        eprintln!(
+            "{variant}: recall@10 {:.1}, nDCG@10 {:.1}, top-10 moved {:.1} %, fallbacks {:.1} %, \
+             {:.2} queries per search, rerank p95 {:.0} ms, rewrite p95 {:.0} ms, ${:.5} per query",
+            r.overall.recall_at_10,
+            r.overall.ndcg_at_10,
+            s.rerank_moved_at_10,
+            s.rerank_fallback_rate,
+            s.queries_mean,
+            s.rerank_ms_p95,
+            s.rewrite_ms_p95,
+            s.small_cost_usd
+        );
+        violations.extend(o.violations);
+    }
+    assert!(
+        violations.is_empty(),
+        "the R2 gates failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The prompt lock (R2, `docs/r2-brief.md` D4.2): every prompt's constant block hashes
+/// as `evals/prompts.lock` says under its version. Needs no recording; always on
+/// (`[prompts] lock` in `evals/gates.toml`; off, it only prints what differs).
+#[test]
+fn prompt_lock() {
+    use margin_evals::gates::{PROMPT_LOCK_FILE, PromptLock, check_prompt_lock, locked_catalog};
+    let path = evals_dir().join(PROMPT_LOCK_FILE);
+    let lock: PromptLock = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let violations = check_prompt_lock(&lock, &locked_catalog());
+    let gates: Gates =
+        toml::from_str(&std::fs::read_to_string(evals_dir().join("gates.toml")).unwrap()).unwrap();
+    if !gates.prompts.lock {
+        for v in &violations {
+            eprintln!("prompt lock (advisory): {v}");
+        }
+        return;
+    }
+    assert!(
+        violations.is_empty(),
+        "evals/prompts.lock disagrees with the prompts:\n{}",
+        violations.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The Claude prompt-prefix gate (docs/agent-providers-brief.md D12)
 // ---------------------------------------------------------------------------
@@ -94,9 +189,10 @@ mod claude_prefix {
     use margin_ai::prompts::{self, Prompt};
     use margin_ai::{
         CallOptions, ClaudeClient, DocumentContents, FailedScene, Image, LessonContext, Passage,
-        PlanRequest, RerankCandidate, RouteModels, SceneRequest, TextModel,
+        PlanRequest, RerankCandidate, RewriteInput, RouteModels, SceneRequest, TextModel,
     };
     use margin_evals::prefix::{check_call, check_recorded, identical_prefixes, known_constants};
+    use margin_shared::pipeline::RetrievalPurpose;
     use margin_shared::pipeline::Route;
     use margin_shared::{Level, OutlineLesson};
     use serde_json::{Value, json};
@@ -233,7 +329,7 @@ mod claude_prefix {
     /// Varied calls of every constant-first prompt the Claude client's `TextModel`
     /// runs: lessons (first, middle, last; intro and advanced; with and without quiz,
     /// passages and a picture), scenes (first try and repair), the planner, the
-    /// reranker.
+    /// reranker, the query rewriter.
     fn prompts_sent() -> Vec<Prompt> {
         let mut out = Vec::new();
         for index in 0..3 {
@@ -299,13 +395,32 @@ mod claude_prefix {
                 ],
             ));
         }
+        for (query, purpose, scope_names) in [
+            (
+                "gibbs",
+                RetrievalPurpose::Agent,
+                vec!["dsp.pdf".to_string()],
+            ),
+            (
+                "Fourier coefficients",
+                RetrievalPurpose::Lesson,
+                vec!["dsp.pdf".to_string(), "notes/waves.md".to_string()],
+            ),
+        ] {
+            out.push(prompts::rewrite(&RewriteInput {
+                query: query.into(),
+                purpose,
+                scope_names,
+                max_added: 2,
+            }));
+        }
         out
     }
 
     /// The route a prompt's calls run on (D10: lessons, scenes and the planner on
-    /// Write; the reranker is a small task).
+    /// Write; the reranker and the rewriter are small tasks).
     fn route(p: &Prompt) -> Route {
-        if p.job == "rerank" {
+        if p.job == "rerank" || p.job == "rewrite" {
             Route::Small
         } else {
             Route::Write
@@ -345,6 +460,7 @@ mod claude_prefix {
         assert_eq!(report.per_version[prompts::SCENE_VERSION], 2);
         assert_eq!(report.per_version[prompts::PLAN_VERSION], 2);
         assert_eq!(report.per_version[prompts::RERANK_VERSION], 2);
+        assert_eq!(report.per_version[prompts::REWRITE_VERSION], 2);
         let models = RouteModels::claude_default();
         for (i, (p, body)) in sent.iter().zip(&bodies).enumerate() {
             let v = check_call(body, p);

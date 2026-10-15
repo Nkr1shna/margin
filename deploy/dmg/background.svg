@@ -36,6 +36,15 @@
   <path d="M366 170 L377 180 L366 190" fill="none" stroke="#4da3ff" stroke-opacity="0.9"
         stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 
+  <!-- Label plates under each icon. Finder draws the icon labels itself, black in light
+       mode and white in dark mode, whatever the background. A slate mid-tone (the accent's
+       hue, luminance ~0.18) reads at about 4.5:1 against both, so the labels stay legible
+       in either appearance. Labels sit just below the 112 px icons (centres y=180). -->
+  <g fill="#67778f">
+    <rect x="116" y="236" width="128" height="30" rx="15"/>
+    <rect x="396" y="236" width="128" height="30" rx="15"/>
+  </g>
+
   <!-- Hairline and caption under the icon labels. -->
   <rect x="220" y="300" width="200" height="1" fill="#ffffff" fill-opacity="0.08"/>
   <text x="320" y="334" text-anchor="middle" font-family="Albert Sans" font-weight="500"

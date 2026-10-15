@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use dioxus::prelude::*;
 use margin_shared::{
-    Event, Id, LessonPatch, LessonStatus, NewNote, Note, NotePatch, Video, VideoStatus,
+    Event, Id, LessonPatch, LessonStatus, NewNote, Note, NotePatch, Video, VideoStatus, WrittenWith,
 };
 use serde::Deserialize;
 
@@ -200,7 +200,10 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                                     renaming.set(false);
                                 } else if e.key() == Key::Enter {
                                     e.prevent_default();
-                                    save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await;
+                                    // Read in a statement of its own: a guard held across the
+                                    // save would make the next keystroke's `set` panic.
+                                    let title = rename_value.peek().clone();
+                                    save_title(app, id, title, renaming, action_error, rename_busy).await;
                                 }
                             }
                         }
@@ -213,7 +216,8 @@ pub fn LessonScreen(id: Id, view: LessonView) -> Element {
                         let id = id.clone();
                         move |_| {
                             let id = id.clone();
-                            async move { save_title(app, id, rename_value.peek().clone(), renaming, action_error, rename_busy).await }
+                            let title = rename_value.peek().clone();
+                            async move { save_title(app, id, title, renaming, action_error, rename_busy).await }
                         }
                     },
                     if *rename_busy.read() {
@@ -467,6 +471,11 @@ fn ReadView(lesson_id: Id, busy: bool, on_regenerate: EventHandler<()>) -> Eleme
                     span { "{lesson.minutes} min read" }
                     span { {level_label(lesson.level)} }
                     span { "Updated {date(&lesson.updated_at)}" }
+                    if let Some(w) = lesson.written_with.as_ref().filter(|_| lesson.status == LessonStatus::Ready) {
+                        span { class: "written-with", title: "{written_with_details(w)}",
+                            {written_with_line(w)}
+                        }
+                    }
                 }
                 h1 { "{lesson.title}" }
                 if !lesson.summary.is_empty() {
@@ -1251,4 +1260,83 @@ fn pipeline_steps(status: &VideoStatus) -> Vec<(String, &'static str)> {
             if rank == 4 { "done" } else { state(4) },
         ),
     ]
+}
+
+/// The lesson's details line for what wrote it (R2): "Written with lesson-v2 on
+/// claude-sonnet-5-5, 14 Oct 09:12", in local time.
+pub fn written_with_line(w: &WrittenWith) -> String {
+    format!(
+        "Written with {} on {}, {}",
+        w.prompt_version,
+        w.model,
+        w.at.with_timezone(&Local).format("%-d %b %H:%M")
+    )
+}
+
+/// What hovering the line shows: the pipeline's fingerprint, the provider and the time.
+pub fn written_with_details(w: &WrittenWith) -> String {
+    format!(
+        "Pipeline {} · {} · {}",
+        w.pipeline_hash,
+        w.provider.label(),
+        w.at.with_timezone(&Local).format("%-d %b %Y, %H:%M")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::LibraryState;
+    use crate::ui::test_render::render_route;
+    use margin_shared::Provider;
+
+    #[test]
+    fn the_details_line_says_what_wrote_the_lesson() {
+        let lib = crate::fake::sample_library();
+        let l1 = lib.lessons.iter().find(|l| l.id == "l1").unwrap().clone();
+        let w = l1.written_with.clone().unwrap();
+        let line = written_with_line(&w);
+        assert!(
+            line.starts_with("Written with lesson-v2 on claude-sonnet-5-5, "),
+            "{line}"
+        );
+        let details = written_with_details(&w);
+        assert!(details.starts_with(&format!("Pipeline {} · Claude · ", w.pipeline_hash)));
+        assert!(details.contains(&w.at.with_timezone(&Local).format("%Y").to_string()));
+
+        let html = render_route("/lesson/l1", LibraryState::from_library(lib.clone()));
+        assert!(html.contains(&line), "{html}");
+        assert!(html.contains(&format!(r#"title="{details}""#)), "{html}");
+
+        // Another provider and model, as the service sets them.
+        let mut lib2 = lib.clone();
+        let l2 = lib2.lessons.iter_mut().find(|l| l.id == "l2").unwrap();
+        l2.written_with = Some(crate::fake::sample_written_with(
+            Provider::OpenAi,
+            "gpt-6-astra",
+            l2.created_at,
+        ));
+        let html = render_route("/lesson/l2", LibraryState::from_library(lib2));
+        assert!(
+            html.contains("Written with lesson-v2 on gpt-6-astra, "),
+            "{html}"
+        );
+        assert!(html.contains(" · OpenAI · "), "{html}");
+
+        // Nothing for a lesson written before R2, or one not written yet.
+        let mut lib3 = lib;
+        for l in &mut lib3.lessons {
+            if l.id == "l2" {
+                l.written_with = None;
+            }
+            if l.id == "l1" {
+                l.status = LessonStatus::Queued;
+            }
+        }
+        let lib3 = LibraryState::from_library(lib3);
+        let html = render_route("/lesson/l2", lib3.clone());
+        assert!(html.contains("Updated "), "{html}");
+        assert!(!html.contains("Written with"), "{html}");
+        assert!(!render_route("/lesson/l1", lib3).contains("Written with"));
+    }
 }

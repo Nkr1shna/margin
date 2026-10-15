@@ -19,39 +19,49 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Deploy**: dev and prod on the Mac mini (Tart/Orchard), Cloudflare tunnels, CI per platform (Linux runner `margin-ci`, macOS for the app), CD per product, local Linux check | `docs/plan-deploy.md` |
 | ✅ | **Linux service**: ONNX EmbeddingGemma, pdfium, tesseract, ffmpeg, Parakeet, pocket-tts, bubblewrap, file secrets, systemd guests | `docs/plan-linux-service.md` |
 | ✅ | **macOS service leftovers removed** (Core ML, PDFKit/Vision/ImageIO/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd): Linux is the only service platform; the apps stay on Mac, iPhone, Android. Core ML-era passages are re-embedded by the one-pass re-embed | `docs/plan-linux-service.md` §0 |
+| ✅ | **Phase 5 — hardening**: injection guard (`text::for_model` at every edge, injection suite), one retry policy with visible waits, compaction trace markers, per-device rate limits and body limits, checked backups + schema guard + restore drill, alerts from traces + `perf`, iOS continued processing for folder syncs (on `feat/p5`) | [`docs/phase5-brief.md`](phase5-brief.md) |
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
+| ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
+| ✅ | **R2 — rerank, query rewriting, prompt-version tracking**: `listwise-small` and `small-expand-v1` on the Small route, the `onnx-crossencoder` stage (ms-marco-MiniLM, downloaded on demand), `written_with` on lessons/proposals/videos, the prompt catalog and `evals/prompts.lock` in CI, recorded reranks/rewrites in the eval. Every stage stays `"none"` by default: variants until the eval promotes them | `docs/r2-brief.md` |
 
 ## In progress
 
 | | Item | Notes |
 |---|---|---|
-| | Nothing right now | |
+| 🟡 | **L2 — access control inside search**: hierarchical groups, grants and denials, agents limited by their owner, private knowledge and publishing, audit log | `docs/l2-brief.md`; five areas building on `feat/l2` |
+| 🟡 | **App crash logging and the first panic fixes** (panic hook, log file, "quit unexpectedly" notice, the rename-while-saving crash) | branch `fix/app-crash-logs` |
+| 🟡 | **Provider settings defaults** (model slots filled, no Keychain copy, sensible default provider) | branch `fix/provider-defaults` |
 
 ## Next (in order)
 
-| | Item | Plan | Notes |
-|---|---|---|---|
-| ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/plan-live-context.md` | Fixes events going to every device |
-| ⏳ | **R2 — rerank, query rewriting, prompt-version tracking**, eval-gated | `docs/r2-brief.md` (from `docs/agent-rag-architecture.md` §4) | Cross-encoder built as a variant (ONNX on the CPU), promoted only by the eval |
-| ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
-| ⏳ | **Phase 5 — hardening** | `docs/phase5-brief.md` | iOS background continuation for folders, prompt-injection tests, job retries, backups/drills, alerts from traces, security review, performance budgets |
-| ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
-| ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
-| ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
-| ⏳ | **L5 — voice-first** with ElevenLabs | `docs/plan-live-context.md` | |
-| ⏳ | **L6 — permission sync from GitHub + repository source** (code comes in this way) | `docs/plan-live-context.md` | |
+Each step is a vertical slice: a person can use it end to end on desktop, iPhone and Android when it lands. Order: keep the app stable, finish who-sees-what, make the knowledge base usable day to day, get more knowledge in, then run it for a company and ship to prod, then the live features.
+
+| | Slice | Items | Plan | Notes |
+|---|---|---|---|---|
+| ⏳ | **S0 — Stability** (from the three quality reviews) | Request ids and an info-level request log with error reference ids; supervised background workers and a real `/health`; CI scope detection fails closed; a mutex-poison policy (ONNX load outside its lock); workspace `[lints]` against unwrap/expect/panic; corrupt drafts and config quarantined, save failures logged; the 24 fixed sleeps in tests replaced with condition waits; cargo-deny, Dependabot, SHA-pinned actions, Android build hard-fails; a route-table contract test between the app's fake and the service, and an `ErrorCode` enum; keep the last few dev builds; offsite backup reports copy failures; a README and a correct HANDOFF header | quality review page | Runs beside L2; small items |
+| ⏳ | **S1 — Find and manage your knowledge** | Search inside files and chats with highlighted matches on the EmbeddingGemma hybrid pipeline (not plain text); a Files screen (open, rename, download, sort); trash with undo and restore; move and reorder topics, lessons and notes; copy an answer and a code block; toasts, help, feedback and the version everywhere | `docs/basics-brief.md` | After L2 (results respect the reader) |
+| ⏳ | **S2 — Bring knowledge in** | Office formats (docx, pptx, xlsx); a web page as a source; the share sheet on iOS and Android; repository source and GitHub permission sync (L6) | `docs/basics-brief.md`, `docs/plan-live-context.md` | L6 moves up: code comes in this way |
+| ⏳ | **S3 — Run it for a company, and ship** | Usage per person on L2's audit log; offboarding session, then removal with content reassignment and per-person export; **prod on Linux** (`margin-prod` guest) with the infra review's settings and runner fixes | `docs/basics-brief.md`, `docs/plan-deploy.md` | The point where a second company can be invited |
+| ⏳ | **S4 — Learn it properly: Q, serious quizzes** | Graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | Needs L2's per-person attempts |
+| ⏳ | **S5 — L3 inbox and @mentions** | For people and agents, with push notifications and deep links | `docs/plan-live-context.md` | |
+| ⏳ | **S6 — L4 meetings** | LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
+| ⏳ | **S7 — L5 voice-first** | ElevenLabs | `docs/plan-live-context.md` | |
 
 ## Later / ideas
 
-- 🗓 Office and e-book formats (`.docx .pptx .epub`) once an extractor exists.
+- 🗓 E-book formats (`.epub`) once an extractor exists.
 - 🗓 Audio and video in folders.
-- 🗓 A cross-encoder reranker if the eval earns it.
+- 🗓 R2's variants as defaults (listwise rerank for lessons, rewriting, the cross-encoder for agent search) once the eval earns it (`docs/r2-brief.md` §6); a `by-purpose` reranker if both rerankers win.
 - 🗓 Agents over MCP for other companies' tools (after L1's agent tokens).
 
 ## Waiting on the owner
 
 - 👤 `margin-eval record-embeddings` + baseline, then un-ignore the CI eval gate (`crates/evals/tests/gates.rs`).
+- 👤 R2's recordings, in this order: `margin-eval record-rewrites --variant rewrite-small` → `margin-eval record-embeddings` (adds the rewrites' vectors) → `margin-eval record-reranks --variant rerank-small`; commit them so the R2 CI gate runs instead of skipping; then the A/B runs and `compare` of `docs/r2-brief.md` §6, and flip a default in Settings only if its rule passes.
+- 👤 R2 on the dev guest: `margin-service download-model --reranker ms-marco-minilm-l6-v2`, a real `search` with `rerank-xenc` showing `rerank_ms` in `GET /api/traces`.
+- 👤 `bge-reranker-base`: needs ~1.3 GB loaded (1266 MB RSS measured, over the 400 MB budget MiniLM meets). It stays an opt-in variant (`rerank-xenc-bge`) for non-English corpora; decide whether to keep offering it or drop it.
 - 👤 Hands-on runs: phase 4's manual D13 checks (macOS scanned PDF, iOS iCloud folder, Android), the providers screens, a real course from a real PDF.
 - 👤 First real-provider runs (OpenAI, ChatGPT, Claude); ChatGPT's per-app cap doesn't list Margin yet.
+- 👤 Phase 5 manual checks (`docs/phase5-brief.md` §5): the iPhone continued task (iOS 26, a 1 000-file iCloud folder synced with Margin closed, expiry → Paused; the task identifier may need a `.*` wildcard), `restore-drill.sh dev` (first run with `--hard-stop`), `perf` against dev, an alert end to end, one 429 per provider.
+- 👤 Phase 5 D3d fixtures: the live 400 texts of a compaction rejection from OpenAI and Claude, copied into the fake servers so `rejects_compaction` is tested against real text.
 - 👤 Licence reads before selling: EmbeddingGemma terms; pocket-tts voices (cosette and jean are blocked as non-commercial).
