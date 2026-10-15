@@ -174,7 +174,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
                 .context("perf needs --service-url")?;
             margin_evals::perf::run(&reqwest::Client::new(), url, &token()?, &evals).await?;
         }
-        live_cmd => live_command(live_cmd, &paths, &store).await?,
+        live_cmd => live_command(live_cmd, &paths, &data, &store).await?,
     }
     Ok(())
 }
@@ -211,7 +211,12 @@ fn need_judges(js: &[Box<dyn Judge>]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow::Result<()> {
+async fn live_command(
+    cmd: &Command,
+    paths: &Paths,
+    data: &Path,
+    store: &EvalStore,
+) -> anyhow::Result<()> {
     let cfg = live::RunnerConfig::load(&paths.evals.join("runner.toml"))?;
     // The dogfood suite reads the repository's docs/ (next to evals/) as its corpus.
     let dogfood;
@@ -254,8 +259,9 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     let reader = live::reader_name();
     let recording_file = paths.evals.join(live::recording_file(backend));
     let extraction_file = paths.evals.join(live::extraction_file(reader));
-    let data = default_data_dir();
-    let media = media_dir(&data);
+    // Page renders and the recording's staging folder go under the runner's own data
+    // folder (`--data`), never the default one when another was given.
+    let media = media_dir(data);
     let corpus = paths.corpus();
     let docs = documents(&corpus)?;
     let embedder: &'static live::LiveVectors = Box::leak(Box::new(live::LiveVectors::load(

@@ -7,7 +7,7 @@
 //! Android, and in the data directory elsewhere. There:
 //! - `margin.log`, `margin.1.log` … `margin.4.log`: the log, newest first, at most
 //!   `LOG_MAX_BYTES` each (warnings and up from libraries, info and up from the app);
-//! - `crash-<time>.log`: one per panic, the last `KEEP_CRASHES` kept;
+//! - `crash-<time>-<n>.log`: one per panic, the last `KEEP_CRASHES` kept;
 //! - `last-crash.log`: a copy of the report of a panic on the main thread, which quit
 //!   the app; the next launch takes it (`take_last_crash`) and says so (`CrashNotice`).
 //!
@@ -22,6 +22,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::config::APP_NAME;
@@ -239,8 +240,12 @@ impl Panic<'_> {
 /// `last-crash.log` when the panic `quit` the app.
 fn save_crash(dir: &Path, report: &str, quit: bool) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // Two panics in the same millisecond (a thread's, then the main thread's it took
+    // down) would share a stamp; the count keeps both, and the names still sort by time.
+    static SEQ: AtomicU32 = AtomicU32::new(0);
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
-    std::fs::write(dir.join(format!("crash-{stamp}.log")), report)?;
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::fs::write(dir.join(format!("crash-{stamp}-{seq:04}.log")), report)?;
     let mut crashes: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
