@@ -36,6 +36,8 @@ Two ways they run:
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
+| `recorded/reranks.jsonl`, `recorded/rewrites.jsonl` | R2: what the listwise reranker (`listwise-small`) and the query rewriter (`small-expand-v1`) answered on the small-tasks model, one record per search, keyed by `sha256(stage + params, prompt version, purpose, query [, candidate ids])`, with the call's time and cost. CI replays them under the real stage names; a search not recorded is an error, never a made-up answer. |
+| `prompts.lock` | Every prompt's version and the hash of its constant block; the always-on `prompt_lock` test fails when a constant block changes under an unchanged version. |
 
 The judge rubrics, the question-generation and seriousness-grading prompts and the
 canary sets (10 trivial questions to reject, 5 serious ones to keep, 20 deliberately bad
@@ -105,6 +107,51 @@ none; a text call has exactly one breakpoint; the constant block is sent nowhere
 It covers lessons, scenes, the planner and the reranker, each call on its route's model.
 A change to a constant block bumps its `prompt_version`. The OpenAI counterpart is
 R1's prefix-identity test in `crates/ai/tests/fake_responses.rs`.
+
+## Reranking, query rewriting and prompt versions (R2)
+
+The listwise rerank and the query rewriter run on the small-tasks model, so CI can't call
+them: the owner records their answers once and CI replays them
+(`docs/r2-brief.md` §6). Recording is an owner step with the model keys; nothing
+becomes the default by being recorded.
+
+```sh
+margin-eval record-rewrites --variant rewrite-small   # one small call per golden query/lesson plan
+margin-eval record-reranks  --variant rerank-small    # one small call per golden query/lesson plan, over its fused candidates
+margin-eval record-embeddings                         # also embeds the recorded rewrites
+git add evals/recorded/rewrites.jsonl evals/recorded/reranks.jsonl evals/recorded/embeddings-*.bin
+margin-eval run --suite retrieval --variant rerank-small   # served from the recording
+margin-eval compare <baseline run> <rerank-small run>
+margin-eval prompts                                   # the catalog against prompts.lock
+margin-eval prompts --write-lock                      # after bumping a changed prompt's version
+```
+
+A rerank is keyed by its candidates, which come from the recorded vectors, so for a
+variant with both stages (`r2-full`) run `record-rewrites` and `record-embeddings`
+before `record-reranks` (its rewritten queries then search with the vectors CI replays).
+Answers already recorded are reused, never paid for twice; a run of a variant with a
+small-model stage is served from the recording and calls the model only for searches
+that weren't recorded (with no key it replays only, and a miss is an error).
+`rerank-small` sets `params.purpose = "lesson"` on its reranker: the retrieval suite then
+searches the golden questions as lessons do (its reranker leaves the agent tool alone),
+else it searches as the agent tool. The courses suite searches as lessons, the agent
+suite as the agent tool. A variant's recorded lessons go under
+`recorded/generations/<prompt version>+<variant>/`, so they never overwrite the
+baseline's.
+
+The retrieval report's **Reranking** section gives the share of the top 10 places the
+reranker changed (`rerank_moved_at_10`), its fallbacks (searches it applies to that kept
+the fused order), `rerank_ms`/`rewrite_ms` p50/p95, query strings per search, and the
+small route's cost per query (from the stages' trace rows, or the recording's when
+replayed). CI's `r2_variants_on_the_recorded_small_calls` replays `rerank-small` and
+`rewrite-small` against `[rerank]` in `gates.toml` (at most 60 % of the top 10 moved, no
+fallbacks) and the tool-output size; until a recording is committed that variant is
+skipped with a message saying so.
+
+Every run records the prompt versions its model calls used (`prompt_versions`, shown in
+its report). `compare` refuses runs that ran one prompt under two versions ("rerank-v1 →
+rerank-v2") unless `--allow-prompt-change`; a job only one run has (the variant adds a
+reranker) is what is being compared, noted as a warning.
 
 ## How quality is shown without human review
 

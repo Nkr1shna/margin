@@ -15,6 +15,7 @@ use crate::index::scope_of;
 use crate::packing::{check_packing, tool_output_bytes};
 use crate::retrieval::RetrievalReport;
 use crate::runner::Env;
+use crate::small::{SmallKind, stage_applies};
 
 /// The model windows packing is checked at: a small one where the budget binds, and a
 /// current model's.
@@ -112,6 +113,86 @@ pub async fn run_gates(
     })
 }
 
+/// What the R2 gate measured on one variant.
+#[derive(Debug)]
+pub struct SmallGateOutcome {
+    pub variant: String,
+    pub retrieval: RetrievalReport,
+    pub violations: Vec<String>,
+}
+
+/// The R2 gate (`docs/r2-brief.md` §6): `variant` over the recorded corpus with its
+/// model-backed stages replayed from `recorded/{reranks,rewrites}.jsonl` (no model: a
+/// search that wasn't recorded is an error). Checks the reranker's `[rerank]` gates
+/// (top-10 places changed, fallbacks), that the stages did something (a reranker that
+/// doesn't apply to the suite's purpose or a rewriter that never added a query makes
+/// the gate vacuous, so it fails), and the tool-output size. The retrieval numbers are
+/// returned, not gated: a variant may lose; `compare` and §6's rules decide promotion.
+pub async fn run_small_gates(
+    env: &Env<'_>,
+    gates: &Gates,
+    variant: &str,
+) -> anyhow::Result<SmallGateOutcome> {
+    anyhow::ensure!(
+        env.models.is_none(),
+        "the R2 gate replays the recordings; it never calls a model"
+    );
+    let (cfg, _) = env.paths.variant(variant)?;
+    let index = env.index(&cfg).await?;
+    let queries = env.paths.retrieval_golden()?;
+    let report = crate::retrieval::run(&index, &queries).await?;
+    let mut v = Vec::new();
+    let s = &report.stages;
+    if SmallKind::Reranks.is_small(&cfg) {
+        let purpose = index.retrieval_purpose();
+        if !stage_applies(&cfg.reranker, purpose) {
+            v.push(format!(
+                "{variant}: its reranker doesn't apply to the purpose the suite searches for \
+                 ({}), so nothing was measured; set the reranker's params.purpose",
+                purpose.as_str()
+            ));
+        }
+        if s.rerank_moved_at_10 > gates.rerank.moved_at_10_max + 1e-9 {
+            v.push(format!(
+                "{variant}: the reranker changed {:.1} % of the top 10 places on average (at \
+                 most {} allowed): a reranker reordering that much is a bug, not a win",
+                s.rerank_moved_at_10, gates.rerank.moved_at_10_max
+            ));
+        }
+        if s.rerank_fallback_rate > gates.rerank.fallback_rate_max + 1e-9 {
+            v.push(format!(
+                "{variant}: {:.1} % of the searches the reranker applies to kept the fused \
+                 order (its fallback: a timeout, a refusal or bad JSON when recorded; at most \
+                 {} allowed): re-record with `margin-eval record-reranks --variant {variant}`",
+                s.rerank_fallback_rate, gates.rerank.fallback_rate_max
+            ));
+        }
+    }
+    if SmallKind::Rewrites.is_small(&cfg) && report.queries.iter().all(|q| q.stages.queries <= 1) {
+        v.push(format!(
+            "{variant}: the rewriter added no query to any golden search, so nothing was \
+             measured: re-record with `margin-eval record-rewrites --variant {variant}`"
+        ));
+    }
+    for q in &queries {
+        let ranked = index
+            .search(std::slice::from_ref(&q.query), &scope_of(q.scope))
+            .await?;
+        let bytes = tool_output_bytes(&ranked.hits);
+        if bytes > gates.packing.tool_output_max_bytes {
+            v.push(format!(
+                "{variant} {}: a search returning its top hits is {bytes} bytes, over {}",
+                q.id, gates.packing.tool_output_max_bytes
+            ));
+        }
+    }
+    Ok(SmallGateOutcome {
+        variant: variant.to_string(),
+        retrieval: report,
+        violations: v,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -188,6 +269,7 @@ mod tests {
             vectors: &V,
             register: &register,
             pack_budget: &budget,
+            models: None,
         };
         let store = EvalStore::memory().await.unwrap();
         run_retrieval(&env, "baseline", &store, true).await.unwrap();

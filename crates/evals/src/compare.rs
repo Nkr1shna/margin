@@ -75,6 +75,18 @@ pub fn providers_of<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     out
 }
 
+/// Prompt versions by job: "rerank-v1" is job "rerank", "title-1a2b3c4d" job "title"
+/// (the name before the last `-`).
+pub fn prompt_jobs(versions: &[String]) -> BTreeMap<String, String> {
+    versions
+        .iter()
+        .map(|v| {
+            let job = v.rsplit_once('-').map_or(v.as_str(), |(job, _)| job);
+            (job.to_string(), v.clone())
+        })
+        .collect()
+}
+
 /// Compares the per-item results of two runs.
 pub fn compare(
     a: &EvalRun,
@@ -131,6 +143,44 @@ pub fn compare(
             some.id,
             shown(p)
         ));
+    }
+    // Prompt versions (R2, D4.4): one job under two versions is refused; a job only one
+    // run has (the variant adds a reranker or a rewriter) is what is being compared.
+    let (ja, jb) = (
+        prompt_jobs(&a.prompt_versions),
+        prompt_jobs(&b.prompt_versions),
+    );
+    let changed: Vec<String> = ja
+        .iter()
+        .filter_map(|(job, va)| {
+            jb.get(job)
+                .filter(|vb| *vb != va)
+                .map(|vb| format!("{va} → {vb}"))
+        })
+        .collect();
+    if !changed.is_empty() {
+        anyhow::ensure!(
+            allow.prompt_change,
+            "{} and {} ran different prompt versions ({}): a difference could come from the \
+             reworded prompt alone; re-run both on one version, or pass --allow-prompt-change",
+            a.id,
+            b.id,
+            changed.join(", ")
+        );
+        warnings.push(format!(
+            "the prompt changed ({}): the deltas include the prompt's effect",
+            changed.join(", ")
+        ));
+    }
+    for (job, v) in &jb {
+        if !ja.contains_key(job) {
+            warnings.push(format!("only {} ran {v}", b.id));
+        }
+    }
+    for (job, v) in &ja {
+        if !jb.contains_key(job) {
+            warnings.push(format!("only {} ran {v}", a.id));
+        }
     }
     if a.corpus_hash != b.corpus_hash {
         warnings.push("the runs are over different corpora".to_string());
@@ -367,6 +417,50 @@ mod tests {
                 .unwrap()
                 .warnings
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn refuses_across_prompt_versions_unless_allowed() {
+        let mut a = run("a", "v");
+        let mut b = run("b", "v");
+        let ra = rows("a", &[("q1", 0.0)]);
+        let rb = rows("b", &[("q1", 1.0)]);
+        // The baseline has no rerank job; the variant adds one: that is the comparison.
+        b.prompt_versions = vec!["rerank-v1".into()];
+        let c = compare(&a, &ra, &b, &rb, STRICT).unwrap();
+        assert_eq!(c.warnings, ["only b ran rerank-v1"]);
+        // One job under two versions is refused.
+        a.prompt_versions = vec!["lesson-v2".into(), "rerank-v1".into()];
+        b.prompt_versions = vec!["lesson-v2".into(), "rerank-v2".into()];
+        let err = compare(&a, &ra, &b, &rb, STRICT).unwrap_err().to_string();
+        assert!(err.contains("rerank-v1 → rerank-v2"), "{err}");
+        assert!(err.contains("--allow-prompt-change"), "{err}");
+        let allowed = Allow {
+            prompt_change: true,
+            ..STRICT
+        };
+        let c = compare(&a, &ra, &b, &rb, allowed).unwrap();
+        assert!(
+            c.warnings[0].contains("the prompt changed"),
+            "{:?}",
+            c.warnings
+        );
+        // The same versions compare silently; hash-versioned jobs pair by name.
+        b.prompt_versions = a.prompt_versions.clone();
+        assert!(
+            compare(&a, &ra, &b, &rb, STRICT)
+                .unwrap()
+                .warnings
+                .is_empty()
+        );
+        assert_eq!(
+            prompt_jobs(&["title-1a2b3c4d".into(), "agent-v2".into()]),
+            [
+                ("agent".to_string(), "agent-v2".to_string()),
+                ("title".to_string(), "title-1a2b3c4d".to_string())
+            ]
+            .into()
         );
     }
 

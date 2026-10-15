@@ -266,11 +266,96 @@ pub fn check_prompt_lock(
     out
 }
 
+/// `margin-eval prompts [--write-lock]`: every locked prompt's job, version and
+/// constant-block hash beside what `prompts.lock` says (read from `paths.out`, else
+/// `paths.evals`), and whether they agree. With `write_lock` the lock under `paths.out`
+/// is rewritten from the catalog first (do it with the version bump, in the same
+/// change). Returns the text and whether the lock now agrees.
+pub fn prompts_command(
+    paths: &crate::runner::Paths,
+    write_lock: bool,
+) -> anyhow::Result<(String, bool)> {
+    let catalog = locked_catalog();
+    let out = paths.out.join(PROMPT_LOCK_FILE);
+    let mut text = String::new();
+    if write_lock {
+        std::fs::write(&out, prompt_lock_toml(&catalog))
+            .with_context(|| format!("couldn't write {}", out.display()))?;
+        text.push_str(&format!("wrote {}\n\n", out.display()));
+    }
+    let path = if out.is_file() {
+        out
+    } else {
+        paths.evals.join(PROMPT_LOCK_FILE)
+    };
+    let lock: PromptLock = match std::fs::read_to_string(&path) {
+        Ok(t) => toml::from_str(&t).with_context(|| format!("bad {}", path.display()))?,
+        Err(_) => PromptLock::new(),
+    };
+    text.push_str(&format!(
+        "{:<14} {:<16} {:<18} {:>9}  lock\n",
+        "job", "version", "constant hash", "chars"
+    ));
+    for p in &catalog {
+        let state = match lock.get(&p.job) {
+            None => "missing".to_string(),
+            Some(l) if l.version != p.version => format!("lock says {}", l.version),
+            Some(l) if l.constant_hash != p.constant_hash => {
+                "CHANGED under this version".to_string()
+            }
+            Some(_) => "ok".to_string(),
+        };
+        text.push_str(&format!(
+            "{:<14} {:<16} {:<18} {:>9}  {state}\n",
+            p.job, p.version, p.constant_hash, p.constant_chars
+        ));
+    }
+    let violations = check_prompt_lock(&lock, &catalog);
+    for v in &violations {
+        text.push_str(&format!("\n{v}"));
+    }
+    if !violations.is_empty() {
+        text.push('\n');
+    }
+    Ok((text, violations.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::golden::evals_dir;
     use crate::retrieval::IndexSummary;
+
+    #[test]
+    fn the_prompts_command_reads_and_writes_the_lock() {
+        let out = std::env::temp_dir().join(format!(
+            "margin-evals-prompts-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&out).unwrap();
+        let paths = crate::runner::Paths {
+            out: out.clone(),
+            ..crate::runner::Paths::same(&evals_dir())
+        };
+        // A lock with the lesson prompt changed under its version.
+        let mut lock: PromptLock = toml::from_str(&prompt_lock_toml(&locked_catalog())).unwrap();
+        lock.get_mut("lesson").unwrap().constant_hash = "0000000000000000".into();
+        std::fs::write(out.join(PROMPT_LOCK_FILE), toml::to_string(&lock).unwrap()).unwrap();
+        let (text, ok) = prompts_command(&paths, false).unwrap();
+        assert!(!ok);
+        assert!(text.contains("CHANGED under this version"), "{text}");
+        assert!(text.contains("bump its version"), "{text}");
+        // --write-lock rewrites it from the catalog.
+        let (text, ok) = prompts_command(&paths, true).unwrap();
+        assert!(ok, "{text}");
+        assert!(text.starts_with("wrote "), "{text}");
+        assert!(text.contains("rerank-v1"), "{text}");
+        let written: PromptLock =
+            toml::from_str(&std::fs::read_to_string(out.join(PROMPT_LOCK_FILE)).unwrap()).unwrap();
+        assert!(check_prompt_lock(&written, &locked_catalog()).is_empty());
+        std::fs::remove_dir_all(&out).unwrap();
+    }
 
     #[test]
     fn the_prompt_lock_catches_a_changed_constant_under_one_version() {
@@ -317,6 +402,7 @@ mod tests {
             dedup_rate: 0.0,
             latency_p50_ms: 1.0,
             latency_p95_ms: p95,
+            stages: Default::default(),
             queries: vec![],
         }
     }

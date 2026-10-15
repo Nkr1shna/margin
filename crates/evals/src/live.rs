@@ -439,6 +439,80 @@ pub fn models(
     })
 }
 
+/// The runner's small-tasks models for the model-backed stages (R2: the listwise rerank,
+/// the query rewriter), as `StageDeps.models`: Claude's small slot through the Messages
+/// client and OpenAI's through the Responses client, from the keys in the service's
+/// secret store. The default (`provider: None`) is the writer's provider (Claude when
+/// its key is there), as the service's jobs use the default provider.
+pub struct LiveSmall {
+    /// The default first.
+    pub models: Vec<margin_service::pipeline::SmallModel>,
+}
+
+impl margin_service::pipeline::SmallModels for LiveSmall {
+    fn small<'a>(
+        &'a self,
+        provider: Option<margin_shared::Provider>,
+    ) -> BoxFuture<'a, anyhow::Result<margin_service::pipeline::SmallModel>> {
+        Box::pin(async move {
+            let found = match provider {
+                None => self.models.first(),
+                Some(p) => self.models.iter().find(|m| m.provider == p),
+            };
+            found.cloned().with_context(|| {
+                format!(
+                    "no small-tasks model for {}: no key for it in the service's secret store",
+                    provider.map_or("the default provider", |p| p.as_str())
+                )
+            })
+        })
+    }
+}
+
+/// The small-tasks models the configured keys allow; `None` without a key.
+pub fn small_models(
+    cfg: &RunnerConfig,
+    secrets: &dyn margin_service::secrets::SecretStore,
+) -> anyhow::Result<Option<Arc<dyn margin_service::pipeline::SmallModels>>> {
+    use margin_service::pipeline::SmallModel;
+    let openai = secrets.get(OPENAI_KEY)?.filter(|k| !k.is_empty());
+    let anthropic = secrets.get(ANTHROPIC_KEY)?.filter(|k| !k.is_empty());
+    let m = &cfg.models;
+    let mut models = Vec::new();
+    if let Some(k) = &anthropic {
+        let client = margin_ai::ClaudeClient::new(
+            &cfg.anthropic_base_url,
+            k.as_str(),
+            margin_ai::RouteModels {
+                chat: m.anthropic_write.clone(),
+                write: m.anthropic_write.clone(),
+                small: m.anthropic_small.clone(),
+            },
+        );
+        models.push(SmallModel {
+            model: Arc::new(client),
+            provider: margin_shared::Provider::Claude,
+            id: m.anthropic_small.clone(),
+            window: margin_ai::MODEL_WINDOW_FALLBACK,
+        });
+    }
+    if let Some(k) = &openai {
+        models.push(SmallModel {
+            model: Arc::new(ResponsesClient::new(
+                &cfg.openai_base_url,
+                k.as_str(),
+                &m.openai_small,
+            )),
+            provider: margin_shared::Provider::OpenAi,
+            id: m.openai_small.clone(),
+            window: margin_ai::windows::openai_window(&m.openai_small)
+                .unwrap_or(margin_ai::MODEL_WINDOW_FALLBACK),
+        });
+    }
+    Ok((!models.is_empty())
+        .then(|| Arc::new(LiveSmall { models }) as Arc<dyn margin_service::pipeline::SmallModels>))
+}
+
 /// The real embedder's vectors: EmbeddingGemma 2 on the chosen backend (`live_backend`),
 /// pictures through its image encoder (a PDF page from the render `extract` wrote under
 /// `media`).
@@ -694,6 +768,37 @@ mod tests {
         let m = models(&cfg, &openai).unwrap();
         assert_eq!(m.writer.provider(), "openai");
         assert_eq!(m.small.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn small_models_follow_the_keys() {
+        use margin_shared::Provider;
+        let cfg = RunnerConfig::load(&crate::golden::evals_dir().join("runner.toml")).unwrap();
+        let none = margin_service::secrets::MemoryStore::new();
+        assert!(small_models(&cfg, &none).unwrap().is_none());
+        let both = margin_service::secrets::MemoryStore::new()
+            .with(OPENAI_KEY, "sk-test")
+            .with(ANTHROPIC_KEY, "ak-test");
+        let m = small_models(&cfg, &both).unwrap().unwrap();
+        let d = m.small(None).await.unwrap();
+        assert_eq!(
+            d.provider,
+            Provider::Claude,
+            "the writer's provider by default"
+        );
+        assert_eq!(d.id, cfg.models.anthropic_small);
+        let o = m.small(Some(Provider::OpenAi)).await.unwrap();
+        assert_eq!(o.id, cfg.models.openai_small);
+        let err = m
+            .small(Some(Provider::ChatGpt))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("chatgpt"), "{err}");
+        let openai = margin_service::secrets::MemoryStore::new().with(OPENAI_KEY, "sk-test");
+        let m = small_models(&cfg, &openai).unwrap().unwrap();
+        assert_eq!(m.small(None).await.unwrap().provider, Provider::OpenAi);
     }
 
     async fn serve(app: axum::Router) -> String {

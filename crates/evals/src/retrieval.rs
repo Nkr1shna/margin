@@ -13,7 +13,7 @@ use margin_service::pipeline::Hit;
 use serde::{Deserialize, Serialize};
 
 use crate::golden::{QueryKind, Relevant, RetrievalQuery, matches_anchor};
-use crate::index::{EvalIndex, IndexStats, scope_of};
+use crate::index::{EvalIndex, IndexStats, SearchStages, scope_of};
 use crate::metrics;
 
 /// The share of answerable queries whose first relevant hit must clear the negatives'
@@ -78,6 +78,73 @@ pub struct QueryResult {
     pub picture_hit: Option<bool>,
     pub dedup_rate: f64,
     pub ms: f64,
+    /// What the rewriter and the reranker did (R2).
+    #[serde(default)]
+    pub stages: SearchStages,
+}
+
+/// What the model-backed stages (R2) did over a run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StageSummary {
+    /// The variant's stages and the purpose the suite searched for.
+    pub reranker: String,
+    pub rewriter: String,
+    pub purpose: String,
+    /// Points: the mean share of the top 10 places the reranker changed (0 without one).
+    pub rerank_moved_at_10: f64,
+    /// Points: searches the reranker applies to that it left in the fused order.
+    pub rerank_fallback_rate: f64,
+    /// Searches the reranker reordered.
+    pub reranked: usize,
+    pub rerank_ms_p50: f64,
+    pub rerank_ms_p95: f64,
+    pub rewrite_ms_p50: f64,
+    pub rewrite_ms_p95: f64,
+    /// Query strings per search after rewriting.
+    pub queries_mean: f64,
+    /// USD of the small-route calls per search, and in all.
+    pub small_cost_usd: f64,
+    pub small_cost_usd_total: f64,
+    pub small_calls: u64,
+}
+
+impl StageSummary {
+    /// The numbers of `results` (names left empty).
+    pub fn of(results: &[QueryResult]) -> Self {
+        let s: Vec<&SearchStages> = results.iter().map(|r| &r.stages).collect();
+        let f = |g: &dyn Fn(&SearchStages) -> f64| s.iter().map(|x| g(x)).collect::<Vec<f64>>();
+        let moved: Vec<f64> = s.iter().filter_map(|x| x.rerank_moved_at_10).collect();
+        let applied = s.iter().filter(|x| x.reranked || x.rerank_fallback).count();
+        let fallbacks = s.iter().filter(|x| x.rerank_fallback).count();
+        let rerank_ms = f(&|x| x.rerank_ms);
+        let rewrite_ms = f(&|x| x.rewrite_ms);
+        let cost = f(&|x| x.small_cost_usd);
+        Self {
+            rerank_moved_at_10: metrics::mean(&moved) * 100.0,
+            rerank_fallback_rate: if applied == 0 {
+                0.0
+            } else {
+                fallbacks as f64 * 100.0 / applied as f64
+            },
+            reranked: s.iter().filter(|x| x.reranked).count(),
+            rerank_ms_p50: metrics::percentile(&rerank_ms, 50.0),
+            rerank_ms_p95: metrics::percentile(&rerank_ms, 95.0),
+            rewrite_ms_p50: metrics::percentile(&rewrite_ms, 50.0),
+            rewrite_ms_p95: metrics::percentile(&rewrite_ms, 95.0),
+            queries_mean: metrics::mean(&f(&|x| x.queries as f64)),
+            small_cost_usd: metrics::mean(&cost),
+            small_cost_usd_total: cost.iter().sum(),
+            small_calls: s.iter().map(|x| u64::from(x.small_calls)).sum(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the run had a reranker or a rewriter to report.
+    pub fn active(&self) -> bool {
+        (!self.reranker.is_empty() && self.reranker != "none")
+            || (!self.rewriter.is_empty() && self.rewriter != "none")
+    }
 }
 
 /// Points (0–100) over a set of queries.
@@ -122,6 +189,9 @@ pub struct RetrievalReport {
     pub dedup_rate: f64,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
+    /// The rewriter and the reranker (R2).
+    #[serde(default)]
+    pub stages: StageSummary,
     pub queries: Vec<QueryResult>,
 }
 
@@ -185,6 +255,7 @@ pub fn score_query(q: &RetrievalQuery, hits: &[Hit], query_vector: &[f32], ms: f
         dedup_rate: metrics::dedup_rate(&overlaps(hits), 10),
         judged,
         ms,
+        stages: SearchStages::default(),
     }
 }
 
@@ -239,6 +310,7 @@ pub fn summarize(
         dedup_rate: metrics::mean(&refs.iter().map(|r| r.dedup_rate).collect::<Vec<_>>()) * 100.0,
         latency_p50_ms: metrics::percentile(&ms, 50.0),
         latency_p95_ms: metrics::percentile(&ms, 95.0),
+        stages: StageSummary::of(&results),
         queries: results,
     }
 }
@@ -254,19 +326,21 @@ pub async fn run(
             .search(std::slice::from_ref(&q.query), &scope_of(q.scope))
             .await
             .map_err(|e| e.context(format!("query {}", q.id)))?;
-        results.push(score_query(
-            q,
-            &ranked.hits,
-            &ranked.query_vector,
-            ranked.ms,
-        ));
+        let mut r = score_query(q, &ranked.hits, &ranked.query_vector, ranked.ms);
+        r.stages = ranked.stages;
+        results.push(r);
     }
-    Ok(summarize(
+    let mut report = summarize(
         results,
         index.vectors.version(),
         &index.pipeline.hash,
         index.stats.into(),
-    ))
+    );
+    let cfg = &index.pipeline.config;
+    report.stages.reranker = cfg.reranker.name.clone();
+    report.stages.rewriter = cfg.rewriter.name.clone();
+    report.stages.purpose = index.retrieval_purpose().as_str().to_string();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -397,6 +471,7 @@ mod tests {
             picture_hit: None,
             dedup_rate: 0.0,
             ms: 1.0,
+            stages: Default::default(),
         };
         let mut results: Vec<QueryResult> = (0..10)
             .map(|i| {
