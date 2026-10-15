@@ -13,17 +13,20 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use margin_shared::context::AuditKind;
 use margin_shared::{
     Event, Group, GroupPatch, Id, NewGroup, OrgRole, ROOT_GROUP, SOURCE_MANUAL, access_code,
     ancestors, is_group_path, person_id,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::watch;
 
+use crate::audit;
 use crate::db::{self, Store};
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::people::PersonRow;
-use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentPrincipal, RequireAdmin};
+use crate::principal::{BOOTSTRAP_PERSON_ID, CurrentPrincipal, Principal, RequireAdmin};
 use crate::state::{AppState, Audience};
 
 /// Longest group name.
@@ -320,6 +323,39 @@ pub async fn set_memberships(
     Ok(now)
 }
 
+/// `set_memberships` made by `actor` (`PUT /api/people/{id}/groups`), journaled as a
+/// `MembershipChange` with the person's direct groups before and after, under the same
+/// write lock. Nothing is journaled when nothing changed.
+pub async fn set_memberships_by(
+    state: &AppState,
+    actor: &Principal,
+    person_id_: &str,
+    groups: &[String],
+) -> AppResult<Vec<String>> {
+    let now = {
+        let _w = state.write_lock.lock().await;
+        let before = groups_of(&state.store, person_id_).await?;
+        let now = set_memberships_locked(&state.store, person_id_, groups).await?;
+        if before != now {
+            audit::record(
+                state,
+                audit::by(
+                    actor,
+                    AuditKind::MembershipChange,
+                    "person",
+                    person_id_,
+                    json!({"groups": before}),
+                    json!({"groups": now}),
+                ),
+            );
+        }
+        now
+    };
+    state.expansions.invalidate_all();
+    memberships_changed(state, person_id_, &now);
+    Ok(now)
+}
+
 /// The events of a membership change: `MembershipChanged` to everyone (a directory),
 /// `AccessChanged` to the person.
 pub fn memberships_changed(state: &AppState, person_id_: &str, groups: &[String]) {
@@ -410,7 +446,7 @@ pub async fn list_groups(
 /// `POST /api/groups` (admins).
 pub async fn create_group(
     State(state): State<AppState>,
-    _admin: RequireAdmin,
+    RequireAdmin(admin): RequireAdmin,
     ApiJson(new): ApiJson<NewGroup>,
 ) -> AppResult<Json<Group>> {
     let path = new.path.trim().to_string();
@@ -454,6 +490,17 @@ pub async fn create_group(
             created_at: Utc::now(),
         };
         state.store.put(db::GROUP, &path, &row).await?;
+        audit::record(
+            &state,
+            audit::by(
+                &admin,
+                AuditKind::GroupChange,
+                "group",
+                &path,
+                Value::Null,
+                json!({"event": "created", "path": path, "parent": parent}),
+            ),
+        );
         row.to_group(0)
     };
     group_written(&state, group.clone());
@@ -463,7 +510,7 @@ pub async fn create_group(
 /// `PATCH /api/groups/{*path}` (admins): rename (moving a path is not L1).
 pub async fn patch_group(
     State(state): State<AppState>,
-    _admin: RequireAdmin,
+    RequireAdmin(admin): RequireAdmin,
     Path(path): Path<String>,
     ApiJson(patch): ApiJson<GroupPatch>,
 ) -> AppResult<Json<Group>> {
@@ -482,8 +529,23 @@ pub async fn patch_group(
             return Err(managed_by_source(&row.source));
         }
         if let Some(name) = &patch.name {
-            row.name = group_name(name)?;
-            state.store.put(db::GROUP, &path, &row).await?;
+            let name = group_name(name)?;
+            if name != row.name {
+                row.name = name;
+                state.store.put(db::GROUP, &path, &row).await?;
+                // The name itself is never journaled (the Audit view joins it).
+                audit::record(
+                    &state,
+                    audit::by(
+                        &admin,
+                        AuditKind::GroupChange,
+                        "group",
+                        &path,
+                        json!({"path": path}),
+                        json!({"event": "renamed", "path": path}),
+                    ),
+                );
+            }
         }
         row.to_group(member_count(&state.store, &path).await?)
     };
@@ -494,7 +556,7 @@ pub async fn patch_group(
 /// `DELETE /api/groups/{*path}` (admins): only an empty group, never `company`.
 pub async fn delete_group(
     State(state): State<AppState>,
-    _admin: RequireAdmin,
+    RequireAdmin(admin): RequireAdmin,
     Path(path): Path<String>,
 ) -> AppResult<StatusCode> {
     if path == ROOT_GROUP {
@@ -544,6 +606,17 @@ pub async fn delete_group(
             ));
         }
         state.store.delete(db::GROUP, &path).await?;
+        audit::record(
+            &state,
+            audit::by(
+                &admin,
+                AuditKind::GroupChange,
+                "group",
+                &path,
+                json!({"path": path}),
+                json!({"event": "deleted"}),
+            ),
+        );
     }
     state.expansions.invalidate_all();
     state.emit(Event::GroupDeleted { path });

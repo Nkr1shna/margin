@@ -13,6 +13,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
+use margin_shared::context::AuditKind;
 use margin_shared::context::is_agent_name;
 use margin_shared::{
     AGENT_TOKEN_PREFIX, Agent, AgentKind, AgentPatch, AgentToken, AgentTokenInfo, Event, Id,
@@ -20,7 +21,9 @@ use margin_shared::{
     ancestors, handle_for_login, is_group_path, person_id,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use crate::audit;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::groups::{self, Expansion};
@@ -345,6 +348,23 @@ pub async fn create_agent(
             token_hash: None,
         };
         state.store.put(db::AGENT, &agent.id, &row).await?;
+        audit::record(
+            &state,
+            audit::by(
+                &p,
+                AuditKind::AgentChange,
+                "agent",
+                &agent.id,
+                Value::Null,
+                json!({
+                    "event": "created",
+                    "owner": person_id(&agent.owner_id),
+                    "kind": agent.kind,
+                    "ceiling": agent.ceiling,
+                    "disabled": agent.disabled,
+                }),
+            ),
+        );
         agent
     };
     agent_written(&state, &agent);
@@ -382,6 +402,7 @@ pub async fn patch_agent(
             check_unique(&state, &row.agent.owner_id, &name, Some(&id)).await?;
             row.agent.name = name;
         }
+        let before = json!({"ceiling": row.agent.ceiling, "disabled": row.agent.disabled});
         if let Some(ceiling) = ceiling {
             row.agent.ceiling = ceiling;
         }
@@ -389,6 +410,26 @@ pub async fn patch_agent(
             row.agent.disabled = disabled;
         }
         state.store.put(db::AGENT, &id, &row).await?;
+        let after = json!({"ceiling": row.agent.ceiling, "disabled": row.agent.disabled});
+        // What the agent may read or do changed (a rename isn't journaled).
+        if before != after {
+            audit::record(
+                &state,
+                audit::by(
+                    &p,
+                    AuditKind::AgentChange,
+                    "agent",
+                    &id,
+                    before,
+                    json!({
+                        "event": "changed",
+                        "owner": person_id(&row.agent.owner_id),
+                        "ceiling": row.agent.ceiling,
+                        "disabled": row.agent.disabled,
+                    }),
+                ),
+            );
+        }
         row.agent
     };
     agent_written(&state, &agent);
@@ -405,6 +446,22 @@ pub async fn delete_agent(
         let _w = state.write_lock.lock().await;
         let row = owned(&state, &p, &id).await?;
         state.store.delete(db::AGENT, &id).await?;
+        audit::record(
+            &state,
+            audit::by(
+                &p,
+                AuditKind::AgentChange,
+                "agent",
+                &id,
+                json!({
+                    "owner": person_id(&row.agent.owner_id),
+                    "ceiling": row.agent.ceiling,
+                    "disabled": row.agent.disabled,
+                    "token_prefix": row.agent.token.as_ref().map(|t| t.prefix.clone()),
+                }),
+                json!({"event": "deleted"}),
+            ),
+        );
         row.agent.owner_id
     };
     state.expansions.invalidate_all();
@@ -426,6 +483,7 @@ pub async fn mint_token(
     let agent = {
         let _w = state.write_lock.lock().await;
         let mut row = owned(&state, &p, &id).await?;
+        let before = json!({"token_prefix": row.agent.token.as_ref().map(|t| t.prefix.clone())});
         row.agent.token = Some(AgentTokenInfo {
             prefix: token.chars().take(TOKEN_PREFIX_LEN).collect(),
             created_at: Utc::now(),
@@ -434,6 +492,20 @@ pub async fn mint_token(
         });
         row.token_hash = Some(sha256_hex(&token));
         state.store.put(db::AGENT, &id, &row).await?;
+        audit::record(
+            &state,
+            audit::by(
+                &p,
+                AuditKind::AgentToken,
+                "agent",
+                &id,
+                before,
+                json!({
+                    "event": "minted",
+                    "token_prefix": row.agent.token.as_ref().map(|t| t.prefix.clone()),
+                }),
+            ),
+        );
         row.agent
     };
     agent_written(&state, &agent);
@@ -449,9 +521,23 @@ pub async fn revoke_token(
     let agent = {
         let _w = state.write_lock.lock().await;
         let mut row = owned(&state, &p, &id).await?;
+        let prefix = row.agent.token.as_ref().map(|t| t.prefix.clone());
         row.agent.token = None;
         row.token_hash = None;
         state.store.put(db::AGENT, &id, &row).await?;
+        if prefix.is_some() {
+            audit::record(
+                &state,
+                audit::by(
+                    &p,
+                    AuditKind::AgentToken,
+                    "agent",
+                    &id,
+                    json!({"token_prefix": prefix}),
+                    json!({"event": "revoked"}),
+                ),
+            );
+        }
         row.agent
     };
     agent_written(&state, &agent);
