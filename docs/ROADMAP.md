@@ -34,7 +34,7 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ⏳ | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/plan-live-context.md` | Fixes events going to every device |
 | ⏳ | **R2 — rerank and query rewriting**, eval-gated | `docs/agent-rag-architecture.md` §4 | |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
-| ⏳ | **Phase 5 — hardening** | `docs/agent-architecture.md` §2.10 | iOS background continuation for folders |
+| ⏳ | **Phase 5 — hardening** | `docs/phase5-brief.md` | iOS background continuation for folders, prompt-injection tests, job retries, backups/drills, alerts from traces, security review, performance budgets |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
 | ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
 | ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
