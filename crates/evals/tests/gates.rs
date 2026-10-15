@@ -40,3 +40,347 @@ async fn ci_gates_on_the_recorded_corpus() {
         outcome.violations.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// The Claude prompt-prefix gate (docs/agent-providers-brief.md D12)
+// ---------------------------------------------------------------------------
+
+mod claude_prefix {
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::{HeaderMap, header};
+    use axum::response::Response;
+    use axum::routing::post;
+    use margin_ai::prompts::{self, Prompt};
+    use margin_ai::{
+        CallOptions, ClaudeClient, DocumentContents, FailedScene, Image, LessonContext, Passage,
+        PlanRequest, RerankCandidate, RouteModels, SceneRequest, TextModel,
+    };
+    use margin_evals::prefix::{check_call, check_recorded, identical_prefixes, known_constants};
+    use margin_shared::pipeline::Route;
+    use margin_shared::{Level, OutlineLesson};
+    use serde_json::{Value, json};
+
+    /// A fake Messages API: records every request body as the client sent it (with its
+    /// `x-api-key`) and answers each with one streamed text block.
+    #[derive(Default)]
+    struct FakeMessages {
+        requests: Mutex<Vec<(Option<String>, Value)>>,
+    }
+
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// A complete, documented Messages stream answering `text`.
+    fn text_stream(model: &str, text: &str) -> Vec<String> {
+        vec![
+            sse(
+                "message_start",
+                json!({"type": "message_start", "message": {
+                    "id": "msg_fake", "type": "message", "role": "assistant", "model": model,
+                    "content": [], "stop_reason": null, "stop_sequence": null,
+                    "usage": {"input_tokens": 1200, "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0, "output_tokens": 1}}}),
+            ),
+            sse(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse("ping", json!({"type": "ping"})),
+            sse(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": text}}),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse(
+                "message_delta",
+                json!({"type": "message_delta",
+                       "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                       "usage": {"output_tokens": 12}}),
+            ),
+            sse("message_stop", json!({"type": "message_stop"})),
+        ]
+    }
+
+    async fn messages(
+        State(fake): State<Arc<FakeMessages>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let key = headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let json: Value = serde_json::from_slice(&body).expect("the client sends JSON");
+        let model = json["model"].as_str().unwrap_or("?").to_string();
+        fake.requests.lock().unwrap().push((key, json));
+        let chunks = text_stream(&model, "## Idea\n\nText.\n");
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, Infallible>(Bytes::from(c))),
+        );
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    async fn spawn() -> (ClaudeClient, Arc<FakeMessages>) {
+        let fake = Arc::new(FakeMessages::default());
+        let app = Router::new()
+            .route("/v1/messages", post(messages))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ClaudeClient::new(
+            format!("http://{addr}"),
+            "test-key",
+            RouteModels::claude_default(),
+        );
+        (client, fake)
+    }
+
+    fn lesson_ctx(index: usize, with_quiz: bool) -> LessonContext {
+        LessonContext {
+            subject_title: "Signals & Systems".into(),
+            topic_title: "Fourier series".into(),
+            prompt: "Fourier series".into(),
+            level: if with_quiz {
+                Level::Advanced
+            } else {
+                Level::Intro
+            },
+            with_quiz,
+            outline: vec![
+                OutlineLesson {
+                    title: "Waves as sums".into(),
+                    summary: "Why sums of sines.".into(),
+                    minutes: 8,
+                },
+                OutlineLesson {
+                    title: "Coefficients".into(),
+                    summary: "Computing them.".into(),
+                    minutes: 12,
+                },
+                OutlineLesson {
+                    title: "Convergence".into(),
+                    summary: "Gibbs.".into(),
+                    minutes: 10,
+                },
+            ],
+            index,
+            passages: vec![],
+        }
+    }
+
+    fn passages() -> Vec<Passage> {
+        vec![Passage {
+            source: "dsp.pdf".into(),
+            page: Some(12),
+            text: "The coefficient a_n is the projection onto cos(n x).".into(),
+            ..Default::default()
+        }]
+    }
+
+    /// Varied calls of every constant-first prompt the Claude client's `TextModel`
+    /// runs: lessons (first, middle, last; intro and advanced; with and without quiz,
+    /// passages and a picture), scenes (first try and repair), the planner, the
+    /// reranker.
+    fn prompts_sent() -> Vec<Prompt> {
+        let mut out = Vec::new();
+        for index in 0..3 {
+            for with_quiz in [false, true] {
+                let mut ctx = lesson_ctx(index, with_quiz);
+                if index > 0 {
+                    ctx.passages = passages();
+                }
+                if index == 2 && with_quiz {
+                    ctx.passages.push(Passage {
+                        source: "board.jpg".into(),
+                        image: Some(Image {
+                            media_type: "image/jpeg".into(),
+                            data: vec![0xff, 0xd8, 0xff],
+                        }),
+                        ..Default::default()
+                    });
+                }
+                out.push(prompts::lesson(&ctx));
+            }
+        }
+        out.push(prompts::scene(&SceneRequest {
+            lesson_title: "Waves as sums".into(),
+            lesson_body_md: "## Idea\n\nSines add.\n\n## Check yourself\n\nQ".into(),
+            previous_attempt: None,
+        }));
+        out.push(prompts::scene(&SceneRequest {
+            lesson_title: "Coefficients".into(),
+            lesson_body_md: "## Idea\n\nProject.".into(),
+            previous_attempt: Some(FailedScene {
+                code: "class S(Scene): pass".into(),
+                error: "NameError".into(),
+            }),
+        }));
+        for (count, with_quiz) in [(2, true), (5, false)] {
+            out.push(prompts::plan(&PlanRequest {
+                prompt: "Fourier series, for signal processing".into(),
+                level: Level::Intermediate,
+                lesson_count: count,
+                with_quiz,
+                draft: None,
+                contents: vec![DocumentContents {
+                    document: "dsp.pdf".into(),
+                    sections: vec!["2 Fourier series > 2.2 Coefficients".into()],
+                }],
+                survey: passages(),
+            }));
+        }
+        for query in ["what is a_n", "Gibbs phenomenon"] {
+            out.push(prompts::rerank(
+                query,
+                &[
+                    RerankCandidate {
+                        id: "c1".into(),
+                        label: "dsp.pdf, p. 12".into(),
+                        text: "The coefficient a_n is a projection.".into(),
+                    },
+                    RerankCandidate {
+                        id: "c2".into(),
+                        label: "dsp.pdf, p. 14".into(),
+                        text: "Overshoot near a jump.".into(),
+                    },
+                ],
+            ));
+        }
+        out
+    }
+
+    /// The route a prompt's calls run on (D10: lessons, scenes and the planner on
+    /// Write; the reranker is a small task).
+    fn route(p: &Prompt) -> Route {
+        if p.job == "rerank" {
+            Route::Small
+        } else {
+            Route::Write
+        }
+    }
+
+    /// D12's invariant on the bodies the fake Messages server recorded: for one prompt
+    /// version, `system[0]` is that version's constant block byte for byte with the
+    /// ephemeral marker, `system[1]` is the variable part (unmarked; absent when there
+    /// is none), one breakpoint per text call, the constant block nowhere else; and
+    /// each call is on its route's model.
+    ///
+    /// Drives the real `ClaudeClient` (area P-ai-claude, built in parallel). Where its
+    /// `TextModel` is still the first commit's `unimplemented!` stub this would panic,
+    /// so it is ignored until P-ai-claude merges.
+    #[tokio::test]
+    #[ignore = "needs P-ai-claude's ClaudeClient (TextModel::stream_parts is unimplemented! in the first commit); remove this ignore when agent/prov-claude merges"]
+    async fn claude_prefixes_are_byte_identical_per_prompt_version() {
+        let (client, fake) = spawn().await;
+        let sent = prompts_sent();
+        for p in &sent {
+            let opts = CallOptions::new(route(p)).keyed(p);
+            let out = client
+                .stream_parts(&p.instructions(), &p.input, &opts, Box::new(|_| {}))
+                .await
+                .unwrap();
+            assert_eq!(out.text, "## Idea\n\nText.\n");
+        }
+        let recorded: Vec<(Option<String>, Value)> = fake.requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), sent.len());
+        let bodies: Vec<Value> = recorded.iter().map(|(_, b)| b.clone()).collect();
+        let known = known_constants();
+        let report = check_recorded(&bodies, &known);
+        assert!(
+            report.violations.is_empty(),
+            "the Claude prefix gate failed:\n{}",
+            report.violations.join("\n")
+        );
+        assert_eq!(report.per_version[prompts::LESSON_VERSION], 6);
+        assert_eq!(report.per_version[prompts::SCENE_VERSION], 2);
+        assert_eq!(report.per_version[prompts::PLAN_VERSION], 2);
+        assert_eq!(report.per_version[prompts::RERANK_VERSION], 2);
+        let models = RouteModels::claude_default();
+        for (i, (p, body)) in sent.iter().zip(&bodies).enumerate() {
+            let v = check_call(body, p);
+            assert!(v.is_empty(), "request {i} ({}): {v:?}", p.version);
+            assert_eq!(
+                body["model"],
+                models.get(route(p)),
+                "request {i}: the route's model"
+            );
+        }
+        for (version, _) in &known {
+            let same: Vec<&Value> = sent
+                .iter()
+                .zip(&bodies)
+                .filter(|(p, _)| p.version == *version)
+                .map(|(_, b)| b)
+                .collect();
+            assert!(identical_prefixes(same), "{version}");
+        }
+        // The variable parts really differ, so the identity isn't vacuous.
+        let rest = |i: usize| bodies[i]["system"][1]["text"].clone();
+        assert_ne!(rest(0), rest(5));
+        assert!(
+            recorded
+                .iter()
+                .all(|(key, _)| key.as_deref() == Some("test-key")),
+            "x-api-key on every call"
+        );
+    }
+
+    /// The gate itself on bodies shaped as the brief says the client sends them, so it
+    /// runs on every branch: a pass, then a client that marks the whole instructions
+    /// (the variable part cached too), which it must catch.
+    #[test]
+    fn the_gate_on_brief_shaped_bodies() {
+        let sent = prompts_sent();
+        let body = |p: &Prompt, merged: bool| {
+            let ins = p.instructions();
+            let (constant, rest) = ins.split_at(p.constant.len());
+            let first = if merged { ins.as_str() } else { constant };
+            let mut system = vec![
+                json!({"type": "text", "text": first, "cache_control": {"type": "ephemeral"}}),
+            ];
+            if !merged && !rest.is_empty() {
+                system.push(json!({"type": "text", "text": rest}));
+            }
+            json!({
+                "model": "claude-opus-5-5",
+                "max_tokens": 64000,
+                "stream": true,
+                "system": system,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": p.input_text()}]}],
+            })
+        };
+        let good: Vec<Value> = sent.iter().map(|p| body(p, false)).collect();
+        let report = check_recorded(&good, &known_constants());
+        assert_eq!(report.violations, Vec::<String>::new());
+        assert_eq!(report.calls, sent.len());
+        assert!(
+            sent.iter()
+                .zip(&good)
+                .all(|(p, b)| check_call(b, p).is_empty())
+        );
+        let bad = body(&sent[1], true);
+        let report = check_recorded(std::slice::from_ref(&bad), &known_constants());
+        assert!(
+            report.violations[0].contains("breakpoint sits after variable text"),
+            "{:?}",
+            report.violations
+        );
+    }
+}
