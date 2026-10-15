@@ -90,7 +90,7 @@ fn main() -> ExitCode {
         Some("version" | "--version") if args.len() == 1 => {
             println!(
                 "margin-service {} ({})",
-                env!("CARGO_PKG_VERSION"),
+                version::VERSION,
                 version::BUILD_SHA
             );
             return ExitCode::SUCCESS;
@@ -171,7 +171,7 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             .with_context(|| format!("couldn't listen on {}", config.bind))?;
         tracing::info!(
             "Margin service {} ({}) listening on {} (public URL {}, environment {}, embedder {}, secrets in {})",
-            env!("CARGO_PKG_VERSION"),
+            version::VERSION,
             version::BUILD_SHA,
             config.bind,
             config.public_url,

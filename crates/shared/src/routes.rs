@@ -12,7 +12,7 @@
 //! | Method | Path                                   | Body               | Response            |
 //! |--------|----------------------------------------|--------------------|---------------------|
 //! | GET    | /health                                |                    | "ok"                |
-//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes, alerts_active, alerts_since } |
+//! | GET    | /api/version (no token)                |                    | VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes, alerts_active, alerts_since, api_version, min_client_api, schema_version } |
 //! | POST   | /auth/start                            | StartLoginRequest  | StartLogin          |
 //! | POST   | /auth/poll                             | PollLoginRequest   | LoginState          |
 //! | GET    | /auth/github/callback?code&state       |                    | HTML page           |
@@ -107,7 +107,7 @@
 
 pub const HEALTH: &str = "/health";
 /// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes,
-/// alerts_active, alerts_since }`, without a token like `/health`
+/// alerts_active, alerts_since, api_version, min_client_api, schema_version }`, without a token like `/health`
 /// (`docs/plan-deploy.md` §8). Alerts are a count only here: the route is public.
 pub const VERSION: &str = "/api/version";
 pub const AUTH_START: &str = "/auth/start";

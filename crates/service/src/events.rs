@@ -178,7 +178,7 @@ async fn serve(
     mut feeds: Feeds,
 ) {
     let hello = Event::Hello {
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        server_version: crate::version::VERSION.to_string(),
     };
     if send_json(socket, &hello).await.is_err() {
         return;

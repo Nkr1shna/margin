@@ -21,6 +21,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A PR into dev that changes code declares how it changes the version: a changeset,
+  # changes/<slug>.md, with a level and a one-line note (docs/versioning.md, scripts/version.sh
+  # check). Nothing is bumped in the PR; the version of a dev commit is computed from these.
+  # No build: a GitHub-hosted runner reads a few files in seconds. Dependabot PRs may go
+  # without one.
+  version:
+    name: Version
+    if: github.event_name == 'pull_request' && github.base_ref == 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            changes
+      - name: Test version.sh
+        run: sh scripts/version-test.sh
+      - name: Does the PR declare its change?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          # Fail closed, like the platform checks: no file list, no pass.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/files" || {
+            echo "::error::could not list this PR's files"; exit 1; }
+          [ -s "$RUNNER_TEMP/files" ] || { echo "::error::this PR lists no files"; exit 1; }
+          [ "$AUTHOR" = "dependabot[bot]" ] && export MARGIN_VERSION_EXEMPT=1
+          if ! sh scripts/version.sh check < "$RUNNER_TEMP/files" 2> "$RUNNER_TEMP/err"; then
+            echo "::error::$(cat "$RUNNER_TEMP/err")"
+            exit 1
+          fi
+
   # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
   # Linux build now (docs/plan-linux-service.md).
   linux:

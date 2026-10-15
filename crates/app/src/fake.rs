@@ -911,6 +911,7 @@ impl FakeService {
 pub fn router(fake: Fake) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route(routes::VERSION, get(version))
         .route("/auth/start", post(auth_start))
         .route("/auth/poll", post(auth_poll))
         .route(
@@ -2562,6 +2563,23 @@ async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Respo
         publish(&fake, Event::SettingsChanged { settings });
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/version`, open like the real one.
+async fn version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        sha: "fakefakefake".into(),
+        environment: "dev".into(),
+        started_at: Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap(),
+        rss_bytes: None,
+        physical_memory_bytes: None,
+        alerts_active: 0,
+        alerts_since: None,
+        api_version: API_VERSION,
+        min_client_api: API_VERSION,
+        schema_version: 2,
+    })
 }
 
 async fn tools(State(fake): State<Fake>, headers: HeaderMap) -> Response {

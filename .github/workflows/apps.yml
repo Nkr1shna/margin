@@ -9,6 +9,11 @@
 #   workflow_dispatch     -> on dev with "dev" / on release with "prod": publishes as above;
 #                            otherwise workflow artifacts only
 #
+# Every build carries the commit's version (docs/versioning.md, scripts/version.sh at): in
+# the files' names (Margin-<environment>-<version>-<sha>), the app's bundle version, the app
+# itself (MARGIN_VERSION, Settings > General > About) and the release title. The dev-v<version>
+# tags tag-version.yml puts on dev merges don't match v*.
+#
 # Each build is pinned to the service named by MARGIN_DEFAULT_SERVICE_URL at build time
 # (docs/plan-deploy.md §10): its sign-in screen has no service picker. Only a developer
 # build, made without that variable, asks for an address. Desktop: a .dmg of the bundled
@@ -57,7 +62,13 @@ jobs:
       environments: ${{ steps.pick.outputs.environments }}
       sha: ${{ steps.pick.outputs.sha }}
       release: ${{ steps.pick.outputs.release }}
+      version: ${{ steps.pick.outputs.version }}
     steps:
+      # The version is computed from dev's history (scripts/version.sh).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,10 +103,13 @@ jobs:
               ;;
           esac
           case "$sha" in *[!0-9a-f]*|"") echo "::error::no deployed commit found (got '$sha')"; exit 1 ;; esac
+          version="$(sh scripts/version.sh at "$sha")"
+          echo "Version $version."
           {
             echo "environments=$environments"
             echo "sha=$sha"
             echo "release=$release"
+            echo "version=$version"
           } >> "$GITHUB_OUTPUT"
 
   apps:
@@ -110,6 +124,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       SHA: ${{ needs.plan.outputs.sha }}
+      # Compiled into the app (build.rs) and stamped on its bundle.
+      MARGIN_VERSION: ${{ needs.plan.outputs.version }}
       MARGIN_DEFAULT_SERVICE_URL: ${{ matrix.environment == 'dev' && 'https://devmargin.krishnanelloore.com' || 'https://margin.krishnanelloore.com' }}
       # The dev build is its own app ("Margin Dev"), so it installs beside Margin with its
       # own settings folder and Keychain entries (crates/app config.rs APP_NAME, secrets.rs).
@@ -146,6 +162,10 @@ jobs:
           [ -d "$app" ] || { echo "::error::dx bundled no .app"; exit 1; }
           id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
           [ "$id" = "$MARGIN_APP_ID" ] || { echo "::error::$app is $id, expected $MARGIN_APP_ID"; exit 1; }
+          # On the bundle dx made, whatever its template says. Both only increase: a later
+          # commit of dev (or release) never has a lower version.
+          plutil -replace CFBundleShortVersionString -string "$MARGIN_VERSION" "$app/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$MARGIN_VERSION" "$app/Contents/Info.plist"
           codesign --force --deep --sign - "$app"
           mkdir -p dist
           # The disk image holds the app and a link to /Applications, so installing is a
@@ -154,7 +174,7 @@ jobs:
           # needs no Finder session on the runner.
           command -v uvx >/dev/null || { echo "::error::uvx not on PATH (brew install uv); it runs dmgbuild"; exit 1; }
           uvx dmgbuild==1.6.7 -s deploy/dmg/settings.py -D app="$app" "$MARGIN_APP_NAME" \
-            "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
+            "dist/Margin-${{ matrix.environment }}-$MARGIN_VERSION-${SHA::12}.dmg"
       - name: Android build
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
@@ -168,7 +188,7 @@ jobs:
           dx build -p margin-app --platform android --release
           apk="$(find target/dx/margin-app -name '*.apk' -newer Cargo.toml | head -n 1)"
           [ -n "$apk" ] || { echo "::error::dx built no APK"; exit 1; }
-          cp "$apk" "dist/Margin-${{ matrix.environment }}-${SHA::12}.apk"
+          cp "$apk" "dist/Margin-${{ matrix.environment }}-$MARGIN_VERSION-${SHA::12}.apk"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: margin-apps-${{ matrix.environment }}-${{ needs.plan.outputs.sha }}
@@ -186,6 +206,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SHA: ${{ needs.plan.outputs.sha }}
       KIND: ${{ needs.plan.outputs.release }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -197,7 +218,7 @@ jobs:
           export PATH="/opt/homebrew/bin:$PATH"
           short="${SHA::12}"
           cat > notes.md <<EOF
-          Margin apps built from \`$short\` on ${GITHUB_REF_NAME}.
+          Margin $VERSION apps built from \`$short\` on ${GITHUB_REF_NAME}.
 
           The desktop app is signed ad hoc, not notarized: after moving it to Applications,
           run \`xattr -dr com.apple.quarantine "/Applications/Margin Dev.app"\` (dev) or
@@ -210,14 +231,14 @@ jobs:
               # the repository had immutable releases on.)
               gh release delete dev-build -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
               gh release create dev-build dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
-                --prerelease --title "Margin Dev ($short)" --notes-file notes.md
+                --prerelease --title "Margin Dev $VERSION ($short)" --notes-file notes.md
               ;;
             prod)
               gh release create "prod-$short" dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
-                --latest --title "Margin ($short)" --notes-file notes.md
+                --latest --title "Margin $VERSION ($short)" --notes-file notes.md
               ;;
             tag)
               gh release create "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --verify-tag \
-                --title "Margin $GITHUB_REF_NAME" --notes-file notes.md
+                --title "Margin $GITHUB_REF_NAME ($VERSION)" --notes-file notes.md
               ;;
           esac

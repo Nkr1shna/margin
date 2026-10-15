@@ -242,6 +242,7 @@ pub fn SettingsDialog() -> Element {
                             SettingsPane::General => rsx! {
                                 AppearanceSection {}
                                 TextSizeSection {}
+                                AboutSection {}
                             },
                             SettingsPane::Account => rsx! { AccountSection {} },
                             SettingsPane::Organisation => rsx! { OrganisationPane {} },
@@ -3377,10 +3378,89 @@ fn AppearanceSection() -> Element {
     }
 }
 
+/// This app's version and build, and the service's (`GET /api/version`), for a bug report.
+#[component]
+fn AboutSection() -> Element {
+    let app = use_app();
+    let service = use_resource(move || async move {
+        let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+        api.service_version().await.map_err(|e| app.failure(&e))
+    });
+    rsx! {
+        section { class: "set-sec",
+            h2 { "About" }
+            div { class: "kv",
+                span { "{APP_NAME}" }
+                span { class: "mono", "{app_build()}" }
+            }
+            div { class: "kv",
+                span { "Service" }
+                match &*service.read() {
+                    Some(Ok(v)) => rsx! { span { class: "mono", "{service_build(v)}" } },
+                    Some(Err(e)) => rsx! { span { class: "help", "{e}" } },
+                    None => rsx! { div { class: "skel", style: "width: 40%" } },
+                }
+            }
+            if let Some(Ok(v)) = &*service.read() {
+                if v.app_too_old() {
+                    p { class: "help", role: "alert", "{TOO_OLD}" }
+                }
+            }
+        }
+    }
+}
+
+/// Under About when the service no longer serves this app's contract (`VersionInfo::app_too_old`).
+const TOO_OLD: &str = "This app is older than the service supports: install the newest build.";
+
+/// "0.2.0 (build 1a2b3c4d5e6f)".
+fn app_build() -> String {
+    format!(
+        "{} (build {})",
+        crate::diagnostics::VERSION,
+        crate::diagnostics::BUILD
+    )
+}
+
+/// "0.2.0 (build 1a2b3c4d5e6f), dev".
+fn service_build(v: &margin_shared::VersionInfo) -> String {
+    let sha: String = v.sha.chars().take(12).collect();
+    format!("{} (build {sha}), {}", v.version, v.environment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn about_shows_both_versions() {
+        let v = margin_shared::VersionInfo {
+            version: "0.2.0".into(),
+            sha: "9eaf1a645095f7eceaa20c67724f5bfd0dc970fe".into(),
+            environment: "dev".into(),
+            started_at: Utc::now(),
+            rss_bytes: None,
+            physical_memory_bytes: None,
+            alerts_active: 0,
+            alerts_since: None,
+            api_version: 1,
+            min_client_api: 1,
+            schema_version: 2,
+        };
+        assert_eq!(service_build(&v), "0.2.0 (build 9eaf1a645095), dev");
+        assert!(!v.app_too_old());
+        let newer = margin_shared::VersionInfo {
+            min_client_api: margin_shared::API_VERSION + 1,
+            ..v
+        };
+        assert!(newer.app_too_old());
+        let lib = crate::store::LibraryState::from_library(crate::fake::sample_library());
+        let html =
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::General));
+        assert!(html.contains("About"), "{html}");
+        assert!(html.contains(&app_build()), "{html}");
+    }
 
     fn folders_lib() -> crate::store::LibraryState {
         let mut lib = crate::store::LibraryState::from_library(crate::fake::sample_library());

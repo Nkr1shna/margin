@@ -14,7 +14,7 @@ use margin_shared::{
     MessageSent, ModelInfo, NewChat, NewMessage, NewNote, NewTopic, NewWorkspace, Note, NotePatch,
     PollLoginRequest, Proposal, Provider, SearchHit, Settings, SettingsPatch, Source, SourceKind,
     SourceUpload, StartLogin, StartLoginRequest, SyncManifest, SyncPlan, ToolOutputText,
-    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
+    ToolStatus, Topic, TopicPatch, TranscriptSegment, VersionInfo, Video, Workspace, routes,
 };
 use margin_shared::{
     Agent, AgentPatch, AgentToken, Audience, AudienceUnit, AudienceView, Group, GroupPatch,
@@ -228,6 +228,11 @@ impl Api {
         self.send(self.request(Method::GET, routes::HEALTH))
             .await
             .map(|_| ())
+    }
+
+    /// Which build the service is (`GET /api/version`, no token needed).
+    pub async fn service_version(&self) -> ApiResult<VersionInfo> {
+        self.get(routes::VERSION).await
     }
 
     pub async fn start_login(&self, device_name: &str) -> ApiResult<StartLogin> {

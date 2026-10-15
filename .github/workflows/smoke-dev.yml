@@ -67,6 +67,13 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
 
+      # dev's history: the deployed commit's version, and the PRs since the previous deploy.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Smoke test devmargin
         id: smoke
         env:
@@ -96,9 +103,13 @@ jobs:
           code="$(status "$URL/api/version")"
           got_sha="$(jq -r '.sha // empty' "$RUNNER_TEMP/body" 2>/dev/null || true)"
           got_env="$(jq -r '.environment // empty' "$RUNNER_TEMP/body" 2>/dev/null || true)"
-          check "GET /api/version" 200 "$code" "sha \`${got_sha:-?}\`, environment \`${got_env:-?}\`"
+          got_version="$(jq -r '.version // empty' "$RUNNER_TEMP/body" 2>/dev/null || true)"
+          check "GET /api/version" 200 "$code" "version \`${got_version:-?}\`, sha \`${got_sha:-?}\`, environment \`${got_env:-?}\`"
           [ "$got_sha" = "$SHA" ] && r=match || r=mismatch
           check "/api/version sha is the deployed build" match "$r" "expected \`$SHA\`"
+          want_version="$(sh scripts/version.sh at "$SHA")"
+          [ "$got_version" = "$want_version" ] && r=match || r=mismatch
+          check "/api/version version is the deployed commit's" match "$r" "expected \`$want_version\`"
           [ "$got_env" = dev ] && r=dev || r="${got_env:-none}"
           check "/api/version environment" dev "$r"
 
@@ -126,12 +137,6 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" -f context=smoke-dev \
             -f description="$desc" -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
           echo "smoke-dev: $state on $SHA"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: dev
-          fetch-depth: 0
-          persist-credentials: false
 
       - name: Comment on the PRs this deploy brought to dev
         env:

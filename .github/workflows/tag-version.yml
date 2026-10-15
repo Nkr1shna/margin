@@ -1,0 +1,46 @@
+# Tags each dev merge that bumped the version dev-v<version> (docs/versioning.md): the
+# version scripts/version.sh computes from the changesets (changes/*.md) on dev. The tag's
+# message is the merge's changeset notes. A merge without a changeset (docs, Dependabot)
+# keeps its parent's version and gets no tag. Builds don't wait for the tag: they compute
+# the same version from history. No concurrency group: a queued run would be dropped for a
+# newer one, and each run only creates its own commit's tag.
+# Plain v<version> tags are left for release commits; dev-v tags match no build trigger
+# (apps.yml builds on v*), and a tag made with the workflow's token starts no workflow anyway.
+name: tag-version
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag dev-v<version>
+        run: |
+          notes="$(sh scripts/version.sh notes "$GITHUB_SHA")"
+          if [ -z "$notes" ]; then
+            echo "::notice::$GITHUB_SHA adds no changeset; it keeps version $(sh scripts/version.sh at "$GITHUB_SHA")."
+            exit 0
+          fi
+          version="$(sh scripts/version.sh at "$GITHUB_SHA")"
+          tag="dev-v$version"
+          if at="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
+            echo "::notice::$tag already exists ($at)."
+            exit 0
+          fi
+          obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$tag" -f object="$GITHUB_SHA" -f type=commit \
+            -f message="$(printf 'Margin %s\n\n%s\n' "$version" "$notes")" --jq .sha)"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$obj" > /dev/null
+          echo "Tagged ${GITHUB_SHA:0:12} $tag."
+          { echo "### $tag at \`${GITHUB_SHA:0:12}\`"; echo; printf '%s\n' "$notes" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"

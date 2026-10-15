@@ -1186,6 +1186,54 @@ pub enum Event {
     },
 }
 
+/// The version of this contract (the routes and bodies in this crate) an app speaks and a
+/// service serves. Raise it when the service starts answering in a way an app built
+/// against the previous value can't use; the semantic version (`docs/versioning.md`) is
+/// for people and is never compared.
+pub const API_VERSION: u32 = 1;
+
+/// `GET /api/version` (`routes::VERSION`): which build the service is and which deploy it
+/// serves. The app shows it in Settings > General > About.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VersionInfo {
+    /// The semantic version of the build (`docs/versioning.md`).
+    pub version: String,
+    pub sha: String,
+    /// `"dev"` or `"prod"` from `service.toml`.
+    pub environment: String,
+    pub started_at: DateTime<Utc>,
+    /// The process's resident memory now, when the platform reports it.
+    #[serde(default)]
+    pub rss_bytes: Option<u64>,
+    /// The machine's (or VM's) physical memory, when the platform reports it.
+    #[serde(default)]
+    pub physical_memory_bytes: Option<u64>,
+    /// How many alerts are active (`GET /api/alerts` names them; this route is public,
+    /// so only the count).
+    #[serde(default)]
+    pub alerts_active: u32,
+    /// When the oldest active alert rose.
+    #[serde(default)]
+    pub alerts_since: Option<DateTime<Utc>>,
+    /// The service's `API_VERSION` (0 from a service older than the field).
+    #[serde(default)]
+    pub api_version: u32,
+    /// The lowest app `API_VERSION` this service still serves; an older app should be
+    /// updated.
+    #[serde(default)]
+    pub min_client_api: u32,
+    /// The stored data's shape this build writes (the service's `db::SCHEMA_VERSION`).
+    #[serde(default)]
+    pub schema_version: u32,
+}
+
+impl VersionInfo {
+    /// Whether this app (built against `API_VERSION`) is too old for the service.
+    pub fn app_too_old(&self) -> bool {
+        API_VERSION < self.min_client_api
+    }
+}
+
 /// Error body for every non-2xx API response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiError {

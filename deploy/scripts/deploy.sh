@@ -36,9 +36,11 @@ if [ "${1:-}" = "--in-guest" ]; then
   bind="$(toml_value "$MARGIN_CONFIG" bind)"
   bind="${bind:-127.0.0.1:8787}"
 
-  old_sha="$(curl -fsS -m 5 "http://$bind/api/version" 2>/dev/null | json_field sha || true)"
+  old="$(curl -fsS -m 5 "http://$bind/api/version" 2>/dev/null || true)"
+  old_sha="$(printf '%s' "$old" | json_field sha || true)"
   old_sha="${old_sha:-none}"
-  echo "Deploying $sha to $env_name (running: $old_sha)."
+  old_version="$(printf '%s' "$old" | json_field version || true)"
+  echo "Deploying $sha to $env_name (running: ${old_version:-?} $old_sha)."
 
   sudo systemctl stop "$unit" 2>/dev/null || true
   i=0
@@ -85,12 +87,13 @@ if [ "${1:-}" = "--in-guest" ]; then
     version="$(curl -fsS -m 5 "http://$bind/api/version")"
     got_sha="$(printf '%s' "$version" | json_field sha || true)"
     got_env="$(printf '%s' "$version" | json_field environment || true)"
+    got_version="$(printf '%s' "$version" | json_field version || true)"
     rss="$(printf '%s' "$version" | json_field rss_bytes || true)"
     if [ "$got_sha" != "$sha" ] || [ "$got_env" != "$env_name" ]; then
       echo "/api/version reports sha \"$got_sha\" environment \"$got_env\"; expected \"$sha\" \"$env_name\"." >&2
       ok=0
     else
-      echo "$env_name runs $sha (rss ${rss:-?} bytes)."
+      echo "$env_name runs ${got_version:-?} $sha (rss ${rss:-?} bytes)."
     fi
   fi
   if [ "$ok" = 0 ]; then

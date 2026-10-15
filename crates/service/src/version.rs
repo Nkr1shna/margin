@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use axum::Json;
 use axum::extract::State;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+pub use margin_shared::VersionInfo;
 
 use crate::state::AppState;
 
@@ -20,32 +20,21 @@ pub const BUILD_SHA: &str = match option_env!("MARGIN_BUILD_SHA") {
     None => "unknown",
 };
 
+/// The build's semantic version: `MARGIN_VERSION` at compile time (`build-service.yml`
+/// computes it with `scripts/version.sh at`, docs/versioning.md), Cargo.toml's version for
+/// a local build.
+pub const VERSION: &str = match option_env!("MARGIN_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// The lowest app `API_VERSION` this service serves. Raise it, with `API_VERSION`, when an
+/// app built against an older contract would misread this service's answers.
+pub const MIN_CLIENT_API: u32 = 1;
+
 /// Below this much physical memory the service warns at start: the embedding model
 /// (~1.4 GB loaded), SurrealDB's caches and a lesson job don't fit with room to spare.
 pub const LOW_MEMORY_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VersionInfo {
-    /// The crate version (`CARGO_PKG_VERSION`).
-    pub version: String,
-    pub sha: String,
-    /// `"dev"` or `"prod"` from `service.toml`.
-    pub environment: String,
-    pub started_at: DateTime<Utc>,
-    /// The process's resident memory now, when the platform reports it.
-    #[serde(default)]
-    pub rss_bytes: Option<u64>,
-    /// The machine's (or VM's) physical memory, when the platform reports it.
-    #[serde(default)]
-    pub physical_memory_bytes: Option<u64>,
-    /// How many alerts are active (`GET /api/alerts` names them; this route is public,
-    /// so only the count).
-    #[serde(default)]
-    pub alerts_active: u32,
-    /// When the oldest active alert rose.
-    #[serde(default)]
-    pub alerts_since: Option<DateTime<Utc>>,
-}
 
 static STARTED_AT: OnceLock<DateTime<Utc>> = OnceLock::new();
 
@@ -57,7 +46,7 @@ pub fn mark_started() -> DateTime<Utc> {
 
 pub fn info(environment: &str) -> VersionInfo {
     VersionInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: VERSION.to_string(),
         sha: BUILD_SHA.to_string(),
         environment: environment.to_string(),
         started_at: mark_started(),
@@ -65,6 +54,9 @@ pub fn info(environment: &str) -> VersionInfo {
         physical_memory_bytes: physical_memory_bytes(),
         alerts_active: 0,
         alerts_since: None,
+        api_version: margin_shared::API_VERSION,
+        min_client_api: MIN_CLIENT_API,
+        schema_version: crate::db::SCHEMA_VERSION,
     }
 }
 
@@ -125,7 +117,15 @@ mod tests {
         let first = mark_started();
         let v = info("dev");
         assert_eq!(v.environment, "dev");
-        assert_eq!(v.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(v.version, VERSION);
+        assert_eq!(
+            (v.api_version, v.min_client_api, v.schema_version),
+            (
+                margin_shared::API_VERSION,
+                MIN_CLIENT_API,
+                crate::db::SCHEMA_VERSION
+            )
+        );
         assert_eq!(v.sha, BUILD_SHA);
         assert_eq!(v.started_at, first);
         // The JSON shape deploy.sh and margin-eval read.
@@ -137,6 +137,9 @@ mod tests {
             "started_at",
             "rss_bytes",
             "alerts_active",
+            "api_version",
+            "min_client_api",
+            "schema_version",
         ] {
             assert!(json.get(key).is_some(), "{key} missing: {json}");
         }
@@ -150,6 +153,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((v.alerts_active, v.alerts_since), (0, None));
+        assert_eq!(
+            (v.api_version, v.min_client_api, v.schema_version),
+            (0, 0, 0)
+        );
+        assert!(!v.app_too_old());
     }
 
     #[cfg(target_os = "linux")]
