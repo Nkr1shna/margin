@@ -1087,14 +1087,30 @@ pub async fn rerank(
 /// route the caller gives (`Small` in the product), as one strict-JSON call with the
 /// key `rewrite:rewrite-v1` unless the options name another. The answer is completed
 /// in Rust: trimmed, empty and repeated strings (and the query itself) dropped, capped
-/// at `max_added`. R2-ai builds it.
+/// at `max_added`, in the model's order. A blank query or `max_added == 0` makes no
+/// call. The output cap is `routes::REWRITE_MAX_OUTPUT_TOKENS` unless the options set
+/// one.
 pub async fn rewrite_queries(
     model: &dyn TextModel,
     input: &RewriteInput,
     opts: &CallOptions,
 ) -> Result<Generated<Vec<String>>, AiError> {
-    let _ = (model, input, opts);
-    unimplemented!("R2-ai, rewrite_queries")
+    if input.max_added == 0 || input.query.trim().is_empty() {
+        return Ok(Generated {
+            value: Vec::new(),
+            usage: Usage::default(),
+        });
+    }
+    let mut opts = opts.clone();
+    if opts.max_output_tokens.is_none() {
+        opts.max_output_tokens = Some(margin_shared::routes::REWRITE_MAX_OUTPUT_TOKENS);
+    }
+    let Generated { value, usage } =
+        json_call::<prompts::RewriteAnswer>(model, &prompts::rewrite(input), &opts).await?;
+    Ok(Generated {
+        value: prompts::complete_rewrite(value, input),
+        usage,
+    })
 }
 
 #[cfg(test)]
