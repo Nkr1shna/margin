@@ -1,8 +1,8 @@
 ## Phase 5 brief — hardening
 
-Read (2026-10-14, `dev` at `0d2ead0`): `docs/agent-architecture.md` §2.10 and §3, `docs/agent-rag-architecture.md` §2.9, §2.11, §4 ("Phase 5 then hardens all of it"), `docs/agent-providers-brief.md` D3, D7, §7, `docs/agent-phase4-brief.md` D6, D11, `docs/ROADMAP.md`, `docs/plan-deploy.md` §5, `docs/plan-linux-service.md` §2.10, §3, §5.1, `docs/agent-contract.md` §4.5; `crates/agent/src/{lib,turn,prompt,device,tool}.rs`; `crates/ai/src/{lib,model,responses,messages}.rs`; `crates/service/src/{auth,server,state,turns,trace,version,db,ingest,restore,folders,uploads,context_api,media,config,engines,ask,video,secrets}.rs`; `crates/app/src/{main,state}.rs`, `crates/app/src/folders/{sync,ios,mod}.rs`, `crates/app/src/tools/mod.rs`, `crates/app/{Dioxus.toml,Cargo.toml}`; `crates/evals/src/{cli,traces}.rs`, `crates/evals/tests/gates.rs`; `deploy/scripts/{backup-margin,restore-into-dev,deploy,provision-guest}.sh`, `deploy/systemd/*`, `deploy/ci/linux-ci.sh`, `.github/workflows/ci.yml`. No code edited.
+Read (2026-10-14, `dev` at `0d2ead0`): `docs/agent-architecture.md` §2.10 and §3, `docs/agent-rag-architecture.md` §2.9, §2.11, §4 ("Phase 5 then hardens all of it"), `docs/agent-providers-brief.md` D3, D7, §7, `docs/agent-phase4-brief.md` D6, D11, `docs/plan-deploy.md` §5, `docs/plan-linux-service.md` §2.10, §3, §5.1, `docs/agent-contract.md` §4.5; `crates/agent/src/{lib,turn,prompt,device,tool}.rs`; `crates/ai/src/{lib,model,responses,messages}.rs`; `crates/service/src/{auth,server,state,turns,trace,version,db,ingest,restore,folders,uploads,context_api,media,config,engines,ask,video,secrets}.rs`; `crates/app/src/{main,state}.rs`, `crates/app/src/folders/{sync,ios,mod}.rs`, `crates/app/src/tools/mod.rs`, `crates/app/{Dioxus.toml,Cargo.toml}`; `crates/evals/src/{cli,traces}.rs`, `crates/evals/tests/gates.rs`; `deploy/scripts/{backup-margin,restore-into-dev,deploy,provision-guest}.sh`, `deploy/systemd/*`, `deploy/ci/linux-ci.sh`, `.github/workflows/ci.yml`. No code edited.
 
-**The service is Linux-only now** (ROADMAP "In progress": the macOS service leftovers are being removed). Everything below that touches the service assumes a Linux guest under systemd (`deploy/systemd/margin-service.service`, `MemoryMax`, journald), the file secret store and the host share of `docs/plan-deploy.md` §5. The apps stay on macOS, iOS/iPadOS and Android.
+**The service is Linux-only now** (the macOS service leftovers were removed). Everything below that touches the service assumes a Linux guest under systemd (`deploy/systemd/margin-service.service`, `MemoryMax`, journald), the file secret store and the host share of `docs/plan-deploy.md` §5. The apps stay on macOS, iOS/iPadOS and Android.
 
 ### Decided by the owner (binding here)
 
@@ -134,7 +134,7 @@ Targets for the **Linux prod guest** (4 vCPU / 8 GB, plan-linux §3), measured f
 
 `crates/evals` + `evals/`: `cli.rs` gains `injection`, `alerts` and `perf` sub-commands parsed and dispatched to `unimplemented!` modules (`injection.rs`, `alerts.rs`, `perf.rs`); `evals/corpus/injection/` with the first six canary documents (D2); `evals/golden/injection.jsonl` (24 prompts); `evals/rubrics/injection.md` (new folder; the judge rubric of D2); `evals/budgets.toml` (D8). `crates/mcp/src/client.rs`: honour 429 + `Retry-After` (§7).
 
-Contract (`docs/agent-contract.md`): §2 a "Phase 5" row; §4.5 the job-call retry rule; §7 the limits table of D7; §8 the tests of §5 below. `docs/ROADMAP.md`: Phase 5 → 🟡 with this brief linked. `docs/HANDOFF.md`: a row.
+Contract (`docs/agent-contract.md`): §2 a "Phase 5" row; §4.5 the job-call retry rule; §7 the limits table of D7; §8 the tests of §5 below. `docs/HANDOFF.md`: a row.
 
 ### 4. Areas (worktree each; files exclusive; all branch from the first commit as `agent/p5-<area>`)
 
