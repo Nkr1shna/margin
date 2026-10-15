@@ -33,7 +33,7 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    access, agents, ask, chats, context_api, embedding, events, folders, groups, ingest,
+    access, agents, alerts, ask, chats, context_api, embedding, events, folders, groups, ingest,
     invitations, library, media, people, principal, providers, retrieval, search, settings,
     sources, trace, turns, uploads, version, video, workspaces,
 };
@@ -146,6 +146,8 @@ impl Service {
             folder_sync_emits: Mutex::new(Default::default()),
             sources_replaced: Mutex::new(Default::default()),
             providers: providers::Providers::new(),
+            alerts: Arc::new(Mutex::new(alerts::Alerts::default())),
+            http_errors: std::sync::atomic::AtomicU64::new(0),
             expansions: groups::Expansions::new(),
             access_sources: vec![Arc::new(access::Manual(opts.store.clone()))],
         });
@@ -206,11 +208,17 @@ impl Service {
 }
 
 pub fn router(state: AppState) -> Router {
+    // A route's rate limit (`docs/agent-contract.md` §7); a principal's sits inside
+    // `require_principal`, so it counts per person or agent.
+    let limit = |l: auth::Limit| middleware::from_fn_with_state((state.clone(), l), auth::limit);
     // What an agent token may call (`margin-mcp serve` needs exactly these).
     let agent_api = Router::new()
         .route(routes::ME, get(auth::me))
         .route(routes::PROJECTS, get(context_api::projects))
-        .route(routes::CONTEXT_SEARCH, post(context_api::search))
+        .route(
+            routes::CONTEXT_SEARCH,
+            post(context_api::search).layer(limit(auth::CONTEXT_SEARCH_LIMIT)),
+        )
         .route(
             "/api/context/documents/{id}",
             delete(context_api::delete_document),
@@ -223,7 +231,13 @@ pub fn router(state: AppState) -> Router {
             "/api/context/documents/{id}/passages",
             get(context_api::passages),
         )
-        .route(routes::CONTEXT_INGEST, post(context_api::ingest))
+        // An agent-written document may be long (`docs/agent-contract.md` §7).
+        .route(
+            routes::CONTEXT_INGEST,
+            post(context_api::ingest)
+                .layer(DefaultBodyLimit::max(routes::CONTEXT_INGEST_MAX_BYTES))
+                .layer(limit(auth::CONTEXT_INGEST_LIMIT)),
+        )
         .route(routes::CONTEXT_CHANGES, get(context_api::changes));
 
     let device_api = Router::new()
@@ -269,12 +283,17 @@ pub fn router(state: AppState) -> Router {
         // Upload bodies are streamed to disk, each against its kind's limit.
         .route(
             routes::SOURCES,
-            post(sources::upload).layer(DefaultBodyLimit::disable()),
+            post(sources::upload)
+                .layer(DefaultBodyLimit::disable())
+                .layer(limit(auth::SOURCES_LIMIT)),
         )
         .route("/api/sources/{id}", delete(sources::delete_source))
         .route("/api/sources/{id}/reprocess", post(sources::reprocess))
         .route("/api/sources/{id}/transcript", get(sources::transcript))
-        .route(routes::SOURCE_UPLOADS, post(uploads::start))
+        .route(
+            routes::SOURCE_UPLOADS,
+            post(uploads::start).layer(limit(auth::SOURCES_LIMIT)),
+        )
         .route(
             "/api/source-uploads/{id}",
             get(uploads::get)
@@ -303,7 +322,10 @@ pub fn router(state: AppState) -> Router {
                 .patch(chats::patch_chat)
                 .delete(chats::delete_chat),
         )
-        .route("/api/chats/{id}/messages", post(chats::post_message))
+        .route(
+            "/api/chats/{id}/messages",
+            post(chats::post_message).layer(limit(auth::MESSAGES_LIMIT)),
+        )
         .route("/api/chats/{id}/pending", delete(chats::cancel_pending))
         .route("/api/chats/{id}/stop", post(chats::stop))
         .route("/api/chats/{id}/continue", post(chats::continue_turn))
@@ -324,6 +346,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/workspaces/{id}/files", get(folders::files))
         .route(routes::TRACES, get(trace::list_traces))
         .route(routes::TRACES_ROLLUP, get(trace::rollup))
+        .route(routes::ALERTS, get(alerts::get_alerts))
         .route(routes::EVENTS, get(events::events))
         // Accounts and principals (L1).
         .route(routes::PEOPLE, get(people::list_people))
@@ -370,6 +393,9 @@ pub fn router(state: AppState) -> Router {
     let api = agent_api
         .merge(device_api)
         .fallback(api_not_found)
+        // Every other body: the limit in code, not axum's default (the routes above
+        // that stream or take more set their own).
+        .layer(DefaultBodyLimit::max(routes::JSON_BODY_MAX_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             principal::require_principal,
@@ -378,8 +404,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route(routes::HEALTH, get(|| async { "ok" }))
         .route(routes::VERSION, get(version::get_version))
-        .route(routes::AUTH_START, post(auth::start))
-        .route(routes::AUTH_POLL, post(auth::poll))
+        .route(
+            routes::AUTH_START,
+            post(auth::start).layer(limit(auth::START_LIMIT)),
+        )
+        .route(
+            routes::AUTH_POLL,
+            post(auth::poll).layer(limit(auth::POLL_LIMIT)),
+        )
         .route(routes::AUTH_GITHUB_CALLBACK, get(auth::github_callback))
         .route("/media/videos/{id}/{file}", get(media::serve))
         .route("/media/sources/{id}/{file}", get(media::serve_source))
@@ -394,11 +426,17 @@ async fn api_not_found() -> AppError {
 }
 
 /// Logs method, path (never the query string: it carries codes and signatures) and status.
-async fn log_requests(State(_state): State<AppState>, req: Request, next: Next) -> Response {
+/// Counts 5xx answers for the alert job (`App.http_errors`).
+async fn log_requests(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let started = std::time::Instant::now();
     let res = next.run(req).await.into_response();
+    if res.status().is_server_error() {
+        state
+            .http_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     tracing::debug!(%method, %path, status = res.status().as_u16(), ms = started.elapsed().as_millis() as u64, "request");
     res
 }

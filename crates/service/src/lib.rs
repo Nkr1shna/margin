@@ -5,6 +5,7 @@
 pub mod access;
 pub mod agent_tools;
 pub mod agents;
+pub mod alerts;
 pub mod ask;
 pub mod auth;
 pub mod chats;

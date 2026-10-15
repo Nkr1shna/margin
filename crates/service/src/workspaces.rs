@@ -29,8 +29,11 @@ pub async fn list_workspaces(
     Ok(Json(all))
 }
 
+/// A device-given name or location as stored: normalised (`text::for_model`: it reaches
+/// the model in each message's context), trimmed, not empty, at most `MAX_FIELD_CHARS`.
 fn clean(value: &str, what: &str) -> AppResult<String> {
-    let v = value.trim();
+    let v = margin_shared::text::for_model(value);
+    let v = v.trim();
     if v.is_empty() {
         return Err(AppError::bad_request(format!(
             "The folder's {what} is missing."

@@ -19,6 +19,7 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Deploy**: dev and prod on the Mac mini (Tart/Orchard), Cloudflare tunnels, CI per platform (Linux runner `margin-ci`, macOS for the app), CD per product, local Linux check | `docs/plan-deploy.md` |
 | ✅ | **Linux service**: ONNX EmbeddingGemma, pdfium, tesseract, ffmpeg, Parakeet, pocket-tts, bubblewrap, file secrets, systemd guests | `docs/plan-linux-service.md` |
 | ✅ | **macOS service leftovers removed** (Core ML, PDFKit/Vision/ImageIO/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd): Linux is the only service platform; the apps stay on Mac, iPhone, Android. Core ML-era passages are re-embedded by the one-pass re-embed | `docs/plan-linux-service.md` §0 |
+| ✅ | **Phase 5 — hardening**: injection guard (`text::for_model` at every edge, injection suite), one retry policy with visible waits, compaction trace markers, per-device rate limits and body limits, checked backups + schema guard + restore drill, alerts from traces + `perf`, iOS continued processing for folder syncs (on `feat/p5`) | [`docs/phase5-brief.md`](phase5-brief.md) |
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
 | ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
 
@@ -35,7 +36,6 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
 | ⏳ | **R2 — rerank, query rewriting, prompt-version tracking**, eval-gated | `docs/r2-brief.md` (from `docs/agent-rag-architecture.md` §4) | Cross-encoder built as a variant (ONNX on the CPU), promoted only by the eval |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
-| ⏳ | **Phase 5 — hardening** | `docs/phase5-brief.md` | iOS background continuation for folders, prompt-injection tests, job retries, backups/drills, alerts from traces, security review, performance budgets |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
 | ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
 | ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
@@ -54,4 +54,6 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 - 👤 `margin-eval record-embeddings` + baseline, then un-ignore the CI eval gate (`crates/evals/tests/gates.rs`).
 - 👤 Hands-on runs: phase 4's manual D13 checks (macOS scanned PDF, iOS iCloud folder, Android), the providers screens, a real course from a real PDF.
 - 👤 First real-provider runs (OpenAI, ChatGPT, Claude); ChatGPT's per-app cap doesn't list Margin yet.
+- 👤 Phase 5 manual checks (`docs/phase5-brief.md` §5): the iPhone continued task (iOS 26, a 1 000-file iCloud folder synced with Margin closed, expiry → Paused; the task identifier may need a `.*` wildcard), `restore-drill.sh dev` (first run with `--hard-stop`), `perf` against dev, an alert end to end, one 429 per provider.
+- 👤 Phase 5 D3d fixtures: the live 400 texts of a compaction rejection from OpenAI and Claude, copied into the fake servers so `rejects_compaction` is tested against real text.
 - 👤 Licence reads before selling: EmbeddingGemma terms; pocket-tts voices (cosette and jean are blocked as non-commercial).

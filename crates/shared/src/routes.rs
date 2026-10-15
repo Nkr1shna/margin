@@ -12,7 +12,7 @@
 //! | Method | Path                                   | Body               | Response            |
 //! |--------|----------------------------------------|--------------------|---------------------|
 //! | GET    | /health                                |                    | "ok"                |
-//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes } |
+//! | GET    | /api/version (no token)                |                    | version::VersionInfo { version, sha, environment, started_at, rss_bytes, physical_memory_bytes, alerts_active, alerts_since } |
 //! | POST   | /auth/start                            | StartLoginRequest  | StartLogin          |
 //! | POST   | /auth/poll                             | PollLoginRequest   | LoginState          |
 //! | GET    | /auth/github/callback?code&state       |                    | HTML page           |
@@ -78,6 +78,7 @@
 //! | GET    | /api/context/changes?since&limit       |                    | context::ContextChanges (one page by generation: limit 1-500, default 100; `more`; 400 outside) |
 //! | GET    | /api/traces?kind&from&to&trace_id      |                    | JSONL of context::TraceRow, oldest first (400 bad_range) |
 //! | GET    | /api/traces/rollup?bucket&from&to      |                    | Vec<context::TraceRollup> (400 bad_range) |
+//! | GET    | /api/alerts                            |                    | context::AlertList { active, recent } |
 //! | GET    | /api/events  (WebSocket upgrade, devices only; `?traces=1` adds Event::Trace for admins) | DeviceFrame frames | ServerFrame frames  |
 //! | GET    | /api/people                            |                    | Vec<Person> (`settings` only on the caller's own) |
 //! | GET    | /api/people/{id}                       |                    | Person (404)        |
@@ -102,8 +103,9 @@
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
 pub const HEALTH: &str = "/health";
-/// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes }`,
-/// without a token like `/health` (`docs/plan-deploy.md` §8).
+/// `GET` → `{ version, sha, environment, started_at, rss_bytes, physical_memory_bytes,
+/// alerts_active, alerts_since }`, without a token like `/health`
+/// (`docs/plan-deploy.md` §8). Alerts are a count only here: the route is public.
 pub const VERSION: &str = "/api/version";
 pub const AUTH_START: &str = "/auth/start";
 pub const AUTH_POLL: &str = "/auth/poll";
@@ -174,6 +176,9 @@ pub const TRACES: &str = "/api/traces";
 /// `GET ?bucket=hour|day&from&to` → `Vec<context::TraceRollup>` from the pre-computed
 /// views.
 pub const TRACES_ROLLUP: &str = "/api/traces/rollup";
+/// `GET` → `context::AlertList`: the alerts now active and the last rises and clears
+/// (`docs/phase5-brief.md` D6).
+pub const ALERTS: &str = "/api/alerts";
 pub const EMBEDDING_DOWNLOAD: &str = "/api/embedding/download";
 /// `DELETE` removes the speech model's files; `POST SPEECH_MODEL_DOWNLOAD` starts its
 /// download. Both answer with the whole `EmbeddingModel` (its `speech` part changed),
@@ -202,6 +207,20 @@ pub const MAX_OTHER_SOURCE_BYTES: u64 = 50 * MB;
 /// Largest part of an upload in parts, and the size above which the app uploads in parts:
 /// well under the 100 MB a Cloudflare-proxied request body may be.
 pub const UPLOAD_PART_BYTES: u64 = 32 * MB;
+
+// Body and frame limits (`docs/agent-contract.md` §7; `docs/phase5-brief.md` D7).
+
+/// Largest `POST CONTEXT_INGEST` body: a long document an agent wrote.
+pub const CONTEXT_INGEST_MAX_BYTES: usize = 16 * MB as usize;
+/// Largest JSON body of every other API route (axum's default, set in code).
+pub const JSON_BODY_MAX_BYTES: usize = 2 * MB as usize;
+/// Largest frame a device sends on the events socket (tool outputs are capped before
+/// they're sent).
+pub const DEVICE_FRAME_MAX_BYTES: usize = MB as usize;
+/// Longest summary a local condense keeps (`docs/phase5-brief.md` D3).
+pub const CONDENSE_SUMMARY_MAX_CHARS: usize = 8_000;
+/// How often the service's alert job looks at the last window of traces.
+pub const ALERT_TICK_SECS: u64 = 60;
 
 /// The largest file of `kind` the service accepts as a source.
 pub fn max_source_bytes(kind: crate::SourceKind) -> u64 {
@@ -433,6 +452,17 @@ mod tests {
             source_limits_text(),
             "Audio and video files can be up to 500 MB each; other files up to 50 MB."
         );
+    }
+
+    #[test]
+    fn phase5_limits() {
+        assert_eq!(CONTEXT_INGEST_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(JSON_BODY_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(DEVICE_FRAME_MAX_BYTES, 1024 * 1024);
+        const { assert!(JSON_BODY_MAX_BYTES < CONTEXT_INGEST_MAX_BYTES) };
+        assert_eq!(CONDENSE_SUMMARY_MAX_CHARS, 8_000);
+        assert_eq!(ALERT_TICK_SECS, 60);
+        assert_eq!(ALERTS, "/api/alerts");
     }
 
     #[test]

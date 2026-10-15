@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use margin_ai::ModelWindow;
+use margin_shared::context::Compaction;
 use margin_shared::{ChatItem, ChatItemKind, Decision, ItemStatus, Usage};
 use serde_json::Value;
 
@@ -115,5 +116,12 @@ pub trait TurnSink: Send + Sync {
     /// [`TurnSink::add_usage`]). For the trace row (D14).
     fn model_called(&self, step: u32, model: &str, stop_reason: &str, usage: &Usage) {
         let _ = (step, model, stop_reason, usage);
+    }
+
+    /// Step `step`'s history was shortened: its output carried a server compaction
+    /// item, or the loop condensed locally before it. The service stamps the step's
+    /// `model_call` trace row (`TraceRow.compaction`; `docs/phase5-brief.md` D3).
+    fn compaction(&self, step: u32, kind: Compaction) {
+        let _ = (step, kind);
     }
 }

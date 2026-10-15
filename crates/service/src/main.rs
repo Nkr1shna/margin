@@ -1,5 +1,6 @@
 //! `margin-service setup` | `margin-service serve [--allow-unsandboxed-render]` |
 //! `margin-service download-model [--embedder NAME]` | `margin-service scrub-restored` |
+//! `margin-service check-data <dir>` | `margin-service backup [--label NAME]` |
 //! `margin-service version`
 
 use std::process::ExitCode;
@@ -7,7 +8,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use margin_service::config::{self, Config};
-use margin_service::db::Store;
 use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
@@ -24,6 +24,9 @@ Usage:
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)
+  margin-service check-data <dir>                    Check a data folder (a backup) on a copy:
+                                                     tables, migrations, source files
+  margin-service backup [--label NAME]               Back up the data folder now
   margin-service version                             Print the build's version and commit
 ";
 
@@ -41,6 +44,15 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("setup") if args.len() == 1 => config::run_setup(&config::config_path()),
         Some("scrub-restored") if args.len() == 1 => scrub_restored(),
+        Some("check-data") if args.len() == 2 => check_data(std::path::Path::new(&args[1])),
+        Some("backup") => match &args[1..] {
+            [] => backup(None),
+            [flag, label] if flag == "--label" => backup(Some(label)),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        },
         Some("download-model") => match model_download::parse_args(&args[1..]) {
             Ok(embedder) => download_model(embedder),
             Err(e) => {
@@ -117,7 +129,16 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
         // Tools a user installed without root (the pdfium library) are looked for here.
         margin_embed::set_tools_dir(config.data_dir.join("tools"));
         let source_tools = Arc::new(EmbedTools::new(&config.models_dir()));
-        let store = Store::open(&config.db_dir()).await?;
+        // Refuses data a newer build wrote; backs up data an older one wrote before
+        // this build migrates it (`restore::open_guarded`).
+        let (store, backup) = restore::open_guarded(&config).await?;
+        if let Some(dir) = backup {
+            tracing::info!(
+                "backed up the data before migrating it to schema {}: {}",
+                margin_service::db::SCHEMA_VERSION,
+                dir.display()
+            );
+        }
         let listener = tokio::net::TcpListener::bind(&config.bind)
             .await
             .with_context(|| format!("couldn't listen on {}", config.bind))?;
@@ -176,12 +197,48 @@ fn scrub_restored() -> anyhow::Result<()> {
     runtime.block_on(async {
         let config = Config::load(&config::config_path())?;
         restore::check_environment(&config)?;
-        let store = Store::open(&config.db_dir())
+        let (store, _) = restore::open_guarded(&config)
             .await
             .context("couldn't open the database; stop the service first")?;
         for done in restore::scrub(&store).await? {
             println!("deleted {} {} rows", done.rows, done.table);
         }
+        Ok(())
+    })
+}
+
+/// Checks a data folder on a copy and prints the report (`count <table> <n>` lines,
+/// the problems, a last one-line verdict); fails on any problem. Needs no config.
+fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let check = restore::check_data(dir).await?;
+        print!("{}", check.report(dir));
+        anyhow::ensure!(
+            check.problems.is_empty(),
+            "{} has {} problem(s)",
+            dir.display(),
+            check.problems.len()
+        );
+        Ok(())
+    })
+}
+
+/// Backs up the configured data folder (the service must be stopped) and checks the
+/// copy; prints `BACKUP=<folder>` last, like `backup-margin.sh`.
+fn backup(label: Option<&str>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(10 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async {
+        let config = Config::load(&config::config_path())?;
+        let dir = restore::backup(&config, label).await?;
+        println!("Backed up and checked {}.", config.data_dir.display());
+        println!("BACKUP={}", dir.display());
         Ok(())
     })
 }

@@ -2462,3 +2462,435 @@ mod retrieval_api {
         assert!(!out.ok);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Security review (phase 5, D7): CORS, the callback page, replays, revoked tokens,
+// per-device limits, body and frame limits
+// ---------------------------------------------------------------------------
+
+mod security {
+    use super::*;
+    use futures_util::SinkExt;
+    use margin_service::auth;
+    use margin_shared::routes::{self, CONTEXT_INGEST_MAX_BYTES, JSON_BODY_MAX_BYTES};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    fn no_cors(r: &reqwest::Response, what: &str) {
+        let cors: Vec<_> = r
+            .headers()
+            .keys()
+            .filter(|k| k.as_str().starts_with("access-control-"))
+            .collect();
+        assert!(cors.is_empty(), "{what}: {cors:?}");
+    }
+
+    /// The service serves native apps and `margin-mcp`, never a browser page that calls
+    /// it: no route answers with CORS headers, and a preflight gets nothing to go on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_cors_headers_anywhere_and_the_api_wants_a_bearer() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let origin = "https://evil.example";
+        for path in [
+            "/api/library",
+            "/api/me",
+            routes::CONTEXT_SEARCH,
+            "/api/chats",
+        ] {
+            let r = h
+                .http
+                .request(reqwest::Method::OPTIONS, h.u(path))
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header(
+                    "access-control-request-headers",
+                    "authorization, content-type",
+                )
+                .send()
+                .await
+                .unwrap();
+            no_cors(&r, &format!("OPTIONS {path}"));
+            assert!(!r.status().is_success(), "OPTIONS {path}: {}", r.status());
+        }
+        let r = h
+            .http
+            .get(h.u("/api/library"))
+            .header("origin", origin)
+            .send()
+            .await
+            .unwrap();
+        no_cors(&r, "GET /api/library without a bearer");
+        let (status, e) = api_error(r).await;
+        assert_eq!((status, e.code.as_str()), (401, "unauthorized"));
+        let r = h
+            .get(&t, "/api/library")
+            .header("origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        no_cors(&r, "GET /api/library with a bearer");
+        for path in [routes::HEALTH, routes::VERSION] {
+            let r = h
+                .http
+                .get(h.u(path))
+                .header("origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            no_cors(&r, path);
+        }
+        let r = h
+            .http
+            .post(h.u(routes::AUTH_START))
+            .header("origin", origin)
+            .json(&json!({"device_name": "x"}))
+            .send()
+            .await
+            .unwrap();
+        no_cors(&r, "POST /auth/start");
+    }
+
+    /// The callback page is the only HTML the service serves: nothing runs, loads,
+    /// frames it or leaks its URL (code and state) as a referrer, whatever the outcome.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_callback_page_sets_a_strict_csp_and_no_referrer() {
+        let h = start().await;
+        let s = h.start_login("Mac").await;
+        let ok = h.callback(OWNER_CODE, &s.login_id).await;
+        let expired = h.callback(OWNER_CODE, "not-a-login").await;
+        let s2 = h.start_login("Phone").await;
+        let denied = h.callback(OTHER_CODE, &s2.login_id).await;
+        for (r, status) in [(ok, 200), (expired, 410), (denied, 403)] {
+            assert_eq!(r.status(), status);
+            let headers = r.headers();
+            let csp = headers["content-security-policy"].to_str().unwrap();
+            assert_eq!(csp, auth::page_csp());
+            assert!(csp.starts_with("default-src 'none';"), "{csp}");
+            assert!(!csp.contains("unsafe-inline"), "{csp}");
+            assert_eq!(headers["referrer-policy"], "no-referrer");
+            assert_eq!(headers["cache-control"], "no-store");
+            assert_eq!(headers["x-content-type-options"], "nosniff");
+            let html = r.text().await.unwrap();
+            assert!(!html.contains("<script"), "{html}");
+        }
+    }
+
+    /// The OAuth `state` is single-use: once a callback completed, the same callback
+    /// (with its code or any other) is refused and doesn't touch the sign-in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_callback_is_refused() {
+        let h = start().await;
+        let s = h.start_login("Mac").await;
+        assert_eq!(h.callback(OWNER_CODE, &s.login_id).await.status(), 200);
+        // Replays, before the app collected the token.
+        let replay = h.callback(OWNER_CODE, &s.login_id).await;
+        assert_eq!(replay.status(), 410);
+        assert!(replay.text().await.unwrap().contains("already used"));
+        // Another code on the same state can't turn the approval into a denial (it
+        // never reaches GitHub).
+        assert_eq!(h.callback(OTHER_CODE, &s.login_id).await.status(), 410);
+        let token = match h.poll(&s).await {
+            LoginState::Approved { token, .. } => token,
+            other => panic!("{other:?}"),
+        };
+        // And after.
+        assert_eq!(h.callback(OWNER_CODE, &s.login_id).await.status(), 410);
+        assert_eq!(h.poll(&s).await, LoginState::Expired);
+        let devices: Vec<Device> = h
+            .get(&token, "/api/devices")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+
+        // A denied sign-in stays denied: the owner's code on its state does nothing.
+        let s = h.start_login("Phone").await;
+        assert_eq!(h.callback(OTHER_CODE, &s.login_id).await.status(), 403);
+        assert_eq!(h.callback(OWNER_CODE, &s.login_id).await.status(), 403);
+        assert!(matches!(h.poll(&s).await, LoginState::Denied { .. }));
+        assert_eq!(
+            h.state
+                .store
+                .list::<serde_json::Value>(db::DEVICE)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A revoked token fails on its very next request, on every kind of route, and no
+    /// route hands out a token or its hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_token_fails_on_its_next_request() {
+        let h = start().await;
+        let a = h.sign_in("Mac").await;
+        let b = h.sign_in("Phone").await;
+        // B was just seen, so its row isn't rewritten on the next request.
+        assert_eq!(h.get(&b, "/api/me").send().await.unwrap().status(), 200);
+        let devices_body = h
+            .get(&a, "/api/devices")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = h.state.store.list(db::DEVICE).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let hash = row["token_hash"].as_str().unwrap();
+            assert!(!devices_body.contains(hash));
+        }
+        assert!(!devices_body.contains("token_hash"));
+        let me_body = h
+            .get(&b, "/api/me")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!me_body.contains("token_hash") && !me_body.contains(&b));
+        let devices: Vec<Device> = serde_json::from_str(&devices_body).unwrap();
+        let phone = devices.iter().find(|d| d.name == "Phone").unwrap();
+        assert_eq!(
+            h.delete(&a, &format!("/api/devices/{}", phone.id))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let checks = [
+            h.get(&b, "/api/me"),
+            h.get(&b, "/api/library"),
+            h.post(&b, "/api/chats")
+                .json(&json!({"message": {"text": "hi"}})),
+            h.post(&b, routes::CONTEXT_SEARCH)
+                .json(&json!({"query": "x"})),
+            h.get(&b, routes::SETTINGS),
+        ];
+        for req in checks {
+            let (status, e) = api_error(req.send().await.unwrap()).await;
+            assert_eq!((status, e.code.as_str()), (401, "unauthorized"));
+        }
+        let mut req = format!("{}/api/events", h.url.replace("http://", "ws://"))
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {b}").parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(req).await.is_err());
+        assert_eq!(h.get(&a, "/api/me").send().await.unwrap().status(), 200);
+    }
+
+    /// Sends `n` requests one after another; returns their statuses.
+    async fn burst(n: usize, mut req: impl FnMut(usize) -> reqwest::RequestBuilder) -> Vec<u16> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(req(i).send().await.unwrap().status().as_u16());
+        }
+        out
+    }
+
+    async fn assert_limited(r: reqwest::Response) {
+        let retry: u64 = r.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "Retry-After {retry}");
+        let (status, e) = api_error(r).await;
+        assert_eq!((status, e.code.as_str()), (429, "rate_limited"));
+    }
+
+    /// Messages 30/min, context search 120/min, context ingest 60/min, source and
+    /// upload starts 60/min together, each per principal (a person's devices share
+    /// one window; another person has their own); a folder's files don't count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_principal_rate_limits() {
+        let h = start().await;
+        let a = h.sign_in("Mac").await;
+        let a2 = h.sign_in("Phone").await;
+        h.invite(&a, "bob-dev", margin_shared::OrgRole::Member, &[])
+            .await;
+        let b = h.sign_in_as(BOB_CODE, "Laptop").await;
+
+        // Messages: the limiter counts before the handler (the chat doesn't exist).
+        let msg = |t: &str| {
+            h.post(t, "/api/chats/no-such-chat/messages")
+                .json(&json!({"text": "hi"}))
+        };
+        let statuses = burst(auth::MESSAGES_LIMIT.per_minute as usize, |_| msg(&a)).await;
+        assert!(statuses.iter().all(|s| *s != 429), "{statuses:?}");
+        assert_limited(msg(&a).send().await.unwrap()).await;
+        // The same person's other device shares the window; another person is unaffected.
+        assert_limited(msg(&a2).send().await.unwrap()).await;
+        assert_ne!(msg(&b).send().await.unwrap().status(), 429);
+
+        let search = |t: &str| h.post(t, routes::CONTEXT_SEARCH).json(&json!({}));
+        let statuses = burst(auth::CONTEXT_SEARCH_LIMIT.per_minute as usize, |_| {
+            search(&a)
+        })
+        .await;
+        assert!(statuses.iter().all(|s| *s != 429), "{statuses:?}");
+        assert_limited(search(&a).send().await.unwrap()).await;
+        assert_ne!(search(&b).send().await.unwrap().status(), 429);
+
+        let ingest = |t: &str| h.post(t, routes::CONTEXT_INGEST).json(&json!({}));
+        let statuses = burst(auth::CONTEXT_INGEST_LIMIT.per_minute as usize, |_| {
+            ingest(&a)
+        })
+        .await;
+        assert!(statuses.iter().all(|s| *s != 429), "{statuses:?}");
+        assert_limited(ingest(&a).send().await.unwrap()).await;
+        assert_ne!(ingest(&b).send().await.unwrap().status(), 429);
+
+        // Sources and upload starts share one budget (both requests fail fast in
+        // their handlers: an unsupported file and a start without `bytes`).
+        let upload = |t: &str| {
+            h.post(t, routes::SOURCES)
+                .query(&[("name", "tool.exe")])
+                .body("x")
+        };
+        let start_upload = |t: &str| {
+            h.post(t, routes::SOURCE_UPLOADS)
+                .query(&[("name", "a.pdf")])
+        };
+        let statuses = burst(auth::SOURCES_LIMIT.per_minute as usize, |i| {
+            if i % 2 == 0 {
+                upload(&a)
+            } else {
+                start_upload(&a)
+            }
+        })
+        .await;
+        assert!(statuses.iter().all(|s| *s != 429), "{statuses:?}");
+        assert_limited(upload(&a).send().await.unwrap()).await;
+        assert_limited(start_upload(&a).send().await.unwrap()).await;
+        assert_ne!(upload(&b).send().await.unwrap().status(), 429);
+        // A folder's files go on: a sync sends as many as the folder holds.
+        let statuses = burst(5, |_| {
+            h.post(&a, routes::SOURCES)
+                .query(&[("name", "a.md"), ("workspace_id", "no-such-folder")])
+                .body("x")
+        })
+        .await;
+        assert!(statuses.iter().all(|s| *s != 429), "{statuses:?}");
+
+        // Routes without a principal limit aren't touched by these windows.
+        assert_eq!(
+            h.get(&a, "/api/library").send().await.unwrap().status(),
+            200
+        );
+    }
+
+    /// Sign-in's per-IP limits answer like the principal limits: 429 with `Retry-After`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_in_limits_say_when_to_retry() {
+        let h = start().await;
+        for _ in 0..auth::START_LIMIT.per_minute {
+            h.start_login("x").await;
+        }
+        let r = h
+            .http
+            .post(h.u(routes::AUTH_START))
+            .json(&json!({"device_name": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_limited(r).await;
+    }
+
+    /// `n` bytes that aren't JSON, sent as JSON: 400 when the body is read whole
+    /// (within the limit), 413 when it's over.
+    async fn junk_json(h: &Harness, req: reqwest::RequestBuilder, n: usize) -> u16 {
+        let _ = h;
+        req.header("content-type", "application/json")
+            .body(vec![b'x'; n])
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// Every JSON route takes 2 MB; `POST /api/context/ingest` 16 MB.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn json_bodies_stop_at_their_limits() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let routes_2mb = [
+            h.post(&t, "/api/topics"),
+            h.post(&t, "/api/chats"),
+            h.patch(&t, routes::SETTINGS),
+            h.post(&t, routes::CONTEXT_SEARCH),
+        ];
+        for req in routes_2mb {
+            let over = req.try_clone().unwrap();
+            assert_eq!(junk_json(&h, req, JSON_BODY_MAX_BYTES).await, 400);
+            assert_eq!(junk_json(&h, over, JSON_BODY_MAX_BYTES + 1).await, 413);
+        }
+
+        // Context ingest: past 2 MB is read; 16 MB is read; one byte more isn't.
+        let ingest = || h.post(&t, routes::CONTEXT_INGEST);
+        assert_eq!(junk_json(&h, ingest(), JSON_BODY_MAX_BYTES + 1).await, 400);
+        assert_eq!(junk_json(&h, ingest(), CONTEXT_INGEST_MAX_BYTES).await, 400);
+        assert_eq!(
+            junk_json(&h, ingest(), CONTEXT_INGEST_MAX_BYTES + 1).await,
+            413
+        );
+        // A real 15 MB document reaches the handler (refused there for its origin, so
+        // nothing is ingested).
+        let doc = json!({
+            "name": "long.md",
+            "origin": {"origin": "agent", "name": " "},
+            "text": "a".repeat(15 * 1024 * 1024),
+        })
+        .to_string();
+        let r = ingest()
+            .header("content-type", "application/json")
+            .body(doc)
+            .send()
+            .await
+            .unwrap();
+        let (status, e) = api_error(r).await;
+        assert_eq!((status, e.code.as_str()), (400, "bad_origin"));
+    }
+
+    /// A device's frame on the events socket is at most 1 MB: under it is read (an
+    /// unknown frame is ignored), over it closes the socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_frames_over_the_limit_close_the_socket() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let mut sock = h.socket(&t).await;
+        let under = format!(
+            "{{\"junk\":\"{}\"}}",
+            "a".repeat(routes::DEVICE_FRAME_MAX_BYTES - 32)
+        );
+        sock.ws.send(WsMessage::Text(under.into())).await.unwrap();
+        // Still open: an event still arrives.
+        let r = h
+            .post(&t, "/api/topics")
+            .json(&json!({"title": "Optics"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+        assert!(sock.next_event().await.is_some());
+
+        let over = "a".repeat(2 * 1024 * 1024);
+        let _ = sock.ws.send(WsMessage::Text(over.into())).await;
+        let code = sock.closed().await;
+        assert!(matches!(code, None | Some(1009)), "{code:?}");
+        // The device itself is fine: it connects again.
+        h.socket(&t).await.close().await;
+    }
+}

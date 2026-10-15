@@ -4,7 +4,7 @@
 # nightly by the margin-backup systemd timer, by restore-into-dev.sh before it replaces
 # dev's data, and by hand.
 #
-#   backup-margin.sh [--label TEXT] [--keep N] [--stop-service]
+#   backup-margin.sh [--label TEXT] [--keep N] [--stop-service] [--check]
 #
 # Copies `data_dir` from the service config to `<data_dir>/../backups/<date-time>[-label]/data`.
 # In a VM that is the persistent share, so backups live on the Mac mini's disk.
@@ -12,18 +12,25 @@
 # --stop-service, which stops the service (the margin-service systemd unit), backs up,
 # and starts it again even when the copy fails. Keeps the newest N backups (default 10;
 # 0 keeps all).
+# --check (on in the nightly unit, deploy.sh and the restore scripts) runs
+# `margin-service check-data` on the fresh copy (docs/phase5-brief.md D5): a sound copy
+# gets backups/<name>/CHECKED holding the check's report; a copy that fails is deleted
+# and the script exits 1. The binary is $MARGIN_SERVICE_BIN, else margin-service beside
+# this script, else margin-service on the PATH.
 # The config is $MARGIN_CONFIG, else /etc/margin/service.toml.
 set -eu
 
 label=""
 keep=10
 stop_service=0
+check=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --label) label="${2:?--label needs a value}"; shift 2 ;;
     --keep) keep="${2:?--keep needs a value}"; shift 2 ;;
     --stop-service) stop_service=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --check) check=1; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "backup-margin: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -51,6 +58,21 @@ port="${bind##*:}"
 if [ ! -d "$data_dir" ]; then
   echo "backup-margin: the data folder $data_dir doesn't exist" >&2
   exit 1
+fi
+
+service_bin=""
+if [ "$check" = 1 ]; then
+  if [ -n "${MARGIN_SERVICE_BIN:-}" ]; then
+    service_bin="$MARGIN_SERVICE_BIN"
+  elif [ -x "$(dirname "$0")/margin-service" ]; then
+    service_bin="$(dirname "$0")/margin-service"
+  else
+    service_bin="$(command -v margin-service || true)"
+  fi
+  [ -n "$service_bin" ] && [ -x "$service_bin" ] || {
+    echo "backup-margin: --check needs the margin-service binary (set MARGIN_SERVICE_BIN)" >&2
+    exit 1
+  }
 fi
 
 running() {
@@ -98,17 +120,42 @@ fi
 mv "$dest/data.partial" "$dest/data"
 echo "Backed up $data_dir to $dest/data ($(du -sh "$dest/data" | cut -f1))."
 
+# The copy is complete: the check and the pruning below read only the copy, so the
+# service needn't stay down for them (the EXIT trap stays as the safety net).
+if [ "$restart_after" = 1 ]; then
+  echo "Starting the service again."
+  $sudo_cmd systemctl start margin-service.service
+  restart_after=0
+fi
+
+if [ "$check" = 1 ]; then
+  # check-data opens a copy of the copy, never the backup itself.
+  if "$service_bin" check-data "$dest/data" > "$dest/CHECKED.partial" 2>&1; then
+    mv "$dest/CHECKED.partial" "$dest/CHECKED"
+    echo "Checked: $(tail -n 1 "$dest/CHECKED")"
+  else
+    cat "$dest/CHECKED.partial" >&2
+    rm -rf "$dest"
+    echo "backup-margin: the backup failed its check (above) and was deleted" >&2
+    exit 1
+  fi
+fi
+
 # Keep the newest $keep complete backups (folders named by this script).
 if [ "$keep" -gt 0 ]; then
   ls -1 "$backups" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' | sort -r | tail -n +"$((keep + 1))" |
     while IFS= read -r old; do
       [ -d "$backups/$old/data" ] || continue
-      rm -rf "${backups:?}/$old"
-      echo "Removed the old backup $backups/$old (keeping $keep)."
+      # The backup above is complete and checked: an old copy that won't go is a
+      # warning, not a failed backup.
+      if rm -rf "${backups:?}/$old"; then
+        echo "Removed the old backup $backups/$old (keeping $keep)."
+      else
+        echo "backup-margin: couldn't remove the old backup $backups/$old" >&2
+      fi
     done
 fi
 
-[ "$restart_after" = 1 ] && echo "Starting the service again."
 echo "To restore: stop the service, move $data_dir aside, copy $dest/data back to it, start the service."
 # The path of this backup, last, for deploy.sh.
 echo "BACKUP=$dest"

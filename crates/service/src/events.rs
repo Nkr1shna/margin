@@ -15,6 +15,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_
 use axum::extract::{Query, State};
 use axum::response::Response;
 use margin_shared::context::TraceRow;
+use margin_shared::routes::DEVICE_FRAME_MAX_BYTES;
 use margin_shared::{DeviceFrame, DirectedFrame, Event, Id};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
@@ -46,7 +47,11 @@ pub async fn events(
     ws: WebSocketUpgrade,
 ) -> Response {
     let traces = matches!(q.traces.as_deref(), Some("1" | "true"));
-    ws.on_upgrade(move |socket| run(state, device.id, principal, traces, socket))
+    // A device's answers are capped before they're sent; anything bigger closes the
+    // socket (1009, "message too big") instead of being buffered.
+    ws.max_frame_size(DEVICE_FRAME_MAX_BYTES)
+        .max_message_size(DEVICE_FRAME_MAX_BYTES)
+        .on_upgrade(move |socket| run(state, device.id, principal, traces, socket))
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
@@ -252,7 +257,15 @@ async fn serve(
                 }
             }
             msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(Message::Close(_))) | None => return,
+                Some(Err(e)) => {
+                    // Over `DEVICE_FRAME_MAX_BYTES`: say why before closing.
+                    if e.to_string().contains("too long") {
+                        tracing::info!(device = %device_id, "closing a socket whose frame was too big");
+                        close(socket, close_code::SIZE, "frame too big").await;
+                    }
+                    return;
+                }
                 Some(Ok(Message::Text(text))) => receive(state, device_id, text.as_str()),
                 Some(Ok(_)) => {}
             },

@@ -52,7 +52,7 @@ read -r answer
 
 guest_ssh dev "test -f '$MARGIN_PERSIST_GUEST/$MARGIN_MARKER'" || die "dev's share isn't mounted in margin-dev"
 cfg="$MARGIN_PERSIST_GUEST/service.toml"
-guest_ssh dev "sudo systemctl stop $MARGIN_SERVICE_UNIT.service; MARGIN_CONFIG='$cfg' /bin/sh '$MARGIN_PERSIST_GUEST/bin/backup-margin.sh' --label pre-restore" \
+guest_ssh dev "sudo systemctl stop $MARGIN_SERVICE_UNIT.service; MARGIN_CONFIG='$cfg' /bin/sh '$MARGIN_PERSIST_GUEST/bin/backup-margin.sh' --check --label pre-restore" \
   || die "dev's pre-restore backup failed; dev was left stopped: sudo systemctl start $MARGIN_SERVICE_UNIT in the guest"
 
 stamp="$(date +%Y%m%d-%H%M%S)"

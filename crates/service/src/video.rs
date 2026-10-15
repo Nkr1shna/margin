@@ -20,6 +20,7 @@ use margin_video::{
 use tokio::sync::mpsc;
 
 use crate::db;
+use crate::engines::{JobCalls, JobWait, failed_attempts, ordered_waits, waiting_line};
 use crate::error::{AppError, AppResult};
 use crate::library::{self, video_for_lesson};
 use crate::principal::{CurrentPrincipal, Principal};
@@ -340,7 +341,16 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
         call.row().job_id = Some(id.to_string());
         call.row().step = Some(attempt);
         let opts = scene_options(&request);
-        let code = match state.generator.write_scene(&ai, &request, &opts).await {
+        let calls = JobCalls {
+            backoff: crate::ask::job_backoff(state),
+            on_wait: video_waits(state, id),
+            on_failed: failed_attempts(state, call.row().clone()),
+            clock: Some(call.clock()),
+        };
+        let code = match calls
+            .run(state.generator.write_scene(&ai, &request, &opts))
+            .await
+        {
             Ok(Generated { value: code, usage }) => {
                 call.row().usage = Some(trace::trace_usage(&usage));
                 call.finish(true);
@@ -499,6 +509,39 @@ async fn finish(
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
     Ok(())
+}
+
+/// A video job's waits before retrying the scene call, shown as its log's last line
+/// while it is Scripting; the line goes when the wait ends.
+fn video_waits(state: &AppState, id: &str) -> JobWait {
+    const PREFIX: &str = "Waiting for the model until ";
+    let state = state.clone();
+    let id = id.to_string();
+    ordered_waits(move |wait| {
+        let (state, id) = (state.clone(), id.clone());
+        async move {
+            let shown = update(&state, &id, move |v| {
+                if v.video.status != VideoStatus::Scripting {
+                    return;
+                }
+                let mut lines: Vec<String> = v
+                    .video
+                    .log
+                    .lines()
+                    .filter(|l| !l.starts_with(PREFIX))
+                    .map(str::to_string)
+                    .collect();
+                if let Some(wait) = &wait {
+                    lines.push(waiting_line(wait));
+                }
+                v.video.log = lines.join("\n");
+            })
+            .await;
+            if let Err(e) = shown {
+                tracing::warn!("couldn't show the wait on video {id}: {e:#}");
+            }
+        }
+    })
 }
 
 /// The last `LOG_LINES` lines of the render log.

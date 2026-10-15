@@ -79,6 +79,36 @@ recorded before providers were compares with a warning. ChatGPT is its own provi
 on model ids OpenAI also serves. Commit the new `baseline.json` (and the report's summary
 table) with the change that improves it.
 
+## Alerts and performance budgets
+
+```sh
+margin-eval alerts --service-url https://devmargin.krishnanelloore.com
+margin-eval perf   --service-url https://devmargin.krishnanelloore.com
+```
+
+`alerts` prints the service's active alerts (`GET /api/alerts`) and the last day's
+rises and clears (its `alert` trace rows). The service's alert job
+(`crates/service/src/alerts.rs`, `docs/phase5-brief.md` D6) compares the last
+`[alerts] window_minutes` of traces with `[alerts]` in `service.toml` every minute; each
+rise and clear also goes to journald (`journalctl -u margin-service -p warning`), to the
+count in the public `GET /api/version` (`alerts_active`, `alerts_since`) and, when
+`[alerts] webhook_url` is set, as a JSON `POST` (the `AlertEvent` plus `environment` and
+a `text` line). `report` adds an "Alerts" section from the `alert` rows it reads.
+
+`perf` measures the service against `budgets.toml` (D8: the Linux prod guest's
+targets) and prints each as met, missed, not measured or manual. It ingests the
+corpus's text documents as agent `perf` documents (`perf/<path>`) and sends one back
+unchanged, runs every `golden/retrieval.jsonl` query over `POST /api/context/search`
+(timed end to end, and by the `retrieval` rows), runs the first `golden/agent.jsonl`
+question as a chat turn (step overhead `duration_ms − provider_ms`, cached share from
+step 2, the title's tokens) and asks for a one-lesson course, accepting its outline cut
+to one lesson. It deletes what it made (documents, chat, topics) at the end; the trace
+rows stay. **It calls the service's configured models, not fakes: one real agent turn
+and one real lesson on the provider dev is set up with (their tokens are the cost), and
+its `Scope::Library` searches read the library the token can read.** Run it against dev
+by hand after a deploy that touches ingest, retrieval or the loop (the prod URL is
+refused). Numbers are reported, never gated.
+
 ## Cost per provider
 
 `margin-eval report --traces FILE` (or `--service`) adds an Efficiency section from the

@@ -1360,3 +1360,124 @@ async fn list_models_errors() {
         Err(AiError::Network(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// `Retrying` on Claude: 529 overloaded, `retry-after` in seconds, the spend limit
+// ---------------------------------------------------------------------------
+
+/// What a `Retrying` model's `on_wait` was told, in order.
+type Waits = Arc<Mutex<Vec<Option<margin_shared::Waiting>>>>;
+
+fn retrying(client: ClaudeClient) -> (margin_ai::Retrying<ClaudeClient>, Waits) {
+    let seen: Waits = Arc::new(Mutex::new(Vec::new()));
+    let keep = seen.clone();
+    let backoff = margin_ai::Backoff {
+        retries: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+    };
+    let model = margin_ai::Retrying::new(
+        client,
+        backoff,
+        Box::new(move |w| keep.lock().unwrap().push(w)),
+    );
+    (model, seen)
+}
+
+async fn text(model: &dyn TextModel) -> (Result<String, AiError>, String) {
+    let mut shown = String::new();
+    let out = model
+        .stream_parts(
+            "Write it.",
+            &[InputPart::Text("x".into())],
+            &CallOptions::new(Route::Write),
+            Box::new(|d| shown.push_str(d)),
+        )
+        .await
+        .map(|o| o.text);
+    (out, shown)
+}
+
+#[tokio::test]
+async fn retrying_waits_out_overloaded_and_rate_limits_on_claude() {
+    let overloaded_event = whole(sse(&[
+        message_start("claude-sonnet-5-5"),
+        json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}),
+    ]));
+    let (client, fake) = spawn(vec![
+        Reply::Json(
+            StatusCode::from_u16(529).unwrap(),
+            api_error("overloaded_error", "Overloaded"),
+        ),
+        Reply::WithHeaders(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("retry-after", "1".into())],
+            api_error("rate_limit_error", "Slow down."),
+        ),
+        overloaded_event,
+        text_reply("Lesson."),
+    ])
+    .await;
+    let (model, seen) = retrying(client);
+    let started = std::time::Instant::now();
+    let (out, shown) = text(&model).await;
+    assert_eq!(out.unwrap(), "Lesson.");
+    assert_eq!(shown, "Lesson.");
+    // The 429's `retry-after: 1` (seconds on Claude) was waited in full, past
+    // `max_delay`.
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(requests(&fake).len(), 4);
+    let seen = seen.lock().unwrap();
+    let reasons: Vec<_> = seen.iter().flatten().map(|w| w.reason.as_str()).collect();
+    assert_eq!(
+        reasons,
+        [
+            "The model API had a problem.",
+            "The model API asked Margin to slow down.",
+            "The model API had a problem.",
+        ]
+    );
+    assert_eq!(seen.iter().filter(|w| w.is_none()).count(), 3);
+}
+
+#[tokio::test]
+async fn retrying_stops_at_the_spend_limit_and_a_refused_key_on_claude() {
+    for reply in [
+        Reply::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"type": "error", "error": {"type": "rate_limit_error",
+                "message": "You have reached your spend limit.",
+                "details": {"error_code": "enforced_spend_limit_reached"}}}),
+        ),
+        Reply::Json(
+            StatusCode::UNAUTHORIZED,
+            api_error("authentication_error", "invalid x-api-key"),
+        ),
+    ] {
+        let (client, fake) = spawn(vec![reply]).await;
+        let (model, seen) = retrying(client);
+        let (out, _) = text(&model).await;
+        let err = out.unwrap_err();
+        assert!(!err.is_retryable(), "{err:?}");
+        assert_eq!(requests(&fake).len(), 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    // Cut off after text was shown: returned as it is.
+    let cut = whole(response(
+        vec![
+            start(0, json!({"type": "text", "text": ""})),
+            text_delta(0, "Half"),
+            stop(0),
+        ],
+        "max_tokens",
+    ));
+    let (client, fake) = spawn(vec![cut]).await;
+    let (model, seen) = retrying(client);
+    let (out, shown) = text(&model).await;
+    assert!(matches!(out, Err(AiError::Incomplete(_))));
+    assert_eq!(shown, "Half");
+    assert_eq!(requests(&fake).len(), 1);
+    assert!(seen.lock().unwrap().is_empty());
+}

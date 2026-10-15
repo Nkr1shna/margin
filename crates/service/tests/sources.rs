@@ -1834,3 +1834,126 @@ async fn without_ocr_pictures_are_ready_with_a_warning() {
         text.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// Media links (phase 5, D7): cache lifetime and paths
+// ---------------------------------------------------------------------------
+
+/// A source's signed link is cached privately for no longer than it works, and only
+/// ids the service minted and file names it knows are served: `..`, absolute and
+/// percent-encoded separators get 404, even when the link is signed for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_media_is_cached_privately_and_paths_cant_escape() {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    let r = h.upload(&t, "notes.md", None, FOURIER).await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let source: Source = r.json().await.unwrap();
+    let url = source.media_url.clone().unwrap();
+    let r = h.http.get(&url).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+    let max_age: i64 = cache
+        .strip_prefix("private, max-age=")
+        .unwrap_or_else(|| panic!("{cache}"))
+        .parse()
+        .unwrap();
+    let ttl = margin_service::state::MEDIA_URL_TTL_SECONDS;
+    assert!(max_age <= ttl && max_age > ttl - 60, "{cache}");
+    assert_eq!(r.text().await.unwrap(), FOURIER);
+
+    // A link close to its end is cached only for what's left of it.
+    let exp = Utc::now().timestamp() + 30;
+    let sig = h.state.source_media_signature(&source.id, "original", exp);
+    let r = h
+        .http
+        .get(h.u(&format!(
+            "/media/sources/{}/original?exp={exp}&sig={sig}",
+            source.id
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+    let left: i64 = cache
+        .strip_prefix("private, max-age=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((0..=30).contains(&left), "{cache}");
+
+    let exp = Utc::now().timestamp() + 600;
+    let signed = |id: &str, file: &str| {
+        let sig = h.state.source_media_signature(id, file, exp);
+        (id.to_string(), file.to_string(), sig)
+    };
+    let tries = [
+        // The file name escaping the source's folder, encoded so the URL keeps it.
+        (
+            source.id.clone(),
+            "..%2F..%2Fdb".to_string(),
+            signed(&source.id, "../../db").2,
+        ),
+        (
+            source.id.clone(),
+            "%2E%2E".to_string(),
+            signed(&source.id, "..").2,
+        ),
+        (
+            source.id.clone(),
+            "%2Fetc%2Fpasswd".to_string(),
+            signed(&source.id, "/etc/passwd").2,
+        ),
+        (
+            source.id.clone(),
+            "..%5Csecrets".to_string(),
+            signed(&source.id, "..\\secrets").2,
+        ),
+        (
+            source.id.clone(),
+            "page-1.png%2F..%2F..%2Ffile".to_string(),
+            signed(&source.id, "page-1.png/../../file").2,
+        ),
+        // The id escaping the sources folder.
+        (
+            "%2E%2E".to_string(),
+            "original".to_string(),
+            signed("..", "original").2,
+        ),
+        (
+            "..%2Fuploads".to_string(),
+            "original".to_string(),
+            signed("../uploads", "original").2,
+        ),
+        (
+            "%2Fetc".to_string(),
+            "original".to_string(),
+            signed("/etc", "original").2,
+        ),
+    ];
+    for (id, file, sig) in tries {
+        let path = format!("/media/sources/{id}/{file}?exp={exp}&sig={sig}");
+        let r = h.http.get(h.u(&path)).send().await.unwrap();
+        assert_eq!(r.status(), 404, "{path}");
+        let r = h
+            .http
+            .get(h.u(&format!("/media/videos/{id}/{file}?exp={exp}&sig={sig}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "videos {path}");
+    }
+    // An unencoded `..` the client doesn't fold away (raw request line).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = h.url.trim_start_matches("http://").to_string();
+    let mut tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let line = format!(
+        "GET /media/sources/{}/../../secrets.toml HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n",
+        source.id
+    );
+    tcp.write_all(line.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    tcp.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+}
