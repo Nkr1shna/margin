@@ -757,8 +757,11 @@ Providers, `margin_ai`: `CLAUDE_MAX_OUTPUT_TOKENS` 32 000 (a text call: 64 000),
 `web_search_20260318`, `WEB_FETCH_TOOL` `web_fetch_20260318`, `CLAUDE_BETAS`
 `compact-2026-01-12,thinking-binding-controls-2026-08-01`; `windows::openai_window`
 (GPT-6 family: 1 050 000 / 128 000). Model defaults (`margin_shared`): Claude
-`claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI small
-`gpt-6-luna`; ChatGPT `gpt-6.1-sol`.
+`claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI
+`gpt-6.1-sol` for chats and writing, `gpt-6-luna` for small tasks; ChatGPT `gpt-6.1-sol`.
+The service serves a slot never picked (missing or stored empty) as its default
+(`RouteModels::or_defaults`), and Settings' `default_provider`, until an admin picks one,
+as the first provider with a credential (OpenAI, ChatGPT, Claude; OpenAI when none).
 R2, `margin_shared::routes`: `RERANK_MAX_CANDIDATES` 24, `RERANK_QUERY_CHARS` 800,
 `RERANK_MAX_OUTPUT_TOKENS` 400, `REWRITE_MAX_ADDED` 2, `REWRITE_MIN_WORDS` 5,
 `REWRITE_MAX_OUTPUT_TOKENS` 120, `RERANK_PAIR_TOKENS` 512.

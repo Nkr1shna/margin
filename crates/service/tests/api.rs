@@ -869,13 +869,18 @@ async fn generation_needs_an_api_key_and_a_model() {
     let (status, e) = api_error(accept().await.unwrap()).await;
     assert_eq!((status, e.code.as_str()), (400, "no_api_key"));
     assert!(e.message.contains("API key"));
-    h.patch(&t, "/api/settings")
-        .json(&json!({"openai_api_key": API_KEY, "openai_model": ""}))
+    // A model cleared through the legacy field is the default again, never empty.
+    let s: Settings = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_model": ""}))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    let (status, e) = api_error(accept().await.unwrap()).await;
-    assert_eq!((status, e.code.as_str()), (400, "no_model"));
+    assert_eq!(s.openai_model, margin_shared::OPENAI_DEFAULT_MODEL);
+    assert_eq!(s.openai_models.write, margin_shared::OPENAI_DEFAULT_MODEL);
 
     h.configure_ai(&t).await;
     let (topic, _) = create_lessons(&h, &t, "x", 1, false).await;
@@ -982,7 +987,7 @@ async fn settings_store_the_key_but_never_return_it() {
         .await
         .unwrap();
     assert_eq!(s.openai_base_url, "https://api.openai.com/v1");
-    assert_eq!(s.openai_model, "");
+    assert_eq!(s.openai_model, margin_shared::OPENAI_DEFAULT_MODEL);
     assert!(!s.has_api_key);
     assert_eq!(
         (s.render_width, s.render_height, s.render_fps),

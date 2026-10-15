@@ -178,9 +178,10 @@ pub struct SettingsRow {
     /// runs once.
     #[serde(default)]
     pub migrations: Vec<String>,
-    /// The provider new chats and the job routes use (D9).
+    /// The provider new chats and the job routes use (D9), once an admin picks one;
+    /// `None` = the first provider with a credential (`Settings::first_configured`).
     #[serde(default)]
-    pub default_provider: Provider,
+    pub default_provider: Option<Provider>,
     /// The OpenAI slots once stored; `None` (settings from before the slots) derives
     /// them from `openai_model` and the deprecated `agent_model`
     /// (`RouteModels::openai_from`).
@@ -210,21 +211,17 @@ impl SettingsRow {
         self.schema_version.max(1)
     }
 
-    /// `provider`'s three slots as stored (before any pipeline override).
+    /// `provider`'s three slots as stored (before any pipeline override), each slot
+    /// never picked (missing, or stored empty) read as the provider's shipped default.
     pub fn slots(&self, provider: Provider) -> RouteModels {
-        match provider {
+        let stored = match provider {
             Provider::OpenAi => self.openai_models.clone().unwrap_or_else(|| {
                 RouteModels::openai_from(self.openai_model.trim(), self.agent_model.as_deref())
             }),
-            Provider::ChatGpt => self
-                .chatgpt_models
-                .clone()
-                .unwrap_or_else(RouteModels::chatgpt_default),
-            Provider::Claude => self
-                .claude_models
-                .clone()
-                .unwrap_or_else(RouteModels::claude_default),
-        }
+            Provider::ChatGpt => self.chatgpt_models.clone().unwrap_or_default(),
+            Provider::Claude => self.claude_models.clone().unwrap_or_default(),
+        };
+        stored.or_defaults(provider)
     }
 
     /// The legacy `openai_model` patch: the writing slot; the chat slot too while it
@@ -274,7 +271,7 @@ impl Default for SettingsRow {
             pipeline: PipelineConfig::default(),
             trace_retention_days: margin_shared::TRACE_RETENTION_DAYS,
             migrations: Vec::new(),
-            default_provider: Provider::default(),
+            default_provider: None,
             openai_models: None,
             chatgpt_models: None,
             claude_models: None,
@@ -719,12 +716,14 @@ impl App {
             .await?
             .is_some_and(|k| !k.is_empty());
         let chatgpt = crate::providers::chatgpt_account(self).await?;
-        Ok(Settings {
-            openai_models: row.slots(Provider::OpenAi),
+        let openai_models = row.slots(Provider::OpenAi);
+        let mut settings = Settings {
+            // The legacy field mirrors the writing slot, its default included.
+            openai_model: openai_models.write.clone(),
+            openai_models,
             chatgpt_models: row.slots(Provider::ChatGpt),
             claude_models: row.slots(Provider::Claude),
             openai_base_url: row.openai_base_url,
-            openai_model: row.openai_model,
             has_api_key,
             voice: row.voice,
             render_width: row.render_width,
@@ -734,10 +733,23 @@ impl App {
             agent_model: row.agent_model,
             pipeline: row.pipeline.with_embedder(self.model_files.backend.name()),
             trace_retention_days: row.trace_retention_days,
-            default_provider: row.default_provider,
+            default_provider: Provider::default(),
             has_claude_api_key,
             chatgpt,
-        })
+        };
+        settings.default_provider = row
+            .default_provider
+            .unwrap_or_else(|| settings.first_configured());
+        Ok(settings)
+    }
+
+    /// Settings' default provider: the one an admin picked, else the first provider with
+    /// a credential (OpenAI when none has one).
+    pub async fn default_provider(&self) -> anyhow::Result<Provider> {
+        match self.settings_row().await?.default_provider {
+            Some(p) => Ok(p),
+            None => Ok(self.settings().await?.default_provider),
+        }
     }
 
     /// Where and how to call `provider` (D10): its base URL, credential and slots, each
@@ -818,7 +830,7 @@ impl App {
     ) -> AppResult<ModelChoice> {
         let provider = match provider {
             Some(p) => p,
-            None => self.settings_row().await?.default_provider,
+            None => self.default_provider().await?,
         };
         let config = self.provider_config(provider).await?;
         let model = config.models.get(route).trim().to_string();
