@@ -186,8 +186,29 @@ async fn every_change_to_who_may_do_what_is_journaled_without_names() {
         .unwrap())
     .await;
 
-    // A person: role, then disabled (their device goes) and enabled again.
     let owner = h.sign_in("owner's Mac").await;
+    // Up to here Bob is a member: once every row so far is written (and announced), his
+    // socket has had none of them. A socket's audience is evaluated at delivery, so
+    // from the promotion on he may get rows, his own promotion's among them (checked
+    // at the end).
+    assert!(margin_service::audit::flush(&h.state, std::time::Duration::from_secs(5)).await);
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            bob_socket.next_event(),
+        )
+        .await
+        {
+            Ok(Some(Event::AuditAppended { row })) => {
+                panic!("a member's socket got an audit row: {row:?}")
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("bob's socket closed early"),
+            Err(_) => break,
+        }
+    }
+
+    // A person: role, then disabled (their device goes) and enabled again.
     ok(h.patch(&owner, "/api/people/bob")
         .json(&json!({"org_role": "admin"}))
         .send()
@@ -311,7 +332,11 @@ async fn every_change_to_who_may_do_what_is_journaled_without_names() {
             .count()
             >= 15
     );
-    // Bob was a member until the role change: no audit row reached him before it.
+    // Bob's socket (a member's until the promotion, checked above) sees its `PersonChanged`
+    // to admin; any audit row that reaches it is from the promotion on (the audience is
+    // evaluated at delivery: an admin's socket gets rows, whenever it was opened), never
+    // one of the rows written while he was a member.
+    let mut promoted = false;
     loop {
         match tokio::time::timeout(
             std::time::Duration::from_millis(300),
@@ -319,18 +344,21 @@ async fn every_change_to_who_may_do_what_is_journaled_without_names() {
         )
         .await
         {
-            Ok(Some(Event::AuditAppended { row })) => {
-                panic!("a member's socket got an audit row: {row:?}")
-            }
+            Ok(Some(Event::AuditAppended { row })) => assert!(
+                row.subject.id == "bob" && row.kind == AuditKind::PersonChange
+                    || row.subject.id == "device-bob",
+                "bob's socket got a row from before his promotion: {row:?}"
+            ),
             Ok(Some(Event::PersonChanged { person }))
                 if person.id == "bob" && person.org_role == OrgRole::Admin =>
             {
-                break;
+                promoted = true;
             }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }
     }
+    assert!(promoted, "bob's socket never saw his promotion");
 }
 
 #[tokio::test(flavor = "multi_thread")]
