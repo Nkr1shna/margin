@@ -21,49 +21,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Which platforms this PR touches, from its changed files (crate lists per `cargo
-  # metadata`). A job that's skipped counts as passed for the required checks, so a PR that
-  # only changes the service doesn't wait for the Mac, and an app-only PR doesn't wait for
-  # Linux. Manual runs check both.
-  changes:
-    name: Changes
-    runs-on: ubuntu-latest
-    outputs:
-      linux: ${{ steps.files.outputs.linux }}
-      macos: ${{ steps.files.outputs.macos }}
-    steps:
-      - id: files
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            echo "linux=true" >> "$GITHUB_OUTPUT"; echo "macos=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          linux=false
-          macos=false
-          for f in $(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
-            case "$f" in
-              crates/app/*) macos=true ;;
-              crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) linux=true; macos=true ;;
-              crates/*|deploy/ci/linux-ci.sh) linux=true ;;
-            esac
-          done
-          echo "linux=$linux macos=$macos"
-          echo "linux=$linux" >> "$GITHUB_OUTPUT"
-          echo "macos=$macos" >> "$GITHUB_OUTPUT"
-
   # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
   # Linux build now (docs/plan-linux-service.md).
   linux:
     name: Linux
-    needs: changes
     # Same-repository pull requests only; never code from a fork on a self-hosted runner.
-    if: needs.changes.outputs.linux == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, margin]
     timeout-minutes: 90
     steps:
+      # Does this PR touch this platform? (crate lists per `cargo metadata`). If not, the
+      # remaining steps are skipped and the check passes in seconds, so a service-only PR
+      # doesn't wait on the Mac and an app-only PR doesn't wait on Linux. Manual runs check.
+      - name: Does this PR touch Linux?
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          run=false
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then run=true; fi
+          for f in $( [ "$run" = true ] || gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
+            case "$f" in
+              crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
+              crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|deploy/ci/linux-ci.sh) run=true ;;
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          [ "$run" = true ] && echo "Checking Linux." || echo "Nothing for Linux in this PR; passing."
       - uses: actions/checkout@v4
+        if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
       # Cargo's build output lives outside the checkout (actions/checkout wipes untracked
@@ -72,6 +59,7 @@ jobs:
       # image build), so a changed toolchain or image starts a fresh one; caches unused for
       # a week are removed.
       - name: Put Rust on PATH, keep the build cache
+        if: steps.scope.outputs.run == 'true'
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -83,14 +71,14 @@ jobs:
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
       # The same steps the local check runs (deploy/local/linux-check.sh).
       - name: Format, clippy, tests
+        if: steps.scope.outputs.run == 'true'
         run: sh deploy/ci/linux-ci.sh
 
   # The app (desktop, iOS) on the Mac host runner. (The service is a Linux build; its macOS
   # backends are no longer checked here.)
   macos:
     name: macOS
-    needs: changes
-    if: needs.changes.outputs.macos == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, margin]
     timeout-minutes: 90
     env:
@@ -98,12 +86,33 @@ jobs:
       CI: "true"
       MARGIN_EMBED_MODEL_DIR: /nonexistent/margin-embed-model
     steps:
+      # Does this PR touch this platform? (crate lists per `cargo metadata`). If not, the
+      # remaining steps are skipped and the check passes in seconds, so a service-only PR
+      # doesn't wait on the Mac and an app-only PR doesn't wait on Linux. Manual runs check.
+      - name: Does this PR touch macOS?
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          run=false
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then run=true; fi
+          for f in $( [ "$run" = true ] || gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
+            case "$f" in
+              crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
+              crates/app/*) run=true ;;
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          [ "$run" = true ] && echo "Checking macOS." || echo "Nothing for macOS in this PR; passing."
       - uses: actions/checkout@v4
+        if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
       # The cache is named after the environment (pinned Rust + the Xcode build), so an Xcode
       # or toolchain update starts a fresh one; caches unused for a week are removed.
       - name: Put Rust and Homebrew on PATH, keep the build cache
+        if: steps.scope.outputs.run == 'true'
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -116,8 +125,11 @@ jobs:
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
       - name: Clippy (app)
+        if: steps.scope.outputs.run == 'true'
         run: cargo clippy --locked -p margin-app --all-targets -- -D warnings
       - name: Tests (app)
+        if: steps.scope.outputs.run == 'true'
         run: cargo test --locked -p margin-app
       - name: iOS simulator check
+        if: steps.scope.outputs.run == 'true'
         run: cargo check --locked -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
