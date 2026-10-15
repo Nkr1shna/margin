@@ -1729,6 +1729,7 @@ fn quick() -> Backoff {
         retries: 3,
         base_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(100),
+        jitter: Duration::ZERO,
     }
 }
 
@@ -2373,4 +2374,273 @@ async fn list_models_for_a_key_and_for_a_plan_token() {
         requests[1],
         (Some("Bearer plan-token".into()), json!("GET /models"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// `Retrying`: the job calls' retries (`docs/phase5-brief.md` D4)
+// ---------------------------------------------------------------------------
+
+use margin_ai::{OnWait, Retrying};
+use margin_shared::Waiting;
+use std::time::SystemTime;
+
+/// An `on_wait` that keeps what it was told, in order.
+fn recorder() -> (OnWait, Arc<Mutex<Vec<Option<Waiting>>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let keep = seen.clone();
+    (
+        Box::new(move |w: Option<Waiting>| keep.lock().unwrap().push(w)),
+        seen,
+    )
+}
+
+fn until(w: &Waiting) -> SystemTime {
+    w.until.into()
+}
+
+#[tokio::test]
+async fn retrying_waits_out_a_429_then_writes_the_lesson() {
+    let (client, fake) = spawn(vec![
+        rate_limited("0.2"),
+        whole(text_stream(&["## Idea\n\n", "Text.\n"])),
+    ])
+    .await;
+    let (on_wait, seen) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let before = SystemTime::now();
+    let started = std::time::Instant::now();
+    let mut deltas = String::new();
+    let out = write_lesson_with(
+        &model,
+        &lesson_ctx(1),
+        &CallOptions::new(Route::Write),
+        |d| deltas.push_str(d),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.value, "## Idea\n\nText.\n");
+    assert_eq!(deltas, "## Idea\n\nText.\n");
+    // The Retry-After (200 ms, past `max_delay`'s 100 ms) was waited in full.
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let waiting = seen[0].clone().expect("the wait was reported");
+    assert_eq!(waiting.reason, "The model API asked Margin to slow down.");
+    assert!(until(&waiting) >= before + Duration::from_millis(190));
+    assert_eq!(seen[1], None, "the end of the wait was reported");
+    let requests = all_requests(&fake);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1], "the retry sends the same request");
+}
+
+#[tokio::test]
+async fn retrying_retries_5xx_and_network_and_gives_up_after_three() {
+    let busy = || Reply::Text(StatusCode::SERVICE_UNAVAILABLE, "busy".into());
+    let (client, fake) = spawn(vec![
+        Reply::Text(StatusCode::GATEWAY_TIMEOUT, "timeout".into()),
+        Reply::SseThenDrop(vec![created().into_bytes()]),
+        whole(text_stream(&["fine"])),
+    ])
+    .await;
+    let (on_wait, seen) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let out = model
+        .stream_parts(
+            "Be brief.",
+            &[InputPart::Text("Say hello.".into())],
+            &CallOptions::new(Route::Small),
+            Box::new(|_| {}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.text, "fine");
+    assert_eq!(fake.requests.lock().unwrap().len(), 3);
+    let reasons: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|w| w.reason.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "The model API had a problem.",
+            "Margin couldn't reach the model API."
+        ]
+    );
+
+    let (client, fake) = spawn(vec![busy(), busy(), busy(), busy(), busy()]).await;
+    let (on_wait, seen) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let err = model
+        .stream_parts(
+            "I",
+            &[InputPart::Text("x".into())],
+            &CallOptions::new(Route::Small),
+            Box::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AiError::Http { status: 503, .. }));
+    assert_eq!(fake.requests.lock().unwrap().len(), 4, "1 call + 3 retries");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        6,
+        "three waits, each with its end"
+    );
+}
+
+#[tokio::test]
+async fn retrying_never_retries_after_text_was_shown_or_what_waiting_wont_cure() {
+    // Cut after the first delta: the caller has shown it, so no second call.
+    let (client, fake) = spawn(vec![Reply::SseThenDrop(vec![
+        format!("{}{}", created(), delta("half")).into_bytes(),
+    ])])
+    .await;
+    let (on_wait, seen) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let mut shown = String::new();
+    let err = model
+        .stream_parts(
+            "I",
+            &[InputPart::Text("x".into())],
+            &CallOptions::new(Route::Write),
+            Box::new(|d| shown.push_str(d)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AiError::Network(_)), "{err:?}");
+    assert_eq!(shown, "half");
+    assert_eq!(fake.requests.lock().unwrap().len(), 1);
+    assert!(seen.lock().unwrap().is_empty());
+
+    for reply in [
+        Reply::Json(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": {"message": "Incorrect API key provided."}}),
+        ),
+        Reply::Json(
+            StatusCode::BAD_REQUEST,
+            json!({"error": {"message": "Bad request."}}),
+        ),
+        Reply::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": {"message": "Your share is used up.", "code": "subscription_sharing_usage_limit_exceeded"}}),
+        ),
+    ] {
+        let (client, fake) = spawn(vec![reply]).await;
+        let (on_wait, seen) = recorder();
+        let model = Retrying::new(client, quick(), on_wait);
+        let err = model
+            .stream_parts(
+                "I",
+                &[InputPart::Text("x".into())],
+                &CallOptions::new(Route::Write),
+                Box::new(|_| {}),
+            )
+            .await
+            .unwrap_err();
+        assert!(!err.is_retryable(), "{err:?}");
+        assert_eq!(fake.requests.lock().unwrap().len(), 1, "{err:?}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn retrying_retries_structured_calls_and_scenes() {
+    let answer = json!({
+        "topic_title": "Fourier series",
+        "subject_title": "Signals and systems",
+        "lessons": [
+            {
+                "title": "Orthogonality",
+                "summary": "Why sines are orthogonal.",
+                "minutes": 12,
+                "queries": ["orthogonality of sines"],
+                "must_cite": [],
+            },
+            {
+                "title": "Coefficients",
+                "summary": "Deriving a_n.",
+                "minutes": 15,
+                "queries": ["coefficient a_n"],
+                "must_cite": [],
+            },
+        ],
+    });
+    let (client, fake) = spawn(vec![
+        rate_limited("0"),
+        Reply::Text(StatusCode::INTERNAL_SERVER_ERROR, "oops".into()),
+        json_reply(answer),
+    ])
+    .await;
+    let (on_wait, seen) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let plan = plan_course(&model, &plan_request(), &CallOptions::new(Route::Write))
+        .await
+        .unwrap();
+    assert_eq!(plan.value.lessons.len(), 2);
+    let requests = all_requests(&fake);
+    assert_eq!(requests.len(), 3);
+    // Every attempt asks for the strict schema.
+    assert!(
+        requests
+            .iter()
+            .all(|r| r["text"]["format"]["type"] == "json_schema")
+    );
+    assert_eq!(seen.lock().unwrap().len(), 4);
+
+    let scene = "```python\nimport manimgx as m\n\nclass LessonScene(m.Scene):\n    pass\n```";
+    let (client, fake) = spawn(vec![
+        Reply::Text(StatusCode::BAD_GATEWAY, "upstream down".into()),
+        whole(text_stream(&[scene])),
+    ])
+    .await;
+    let (on_wait, _) = recorder();
+    let model = Retrying::new(client, quick(), on_wait);
+    let req = SceneRequest {
+        lesson_title: "Coefficients".into(),
+        lesson_body_md: "## Idea".into(),
+        previous_attempt: None,
+    };
+    let code = write_scene_with(&model, &req, &CallOptions::new(Route::Write))
+        .await
+        .unwrap();
+    assert!(code.value.contains("class LessonScene"));
+    assert_eq!(fake.requests.lock().unwrap().len(), 2);
+}
+
+/// A job stopped mid-wait (its future dropped) still reports the wait's end, and no
+/// second call is made.
+#[tokio::test]
+async fn retrying_reports_the_end_of_a_wait_cut_short() {
+    let (client, fake) = spawn(vec![rate_limited("600")]).await;
+    let (on_wait, seen) = recorder();
+    let model = Arc::new(Retrying::new(client, quick(), on_wait));
+    let call = {
+        let model = model.clone();
+        tokio::spawn(async move {
+            model
+                .stream_parts(
+                    "I",
+                    &[InputPart::Text("x".into())],
+                    &CallOptions::new(Route::Write),
+                    Box::new(|_| {}),
+                )
+                .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no wait was reported");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let waiting = seen.lock().unwrap()[0].clone().unwrap();
+    // Ten minutes, as asked: not capped at `max_delay`.
+    assert!(until(&waiting) >= SystemTime::now() + Duration::from_secs(590));
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(seen.lock().unwrap().last(), Some(&None));
+    assert_eq!(fake.requests.lock().unwrap().len(), 1);
 }

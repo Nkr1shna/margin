@@ -54,11 +54,13 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent|dogfood --service-url URL [--variant NAME]
-      [--write-baseline] [--no-judge]
+  run --suite retrieval|courses|agent|dogfood|injection --service-url URL
+      [--variant NAME] [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
                         beside the dev service at URL; dogfood runs the retrieval suite
-                        over the repository's docs/ with evals/golden/dogfood.jsonl
+                        over the repository's docs/ with evals/golden/dogfood.jsonl;
+                        injection asks evals/golden/injection.jsonl over the canaries in
+                        evals/corpus/injection/ on each configured provider
   harvest --service-url URL [--since T] [--out FILE]
                         Turn agents' context-API searches and the passages they read
                         after them (trace rows with via \"mcp\") into candidate questions,
@@ -82,6 +84,12 @@ Commands:
                         with efficiency from exported traces or the service at URL
   export --service-url URL [--kind K] [--from T] [--to T] [--trace-id ID] [--out FILE]
                         Export the service's trace rows over GET /api/traces to JSONL
+  alerts --service-url URL
+                        The service's active alerts and the last day's rises and clears
+  perf --service-url URL
+                        Measure the service against evals/budgets.toml (ingest, retrieval,
+                        context search, agent step overhead, cache share, title, memory)
+                        and print each budget as met or missed
   runs                  List the runs in the runner's database
 
 Options for every command:
@@ -151,6 +159,10 @@ pub enum Command {
         since: Option<DateTime<Utc>>,
         out: Option<PathBuf>,
     },
+    /// `docs/phase5-brief.md` D6.
+    Alerts,
+    /// `docs/phase5-brief.md` D8.
+    Perf,
     Runs,
     Help,
 }
@@ -162,6 +174,8 @@ pub enum Suite {
     Agent,
     /// The retrieval suite over `docs/` with the questions agents really asked.
     Dogfood,
+    /// Prompt-injection resistance over `corpus/injection/` (`docs/phase5-brief.md` D2).
+    Injection,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,13 +190,15 @@ pub struct Cli {
 
 impl Command {
     /// Whether it reads the service, so `--service-url` is required: `run`, `export`,
-    /// `harvest` and `report --service`.
+    /// `harvest`, `alerts`, `perf` and `report --service`.
     pub fn needs_service_url(&self) -> bool {
         matches!(
             self,
             Command::Run { .. }
                 | Command::Export { .. }
                 | Command::Harvest { .. }
+                | Command::Alerts
+                | Command::Perf
                 | Command::Report { service: true, .. }
         )
     }
@@ -196,6 +212,8 @@ impl Command {
                 | Command::Report { .. }
                 | Command::Export { .. }
                 | Command::Harvest { .. }
+                | Command::Alerts
+                | Command::Perf
                 | Command::Runs
                 | Command::Help
         )
@@ -287,10 +305,11 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 Some("courses") => Suite::Courses,
                 Some("agent") => Suite::Agent,
                 Some("dogfood") => Suite::Dogfood,
+                Some("injection") => Suite::Injection,
                 Some(other) => {
-                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood)")
+                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood, injection)")
                 }
-                None => bail!("run needs --suite retrieval|courses|agent|dogfood"),
+                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection"),
             },
             variant,
             write_baseline: flag(take("write-baseline")),
@@ -337,6 +356,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
             since: time(take("since"))?,
             out: take("out").map(PathBuf::from),
         },
+        Some("alerts") => Command::Alerts,
+        Some("perf") => Command::Perf,
         Some("runs") => Command::Runs,
         Some(other) => bail!("no command \"{other}\""),
     };
@@ -429,6 +450,30 @@ mod tests {
 
     fn p(s: &str) -> anyhow::Result<Cli> {
         parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn parses_the_phase5_commands() {
+        let url = "--service-url http://127.0.0.1:8787";
+        assert_eq!(
+            p(&format!("run --suite injection --variant v {url}"))
+                .unwrap()
+                .command,
+            Command::Run {
+                suite: Suite::Injection,
+                variant: "v".into(),
+                write_baseline: false,
+                judge: true
+            }
+        );
+        for (args, cmd) in [("alerts", Command::Alerts), ("perf", Command::Perf)] {
+            let c = p(&format!("{args} {url}")).unwrap();
+            assert_eq!(c.command, cmd);
+            assert!(!c.command.is_live());
+            // Both read the service.
+            assert!(p(args).is_err());
+            assert!(p(&format!("{args} --service-url https://{PROD_HOST}")).is_err());
+        }
     }
 
     #[test]
@@ -549,6 +594,12 @@ mod tests {
             }
         );
         assert!(!p("runs").unwrap().command.is_live());
+        assert!(
+            p("run --suite injection --service-url http://127.0.0.1:8787")
+                .unwrap()
+                .command
+                .is_live()
+        );
         // The dogfood feed (plan-dogfood §6).
         assert_eq!(
             p("run --suite dogfood --service-url http://127.0.0.1:8787")

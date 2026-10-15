@@ -16,6 +16,7 @@
 //! phase's first commit: a change goes through the orchestrator.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures_util::Stream;
 use margin_shared::pipeline::Route;
@@ -157,6 +158,229 @@ impl CallOptions {
             opts.prompt_version = Some(prompt.version.to_string());
         }
         opts
+    }
+}
+
+/// How a failed model call is retried, for the agent loop and every job call alike
+/// (`docs/phase5-brief.md` D4: the one retry policy): `retries` more attempts after
+/// the first, each after the pause the API asked for (`Retry-After`, honoured as asked
+/// however long, plus up to `jitter` so two callers told the same thing don't retry at
+/// the same instant), else `base_delay · 2^n` capped at `max_delay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    /// Retries after the first attempt.
+    pub retries: u32,
+    pub base_delay: Duration,
+    /// Longest computed pause. A `Retry-After` isn't capped (owner decision).
+    pub max_delay: Duration,
+    /// Most random time added to a `Retry-After` pause.
+    pub jitter: Duration,
+}
+
+impl Default for Backoff {
+    /// 3 retries, 2 s doubling up to 60 s, `Retry-After` plus 0–1 s.
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(60),
+            jitter: Duration::from_secs(1),
+        }
+    }
+}
+
+impl Backoff {
+    /// No computed pauses, for tests (a `Retry-After` is still honoured).
+    pub fn immediate() -> Self {
+        Self {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+
+    /// The pause before retry number `attempt + 1`: `retry_after` when the API sent one,
+    /// as asked plus up to `jitter`; else `base_delay · 2^attempt`, at most `max_delay`.
+    pub fn pause(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        match retry_after {
+            Some(wait) => wait.saturating_add(jitter(self.jitter)),
+            None => self
+                .base_delay
+                .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+                .min(self.max_delay),
+        }
+    }
+
+    /// The pause before the next attempt after `err`, where `attempt` counts the retries
+    /// already made; `None` when `err` isn't worth retrying or the retries are used up.
+    pub fn delay(&self, attempt: u32, err: &AiError) -> Option<Duration> {
+        if attempt >= self.retries || !err.is_retryable() {
+            return None;
+        }
+        Some(self.pause(attempt, err.retry_after()))
+    }
+}
+
+/// A random pause of up to `max` (to the millisecond).
+fn jitter(max: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let max_ms = max.as_millis().min(u128::from(u64::MAX)) as u64;
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    // `RandomState` is seeded randomly per instance: enough randomness for spreading
+    // retries, without a dependency.
+    let random = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    Duration::from_millis(random % (max_ms + 1))
+}
+
+/// Called when a retried call starts waiting (`Some`, with until when and why) and
+/// when the wait ends (`None`).
+pub type OnWait = Box<dyn Fn(Option<margin_shared::Waiting>) + Send + Sync>;
+
+/// A [`TextModel`] whose calls are retried as `backoff` says when they fail before any
+/// delta arrived (429 except `NOT_RETRYABLE_429`, 5xx incl. 529, network), reporting
+/// each wait through `on_wait` (`docs/phase5-brief.md` D4). The service wraps every
+/// text model it hands to a job (lessons, scenes, the planner, titles, condense).
+pub struct Retrying<M> {
+    pub inner: M,
+    pub backoff: Backoff,
+    pub on_wait: OnWait,
+}
+
+impl<M: TextModel> Retrying<M> {
+    pub fn new(inner: M, backoff: Backoff, on_wait: OnWait) -> Self {
+        Self {
+            inner,
+            backoff,
+            on_wait,
+        }
+    }
+}
+
+impl<M: TextModel> Retrying<M> {
+    /// The pause before the next attempt after `err` (`attempt` retries made so far),
+    /// waited with `on_wait` told until when and why; `None` (no wait) when `err` isn't
+    /// worth retrying or the retries are used up.
+    async fn wait(&self, attempt: u32, err: &AiError) -> Option<()> {
+        /// Reports the wait's end, also when the call is dropped mid-wait (a stopped
+        /// job).
+        struct Ends<'a>(&'a OnWait);
+        impl Drop for Ends<'_> {
+            fn drop(&mut self) {
+                (self.0)(None);
+            }
+        }
+        let pause = self.backoff.delay(attempt, err)?;
+        tracing::info!(attempt, ?pause, error = %err, "retrying the model call");
+        (self.on_wait)(Some(waiting(pause, err)));
+        let _ends = Ends(&self.on_wait);
+        tokio::time::sleep(pause).await;
+        Some(())
+    }
+}
+
+/// The wait of `pause` from now after `err`. A pause past a century shows as a
+/// century (a date can't name the end of `Duration::MAX`).
+fn waiting(pause: Duration, err: &AiError) -> margin_shared::Waiting {
+    const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    let now = std::time::SystemTime::now();
+    let until = now.checked_add(pause.min(CENTURY)).unwrap_or(now);
+    margin_shared::Waiting {
+        until: until.into(),
+        reason: err.wait_reason().to_string(),
+    }
+}
+
+impl<M: TextModel> TextModel for Retrying<M> {
+    /// Retries while no text has reached `on_delta`: once the caller has shown output,
+    /// starting over would repeat it, so a later failure is returned as it is.
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        Box::pin(async move {
+            let on_delta = std::sync::Mutex::new(on_delta);
+            let mut attempt = 0;
+            loop {
+                let started = AtomicBool::new(false);
+                let forward = |delta: &str| {
+                    if !delta.is_empty() {
+                        started.store(true, Ordering::Relaxed);
+                    }
+                    let mut on_delta = on_delta.lock().unwrap_or_else(|e| e.into_inner());
+                    on_delta(delta);
+                };
+                let err = match self
+                    .inner
+                    .stream_parts(instructions, input, opts, Box::new(forward))
+                    .await
+                {
+                    Ok(out) => return Ok(out),
+                    Err(e) if started.load(Ordering::Relaxed) => return Err(e),
+                    Err(e) => e,
+                };
+                if self.wait(attempt, &err).await.is_none() {
+                    return Err(err);
+                }
+                attempt += 1;
+            }
+        })
+    }
+
+    /// Retries every retryable failure: a structured answer shows nothing until it is
+    /// complete.
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        Box::pin(async move {
+            let mut attempt = 0;
+            loop {
+                let err = match self
+                    .inner
+                    .stream_json(instructions, input, format, opts)
+                    .await
+                {
+                    Ok(out) => return Ok(out),
+                    Err(e) => e,
+                };
+                if self.wait(attempt, &err).await.is_none() {
+                    return Err(err);
+                }
+                attempt += 1;
+            }
+        })
+    }
+}
+
+/// A shared text model is a text model (the service hands out `Arc<dyn TextModel>`).
+impl<T: TextModel + ?Sized> TextModel for std::sync::Arc<T> {
+    fn stream_parts<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        opts: &'a CallOptions,
+        on_delta: Box<dyn FnMut(&str) + Send + 'a>,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        (**self).stream_parts(instructions, input, opts, on_delta)
+    }
+
+    fn stream_json<'a>(
+        &'a self,
+        instructions: &'a str,
+        input: &'a [InputPart],
+        format: &'a JsonFormat,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<TextOutput, AiError>> {
+        (**self).stream_json(instructions, input, format, opts)
     }
 }
 

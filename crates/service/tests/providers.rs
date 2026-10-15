@@ -1017,8 +1017,13 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
     };
     assert_eq!(account.email, OWNER_EMAIL);
     assert!(account.expires_at.is_some());
-    sock.until(|e| matches!(e, Event::SettingsChanged { settings } if settings.chatgpt.is_some()))
+    let events = sock
+        .until(|e| matches!(e, Event::SettingsChanged { settings } if settings.chatgpt.is_some()))
         .await;
+    // The broadcast carries the account (its email), never a token.
+    let sent = serde_json::to_string(&events).unwrap();
+    assert!(sent.contains(OWNER_EMAIL), "{sent}");
+    assert!(!sent.contains("at-1") && !sent.contains("rt-1"), "{sent}");
     let body = h
         .get(&t, routes::SETTINGS)
         .send()

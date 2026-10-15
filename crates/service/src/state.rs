@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
@@ -191,6 +192,12 @@ pub struct SettingsRow {
     /// The Claude slots; `None` = `RouteModels::claude_default`.
     #[serde(default)]
     pub claude_models: Option<RouteModels>,
+    /// The `db::SCHEMA_VERSION` of the build that last opened this data. A row from
+    /// before phase 5 has none (0) and reads as 1 (`schema_version()`). A newer one than
+    /// the build's refuses to serve; an older one is backed up before migrating
+    /// (`docs/phase5-brief.md` D5).
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 fn trace_retention_days() -> u32 {
@@ -198,6 +205,11 @@ fn trace_retention_days() -> u32 {
 }
 
 impl SettingsRow {
+    /// `schema_version`, with a row from before the field read as version 1.
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version.max(1)
+    }
+
     /// `provider`'s three slots as stored (before any pipeline override).
     pub fn slots(&self, provider: Provider) -> RouteModels {
         match provider {
@@ -266,6 +278,7 @@ impl Default for SettingsRow {
             openai_models: None,
             chatgpt_models: None,
             claude_models: None,
+            schema_version: db::SCHEMA_VERSION,
         }
     }
 }
@@ -348,6 +361,11 @@ pub struct App {
     pub sources_replaced: Mutex<HashSet<Id>>,
     /// The model providers' endpoints, the ChatGPT sign-in and the model windows.
     pub providers: crate::providers::Providers,
+    /// Alerts raised from the traces (`alerts::run`).
+    pub alerts: Arc<Mutex<crate::alerts::Alerts>>,
+    /// HTTP answers with a 5xx status since start (`server::log_requests`), for the
+    /// alert job's `http_5xx` count.
+    pub http_errors: AtomicU64,
     /// Each person's expanded read set, cleared whole after any person, group,
     /// membership or agent write (`groups::Expansions::invalidate_all`).
     pub expansions: crate::groups::Expansions,

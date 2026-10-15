@@ -633,13 +633,13 @@ async fn a_short_search_is_rewritten_once_and_thin_lesson_plans_are_too() {
     assert_eq!(retrievals(&rows)[0].queries, Some(3));
 
     // A lesson the agent adds with `write_lesson` (no proposal; two strings): one call,
-    // as a lesson.
+    // as a lesson. The tool acts as the chat's owner (L1), so it runs in the chat above.
     let before = h.generator.rewrite_requests.lock().unwrap().len();
     let registry = margin_service::agent_tools::registry(&h.state);
     let tool = registry.get("write_lesson").unwrap().clone();
     let out = tool
         .run(
-            &tool_ctx("no-chat"),
+            &tool_ctx(&d.chat.id),
             json!({
                 "topic_id": lesson.topic_id,
                 "title": "Gibbs",
@@ -714,7 +714,7 @@ async fn the_prompt_catalog_lists_every_prompt_the_service_sends() {
             .find(|p| p.job == "condense")
             .unwrap()
             .version,
-        "condense-v1"
+        "condense-v2"
     );
 }
 

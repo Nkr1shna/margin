@@ -2540,7 +2540,7 @@ pub fn folders_platform_help() -> Option<&'static str> {
         Some("macOS may ask once before Margin reads Desktop, Documents or Downloads.")
     } else if cfg!(target_os = "ios") {
         Some(
-            "Files that iCloud hasn't downloaded to this device are downloaded as they're sent. Sending happens while Margin is open.",
+            "Files that iCloud hasn't downloaded to this device are downloaded as they're sent. Sending keeps going after you leave Margin; iOS shows its progress and can end it to save power — open Margin to continue.",
         )
     } else if cfg!(target_os = "android") {
         Some("Sending happens while Margin is open.")

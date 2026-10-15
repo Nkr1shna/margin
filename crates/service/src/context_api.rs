@@ -27,6 +27,7 @@ use margin_shared::context::{
 };
 use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
+use margin_shared::text::for_model;
 use serde::Deserialize;
 
 use crate::db;
@@ -257,14 +258,20 @@ pub async fn ingest(
             }
         },
     };
-    if doc.name.trim().is_empty() {
+    // Another agent's writing reaches Margin's models when it is retrieved: stored as a
+    // model may read it (`text::for_model`, `docs/phase5-brief.md` D2.1).
+    let name = for_model(&doc.name);
+    let text = for_model(&doc.text);
+    if name.trim().is_empty() {
         return Err(AppError::bad_request("Give the document a name."));
     }
-    if doc.text.trim().is_empty() {
+    if text.trim().is_empty() {
         return Err(AppError::bad_request("The document has no text."));
     }
     let req = ContextIngest {
         origin: Origin::Agent { name: agent },
+        name,
+        text,
         ..doc
     };
     if let Some(existing) = existing_agent_document(&state, &req.origin, req.name.trim()).await?

@@ -32,6 +32,7 @@ use margin_shared::pipeline::{Budget, RetrievalPurpose, Route};
 use margin_shared::routes::{
     RERANK_QUERY_CHARS, RETRIEVAL_K_DENSE, RETRIEVAL_K_FUSED, RETRIEVAL_K_LEX, RRF_K,
 };
+use margin_shared::text::for_model;
 use margin_shared::{
     Chat, Citation, Event, Id, Proposal, ProposalStatus, Source, SourceKind, SourceStatus, Topic,
     Workspace, WorkspaceFile,
@@ -1802,8 +1803,8 @@ pub fn reranked_count(fused: &[Hit], reranked: &[Hit]) -> Option<u32> {
 
 /// Up to `REWRITE_SCOPE_NAMES` names of the documents in `resolved` (every document for
 /// the whole library) that a reader with `access` may see (L1; `None` = no filter), for
-/// the query rewriter's prompt: names, never passage text, and never a document the
-/// caller can't read.
+/// the query rewriter's prompt: names (through `text::for_model`), never passage text,
+/// and never a document the caller can't read.
 pub async fn scope_names(
     store: &Store,
     resolved: &Resolved,
@@ -1819,12 +1820,13 @@ pub async fn scope_names(
     let mut names: Vec<String> = Vec::new();
     for d in documents {
         let visible = access.is_none_or(|paths| d.access.iter().any(|a| may_see(paths, a)));
+        let name = for_model(&d.name);
         if (resolved.library || resolved.keys.contains(&d.id))
             && visible
-            && !d.name.trim().is_empty()
-            && !names.contains(&d.name)
+            && !name.trim().is_empty()
+            && !names.contains(&name)
         {
-            names.push(d.name);
+            names.push(name);
         }
     }
     names.sort();
@@ -2093,6 +2095,7 @@ pub fn folder_file_name(folder: Option<&str>, path: &str) -> String {
 pub async fn describe_packed(state: &AppState, packed: &mut [Packed]) -> anyhow::Result<()> {
     let mut infos: HashMap<String, Option<DocInfo>> = HashMap::new();
     for p in packed.iter_mut() {
+        normalise_packed(p);
         let doc = p.citation.document_id.clone().unwrap_or_default();
         if !infos.contains_key(&doc) {
             infos.insert(doc.clone(), doc_info(&state.store, &doc).await?);
@@ -2108,6 +2111,10 @@ pub async fn describe_packed(state: &AppState, packed: &mut [Packed]) -> anyhow:
         c.source_name.clone_from(&info.name);
         c.kind = info.kind;
         c.file.clone_from(&info.file);
+        c.source_name = for_model(&c.source_name);
+        if let Some(file) = &mut c.file {
+            file.path = for_model(&file.path);
+        }
         if c.image_url.is_none()
             && let Some(source_id) = &info.source_id
         {
@@ -2115,6 +2122,26 @@ pub async fn describe_packed(state: &AppState, packed: &mut [Packed]) -> anyhow:
         }
     }
     Ok(())
+}
+
+/// A packed passage as a model may read it (`docs/phase5-brief.md` D2.1): its text,
+/// its hits' text and section paths, and its citation's name, excerpt and section
+/// through `text::for_model`. Every packed passage passes here before it reaches a
+/// prompt (lessons, the planner), a tool output or the context API, and before it is
+/// cached.
+pub fn normalise_packed(p: &mut Packed) {
+    p.text = for_model(&p.text);
+    for h in &mut p.hits {
+        h.passage.text = for_model(&h.passage.text);
+        h.passage.section_path = for_model(&h.passage.section_path);
+    }
+    let c = &mut p.citation;
+    c.source_name = for_model(&c.source_name);
+    c.excerpt = for_model(&c.excerpt);
+    c.section_path = c.section_path.as_deref().map(for_model);
+    if let Some(file) = &mut c.file {
+        file.path = for_model(&file.path);
+    }
 }
 
 /// The picture shown with a text passage: its rendered PDF page, or the video frame
@@ -2318,15 +2345,16 @@ pub fn context_hit(
         unit_id: row.unit_id.clone(),
         passage_id: row.id.clone(),
         modality,
-        section_path: row.section_path.clone(),
+        section_path: for_model(&row.section_path),
         page: row.page.map(|v| v as u32),
         start_line: row.start_line.map(|v| v as u32),
         end_line: row.end_line.map(|v| v as u32),
         start_ms: row.start_ms.map(|v| v as u64),
         end_ms: row.end_ms.map(|v| v as u64),
-        text: row.text.clone(),
+        // What the context API and the tools return is what a model reads.
+        text: for_model(&row.text),
         score,
-        highlight,
+        highlight: highlight.as_deref().map(for_model),
     }
 }
 
@@ -2343,7 +2371,7 @@ pub fn packed_hit(p: &Packed) -> margin_shared::context::Hit {
         p.hits.iter().map(|h| h.score).fold(f32::MIN, f32::max),
         p.hits.iter().find_map(|h| h.highlight.clone()),
     );
-    hit.text.clone_from(&p.text);
+    hit.text = for_model(&p.text);
     hit
 }
 

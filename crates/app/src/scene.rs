@@ -62,6 +62,9 @@ define_class!(
             _session: &UISceneSession,
             _options: &UISceneConnectionOptions,
         ) {
+            // The continued-processing task's launch handler (src/background/ios.rs),
+            // registered while the app launches; once, on the main thread.
+            crate::background::ios::register(self.mtm());
             let Some(scene) = scene.downcast_ref::<UIWindowScene>() else {
                 return;
             };

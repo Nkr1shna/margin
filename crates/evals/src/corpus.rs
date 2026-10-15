@@ -21,6 +21,9 @@ use sha2::{Digest, Sha256};
 const SOURCES_DIR: &str = "sources";
 /// The attached-folder tree.
 pub const FOLDER_DIR: &str = "folder";
+/// The prompt-injection canaries (`docs/phase5-brief.md` D2): read by the injection
+/// suite only, never part of the retrieval corpus or its hash.
+pub const INJECTION_DIR: &str = "injection";
 
 /// One document of the corpus.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +98,7 @@ fn files(dir: &Path) -> anyhow::Result<Vec<String>> {
     }
     let mut out = Vec::new();
     walk(dir, dir, &mut out)?;
+    out.retain(|rel| rel.split('/').next() != Some(INJECTION_DIR));
     out.sort();
     Ok(out)
 }

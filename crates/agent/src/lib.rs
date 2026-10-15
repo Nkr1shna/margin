@@ -43,7 +43,8 @@ pub use scripted::{Recorded, Scripted, ScriptedModel};
 pub use sink::{ItemRecord, SinkError, TurnSink};
 pub use tool::{
     ConfirmationPrompt, Tool, ToolContext, ToolKind, ToolOutput, Typed, TypedTool,
-    check_strict_schema, error_output, strict_schema, truncate_output,
+    check_strict_schema, clean_card, clean_web_result, error_output, strict_schema,
+    truncate_output,
 };
 pub use turn::{
     RetryPolicy, SUMMARY_INSTRUCTIONS, SUMMARY_PROMPT_VERSION, TurnDeps, TurnInput, TurnOutcome,

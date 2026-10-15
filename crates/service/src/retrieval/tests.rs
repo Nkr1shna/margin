@@ -1087,7 +1087,10 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
         ["a-paper.pdf", "b-notes.pdf"]
     );
     let eng = vec!["company/eng".to_string()];
-    assert_eq!(scope_names(&s, &resolved, Some(&eng)).await, ["a-paper.pdf"]);
+    assert_eq!(
+        scope_names(&s, &resolved, Some(&eng)).await,
+        ["a-paper.pdf"]
+    );
     let nobody: Vec<String> = Vec::new();
     assert!(scope_names(&s, &library, Some(&nobody)).await.is_empty());
 }

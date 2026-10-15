@@ -18,6 +18,7 @@ use margin_ai::{
 use margin_embed::{Chunk, Extracted, SourceKind};
 use margin_shared::context::{Modality, Scope};
 use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose, RouteTable, StageCfg};
+use margin_shared::text::for_model;
 use margin_shared::{Citation, Provider};
 
 use crate::db::{PassageRow, Store};
@@ -689,7 +690,8 @@ impl Packer for TakeK {
 /// The hits as the rerank prompt's candidates (ids are passage ids), labelled by
 /// `RerankCandidate::new`: "notes/paper.pdf, p. 3, Fourier series > Coefficients" (the
 /// document's name from `names`, else its id; then the page and the section when it
-/// has them).
+/// has them). Name, section and text pass `text::for_model` (phase 5) as every passage
+/// does before a model reads it.
 pub fn rerank_candidates(hits: &[Hit], names: &HashMap<String, String>) -> Vec<RerankCandidate> {
     hits.iter()
         .map(|h| {
@@ -700,10 +702,10 @@ pub fn rerank_candidates(hits: &[Hit], names: &HashMap<String, String>) -> Vec<R
                 .unwrap_or(&p.document_id);
             RerankCandidate::new(
                 &p.id,
-                document,
+                &for_model(document),
                 p.page.and_then(|n| u32::try_from(n).ok()),
-                &p.section_path,
-                p.text.clone(),
+                &for_model(&p.section_path),
+                for_model(&p.text),
             )
         })
         .collect()

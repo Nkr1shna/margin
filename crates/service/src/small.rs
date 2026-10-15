@@ -1,9 +1,10 @@
 //! The service's `SmallModels` (R2, `docs/r2-brief.md` D1, D2): a provider's
 //! small-tasks model resolved through `AppState::model_for(Route::Small, provider)` and
 //! `Generator::text_model`; the rerank and rewrite calls go through `Generator::rerank`
-//! and `Generator::rewrite_queries` (scripted by `FakeGenerator` in tests) and are
-//! recorded as `model_call` rows (route `small`, their prompt version, the job, the
-//! retrieval row as parent, the cost). The registry is built before the `App` it reads
+//! and `Generator::rewrite_queries` (scripted by `FakeGenerator` in tests), retried as
+//! job calls are (phase 5, `JobCalls`), and are recorded as `model_call` rows (route
+//! `small`, their prompt version, the job, the retrieval row as parent, the cost,
+//! `provider_ms`; a retried attempt is a failed row of its own). The registry is built before the `App` it reads
 //! from, so the state is bound after (`bind`).
 //!
 //! It also finds the local cross-encoder (`"onnx-crossencoder"`): the download under
@@ -20,7 +21,8 @@ use margin_embed::{EmbedError, RerankerFiles, RerankerModel};
 use margin_shared::Provider;
 use margin_shared::pipeline::Route;
 
-use crate::engines::{BoxFuture, ModelChoice};
+use crate::ask::job_backoff;
+use crate::engines::{BoxFuture, JobCalls, ModelChoice, failed_attempts};
 use crate::pipeline::{SmallCall, SmallModel, SmallModels};
 use crate::state::{App, AppState};
 use crate::trace::{self, SpanGuard};
@@ -82,6 +84,19 @@ fn small_call_span(
     span
 }
 
+/// How a small call's attempts are retried (phase 5 D4): the service's job backoff,
+/// each failed attempt a `model_call` row like `span`'s, the span's clock so its row
+/// times the last attempt and carries `provider_ms`. A wait shows nowhere: the stage's
+/// own timeout bounds the whole call, and the retrieval falls back when it passes.
+fn job_calls(app: &AppState, span: &mut SpanGuard) -> JobCalls {
+    JobCalls {
+        backoff: job_backoff(app),
+        on_wait: Arc::new(|_| {}),
+        on_failed: failed_attempts(app, span.row().clone()),
+        clock: Some(span.clock()),
+    }
+}
+
 /// Finishes `span` with the call's usage, or fails it with the error's code.
 fn finish<T>(
     mut span: SpanGuard,
@@ -126,8 +141,10 @@ impl SmallModels for StateModels {
     ) -> BoxFuture<'a, anyhow::Result<Vec<Ranked>>> {
         Box::pin(async move {
             let (app, choice) = self.choice(Some(small.provider)).await?;
-            let span = small_call_span(&app, &choice, RERANK_VERSION, &call);
-            let result = app.generator.rerank(&choice, query, candidates, opts).await;
+            let mut span = small_call_span(&app, &choice, RERANK_VERSION, &call);
+            let result = job_calls(&app, &mut span)
+                .run(app.generator.rerank(&choice, query, candidates, opts))
+                .await;
             finish(span, result)
         })
     }
@@ -141,8 +158,10 @@ impl SmallModels for StateModels {
     ) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
         Box::pin(async move {
             let (app, choice) = self.choice(Some(small.provider)).await?;
-            let span = small_call_span(&app, &choice, REWRITE_VERSION, &call);
-            let result = app.generator.rewrite_queries(&choice, input, opts).await;
+            let mut span = small_call_span(&app, &choice, REWRITE_VERSION, &call);
+            let result = job_calls(&app, &mut span)
+                .run(app.generator.rewrite_queries(&choice, input, opts))
+                .await;
             finish(span, result)
         })
     }
