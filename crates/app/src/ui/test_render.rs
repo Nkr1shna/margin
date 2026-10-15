@@ -40,6 +40,8 @@ pub struct Extra {
     pub me: Option<Me>,
     /// The sign-in screen's build: pinned to this service, or a developer build (`None`).
     pub pinned: Option<String>,
+    /// The Audience control, open on this unit over the screen.
+    pub audience: Option<crate::ui::audience::AudienceTarget>,
 }
 
 #[allow(non_snake_case)]
@@ -93,7 +95,13 @@ fn Harness(props: HarnessProps) -> Element {
         let pinned = extra.pinned.clone();
         return rsx! { crate::ui::signin::ConnectScreen { pinned } };
     }
-    rsx! { Router::<Route> {} }
+    let audience = extra.audience.clone();
+    rsx! {
+        Router::<Route> {}
+        if let Some(target) = audience {
+            crate::ui::audience::AudienceDialog { target, on_close: |_| {} }
+        }
+    }
 }
 
 /// The app's HTML on `route` with `lib` loaded.

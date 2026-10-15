@@ -11,6 +11,8 @@ mod drafts;
 mod events;
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod l2_tests;
 // `StdDir` and some `DirError`s are used by the platforms' `open` (4a, 4b, 4c), which
 // aren't built on every platform yet.
 #[allow(dead_code)]

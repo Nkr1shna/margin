@@ -20,6 +20,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use margin_shared::*;
 use tokio::sync::broadcast;
 
+#[path = "fake_l2.rs"]
+mod l2;
+pub use l2::{owner_of, sample_audit, sample_documents};
+
 /// Alice's device token (`d1`, "test-mac"): the organisation's owner.
 pub const TOKEN: &str = "test-device-token";
 /// Bob's device token (`d3`): a member.
@@ -107,6 +111,15 @@ pub struct FakeState {
     pub tokens: HashMap<String, (Id, Id)>,
     /// Who the next approved sign-in is (`ALICE` or `BOB`).
     pub login_as: Id,
+    /// Documents agents ingested (`routes::CONTEXT_INGEST`), as the change feed lists
+    /// them (L2).
+    pub documents: Vec<margin_shared::context::Document>,
+    /// Deleted documents: id, the generation of the deletion, and who could read it.
+    pub doc_tombstones: Vec<(Id, u64, Audience)>,
+    /// The change feed's generation.
+    pub generation: u64,
+    /// The audit trail (L2 D7), oldest first.
+    pub audit: Vec<margin_shared::context::AuditRow>,
 }
 
 /// An upload in parts the fake is receiving.
@@ -144,6 +157,8 @@ pub struct Fake {
     pub events: broadcast::Sender<Event>,
     /// Frames for the device on the socket (every connected socket gets them here).
     pub directed: broadcast::Sender<DirectedFrame>,
+    /// Events for some people only (`AudienceRevoked` to who lost access).
+    pub targeted: broadcast::Sender<(Vec<Id>, Event)>,
 }
 
 pub struct FakeService {
@@ -151,6 +166,7 @@ pub struct FakeService {
     pub state: Arc<Mutex<FakeState>>,
     pub events: broadcast::Sender<Event>,
     pub directed: broadcast::Sender<DirectedFrame>,
+    pub targeted: broadcast::Sender<(Vec<Id>, Event)>,
 }
 
 fn ts(n: i64) -> DateTime<Utc> {
@@ -349,11 +365,43 @@ pub fn sample_citations() -> Vec<Citation> {
     ]
 }
 
+/// Who reads the sample rows (L2): Signals & Systems and everything in it is shared
+/// with Engineering; Linear Algebra and the file s8 are private to Alice.
+fn sample_access(topic_id: Option<&str>) -> Vec<String> {
+    match topic_id {
+        Some("signals" | "complex" | "fourier") => {
+            vec![person_id(ALICE), "company/engineering".into()]
+        }
+        _ => vec![person_id(ALICE)],
+    }
+}
+
+/// What "Computing coefficients" cites: Alice's private interview notes, so it is
+/// narrowed to her (L2 D4).
+pub fn narrowed_citation() -> Citation {
+    Citation {
+        n: 1,
+        source_id: "s8".into(),
+        source_name: "interview-notes.md".into(),
+        kind: SourceKind::Text,
+        page: None,
+        start_ms: None,
+        end_ms: None,
+        excerpt: "Orthogonality is what lets each coefficient be computed on its own.".into(),
+        image_url: None,
+        document_id: Some("doc-s8".into()),
+        start_line: Some(2),
+        end_line: Some(2),
+        file: None,
+        section_path: None,
+    }
+}
+
 pub fn sample_library() -> Library {
     let topic = |id: &str, parent: Option<&str>, title: &str, position| Topic {
-        access: Vec::new(),
+        access: sample_access(Some(id)),
         deny: Vec::new(),
-        owner: None,
+        owner: Some(ALICE.into()),
         id: id.into(),
         parent_id: parent.map(Into::into),
         title: title.into(),
@@ -362,9 +410,9 @@ pub fn sample_library() -> Library {
         updated_at: ts(0),
     };
     let lesson = |id: &str, topic_id: &str, title: &str, position, status, body: &str| Lesson {
-        access: Vec::new(),
+        access: sample_access(Some(topic_id)),
         deny: Vec::new(),
-        owner: None,
+        owner: Some(ALICE.into()),
         citations: Vec::new(),
         id: id.into(),
         topic_id: topic_id.into(),
@@ -406,14 +454,20 @@ pub fn sample_library() -> Library {
                     LESSON_ONE,
                 )
             },
-            lesson(
-                "l2",
-                "fourier",
-                "Computing coefficients",
-                1,
-                LessonStatus::Ready,
-                "## Orthogonality\n\nThe integral of $\\sin m t \\sin n t$ over a period is zero unless $m = n$.\n",
-            ),
+            Lesson {
+                // It drew on a private file: visible only to Alice.
+                access: vec![person_id(ALICE)],
+                audience_narrowed: true,
+                citations: vec![narrowed_citation()],
+                ..lesson(
+                    "l2",
+                    "fourier",
+                    "Computing coefficients",
+                    1,
+                    LessonStatus::Ready,
+                    "## Orthogonality\n\nThe integral of $\\sin m t \\sin n t$ over a period is zero unless $m = n$.\n",
+                )
+            },
             lesson(
                 "l3",
                 "fourier",
@@ -434,7 +488,7 @@ pub fn sample_library() -> Library {
             ),
         ],
         notes: vec![
-            Note { access: Vec::new(), deny: Vec::new(), owner: None,
+            Note { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 id: "n1".into(),
                 topic_id: "fourier".into(),
                 lesson_id: Some("l1".into()),
@@ -444,7 +498,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(10),
                 updated_at: ts(10),
             },
-            Note { access: Vec::new(), deny: Vec::new(), owner: None,
+            Note { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 id: "n2".into(),
                 topic_id: "fourier".into(),
                 lesson_id: None,
@@ -469,7 +523,7 @@ pub fn sample_library() -> Library {
             updated_at: ts(0),
         }],
         sources: vec![
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s1", "original")),
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
@@ -486,7 +540,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s2", "original")),
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
@@ -503,7 +557,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: None,
                 id: "s3".into(),
                 topic_id: Some("fourier".into()),
@@ -518,7 +572,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s7", "original")),
                 id: "s7".into(),
                 topic_id: Some("fourier".into()),
@@ -535,7 +589,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s4", "original")),
                 id: "s4".into(),
                 topic_id: Some("fourier".into()),
@@ -552,7 +606,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s5", "original")),
                 id: "s5".into(),
                 topic_id: Some("fourier".into()),
@@ -569,7 +623,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source { access: Vec::new(), deny: Vec::new(), owner: None,
+            Source { access: sample_access(Some("fourier")), deny: Vec::new(), owner: Some(ALICE.into()),
                 media_url: Some(media_url("s6", "original")),
                 id: "s6".into(),
                 topic_id: Some("fourier".into()),
@@ -579,6 +633,20 @@ pub fn sample_library() -> Library {
                 bytes: 127_994,
                 status: SourceStatus::Ready { chunks: 5, pages: None, warning: None, },
                 created_at: ts(36),
+                workspace_id: None,
+                modified: None,
+            },
+            // A file of no topic (attached to a chat), private to Alice.
+            Source { access: sample_access(None), deny: Vec::new(), owner: Some(ALICE.into()),
+                media_url: None,
+                id: "s8".into(),
+                topic_id: None,
+                name: "interview-notes.md".into(),
+                folder: None,
+                kind: SourceKind::Text,
+                bytes: 1_200,
+                status: SourceStatus::Ready { chunks: 1, pages: None, warning: None },
+                created_at: ts(37),
                 workspace_id: None,
                 modified: None,
             },
@@ -692,6 +760,10 @@ impl FakeState {
             ]
             .into(),
             login_as: ALICE.into(),
+            documents: sample_documents(),
+            doc_tombstones: Vec::new(),
+            generation: 3,
+            audit: sample_audit(Utc::now()),
         };
         for (chat, items) in sample_chats() {
             for item in &items {
@@ -802,10 +874,12 @@ impl FakeService {
         }
         let (events, _) = broadcast::channel(1024);
         let (directed, _) = broadcast::channel(64);
+        let (targeted, _) = broadcast::channel(256);
         let fake = Fake {
             state: Arc::new(Mutex::new(state)),
             events: events.clone(),
             directed: directed.clone(),
+            targeted: targeted.clone(),
         };
         let app = router(fake.clone());
         tokio::spawn(async move {
@@ -816,6 +890,7 @@ impl FakeService {
             state: fake.state,
             events,
             directed,
+            targeted,
         }
     }
 
@@ -958,6 +1033,17 @@ pub fn router(fake: Fake) -> Router {
         .route(
             "/api/agents/{id}/token",
             post(mint_agent_token).delete(revoke_agent_token),
+        )
+        // Audiences, the audit trail and agents' documents (L2).
+        .route(
+            "/api/audience/{unit}/{id}",
+            get(l2::get_audience).put(l2::put_audience),
+        )
+        .route(routes::AUDIT, get(l2::audit))
+        .route(routes::CONTEXT_CHANGES, get(l2::context_changes))
+        .route(
+            "/api/context/documents/{id}",
+            axum::routing::delete(l2::delete_document),
         )
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
@@ -1105,11 +1191,13 @@ fn fake_media(s: &FakeState, video_id: &Id) -> VideoMedia {
 }
 
 async fn library(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
     let s = fake.state.lock().unwrap();
-    let mut lib = s.library.clone();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    // What the caller reads (L2).
+    let mut lib = s.library_for(&caller.person.id);
     lib.videos = lib.videos.into_iter().map(|v| with_media(&s, v)).collect();
     Json(lib).into_response()
 }
@@ -1119,11 +1207,12 @@ async fn create_topic(
     headers: HeaderMap,
     Json(req): Json<NewTopic>,
 ) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
     let topic = {
         let mut s = fake.state.lock().unwrap();
+        let me = match caller(&s, &headers) {
+            Ok(c) => c.person.id,
+            Err(r) => return r,
+        };
         let id = s.id("topic");
         let position = s
             .library
@@ -1131,10 +1220,17 @@ async fn create_topic(
             .iter()
             .filter(|t| t.parent_id == req.parent_id)
             .count() as i64;
+        // A sub-topic copies its parent's audience; a new subject is private (L2).
+        let audience = req
+            .parent_id
+            .as_ref()
+            .and_then(|p| s.topic_audience(p))
+            .map(|(_, a)| a)
+            .unwrap_or_else(|| crate::org::audience_of(Some(&me), &[], &[]));
         let topic = Topic {
-            access: Vec::new(),
-            deny: Vec::new(),
-            owner: None,
+            access: audience.access,
+            deny: audience.deny,
+            owner: Some(me),
             id,
             parent_id: req.parent_id,
             title: req.title,
@@ -1485,15 +1581,21 @@ async fn create_note(
     headers: HeaderMap,
     Json(req): Json<NewNote>,
 ) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
     let note = {
         let mut s = fake.state.lock().unwrap();
+        let me = match caller(&s, &headers) {
+            Ok(c) => c.person.id,
+            Err(r) => return r,
+        };
+        // It copies its topic's audience (L2).
+        let audience = s
+            .topic_audience(&req.topic_id)
+            .map(|(_, a)| a)
+            .unwrap_or_else(|| crate::org::audience_of(Some(&me), &[], &[]));
         let note = Note {
-            access: Vec::new(),
-            deny: Vec::new(),
-            owner: None,
+            access: audience.access,
+            deny: audience.deny,
+            owner: Some(me),
             id: s.id("note"),
             topic_id: req.topic_id,
             lesson_id: req.lesson_id,
@@ -1758,10 +1860,14 @@ impl FakeState {
                 videos.push(video);
             }
         }
-        // The proposal's sources now belong to the new topic.
+        // The proposal's sources now belong to the new topic, with its audience (L2).
+        let audience = self.topic_audience(&topic.id).map(|(_, a)| a);
         for src in self.library.sources.iter_mut() {
             if src.topic_id.is_none() && p.request.source_ids.contains(&src.id) {
                 src.topic_id = Some(topic.id.clone());
+                if let Some(a) = &audience {
+                    (src.access, src.deny) = (a.access.clone(), a.deny.clone());
+                }
                 events.push(Event::SourceChanged {
                     source: src.clone(),
                 });
@@ -2539,14 +2645,15 @@ async fn upload_source(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
+    let owner = match caller(&fake.state.lock().unwrap(), &headers) {
+        Ok(c) => c.person.id,
+        Err(r) => return r,
+    };
     let kind = match check_upload(&fake, &query, body.len() as u64) {
         Ok(kind) => kind,
         Err(r) => return r,
     };
-    add_source(&fake, query, kind, body.to_vec())
+    add_source(&fake, &owner, query, kind, body.to_vec())
 }
 
 /// The kind of an upload's file, or the service's refusal: a name Margin can't read,
@@ -2712,17 +2819,30 @@ fn add_folder_source(
 
 /// Records an uploaded file as a Queued source (read over a couple of seconds when
 /// simulating with the model downloaded).
-fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) -> Response {
+fn add_source(
+    fake: &Fake,
+    owner: &str,
+    query: UploadQuery,
+    kind: SourceKind,
+    body: Vec<u8>,
+) -> Response {
     if let Some(workspace_id) = query.workspace_id.clone() {
         return add_folder_source(fake, query, workspace_id, kind, body);
     }
     let (source, process) = {
         let mut s = fake.state.lock().unwrap();
         let id = s.id("source");
+        // A topic's file copies the topic's audience; one of no topic is private (L2).
+        let audience = query
+            .topic_id
+            .as_ref()
+            .and_then(|t| s.topic_audience(t))
+            .map(|(_, a)| a)
+            .unwrap_or_else(|| crate::org::audience_of(Some(owner), &[], &[]));
         let source = Source {
-            access: Vec::new(),
-            deny: Vec::new(),
-            owner: None,
+            access: audience.access,
+            deny: audience.deny,
+            owner: Some(owner.to_string()),
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: query.topic_id,
@@ -2898,8 +3018,11 @@ async fn finish_part_upload(
         workspace_id: upload.workspace_id,
         modified: upload.modified,
     };
+    let owner = caller(&fake.state.lock().unwrap(), &headers)
+        .map(|c| c.person.id)
+        .unwrap_or_else(|_| ALICE.into());
     match check_upload(&fake, &query, upload.bytes) {
-        Ok(kind) => add_source(&fake, query, kind, upload.data),
+        Ok(kind) => add_source(&fake, &owner, query, kind, upload.data),
         Err(r) => r,
     }
 }
@@ -3384,18 +3507,25 @@ async fn delete_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Respon
 }
 
 async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
+    let person = match caller(&fake.state.lock().unwrap(), &headers) {
+        Ok(c) => c.person.id,
+        Err(r) => return r,
+    };
     let rx = fake.events.subscribe();
     let directed = fake.directed.subscribe();
-    ws.on_upgrade(move |socket| socket_loop(socket, rx, directed))
+    let targeted = fake.targeted.subscribe();
+    ws.on_upgrade(move |socket| socket_loop(socket, fake, person, rx, directed, targeted))
 }
 
+/// One device's socket: every event its person may see (rows they read, their chats,
+/// audit rows for admins), the events meant for them, and the frames for devices.
 async fn socket_loop(
     mut socket: WebSocket,
+    fake: Fake,
+    person: Id,
     mut rx: broadcast::Receiver<Event>,
     mut directed: broadcast::Receiver<DirectedFrame>,
+    mut targeted: broadcast::Receiver<(Vec<Id>, Event)>,
 ) {
     let hello = Event::Hello {
         server_version: "fake-0.1".into(),
@@ -3409,6 +3539,24 @@ async fn socket_loop(
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
+                        let Some(event) = fake.state.lock().unwrap().visible_event(&person, event) else {
+                            continue;
+                        };
+                        let json = serde_json::to_string(&event).unwrap();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return,
+                }
+            }
+            event = targeted.recv() => {
+                match event {
+                    Ok((people, event)) => {
+                        if !people.contains(&person) {
+                            continue;
+                        }
                         let json = serde_json::to_string(&event).unwrap();
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             return;
@@ -5723,7 +5871,17 @@ async fn list_chats(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
-    let mut chats = fake.state.lock().unwrap().chats.clone();
+    let s = fake.state.lock().unwrap();
+    let me = caller(&s, &headers)
+        .map(|c| c.person.id)
+        .unwrap_or_default();
+    // Chats stay private to their owner (L2).
+    let mut chats: Vec<Chat> = s
+        .chats
+        .iter()
+        .filter(|c| owner_of(&c.owner) == me)
+        .cloned()
+        .collect();
     chats.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
     Json(chats).into_response()
 }
@@ -5748,11 +5906,13 @@ async fn create_chat(
         {
             return r;
         }
+        let me = caller(&s, &headers).ok().map(|c| c.person.id);
         let now = Utc::now();
+        // Private to its owner (L2).
         let chat = Chat {
-            access: Vec::new(),
+            access: me.iter().map(|m| person_id(m)).collect(),
             deny: Vec::new(),
-            owner: None,
+            owner: me,
             id: s.id("chat"),
             title: String::new(),
             title_by: Default::default(),
@@ -5798,10 +5958,13 @@ async fn get_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
-    match chat_detail(&fake.state.lock().unwrap(), &id) {
+    let s = fake.state.lock().unwrap();
+    let me = match caller(&s, &headers) {
+        Ok(c) => c.person.id,
+        Err(r) => return r,
+    };
+    // Someone else's chat isn't there for the caller (chats stay private, L2).
+    match chat_detail(&s, &id).filter(|d| owner_of(&d.chat.owner) == me) {
         Some(detail) => Json(detail).into_response(),
         None => not_found(),
     }
@@ -6300,10 +6463,18 @@ async fn chat_item_output(
 }
 
 async fn list_workspaces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
-    Json(fake.state.lock().unwrap().workspaces.clone()).into_response()
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let list: Vec<Workspace> = s
+        .workspaces
+        .iter()
+        .filter(|w| s.reads_workspace(&caller.person.id, w))
+        .map(|w| s.resolved_workspace(w.clone()))
+        .collect();
+    Json(list).into_response()
 }
 
 async fn create_workspace(
@@ -6316,11 +6487,13 @@ async fn create_workspace(
     }
     let workspace = {
         let mut s = fake.state.lock().unwrap();
+        let me = caller(&s, &headers).ok().map(|c| c.person.id);
         let (device_id, device_name) = s.current_device();
+        // A folder is private to who attached it until they publish it (L2).
         let workspace = Workspace {
-            access: Vec::new(),
+            access: me.iter().map(|m| person_id(m)).collect(),
             deny: Vec::new(),
-            owner: None,
+            owner: me,
             id: s.id("workspace"),
             name: req.name,
             device_id,
@@ -6385,9 +6558,10 @@ async fn delete_workspace(
 pub fn sample_workspaces() -> Vec<Workspace> {
     let ws =
         |id: &str, name: &str, device: (&str, &str), platform, location: &str, sync| Workspace {
-            access: Vec::new(),
+            // Alice's, private to her; “Papers” is shared with Engineering (below).
+            access: vec![person_id(ALICE)],
             deny: Vec::new(),
-            owner: None,
+            owner: Some(ALICE.into()),
             id: id.into(),
             name: name.into(),
             device_id: device.0.into(),
@@ -6451,6 +6625,7 @@ pub fn sample_workspaces() -> Vec<Workspace> {
             WorkspaceSync::default(),
         ),
     ];
+    all[1].access.push("company/engineering".into());
     // “notes” has a file only in iCloud and one it can't read.
     all[0].unreadable = vec![
         UnreadableFile {
@@ -6673,18 +6848,24 @@ async fn workspace_files(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&fake, &headers) {
-        return r;
-    }
     let s = fake.state.lock().unwrap();
-    if !s.workspaces.iter().any(|w| w.id == id) {
+    let me = match caller(&s, &headers) {
+        Ok(c) => c.person.id,
+        Err(r) => return r,
+    };
+    // A folder the caller can't read isn't there for them (L2).
+    if !s
+        .workspaces
+        .iter()
+        .any(|w| w.id == id && s.reads_workspace(&me, w))
+    {
         return not_found();
     }
     let mut files: Vec<Source> = s
         .folder_sources
         .iter()
         .filter(|src| src.workspace_id.as_deref() == Some(id.as_str()))
-        .cloned()
+        .map(|src| s.resolved_source(src.clone()))
         .collect();
     files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
     Json(files).into_response()
@@ -6692,8 +6873,8 @@ async fn workspace_files(
 
 // ---------------------------------------------------------------------------
 // Accounts and principals (L1): people, invitations, groups, agents. The same rules as
-// the service (`docs/l1-brief.md` D3–D7); events carry no audience here (the fake is one
-// person per run), so the per-principal filter is the service's test.
+// the service (`docs/l1-brief.md` D3–D7); each socket gets only what its person may see
+// (`FakeState::visible_event`, L2), and changes are journaled to the audit trail.
 // ---------------------------------------------------------------------------
 
 /// Alice, the owner, and Bob, a member; both in `company` (everyone is, as the service's
@@ -7015,6 +7196,15 @@ impl FakeState {
             created_at: now,
         };
         self.people.push(person.clone());
+        // The invitation's groups become theirs: journaled as the service's admission.
+        self.record_audit(
+            margin_shared::context::AuditKind::MembershipChange,
+            &person_id(&id),
+            ("person", &id),
+            serde_json::json!({ "groups": [] }),
+            serde_json::json!({ "groups": person.groups }),
+            None,
+        );
         self.invitations[i].accepted_at = Some(now);
         self.invitations[i].accepted_by = Some(id.clone());
         let token = self.new_device_token(&id, device_name);
@@ -7221,6 +7411,15 @@ async fn patch_person(
         }
         p.clone()
     };
+    let audit = (role_change.is_some() || state_change.is_some()).then(|| {
+        s.journal(
+            &caller,
+            margin_shared::context::AuditKind::PersonChange,
+            ("person", &id),
+            serde_json::json!({ "role": target.org_role, "state": target.state }),
+            serde_json::json!({ "role": person.org_role, "state": person.state }),
+        )
+    });
     let mut revoked = Vec::new();
     if state_change == Some(PersonState::Disabled) {
         // Every device of a disabled person is deleted, and their tokens with them, so
@@ -7235,6 +7434,9 @@ async fn patch_person(
         s.tokens.retain(|_, (_, owner)| *owner != person.id);
     }
     drop(s);
+    if let Some(audit) = audit {
+        publish(&fake, audit);
+    }
     for id in revoked {
         publish(&fake, Event::DeviceDeleted { id });
     }
@@ -7290,12 +7492,13 @@ async fn put_person_groups(
     Json(groups): Json<Vec<String>>,
 ) -> Response {
     let mut s = fake.state.lock().unwrap();
-    if let Err(r) = admin(&s, &headers) {
-        return r;
-    }
-    if s.person(&id).is_none() {
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(before) = s.person(&id).map(|p| p.groups.clone()) else {
         return person_not_found();
-    }
+    };
     let groups = tidy_groups(groups);
     if let Err(r) = check_groups_exist(&s, &groups) {
         return r;
@@ -7305,7 +7508,15 @@ async fn put_person_groups(
         p.groups = groups.clone();
         p.clone()
     };
+    let audit = s.journal(
+        &caller,
+        margin_shared::context::AuditKind::MembershipChange,
+        ("person", &id),
+        serde_json::json!({ "groups": before }),
+        serde_json::json!({ "groups": groups }),
+    );
     drop(s);
+    publish(&fake, audit);
     publish(
         &fake,
         Event::MembershipChanged {
@@ -7528,9 +7739,10 @@ async fn create_group(
     Json(new): Json<NewGroup>,
 ) -> Response {
     let mut s = fake.state.lock().unwrap();
-    if let Err(r) = admin(&s, &headers) {
-        return r;
-    }
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     let path = new.path.trim().to_string();
     if !is_group_path(&path) {
         return bad_request(
@@ -7563,7 +7775,15 @@ async fn create_group(
         created_at: Utc::now(),
     };
     s.groups.push(group.clone());
+    let audit = s.journal(
+        &caller,
+        margin_shared::context::AuditKind::GroupChange,
+        ("group", &group.path),
+        serde_json::json!({}),
+        serde_json::json!({ "path": group.path }),
+    );
     drop(s);
+    publish(&fake, audit);
     publish(
         &fake,
         Event::GroupChanged {
@@ -7615,9 +7835,10 @@ async fn delete_group(
     Path(path): Path<String>,
 ) -> Response {
     let mut s = fake.state.lock().unwrap();
-    if let Err(r) = admin(&s, &headers) {
-        return r;
-    }
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     if path == ROOT_GROUP {
         return bad_request(
             "root_group",
@@ -7656,7 +7877,15 @@ async fn delete_group(
         );
     }
     s.groups.retain(|g| g.path != path);
+    let audit = s.journal(
+        &caller,
+        margin_shared::context::AuditKind::GroupChange,
+        ("group", &path),
+        serde_json::json!({ "path": path }),
+        serde_json::json!({}),
+    );
     drop(s);
+    publish(&fake, audit);
     publish(&fake, Event::GroupDeleted { path });
     StatusCode::NO_CONTENT.into_response()
 }
@@ -7861,6 +8090,7 @@ async fn patch_agent(
     {
         return r;
     }
+    let before = s.agents[i].clone();
     let agent = {
         let a = &mut s.agents[i];
         if let Some(name) = name {
@@ -7874,7 +8104,20 @@ async fn patch_agent(
         }
         a.clone()
     };
+    // A ceiling or the agent's state changed: journaled (a rename isn't access).
+    let audit = (before.ceiling != agent.ceiling || before.disabled != agent.disabled).then(|| {
+        s.journal(
+            &caller,
+            margin_shared::context::AuditKind::AgentChange,
+            ("agent", &id),
+            serde_json::json!({ "ceiling": before.ceiling, "disabled": before.disabled }),
+            serde_json::json!({ "ceiling": agent.ceiling, "disabled": agent.disabled }),
+        )
+    });
     drop(s);
+    if let Some(audit) = audit {
+        publish(&fake, audit);
+    }
     publish(
         &fake,
         Event::AgentChanged {
@@ -7899,9 +8142,23 @@ async fn delete_agent(
         Ok((_, false)) => return not_agent_owner(),
         Err(r) => return r,
     }
+    let ceiling = s
+        .agents
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.ceiling.clone())
+        .unwrap_or_default();
     s.agents.retain(|a| a.id != id);
     s.agent_tokens.remove(&id);
+    let audit = s.journal(
+        &caller,
+        margin_shared::context::AuditKind::AgentChange,
+        ("agent", &id),
+        serde_json::json!({ "ceiling": ceiling }),
+        serde_json::json!({ "deleted": true }),
+    );
     drop(s);
+    publish(&fake, audit);
     publish(&fake, Event::AgentDeleted { id });
     StatusCode::NO_CONTENT.into_response()
 }
@@ -7931,15 +8188,25 @@ async fn mint_agent_token(
         n.wrapping_mul(0x9e37_79b9_7f4a_7c15)
     );
     let now = Utc::now();
+    let before = s.agents[i].token.as_ref().map(|t| t.prefix.clone());
     s.agents[i].token = Some(AgentTokenInfo {
         prefix: token.chars().take(8).collect(),
         created_at: now,
         last_used_at: None,
         expires_at: None,
     });
+    let prefix: String = token.chars().take(8).collect();
+    let audit = s.journal(
+        &caller,
+        margin_shared::context::AuditKind::AgentToken,
+        ("agent", &id),
+        serde_json::json!({ "prefix": before }),
+        serde_json::json!({ "prefix": prefix }),
+    );
     s.agent_tokens.insert(id, token.clone());
     let agent = s.agents[i].clone();
     drop(s);
+    publish(&fake, audit);
     publish(
         &fake,
         Event::AgentChanged {
@@ -7965,10 +8232,22 @@ async fn revoke_agent_token(
         Err(r) => return r,
     };
     // As the service: revoking an agent without a token is 204 too.
-    s.agents[i].token = None;
+    let before = s.agents[i].token.take().map(|t| t.prefix);
     s.agent_tokens.remove(&id);
     let agent = s.agents[i].clone();
+    let audit = before.is_some().then(|| {
+        s.journal(
+            &caller,
+            margin_shared::context::AuditKind::AgentToken,
+            ("agent", &id),
+            serde_json::json!({ "prefix": before }),
+            serde_json::json!({ "prefix": null }),
+        )
+    });
     drop(s);
+    if let Some(audit) = audit {
+        publish(&fake, audit);
+    }
     publish(&fake, Event::AgentChanged { agent });
     StatusCode::NO_CONTENT.into_response()
 }
