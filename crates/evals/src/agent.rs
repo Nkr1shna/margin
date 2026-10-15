@@ -85,6 +85,7 @@ impl Tool for SearchTool {
             let ranked = match self
                 .index
                 .search_as(
+                    &crate::access::company_reader(),
                     std::slice::from_ref(&args.query),
                     &self.scope,
                     margin_shared::pipeline::RetrievalPurpose::Agent,

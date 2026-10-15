@@ -1972,6 +1972,7 @@ mod lesson_retrieval {
             origin: "agent".into(),
             scope_ids: vec![scope.into()],
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: format!("notes:{id}"),
             modality: "text".into(),
             ord,
@@ -2045,6 +2046,7 @@ mod lesson_retrieval {
             created_at: now,
             chat_id: None,
             written_with: None,
+            audience_narrowed: false,
         };
         let stored = StoredProposal {
             proposal,
@@ -2095,6 +2097,7 @@ mod lesson_retrieval {
                 created_at: now,
                 updated_at: now,
                 written_with: None,
+                audience_narrowed: false,
             },
             proposal_id: Some("prop".into()),
             previous_body: None,
@@ -2295,7 +2298,18 @@ Photosynthesis stores light energy as sugar.";
             scope: Scope::Topic {
                 id: topic.id.clone(),
             },
-            access: None,
+            // The topic owner reads, as the lesson job does (L2 D1).
+            reader: margin_service::pipeline::Reader::of(
+                &margin_service::state::person_principal(
+                    &h.state,
+                    topic
+                        .owner
+                        .as_deref()
+                        .unwrap_or(margin_service::principal::BOOTSTRAP_PERSON_ID),
+                )
+                .await
+                .unwrap(),
+            ),
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,

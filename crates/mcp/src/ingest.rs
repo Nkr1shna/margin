@@ -74,6 +74,7 @@ pub async fn ingest_text(
             origin: Origin::Agent { name: agent.into() },
             kind,
             text,
+            audience: None,
         })
         .await
 }
@@ -248,6 +249,7 @@ pub async fn ingest_dir(
                     origin: Origin::Agent { name: REPO.into() },
                     kind: SourceKind::Text,
                     text,
+                    audience: None,
                 })
                 .await?;
         }

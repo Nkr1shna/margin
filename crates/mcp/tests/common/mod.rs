@@ -265,6 +265,7 @@ impl Fake {
             bytes: text.len() as u64,
             actor: actor.into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: now,
             updated_at: now,
         };

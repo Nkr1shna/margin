@@ -35,7 +35,7 @@ use crate::engines::{
 };
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
-use crate::pipeline::Packed;
+use crate::pipeline::{Packed, Reader};
 use crate::principal::{CurrentPrincipal, Principal};
 use crate::retrieval::{self, QueryPlan};
 use crate::state::{
@@ -146,7 +146,18 @@ pub async fn propose_planned(
     let mut written_with = None;
     if wanted {
         let trace_id = trace_id.map_or_else(new_id, str::to_string);
-        match plan_course(state, &request, &outline, &workspaces, chat_id, &trace_id).await {
+        let reader = Reader::of(p);
+        match plan_course(
+            state,
+            &reader,
+            &request,
+            &outline,
+            &workspaces,
+            chat_id,
+            &trace_id,
+        )
+        .await
+        {
             Ok(Some((p, with))) => match validate_outline(&p.outline()) {
                 Ok(planned) => {
                     outline = planned;
@@ -173,6 +184,7 @@ pub async fn propose_planned(
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
         written_with,
+        audience_narrowed: false,
     };
     let stored = StoredProposal {
         proposal: proposal.clone(),
@@ -437,6 +449,7 @@ pub async fn accept_proposal(
                     created_at: now,
                     updated_at: now,
                     written_with: None,
+                    audience_narrowed: false,
                 },
                 proposal_id: Some(proposal.id.clone()),
                 previous_body: None,
@@ -578,6 +591,7 @@ pub async fn append_lesson(state: &AppState, p: &Principal, req: NewLesson) -> A
                 created_at: now,
                 updated_at: now,
                 written_with: None,
+                audience_narrowed: false,
             },
             proposal_id: None,
             previous_body: None,
@@ -744,12 +758,13 @@ async fn lesson_passages(
         }
         let scope = Scope::Union { scopes };
         retrieval::wait_until_read(state, &scope, sources::SOURCE_WAIT).await?;
+        let reader = topic_owner_reader(state, lesson).await?;
         let pipeline = state.pipeline.load_full();
         let window = retrieval::route_window(state, Route::Write, None).await?;
         let req = retrieval::Request {
             plan,
             scope,
-            access: None,
+            reader,
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
@@ -769,6 +784,21 @@ async fn lesson_passages(
             Vec::new()
         }
     }
+}
+
+/// Who a lesson job reads as (L2 D1): the topic owner's access at the time the job
+/// runs (the lesson is theirs); the lesson's own owner when the topic is gone, the
+/// bootstrap owner before `people-v1`.
+async fn topic_owner_reader(state: &AppState, lesson: &Lesson) -> anyhow::Result<Reader> {
+    let topic: Option<Topic> = state.store.get(db::TOPIC, &lesson.topic_id).await?;
+    let owner = topic
+        .and_then(|t| t.owner)
+        .or_else(|| lesson.owner.clone())
+        .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string());
+    let p = crate::state::person_principal(state, &owner)
+        .await
+        .map_err(|e| anyhow::anyhow!("couldn't read who owns the lesson: {}", e.message))?;
+    Ok(Reader::of(&p))
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +847,7 @@ const SURVEY_QUERY_CHARS: usize = 500;
 /// as retrieval traced them). `None` when the course has nothing to survey.
 pub async fn survey(
     state: &AppState,
+    reader: &Reader,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
@@ -844,7 +875,7 @@ pub async fn survey(
     let mut contents = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for key in &resolved.keys {
-        let Some(info) = retrieval::doc_info(&state.store, key).await? else {
+        let Some(info) = retrieval::doc_info(&state.store, reader, key).await? else {
             continue;
         };
         if !seen.insert(info.document_id.clone()) {
@@ -852,6 +883,7 @@ pub async fn survey(
         }
         let first = retrieval::read_passages(
             &state.store,
+            reader,
             &info.document_id,
             retrieval::Selector::Ords { from: 0, to: 0 },
             1,
@@ -862,7 +894,7 @@ pub async fn survey(
         };
         queries.push(first.text.chars().take(SURVEY_QUERY_CHARS).collect());
         let mut sections: Vec<String> = Vec::new();
-        for s in retrieval::document_outline(&state.store, &info.document_id).await? {
+        for s in retrieval::document_outline(&state.store, reader, &info.document_id).await? {
             if !s.section_path.is_empty() && !sections.contains(&s.section_path) {
                 sections.push(s.section_path);
             }
@@ -879,7 +911,7 @@ pub async fn survey(
         &retrieval::Request {
             plan: QueryPlan::from_strings(queries),
             scope,
-            access: None,
+            reader: reader.clone(),
             modalities: Vec::new(),
             k: retrieval::fused_k(&pipeline.config),
             budget: pipeline.config.budget,
@@ -910,13 +942,15 @@ pub async fn survey(
 /// draft (the call is traced as failed). The plan comes with what wrote it.
 pub async fn plan_course(
     state: &AppState,
+    reader: &Reader,
     request: &AskRequest,
     draft: &Outline,
     workspaces: &[Id],
     chat_id: &str,
     trace_id: &str,
 ) -> anyhow::Result<Option<(CoursePlan, WrittenWith)>> {
-    let Some((req, _survey)) = survey(state, request, draft, workspaces, trace_id).await? else {
+    let Some((req, _survey)) = survey(state, reader, request, draft, workspaces, trace_id).await?
+    else {
         return Ok(None);
     };
     let ai = state

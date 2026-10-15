@@ -177,7 +177,9 @@ async fn uploads_are_read_embedded_and_listed() {
     assert!(rows[1].scope_ids.is_empty());
     assert_eq!(rows[1].document_id, s.id);
     assert_eq!(rows[1].embedder, margin_service::ingest::EMBEDDER_VERSION);
-    assert_eq!(rows[1].access, ["company"]);
+    // The source's audience (L2: private to its owner unless published).
+    assert_eq!(rows[1].access, s.access);
+    assert!(rows[1].access[0].starts_with("person/"));
     assert_eq!(rows[1].vector.len(), margin_embed::DIM);
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 
@@ -996,7 +998,9 @@ async fn sources_become_documents_with_located_passages_in_the_default_project()
         }
     );
     assert_eq!(doc.actor, "owner");
-    assert_eq!(doc.access, ["company"]);
+    // The source's audience: its topic's, private to its owner (L2).
+    assert_eq!(doc.access, s.access);
+    assert_eq!(doc.access, topic.access);
     assert!(doc.generation > 0);
     // One project, "My library", holds it.
     let projects: Vec<Project> = h.state.store.list(db::PROJECT).await.unwrap();
@@ -1022,7 +1026,7 @@ async fn sources_become_documents_with_located_passages_in_the_default_project()
     assert_eq!(rows[2].start_line, Some(9));
     assert!(rows.iter().all(|r| r.project_id == projects[0].id
         && r.scope_ids == [topic.id.clone()]
-        && r.access == ["company"]
+        && r.access == doc.access
         && r.origin == "source"
         && r.chunk_hash.len() == 64
         && r.id == format!("{}:{}", s.id, r.chunk_hash)
@@ -1365,6 +1369,7 @@ async fn agents_documents_and_library_items_are_indexed_too() {
         },
         kind: SourceKind::Text,
         text: "Restart the queue worker.\n\nThen drain the dead letters.".into(),
+        audience: None,
     };
     let doc = margin_service::ingest::ingest_text(&h.state, &req)
         .await

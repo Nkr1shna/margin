@@ -497,3 +497,140 @@ mod claude_prefix {
         );
     }
 }
+
+/// The leakage gate (L2, `docs/l2-brief.md` D8): the fixture corpus stamped with the
+/// audiences of `evals/access.toml` through the service's own writer, every golden query
+/// searched as every principal there (expanded by the service's own functions), and every
+/// hit checked against the oracle (the fixture and the expansion, in Rust, independent of
+/// the SQL); every by-id read the oracle forbids must come back empty. Never ignored: on
+/// the recorded vectors when they are committed, else on the deterministic
+/// `FakeEmbedder` (leakage is a property of the predicate, not of the vectors). It fails
+/// if a prefix rule comes back (a reader in `company` reading `company/engineering`).
+#[tokio::test]
+async fn access_gates() {
+    use margin_evals::access::{ACCESS_FILE, AccessFixture};
+    use margin_evals::corpus::documents;
+    use margin_evals::index::{EvalIndex, scope_of};
+    use margin_evals::recorded::{FakeVectors, Vectors};
+    use margin_service::db::Store;
+    use margin_service::pipeline::Reader;
+    use margin_service::retrieval::{Selector, document_outline, read_passages};
+    use margin_shared::pipeline::PipelineConfig;
+
+    let evals = evals_dir();
+    let gates: Gates =
+        toml::from_str(&std::fs::read_to_string(evals.join("gates.toml")).unwrap()).unwrap();
+    let fx = AccessFixture::load(&evals.join(ACCESS_FILE)).unwrap();
+    let corpus = evals.join("corpus");
+    let docs = documents(&corpus).unwrap();
+    let recorded = RecordedVectors::open(&evals.join(EMBEDDINGS_FILE)).ok();
+    let fake = FakeVectors;
+    let vectors: &dyn Vectors = match &recorded {
+        Some(r) => r,
+        None => &fake,
+    };
+    let extraction = Extraction::load(&evals.join(EXTRACTED_FILE))
+        .unwrap_or_else(|_| Extraction::fixture(&corpus, &docs).unwrap());
+    let index = EvalIndex::build(
+        Store::memory().await.unwrap(),
+        &PipelineConfig::default(),
+        |_| {},
+        vectors,
+        &corpus,
+        &docs,
+        &extraction,
+    )
+    .await
+    .unwrap();
+    fx.stamp(&index).await.unwrap();
+
+    let golden = Paths::same(&evals).retrieval_golden().unwrap();
+    // Reads everything the fixture names: what the filter had to remove.
+    let mut all: Vec<String> = fx
+        .principals()
+        .iter()
+        .flat_map(|p| fx.reader(p).unwrap().paths)
+        .collect();
+    all.extend(fx.people.keys().map(|p| margin_shared::person_id(p)));
+    let everything = Reader::sorted(all, Vec::new());
+    let purpose = index.retrieval_purpose();
+    let (mut leaks, mut removed) = (Vec::new(), 0usize);
+    for name in fx.principals() {
+        let reader = fx.reader(&name).unwrap();
+        let mut hits = 0usize;
+        for q in &golden {
+            let plan = std::slice::from_ref(&q.query);
+            let scope = scope_of(q.scope);
+            let ranked = index
+                .search_as(&reader, plan, &scope, purpose)
+                .await
+                .unwrap();
+            for h in &ranked.hits {
+                if !fx.may_read(&reader, &h.passage.document_id) {
+                    leaks.push(format!(
+                        "{name} found {} for {}",
+                        h.passage.document_id, q.id
+                    ));
+                }
+            }
+            hits += ranked.hits.len();
+            let unfiltered = index
+                .search_as(&everything, plan, &scope, purpose)
+                .await
+                .unwrap();
+            removed += unfiltered
+                .hits
+                .iter()
+                .filter(|h| !fx.may_read(&reader, &h.passage.document_id))
+                .count();
+        }
+        assert!(
+            hits > 0,
+            "{name} found nothing at all: the gate tests nothing"
+        );
+    }
+    // The fixture's audiences did hide something from someone.
+    assert!(removed > 0, "no principal was refused anything");
+
+    let mut by_id = Vec::new();
+    for name in fx.principals() {
+        let reader = fx.reader(&name).unwrap();
+        for path in index.document_paths() {
+            if fx.may_read(&reader, &path) {
+                continue;
+            }
+            let outline = document_outline(&index.store, &reader, &path)
+                .await
+                .unwrap();
+            let rows = read_passages(
+                &index.store,
+                &reader,
+                &path,
+                Selector::Ords { from: 0, to: 999 },
+                1000,
+            )
+            .await
+            .unwrap();
+            if !outline.is_empty() || !rows.is_empty() {
+                by_id.push(format!("{name} read {path} by id"));
+            }
+        }
+    }
+    eprintln!(
+        "access: {} principals x {} queries, {} leaks, {} by-id leaks, {removed} hits removed",
+        fx.principals().len(),
+        golden.len(),
+        leaks.len(),
+        by_id.len()
+    );
+    assert!(
+        leaks.len() as u32 <= gates.access.leaks_max,
+        "the access gate failed:\n{}",
+        leaks.join("\n")
+    );
+    assert!(
+        by_id.len() as u32 <= gates.access.by_id_leaks_max,
+        "the access gate failed:\n{}",
+        by_id.join("\n")
+    );
+}

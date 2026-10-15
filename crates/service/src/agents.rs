@@ -91,7 +91,11 @@ pub async fn principal_for_token(
 
 /// The principal an agent acts as, from its owner's expansion.
 pub fn agent_principal(agent: &Agent, owner: &Expansion, person: Person) -> Principal {
-    let paths = intersect(&owner.paths, &agent.ceiling);
+    // L2 D6: the agent reads what its owner reads within its ceiling, plus rows shared
+    // with it by name; a deny on the owner, or on the agent by name, denies it.
+    let mut paths = intersect(&owner.paths, &agent.ceiling);
+    paths.push(agent_id(&agent.id));
+    paths.sort();
     let mut deny_ids: BTreeSet<String> = owner.deny_ids.iter().cloned().collect();
     deny_ids.insert(agent_id(&agent.id));
     Principal {
@@ -583,7 +587,8 @@ mod tests {
             created_at: Utc::now(),
         };
         let p = agent_principal(&agent, &o, person);
-        assert_eq!(p.paths, s(&["company", "company/eng"]));
+        // L2 D6: and its own id, so a row can be shared with the agent alone.
+        assert_eq!(p.paths, s(&["agent/a1", "company", "company/eng"]));
         assert_eq!(p.id, "agent/a1");
         assert_eq!(p.person_id, "o");
         assert_eq!(p.org_role, OrgRole::Member);

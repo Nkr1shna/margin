@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod audience;
 pub mod chat;
 pub mod context;
 pub mod device;
@@ -16,6 +17,7 @@ pub mod providers;
 pub mod routes;
 pub mod text;
 
+pub use audience::*;
 pub use chat::*;
 pub use device::*;
 pub use principal::*;
@@ -132,6 +134,11 @@ pub struct Lesson {
     /// written before R2 and for pending ones. Regenerating overwrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_with: Option<WrittenWith>,
+    /// The lesson drew on documents whose audiences share no reader with its topic's
+    /// (`audience::derive`), so it is private to its creator; the app says so with
+    /// "Publish…" (L2 D4).
+    #[serde(default)]
+    pub audience_narrowed: bool,
 }
 
 /// What wrote a lesson, a proposal's outline or a scene (R2, `docs/r2-brief.md` D4.3):
@@ -310,6 +317,9 @@ pub struct Proposal {
     /// The planner call that wrote the outline (R2); `None` before R2 or while drafting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_with: Option<WrittenWith>,
+    /// As `Lesson.audience_narrowed`, from the planner's retrieval (L2 D4).
+    #[serde(default)]
+    pub audience_narrowed: bool,
 }
 
 /// Accept a proposal, optionally with an edited outline and the outline card's chips.
@@ -1148,6 +1158,17 @@ pub enum Event {
     /// What `person_id` may read changed (memberships, role): reload the library.
     AccessChanged {
         person_id: Id,
+    },
+    /// The readers this is sent to lost access to these units (and what follows them:
+    /// a topic's subtree, lessons, notes and sources; a folder's files): drop them
+    /// without a reload (L2 D3).
+    AudienceRevoked {
+        unit: AudienceUnit,
+        ids: Vec<Id>,
+    },
+    /// An audit row was written (admins only, L2 D7).
+    AuditAppended {
+        row: context::AuditRow,
     },
 }
 

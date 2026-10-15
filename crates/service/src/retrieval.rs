@@ -44,7 +44,7 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::db::{self, PassageRow, Store};
 use crate::engines::BoxFuture;
 use crate::pipeline::{
-    Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Registry, RerankRequest,
+    Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Reader, Registry, RerankRequest,
     RetrievalCtx, Retriever, RewriteRequest, StageCtor, hit_citation, with_retrieval,
 };
 use crate::sources::{ChunkRow, MediaKind, MediaRow};
@@ -98,8 +98,8 @@ impl QueryPlan {
 pub struct Request {
     pub plan: QueryPlan,
     pub scope: Scope,
-    /// The caller's access paths (pre-filter in the index query; `None` = no filter).
-    pub access: Option<Vec<String>>,
+    /// Who is reading: `Reader::sql()` inside every index query (L2 D1).
+    pub reader: Reader,
     /// Empty means every modality.
     pub modalities: Vec<Modality>,
     /// Most passages, whatever the budget.
@@ -439,35 +439,50 @@ pub async fn project(store: &Store) -> anyhow::Result<Project> {
 }
 
 // ---------------------------------------------------------------------------
-// Access (the seam; not enforced for the owner)
+// Access (L2 D1): exact membership, two conjuncts inside every scan
 // ---------------------------------------------------------------------------
 
-/// Whether a reader with `paths` may see something whose access path is `path`: one of
-/// the reader's paths is `path` or a prefix of it ("company" sees "company/eng").
-pub fn may_see(paths: &[String], path: &str) -> bool {
-    paths.iter().any(|r| {
-        path == r
-            || path
-                .strip_prefix(r.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+/// A document's audience as stored: read empty, it is private to its owner (the
+/// bootstrap owner before `people-v1`).
+pub fn document_access(d: &Document) -> Vec<String> {
+    if d.access.is_empty() {
+        vec![margin_shared::person_id(
+            d.owner
+                .as_deref()
+                .unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID),
+        )]
+    } else {
+        d.access.clone()
+    }
 }
 
-/// The access paths a reader with `paths` may see, among those the project's documents
-/// use (plus "company" and the reader's own): what `access CONTAINSANY` is given, so the
-/// filter stays an index condition.
-async fn visible_paths(store: &Store, paths: &[String]) -> anyhow::Result<Vec<String>> {
-    let documents: Vec<Document> = store.list(db::DOCUMENT).await?;
-    let mut known: Vec<String> = vec![ACCESS_COMPANY.to_string()];
-    known.extend(documents.into_iter().flat_map(|d| d.access));
-    known.extend(paths.iter().cloned());
-    let mut out: Vec<String> = Vec::new();
-    for p in known {
-        if may_see(paths, &p) && !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    Ok(out)
+/// Whether `reader` reads the document row `d` (the Rust twin of `Reader::doc_sql()`,
+/// for a row already read by id).
+pub fn reads_document(reader: &Reader, d: &Document) -> bool {
+    reader.allows(&document_access(d), &d.deny)
+}
+
+/// Whether `reader` reads the source row `s` (read empty, private to its owner).
+fn reads_source(reader: &Reader, s: &Source) -> bool {
+    let owner = s
+        .owner
+        .as_deref()
+        .unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID);
+    let access = if s.access.is_empty() {
+        vec![margin_shared::person_id(owner)]
+    } else {
+        s.access.clone()
+    };
+    reader.allows(&access, &s.deny)
+}
+
+/// Whether `reader` may read the rows from before `passages-v1` (`chunk`, `media`) of the
+/// source `id`: they carry no audience, so the source row decides.
+async fn reads_legacy(store: &Store, reader: &Reader, id: &str) -> anyhow::Result<bool> {
+    Ok(store
+        .get::<Source>(db::SOURCE, id)
+        .await?
+        .is_some_and(|s| reads_source(reader, &s)))
 }
 
 // ---------------------------------------------------------------------------
@@ -475,12 +490,12 @@ async fn visible_paths(store: &Store, paths: &[String]) -> anyhow::Result<Vec<St
 // ---------------------------------------------------------------------------
 
 /// The `WHERE` conditions every leg shares, with their bindings.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Filter {
     resolved: Resolved,
     modalities: Vec<String>,
-    /// Visible access paths; `None` = no access filter.
-    access: Option<Vec<String>>,
+    /// Who is reading: always two conjuncts, never a prefix rule.
+    reader: Reader,
     /// The query vector's embedder version: the dense leg's `embedder = $embedder`
     /// (empty = none).
     embedder: String,
@@ -489,10 +504,6 @@ struct Filter {
 impl Filter {
     async fn new(store: &Store, q: &Query) -> anyhow::Result<Self> {
         let resolved = resolve_for_index(store, &q.scope).await?;
-        let access = match &q.access {
-            Some(paths) => Some(visible_paths(store, paths).await?),
-            None => None,
-        };
         Ok(Self {
             resolved,
             modalities: q
@@ -500,14 +511,14 @@ impl Filter {
                 .iter()
                 .map(|m| m.as_str().to_string())
                 .collect(),
-            access,
+            reader: q.reader.clone(),
             embedder: q.embedder.clone(),
         })
     }
 
     /// Whether the filter lets nothing through.
     fn is_empty(&self) -> bool {
-        self.resolved.is_empty() || self.access.as_ref().is_some_and(|a| a.is_empty())
+        self.resolved.is_empty() || self.reader.is_empty()
     }
 
     /// ` AND …` conditions for a `passage` query.
@@ -519,9 +530,7 @@ impl Filter {
         if !self.modalities.is_empty() {
             sql.push_str(" AND modality IN $modalities");
         }
-        if self.access.is_some() {
-            sql.push_str(" AND access CONTAINSANY $paths");
-        }
+        sql.push_str(Reader::sql());
         sql
     }
 
@@ -530,9 +539,7 @@ impl Filter {
             ("keys", json!(self.resolved.keys)),
             ("modalities", json!(self.modalities)),
         ];
-        if let Some(paths) = &self.access {
-            binds.push(("paths", json!(paths)));
-        }
+        binds.extend(self.reader.binds());
         if !self.embedder.is_empty() {
             binds.push(("embedder", json!(self.embedder)));
         }
@@ -1626,7 +1633,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     let key = json!({
         "q": req.plan.queries,
         "scope": req.scope,
-        "access": req.access,
+        "reader": req.reader,
         "modalities": req.modalities,
         "k": req.k,
         "budget": req.budget,
@@ -1663,7 +1670,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     let names = if pipeline.rewriter.name() == "none" {
         Vec::new()
     } else {
-        scope_names(&state.store, &resolved, req.access.as_deref()).await
+        scope_names(&state.store, &resolved, &req.reader).await
     };
     let rewrite = RewriteRequest {
         purpose: req.purpose,
@@ -1719,7 +1726,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
                 .map_or_else(String::new, |e| e.version().to_string()),
             vector,
             scope: req.scope.clone(),
-            access: req.access.clone(),
+            reader: req.reader.clone(),
             modalities: req.modalities.clone(),
             k: fusion_cfg.k_fused,
             budget_tokens: budget.tokens,
@@ -1728,7 +1735,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         };
         let mut leg = pipeline.retriever.search(&q).await?;
         if !legacy.is_empty() {
-            leg.extend(legacy_hits(state, &legacy, &q, req.access.as_deref()).await?);
+            leg.extend(legacy_hits(state, &legacy, &q, &req.reader).await?);
             leg.sort_by(|a, b| b.score.total_cmp(&a.score));
             leg.truncate(fusion_cfg.k_fused);
         }
@@ -1768,7 +1775,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     };
     let rerank_ms = t.elapsed().as_secs_f64() * 1000.0;
     let mut packed = pipeline.packer.pack(reranked, &budget);
-    describe_packed(state, &mut packed).await?;
+    describe_packed(state, &req.reader, &mut packed).await?;
 
     row.legs = Some(RetrievalLegs {
         dense_ms: search_ms,
@@ -1802,14 +1809,10 @@ pub fn reranked_count(fused: &[Hit], reranked: &[Hit]) -> Option<u32> {
 }
 
 /// Up to `REWRITE_SCOPE_NAMES` names of the documents in `resolved` (every document for
-/// the whole library) that a reader with `access` may see (L1; `None` = no filter), for
-/// the query rewriter's prompt: names (through `text::for_model`), never passage text,
-/// and never a document the caller can't read.
-pub async fn scope_names(
-    store: &Store,
-    resolved: &Resolved,
-    access: Option<&[String]>,
-) -> Vec<String> {
+/// the whole library) that `reader` reads (exact membership and denials), for the query
+/// rewriter's prompt: names (through `text::for_model`), never passage text, and never a
+/// document the caller can't read.
+pub async fn scope_names(store: &Store, resolved: &Resolved, reader: &Reader) -> Vec<String> {
     let documents: Vec<Document> = match store.list(db::DOCUMENT).await {
         Ok(d) => d,
         Err(e) => {
@@ -1819,7 +1822,7 @@ pub async fn scope_names(
     };
     let mut names: Vec<String> = Vec::new();
     for d in documents {
-        let visible = access.is_none_or(|paths| d.access.iter().any(|a| may_see(paths, a)));
+        let visible = reads_document(reader, &d);
         let name = for_model(&d.name);
         if (resolved.library || resolved.keys.contains(&d.id))
             && visible
@@ -1915,6 +1918,7 @@ fn legacy_row(
         origin: "source".into(),
         scope_ids: Vec::new(),
         access: vec![ACCESS_COMPANY.to_string()],
+        deny: Vec::new(),
         unit_id: match page {
             Some(p) => format!("{source_id}:page:{p}"),
             None => format!("{source_id}:{}:{ord}", modality.as_str()),
@@ -1941,13 +1945,15 @@ async fn legacy_hits(
     state: &AppState,
     sources: &[Source],
     q: &Query,
-    access: Option<&[String]>,
+    reader: &Reader,
 ) -> anyhow::Result<Vec<Hit>> {
-    if q.vector.is_empty() || access.is_some_and(|paths| !may_see(paths, ACCESS_COMPANY)) {
+    if q.vector.is_empty() {
         return Ok(Vec::new());
     }
     let mut rows = Vec::new();
-    for s in sources {
+    // Rows from before `passages-v1` carry no audience: only their source's owner reads
+    // them (legacy rows exist only until that migration finishes).
+    for s in sources.iter().filter(|s| reads_source(reader, s)) {
         let chunks: Vec<ChunkRow> = legacy_rows(&state.store, db::CHUNK, &s.id).await?;
         rows.extend(chunks.iter().map(|c| {
             legacy_row(
@@ -2024,9 +2030,13 @@ pub struct DocInfo {
     pub file: Option<WorkspaceFile>,
 }
 
-/// The document `id` (or, for rows written before documents existed, the source).
-pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>> {
+/// The document `id` (or, for rows written before documents existed, the source), when
+/// `reader` reads it; `None` otherwise (a 404, never a 403).
+pub async fn doc_info(store: &Store, reader: &Reader, id: &str) -> anyhow::Result<Option<DocInfo>> {
     if let Some(d) = store.get::<Document>(db::DOCUMENT, id).await? {
+        if !reads_document(reader, &d) {
+            return Ok(None);
+        }
         let (source_id, file) = match &d.origin {
             Origin::Source { source_id } => (Some(source_id.clone()), None),
             Origin::FolderFile { workspace_id, path } => (
@@ -2066,7 +2076,11 @@ pub async fn doc_info(store: &Store, id: &str) -> anyhow::Result<Option<DocInfo>
             file,
         }));
     }
-    Ok(store.get::<Source>(db::SOURCE, id).await?.map(|s| DocInfo {
+    let source = store
+        .get::<Source>(db::SOURCE, id)
+        .await?
+        .filter(|s| reads_source(reader, s));
+    Ok(source.map(|s| DocInfo {
         document_id: s.id.clone(),
         source_id: Some(s.id.clone()),
         file: s.workspace_id.clone().map(|workspace_id| WorkspaceFile {
@@ -2091,14 +2105,19 @@ pub fn folder_file_name(folder: Option<&str>, path: &str) -> String {
 
 /// Fills each packed passage's citation with its document (name, kind, the source its
 /// media are served under) and, for text on a rendered page or in a recording, the
-/// picture to show with it.
-pub async fn describe_packed(state: &AppState, packed: &mut [Packed]) -> anyhow::Result<()> {
+/// picture to show with it. Only what `reader` reads is described (the hits came from
+/// a query with the same reader).
+pub async fn describe_packed(
+    state: &AppState,
+    reader: &Reader,
+    packed: &mut [Packed],
+) -> anyhow::Result<()> {
     let mut infos: HashMap<String, Option<DocInfo>> = HashMap::new();
     for p in packed.iter_mut() {
         normalise_packed(p);
         let doc = p.citation.document_id.clone().unwrap_or_default();
         if !infos.contains_key(&doc) {
-            infos.insert(doc.clone(), doc_info(&state.store, &doc).await?);
+            infos.insert(doc.clone(), doc_info(&state.store, reader, &doc).await?);
         }
         let Some(info) = infos.get(&doc).cloned().flatten() else {
             continue;
@@ -2118,7 +2137,7 @@ pub async fn describe_packed(state: &AppState, packed: &mut [Packed]) -> anyhow:
         if c.image_url.is_none()
             && let Some(source_id) = &info.source_id
         {
-            c.image_url = text_picture(state, source_id, &p.hits[0].passage).await?;
+            c.image_url = text_picture(state, reader, source_id, &p.hits[0].passage).await?;
         }
     }
     Ok(())
@@ -2148,6 +2167,7 @@ pub fn normalise_packed(p: &mut Packed) {
 /// nearest the words.
 async fn text_picture(
     state: &AppState,
+    reader: &Reader,
     source_id: &str,
     passage: &PassageRow,
 ) -> anyhow::Result<Option<String>> {
@@ -2170,11 +2190,17 @@ async fn text_picture(
         #[serde(default)]
         start_ms: Option<i64>,
     }
+    let mut binds = reader.binds();
+    binds.push(("d", json!(passage.document_id)));
     let mut frames: Vec<(i64, String)> = state
         .store
         .query_rows::<Frame>(
-            "SELECT file, start_ms FROM passage WHERE document_id = $d AND modality = 'frame'",
-            vec![("d", json!(passage.document_id))],
+            &format!(
+                "SELECT file, start_ms FROM passage WHERE document_id = $d \
+                 AND modality = 'frame'{}",
+                Reader::sql()
+            ),
+            binds,
         )
         .await?
         .into_iter()
@@ -2383,19 +2409,28 @@ pub enum DocState {
     Ready,
 }
 
-pub async fn doc_state(store: &Store, id: &str) -> anyhow::Result<DocState> {
+/// `Unknown` for a document `reader` can't read, so `readable` answers 404, never 403.
+pub async fn doc_state(store: &Store, reader: &Reader, id: &str) -> anyhow::Result<DocState> {
     #[derive(Deserialize)]
     struct Count {
         n: u64,
     }
+    let mut binds = reader.binds();
+    binds.push(("d", json!(id)));
     let n: Vec<Count> = store
         .query_rows(
-            "RETURN { n: count(SELECT id FROM passage WHERE document_id = $d) };",
-            vec![("d", json!(id))],
+            &format!(
+                "RETURN {{ n: count(SELECT id FROM passage WHERE document_id = $d{}) }};",
+                Reader::sql()
+            ),
+            binds,
         )
         .await?;
     let has_passages = n.first().is_some_and(|c| c.n > 0);
     if let Some(d) = store.get::<Document>(db::DOCUMENT, id).await? {
+        if !reads_document(reader, &d) {
+            return Ok(DocState::Unknown);
+        }
         return Ok(match d.status {
             margin_shared::context::DocumentStatus::Indexing { .. } if !has_passages => {
                 DocState::NotReady
@@ -2407,6 +2442,7 @@ pub async fn doc_state(store: &Store, id: &str) -> anyhow::Result<DocState> {
         return Ok(DocState::Ready);
     }
     Ok(match store.get::<Source>(db::SOURCE, id).await? {
+        Some(s) if !reads_source(reader, &s) => DocState::Unknown,
         Some(s) if crate::sources::is_pending(&s.status) => DocState::NotReady,
         Some(_) => DocState::Ready,
         None => DocState::Unknown,
@@ -2426,15 +2462,18 @@ pub enum Selector {
 /// passages is read from its old chunks.
 pub async fn read_passages(
     store: &Store,
+    reader: &Reader,
     document_id: &str,
     sel: Selector,
     max: usize,
 ) -> anyhow::Result<Vec<PassageRow>> {
     let rows = match sel {
-        Selector::Page(page) => passages_on_page(store, document_id, page, max).await?,
-        Selector::Ords { from, to } => passages_by_ord(store, document_id, from, to, max).await?,
+        Selector::Page(page) => passages_on_page(store, reader, document_id, page, max).await?,
+        Selector::Ords { from, to } => {
+            passages_by_ord(store, reader, document_id, from, to, max).await?
+        }
     };
-    if !rows.is_empty() {
+    if !rows.is_empty() || !reads_legacy(store, reader, document_id).await? {
         return Ok(rows);
     }
     let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
@@ -2464,9 +2503,11 @@ pub async fn read_passages(
 /// `retrieve` for a context query (the agent's `search` tool and `POST
 /// routes::CONTEXT_SEARCH`, one path): packed to `q.budget`, or to the pipeline's budget
 /// when it has none, against `route`'s window.
+#[allow(clippy::too_many_arguments)]
 pub async fn context_search(
     state: &AppState,
     q: &margin_shared::context::ContextQuery,
+    reader: &Reader,
     route: Route,
     provider: Option<Provider>,
     purpose: RetrievalPurpose,
@@ -2480,7 +2521,7 @@ pub async fn context_search(
         &Request {
             plan: QueryPlan::single(&q.text),
             scope: q.scope.clone(),
-            access: q.access.clone(),
+            reader: reader.clone(),
             modalities: q.modalities.clone(),
             k: q.k as usize,
             budget,
@@ -2499,6 +2540,7 @@ pub async fn context_search(
 /// (the index on `document_id` finds them).
 pub async fn passages_by_ord(
     store: &Store,
+    reader: &Reader,
     document_id: &str,
     from: u32,
     to: u32,
@@ -2507,15 +2549,20 @@ pub async fn passages_by_ord(
     let to = to
         .max(from)
         .min(from.saturating_add(max.saturating_sub(1) as u32));
+    let mut binds = reader.binds();
+    binds.extend([
+        ("d", json!(document_id)),
+        ("from", json!(from)),
+        ("to", json!(to)),
+    ]);
     store
         .query_rows(
-            "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
-             AND modality = 'text' AND ord >= $from AND ord <= $to ORDER BY ord",
-            vec![
-                ("d", json!(document_id)),
-                ("from", json!(from)),
-                ("to", json!(to)),
-            ],
+            &format!(
+                "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
+                 AND modality = 'text' AND ord >= $from AND ord <= $to{} ORDER BY ord",
+                Reader::sql()
+            ),
+            binds,
         )
         .await
 }
@@ -2523,15 +2570,21 @@ pub async fn passages_by_ord(
 /// Text passages of `document_id` on `page`, in order, at most `max`.
 pub async fn passages_on_page(
     store: &Store,
+    reader: &Reader,
     document_id: &str,
     page: u32,
     max: usize,
 ) -> anyhow::Result<Vec<PassageRow>> {
+    let mut binds = reader.binds();
+    binds.extend([("d", json!(document_id)), ("page", json!(page))]);
     let mut rows: Vec<PassageRow> = store
         .query_rows(
-            "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
-             AND modality = 'text' AND page = $page ORDER BY ord",
-            vec![("d", json!(document_id)), ("page", json!(page))],
+            &format!(
+                "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
+                 AND modality = 'text' AND page = $page{} ORDER BY ord",
+                Reader::sql()
+            ),
+            binds,
         )
         .await?;
     rows.truncate(max);
@@ -2542,6 +2595,7 @@ pub async fn passages_on_page(
 /// of one path are one section).
 pub async fn document_outline(
     store: &Store,
+    reader: &Reader,
     document_id: &str,
 ) -> anyhow::Result<Vec<margin_shared::context::OutlineSection>> {
     #[derive(Deserialize)]
@@ -2556,14 +2610,19 @@ pub async fn document_outline(
         #[serde(default)]
         end_line: Option<i64>,
     }
+    let mut binds = reader.binds();
+    binds.push(("d", json!(document_id)));
     let mut rows: Vec<Loc> = store
         .query_rows(
-            "SELECT ord, section_path, page, start_line, end_line FROM passage \
-             WHERE document_id = $d AND modality = 'text' ORDER BY ord",
-            vec![("d", json!(document_id))],
+            &format!(
+                "SELECT ord, section_path, page, start_line, end_line FROM passage \
+                 WHERE document_id = $d AND modality = 'text'{} ORDER BY ord",
+                Reader::sql()
+            ),
+            binds,
         )
         .await?;
-    if rows.is_empty() {
+    if rows.is_empty() && reads_legacy(store, reader, document_id).await? {
         // A source not yet moved to passages: its old chunks (pages, no sections).
         let mut chunks: Vec<ChunkRow> = legacy_rows(store, db::CHUNK, document_id).await?;
         chunks.sort_by_key(|c| c.ord);
@@ -2617,25 +2676,30 @@ pub async fn document_outline(
 /// A document's picture: the one of `page`, else its first.
 pub async fn document_picture(
     store: &Store,
+    reader: &Reader,
     document_id: &str,
     page: Option<u32>,
 ) -> anyhow::Result<Option<PassageRow>> {
-    let (sql, mut binds) = match page {
-        Some(p) => (
-            "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
-             AND modality = 'picture' AND page = $page ORDER BY ord LIMIT 1",
-            vec![("page", json!(p))],
-        ),
-        None => (
-            "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
-             AND modality = 'picture' ORDER BY ord LIMIT 1",
-            Vec::new(),
-        ),
+    let mut binds = reader.binds();
+    let on_page = match page {
+        Some(p) => {
+            binds.push(("page", json!(p)));
+            " AND page = $page"
+        }
+        None => "",
     };
     binds.push(("d", json!(document_id)));
-    let rows: Vec<PassageRow> = store.query_rows(sql, binds).await?;
+    let sql = format!(
+        "SELECT *, record::id(id) AS id FROM passage WHERE document_id = $d \
+         AND modality = 'picture'{on_page}{} ORDER BY ord LIMIT 1",
+        Reader::sql()
+    );
+    let rows: Vec<PassageRow> = store.query_rows(&sql, binds).await?;
     if let Some(row) = rows.into_iter().next() {
         return Ok(Some(row));
+    }
+    if !reads_legacy(store, reader, document_id).await? {
+        return Ok(None);
     }
     // A source not yet moved to passages: its old picture rows.
     let media: Vec<MediaRow> = legacy_rows(store, db::MEDIA, document_id).await?;

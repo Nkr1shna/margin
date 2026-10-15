@@ -28,14 +28,13 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 
 | | Item | Notes |
 |---|---|---|
-| | Nothing right now | |
+| 🟡 | **L2 — access control inside search**: the reader's two conjuncts (`access CONTAINSANY $paths AND deny CONTAINSNONE $deny`) inside both legs of the hybrid query, by-id reads, the change feed and ⌘K; exact membership (no prefix rule); `passages-access-v1`; publishing with `PUT /api/audience/…` and its cascade; derived audiences; agents within owner ∩ ceiling, nameable in `deny`; the audit trail and the owner-only export; the Audience control and the Audit view; the leakage gate | [`docs/l2-brief.md`](l2-brief.md); first commit on `feat/l2`, areas L2-write → L2-retrieve → L2-audit → L2-evals → L2-app |
 
 ## Next (in order)
 
 | | Item | Plan | Notes |
 |---|---|---|---|
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
 | ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
 | ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |

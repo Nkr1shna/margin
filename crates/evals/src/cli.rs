@@ -54,13 +54,15 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent|dogfood|injection --service-url URL
+  run --suite retrieval|courses|agent|dogfood|injection|access --service-url URL
       [--variant NAME] [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
                         beside the dev service at URL; dogfood runs the retrieval suite
                         over the repository's docs/ with evals/golden/dogfood.jsonl;
                         injection asks evals/golden/injection.jsonl over the canaries in
-                        evals/corpus/injection/ on each configured provider
+                        evals/corpus/injection/ on each configured provider; access
+                        searches as every principal of evals/access.toml (leaks, the
+                        owner's ranks, latency)
   harvest --service-url URL [--since T] [--out FILE]
                         Turn agents' context-API searches and the passages they read
                         after them (trace rows with via \"mcp\") into candidate questions,
@@ -176,6 +178,8 @@ pub enum Suite {
     Dogfood,
     /// Prompt-injection resistance over `corpus/injection/` (`docs/phase5-brief.md` D2).
     Injection,
+    /// Leakage and the owner's unchanged ranks over `evals/access.toml` (L2 D8).
+    Access,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,10 +310,13 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 Some("agent") => Suite::Agent,
                 Some("dogfood") => Suite::Dogfood,
                 Some("injection") => Suite::Injection,
+                Some("access") => Suite::Access,
                 Some(other) => {
-                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood, injection)")
+                    bail!(
+                        "no suite \"{other}\" (retrieval, courses, agent, dogfood, injection, access)"
+                    )
                 }
-                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection"),
+                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection|access"),
             },
             variant,
             write_baseline: flag(take("write-baseline")),
@@ -600,6 +607,16 @@ mod tests {
                 .command
                 .is_live()
         );
+        // The access suite (L2 D8).
+        assert!(matches!(
+            p("run --suite access --service-url http://127.0.0.1:8787")
+                .unwrap()
+                .command,
+            Command::Run {
+                suite: Suite::Access,
+                ..
+            }
+        ));
         // The dogfood feed (plan-dogfood §6).
         assert_eq!(
             p("run --suite dogfood --service-url http://127.0.0.1:8787")

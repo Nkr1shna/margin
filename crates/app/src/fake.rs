@@ -380,6 +380,7 @@ pub fn sample_library() -> Library {
         status,
         created_at: ts(position),
         updated_at: ts(position),
+        audience_narrowed: false,
     };
     Library {
         topics: vec![
@@ -1727,6 +1728,7 @@ impl FakeState {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 written_with: None,
+                audience_narrowed: false,
             };
             self.library.lessons.push(lesson.clone());
             events.push(Event::LessonChanged {
@@ -4135,6 +4137,7 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         created_at: ts(60),
         chat_id: Some(chat_id.into()),
         written_with: None,
+        audience_narrowed: false,
     }
 }
 
@@ -4800,6 +4803,7 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
                 created_at: Utc::now(),
                 chat_id: Some(chat_id.into()),
                 written_with: None,
+                audience_narrowed: false,
             };
             // Only the chat's newest outline can create a course.
             let mut events = Vec::new();
@@ -5072,6 +5076,7 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             created_at: Utc::now(),
             updated_at: Utc::now(),
             written_with: None,
+            audience_narrowed: false,
         };
         s.library.lessons.push(lesson.clone());
         (

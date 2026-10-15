@@ -518,6 +518,9 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                     if run.valid { "" } else { "  INVALID" }
                 );
             }
+            Suite::Access => {
+                unimplemented!("L2-evals: margin-eval run --suite access")
+            }
             Suite::Injection => {
                 margin_evals::injection::run(
                     &env,

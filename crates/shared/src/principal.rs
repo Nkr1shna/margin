@@ -324,8 +324,17 @@ pub mod access_code {
     pub const MANAGED_BY_SOURCE: &str = "managed_by_source";
     /// 401: the token's person is disabled (the message is the sentence to show).
     pub const PERSON_DISABLED: &str = "person_disabled";
+    /// 400: an audience names a person who isn't an active person (L2).
+    pub const UNKNOWN_PERSON: &str = "unknown_person";
+    /// 400: an audience names an agent that isn't one of the caller's (L2).
+    pub const UNKNOWN_AGENT: &str = "unknown_agent";
+    /// 400: an audience names more than `audience::AUDIENCE_MAX` entries (L2).
+    pub const AUDIENCE_TOO_LARGE: &str = "audience_too_large";
+    /// 400: the audience of this kind of row can't be set by hand: lessons and notes
+    /// follow their topic, chats stay private (L2).
+    pub const NOT_A_UNIT: &str = "not_a_unit";
 
-    pub const ALL: [&str; 14] = [
+    pub const ALL: [&str; 18] = [
         ADMIN_REQUIRED,
         DEVICE_REQUIRED,
         AGENT_NOT_ALLOWED,
@@ -340,6 +349,10 @@ pub mod access_code {
         ALREADY_INVITED,
         MANAGED_BY_SOURCE,
         PERSON_DISABLED,
+        UNKNOWN_PERSON,
+        UNKNOWN_AGENT,
+        AUDIENCE_TOO_LARGE,
+        NOT_A_UNIT,
     ];
 }
 
@@ -391,7 +404,7 @@ mod tests {
         assert_eq!(ROOT_GROUP, "company");
         assert!(OrgRole::Owner.is_admin() && OrgRole::Admin.is_admin());
         assert!(!OrgRole::Member.is_admin());
-        assert_eq!(access_code::ALL.len(), 14);
+        assert_eq!(access_code::ALL.len(), 18);
     }
 
     #[test]

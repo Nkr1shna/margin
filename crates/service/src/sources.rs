@@ -1017,6 +1017,7 @@ fn old_passage(source_id: &str, modality: Modality, ord: i64, text: String) -> P
         origin: "source".into(),
         scope_ids: Vec::new(),
         access: vec![ACCESS_COMPANY.to_string()],
+        deny: Vec::new(),
         unit_id: format!("{source_id}:old:{ord}"),
         modality: modality.as_str().into(),
         ord,

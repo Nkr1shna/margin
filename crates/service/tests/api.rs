@@ -1635,6 +1635,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
                 created_at: now,
                 updated_at: now,
                 written_with: None,
+                audience_narrowed: false,
             },
             proposal_id: None,
             previous_body: prev.map(Into::into),
@@ -1714,6 +1715,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         created_at: now,
         chat_id: None,
         written_with: None,
+        audience_narrowed: false,
     };
     store.put(db::PROPOSAL, "p1", &proposal).await.unwrap();
     store
@@ -1890,6 +1892,7 @@ mod retrieval_api {
             origin: "agent".into(),
             scope_ids: scope.iter().map(|s| s.to_string()).collect(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: format!("{doc}:{id}"),
             modality: "text".into(),
             ord,
@@ -1922,6 +1925,7 @@ mod retrieval_api {
             bytes: 10,
             actor: "agent:test".into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1951,6 +1955,8 @@ mod retrieval_api {
                     id: "gone".into(),
                     generation: 3,
                     deleted_at: Utc::now(),
+                    access: Vec::new(),
+                    deny: Vec::new(),
                 },
             )
             .await

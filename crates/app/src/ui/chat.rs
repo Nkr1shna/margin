@@ -2869,6 +2869,7 @@ mod tests {
             created_at: Utc::now(),
             chat_id: Some("c1".into()),
             written_with: None,
+            audience_narrowed: false,
         }
     }
 

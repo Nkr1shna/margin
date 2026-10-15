@@ -49,9 +49,9 @@ pub struct Query {
     /// half re-embedded index never mixes vector spaces. Empty = no such filter.
     pub embedder: String,
     pub scope: Scope,
-    /// The caller's access paths; `None` = no filter (today's single owner). Retrievers
-    /// must apply it inside the index query (pre-filter), never to their results.
-    pub access: Option<Vec<String>>,
+    /// Who is reading. Retrievers apply `Reader::sql()` inside every index query
+    /// (pre-filter), never to their results.
+    pub reader: Reader,
     /// Empty means every modality.
     pub modalities: Vec<Modality>,
     /// Candidates wanted from this stage.
@@ -59,6 +59,68 @@ pub struct Query {
     pub budget_tokens: usize,
     pub images_max: usize,
     pub diversity: Diversity,
+}
+
+/// Who is reading: bound as `$paths` and `$deny` inside every index statement (L2 D1).
+/// Built from a `Principal` in the service (`Reader::of`), from the golden principals in
+/// the eval runner. There is no "everything" reader.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct Reader {
+    /// The expanded read set: `person/<id>`, `company`, every group and ancestor; for an
+    /// agent, `owner ∩ ceiling ∪ { agent/<id> }`.
+    pub paths: Vec<String>,
+    /// What a `deny` entry can name for this reader: the person's paths; for an agent,
+    /// the owner's `deny_ids ∪ { agent/<id> }` (a deny on the owner denies the agent).
+    pub deny_ids: Vec<String>,
+}
+
+impl Reader {
+    /// The reader a principal is: the only constructor outside tests and the eval
+    /// fixture. Both arrays sorted and de-duplicated (the retrieval cache keys on them).
+    pub fn of(p: &crate::principal::Principal) -> Self {
+        Self::sorted(p.paths.clone(), p.deny_ids.clone())
+    }
+
+    /// A reader with these arrays, sorted and de-duplicated.
+    pub fn sorted(mut paths: Vec<String>, mut deny_ids: Vec<String>) -> Self {
+        paths.sort();
+        paths.dedup();
+        deny_ids.sort();
+        deny_ids.dedup();
+        Self { paths, deny_ids }
+    }
+
+    /// The two conjuncts every statement over `passage` content carries, inside the
+    /// scan. Exact membership: a reader in `company` does not read `company/sales`.
+    pub fn sql() -> &'static str {
+        " AND access CONTAINSANY $paths AND deny CONTAINSNONE $deny"
+    }
+
+    /// The same two conjuncts for a statement over `document` (and the library tables),
+    /// whose rows keep their fields under `doc`.
+    pub fn doc_sql() -> &'static str {
+        " AND doc.access CONTAINSANY $paths AND doc.deny CONTAINSNONE $deny"
+    }
+
+    /// `("paths", ..)` and `("deny", ..)`.
+    pub fn binds(&self) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("paths", serde_json::json!(self.paths)),
+            ("deny", serde_json::json!(self.deny_ids)),
+        ]
+    }
+
+    /// Whether this reader reads a row with `access` and `deny`: the Rust twin of
+    /// `sql()`, for rows already read by id (a document's name for the rewriter).
+    pub fn allows(&self, access: &[String], deny: &[String]) -> bool {
+        access.iter().any(|a| self.paths.contains(a))
+            && !deny.iter().any(|d| self.deny_ids.contains(d))
+    }
+
+    /// Reads nothing (no path): every query comes back empty without running.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
 }
 
 /// How the packer spreads its picks.
@@ -893,6 +955,7 @@ mod tests {
                 origin: "source".into(),
                 scope_ids: Vec::new(),
                 access: vec![margin_shared::context::ACCESS_COMPANY.to_string()],
+                deny: Vec::new(),
                 unit_id: format!("s1:page:{ord}"),
                 modality: "text".into(),
                 ord,

@@ -685,6 +685,7 @@ async fn read_tools_answer_from_the_library() {
                 section_path: None,
             }],
             written_with: None,
+            audience_narrowed: false,
         },
         proposal_id: None,
         previous_body: None,

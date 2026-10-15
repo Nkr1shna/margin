@@ -32,6 +32,7 @@ use serde::Deserialize;
 
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::pipeline::Reader;
 use crate::principal::{CurrentPrincipal, Principal};
 use crate::retrieval::{self, BadScope, DocState};
 use crate::state::{AppState, new_id};
@@ -59,9 +60,10 @@ fn not_owner() -> AppError {
     )
 }
 
-/// 404 for an unknown document, 409 `not_ready` while it is first being indexed.
-async fn readable(state: &AppState, id: &str) -> AppResult<()> {
-    match retrieval::doc_state(&state.store, id).await? {
+/// 404 for an unknown document (or one `reader` can't read), 409 `not_ready` while it
+/// is first being indexed.
+async fn readable(state: &AppState, reader: &Reader, id: &str) -> AppResult<()> {
+    match retrieval::doc_state(&state.store, reader, id).await? {
         DocState::Ready => Ok(()),
         DocState::NotReady => Err(not_ready()),
         DocState::Unknown => Err(AppError::not_found("document")),
@@ -126,12 +128,15 @@ pub async fn search(
     if q.k == 0 {
         return Err(AppError::bad_request("k must be at least 1."));
     }
-    q.access = Some(query_access(&p, q.access.take())?);
+    // A narrowed `access` never loosens a deny: the denials are the principal's.
+    let paths = query_access(&p, q.access.take())?;
+    let reader = Reader::sorted(paths, p.deny_ids.clone());
     let found = trace::with_principal(
         p.id.clone(),
         retrieval::context_search(
             &state,
             &q,
+            &reader,
             Route::Chat,
             None,
             RetrievalPurpose::Context,
@@ -152,10 +157,12 @@ pub async fn search(
 /// `GET routes::context_document_outline(id)`.
 pub async fn outline(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<String>,
 ) -> AppResult<Json<DocumentOutline>> {
-    readable(&state, &id).await?;
-    let sections = retrieval::document_outline(&state.store, &id).await?;
+    let reader = Reader::of(&p);
+    readable(&state, &reader, &id).await?;
+    let sections = retrieval::document_outline(&state.store, &reader, &id).await?;
     Ok(Json(DocumentOutline {
         document_id: id,
         sections,
@@ -180,9 +187,11 @@ pub async fn passages(
     if q.to < q.from {
         return Err(AppError::bad_request("`to` comes before `from`."));
     }
-    readable(&state, &id).await?;
+    let reader = Reader::of(&p);
+    readable(&state, &reader, &id).await?;
     let rows = retrieval::read_passages(
         &state.store,
+        &reader,
         &id,
         retrieval::Selector::Ords {
             from: q.from,

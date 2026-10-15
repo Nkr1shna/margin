@@ -44,12 +44,17 @@ pub struct Document {
     /// `owner` or `agent:<name>`: who wrote it.
     #[serde(default = "owner")]
     pub actor: String,
-    /// Who may see it, as hierarchical access paths: "company", "company/engineering",
-    /// "company/engineering/platform". A reader whose paths include one of these, or a
-    /// prefix of one, may see the document. Copied onto every passage at ingest;
-    /// retrieval filters by it inside the index query. Not enforced yet (the seam only).
-    #[serde(default = "company")]
+    /// Who may read it: principal ids and group paths (`principal`), the audience of
+    /// the row that owns it (L2 D2). A reader whose expanded paths hold one of these
+    /// reads it (exact membership; the hierarchy is in the reader's expansion). Copied
+    /// onto every passage at ingest; retrieval filters by it inside the index query.
+    /// Read empty, it is private to `owner`.
+    #[serde(default)]
     pub access: Vec<String>,
+    /// Principal ids and group paths refused even when `access` admits them; copied
+    /// onto every passage with `access` (L2).
+    #[serde(default)]
+    pub deny: Vec<String>,
     /// The person whose row the document indexes (an agent's documents: its owner).
     /// `None` only before the `people-v1` migration.
     #[serde(default)]
@@ -62,12 +67,9 @@ fn owner() -> String {
     "owner".into()
 }
 
-/// The access path everything belongs to unless said otherwise.
+/// The root group: everyone in the organisation. Nothing is in it unless published
+/// to it (L2).
 pub const ACCESS_COMPANY: &str = "company";
-
-fn company() -> Vec<String> {
-    vec![ACCESS_COMPANY.into()]
-}
 
 /// Where a document comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,9 +186,10 @@ pub struct ContextQuery {
     /// of them; `None` packs to the pipeline's `PipelineConfig.budget`.
     #[serde(default)]
     pub budget: Option<Budget>,
-    /// The caller's access paths: only passages whose `access` the caller may see are
-    /// searched (a pre-filter in the index query, never a post-filter). `None` = the
-    /// caller's own grants (today everything).
+    /// Narrows the caller's access paths to these (each must be one of the caller's:
+    /// else 400 `bad_access`): only passages whose `access` holds one of them are
+    /// searched (a pre-filter in the index query, never a post-filter). `None` = all
+    /// of the caller's paths. The caller's denials always apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<Vec<String>>,
 }
@@ -252,6 +255,11 @@ pub struct ContextIngest {
     #[serde(default = "text_kind")]
     pub kind: SourceKind,
     pub text: String,
+    /// Who may read it. `None`: private to the agent's owner (and the agent). An agent
+    /// may name only paths within its own (else 400 `bad_access`), a person any group,
+    /// active person or own agent (L2 D3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<crate::audience::Audience>,
 }
 
 fn text_kind() -> SourceKind {
@@ -279,6 +287,89 @@ pub struct ContextChanges {
 pub const CHANGES_PAGE_DEFAULT: usize = 100;
 /// The most one page lists.
 pub const CHANGES_PAGE_MAX: usize = 500;
+
+// ---------------------------------------------------------------------------
+// Audit (L2 D7)
+// ---------------------------------------------------------------------------
+
+/// What an audit row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditKind {
+    /// A topic's, folder's, source's or agent document's audience was set.
+    AudienceChange,
+    /// A person's direct memberships changed (by an admin, or an invitation accepted).
+    MembershipChange,
+    /// A group was created, renamed or deleted.
+    GroupChange,
+    /// A person's role or state changed.
+    PersonChange,
+    /// An agent's ceiling changed, or it was disabled or deleted.
+    AgentChange,
+    /// An agent token was minted or revoked (its prefix only).
+    AgentToken,
+    /// `margin-service export` ran on the service host.
+    Export,
+}
+
+impl AuditKind {
+    pub const ALL: [AuditKind; 7] = [
+        AuditKind::AudienceChange,
+        AuditKind::MembershipChange,
+        AuditKind::GroupChange,
+        AuditKind::PersonChange,
+        AuditKind::AgentChange,
+        AuditKind::AgentToken,
+        AuditKind::Export,
+    ];
+
+    /// The `kind` of `routes::AUDIT`'s query and of the row's key.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuditKind::AudienceChange => "audience_change",
+            AuditKind::MembershipChange => "membership_change",
+            AuditKind::GroupChange => "group_change",
+            AuditKind::PersonChange => "person_change",
+            AuditKind::AgentChange => "agent_change",
+            AuditKind::AgentToken => "agent_token",
+            AuditKind::Export => "export",
+        }
+    }
+}
+
+/// What an audit row is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSubject {
+    /// "topic", "workspace", "source", "document", "person", "group" or "agent".
+    pub kind: String,
+    pub id: String,
+}
+
+/// One change to who may read or do what (`GET routes::AUDIT`, admins). `before` and
+/// `after` hold ids, paths, roles, ceilings and token prefixes: never content, never
+/// names of rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRow {
+    pub kind: AuditKind,
+    pub at: DateTime<Utc>,
+    /// Who made the change: `person/<id>`, `agent/<id>`, or `host/<unix user>` for an
+    /// export.
+    pub actor: crate::principal::PrincipalId,
+    /// An agent's owner when the actor is an agent.
+    #[serde(default)]
+    pub on_behalf_of: Option<crate::principal::PrincipalId>,
+    pub subject: AuditSubject,
+    #[serde(default)]
+    pub before: serde_json::Value,
+    #[serde(default)]
+    pub after: serde_json::Value,
+    #[serde(default)]
+    pub device_id: Option<Id>,
+    /// The subject's name, joined by `GET routes::AUDIT` only when the admin can read
+    /// the row ("a topic of @alice" otherwise); never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_name: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Traces (§2.11)
@@ -711,6 +802,7 @@ mod tests {
                 bytes: 10,
                 actor: "owner".into(),
                 access: vec!["company/engineering".into()],
+                deny: vec!["person/bob".into()],
                 created_at: at(),
                 updated_at: at(),
             };
@@ -723,7 +815,8 @@ mod tests {
             "created_at": "2025-10-09T08:53:20Z", "updated_at": "2025-10-09T08:53:20Z"
         }))
         .unwrap();
-        assert_eq!(old.access, vec![ACCESS_COMPANY.to_string()]);
+        // L2: a document read without an audience is private to its owner (empty).
+        assert!(old.access.is_empty() && old.deny.is_empty());
         assert_eq!(old.actor, "owner");
         let json = round_trip(&Origin::FolderFile {
             workspace_id: "w".into(),
@@ -883,5 +976,49 @@ mod tests {
         });
         let empty: AlertList = serde_json::from_value(json!({})).unwrap();
         assert_eq!(empty, AlertList::default());
+    }
+
+    #[test]
+    fn audit_rows_and_ingest_audiences_round_trip() {
+        for kind in AuditKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+        let row = AuditRow {
+            kind: AuditKind::AudienceChange,
+            at: at(),
+            actor: "person/alice".into(),
+            on_behalf_of: None,
+            subject: AuditSubject {
+                kind: "topic".into(),
+                id: "t1".into(),
+            },
+            before: json!({"access": ["person/alice"], "deny": []}),
+            after: json!({"access": ["person/alice", "company"], "deny": ["person/bob"]}),
+            device_id: Some("d1".into()),
+            subject_name: None,
+        };
+        let json = round_trip(&row);
+        assert!(json.get("subject_name").is_none());
+        let minimal: AuditRow = serde_json::from_value(json!({
+            "kind": "export", "at": "2025-10-09T08:53:20Z", "actor": "host/root",
+            "subject": {"kind": "person", "id": "p1"}
+        }))
+        .unwrap();
+        assert!(minimal.before.is_null() && minimal.device_id.is_none());
+
+        let old: ContextIngest = serde_json::from_value(json!({
+            "name": "n", "origin": {"origin": "agent", "name": "x"}, "text": "t"
+        }))
+        .unwrap();
+        assert_eq!(old.audience, None);
+        let json = round_trip(&old);
+        assert!(json.get("audience").is_none());
+        round_trip(&ContextIngest {
+            audience: Some(crate::audience::Audience {
+                access: vec!["company/engineering".into()],
+                deny: vec![],
+            }),
+            ..old
+        });
     }
 }

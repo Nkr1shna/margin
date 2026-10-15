@@ -1488,6 +1488,35 @@ impl Harness {
         self.http.put(self.u(path)).bearer_auth(token)
     }
 
+    /// `PUT routes::audience(unit, id)` as `token` (L2): the response, for the caller to
+    /// check (200 with the stored `Audience`, or the refusal).
+    pub async fn publish(
+        &self,
+        token: &str,
+        unit: margin_shared::AudienceUnit,
+        id: &str,
+        audience: &margin_shared::Audience,
+    ) -> reqwest::Response {
+        self.put(token, &margin_shared::routes::audience(unit, id))
+            .json(audience)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// `POST routes::CONTEXT_SEARCH` over the whole library as `token`'s principal (L2):
+    /// the hits, which must be only what that reader may read.
+    pub async fn reader_search(&self, token: &str, q: &str) -> Vec<margin_shared::context::Hit> {
+        let r = self
+            .post(token, margin_shared::routes::CONTEXT_SEARCH)
+            .json(&json!({"text": q, "scope": {"scope": "library"}, "k": 24}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        r.json().await.unwrap()
+    }
+
     /// Stores an OpenAI API key and `test-model` in each of its slots.
     pub async fn configure_ai(&self, token: &str) {
         let r = self

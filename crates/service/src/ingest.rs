@@ -37,8 +37,8 @@ use margin_embed::{
     audio_windows, sample_ms,
 };
 use margin_shared::context::{
-    ACCESS_COMPANY, ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality,
-    Origin, TraceKind, TraceRow,
+    ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality, Origin,
+    TraceKind, TraceRow,
 };
 use margin_shared::{Chat, ChatItemKind, Event, Id, Note, Source, SourceStatus};
 use serde::{Deserialize, Serialize};
@@ -111,6 +111,12 @@ pub struct Tombstone {
     pub id: Id,
     pub generation: u64,
     pub deleted_at: DateTime<Utc>,
+    /// The deleted document's audience, copied at deletion: the change feed lists the
+    /// deletion only to readers who could read the document (L2 D5).
+    #[serde(default)]
+    pub access: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// Documents waiting to be indexed, one at a time (chat files ahead of folder files).
@@ -198,7 +204,10 @@ fn new_document(id: Id, project_id: Id, origin: Origin, name: &str, kind: Source
         status: DocumentStatus::Indexing { done: 0, total: 0 },
         generation: 0,
         bytes: 0,
-        access: vec![ACCESS_COMPANY.to_string()],
+        // Private until `upsert_document` stamps its owner's (L2 D2: nothing is
+        // `company` unless published).
+        access: Vec::new(),
+        deny: Vec::new(),
         created_at: now,
         updated_at: now,
     }
@@ -223,14 +232,10 @@ async fn find_by_origin(
     Ok(found.into_iter().next())
 }
 
-/// Who hears about a document (`DocumentChanged`): its owner (L1; L2 widens it to the
-/// document's audience). A document from before `people-v1` is the bootstrap owner's.
+/// Who hears about a document (`DocumentChanged`): its audience (L2 D3; read empty,
+/// its owner, the bootstrap owner before `people-v1`).
 pub fn document_audience(doc: &Document) -> Audience {
-    Audience::Person(
-        doc.owner
-            .clone()
-            .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string()),
-    )
+    Audience::Paths(crate::retrieval::document_access(doc))
 }
 
 /// Sends `DocumentChanged` to the document's audience.
@@ -295,6 +300,13 @@ async fn upsert_document_locked(
             };
             let mut doc = new_document(id, project_id.to_string(), origin, name, kind);
             doc.actor = actor.to_string();
+            // Private to its owner by default (L2 D2); `audience::of_document` stamps
+            // the owning row's audience (L2-write).
+            doc.access = vec![margin_shared::person_id(
+                owner
+                    .as_deref()
+                    .unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID),
+            )];
             doc.owner = owner;
             state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             doc
@@ -355,6 +367,9 @@ pub async fn source_document_locked(
             doc.bytes = source.bytes;
             doc.created_at = source.created_at;
             doc.owner = owner;
+            // The source's audience (L2 D2: the row that owns the document).
+            doc.access = source.audience();
+            doc.deny = source.deny().to_vec();
             state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             Ok(doc)
         }
@@ -565,12 +580,14 @@ async fn library_text(
 /// Call with the write lock held. Nothing happens for a document that doesn't exist.
 pub async fn delete_document_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
     state.store.delete_document_passages(id).await?;
-    if document(state, id).await?.is_some() {
+    if let Some(doc) = document(state, id).await? {
         state.store.delete(db::DOCUMENT, id).await?;
         let tomb = Tombstone {
             id: id.to_string(),
             generation: state.store.next_generation().await?,
             deleted_at: Utc::now(),
+            access: crate::retrieval::document_access(&doc),
+            deny: doc.deny,
         };
         state.store.put(db::DOCUMENT_DELETED, id, &tomb).await?;
         state.retrieval_cache.invalidate(id);
@@ -1137,7 +1154,8 @@ fn items_of(
         document_id: id.clone(),
         origin: origin_name(&doc.origin).to_string(),
         scope_ids: Vec::new(),
-        access: doc.access.clone(),
+        access: crate::retrieval::document_access(doc),
+        deny: doc.deny.clone(),
         unit_id: String::new(),
         modality: modality.as_str().to_string(),
         ord: 0,
@@ -1296,6 +1314,7 @@ fn moved(stored: &PassageRow, now: &PassageRow) -> bool {
         || stored.origin != now.origin
         || stored.scope_ids != now.scope_ids
         || stored.access != now.access
+        || stored.deny != now.deny
         || stored.unit_id != now.unit_id
         || stored.modality != now.modality
         || stored.ord != now.ord
@@ -1640,7 +1659,8 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
     let mut items = prepared.items;
     for item in &mut items {
         item.row.scope_ids = scope.clone();
-        item.row.access = doc.access.clone();
+        item.row.access = crate::retrieval::document_access(&doc);
+        item.row.deny = doc.deny.clone();
         item.row.project_id = doc.project_id.clone();
         // The backend that embeds them (`Embedder::version`), not the default constant.
         item.row.embedder = embedder.version().to_string();
@@ -2098,6 +2118,7 @@ pub async fn reembed(state: &AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use margin_shared::context::ACCESS_COMPANY;
 
     #[test]
     fn stale_rows_are_rewritten_not_deleted() {
@@ -2137,6 +2158,7 @@ mod tests {
             origin: "source".into(),
             scope_ids: Vec::new(),
             access: vec![ACCESS_COMPANY.into()],
+            deny: Vec::new(),
             unit_id: id.into(),
             modality: "text".into(),
             ord,
@@ -2261,7 +2283,7 @@ mod tests {
         );
         assert_eq!(items[2].row.id, format!("d1:{}", items[2].row.chunk_hash));
         assert!(items.iter().all(|i| i.row.embedder == EMBEDDER_VERSION
-            && i.row.access == [ACCESS_COMPANY]
+            && i.row.access == ["person/bootstrap"]
             && i.row.origin == "source"));
     }
 
@@ -2335,6 +2357,11 @@ mod tests {
         assert!(moved(&a, &b));
         let c = PassageRow {
             access: vec!["company/engineering".into()],
+            ..a.clone()
+        };
+        assert!(moved(&a, &c));
+        let c = PassageRow {
+            deny: vec!["person/bob".into()],
             ..a.clone()
         };
         assert!(moved(&a, &c));

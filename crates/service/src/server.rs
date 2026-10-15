@@ -34,9 +34,9 @@ use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
 use crate::turns::Turns;
 use crate::{
-    access, agents, alerts, ask, chats, context_api, embedding, events, folders, groups, ingest,
-    invitations, library, media, people, principal, providers, retrieval, search, settings,
-    sources, trace, turns, uploads, version, video, workspaces,
+    access, agents, alerts, ask, audience, audit, chats, context_api, embedding, events, folders,
+    groups, ingest, invitations, library, media, people, principal, providers, retrieval, search,
+    settings, sources, trace, turns, uploads, version, video, workspaces,
 };
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -162,8 +162,12 @@ impl Service {
 
         // Traces first, so recovery and the workers are traced.
         trace::start(&state);
+        audit::start(&state);
         // The bootstrap owner and every existing row's owner, once (L1, `people-v1`).
         people::migrate(&state).await?;
+        // Every document and passage re-stamped from the row that owns it, once (L2,
+        // `passages-access-v1`).
+        audience::migrate(&state).await?;
         let resume = recover(&state).await?;
         if let Err(e) = uploads::purge_stale(&state).await {
             tracing::warn!("couldn't clear unfinished uploads: {e:#}");
@@ -404,6 +408,12 @@ pub fn router(state: AppState) -> Router {
             "/api/agents/{id}/token",
             post(agents::mint_token).delete(agents::revoke_token),
         )
+        // Audiences and the audit trail (L2).
+        .route(
+            "/api/audience/{unit}/{id}",
+            get(audience::get_audience).put(audience::put_audience),
+        )
+        .route(routes::AUDIT, get(audit::list))
         // Inside `require_principal`, so it sees the principal.
         .route_layer(middleware::from_fn(principal::refuse_agents));
 

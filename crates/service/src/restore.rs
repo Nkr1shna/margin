@@ -861,6 +861,7 @@ mod data_tests {
             bytes: 3,
             actor: "owner".into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -874,6 +875,7 @@ mod data_tests {
             origin: "source".into(),
             scope_ids: vec![],
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: "u".into(),
             modality: "text".into(),
             ord: 0,

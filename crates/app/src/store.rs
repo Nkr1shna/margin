@@ -275,6 +275,8 @@ impl LibraryState {
             }
             // The live loop reloads the library when it is this person's (`main.rs`).
             Event::AccessChanged { .. } => {}
+            // L2: L2-app drops the revoked units and keeps the admins' audit rows.
+            Event::AudienceRevoked { .. } | Event::AuditAppended { .. } => {}
             Event::Hello { server_version } => self.server_version = Some(server_version),
             Event::TopicChanged { topic } => {
                 self.topics.insert(topic.id.clone(), topic);
@@ -860,6 +862,7 @@ pub(crate) mod tests {
             created_at: ts(position),
             updated_at: ts(position),
             written_with: None,
+            audience_narrowed: false,
         }
     }
 
@@ -1242,6 +1245,7 @@ pub(crate) mod tests {
             created_at: ts(0),
             chat_id: None,
             written_with: None,
+            audience_narrowed: false,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -1281,6 +1285,7 @@ pub(crate) mod tests {
             created_at: ts(0),
             chat_id: None,
             written_with: None,
+            audience_narrowed: false,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),

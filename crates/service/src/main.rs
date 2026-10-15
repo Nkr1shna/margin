@@ -2,6 +2,7 @@
 //! `margin-service download-model [--embedder NAME] [--reranker NAME]` |
 //! `margin-service scrub-restored` | `margin-service check-data <dir>` |
 //! `margin-service backup [--label NAME]` |
+//! `margin-service export --person <id> --out <dir>` |
 //! `margin-service version`
 
 use std::process::ExitCode;
@@ -12,7 +13,7 @@ use margin_service::config::{self, Config};
 use margin_service::engines::model_download;
 use margin_service::engines::{AiGenerator, EmbedTools, VideoRenderer};
 use margin_service::server::{Options, Service, shutdown_signal};
-use margin_service::{restore, version};
+use margin_service::{export, restore, version};
 
 const USAGE: &str = "\
 Usage:
@@ -34,6 +35,9 @@ Usage:
   margin-service check-data <dir>                    Check a data folder (a backup) on a copy:
                                                      tables, migrations, source files
   margin-service backup [--label NAME]               Back up the data folder now
+  margin-service export --person <id> --out <dir>    With the service stopped: export one
+                                                     person's library from a copy (logged,
+                                                     shown in the Audit view)
   margin-service version                             Print the build's version and commit
 ";
 
@@ -57,6 +61,13 @@ fn main() -> ExitCode {
             [flag, label] if flag == "--label" => backup(Some(label)),
             _ => {
                 eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        },
+        Some("export") => match export::parse_args(&args[1..]) {
+            Ok((person, out)) => export_person(&person, &out),
+            Err(e) => {
+                eprintln!("{e}\n\n{usage}");
                 return ExitCode::from(2);
             }
         },
@@ -338,6 +349,12 @@ fn check_data(dir: &std::path::Path) -> anyhow::Result<()> {
         );
         Ok(())
     })
+}
+
+/// Exports one person's library from the configured data folder (L2 D7).
+fn export_person(person: &str, out: &std::path::Path) -> anyhow::Result<()> {
+    let config = Config::load(&config::config_path())?;
+    export::run(&config.data_dir, person, out)
 }
 
 /// Backs up the configured data folder (the service must be stopped) and checks the

@@ -789,6 +789,7 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
                 section_path: None,
             }],
             written_with: None,
+            audience_narrowed: false,
         },
         proposal_id: None,
         previous_body: None,

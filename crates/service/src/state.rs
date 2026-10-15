@@ -964,10 +964,11 @@ impl Ownership {
     }
 }
 
-/// Whether `p` may read `row` (its audience meets `p`'s expanded paths). `deny` is
-/// written and read back but not evaluated until L2.
+/// Whether `p` may read `row`: its audience meets `p`'s expanded paths and its `deny`
+/// names none of `p`'s `deny_ids` (L2; exact membership, admins not exempt).
 pub fn can_read(p: &Principal, row: &(impl Owned + ?Sized)) -> bool {
     row.audience().iter().any(|a| p.paths.contains(a))
+        && !row.deny().iter().any(|d| p.deny_ids.contains(d))
 }
 
 /// `row` when `p` may read it, else 404 `what` (never 403: a row outside the caller's
@@ -998,15 +999,18 @@ pub fn not_owner() -> AppError {
 
 /// The SurrealQL condition a list query adds for the principal (`access_binds`): rows
 /// whose `access` meets `$paths` (the `<table>_access` indexes), and rows read with an
-/// empty `access` that are the caller's own (`Owned::audience`). `can_read` is applied
-/// to the result as well.
-pub const ACCESS_WHERE: &str = "(doc.access CONTAINSANY $paths \
-     OR (array::len(doc.access ?? []) = 0 AND (doc.owner ?? $bootstrap) = $person))";
+/// empty `access` that are the caller's own (`Owned::audience`); in both cases none of
+/// whose `deny` is one of `$deny` (L2, the `<table>_deny` indexes). `can_read` is
+/// applied to the result as well.
+pub const ACCESS_WHERE: &str = "((doc.access CONTAINSANY $paths \
+     OR (array::len(doc.access ?? []) = 0 AND (doc.owner ?? $bootstrap) = $person)) \
+     AND (doc.deny ?? []) CONTAINSNONE $deny)";
 
 /// The parameters `ACCESS_WHERE` reads.
 pub fn access_binds(p: &Principal) -> Vec<(&'static str, serde_json::Value)> {
     vec![
         ("paths", serde_json::json!(p.paths)),
+        ("deny", serde_json::json!(p.deny_ids)),
         ("person", serde_json::json!(p.person_id)),
         ("bootstrap", serde_json::json!(BOOTSTRAP_PERSON_ID)),
     ]

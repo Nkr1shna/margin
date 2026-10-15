@@ -413,7 +413,12 @@ pub async fn record_small(
     let purpose = index.retrieval_purpose();
     for q in env.paths.retrieval_golden()? {
         let r = index
-            .search_as(std::slice::from_ref(&q.query), &scope_of(q.scope), purpose)
+            .search_as(
+                &crate::access::company_reader(),
+                std::slice::from_ref(&q.query),
+                &scope_of(q.scope),
+                purpose,
+            )
             .await
             .map_err(|e| e.context(format!("query {}", q.id)))?;
         count(&r);
@@ -424,7 +429,12 @@ pub async fn record_small(
         };
         for i in 0..c.themes.len() {
             let r = index
-                .search_as(&query_plan(&c, i), &scope, RetrievalPurpose::Lesson)
+                .search_as(
+                    &crate::access::company_reader(),
+                    &query_plan(&c, i),
+                    &scope,
+                    RetrievalPurpose::Lesson,
+                )
                 .await
                 .map_err(|e| e.context(format!("course {} lesson {i}", c.id)))?;
             count(&r);
