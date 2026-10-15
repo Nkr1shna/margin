@@ -456,6 +456,8 @@ pub fn OutlineEditor(
             } else {
                 p { class: "muted", style: "margin: 0 0 12px", "New topic: ", b { style: "font-weight: 500; color: var(--fg)", "{outline.topic_title}" } }
             }
+            // The handlers below use the row index from this render; the draft may have
+            // changed since (two quick clicks), so they check it is still in range.
             for (i, (lesson, key)) in outline.lessons.iter().cloned().zip(row_keys).enumerate() {
                 div { key: "{key}", class: if *editing.read() { "ol-item editing" } else { "ol-item" },
                     span { class: "n", "{i + 1}" }
@@ -470,7 +472,7 @@ pub fn OutlineEditor(
                                 "aria-invalid": lesson.title.trim().is_empty().to_string(),
                                 "aria-describedby": lesson.title.trim().is_empty().then(|| ids.row(key, "err")),
                                 initial_value: "{lesson.title}",
-                                oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].title = v.clone()) },
+                                oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| if let Some(l) = o.lessons.get_mut(i) { l.title = v.clone() }) },
                             }
                             if lesson.title.trim().is_empty() {
                                 span { id: ids.row(key, "err"), class: "field-error", "Needs a title" }
@@ -481,7 +483,7 @@ pub fn OutlineEditor(
                                 placeholder: "One-line summary",
                                 disabled: accepting,
                                 initial_value: "{lesson.summary}",
-                                oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| o.lessons[i].summary = v.clone()) },
+                                oninput: move |e| { let v = e.value(); edit(&move |o: &mut Outline| if let Some(l) = o.lessons.get_mut(i) { l.summary = v.clone() }) },
                             }
                         }
                         div { class: "ol-tools",
@@ -495,7 +497,7 @@ pub fn OutlineEditor(
                                 initial_value: "{lesson.minutes}",
                                 oninput: move |e| {
                                     if let Ok(m) = e.value().parse::<u32>() {
-                                        edit(&move |o: &mut Outline| o.lessons[i].minutes = m.clamp(1, 180));
+                                        edit(&move |o: &mut Outline| if let Some(l) = o.lessons.get_mut(i) { l.minutes = m.clamp(1, 180) });
                                     }
                                 },
                             }
@@ -507,9 +509,9 @@ pub fn OutlineEditor(
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
-                                        edit(&move |o: &mut Outline| o.lessons.swap(i, i - 1));
-                                        keys.write().swap(i, i - 1);
-                                        focus_next.set(Some(ids.row(key, after_move(i - 1, n, true))));
+                                        edit(&move |o: &mut Outline| if i > 0 && i < o.lessons.len() { o.lessons.swap(i, i - 1) });
+                                        keys.write().swap(i, i.saturating_sub(1));
+                                        focus_next.set(Some(ids.row(key, after_move(i.saturating_sub(1), n, true))));
                                     }
                                 },
                                 Icon { name: "up" }
@@ -522,7 +524,7 @@ pub fn OutlineEditor(
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
-                                        edit(&move |o: &mut Outline| o.lessons.swap(i, i + 1));
+                                        edit(&move |o: &mut Outline| if i + 1 < o.lessons.len() { o.lessons.swap(i, i + 1) });
                                         keys.write().swap(i, i + 1);
                                         focus_next.set(Some(ids.row(key, after_move(i + 1, n, false))));
                                     }
@@ -536,11 +538,11 @@ pub fn OutlineEditor(
                                 onclick: {
                                     let ids = ids.clone();
                                     move |_| {
-                                        edit(&move |o: &mut Outline| { o.lessons.remove(i); });
+                                        edit(&move |o: &mut Outline| if i < o.lessons.len() && o.lessons.len() > 1 { o.lessons.remove(i); });
                                         let next = {
                                             let mut k = keys.write();
                                             k.remove(i);
-                                            k.at(i.min(n - 2))
+                                            k.at(i.min(n.saturating_sub(2)))
                                         };
                                         focus_next.set(next.map(|k| ids.row(k, "title")));
                                     }

@@ -4,7 +4,7 @@ The one place to see what's built, what's in flight and what's next. Update it i
 
 **Product:** a "Live context" app for a company's projects: humans through a voice-first GUI, agents through context, with learning (courses, lessons, quizzes) built in. Margin is a startup and the vision moves, so designs stay pluggable and every RAG/prompt/model change is measured by evals.
 
-**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
+**Branches:** work goes to a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
 
 Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting on the owner
 
@@ -23,27 +23,33 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
 | ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
 | ✅ | **R2 — rerank, query rewriting, prompt-version tracking**: `listwise-small` and `small-expand-v1` on the Small route, the `onnx-crossencoder` stage (ms-marco-MiniLM, downloaded on demand), `written_with` on lessons/proposals/videos, the prompt catalog and `evals/prompts.lock` in CI, recorded reranks/rewrites in the eval. Every stage stays `"none"` by default: variants until the eval promotes them | `docs/r2-brief.md` |
+| ✅ | **L2 — access control inside search**: the reader's two conjuncts (`access CONTAINSANY $paths AND deny CONTAINSNONE $deny`) inside both legs of the hybrid query, by-id reads, the change feed and ⌘K; exact group membership (no prefix rule); private by default with `passages-access-v1`; publishing (`PUT /api/audience/…`) with its cascade; derived lesson audiences; agents within owner ∩ ceiling and nameable in `deny`; the audit trail and the host-only export; the Audience control and Audit view in the app; the leakage gate in CI | [`docs/l2-brief.md`](l2-brief.md) |
 
 ## In progress
 
 | | Item | Notes |
 |---|---|---|
-| 🟡 | **L2 — access control inside search**: the reader's two conjuncts (`access CONTAINSANY $paths AND deny CONTAINSNONE $deny`) inside both legs of the hybrid query, by-id reads, the change feed and ⌘K; exact membership (no prefix rule); `passages-access-v1`; publishing with `PUT /api/audience/…` and its cascade; derived audiences; agents within owner ∩ ceiling, nameable in `deny`; the audit trail and the owner-only export; the Audience control and the Audit view; the leakage gate | [`docs/l2-brief.md`](l2-brief.md); first commit on `feat/l2`, areas L2-write → L2-retrieve → L2-audit → L2-evals → L2-app |
+| 🟡 | **App crash logging and the first panic fixes** (panic hook, log file, "quit unexpectedly" notice, the rename-while-saving crash) | branch `fix/app-crash-logs` |
+| 🟡 | **Provider settings defaults** (model slots filled, no Keychain copy, sensible default provider) | branch `fix/provider-defaults` |
 
 ## Next (in order)
 
-| | Item | Plan | Notes |
-|---|---|---|---|
-| ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
-| ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
-| ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
-| ⏳ | **L5 — voice-first** with ElevenLabs | `docs/plan-live-context.md` | |
-| ⏳ | **L6 — permission sync from GitHub + repository source** (code comes in this way) | `docs/plan-live-context.md` | |
+Each step is a vertical slice: a person can use it end to end on desktop, iPhone and Android when it lands. Order: keep the app stable, finish who-sees-what, make the knowledge base usable day to day, get more knowledge in, then run it for a company and ship to prod, then the live features.
+
+| | Slice | Items | Plan | Notes |
+|---|---|---|---|---|
+| ⏳ | **S0 — Stability** (from the three quality reviews) | Request ids and an info-level request log with error reference ids; supervised background workers and a real `/health`; CI scope detection fails closed; a mutex-poison policy (ONNX load outside its lock); workspace `[lints]` against unwrap/expect/panic; corrupt drafts and config quarantined, save failures logged; the 24 fixed sleeps in tests replaced with condition waits; cargo-deny, Dependabot, SHA-pinned actions, Android build hard-fails; a route-table contract test between the app's fake and the service, and an `ErrorCode` enum; keep the last few dev builds; offsite backup reports copy failures; a README and a correct HANDOFF header | quality review page | Runs beside L2; small items |
+| ⏳ | **S1 — Find and manage your knowledge** | Search inside files and chats with highlighted matches on the EmbeddingGemma hybrid pipeline (not plain text); a Files screen (open, rename, download, sort); trash with undo and restore; move and reorder topics, lessons and notes; copy an answer and a code block; toasts, help, feedback and the version everywhere | `docs/basics-brief.md` | After L2 (results respect the reader) |
+| ⏳ | **S2 — Bring knowledge in** | Office formats (docx, pptx, xlsx); a web page as a source; the share sheet on iOS and Android; repository source and GitHub permission sync (L6) | `docs/basics-brief.md`, `docs/plan-live-context.md` | L6 moves up: code comes in this way |
+| ⏳ | **S3 — Run it for a company, and ship** | Usage per person on L2's audit log; offboarding session, then removal with content reassignment and per-person export; **prod on Linux** (`margin-prod` guest) with the infra review's settings and runner fixes | `docs/basics-brief.md`, `docs/plan-deploy.md` | The point where a second company can be invited |
+| ⏳ | **S4 — Learn it properly: Q, serious quizzes** | Graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | Needs L2's per-person attempts |
+| ⏳ | **S5 — L3 inbox and @mentions** | For people and agents, with push notifications and deep links | `docs/plan-live-context.md` | |
+| ⏳ | **S6 — L4 meetings** | LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
+| ⏳ | **S7 — L5 voice-first** | ElevenLabs | `docs/plan-live-context.md` | |
 
 ## Later / ideas
 
-- 🗓 Office and e-book formats (`.docx .pptx .epub`) once an extractor exists.
+- 🗓 E-book formats (`.epub`) once an extractor exists.
 - 🗓 Audio and video in folders.
 - 🗓 R2's variants as defaults (listwise rerank for lessons, rewriting, the cross-encoder for agent search) once the eval earns it (`docs/r2-brief.md` §6); a `by-purpose` reranker if both rerankers win.
 - 🗓 Agents over MCP for other companies' tools (after L1's agent tokens).

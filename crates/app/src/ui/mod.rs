@@ -3,6 +3,7 @@ pub mod audit;
 pub mod chat;
 pub mod citations;
 pub mod common;
+pub mod crash;
 pub mod lesson;
 pub mod notes;
 pub mod organisation;

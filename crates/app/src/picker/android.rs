@@ -120,7 +120,7 @@ fn java<T>(f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>) -> Option<T> {
                 let _ = env.exception_describe();
                 let _ = env.exception_clear();
             }
-            eprintln!("picker: {error}");
+            tracing::warn!("picker: {error}");
             None
         }
     }
@@ -182,7 +182,7 @@ extern "system" fn on_picked<'local>(
         match strings(&mut env, &uris) {
             Ok(list) => Some(list),
             Err(error) => {
-                eprintln!("picker: couldn't read the picked documents: {error}");
+                tracing::warn!("picker: couldn't read the picked documents: {error}");
                 None
             }
         }
@@ -258,7 +258,7 @@ fn describe_tree(tree: String) -> Option<FolderPick> {
             handle: FolderHandle::AndroidTree { uri: tree },
         }),
         _ => {
-            eprintln!("picker: the picked folder couldn't be read");
+            tracing::warn!("picker: the picked folder couldn't be read");
             // Don't keep a grant for a folder that isn't attached.
             crate::folders::forget(&FolderHandle::AndroidTree { uri: tree });
             None
@@ -283,7 +283,7 @@ pub async fn pick_files() -> Option<Selection> {
 /// (empty: cancelled), or `None` when it couldn't be shown.
 async fn show(folder: bool) -> Option<Vec<String>> {
     let Some(looper) = EventLoopLooper::current() else {
-        eprintln!("picker: the app's thread has no looper");
+        tracing::warn!("picker: the app's thread has no looper");
         return None;
     };
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);

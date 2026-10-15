@@ -489,24 +489,21 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         Some("gpt-6-luna")
     );
 
-    // Neither: the turn fails with `no_model`'s message.
+    // Neither: chats run on OpenAI's shipped default model, never on an empty slot.
     h.patch(&t, "/api/settings")
         .json(&json!({"agent_model": null}))
         .send()
         .await
         .unwrap();
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["on the default"])));
     assert_eq!(send(&h, &t, &chat.id, "fourth").await.status(), 200);
-    let d = wait_chat(&h, &t, &chat.id, |d| {
-        matches!(d.chat.state, ChatState::Failed { .. })
-    })
-    .await;
-    assert!(
-        lines(&d)
-            .last()
-            .unwrap()
-            .starts_with("error (retry): Choose a model"),
-        "{:?}",
-        lines(&d)
+    let d = wait_chat(&h, &t, &chat.id, |d| d.items.len() == 8 && idle(d)).await;
+    assert_eq!(lines(&d)[7], "assistant: on the default");
+    assert_eq!(
+        h.generator.agent.requests()[3].model.as_deref(),
+        Some(margin_shared::OPENAI_DEFAULT_MODEL)
     );
 }
 

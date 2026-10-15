@@ -40,7 +40,7 @@ fn held(path: PathBuf) -> FolderPick {
             Ok(bytes) => Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
             Err(error) => {
                 // The path still works; only a later move of the folder isn't followed.
-                eprintln!("couldn't bookmark the folder: {error}");
+                tracing::warn!("couldn't bookmark the folder: {error}");
                 None
             }
         }

@@ -70,7 +70,7 @@ pub async fn patch_settings(
             }
         }
         if let Some(provider) = patch.default_provider {
-            row.default_provider = provider;
+            row.default_provider = Some(provider);
         }
         if let Some(effort) = patch.reasoning_effort {
             row.reasoning_effort = effort;

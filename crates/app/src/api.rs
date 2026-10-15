@@ -2925,6 +2925,28 @@ mod tests {
             .unwrap();
         assert!(!settings.has_claude_api_key);
 
+        // Until one is picked, the default provider is the first set up, as on the
+        // service: OpenAI while it has a key, Claude when only Claude has one.
+        assert_eq!(settings.default_provider, Provider::OpenAi);
+        api.patch_settings(&crate::ui::settings::key_patch(
+            Provider::Claude,
+            "sk-ant-test".into(),
+        ))
+        .await
+        .unwrap();
+        let settings = api
+            .patch_settings(&crate::ui::settings::key_patch(
+                Provider::OpenAi,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(settings.default_provider, Provider::Claude);
+        assert_eq!(
+            api.settings().await.unwrap().default_provider,
+            Provider::Claude
+        );
+
         // The default provider.
         let settings = api
             .patch_settings(&SettingsPatch {

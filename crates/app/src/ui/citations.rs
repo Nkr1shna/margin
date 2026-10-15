@@ -492,7 +492,7 @@ async fn fetch_transcript(app: AppCtx, source_id: Id) {
                 transcripts.write().insert(source_id, lines);
             }
         }
-        Err(e) => eprintln!("couldn't fetch the transcript of {source_id}: {e}"),
+        Err(e) => tracing::warn!("couldn't fetch the transcript of {source_id}: {e}"),
     }
 }
 
@@ -569,7 +569,7 @@ fn Lines(
                     Some(text.into())
                 }
                 Err(e) => {
-                    eprintln!("couldn't fetch the original for its lines: {e}");
+                    tracing::warn!("couldn't fetch the original for its lines: {e}");
                     None
                 }
             }

@@ -1803,8 +1803,11 @@ fn AgentDialog(
                             problem.set(None);
                             let Some(api) = app.api() else { return };
                             busy.set(true);
+                            // Not `*kind.peek()` in the match arm: its guard would last
+                            // through the request, and a change to the kind meanwhile panic.
+                            let new_kind = *kind.peek();
                             let result = match &edit {
-                                AgentEdit::Create => api.create_agent(&NewAgent { name: n, kind: *kind.peek(), ceiling: checked }).await,
+                                AgentEdit::Create => api.create_agent(&NewAgent { name: n, kind: new_kind, ceiling: checked }).await,
                                 AgentEdit::Rename(a) => api.patch_agent(&a.id, &AgentPatch { name: Some(n), ..Default::default() }).await,
                                 AgentEdit::Ceiling(a) => api.patch_agent(&a.id, &AgentPatch { ceiling: checked, ..Default::default() }).await,
                             };

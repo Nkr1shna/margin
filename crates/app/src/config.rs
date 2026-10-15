@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The service this build is pinned to: `MARGIN_DEFAULT_SERVICE_URL` at build time
@@ -194,11 +195,10 @@ pub fn load() -> LocalConfig {
     config_path().map(|p| load_from(&p)).unwrap_or_default()
 }
 
+/// The settings at `path`; defaults when there are none, or when the file was damaged
+/// (it is then set aside, see [`read_json`]).
 pub fn load_from(path: &Path) -> LocalConfig {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    read_json(path).unwrap_or_default()
 }
 
 pub fn save(config: &LocalConfig) -> Result<(), String> {
@@ -207,11 +207,65 @@ pub fn save(config: &LocalConfig) -> Result<(), String> {
 }
 
 pub fn save_to(path: &Path, config: &LocalConfig) -> Result<(), String> {
+    write_json(path, config)
+}
+
+/// Where a failure to keep something on this device goes: a file the app couldn't write
+/// (settings, unsaved note edits), or a damaged one it set aside. Stderr for now: the one
+/// place to route these to the app's log.
+pub fn report_save_failure(message: &str) {
+    tracing::warn!("{message}");
+}
+
+/// The JSON file at `path`, or `None` when there is none. A file that can't be read or
+/// parsed is renamed aside ([`corrupt_path`]) and reported, so the next save starts
+/// afresh without overwriting what was there.
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let parsed = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => Err(e.to_string()),
+    };
+    let why = match parsed {
+        Ok(value) => return Some(value),
+        Err(why) => why,
+    };
+    let aside = corrupt_path(path, chrono::Utc::now());
+    let message = match std::fs::rename(path, &aside) {
+        Ok(()) => format!(
+            "couldn't read {} ({why}); moved it to {} and started afresh",
+            path.display(),
+            aside.display()
+        ),
+        Err(e) => format!(
+            "couldn't read {} ({why}) nor move it aside ({e}); the next save replaces it",
+            path.display()
+        ),
+    };
+    report_save_failure(&message);
+    None
+}
+
+/// Where a damaged `path` is kept, beside it: `drafts.json.corrupt-20261015T093000.123Z`.
+pub fn corrupt_path(path: &Path, at: chrono::DateTime<chrono::Utc>) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(
+        "{name}.corrupt-{}",
+        at.format("%Y%m%dT%H%M%S%.3fZ")
+    ))
+}
+
+/// Writes `value` to `path` as JSON, through a temporary file so a crash never leaves
+/// half of it.
+pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
     }
-    let json = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).map_err(|e| format!("Couldn't write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("Couldn't save {}: {e}", path.display()))
@@ -286,6 +340,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         // Missing file -> defaults.
         assert_eq!(load_from(&path), LocalConfig::default());
+    }
+
+    #[test]
+    fn a_damaged_settings_file_is_set_aside_not_overwritten() {
+        let dir =
+            std::env::temp_dir().join(format!("margin-config-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("app.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_from(&path), LocalConfig::default());
+        assert!(!path.exists());
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let aside = names(&dir);
+        assert_eq!(aside.len(), 1);
+        assert!(aside[0].starts_with("app.json.corrupt-"), "{aside:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&aside[0])).unwrap(),
+            "{not json"
+        );
+        // The next save writes a fresh file beside the kept one.
+        let saved = LocalConfig {
+            zoom: 120,
+            ..LocalConfig::default()
+        };
+        save_to(&path, &saved).unwrap();
+        assert_eq!(load_from(&path), saved);
+        assert_eq!(names(&dir), vec!["app.json".to_string(), aside[0].clone()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_files_are_named_for_when_they_were_found() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-15T09:30:00.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            corrupt_path(Path::new("/d/drafts.json"), at),
+            Path::new("/d/drafts.json.corrupt-20261015T093000.123Z")
+        );
     }
 
     #[test]

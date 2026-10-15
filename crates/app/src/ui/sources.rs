@@ -77,7 +77,9 @@ fn pump(app: AppCtx) {
 }
 
 async fn upload(app: AppCtx, key: u64) {
-    let Some(upload) = app.uploads.peek().iter().find(|u| u.key == key).cloned() else {
+    // Bound first, so the `peek` guard is gone before `pump` writes the list.
+    let found = app.uploads.peek().iter().find(|u| u.key == key).cloned();
+    let Some(upload) = found else {
         return pump(app);
     };
     let Some(api) = app.api() else { return };

@@ -416,7 +416,7 @@ pub async fn create_chat(
     // the chat stays on it for good.
     let provider = match req.provider.or(p.person.settings.default_provider) {
         Some(provider) => provider,
-        None => state.settings_row().await?.default_provider,
+        None => state.default_provider().await?,
     };
     let own = Ownership::private(&p);
     let _w = state.write_lock.lock().await;
