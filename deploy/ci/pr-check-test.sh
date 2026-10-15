@@ -5,8 +5,8 @@
 #
 # Bodies: the empty template, a filled one with the attribution lines first and the
 # generated-by line last, a missing Testing section, an empty Testing section, missing or
-# placeholder release notes, bold headings. Sizes: under the budget, over the warning,
-# over the limit with and without `large-pr`, Cargo.lock and generated files not counted.
+# placeholder release notes, bold headings. Sizes: under the warning, over it, at and over
+# the limit (which nothing lifts), Cargo.lock and generated files not counted. Titles.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/pr-check.sh"
@@ -133,8 +133,9 @@ case "$last" in *warning*) ;; *) echo "FAIL 1,500 lines warns"; failures=$((fail
 
 printf 'crates/service/src/a.rs%s2000\ncrates/app/src/b.rs%s1500\n' "$tab" "$tab" > "$tmp/large.tsv"
 expect fail "3,500 lines" size "$tmp/large.tsv"
-expect fail "3,500 lines with another label" size "$tmp/large.tsv" bug
-expect pass "3,500 lines with large-pr" size "$tmp/large.tsv" bug large-pr
+
+printf 'crates/service/src/a.rs%s3000\n' "$tab" > "$tmp/limit.tsv"
+expect pass "exactly 3,000 lines" size "$tmp/limit.tsv"
 
 printf 'Cargo.lock%s9000\nevals/prompts.lock%s50\nevals/recorded/reranks.jsonl%s4000\nevals/baseline.json%s800\ncrates/app/icon/build/Assets.car%s8000\nCargo.toml%s3\n' \
   "$tab" "$tab" "$tab" "$tab" "$tab" "$tab" > "$tmp/generated.tsv"
@@ -143,6 +144,12 @@ case "$last" in *": 3"*) ;; *) echo "FAIL counted 3 lines: $last"; failures=$((f
 
 printf 'crates/a.rs%s\n' "$tab" > "$tmp/bad.tsv"
 expect fail "a file without a count" size "$tmp/bad.tsv"
+
+expect pass "an imperative title" title "Add a PR template"
+expect pass "a title with an area scope" title "service: Retry the export when the share is busy"
+expect fail "a conventional-commit title" title "fix: retry the export"
+expect fail "a scoped conventional-commit title" title "feat(app)!: new picker"
+expect fail "a title ending in a period" title "Add a PR template."
 
 if [ "$failures" = 0 ]; then
   echo "All pr-check tests passed."

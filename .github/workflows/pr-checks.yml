@@ -1,14 +1,15 @@
-# The pull request itself, not its code: the body has `## Testing` and `Release Notes:`
-# (.github/pull_request_template.md), and the change fits the size budget (over 1,000
-# changed lines warns, over 3,000 fails without the `large-pr` label). Both checks are
-# deploy/ci/pr-check.sh. Runs on a GitHub-hosted runner, so it never queues behind CI on
-# the self-hosted ones, and again when the body or the labels change.
+# The pull request itself, not its code, as Zed's danger checks do: the body has
+# `## Testing` and `Release Notes:` (.github/pull_request_template.md), the title has no
+# conventional-commit prefix, and the change fits the size limit (over 1,000 changed lines
+# warns, over 3,000 fails; nothing lifts it). All three are deploy/ci/pr-check.sh. Runs on
+# a GitHub-hosted runner, so it never queues behind CI on the self-hosted ones, and again
+# when the title or body is edited.
 name: PR checks
 
 on:
   pull_request:
     branches: [dev]
-    types: [opened, edited, reopened, synchronize, labeled, unlabeled, ready_for_review]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
@@ -20,7 +21,7 @@ concurrency:
 
 jobs:
   pr:
-    name: Body and size
+    name: Body, title and size
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -30,7 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The body, labels and author are read from the API rather than the event, so a re-run
+      # The title, body and author are read from the API rather than the event, so a re-run
       # sees the current ones. Fail closed: a read that fails fails the check.
       - name: Read the PR
         run: |
@@ -50,10 +51,10 @@ jobs:
           fi
           jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/body.md"
           sh deploy/ci/pr-check.sh body "$RUNNER_TEMP/body.md"
-      - name: Size budget
-        run: |
-          if jq -e '.labels | any(.name == "large-pr")' "$RUNNER_TEMP/pr.json" > /dev/null; then
-            sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv" large-pr
-          else
-            sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv"
-          fi
+      # The remaining checks run even when an earlier one failed, so one run lists every problem.
+      - name: Title
+        if: ${{ !cancelled() }}
+        run: sh deploy/ci/pr-check.sh title "$(jq -r '.title' "$RUNNER_TEMP/pr.json")"
+      - name: Size limit
+        if: ${{ !cancelled() }}
+        run: sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv"

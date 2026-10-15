@@ -2,15 +2,18 @@
 # A pull request's body and size, checked by .github/workflows/pr-checks.yml (and by hand):
 #
 #   deploy/ci/pr-check.sh body BODY_FILE
-#   deploy/ci/pr-check.sh size FILES_TSV [LABEL...]
+#   deploy/ci/pr-check.sh size FILES_TSV
+#   deploy/ci/pr-check.sh title TITLE
 #
 # body: the body has a `## Testing` section with something in it and a `Release Notes:`
 # line followed by at least one bullet, neither left as the template's placeholder.
 # HTML comments (the template's guidance, the attribution marker) don't count.
 #
 # size: FILES_TSV holds `path<TAB>changed lines` per file. Lines outside Cargo.lock and
-# generated files are counted: over 1,000 warns, over 3,000 fails unless LABELs include
-# `large-pr`, which the owner applies.
+# generated files are counted: over 1,000 warns, over 3,000 fails. No label or override
+# lifts the limit.
+#
+# title: no conventional-commit prefix (`fix:`), no trailing period.
 #
 # Offline test: sh deploy/ci/pr-check-test.sh
 set -eu
@@ -98,12 +101,6 @@ is_generated() {
 }
 
 check_size() {
-  files="$1"
-  shift
-  large=0
-  for label in "$@"; do
-    [ "$label" = large-pr ] && large=1
-  done
   total=0
   tab="$(printf '\t')"
   while IFS="$tab" read -r path changes; do
@@ -111,14 +108,10 @@ check_size() {
     is_generated "$path" && continue
     case "$changes" in ''|*[!0-9]*) error "no changed-line count for $path"; return 1 ;; esac
     total=$((total + changes))
-  done < "$files"
+  done < "$1"
   echo "Changed lines (without Cargo.lock and generated files): $total"
   if [ "$total" -gt "$max_lines" ]; then
-    if [ "$large" = 1 ]; then
-      warning "$total changed lines, over the $max_lines-line budget; allowed by the large-pr label."
-      return 0
-    fi
-    error "$total changed lines is over the $max_lines-line budget. Split it into a stack of PRs (each says \`Part of #N\`), or ask the owner for the \`large-pr\` label."
+    error "$total changed lines is over the $max_lines-line limit. Split it into smaller PRs, each tested on its own and linked to its Linear issue (\`Part of ENG-n\`)."
     return 1
   fi
   if [ "$total" -gt "$warn_lines" ]; then
@@ -126,8 +119,23 @@ check_size() {
   fi
 }
 
+# Zed's title rules: no conventional-commit prefix, no trailing period. An area scope
+# (`service: ...`) is fine.
+check_title() {
+  ok=1
+  if printf '%s\n' "$1" | grep -Eqi '^(feat|fix|style|refactor|perf|test|chore|build|revert)(\([^)]*\))?!?:'; then
+    error "The PR title starts with a conventional-commit prefix. Write an imperative title, optionally scoped by area: \`service: Retry the export when the share is busy\`."
+    ok=0
+  fi
+  case "$1" in
+    *.) error "The PR title ends with a period."; ok=0 ;;
+  esac
+  [ "$ok" = 1 ]
+}
+
 case "${1:-}" in
   body) [ $# = 2 ] || { echo "usage: pr-check.sh body BODY_FILE" >&2; exit 2; }; check_body "$2" ;;
-  size) [ $# -ge 2 ] || { echo "usage: pr-check.sh size FILES_TSV [LABEL...]" >&2; exit 2; }; shift; check_size "$@" ;;
-  *) echo "usage: pr-check.sh body BODY_FILE | size FILES_TSV [LABEL...]" >&2; exit 2 ;;
+  size) [ $# = 2 ] || { echo "usage: pr-check.sh size FILES_TSV" >&2; exit 2; }; check_size "$2" ;;
+  title) [ $# = 2 ] || { echo "usage: pr-check.sh title TITLE" >&2; exit 2; }; check_title "$2" ;;
+  *) echo "usage: pr-check.sh body BODY_FILE | size FILES_TSV | title TITLE" >&2; exit 2 ;;
 esac
