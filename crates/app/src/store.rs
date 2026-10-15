@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use margin_shared::{
-    Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id,
-    ItemStatus, Lesson, LessonStatus, Library, ModelInfo, Note, Proposal, ProposalStatus, Provider,
-    Settings, Source, Topic, Video, VideoStatus, Workspace,
+    Agent, Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event,
+    Group, Id, Invitation, ItemStatus, Lesson, LessonStatus, Library, ModelInfo, Note, Person,
+    Proposal, ProposalStatus, Provider, Settings, Source, Topic, Video, VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -56,6 +56,18 @@ pub struct LibraryState {
     /// The ChatGPT sign-in as last fetched (`GET routes::PROVIDERS_CHATGPT`) or started;
     /// `None` until then (see [`LibraryState::chatgpt_status`]).
     pub chatgpt: Option<ChatGptStatus>,
+    /// Everyone who may sign in (`GET /api/people`), kept current by `PersonChanged` and
+    /// `MembershipChanged`.
+    pub people: BTreeMap<Id, Person>,
+    /// The organisation's groups by path (`GET /api/groups`); the tree is the paths.
+    pub groups: BTreeMap<String, Group>,
+    /// Agents the caller may see (`GET /api/agents`): their own, or everyone's for an
+    /// admin.
+    pub agents: BTreeMap<Id, Agent>,
+    /// Invitations (`GET /api/invitations`), fetched only for admins.
+    pub invitations: BTreeMap<Id, Invitation>,
+    /// Whether `people`, `groups` and `agents` hold the service's lists yet.
+    pub org_loaded: bool,
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -236,16 +248,33 @@ impl LibraryState {
 
     pub fn apply(&mut self, event: Event) {
         match event {
-            // L1-app keeps people, groups, agents and invitations (docs/l1-brief.md D10).
-            Event::PersonChanged { .. }
-            | Event::GroupChanged { .. }
-            | Event::GroupDeleted { .. }
-            | Event::MembershipChanged { .. }
-            | Event::AgentChanged { .. }
-            | Event::AgentDeleted { .. }
-            | Event::InvitationChanged { .. }
-            | Event::InvitationDeleted { .. }
-            | Event::AccessChanged { .. } => {}
+            Event::PersonChanged { person } => self.upsert_person(person),
+            Event::GroupChanged { group } => {
+                self.groups.insert(group.path.clone(), group);
+            }
+            Event::GroupDeleted { path } => {
+                self.groups.remove(&path);
+            }
+            Event::MembershipChanged { person_id, groups } => {
+                if let Some(person) = self.people.get_mut(&person_id) {
+                    person.groups = groups;
+                }
+                self.count_members();
+            }
+            Event::AgentChanged { agent } => {
+                self.agents.insert(agent.id.clone(), agent);
+            }
+            Event::AgentDeleted { id } => {
+                self.agents.remove(&id);
+            }
+            Event::InvitationChanged { invitation } => {
+                self.invitations.insert(invitation.id.clone(), invitation);
+            }
+            Event::InvitationDeleted { id } => {
+                self.invitations.remove(&id);
+            }
+            // The live loop reloads the library when it is this person's (`main.rs`).
+            Event::AccessChanged { .. } => {}
             Event::Hello { server_version } => self.server_version = Some(server_version),
             Event::TopicChanged { topic } => {
                 self.topics.insert(topic.id.clone(), topic);
@@ -417,6 +446,82 @@ impl LibraryState {
     /// goes (Settings → Devices shows this list, with who is online).
     pub fn replace_devices(&mut self, devices: Vec<Device>) {
         self.devices = devices.into_iter().map(|d| (d.id.clone(), d)).collect();
+    }
+
+    /// A person as an event or a request brought them. The caller's own `settings` aren't
+    /// in another device's event: a row without them keeps the ones known.
+    pub fn upsert_person(&mut self, mut person: Person) {
+        if let Some(known) = self.people.get(&person.id)
+            && person.settings == Default::default()
+        {
+            person.settings = known.settings.clone();
+        }
+        self.people.insert(person.id.clone(), person);
+        self.count_members();
+    }
+
+    /// The people exactly as `GET /api/people` lists them.
+    pub fn replace_people(&mut self, people: Vec<Person>) {
+        self.people = people.into_iter().map(|p| (p.id.clone(), p)).collect();
+        self.count_members();
+    }
+
+    /// The groups exactly as `GET /api/groups` lists them.
+    pub fn replace_groups(&mut self, groups: Vec<Group>) {
+        self.groups = groups.into_iter().map(|g| (g.path.clone(), g)).collect();
+        self.count_members();
+    }
+
+    /// The agents exactly as `GET /api/agents` lists them.
+    pub fn replace_agents(&mut self, agents: Vec<Agent>) {
+        self.agents = agents.into_iter().map(|a| (a.id.clone(), a)).collect();
+    }
+
+    /// The invitations exactly as `GET /api/invitations` lists them.
+    pub fn replace_invitations(&mut self, invitations: Vec<Invitation>) {
+        self.invitations = invitations.into_iter().map(|i| (i.id.clone(), i)).collect();
+    }
+
+    /// Each group's direct member count again from the people known (memberships move
+    /// with `MembershipChanged`, which says nothing of the groups). Only once the people
+    /// are known: before that the service's counts stand.
+    fn count_members(&mut self) {
+        if self.people.is_empty() {
+            return;
+        }
+        for group in self.groups.values_mut() {
+            group.members = self
+                .people
+                .values()
+                .filter(|p| p.groups.contains(&group.path))
+                .count() as u32;
+        }
+    }
+
+    /// People in the order Organisation lists them: the owner, admins, members; then by
+    /// handle.
+    pub fn people_in_order(&self) -> Vec<&Person> {
+        let mut list: Vec<&Person> = self.people.values().collect();
+        list.sort_by(|a, b| a.org_role.cmp(&b.org_role).then(a.handle.cmp(&b.handle)));
+        list
+    }
+
+    /// Agents of `owner_id`, by name.
+    pub fn agents_of(&self, owner_id: &str) -> Vec<&Agent> {
+        let mut list: Vec<&Agent> = self
+            .agents
+            .values()
+            .filter(|a| a.owner_id == owner_id)
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        list
+    }
+
+    /// Invitations, newest first.
+    pub fn invitations_in_order(&self) -> Vec<&Invitation> {
+        let mut list: Vec<&Invitation> = self.invitations.values().collect();
+        list.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        list
     }
 
     /// One video per lesson: a video for a lesson replaces any other video of that lesson.
@@ -1701,5 +1806,65 @@ pub(crate) mod tests {
         assert_eq!(s.lesson_count_deep("s"), 3);
         assert_eq!(s.notes_for_lesson("l1").len(), 1);
         assert_eq!(s.first_lesson_in("f").unwrap().id, "l1");
+    }
+
+    #[test]
+    fn people_groups_agents_and_invitations_follow_events() {
+        use crate::fake::{
+            ALICE, BOB, sample_agents, sample_groups, sample_invitations, sample_people,
+        };
+        let mut s = LibraryState::default();
+        s.replace_people(sample_people());
+        s.replace_groups(sample_groups());
+        s.replace_agents(sample_agents());
+        s.replace_invitations(sample_invitations(chrono::Utc::now()));
+        assert_eq!(s.groups["company/engineering"].members, 2);
+        let order: Vec<&str> = s.people_in_order().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(order, vec![ALICE, BOB]);
+
+        // Someone's own settings stay when an event (which never carries them) comes.
+        s.people.get_mut(ALICE).unwrap().settings.reasoning_effort =
+            Some(margin_shared::ReasoningEffort::High);
+        let mut renamed = s.people[ALICE].clone();
+        renamed.name = "Alice M.".into();
+        renamed.settings = Default::default();
+        s.apply(Event::PersonChanged { person: renamed });
+        assert_eq!(s.people[ALICE].name, "Alice M.");
+        assert!(s.people[ALICE].settings.reasoning_effort.is_some());
+
+        // Memberships move the counts.
+        s.apply(Event::MembershipChanged {
+            person_id: BOB.into(),
+            groups: vec![],
+        });
+        assert!(s.people[BOB].groups.is_empty());
+        assert_eq!(s.groups["company/engineering"].members, 1);
+        let mut design = s.groups["company/engineering"].clone();
+        design.path = "company/design".into();
+        design.name = "Design".into();
+        s.apply(Event::GroupChanged { group: design });
+        assert_eq!(s.groups.len(), 3);
+        s.apply(Event::GroupDeleted {
+            path: "company/design".into(),
+        });
+        assert_eq!(s.groups.len(), 2);
+
+        let mut agent = s.agents["a-triage"].clone();
+        agent.disabled = true;
+        s.apply(Event::AgentChanged { agent });
+        assert!(s.agents["a-triage"].disabled);
+        assert_eq!(s.agents_of(BOB).len(), 1);
+        s.apply(Event::AgentDeleted {
+            id: "a-triage".into(),
+        });
+        assert!(s.agents_of(BOB).is_empty());
+
+        let first = s.invitations_in_order()[0].id.clone();
+        assert_eq!(first, "inv-carol");
+        s.apply(Event::InvitationDeleted { id: first });
+        assert_eq!(s.invitations.len(), 1);
+        s.apply(Event::AccessChanged {
+            person_id: BOB.into(),
+        });
     }
 }

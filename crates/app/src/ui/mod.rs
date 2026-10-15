@@ -3,6 +3,7 @@ pub mod citations;
 pub mod common;
 pub mod lesson;
 pub mod notes;
+pub mod organisation;
 pub mod outline;
 pub mod search;
 pub mod settings;

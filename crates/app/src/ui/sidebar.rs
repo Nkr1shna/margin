@@ -112,11 +112,19 @@ pub fn Sidebar() -> Element {
         .iter()
         .map(|c| c.id.clone())
         .collect();
-    let login = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.github_login.clone()));
+    // The account row: "@handle · Role" once the person is known (the GitHub login from
+    // a service before L1).
+    let person = app.person();
+    let login = person.as_ref().map(|p| p.handle.clone()).or_else(|| {
+        app.session
+            .read()
+            .as_ref()
+            .and_then(|s| s.me.as_ref().map(|m| m.github_login.clone()))
+    });
+    let account = match &person {
+        Some(p) => format!("@{} · {}", p.handle, crate::org::role_label(p.org_role)),
+        None => login.clone().unwrap_or_else(|| "Signed in".into()),
+    };
     let appearance = app.config.read().appearance;
     let drawer_open = *app.drawer_open.read();
     drop(lib);
@@ -323,9 +331,13 @@ pub fn Sidebar() -> Element {
                 }
             }
             div { class: "sb-foot",
-                span { class: "avatar", "aria-hidden": "true", "{initial}" }
-                span { class: "grow", style: "font-size: 13px; color: var(--fg-2)",
-                    {login.clone().unwrap_or_else(|| "Signed in".into())}
+                button {
+                    class: "sb-account grow",
+                    title: "Account settings",
+                    "aria-label": "Account: {account}. Open account settings",
+                    onclick: move |_| app.settings_open.set(Some(SettingsPane::Account)),
+                    span { class: "avatar", "aria-hidden": "true", "{initial}" }
+                    span { class: "sb-account-name", "{account}" }
                 }
                 button {
                     class: "icon-btn",

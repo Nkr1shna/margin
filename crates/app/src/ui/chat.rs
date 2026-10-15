@@ -496,10 +496,11 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         .as_ref()
         .and_then(|id| lib.chat_items.get(id).cloned())
         .unwrap_or_default();
-    let default_provider = lib
-        .settings
-        .as_ref()
-        .map(|s| s.default_provider)
+    // The person's own default (Settings → Account), else the organisation's.
+    let default_provider = app
+        .person()
+        .and_then(|p| p.settings.default_provider)
+        .or_else(|| lib.settings.as_ref().map(|s| s.default_provider))
         .unwrap_or_default();
     // A chat runs on its own provider; a new one on the one picked (else the default).
     let provider = chat
