@@ -24,11 +24,12 @@ use margin_shared::context::{LibraryKind, Scope};
 use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
-    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
+    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic, WrittenWith,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::chats::{self, StoredChatItem};
+use crate::engines::ModelChoice;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
 use crate::pipeline::Packed;
@@ -132,13 +133,15 @@ pub async fn propose_planned(
     };
     let wanted = survey.unwrap_or(!request.source_ids.is_empty() || !workspaces.is_empty());
     let mut plan = None;
+    let mut written_with = None;
     if wanted {
         let trace_id = trace_id.map_or_else(new_id, str::to_string);
         match plan_course(state, &request, &outline, &workspaces, chat_id, &trace_id).await {
-            Ok(Some(p)) => match validate_outline(&p.outline()) {
+            Ok(Some((p, with))) => match validate_outline(&p.outline()) {
                 Ok(planned) => {
                     outline = planned;
                     plan = Some(p);
+                    written_with = Some(with);
                 }
                 Err(e) => tracing::warn!("the planned outline isn't usable: {}", e.message),
             },
@@ -154,7 +157,7 @@ pub async fn propose_planned(
         outline: Some(outline),
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
-        written_with: None,
+        written_with,
     };
     let stored = StoredProposal {
         proposal: proposal.clone(),
@@ -856,7 +859,7 @@ pub async fn survey(
 /// Surveys the course's sources and folders and asks the planner (the writing route,
 /// `Generator::plan_course`) for the outline with per-lesson questions and sections.
 /// `Ok(None)` when there is nothing to survey or the planner's answer doesn't fit the
-/// draft (the call is traced as failed).
+/// draft (the call is traced as failed). The plan comes with what wrote it.
 pub async fn plan_course(
     state: &AppState,
     request: &AskRequest,
@@ -864,7 +867,7 @@ pub async fn plan_course(
     workspaces: &[Id],
     chat_id: &str,
     trace_id: &str,
-) -> anyhow::Result<Option<CoursePlan>> {
+) -> anyhow::Result<Option<(CoursePlan, WrittenWith)>> {
     let Some((req, _survey)) = survey(state, request, draft, workspaces, trace_id).await? else {
         return Ok(None);
     };
@@ -889,13 +892,26 @@ pub async fn plan_course(
         Ok(Generated { value, usage }) => {
             call.row().usage = Some(trace::trace_usage(&usage));
             call.finish(true);
-            Ok(Some(value))
+            let with = written_with(state, &ai, margin_ai::prompts::PLAN_VERSION);
+            Ok(Some((value, with)))
         }
         Err(e) => {
             call.fail(trace::ai_error_code(&e));
             tracing::warn!("the outline planner's answer isn't usable: {e}");
             Ok(None)
         }
+    }
+}
+
+/// What a call on `ai` with the prompt `version` wrote, now, under the current pipeline
+/// (the hash its trace rows carry).
+pub fn written_with(state: &AppState, ai: &ModelChoice, version: &str) -> WrittenWith {
+    WrittenWith {
+        prompt_version: version.to_string(),
+        pipeline_hash: state.pipeline.load().hash.clone(),
+        provider: ai.config.provider,
+        model: ai.model.clone(),
+        at: Utc::now(),
     }
 }
 
@@ -997,6 +1013,10 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
                 // Footnotes renumbered in reading order, with what they point at.
                 (row.lesson.body_md, row.lesson.citations) = retrieval::cite(body, &retrieved);
                 row.lesson.status = LessonStatus::Ready;
+                // Regenerating overwrites it; a failed write keeps the previous body and
+                // so the previous `written_with`.
+                row.lesson.written_with =
+                    Some(written_with(state, &ai, margin_ai::prompts::LESSON_VERSION));
                 // The body is the model's writing now (owner decision Q2).
                 row.author = Author::Agent;
             }

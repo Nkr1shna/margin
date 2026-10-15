@@ -2187,3 +2187,409 @@ mod lesson_retrieval {
         assert_eq!(checked.outline().lessons[1].title, "B");
     }
 }
+
+// ---------------------------------------------------------------------------
+// R2: the listwise rerank, query rewriting, and what wrote a lesson
+// (`docs/r2-brief.md` D2, D3, D4.3)
+// ---------------------------------------------------------------------------
+
+mod r2 {
+    use std::time::Duration;
+
+    use super::*;
+    use margin_ai::Ranked;
+    use margin_service::pipeline::{Pipeline, Registry, StageDeps};
+    use margin_service::retrieval::{self, QueryPlan, Request};
+    use margin_service::small::StateModels;
+    use margin_shared::context::{Scope, TraceKind, TraceRow};
+    use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose, Route, StageCfg};
+    use margin_shared::{Provider, SourceStatus};
+
+    const NOTES: &str = "Fourier series write a periodic signal as a sum of sines.\n\n\
+Gibbs ringing overshoots near a jump discontinuity.\n\n\
+The coefficients come from integrals over one period.\n\n\
+Photosynthesis stores light energy as sugar.";
+
+    /// Installs `cfg` as the service's pipeline, built from a registry whose
+    /// model-backed stages call the service's small-tasks models (`StateModels`, bound
+    /// to this service), as `server.rs` does once it passes them as `StageDeps.models`.
+    fn install(h: &Harness, cfg: PipelineConfig) {
+        let models = Arc::new(StateModels::default());
+        models.bind(Arc::downgrade(&h.state));
+        let mut deps = StageDeps::new(h.state.store.clone());
+        deps.models = Some(models);
+        let reg = Registry::standard(deps);
+        let cfg = cfg.with_embedder(h.state.model_files.backend.name());
+        h.state
+            .pipeline
+            .store(Arc::new(Pipeline::build(&cfg, &reg).unwrap()));
+    }
+
+    fn stage(name: &str, params: Value) -> StageCfg {
+        StageCfg {
+            name: name.into(),
+            params: params.as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// A topic with `NOTES` read into passages; their ids in order.
+    async fn topic_with_notes(h: &Harness, t: &str) -> (Topic, Vec<String>) {
+        let topic = new_topic(h, t, None, "Signals").await;
+        let r = h
+            .upload(t, "notes/signals.txt", Some(&topic.id), NOTES)
+            .await;
+        assert_eq!(r.status(), 200);
+        let source: Source = r.json().await.unwrap();
+        eventually(|| async {
+            library(h, t)
+                .await
+                .sources
+                .iter()
+                .any(|s| s.id == source.id && matches!(s.status, SourceStatus::Ready { .. }))
+                .then_some(())
+        })
+        .await;
+        let mut rows = h.state.store.passages_of(&source.id).await.unwrap();
+        rows.sort_by_key(|r| r.ord);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        (topic, rows.into_iter().map(|r| r.id).collect())
+    }
+
+    async fn request(
+        h: &Harness,
+        topic: &Topic,
+        plan: QueryPlan,
+        purpose: RetrievalPurpose,
+        trace_id: &str,
+    ) -> Request {
+        let pipeline = h.state.pipeline.load_full();
+        let window = retrieval::route_window(&h.state, Route::Write, None)
+            .await
+            .unwrap();
+        Request {
+            plan,
+            scope: Scope::Topic {
+                id: topic.id.clone(),
+            },
+            access: None,
+            modalities: Vec::new(),
+            k: retrieval::fused_k(&pipeline.config),
+            budget: pipeline.config.budget,
+            window_tokens: window.tokens,
+            reserve_output: window.reserve_output,
+            trace_id: trace_id.into(),
+            caller: None,
+            purpose,
+            provider: None,
+        }
+    }
+
+    async fn rows(h: &Harness, trace_id: &str) -> Vec<TraceRow> {
+        assert!(h.state.tracer.flush(Duration::from_secs(5)).await);
+        margin_service::trace::read_rows(
+            &h.state.store,
+            None,
+            chrono::DateTime::UNIX_EPOCH,
+            chrono::Utc::now() + chrono::Duration::minutes(1),
+            Some(trace_id.into()),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn packed_ids(packed: &[margin_service::pipeline::Packed]) -> Vec<String> {
+        packed
+            .iter()
+            .flat_map(|p| p.hits.iter().map(|h| h.passage.id.clone()))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lesson_records_what_wrote_it_and_regenerating_overwrites_it() {
+        let (h, t) = signed_in().await;
+        let topic = course(
+            &h,
+            &t,
+            "Fourier",
+            1,
+            json!({"with_videos": false, "with_quiz": false}),
+        )
+        .await;
+        let lib = library(&h, &t).await;
+        let lesson = lib
+            .lessons
+            .iter()
+            .find(|l| l.topic_id == topic.id)
+            .unwrap()
+            .clone();
+        let first = lesson.written_with.clone().expect("written_with");
+        assert_eq!(first.prompt_version, "lesson-v2");
+        assert_eq!(first.model, "test-model");
+        assert_eq!(first.provider, Provider::OpenAi);
+        assert_eq!(first.pipeline_hash, h.state.pipeline.load().hash);
+        // The trace rows of its job carry the same pipeline hash.
+        let calls: Vec<TraceRow> = rows(&h, &lesson.id)
+            .await
+            .into_iter()
+            .filter(|r| r.kind == TraceKind::ModelCall)
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .all(|r| r.pipeline_hash.as_deref() == Some(first.pipeline_hash.as_str()))
+        );
+
+        let r = h
+            .post(&t, &format!("/api/lessons/{}/regenerate", lesson.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let again = eventually(|| async {
+            let l = stored_lesson(&h, &lesson.id).await.lesson;
+            (l.status == LessonStatus::Ready
+                && l.written_with.as_ref().is_some_and(|w| w.at > first.at))
+            .then_some(l)
+        })
+        .await;
+        assert_eq!(
+            again.written_with.unwrap().prompt_version,
+            first.prompt_version
+        );
+
+        // A failed rewrite keeps the body and what wrote it.
+        h.generator
+            .fail_lessons
+            .lock()
+            .unwrap()
+            .insert(lesson.title.clone());
+        let before = stored_lesson(&h, &lesson.id).await.lesson;
+        let r = h
+            .post(&t, &format!("/api/lessons/{}/regenerate", lesson.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let failed = eventually(|| async {
+            let l = stored_lesson(&h, &lesson.id).await.lesson;
+            matches!(l.status, LessonStatus::Failed { .. }).then_some(l)
+        })
+        .await;
+        assert_eq!(failed.body_md, before.body_md);
+        assert_eq!(failed.written_with, before.written_with);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lesson_retrieval_is_reranked_on_the_small_route_traced_and_cached() {
+        let (h, t) = signed_in().await;
+        let (topic, ids) = topic_with_notes(&h, &t).await;
+        install(
+            &h,
+            PipelineConfig {
+                reranker: StageCfg::named("listwise-small"),
+                ..PipelineConfig::default()
+            },
+        );
+        // The last paragraph first; the first one irrelevant.
+        let grades = [(&ids[3], 3), (&ids[1], 2), (&ids[2], 1), (&ids[0], 0)];
+        *h.generator.rerank_reply.lock().unwrap() = Some(
+            grades
+                .iter()
+                .map(|(id, grade)| Ranked {
+                    id: id.to_string(),
+                    grade: *grade,
+                })
+                .collect(),
+        );
+        let plan = QueryPlan::lesson("Fourier series", "Sums of sines", &["gibbs".into()], None);
+        let req = request(&h, &topic, plan, RetrievalPurpose::Lesson, "lesson-1").await;
+        let packed = retrieval::retrieve(&h.state, &req).await.unwrap();
+        let got = packed_ids(&packed);
+        assert_eq!(got.first(), Some(&ids[3]), "{got:?}");
+        assert!(!got.contains(&ids[0]), "grade 0 dropped: {got:?}");
+
+        let calls = h.generator.rerank_requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].opts.route, Route::Small);
+        assert_eq!(calls[0].opts.prompt_version.as_deref(), Some("rerank-v1"));
+        assert_eq!(calls[0].choice.model, "test-model");
+        assert!(
+            calls[0]
+                .query
+                .starts_with("Fourier series Sums of sines\nAlso asked: "),
+            "{}",
+            calls[0].query
+        );
+        assert!(
+            calls[0]
+                .candidates
+                .iter()
+                .all(|c| c.label.contains("signals.txt")),
+            "{:?}",
+            calls[0].candidates
+        );
+
+        let trace = rows(&h, "lesson-1").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.reranker.as_deref(), Some("listwise-small"));
+        assert_eq!(retrieval_row.reranked, Some(4));
+        assert_eq!(retrieval_row.error_code, None);
+        assert!(retrieval_row.legs.as_ref().unwrap().rerank_ms > 0.0);
+        let call = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::ModelCall)
+            .unwrap();
+        assert_eq!(call.route, Some(Route::Small));
+        assert_eq!(call.prompt_version.as_deref(), Some("rerank-v1"));
+        assert_eq!(call.job_id.as_deref(), Some("lesson-1"));
+        assert_eq!(call.parent_id.as_deref(), Some(retrieval_row.id.as_str()));
+        assert!(call.ok);
+
+        // The same retrieval again: a cache hit, no second rerank.
+        let again = retrieval::retrieve(&h.state, &req).await.unwrap();
+        assert_eq!(packed_ids(&again), got);
+        assert_eq!(h.generator.rerank_requests.lock().unwrap().len(), 1);
+        let trace = rows(&h, "lesson-1").await;
+        assert!(trace.iter().any(|r| r.cache_hit == Some(true)));
+
+        // A rerank that fails keeps the fused order, traced as rerank_failed.
+        *h.generator.rerank_reply.lock().unwrap() = None;
+        let req = request(
+            &h,
+            &topic,
+            QueryPlan::single("coefficients integrals"),
+            RetrievalPurpose::Lesson,
+            "lesson-2",
+        )
+        .await;
+        let packed = retrieval::retrieve(&h.state, &req).await.unwrap();
+        assert!(!packed.is_empty());
+        let trace = rows(&h, "lesson-2").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.error_code.as_deref(), Some("rerank_failed"));
+        let call = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::ModelCall)
+            .unwrap();
+        assert!(!call.ok);
+
+        // The agent's searches aren't reranked by default.
+        let before = h.generator.rerank_requests.lock().unwrap().len();
+        let req = request(
+            &h,
+            &topic,
+            QueryPlan::single("gibbs"),
+            RetrievalPurpose::Agent,
+            "turn-1",
+        )
+        .await;
+        retrieval::retrieve(&h.state, &req).await.unwrap();
+        assert_eq!(h.generator.rerank_requests.lock().unwrap().len(), before);
+        let trace = rows(&h, "turn-1").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.reranked, None);
+        assert!(trace.iter().all(|r| r.kind != TraceKind::ModelCall));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_query_is_rewritten_once_and_the_answer_reused() {
+        let (h, t) = signed_in().await;
+        let (topic, _ids) = topic_with_notes(&h, &t).await;
+        install(
+            &h,
+            PipelineConfig {
+                rewriter: stage("small-expand-v1", json!({})),
+                ..PipelineConfig::default()
+            },
+        );
+        *h.generator.rewrite_reply.lock().unwrap() = Some(vec![
+            "overshoot near a jump".into(),
+            "ringing artefacts".into(),
+        ]);
+        let req = request(
+            &h,
+            &topic,
+            QueryPlan::single("gibbs"),
+            RetrievalPurpose::Agent,
+            "turn-1",
+        )
+        .await;
+        retrieval::retrieve(&h.state, &req).await.unwrap();
+        let calls = h.generator.rewrite_requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input.query, "gibbs");
+        assert_eq!(calls[0].input.purpose, RetrievalPurpose::Agent);
+        assert_eq!(calls[0].input.scope_names.len(), 1);
+        assert!(
+            calls[0].input.scope_names[0].contains("signals.txt"),
+            "{:?}",
+            calls[0].input.scope_names
+        );
+        assert_eq!(calls[0].opts.route, Route::Small);
+        assert_eq!(calls[0].opts.prompt_version.as_deref(), Some("rewrite-v1"));
+        let trace = rows(&h, "turn-1").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.queries, Some(3));
+        let call = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::ModelCall)
+            .unwrap();
+        assert_eq!(call.prompt_version.as_deref(), Some("rewrite-v1"));
+        assert_eq!(call.parent_id.as_deref(), Some(retrieval_row.id.as_str()));
+
+        // Another retrieval of the same query (another k, so not the retrieval cache):
+        // the rewrite is reused.
+        let mut other = req.clone();
+        other.k = 3;
+        other.trace_id = "turn-2".into();
+        retrieval::retrieve(&h.state, &other).await.unwrap();
+        assert_eq!(h.generator.rewrite_requests.lock().unwrap().len(), 1);
+        let trace = rows(&h, "turn-2").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.queries, Some(3));
+
+        // Five words or more: no call. A failed rewrite keeps the plan.
+        let req = request(
+            &h,
+            &topic,
+            QueryPlan::single("how do the fourier coefficients come"),
+            RetrievalPurpose::Agent,
+            "turn-3",
+        )
+        .await;
+        retrieval::retrieve(&h.state, &req).await.unwrap();
+        assert_eq!(h.generator.rewrite_requests.lock().unwrap().len(), 1);
+        *h.generator.rewrite_reply.lock().unwrap() = None;
+        let req = request(
+            &h,
+            &topic,
+            QueryPlan::single("sugar"),
+            RetrievalPurpose::Agent,
+            "turn-4",
+        )
+        .await;
+        let packed = retrieval::retrieve(&h.state, &req).await.unwrap();
+        assert!(!packed.is_empty());
+        let trace = rows(&h, "turn-4").await;
+        let retrieval_row = trace
+            .iter()
+            .find(|r| r.kind == TraceKind::Retrieval)
+            .unwrap();
+        assert_eq!(retrieval_row.queries, Some(1));
+    }
+}

@@ -44,7 +44,7 @@ use crate::db::{self, PassageRow, Store};
 use crate::engines::BoxFuture;
 use crate::pipeline::{
     Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Registry, RerankRequest,
-    Retriever, RewriteRequest, StageCtor, hit_citation,
+    RetrievalCtx, Retriever, RewriteRequest, StageCtor, hit_citation, with_retrieval,
 };
 use crate::sources::{ChunkRow, MediaKind, MediaRow};
 use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
@@ -1650,15 +1650,33 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     // The rewriter (R2): after the cache check, whose key stays on the original plan
     // (`pipeline.hash` names the rewriter), and before embedding. A failure keeps the
     // plan as it was.
+    // Model-backed stages trace their calls under this row and keep `passages_min`.
+    let stage_ctx = RetrievalCtx {
+        row_id: row.id.clone(),
+        passages_min: req.budget.passages_min as usize,
+    };
+    // A lesson's retrieval runs under the lesson's id: the stages' calls name it as
+    // their job.
+    let job_id = (req.purpose == RetrievalPurpose::Lesson).then_some(req.trace_id.as_str());
     let t = Instant::now();
+    let names = if pipeline.rewriter.name() == "none" {
+        Vec::new()
+    } else {
+        scope_names(&state.store, &resolved).await
+    };
     let rewrite = RewriteRequest {
         purpose: req.purpose,
         provider: req.provider,
         trace_id: &req.trace_id,
-        job_id: None,
-        scope_names: &[],
+        job_id,
+        scope_names: &names,
     };
-    let plan = match pipeline.rewriter.rewrite(&rewrite, req.plan.clone()).await {
+    let rewritten = with_retrieval(
+        stage_ctx.clone(),
+        pipeline.rewriter.rewrite(&rewrite, req.plan.clone()),
+    )
+    .await;
+    let plan = match rewritten {
         Ok(plan) if !plan.queries.is_empty() => plan,
         Ok(_) => req.plan.clone(),
         Err(e) => {
@@ -1729,14 +1747,13 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         purpose: req.purpose,
         provider: req.provider,
         trace_id: &req.trace_id,
-        job_id: None,
+        job_id,
     };
     row.reranker = Some(pipeline.reranker.name().to_string());
-    let reranked = match pipeline.reranker.rerank(&rerank, fused.clone()).await {
+    let result = with_retrieval(stage_ctx, pipeline.reranker.rerank(&rerank, fused.clone())).await;
+    let reranked = match result {
         Ok(hits) => {
-            if hits.iter().any(|h| h.rerank.is_some()) {
-                row.reranked = Some(hits.iter().filter(|h| h.rerank.is_some()).count() as u32);
-            }
+            row.reranked = reranked_count(&fused, &hits);
             hits
         }
         Err(e) => {
@@ -1767,6 +1784,44 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     record_trace(state, row);
     Ok(packed)
+}
+
+/// The candidates a reranker saw, for the trace: those it scored plus those it dropped
+/// (a listwise grade 0); `None` when it changed nothing (`"none"`, or a purpose it
+/// passes through).
+pub fn reranked_count(fused: &[Hit], reranked: &[Hit]) -> Option<u32> {
+    let scored = reranked.iter().filter(|h| h.rerank.is_some()).count();
+    let kept: std::collections::HashSet<&str> =
+        reranked.iter().map(|h| h.passage.id.as_str()).collect();
+    let dropped = fused
+        .iter()
+        .filter(|h| !kept.contains(h.passage.id.as_str()))
+        .count();
+    (scored + dropped > 0).then_some((scored + dropped) as u32)
+}
+
+/// Up to `REWRITE_SCOPE_NAMES` names of the documents in `resolved` (every document for
+/// the whole library), for the query rewriter's prompt: names, never passage text.
+pub async fn scope_names(store: &Store, resolved: &Resolved) -> Vec<String> {
+    let documents: Vec<Document> = match store.list(db::DOCUMENT).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("couldn't list documents for the rewriter: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for d in documents {
+        if (resolved.library || resolved.keys.contains(&d.id))
+            && !d.name.trim().is_empty()
+            && !names.contains(&d.name)
+        {
+            names.push(d.name);
+        }
+    }
+    names.sort();
+    names.truncate(crate::rewrite::REWRITE_SCOPE_NAMES);
+    names
 }
 
 fn fill_packed_trace(row: &mut TraceRow, packed: &[Packed]) {

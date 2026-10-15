@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use margin_ai::{LessonContext, ModelWindow, TextModel};
+use margin_ai::{
+    CallOptions, LessonContext, ModelWindow, Ranked, RerankCandidate, RewriteInput, TextModel,
+};
 use margin_embed::{Chunk, Extracted, SourceKind};
 use margin_shared::context::{Modality, Scope};
 use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose, RouteTable, StageCfg};
@@ -231,6 +233,89 @@ pub trait SmallModels: Send + Sync {
     /// `None` = the default provider.
     fn small<'a>(&'a self, provider: Option<Provider>)
     -> BoxFuture<'a, anyhow::Result<SmallModel>>;
+
+    /// The listwise rerank call (`margin_ai::rerank`) on `small`. The service routes it
+    /// through `Generator::rerank` and records its `model_call` row (`small.rs`); the
+    /// default calls `small.model` directly, untraced (the eval runner's clients).
+    fn rerank<'a>(
+        &'a self,
+        small: &'a SmallModel,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+        call: SmallCall<'a>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Ranked>>> {
+        let _ = call;
+        Box::pin(async move {
+            Ok(margin_ai::rerank(&*small.model, query, candidates, opts)
+                .await?
+                .value)
+        })
+    }
+
+    /// The query rewrite call (`margin_ai::rewrite_queries`) on `small`; routed and
+    /// traced by the service as `rerank` is.
+    fn rewrite_queries<'a>(
+        &'a self,
+        small: &'a SmallModel,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+        call: SmallCall<'a>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        let _ = call;
+        Box::pin(async move {
+            Ok(margin_ai::rewrite_queries(&*small.model, input, opts)
+                .await?
+                .value)
+        })
+    }
+
+    /// The local cross-encoder `model` (`"onnx-crossencoder"`), loaded on its first
+    /// `score`. An error when it isn't downloaded, so the stage's constructor fails and
+    /// Settings shows the variant as unavailable. The default has none.
+    fn cross_encoder(
+        &self,
+        model: margin_embed::RerankerModel,
+    ) -> anyhow::Result<Arc<dyn margin_embed::Reranker>> {
+        anyhow::bail!(
+            "the reranker model \"{}\" isn't available here; download the reranker model in Settings → Sources first",
+            model.name()
+        )
+    }
+}
+
+/// Where a stage's small-model call sits in the trace: the retrieval's `trace_id`, the
+/// job it serves (the lesson id) and the retrieval row it is a child of.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SmallCall<'a> {
+    pub trace_id: &'a str,
+    pub job_id: Option<&'a str>,
+    /// The retrieval row's id (`parent_id` of the `model_call` row).
+    pub parent_id: Option<&'a str>,
+}
+
+/// What a model-backed stage needs from the retrieval it runs in, set by `retrieve`
+/// around the rewriter and the reranker (`with_retrieval`): the retrieval row's id (the
+/// `parent_id` of their `model_call` rows) and the budget's `passages_min` (a grade-0
+/// drop never goes below it). Outside a retrieval (the eval index) it is absent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RetrievalCtx {
+    pub row_id: String,
+    pub passages_min: usize,
+}
+
+tokio::task_local! {
+    static RETRIEVAL: RetrievalCtx;
+}
+
+/// Runs `f` with `ctx` as the current retrieval's context.
+pub async fn with_retrieval<F: std::future::Future>(ctx: RetrievalCtx, f: F) -> F::Output {
+    RETRIEVAL.scope(ctx, f).await
+}
+
+/// The current retrieval's context, when a stage runs inside `retrieve`.
+pub fn retrieval_ctx() -> Option<RetrievalCtx> {
+    RETRIEVAL.try_with(Clone::clone).ok()
 }
 
 /// A provider's small-tasks model, resolved.
@@ -343,6 +428,8 @@ impl Registry {
         register_trivial(&mut reg);
         crate::ingest::register(&mut reg);
         crate::retrieval::register(&mut reg);
+        crate::rerank::register(&mut reg);
+        crate::rewrite::register(&mut reg);
         for b in margin_embed::Backend::ALL {
             reg.register_embedder(b.name());
         }
@@ -593,6 +680,37 @@ impl Packer for TakeK {
     }
 }
 
+/// A hit's label for the reranker: "notes/paper.pdf, p. 3, Fourier series >
+/// Coefficients" (the document's name from `names`, else its id; then the page and the
+/// section when it has them).
+pub fn rerank_label(hit: &Hit, names: &HashMap<String, String>) -> String {
+    let p = &hit.passage;
+    let mut label = names
+        .get(&p.document_id)
+        .filter(|n| !n.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| p.document_id.clone());
+    if let Some(page) = p.page {
+        label.push_str(&format!(", p. {page}"));
+    }
+    if let Some(section) = citation_section_path(hit) {
+        label.push_str(", ");
+        label.push_str(&section);
+    }
+    label
+}
+
+/// The hits as the rerank prompt's candidates (ids are passage ids).
+pub fn rerank_candidates(hits: &[Hit], names: &HashMap<String, String>) -> Vec<RerankCandidate> {
+    hits.iter()
+        .map(|h| RerankCandidate {
+            id: h.passage.id.clone(),
+            label: rerank_label(h, names),
+            text: h.passage.text.clone(),
+        })
+        .collect()
+}
+
 /// The constant-first lesson, planner and rerank prompts of `margin_ai::prompts`
 /// (§2.6), laid out as the pipeline's `Prompt`: the request and passages follow the
 /// variable instructions (pictures are left out of this text form).
@@ -655,19 +773,10 @@ impl PromptSet for LessonV2 {
         };
         from_ai(margin_ai::prompts::plan(&req))
     }
+    /// Candidates labelled by document id; the `"listwise-small"` stage labels them by
+    /// document name (`rerank_candidates` with the names it looked up).
     fn rerank(&self, query: &str, hits: &[Hit]) -> Prompt {
-        let candidates: Vec<margin_ai::RerankCandidate> = hits
-            .iter()
-            .map(|h| margin_ai::RerankCandidate {
-                id: h.passage.id.clone(),
-                label: if h.passage.section_path.is_empty() {
-                    h.passage.document_id.clone()
-                } else {
-                    format!("{}, {}", h.passage.document_id, h.passage.section_path)
-                },
-                text: h.passage.text.clone(),
-            })
-            .collect();
+        let candidates = rerank_candidates(hits, &HashMap::new());
         from_ai(margin_ai::prompts::rerank(query, &candidates))
     }
 }

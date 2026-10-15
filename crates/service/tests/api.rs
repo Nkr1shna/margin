@@ -23,6 +23,36 @@ async fn api_error(r: reqwest::Response) -> (u16, ApiError) {
 // Sign-in
 // ---------------------------------------------------------------------------
 
+/// `GET /api/pipeline/prompts` (R2, `docs/r2-brief.md` D4.1): every prompt the service
+/// sends, with its version and the hash of its constant block; signed-in only.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_prompt_catalog_lists_every_prompt_with_its_version_and_hash() {
+    let h = start().await;
+    let r = reqwest::get(h.u("/api/pipeline/prompts")).await.unwrap();
+    assert_eq!(r.status(), 401);
+    let t = h.sign_in("Mac").await;
+    let r = h.get(&t, "/api/pipeline/prompts").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let catalog: Vec<margin_shared::context::PromptInfo> = r.json().await.unwrap();
+    assert_eq!(catalog, margin_service::settings::prompts_catalog());
+    for (job, version) in [
+        ("lesson", "lesson-v2"),
+        ("scene", "scene-v2"),
+        ("plan", "plan-v1"),
+        ("rerank", "rerank-v1"),
+        ("rewrite", "rewrite-v1"),
+        ("agent", "agent-v2"),
+    ] {
+        let p = catalog
+            .iter()
+            .find(|p| p.job == job)
+            .unwrap_or_else(|| panic!("{job} missing"));
+        assert_eq!(p.version, version);
+        assert_eq!(p.constant_hash.len(), 16);
+        assert!(p.constant_chars > 0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sign_in_approves_once_and_the_token_works() {
     let h = start().await;
