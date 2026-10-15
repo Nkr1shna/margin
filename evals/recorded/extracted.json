@@ -1,0 +1,147 @@
+{
+  "reader": "pdfkit+vision on macOS 27.2",
+  "documents": {
+    "folder/figures/lens-ray-diagram.png": {
+      "pages": [
+        {
+          "number": null,
+          "text": "object\nconverging lens\n●\n2F\n2F\nreal inverted image\nd_0 = 30 cm\nd_і = 15 ст\nf = 10 cm, magnification m = -0.5\nprincipal axis"
+        }
+      ],
+      "pictures": [
+        {
+          "page": null
+        }
+      ]
+    },
+    "folder/papers/rc-circuits.pdf": {
+      "pages": [
+        {
+          "number": 1,
+          "text": "RC circuits and the time constant\nWritten for the Margin evaluation corpus. Released under CC0.\nCharging a capacitor\nWhen a capacitor C is connected through a resistor R to a battery of voltage V0, current flows and\ncharge builds up on the plates. The current is largest at the start, when the capacitor is empty and\nthe whole battery voltage appears across the resistor, and it falls as the capacitor voltage rises.\nKirchhoff's voltage law gives the differential equation V0 = R dq/dt + q/C, whose solution for an\ninitially uncharged capacitor is\nV(t) = V0 (1 - e^(-t/RC))\nThe product RC has units of seconds and is called the time constant, written tau. After one time\nconstant the capacitor has reached 63.2 percent of its final voltage. After five time constants it has\nreached 99.3 percent, which is why engineers treat a circuit as settled after about 5 tau."
+        },
+        {
+          "number": 2,
+          "text": "Discharging and energy\nA charged capacitor discharging through a resistor follows V(t) = V0 e^(-t/RC): after one time\nconstant the voltage has fallen to 36.8 percent of its starting value. The time to fall to half is RC ln\n2, about 0.69 tau.\nThe energy stored in a capacitor charged to voltage V is one half C V squared. When a capacitor is\ncharged from a battery through a resistor, exactly half of the energy the battery supplies is\ndissipated as heat in the resistor, whatever the value of R. A smaller resistor charges the capacitor\nfaster but dissipates the same total energy with a higher peak current.\nExample: a 10 microfarad capacitor charged through a 100 kilohm resistor has a time constant of 1\nsecond. Charged to 9 volts it stores 0.405 millijoules."
+        },
+        {
+          "number": 3,
+          "text": "The RC low-pass filter\nTaking the output across the capacitor turns the circuit into a first-order low-pass filter. At low\nfrequencies the capacitor's impedance is large and the output follows the input; at high frequencies\nthe capacitor shorts the signal to ground. The cutoff frequency, where the output power falls to half\nand the amplitude to 1/sqrt(2) of the input, is\nf_c = 1 / (2 pi R C)\nAbove the cutoff the response falls by 20 decibels per decade of frequency, and the phase shift\napproaches 90 degrees. Swapping the resistor and capacitor, so that the output is taken across the\nresistor, gives a high-pass filter with the same cutoff frequency.\nThe same time constant governs both views of the circuit: a filter with a cutoff of 159 hertz has RC\nequal to 1 millisecond, so its step response settles in about 5 milliseconds."
+        }
+      ],
+      "pictures": [
+        {
+          "page": 1
+        },
+        {
+          "page": 2
+        },
+        {
+          "page": 3
+        }
+      ]
+    },
+    "images/calvin-cycle.png": {
+      "pages": [
+        {
+          "number": null,
+          "text": "The Calvin cycle\n1. CO2 fixation by RuBisCO\nCO2 + RuBP -> 2 × 3-phosphoglycerate\n2. Reduction\nATP and NADPH make G3P\n3 CO2 in : 1 G3P out\n9 ATP, 6 NADPH\nG3P out to sugars\n3. RuBP regeneration\nuses ATP"
+        }
+      ],
+      "pictures": [
+        {
+          "page": null
+        }
+      ]
+    },
+    "images/carnot-pv-diagram.png": {
+      "pages": [
+        {
+          "number": null,
+          "text": "Carnot cycle\nPressure P\nheat in Q_h\nisothermal expansion at T_hot\nadiabatic compression (left curve)\nnet work = enclosed area\nadiabatic expansion\nheat out Q_c\nisothermal compression at T_cold\n▶\nVolume V"
+        }
+      ],
+      "pictures": [
+        {
+          "page": null
+        }
+      ]
+    },
+    "images/scene-red-bicycle.png": {
+      "pages": [],
+      "pictures": [
+        {
+          "page": null
+        }
+      ]
+    },
+    "images/scene-sailboat-sunset.png": {
+      "pages": [],
+      "pictures": [
+        {
+          "page": null
+        }
+      ]
+    },
+    "pdf/glacier-scan.pdf": {
+      "pages": [
+        {
+          "number": 1,
+          "text": "How glaciers move\nWritten for the Margin evaluation corpus. Released under CCO.\nA glacier forms where more snow falls each winter than melts each summer. Buried snow is\ncompressed into firn, granular ice that has survived at least one melt season, and over\ndecades the firn becomes dense glacier ice.\nThe upper part of a glacier, where snowfall exceeds melting over a year, is the\naccumulation zone. The lower part, where melting and sublimation exceed snowfall, is the\nablation zone. The boundary between them is the equilibrium line, and its altitude is a\nsensitive indicator of climate: when summers warm, the equilibrium line altitude rises and\nthe glacier shrinks.\nGlaciers move in two ways. Internal deformation is the slow creep of ice crystals under the\nglacier's own weight, fastest near the surface. Basal sliding happens when meltwater at the\nbed lubricates the contact between ice and rock, and it can make a glacier surge many\ntimes faster than its normal speed.\nRock debris carried by the ice is dropped where the ice melts. Ridges of this debris along\nthe sides of a glacier are lateral moraines, and the ridge left at the glacier's furthest\nadvance is the terminal moraine."
+        }
+      ],
+      "pictures": [
+        {
+          "page": 1
+        }
+      ]
+    },
+    "pdf/lens-optics.pdf": {
+      "pages": [
+        {
+          "number": 1,
+          "text": "Thin lenses\nWritten for the Margin evaluation corpus. Released under CC0.\nA thin converging lens brings parallel rays to a focus at its focal point, a distance f from the lens.\nFor an object at distance d_o from the lens, the image forms at distance d_i given by the thin lens\nequation\n1/f = 1/d_o + 1/d_i\nThe lateral magnification is m = -d_i / d_o. A negative magnification means the image is inverted.\nWhen the object is further than 2f from the lens, the real image is smaller than the object; between f\nand 2f it is larger; at exactly 2f the image is the same size and also at 2f on the other side.\nAn object inside the focal length, closer than f, gives a negative d_i: the image is virtual, upright and\nmagnified, on the same side as the object. That is how a magnifying glass works.\nExample: an object 30 cm from a lens of focal length 10 cm forms a real, inverted image 15 cm\nbehind the lens, half the size of the object.\nThe ray diagram on the next page traces the three principal rays for this example."
+        },
+        {
+          "number": 2,
+          "text": "Figure: ray diagram for an object at 30 cm from a converging lens with focal length 10 cm."
+        }
+      ],
+      "pictures": [
+        {
+          "page": 1
+        },
+        {
+          "page": 2
+        }
+      ]
+    },
+    "pdf/rc-circuits.pdf": {
+      "pages": [
+        {
+          "number": 1,
+          "text": "RC circuits and the time constant\nWritten for the Margin evaluation corpus. Released under CC0.\nCharging a capacitor\nWhen a capacitor C is connected through a resistor R to a battery of voltage V0, current flows and\ncharge builds up on the plates. The current is largest at the start, when the capacitor is empty and\nthe whole battery voltage appears across the resistor, and it falls as the capacitor voltage rises.\nKirchhoff's voltage law gives the differential equation V0 = R dq/dt + q/C, whose solution for an\ninitially uncharged capacitor is\nV(t) = V0 (1 - e^(-t/RC))\nThe product RC has units of seconds and is called the time constant, written tau. After one time\nconstant the capacitor has reached 63.2 percent of its final voltage. After five time constants it has\nreached 99.3 percent, which is why engineers treat a circuit as settled after about 5 tau."
+        },
+        {
+          "number": 2,
+          "text": "Discharging and energy\nA charged capacitor discharging through a resistor follows V(t) = V0 e^(-t/RC): after one time\nconstant the voltage has fallen to 36.8 percent of its starting value. The time to fall to half is RC ln\n2, about 0.69 tau.\nThe energy stored in a capacitor charged to voltage V is one half C V squared. When a capacitor is\ncharged from a battery through a resistor, exactly half of the energy the battery supplies is\ndissipated as heat in the resistor, whatever the value of R. A smaller resistor charges the capacitor\nfaster but dissipates the same total energy with a higher peak current.\nExample: a 10 microfarad capacitor charged through a 100 kilohm resistor has a time constant of 1\nsecond. Charged to 9 volts it stores 0.405 millijoules."
+        },
+        {
+          "number": 3,
+          "text": "The RC low-pass filter\nTaking the output across the capacitor turns the circuit into a first-order low-pass filter. At low\nfrequencies the capacitor's impedance is large and the output follows the input; at high frequencies\nthe capacitor shorts the signal to ground. The cutoff frequency, where the output power falls to half\nand the amplitude to 1/sqrt(2) of the input, is\nf_c = 1 / (2 pi R C)\nAbove the cutoff the response falls by 20 decibels per decade of frequency, and the phase shift\napproaches 90 degrees. Swapping the resistor and capacitor, so that the output is taken across the\nresistor, gives a high-pass filter with the same cutoff frequency.\nThe same time constant governs both views of the circuit: a filter with a cutoff of 159 hertz has RC\nequal to 1 millisecond, so its step response settles in about 5 milliseconds."
+        }
+      ],
+      "pictures": [
+        {
+          "page": 1
+        },
+        {
+          "page": 2
+        },
+        {
+          "page": 3
+        }
+      ]
+    }
+  }
+}

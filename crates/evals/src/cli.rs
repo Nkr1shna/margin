@@ -54,13 +54,17 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent|dogfood|injection --service-url URL
+  run --suite retrieval|courses|agent|dogfood|injection|access [--service-url URL]
       [--variant NAME] [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
-                        beside the dev service at URL; dogfood runs the retrieval suite
-                        over the repository's docs/ with evals/golden/dogfood.jsonl;
-                        injection asks evals/golden/injection.jsonl over the canaries in
-                        evals/corpus/injection/ on each configured provider
+                        beside the dev service at URL (required for courses, agent and
+                        injection; retrieval, dogfood and access need no service);
+                        dogfood runs the retrieval suite over the repository's docs/
+                        with evals/golden/dogfood.jsonl; injection asks
+                        evals/golden/injection.jsonl over the canaries in
+                        evals/corpus/injection/ on each configured provider; access
+                        searches as every principal of evals/access.toml (leaks, the
+                        owner's ranks, latency)
   harvest --service-url URL [--since T] [--out FILE]
                         Turn agents' context-API searches and the passages they read
                         after them (trace rows with via \"mcp\") into candidate questions,
@@ -176,6 +180,8 @@ pub enum Suite {
     Dogfood,
     /// Prompt-injection resistance over `corpus/injection/` (`docs/phase5-brief.md` D2).
     Injection,
+    /// Leakage and the owner's unchanged ranks over `evals/access.toml` (L2 D8).
+    Access,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,18 +195,26 @@ pub struct Cli {
 }
 
 impl Command {
-    /// Whether it reads the service, so `--service-url` is required: `run`, `export`,
-    /// `harvest`, `alerts`, `perf` and `report --service`.
+    /// Whether it reads the service, so `--service-url` is required: `run` of the
+    /// courses, agent and injection suites, `export`, `harvest`, `alerts`, `perf` and
+    /// `report --service`. The retrieval and dogfood suites run on the runner's own index
+    /// and embedder only, so for them it is optional (checked when given).
     pub fn needs_service_url(&self) -> bool {
-        matches!(
-            self,
-            Command::Run { .. }
-                | Command::Export { .. }
-                | Command::Harvest { .. }
-                | Command::Alerts
-                | Command::Perf
-                | Command::Report { service: true, .. }
-        )
+        match self {
+            Command::Run { suite, .. } => {
+                !matches!(suite, Suite::Retrieval | Suite::Dogfood | Suite::Access)
+            }
+            Command::Export { .. } | Command::Harvest { .. } | Command::Alerts | Command::Perf => {
+                true
+            }
+            Command::Report { service, .. } => *service,
+            _ => false,
+        }
+    }
+
+    /// Whether `--service-url` applies at all.
+    pub fn takes_service_url(&self) -> bool {
+        matches!(self, Command::Run { .. }) || self.needs_service_url()
     }
 
     /// Whether it calls a real model or loads the real embedder.
@@ -306,10 +320,13 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
                 Some("agent") => Suite::Agent,
                 Some("dogfood") => Suite::Dogfood,
                 Some("injection") => Suite::Injection,
+                Some("access") => Suite::Access,
                 Some(other) => {
-                    bail!("no suite \"{other}\" (retrieval, courses, agent, dogfood, injection)")
+                    bail!(
+                        "no suite \"{other}\" (retrieval, courses, agent, dogfood, injection, access)"
+                    )
                 }
-                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection"),
+                None => bail!("run needs --suite retrieval|courses|agent|dogfood|injection|access"),
             },
             variant,
             write_baseline: flag(take("write-baseline")),
@@ -371,6 +388,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         (true, None) => bail!(
             "this command reads the service: add --service-url (the dev service, {DEV_SERVICE_URL})"
         ),
+        (false, Some(url)) if command.takes_service_url() => Some(check_service_url(&url)?),
         (false, Some(_)) if command != Command::Help => {
             bail!("--service-url doesn't apply here")
         }
@@ -600,6 +618,16 @@ mod tests {
                 .command
                 .is_live()
         );
+        // The access suite (L2 D8).
+        assert!(matches!(
+            p("run --suite access --service-url http://127.0.0.1:8787")
+                .unwrap()
+                .command,
+            Command::Run {
+                suite: Suite::Access,
+                ..
+            }
+        ));
         // The dogfood feed (plan-dogfood §6).
         assert_eq!(
             p("run --suite dogfood --service-url http://127.0.0.1:8787")
@@ -651,6 +679,25 @@ mod tests {
         assert!(p("export --kind bogus").is_err());
         assert!(p("export --from yesterday").is_err());
         assert!(p("run --suite retrieval --variant").is_err());
+        // Writing and the agent read the service; retrieval needs none, but a URL
+        // given is still checked (never prod).
+        assert!(
+            p("run --suite courses")
+                .unwrap_err()
+                .to_string()
+                .contains("--service-url")
+        );
+        assert!(p("run --suite agent").is_err());
+        let r = p("run --suite retrieval --write-baseline").unwrap();
+        assert_eq!(r.service_url, None);
+        assert!(p("run --suite dogfood").is_ok());
+        assert!(
+            p("run --suite retrieval --service-url https://margin.krishnanelloore.com")
+                .unwrap_err()
+                .to_string()
+                .contains("prod")
+        );
+        assert!(p("record-embeddings --service-url http://127.0.0.1:8787").is_err());
     }
 
     async fn fake_service(environment: Option<&'static str>) -> String {
@@ -691,7 +738,7 @@ mod tests {
 
     #[test]
     fn service_url_is_required_and_never_prod() {
-        for cmd in ["run --suite retrieval", "export", "report --service"] {
+        for cmd in ["run --suite courses", "export", "report --service"] {
             let err = p(cmd).unwrap_err().to_string();
             assert!(err.contains("--service-url"), "{cmd}: {err}");
         }

@@ -2949,6 +2949,7 @@ fn FoldersSection() -> Element {
                                 "{ws.name}"
                                 small { {other_folder_line(&ws, online)} }
                                 small { class: "faint", "Remove it on {ws.device_name}." }
+                                crate::ui::audience::AudienceLine { target: crate::ui::audience::AudienceTarget::workspace(&ws) }
                             }
                         }
                     }
@@ -3016,6 +3017,7 @@ fn HeldFolderRow(ws: Workspace) -> Element {
                         n => format!("In {n} chats"),
                     }
                 }
+                crate::ui::audience::AudienceLine { target: crate::ui::audience::AudienceTarget::workspace(&ws) }
                 if revoked.is_some() {
                     span { class: "badge bad", title: revoked.clone().unwrap_or_default(), "No longer accessible — attach it again" }
                 } else if !held {

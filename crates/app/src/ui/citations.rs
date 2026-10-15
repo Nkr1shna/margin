@@ -157,6 +157,26 @@ pub fn CitationViewer(
             spawn(fetch_transcript(app, source_id));
         }
     }));
+    // A cited source missing here (not a folder's file): the service says whether the
+    // reader can still open it (a 404 when its audience changed after the citation).
+    let missing = found
+        .as_ref()
+        .filter(|c| c.file.is_none())
+        .filter(|c| {
+            !lib.sources.contains_key(&c.source_id)
+                && !lib
+                    .folder_files
+                    .values()
+                    .any(|files| files.contains_key(&c.source_id))
+        })
+        .map(|c| c.source_id.clone());
+    let probe = use_resource(use_reactive!(|missing| async move {
+        match (missing, app.api()) {
+            (Some(id), Some(api)) => crate::ui::audience::source_unreadable(&api, &id).await,
+            _ => false,
+        }
+    }));
+    let unreadable = matches!(*probe.read(), Some(true));
     let Some(c) = found else {
         drop(lib);
         // What it cites changed under the viewer (a lesson regenerated or deleted).
@@ -189,7 +209,7 @@ pub fn CitationViewer(
         .cloned()
         .unwrap_or_default();
     let view = citations::viewer(&c, &all, media_url.as_deref(), &lines);
-    let open = open_url(&c, media_url.as_deref());
+    let open = open_url(&c, media_url.as_deref()).filter(|_| !unreadable);
     let (prev, next) = neighbors(&all, n);
     let (index, total) = position(&all, n).unwrap_or((1, all.len()));
     let go = move |to: u32| {
@@ -256,6 +276,9 @@ pub fn CitationViewer(
                     }
                 }
                 div { class: "viewer-body",
+                    if unreadable {
+                        crate::ui::audience::UnreadableSource {}
+                    } else {
                     ViewerContent {
                         key: "{n}",
                         view,
@@ -266,6 +289,7 @@ pub fn CitationViewer(
                         file: c.file.clone(),
                         folder_attached,
                         on_media_error: move |_| refresh_media(app, retried),
+                    }
                     }
                 }
                 div { class: "viewer-foot",

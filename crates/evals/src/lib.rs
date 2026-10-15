@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+pub mod access;
 pub mod agent;
 pub mod ai_judge;
 pub mod alerts;
@@ -36,6 +37,7 @@ pub mod small;
 pub mod store;
 pub mod synth;
 pub mod traces;
+pub mod unfiltered;
 
 /// `evals/gates.toml`: how far a change may move the metrics before CI fails.
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +51,40 @@ pub struct Gates {
     /// R2: the prompt lock (`evals/prompts.lock`).
     #[serde(default)]
     pub prompts: PromptGates,
+    /// L2: the leakage gate (`evals/access.toml`).
+    #[serde(default)]
+    pub access: AccessGates,
+}
+
+/// `[access]` (L2, `docs/l2-brief.md` D8): over every golden query × every principal of
+/// `evals/access.toml`, by the Rust oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AccessGates {
+    /// Hits a principal can't read.
+    pub leaks_max: u32,
+    /// By-id reads (`read_passages`, `document_outline`) that returned something for a
+    /// (principal, document) pair the oracle forbids.
+    pub by_id_leaks_max: u32,
+    /// The owner's ranked ids equal the run without the conjuncts, to the id.
+    pub owner_rank_identical: bool,
+    /// For a principal who reads every relevant document of a query, the relevant hits
+    /// keep the owner's relative order (the filter removes, never reorders).
+    pub rank_consistent: bool,
+    /// The owner's p95 over the unfiltered run's, same process.
+    pub p95_latency_max_ratio: f64,
+}
+
+impl Default for AccessGates {
+    fn default() -> Self {
+        Self {
+            leaks_max: 0,
+            by_id_leaks_max: 0,
+            owner_rank_identical: true,
+            rank_consistent: true,
+            p95_latency_max_ratio: 1.5,
+        }
+    }
 }
 
 /// `[rerank]`: on the recorded reranks over the golden set.

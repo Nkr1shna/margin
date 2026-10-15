@@ -21,7 +21,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["h
 webbrowser = "=1.2.4"
 gethostname = "=1.1.0"
 keyring-core = "=1.0.1"
-dirs = "=6.0.0"
+dirs = "=7.0.0"
 # Folders (phase 4): `find_files` globs and handle bookmarks stored as base64.
 globset = "=0.4.18"
 base64 = "=0.23.1"

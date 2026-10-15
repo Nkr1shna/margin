@@ -11,6 +11,7 @@ use crate::config::Appearance;
 use crate::routes::{Route, chat_title};
 use crate::state::{LoadStatus, use_app};
 use crate::store::{LibraryState, VideoDot};
+use crate::ui::audience::{AudienceDialog, AudienceTarget};
 use crate::ui::common::{
     BrandMark, ConfirmDialog, DragRegion, HistoryButtons, Icon, RegenerateLessonDialog,
     UNIFIED_TITLE_BAR, focus_first, focus_on_mount,
@@ -44,6 +45,8 @@ struct TreeCtx {
     delete_chat: Signal<Option<Id>>,
     /// The topic whose Sources dialog is open.
     sources: Signal<Option<Id>>,
+    /// The topic whose Audience control is open.
+    audience: Signal<Option<Id>>,
     /// The written lesson waiting for "Regenerate" to be confirmed.
     regenerate: Signal<Option<Id>>,
     /// The lesson whose regenerate request is in flight.
@@ -88,6 +91,7 @@ pub fn Sidebar() -> Element {
         delete_lesson: Signal::new(None),
         delete_chat: Signal::new(None),
         sources: Signal::new(None),
+        audience: Signal::new(None),
         regenerate: Signal::new(None),
         regenerating: Signal::new(None),
         error: Signal::new(None),
@@ -160,6 +164,11 @@ pub fn Sidebar() -> Element {
         .read()
         .clone()
         .filter(|id| app.lib.read().topics.contains_key(id));
+    let mut audience_topic = tree.audience;
+    let audience_open = audience_topic
+        .read()
+        .clone()
+        .and_then(|id| app.lib.read().topics.get(&id).map(AudienceTarget::topic));
     let mut delete_busy = use_signal(|| false);
     let mut delete_error = use_signal(|| None::<String>);
     let mut all_shown = use_signal(|| false);
@@ -418,6 +427,9 @@ pub fn Sidebar() -> Element {
         }
         if let Some(id) = sources_open {
             TopicSourcesDialog { key: "{id}", topic_id: id.clone(), on_close: move |_| sources_topic.set(None) }
+        }
+        if let Some(target) = audience_open {
+            AudienceDialog { key: "{target.id}", target, on_close: move |_| audience_topic.set(None) }
         }
         if let (Some(id), Some(title)) = (deleting_chat.clone(), deleting_chat_title) {
             ConfirmDialog {
@@ -1028,6 +1040,7 @@ fn TopicNode(id: Id) -> Element {
     let mut menu = tree.menu;
     let mut delete = tree.delete;
     let mut sources = tree.sources;
+    let mut audience = tree.audience;
     let mut error = tree.error;
 
     let lib = app.lib.read();
@@ -1211,6 +1224,18 @@ fn TopicNode(id: Id) -> Element {
                         },
                         Icon { name: "clip" }
                         "Sources…"
+                    }
+                    button {
+                        role: "menuitem",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                menu.set(None);
+                                audience.set(Some(id.clone()));
+                            }
+                        },
+                        Icon { name: "users" }
+                        "Who can read…"
                     }
                     div { class: "sep", role: "separator" }
                     button {

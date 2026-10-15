@@ -100,6 +100,9 @@
 //! | DELETE | /api/agents/{id}                       |                    | 204 (owner)         |
 //! | POST   | /api/agents/{id}/token                 |                    | AgentToken (owner; replaces any token; shown once) |
 //! | DELETE | /api/agents/{id}/token                 |                    | 204 (owner)         |
+//! | PUT    | /api/audience/{unit}/{id}              | Audience           | Audience (the row's owner, admins not exempt; unit topic, workspace, source, document; cascades; 400 not_a_unit, unknown_group, unknown_person, unknown_agent, audience_too_large; 403 not_owner; 404) |
+//! | GET    | /api/audience/{unit}/{id}              |                    | AudienceView (anyone who can read the row; 404) |
+//! | GET    | /api/audit?kind&from&to&subject        |                    | JSONL of context::AuditRow, oldest first (admin; 400 bad_range) |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
@@ -213,6 +216,11 @@ pub const INVITATIONS: &str = "/api/invitations";
 pub const GROUPS: &str = "/api/groups";
 /// `GET` → `Vec<Agent>`; `POST NewAgent` → `Agent`.
 pub const AGENTS: &str = "/api/agents";
+/// The prefix of `audience(unit, id)` (L2 D3).
+pub const AUDIENCE: &str = "/api/audience";
+/// `GET ?kind&from&to&subject` → audit rows as JSON lines (`application/x-ndjson`),
+/// oldest first, paged like `TRACES` (admins; L2 D7).
+pub const AUDIT: &str = "/api/audit";
 
 const MB: u64 = 1024 * 1024;
 /// Largest audio or video source.
@@ -277,6 +285,10 @@ pub fn too_large_text(name: &str, kind: crate::SourceKind) -> String {
     )
 }
 
+/// `PUT` an `audience::Audience` (the row's owner) or `GET` its `audience::AudienceView`.
+pub fn audience(unit: crate::audience::AudienceUnit, id: &str) -> String {
+    format!("{AUDIENCE}/{}/{id}", unit.as_str())
+}
 pub fn topic(id: &str) -> String {
     format!("/api/topics/{id}")
 }
@@ -510,6 +522,20 @@ mod tests {
         );
         assert!(PROVIDERS_CHATGPT_START.starts_with(PROVIDERS_CHATGPT));
         assert!(PROVIDERS_CHATGPT_COMPLETE.starts_with(PROVIDERS_CHATGPT));
+    }
+
+    #[test]
+    fn l2_routes() {
+        use crate::audience::AudienceUnit;
+        assert_eq!(
+            audience(AudienceUnit::Topic, "t1"),
+            "/api/audience/topic/t1"
+        );
+        assert_eq!(
+            audience(AudienceUnit::Workspace, "w"),
+            "/api/audience/workspace/w"
+        );
+        assert_eq!(AUDIT, "/api/audit");
     }
 
     #[test]

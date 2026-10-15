@@ -120,6 +120,7 @@ mod tests {
                 origin: "source".into(),
                 scope_ids: vec![],
                 access: vec![],
+                deny: Vec::new(),
                 unit_id: unit.into(),
                 modality: modality.into(),
                 ord: 0,

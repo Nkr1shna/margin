@@ -52,6 +52,10 @@
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
+//! - `RENDER_AUDIENCE=<topic id>` opens that topic's Audience control (L2): a dialog on
+//!   computers, a sheet below 720px (`WIDTHpx`); as Bob (`RENDER_AS=member`) it is the
+//!   read-only summary. Settings → Organisation shows the Audit log and each agent's
+//!   documents; `/lesson/l2` is a lesson narrowed by a private file.
 //! - `RENDER_PINNED=<url>` renders `connect` as a release build pinned to that service
 //!   (`RENDER_PINNED=dev`: as a developer build, with the address field); otherwise it
 //!   has this build's shape.
@@ -351,6 +355,23 @@ fn Harness(props: HarnessProps) -> Element {
         lib.replace_agents(org.agents.clone());
         lib.replace_invitations(org.invitations.clone());
         lib.replace_devices(org.devices.clone());
+        // L2: the audit log and agents' documents, as the owner (or Bob) reads them.
+        let reader = if member { fake::BOB } else { fake::ALICE };
+        lib.replace_audit(if member {
+            Vec::new()
+        } else {
+            org.audit
+                .iter()
+                .map(|r| org.with_subject_name(fake::ALICE, r.clone()))
+                .collect()
+        });
+        lib.replace_agent_documents(
+            org.documents
+                .iter()
+                .filter(|d| org.person_reads(reader, &org.document_audience(d).1))
+                .cloned()
+                .collect(),
+        );
         if member {
             lib.agents.retain(|_, a| a.owner_id == fake::BOB);
             lib.invitations.clear();
@@ -435,6 +456,11 @@ fn Harness(props: HarnessProps) -> Element {
         }
     });
     let sources_topic = std::env::var("RENDER_SOURCES").ok();
+    let audience = std::env::var("RENDER_AUDIENCE").ok().and_then(|id| {
+        let ctx = use_context::<AppCtx>();
+        let lib = ctx.lib.peek();
+        lib.topics.get(&id).map(ui::audience::AudienceTarget::topic)
+    });
     if connect {
         // The build's shape unless RENDER_PINNED names a service (or `dev` for a
         // developer build).
@@ -449,6 +475,9 @@ fn Harness(props: HarnessProps) -> Element {
             Router::<routes::Route> {}
             if let Some(topic_id) = sources_topic {
                 ui::sources::TopicSourcesDialog { topic_id, on_close: |_| {} }
+            }
+            if let Some(target) = audience {
+                ui::audience::AudienceDialog { target, on_close: |_| {} }
             }
         }
     }
