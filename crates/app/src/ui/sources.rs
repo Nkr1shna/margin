@@ -11,7 +11,7 @@ use crate::sources::{Destination, Tone, Upload, UploadState, human_bytes, status
 use crate::state::{AppCtx, use_app};
 use crate::store::LibraryState;
 use crate::ui::common::{ConfirmDialog, Icon, js};
-use crate::ui::settings::SettingsPane;
+use crate::ui::settings::{MODELS_ADMIN_ONLY, SettingsPane};
 
 /// Uploads running at once.
 const CONCURRENT_UPLOADS: usize = 3;
@@ -755,6 +755,8 @@ pub fn EmbeddingNotice() -> Element {
     let Some(model) = app.lib.read().embedding.clone() else {
         return rsx! {};
     };
+    // Admins download the model; a member reads why sources wait and who to ask.
+    let admin = app.is_admin();
     let download = move |_| async move {
         if *busy.peek() {
             return;
@@ -783,8 +785,12 @@ pub fn EmbeddingNotice() -> Element {
                             },
                             _ => rsx! {},
                         }
+                        if !admin && !matches!(state, EmbeddingModelState::Downloading { .. }) {
+                            span { class: "muted", "{MODELS_ADMIN_ONLY}" }
+                        }
                         div { class: "row-actions",
                             match &state {
+                                _ if !admin => rsx! {},
                                 EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
                                     button {
                                         class: "btn btn-primary btn-sm",

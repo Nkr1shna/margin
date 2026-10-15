@@ -2133,6 +2133,10 @@ fn TracesSection(settings: Settings) -> Element {
     }
 }
 
+/// What a member reads where an admin has the model's Download and Remove controls.
+pub const MODELS_ADMIN_ONLY: &str =
+    "Only an organisation admin downloads or removes the models the service runs.";
+
 /// The embedding model sources are read with: its state, download progress, and removal.
 #[component]
 fn SourcesSection() -> Element {
@@ -2142,6 +2146,9 @@ fn SourcesSection() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut confirm_remove = use_signal(|| false);
     let model = app.lib.read().embedding.clone();
+    // The models are the organisation's: a member reads their state, an admin changes it
+    // (the service answers 403 `admin_required` otherwise).
+    let admin = app.is_admin();
     let download = move || async move {
         busy.set(true);
         error.set(download_embedding(app).await.err());
@@ -2174,7 +2181,7 @@ fn SourcesSection() -> Element {
                         }
                     }
                     match model.state {
-                        EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                        EmbeddingModelState::NotDownloaded { download_bytes } if admin => rsx! {
                             div { class: "row-actions",
                                 button {
                                     class: "btn btn-primary btn-sm",
@@ -2189,16 +2196,22 @@ fn SourcesSection() -> Element {
                         EmbeddingModelState::Downloading { received, total } => rsx! {
                             Progress { received, total }
                         },
-                        EmbeddingModelState::Ready { .. } => rsx! {
+                        EmbeddingModelState::Ready { .. } if admin => rsx! {
                             div { class: "row-actions",
                                 button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                             }
                         },
-                        EmbeddingModelState::Failed { error: message } => rsx! {
+                        EmbeddingModelState::Failed { error: message } if admin => rsx! {
                             ErrorNotice {
                                 message: "The download failed. {message}",
                                 on_retry: move |_| { spawn(download()); },
                             }
+                        },
+                        EmbeddingModelState::Failed { error: message } => rsx! {
+                            p { class: "help", "The download failed. {message} {MODELS_ADMIN_ONLY}" }
+                        },
+                        _ => rsx! {
+                            p { class: "help", "{MODELS_ADMIN_ONLY}" }
                         },
                     }
                 },
@@ -2291,6 +2304,8 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
     let mut busy = use_signal(|| false);
     let error = use_signal(|| None::<String>);
     let mut confirm_remove = use_signal(|| false);
+    // Admins download and remove it; a member reads its state.
+    let admin = app.is_admin();
     let download = move || async move {
         let Some(api) = app.api() else { return };
         busy.set(true);
@@ -2319,7 +2334,7 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
                 }
             }
             match speech.state.clone() {
-                EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
+                EmbeddingModelState::NotDownloaded { download_bytes } if admin => rsx! {
                     div { class: "row-actions",
                         button {
                             class: "btn btn-primary btn-sm",
@@ -2334,16 +2349,22 @@ fn SpeechModelSection(speech: SpeechModel) -> Element {
                 EmbeddingModelState::Downloading { received, total } => rsx! {
                     Progress { received, total, label: "Downloading the speech model".to_string() }
                 },
-                EmbeddingModelState::Ready { .. } => rsx! {
+                EmbeddingModelState::Ready { .. } if admin => rsx! {
                     div { class: "row-actions",
                         button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
                     }
                 },
-                EmbeddingModelState::Failed { error: message } => rsx! {
+                EmbeddingModelState::Failed { error: message } if admin => rsx! {
                     ErrorNotice {
                         message: "The download failed. {message}",
                         on_retry: move |_| { spawn(download()); },
                     }
+                },
+                EmbeddingModelState::Failed { error: message } => rsx! {
+                    p { class: "help", "The download failed. {message} {MODELS_ADMIN_ONLY}" }
+                },
+                _ => rsx! {
+                    p { class: "help", "{MODELS_ADMIN_ONLY}" }
                 },
             }
             if let Some(err) = error.read().clone() {

@@ -375,6 +375,30 @@ async fn admin_events_and_settings_need_an_admin() {
     let err: margin_shared::ApiError = r.json().await.unwrap();
     assert_eq!(err.code, "admin_required");
 
+    // The organisation's models and its ChatGPT sign-in are admin-written too (a
+    // member reads the model's state).
+    let r = h.get(&bob, "/api/embedding").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    for (method, path) in [
+        ("POST", "/api/embedding/download"),
+        ("DELETE", "/api/embedding"),
+        ("POST", "/api/embedding/speech/download"),
+        ("DELETE", "/api/embedding/speech"),
+        ("GET", "/api/providers/chatgpt"),
+        ("POST", "/api/providers/chatgpt/start"),
+        ("DELETE", "/api/providers/chatgpt"),
+    ] {
+        let req = match method {
+            "POST" => h.post(&bob, path),
+            "DELETE" => h.delete(&bob, path),
+            _ => h.get(&bob, path),
+        };
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status(), 403, "{method} {path}");
+        let err: margin_shared::ApiError = r.json().await.unwrap();
+        assert_eq!(err.code, "admin_required", "{method} {path}");
+    }
+
     // An admins-only event reaches the owner, not the member.
     h.state.emit_to(
         Audience::Admins,

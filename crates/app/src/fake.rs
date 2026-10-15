@@ -2189,7 +2189,7 @@ pub fn fake_account(email: &str) -> ChatGptAccount {
 /// `GET /api/providers/chatgpt`. A waiting sign-in ends here, as `chatgpt_finish` says
 /// (or, in manual runs, signed in on the third poll).
 async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (status, changed) = {
@@ -2234,7 +2234,7 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
 
 /// `POST /api/providers/chatgpt/start`: a sign-in waits for the owner's browser.
 async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let mut s = fake.state.lock().unwrap();
@@ -2258,7 +2258,7 @@ async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response
 
 /// `DELETE /api/providers/chatgpt`: signs out (or gives up a waiting sign-in).
 async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let settings = {
@@ -2929,7 +2929,7 @@ fn set_embedding(fake: &Fake, state: EmbeddingModelState) -> EmbeddingModel {
 }
 
 async fn download_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -2995,7 +2995,7 @@ async fn simulate_download(fake: Fake) {
 }
 
 async fn delete_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let model = set_embedding(
@@ -3033,7 +3033,7 @@ fn no_speech_model() -> Response {
 }
 
 async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -3085,7 +3085,7 @@ async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Respon
 }
 
 async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     match set_speech(
@@ -7456,13 +7456,8 @@ async fn revoke_agent_token(
         Ok((_, false)) => return not_agent_owner(),
         Err(r) => return r,
     };
-    if s.agents[i].token.take().is_none() {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "That agent has no token.",
-        );
-    }
+    // As the service: revoking an agent without a token is 204 too.
+    s.agents[i].token = None;
     s.agent_tokens.remove(&id);
     let agent = s.agents[i].clone();
     drop(s);

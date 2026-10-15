@@ -3040,7 +3040,8 @@ mod tests {
         let rotated = alice.mint_agent_token(&agent.id).await.unwrap();
         assert_ne!(rotated.token, minted.token);
         alice.revoke_agent_token(&agent.id).await.unwrap();
-        assert!(alice.revoke_agent_token(&agent.id).await.is_err());
+        // Revoking again is 204 as well (the service's answer).
+        alice.revoke_agent_token(&agent.id).await.unwrap();
         // Bob (an admin now) sees it and may only disable it.
         let rename = AgentPatch {
             name: Some("mine".into()),

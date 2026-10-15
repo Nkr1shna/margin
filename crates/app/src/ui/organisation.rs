@@ -521,7 +521,15 @@ fn EditGroupsDialog(person: Person, on_close: EventHandler<()>) -> Element {
     let mut checked = use_signal(|| person.groups.clone());
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
-    let groups: Vec<Group> = app.lib.read().groups.values().cloned().collect();
+    // Everyone is in Company (the service keeps the person in it): not a choice here.
+    let groups: Vec<Group> = app
+        .lib
+        .read()
+        .groups
+        .values()
+        .filter(|g| g.path != margin_shared::ROOT_GROUP)
+        .cloned()
+        .collect();
     let rows = group_rows(&groups, &checked.read());
     let id = person.id.clone();
     rsx! {
@@ -556,7 +564,10 @@ fn EditGroupsDialog(person: Person, on_close: EventHandler<()>) -> Element {
                         async move {
                             let Some(api) = app.api() else { return };
                             busy.set(true);
-                            let list = checked.peek().clone();
+                            let mut list = checked.peek().clone();
+                            if !list.iter().any(|g| g == margin_shared::ROOT_GROUP) {
+                                list.push(margin_shared::ROOT_GROUP.to_string());
+                            }
                             match api.put_person_groups(&id, &list).await {
                                 Ok(person) => {
                                     let mut lib = app.lib;
