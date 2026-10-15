@@ -207,9 +207,9 @@ pub async fn refuse_agents(req: Request, next: Next) -> Response {
 /// A device token's principal. `None` (401) for an unknown token, or a device whose
 /// person is missing or disabled.
 ///
-/// First commit: a device without `person_id` (every device before `people-v1`) is the
-/// bootstrap owner, synthesised from `config.allowed_github_login`; L1-auth refuses it
-/// once the migration has run.
+/// A device without `person_id` exists only before `people-v1` (which runs before the
+/// service serves): it is the bootstrap owner, synthesised from
+/// `config.allowed_github_login`. Once the migration has run such a device is refused.
 pub async fn principal_for_device_token(
     state: &AppState,
     token: &str,
@@ -222,7 +222,8 @@ pub async fn principal_for_device_token(
             Some(row) if row.person.state == PersonState::Active => row.person,
             _ => return Ok(None),
         },
-        None => bootstrap_person(state),
+        None if !crate::people::migration_done(state).await? => bootstrap_person(state),
+        None => return Ok(None),
     };
     let expansion = groups::expansion(state, &person.id).await?;
     Ok(Some(Arc::new(Principal {
@@ -238,7 +239,7 @@ pub async fn principal_for_device_token(
 }
 
 /// The owner as `config.allowed_github_login` names them, before `people-v1`.
-fn bootstrap_person(state: &AppState) -> Person {
+pub fn bootstrap_person(state: &AppState) -> Person {
     let login = state.config.allowed_github_login.clone();
     Person {
         id: BOOTSTRAP_PERSON_ID.into(),

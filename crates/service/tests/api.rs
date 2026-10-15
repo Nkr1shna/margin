@@ -60,7 +60,7 @@ async fn sign_in_approves_once_and_the_token_works() {
             .starts_with("text/html")
     );
     let html = page.text().await.unwrap();
-    assert!(html.contains("Signed in to Margin. You can return to the app."));
+    assert!(html.contains("Signed in to Margin as @nkr1shna. You can return to the app."));
 
     let token = match h.poll(&s).await {
         LoginState::Approved {

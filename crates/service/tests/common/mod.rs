@@ -1300,6 +1300,28 @@ impl Harness {
         }
     }
 
+    /// `POST /api/invitations` as `admin_token`; panics unless it succeeds.
+    pub async fn invite(
+        &self,
+        admin_token: &str,
+        github_login: &str,
+        role: margin_shared::OrgRole,
+        groups: &[&str],
+    ) -> margin_shared::Invitation {
+        let r = self
+            .post(admin_token, "/api/invitations")
+            .json(&margin_shared::NewInvitation {
+                github_login: github_login.into(),
+                role,
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        r.json().await.unwrap()
+    }
+
     pub fn get(&self, token: &str, path: &str) -> reqwest::RequestBuilder {
         self.http.get(self.u(path)).bearer_auth(token)
     }
