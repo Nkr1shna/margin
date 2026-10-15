@@ -1,0 +1,59 @@
+# The pull request itself, not its code: the body has `## Testing` and `Release Notes:`
+# (.github/pull_request_template.md), and the change fits the size budget (over 1,000
+# changed lines warns, over 3,000 fails without the `large-pr` label). Both checks are
+# deploy/ci/pr-check.sh. Runs on a GitHub-hosted runner, so it never queues behind CI on
+# the self-hosted ones, and again when the body or the labels change.
+name: PR checks
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr:
+    name: Body and size
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The body, labels and author are read from the API rather than the event, so a re-run
+      # sees the current ones. Fail closed: a read that fails fails the check.
+      - name: Read the PR
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" > "$RUNNER_TEMP/pr.json" || {
+            echo "::error::could not read PR #$PR; failing rather than skipping the checks"; exit 1; }
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+            --jq '.[] | "\(.filename)\t\(.changes)"' > "$RUNNER_TEMP/files.tsv" || {
+            echo "::error::could not list PR #$PR's files; failing rather than skipping the checks"; exit 1; }
+          [ -s "$RUNNER_TEMP/files.tsv" ] || { echo "::error::PR #$PR lists no files"; exit 1; }
+      # Dependabot writes its own bodies (release notes of the bumped crate, no Testing).
+      - name: Body has Testing and Release Notes
+        run: |
+          author="$(jq -r '.user.login' "$RUNNER_TEMP/pr.json")"
+          if [ "$author" = "dependabot[bot]" ]; then
+            echo "Dependabot PR; body not checked."
+            exit 0
+          fi
+          jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/body.md"
+          sh deploy/ci/pr-check.sh body "$RUNNER_TEMP/body.md"
+      - name: Size budget
+        run: |
+          if jq -e '.labels | any(.name == "large-pr")' "$RUNNER_TEMP/pr.json" > /dev/null; then
+            sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv" large-pr
+          else
+            sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv"
+          fi
