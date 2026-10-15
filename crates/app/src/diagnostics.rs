@@ -9,7 +9,16 @@
 //!   `LOG_MAX_BYTES` each (warnings and up from libraries, info and up from the app);
 //! - `crash-<time>-<n>.log`: one per panic, the last `KEEP_CRASHES` kept;
 //! - `last-crash.log`: a copy of the report of a panic on the main thread, which quit
-//!   the app; the next launch takes it (`take_last_crash`) and says so (`CrashNotice`).
+//!   the app; the next launch takes it (`take_last_crash`) and says so (`CrashNotice`);
+//! - `running` (desktop): there while the app runs, removed on a clean quit (`end_run`).
+//!   Left behind, it tells the next launch the app ended some other way than a panic
+//!   (killed, a crash in native code, the machine stopping), which leaves no report.
+//!   Two copies share the folder (a development build beside the installed app): one
+//!   whose marker names a live process leaves it be, and each removes only its own.
+//!
+//! Each launch logs how the previous run ended (`PreviousRun`), so a crash is findable
+//! in `margin.log` too. The log is written straight to the file, unbuffered, so nothing
+//! is lost when a panic aborts the process.
 //!
 //! In release builds such a panic then aborts (`ABORT_ON_QUIT`), so macOS keeps a crash
 //! report of its own in `~/Library/Logs/DiagnosticReports` as well.
@@ -37,6 +46,7 @@ const LOG_FILES: usize = 5;
 const LOG_NAME: &str = "margin";
 const KEEP_CRASHES: usize = 5;
 const LAST_CRASH: &str = "last-crash.log";
+const RUNNING: &str = "running";
 
 /// Where the log and crash reports go (module docs).
 pub fn log_dir() -> Option<PathBuf> {
@@ -75,12 +85,125 @@ pub fn init() {
         LOG_FILES,
     )));
     init_tracing();
-    install_panic_hook(Some(dir), ABORT_ON_QUIT);
+    install_panic_hook(Some(dir.clone()), ABORT_ON_QUIT);
     tracing::info!(
         "{APP_NAME} {VERSION} (build {BUILD}) on {} {} started",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
+    // Mobile systems end apps in the background without a word, so only the desktop
+    // app can tell an unclean exit from an ordinary one.
+    let previous = PreviousRun::read(&dir);
+    if cfg!(feature = "desktop")
+        && !matches!(previous, PreviousRun::Running(_))
+        && let Err(error) = start_run(&dir)
+    {
+        tracing::warn!("couldn't mark the run as started: {error}");
+    }
+    previous.log(&dir);
+}
+
+/// How the last run ended, from what it left in the log folder.
+#[derive(Debug, PartialEq, Eq)]
+enum PreviousRun {
+    /// It quit cleanly, or this is the first run.
+    Clean,
+    /// A panic quit it; `last-crash.log` holds the report.
+    Panicked,
+    /// It ended without a clean quit and without a panic report: the `running` marker,
+    /// holding what `start_run` wrote.
+    Unclean(String),
+    /// It hasn't ended: another copy of the app, this process id, is running.
+    Running(u32),
+}
+
+impl PreviousRun {
+    fn read(dir: &Path) -> Self {
+        if dir.join(LAST_CRASH).exists() {
+            Self::Panicked
+        } else if let Ok(run) = std::fs::read_to_string(dir.join(RUNNING)) {
+            match marker_pid(&run) {
+                Some(pid) if is_alive(pid) => Self::Running(pid),
+                _ => Self::Unclean(run.trim().to_string()),
+            }
+        } else {
+            Self::Clean
+        }
+    }
+
+    fn log(&self, dir: &Path) {
+        match self {
+            Self::Clean => {}
+            Self::Panicked => tracing::warn!(
+                "the last run crashed; its report is {}",
+                dir.join(LAST_CRASH).display()
+            ),
+            Self::Unclean(run) => tracing::warn!(
+                "the last run ({run}) ended without quitting cleanly and left no crash report; \
+                 macOS may have one in ~/Library/Logs/DiagnosticReports"
+            ),
+            Self::Running(pid) => tracing::info!("another instance (pid {pid}) is running"),
+        }
+    }
+}
+
+/// Leave the `running` marker for this run (module docs).
+fn start_run(dir: &Path) -> io::Result<()> {
+    std::fs::write(
+        dir.join(RUNNING),
+        format!(
+            "pid {}, {VERSION} (build {BUILD}), started {}\n",
+            std::process::id(),
+            chrono::Utc::now().to_rfc3339()
+        ),
+    )
+}
+
+/// The app is quitting cleanly: take the `running` marker away.
+pub fn end_run() {
+    if let Some(dir) = log_dir() {
+        end_run_in(&dir);
+    }
+}
+
+fn end_run_in(dir: &Path) {
+    let path = dir.join(RUNNING);
+    let ours = std::fs::read_to_string(&path)
+        .is_ok_and(|run| marker_pid(&run) == Some(std::process::id()));
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The process id a `running` marker names (`start_run`).
+fn marker_pid(run: &str) -> Option<u32> {
+    run.strip_prefix("pid ")?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether a process with this id is running. A reused id reads as running, which only
+/// skips one unclean-exit line.
+fn is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Record which screen is on show (a route's path, or "sign-in"), for crash reports.
@@ -189,7 +312,7 @@ fn install_panic_hook(dir: Option<PathBuf>, abort_on_quit: bool) {
             eprintln!("couldn't save the crash report: {error}");
         }
         if let Some(log) = LOG.get()
-            && let Ok(mut log) = log.try_lock()
+            && let Some(mut log) = lock_briefly(log)
         {
             let _ = log.write_all(format!("PANIC\n{report}\n").as_bytes());
         }
@@ -198,6 +321,21 @@ fn install_panic_hook(dir: Option<PathBuf>, abort_on_quit: bool) {
             std::process::abort();
         }
     }));
+}
+
+/// The log, if another thread lets go of it within a moment: a panic shouldn't miss the
+/// log because a line was being written, nor hang if it came from code holding it.
+fn lock_briefly<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    for _ in 0..50 {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+    None
 }
 
 /// A panic, for its report.
@@ -478,11 +616,66 @@ mod tests {
         assert!(!BUILD.is_empty());
     }
 
+    #[test]
+    fn the_next_launch_knows_how_the_last_run_ended() {
+        let dir = temp("previous");
+        assert_eq!(PreviousRun::read(&dir), PreviousRun::Clean);
+        // A run that quit cleanly.
+        start_run(&dir).unwrap();
+        end_run_in(&dir);
+        assert_eq!(PreviousRun::read(&dir), PreviousRun::Clean);
+        // A copy still running (here, this process): not a crash.
+        start_run(&dir).unwrap();
+        assert_eq!(
+            PreviousRun::read(&dir),
+            PreviousRun::Running(std::process::id())
+        );
+        // A run that was killed: the marker names a process that's gone.
+        let dead = "pid 1000000, 0.1.0 (build x), started 2026-10-15T00:00:00Z\n";
+        std::fs::write(dir.join(RUNNING), dead).unwrap();
+        assert_eq!(
+            PreviousRun::read(&dir),
+            PreviousRun::Unclean(dead.trim().to_string())
+        );
+        // Quitting leaves another process's marker alone.
+        end_run_in(&dir);
+        assert!(dir.join(RUNNING).exists());
+        // A run a panic quit: its report wins over the marker it also left.
+        save_crash(&dir, "report", true).unwrap();
+        assert_eq!(PreviousRun::read(&dir), PreviousRun::Panicked);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_panic_waits_a_moment_for_the_log() {
+        use std::sync::{Arc, Barrier};
+        let log = Arc::new(Mutex::new(()));
+        // Held throughout: give up rather than hang.
+        let held = log.lock().unwrap();
+        assert!(lock_briefly(&log).is_none());
+        drop(held);
+        // Held by another thread for a moment: wait for it.
+        let taken = Arc::new(Barrier::new(2));
+        let writer = {
+            let (log, taken) = (Arc::clone(&log), Arc::clone(&taken));
+            std::thread::spawn(move || {
+                let _line = log.lock().unwrap();
+                taken.wait();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            })
+        };
+        taken.wait();
+        assert!(lock_briefly(&log).is_some());
+        writer.join().unwrap();
+    }
+
     /// The real hook, on a real panic. It stays installed for the rest of the test run,
-    /// writing into this temporary folder, which is harmless.
+    /// writing into this temporary folder, which is harmless. So does `LOG`, which no
+    /// other test sets.
     #[test]
     fn a_panic_on_the_main_thread_leaves_a_report_for_the_next_launch() {
         let dir = temp("hook");
+        let _ = LOG.set(Mutex::new(Rotating::new(&dir, LOG_NAME, LOG_MAX_BYTES, 2)));
         install_panic_hook(Some(dir.clone()), false);
         set_screen("/notes");
         let _ = std::thread::Builder::new()
@@ -496,6 +689,11 @@ mod tests {
         assert!(report.contains("Screen: /notes"));
         assert!(report.contains("src/diagnostics.rs:"));
         assert!(report.contains("Backtrace:\n"));
+        // The log has it too, written through by the time the hook returns.
+        let log = std::fs::read_to_string(dir.join(format!("{LOG_NAME}.log"))).unwrap();
+        assert!(log.contains("PANIC\n"), "{log}");
+        assert!(log.contains("boom with [secret removed]"), "{log}");
+        assert!(log.contains("Backtrace:\n"), "{log}");
         // A background thread's panic is kept, but didn't quit the app.
         let _ = std::thread::Builder::new()
             .name("worker".into())

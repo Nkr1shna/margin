@@ -5603,7 +5603,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "ulid",
+ "ulid 3.0.0",
  "uuid",
 ]
 
@@ -9591,7 +9591,7 @@ dependencies = [
  "surrealdb-types",
  "thiserror 2.0.21",
  "tracing",
- "ulid",
+ "ulid 1.2.1",
  "uuid",
 ]
 
@@ -9833,7 +9833,7 @@ dependencies = [
  "surrealdb-strand",
  "surrealdb-syn",
  "surrealdb-types",
- "ulid",
+ "ulid 1.2.1",
  "url",
  "uuid",
 ]
@@ -9926,7 +9926,7 @@ dependencies = [
  "surrealdb-protocol",
  "surrealdb-types-derive",
  "tracing",
- "ulid",
+ "ulid 1.2.1",
  "url",
  "uuid",
 ]
@@ -11039,6 +11039,16 @@ checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
  "rand 0.9.5",
  "serde",
+ "web-time",
+]
+
+[[package]]
+name = "ulid"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "947dde63b6d514cc5e044edad4e0ca7261afd1099d16c83d942cb2b2f348689c"
+dependencies = [
+ "rand 0.10.3",
  "web-time",
 ]
 
