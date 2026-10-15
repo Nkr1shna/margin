@@ -2296,6 +2296,20 @@ async fn the_sink_streams_deltas_with_offsets_and_keeps_live_text() {
 // Stop and started writes, waiting, titles
 // ---------------------------------------------------------------------------
 
+/// Waits until a Stop of `chat_id` has aborted the turn and is waiting for its writes.
+async fn until_stopping(h: &Harness, chat_id: &str) {
+    eventually(|| async {
+        h.state
+            .turns
+            .stopping
+            .lock()
+            .unwrap()
+            .contains(chat_id)
+            .then_some(())
+    })
+    .await;
+}
+
 /// Stores an in-progress call of the fake turn, as the loop does once its arguments are
 /// in.
 async fn open_call(sink: &ServiceSink, call_id: &str, name: &str) -> ChatItem {
@@ -2476,7 +2490,7 @@ async fn a_second_stop_while_the_first_waits_finishes_nothing_twice() {
         let t = t.clone();
         tokio::spawn(async move { http.post(h_url).bearer_auth(t).send().await.unwrap() })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_stopping(&h, &chat.id).await;
     let second = h
         .post(&t, &format!("/api/chats/{}/stop", chat.id))
         .send()
@@ -2515,7 +2529,7 @@ async fn a_stop_whose_request_is_dropped_still_finishes_the_turn() {
         let t = t.clone();
         tokio::spawn(async move { http.post(url).bearer_auth(t).send().await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_stopping(&h, &chat.id).await;
     request.abort();
     let d = wait_chat(&h, &t, &chat.id, idle).await;
     assert_eq!(

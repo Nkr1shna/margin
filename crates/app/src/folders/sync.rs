@@ -1261,6 +1261,18 @@ pub mod tests {
     use crate::folders::StdDir;
     use crate::folders::store::Store;
 
+    /// Polls `done` until it holds, for up to 10 s; then fails naming `what`.
+    pub async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// A scratch folder removed when dropped.
     pub struct TempDir(pub PathBuf);
 
@@ -1648,12 +1660,10 @@ pub mod tests {
                 let id = t.attach(&dir, "papers").await;
                 t.engine.start(&id);
                 // Stop once the first part is in.
-                for _ in 0..1000 {
-                    if t.fake.state.lock().unwrap().parts_received >= 1 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                wait_for("the first part", || {
+                    t.fake.state.lock().unwrap().parts_received >= 1
+                })
+                .await;
                 t.engine.pause();
                 assert_eq!(
                     t.until(&id, |s| *s == SyncState::Paused).await,
@@ -1728,8 +1738,10 @@ pub mod tests {
                 let t = setup(slow_opener()).await;
                 let id = t.attach(&dir, "notes").await;
                 let answer = t.engine.request(&id);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                assert_eq!(t.engine.state(&id), Some(SyncState::Scanning));
+                wait_for("the scan", || {
+                    t.engine.state(&id) == Some(SyncState::Scanning)
+                })
+                .await;
                 t.engine.pause();
                 t.until(&id, |s| *s == SyncState::Paused).await;
                 assert_eq!(answer.await.unwrap(), Err(PAUSED.to_string()));
@@ -1753,8 +1765,10 @@ pub mod tests {
                 // Starts before the walk began are this run's.
                 t.engine.start(&id);
                 t.engine.start(&id);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                assert_eq!(t.engine.state(&id), Some(SyncState::Scanning));
+                wait_for("the scan", || {
+                    t.engine.state(&id) == Some(SyncState::Scanning)
+                })
+                .await;
                 // Starts while it runs make one more.
                 for _ in 0..3 {
                     t.engine.start(&id);
@@ -1813,13 +1827,10 @@ pub mod tests {
                     t.engine.request(&id).await.unwrap(),
                     Err(NOT_HELD.to_string())
                 );
-                for _ in 0..100 {
-                    if store::lock(&t.store).get(&id).is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                assert!(store::lock(&t.store).get(&id).is_none());
+                wait_for("the folder to be let go", || {
+                    store::lock(&t.store).get(&id).is_none()
+                })
+                .await;
                 assert_eq!(t.engine.state(&id), None);
             })
             .await;

@@ -96,6 +96,32 @@ fn is_mark(e: &Event) -> bool {
     matches!(e, Event::AccessChanged { person_id } if person_id == BOB)
 }
 
+/// Probes Bob's open socket with admins-only events until it hears them (`true`) or
+/// stops hearing them (`false`): it rebuilds its principal after an access change.
+async fn until_bob_hears_admins(h: &Harness, bob_sock: &mut Socket, hears: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    for n in 0.. {
+        let id = format!("probe-{n}");
+        h.state.emit_to(
+            Audience::Admins,
+            Event::InvitationDeleted { id: id.clone() },
+        );
+        mark_bob(h);
+        let saw = bob_sock.until(is_mark).await;
+        let heard = saw
+            .iter()
+            .any(|e| matches!(e, Event::InvitationDeleted { id: i } if *i == id));
+        if heard == hears {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Bob's socket never {} admins-only events",
+            if hears { "heard" } else { "stopped hearing" }
+        );
+    }
+}
+
 /// Whether `e` carries (or names) someone's library or chat content.
 fn is_content(e: &Event) -> bool {
     matches!(
@@ -418,8 +444,8 @@ async fn admin_events_and_settings_need_an_admin() {
     // Bob becomes an admin: his open socket follows without reconnecting.
     put_bob(&h, OrgRole::Admin).await;
     h.state.expansions.invalidate_all();
-    // The socket rebuilds its principal on the change; give it a moment.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The socket rebuilds its principal on the change, in its own time.
+    until_bob_hears_admins(&h, &mut bob_sock, true).await;
     h.state.emit_to(
         Audience::Admins,
         Event::InvitationDeleted { id: "inv-2".into() },
@@ -431,7 +457,7 @@ async fn admin_events_and_settings_need_an_admin() {
     // And back to a member: they stop.
     put_bob(&h, OrgRole::Member).await;
     h.state.expansions.invalidate_all();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until_bob_hears_admins(&h, &mut bob_sock, false).await;
     h.state.emit_to(
         Audience::Admins,
         Event::InvitationDeleted { id: "inv-3".into() },

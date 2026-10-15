@@ -1184,7 +1184,15 @@ mod data_tests {
             std::fs::create_dir_all(root.0.join(format!("backups/2000-01-0{n}-000000/data")))
                 .unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Names are to the second: wait until one made now sorts after the first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backup_name(chrono::Local::now(), None) <= name {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clock stood still"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let second = backup_data(&data, None, 2).await.unwrap();
         assert_eq!(entries(&root.0.join(BACKUPS_DIR)), vec![first, second]);
     }
