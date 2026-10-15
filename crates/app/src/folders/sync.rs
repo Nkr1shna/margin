@@ -179,7 +179,7 @@ impl Engine {
                 let opened = opener(handle);
                 for (old, new) in super::take_resaved() {
                     if let Err(e) = store::lock(&store).update_handle(&old, new) {
-                        eprintln!("couldn't save a folder's renewed bookmark: {e}");
+                        tracing::warn!("couldn't save a folder's renewed bookmark: {e}");
                     }
                 }
                 opened
@@ -759,6 +759,20 @@ impl Engine {
             if cancel.load(Ordering::Relaxed) {
                 return Delivery::Cancelled;
             }
+            // The service said it holds more than this device has hashed (a part from an
+            // earlier try): hash up to there first. Slicing `data` below assumes
+            // `offset <= hashed`, and would panic otherwise.
+            if offset > hashed {
+                let len = routes::UPLOAD_PART_BYTES.min(offset - hashed);
+                match reader.read(hashed, len).await {
+                    Ok(data) => {
+                        hasher.update(&data);
+                        hashed += len;
+                    }
+                    Err(e) => return give_up(read_failure(e)).await,
+                }
+                continue;
+            }
             let len = routes::UPLOAD_PART_BYTES.min(stamp.bytes - offset);
             let data = match reader.read(offset, len).await {
                 Ok(data) => data,
@@ -1036,7 +1050,7 @@ fn walk(dir: &dyn Dir, rel: &str, cancel: &AtomicBool, found: &mut Scan) -> Resu
                     // Unreadable (evicted to iCloud, locked, no permission, a link): it
                     // can't be sent, but it's still there, so the service keeps its copy.
                     Err(ScanError::Dir(e)) => {
-                        eprintln!("passing over {path}: {e}");
+                        tracing::warn!("passing over {path}: {e}");
                         let reason = if dir.evicted(&path) {
                             UnreadableReason::NotDownloaded
                         } else {
@@ -1101,7 +1115,7 @@ impl FileReader {
             .name("margin-folder-read".into())
             .spawn(move || serve_reads(opener, handle, path, incoming));
         if let Err(e) = spawned {
-            eprintln!("couldn't start reading a folder file: {e}");
+            tracing::warn!("couldn't start reading a folder file: {e}");
         }
         Self { requests }
     }
@@ -1663,6 +1677,44 @@ pub mod tests {
                 assert_eq!(source.name, "scan.pdf");
                 assert_eq!(source.bytes, big.len() as u64);
                 assert_eq!(s.source_files[&source.id], big);
+            })
+            .await;
+    }
+
+    /// A service that says it holds more of an upload than this device has sent (and so
+    /// hashed) doesn't take the app down: this used to panic slicing the next part, in a
+    /// task on the main thread. The run carries on to its end.
+    #[tokio::test]
+    async fn an_upload_state_ahead_of_what_was_sent_doesnt_panic() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dir = TempDir::new("ahead");
+                let big: Vec<u8> = (0..(2 * routes::UPLOAD_PART_BYTES + 1000))
+                    .map(|i| (i % 249) as u8)
+                    .collect();
+                dir.file("scan.pdf", &big);
+                let t = setup(std_opener()).await;
+                {
+                    let mut s = t.fake.state.lock().unwrap();
+                    // The first part fails; asked after, the service claims two parts.
+                    s.fail_parts = 1;
+                    s.misreport_received = Some(2 * routes::UPLOAD_PART_BYTES);
+                }
+                let id = t.attach(&dir, "papers").await;
+                t.engine.start(&id);
+                let state = t
+                    .until(&id, |s| {
+                        !matches!(s, SyncState::Scanning | SyncState::Uploading { .. })
+                    })
+                    .await;
+                assert!(
+                    matches!(state, SyncState::Idle { .. } | SyncState::Failed(_)),
+                    "{state:?}"
+                );
+                // Whatever arrived is the file as it is, never a mix.
+                let s = t.fake.state.lock().unwrap();
+                assert!(s.source_files.values().all(|f| *f == big));
             })
             .await;
     }

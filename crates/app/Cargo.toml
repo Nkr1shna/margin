@@ -27,6 +27,10 @@ globset = "=0.4.18"
 base64 = "=0.23.1"
 # Folder file stamps.
 sha2.workspace = true
+# The app log and crash reports (src/diagnostics.rs). Same versions dioxus-logger uses;
+# `tracing-log` also brings in the `log` records of tao and wry.
+tracing.workspace = true
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "registry", "tracing-log"] }
 
 # keyring 4.2: the `v1` feature picks the native store on desktop (Keychain on macOS);
 # on iOS and Android its `cli` module selects the "protected" (iOS) or "android" store.

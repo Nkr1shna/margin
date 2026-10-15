@@ -18,11 +18,54 @@ const FILES: &[&str] = &["MarginPicker.kt", "proguard-margin.pro"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    build_sha();
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("android") => android(),
         Ok("ios") if is_simulator() => simulator_entitlements(),
         _ => {}
     }
+}
+
+/// The commit this build is from, for crash reports (`MARGIN_BUILD_SHA`, src/diagnostics.rs):
+/// apps.yml's `SHA`, else the Actions checkout's `GITHUB_SHA`, else `git rev-parse HEAD`,
+/// else "unknown".
+fn build_sha() {
+    for var in ["SHA", "GITHUB_SHA"] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let from_env = ["SHA", "GITHUB_SHA"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|s| !s.trim().is_empty()));
+    let sha = match from_env {
+        Some(sha) => sha,
+        None => {
+            // A local build: follow HEAD and the branch it points at, so a new commit
+            // rebuilds with its sha.
+            let branch = git(&["symbolic-ref", "-q", "HEAD"])
+                .and_then(|r| git(&["rev-parse", "--git-path", &r]));
+            for path in [git(&["rev-parse", "--git-path", "HEAD"]), branch]
+                .into_iter()
+                .flatten()
+                // A missing path (a packed ref) would rerun this script on every build.
+                .filter(|p| std::path::Path::new(p).exists())
+            {
+                println!("cargo:rerun-if-changed={path}");
+            }
+            git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+        }
+    };
+    let short: String = sha.trim().chars().take(12).collect();
+    println!("cargo:rustc-env=MARGIN_BUILD_SHA={short}");
 }
 
 /// `aarch64-apple-ios-sim`, or `x86_64-apple-ios` (only ever a simulator).

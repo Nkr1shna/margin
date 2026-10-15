@@ -195,7 +195,7 @@ impl Store {
     pub fn remove(&mut self, id: &str) -> Option<LocalFolder> {
         let removed = self.folders.remove(id)?;
         if let Err(e) = self.save() {
-            eprintln!("couldn't save the folders this device holds: {e}");
+            tracing::warn!("couldn't save the folders this device holds: {e}");
         }
         self.bump();
         Some(removed)
@@ -219,7 +219,7 @@ impl Store {
             .filter_map(|id| self.folders.remove(&id).map(|f| (id, f)))
             .collect();
         if let Err(e) = self.save() {
-            eprintln!("couldn't save the folders this device holds: {e}");
+            tracing::warn!("couldn't save the folders this device holds: {e}");
         }
         self.bump();
         removed
@@ -262,7 +262,7 @@ fn read_file(path: &Path) -> Option<File> {
     match serde_json::from_slice::<File>(&bytes) {
         Ok(file) if file.version <= VERSION => Some(file),
         Ok(file) => {
-            eprintln!(
+            tracing::warn!(
                 "{} is from a newer Margin (version {}); not reading it",
                 path.display(),
                 file.version
@@ -270,7 +270,7 @@ fn read_file(path: &Path) -> Option<File> {
             None
         }
         Err(e) => {
-            eprintln!("couldn't read {}: {e}", path.display());
+            tracing::warn!("couldn't read {}: {e}", path.display());
             None
         }
     }

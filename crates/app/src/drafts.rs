@@ -399,7 +399,7 @@ pub fn save_in_background(app: crate::state::AppCtx, id: Id) {
                 Err(_) => {}
             }
         }
-        eprintln!("couldn't save note {id}; keeping the edit for the next try");
+        tracing::warn!("couldn't save note {id}; keeping the edit for the next try");
         restore(&id, draft);
     });
 }

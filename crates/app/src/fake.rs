@@ -65,6 +65,9 @@ pub struct FakeState {
     pub parts_received: u32,
     /// Fail the next this many parts with a 503, for tests of the retries.
     pub fail_parts: u32,
+    /// Say this much was received the next time an upload's state is asked for (a
+    /// service that over-reports), for tests that the client copes.
+    pub misreport_received: Option<u64>,
     /// Take this long over each part, for tests that stop an upload half way.
     pub part_delay: Option<Duration>,
     pub chats: Vec<Chat>,
@@ -665,6 +668,7 @@ impl FakeState {
             part_uploads: HashMap::new(),
             parts_received: 0,
             fail_parts: 0,
+            misreport_received: None,
             part_delay: None,
             chats: Vec::new(),
             chat_items: HashMap::new(),
@@ -2808,12 +2812,13 @@ async fn get_part_upload(
     if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
-    let s = fake.state.lock().unwrap();
+    let mut s = fake.state.lock().unwrap();
+    let misreport = s.misreport_received.take();
     match s.part_uploads.get(&id) {
         Some(u) => Json(SourceUpload {
             id,
             bytes: u.bytes,
-            received: u.data.len() as u64,
+            received: misreport.unwrap_or(u.data.len() as u64),
         })
         .into_response(),
         None => not_found(),

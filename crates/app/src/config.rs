@@ -214,7 +214,7 @@ pub fn save_to(path: &Path, config: &LocalConfig) -> Result<(), String> {
 /// (settings, unsaved note edits), or a damaged one it set aside. Stderr for now: the one
 /// place to route these to the app's log.
 pub fn report_save_failure(message: &str) {
-    eprintln!("margin: {message}");
+    tracing::warn!("{message}");
 }
 
 /// The JSON file at `path`, or `None` when there is none. A file that can't be read or
