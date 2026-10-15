@@ -417,7 +417,7 @@ impl Drop for SpanGuard {
 
 /// A new row id: a ulid, so ids sort by time within a millisecond's kind and window.
 pub fn new_row_id() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::generate().to_string()
 }
 
 /// The token counts of a call as a trace records them.
