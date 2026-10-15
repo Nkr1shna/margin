@@ -89,6 +89,12 @@ pub struct IngestArgs {
     /// "text" (default) / "code".
     #[serde(default)]
     pub kind: Option<String>,
+    /// Who else may read it: group paths ("company", "company/engineering"),
+    /// "person/<id>", "agent/<id>". Only what you can read yourself. Leave it out to keep
+    /// the document private to your owner and you (a replaced document keeps its
+    /// audience).
+    #[serde(default)]
+    pub access: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -354,12 +360,24 @@ impl Margin {
         &self,
         Parameters(args): Parameters<IngestArgs>,
     ) -> Result<String, String> {
+        let audience = match args.access {
+            Some(access) => {
+                let audience = margin_shared::Audience {
+                    access,
+                    deny: Vec::new(),
+                };
+                margin_shared::validate(&audience)?;
+                Some(audience)
+            }
+            None => None,
+        };
         let doc = ingest_text(
             &self.client,
             CLAUDE_CODE,
             &args.name,
             args.kind.as_deref(),
             args.text,
+            audience,
         )
         .await
         .map_err(err)?;

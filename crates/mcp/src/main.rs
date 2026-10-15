@@ -26,9 +26,9 @@ USAGE:
   margin-mcp login                     sign in with GitHub as a device (your whole access);
                                        the token goes to the secret store
   margin-mcp ingest --name <name> [--kind decision|handoff|note|text|code]
-                    [--agent <name>] (<file> | -)
+                    [--agent <name>] [--access <who>,...] [--deny <who>,...] (<file> | -)
                                        add one document (default agent: claude-code)
-  margin-mcp ingest-dir [--dry-run] <path>...
+  margin-mcp ingest-dir [--dry-run] [--access <who>,...] [--deny <who>,...] <path>...
                                        add the tracked *.md under the paths as agent:repo,
                                        named <path>@<short sha>; older versions are replaced
   margin-mcp purge --actor agent:<name> [--dry-run]
@@ -36,6 +36,11 @@ USAGE:
 
 OPTIONS:
   --url <url>   the Margin service (default: `url` in ~/.config/margin/mcp.toml)
+  --access      who else reads what ingest writes: groups (company/engineering),
+                person/<id>, agent/<id>, comma-separated; an agent token may name only
+                what it reads itself. Without it a document is private to you (and the
+                agent token that wrote it); a replaced document keeps its audience
+  --deny        who never reads it, in the same form
   -h, --help    this text
 ";
 
@@ -66,6 +71,8 @@ struct Args {
     kind: Option<String>,
     agent: Option<String>,
     actor: Option<String>,
+    access: Option<String>,
+    deny: Option<String>,
     dry_run: bool,
     forget: bool,
     positional: Vec<String>,
@@ -82,6 +89,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> anyhow::Result<Option<Args>>
             "--kind" => args.kind = Some(value("--kind")?),
             "--agent" => args.agent = Some(value("--agent")?),
             "--actor" => args.actor = Some(value("--actor")?),
+            "--access" => args.access = Some(value("--access")?),
+            "--deny" => args.deny = Some(value("--deny")?),
             "--dry-run" | "-n" => args.dry_run = true,
             "--forget" => args.forget = true,
             "-" => args.positional.push(arg),
@@ -167,17 +176,28 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     .with_context(|| format!("couldn't read {source}"))?
             };
             let agent = args.agent.as_deref().unwrap_or(CLAUDE_CODE);
+            let audience = ingest::parse_audience(args.access.as_deref(), args.deny.as_deref())?;
             let client = signed_in_client(args.url.as_deref()).await?;
-            let doc = ingest::ingest_text(&client, agent, name, args.kind.as_deref(), text).await?;
+            let doc =
+                ingest::ingest_text(&client, agent, name, args.kind.as_deref(), text, audience)
+                    .await?;
             say(&format!("added {} ({}) as {}", doc.name, doc.id, doc.actor));
             Ok(())
         }
         "ingest-dir" => {
+            let audience = ingest::parse_audience(args.access.as_deref(), args.deny.as_deref())?;
             let client = signed_in_client(args.url.as_deref()).await?;
             let cwd = std::env::current_dir().context("no current directory")?;
-            ingest::ingest_dir(&client, &cwd, &args.positional, args.dry_run, &mut say)
-                .await
-                .map(|_| ())
+            ingest::ingest_dir(
+                &client,
+                &cwd,
+                &args.positional,
+                audience.as_ref(),
+                args.dry_run,
+                &mut say,
+            )
+            .await
+            .map(|_| ())
         }
         "purge" => {
             let actor = args

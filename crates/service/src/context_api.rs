@@ -13,14 +13,18 @@
 //! the caller's access paths; a caller-supplied `access` must be a subset of them (400
 //! `bad_access`). An ingested document belongs to the caller's person (an agent's: its
 //! owner) and only that person deletes or replaces it. Every trace row a request records
-//! names its principal. Outline and passages by document id are not filtered in L1
-//! (closed by L2).
+//! names its principal.
+//!
+//! L2 (`docs/l2-brief.md` D5, D6): every read carries the caller's `Reader`, so outline
+//! and passages of a document the caller can't read are 404, and the change feed lists
+//! only documents (and deletions) the caller reads. An ingested document is private to
+//! its owner (and the agent that wrote it) unless `ContextIngest.audience` names more:
+//! an agent only paths it reads itself, a person any group, active person or own agent.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
-use margin_shared::access_code;
 use margin_shared::context::{
     AGENT_HEADER, ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
     Origin, Project, TraceKind, TraceRow, VIA_MCP, is_agent_name,
@@ -28,6 +32,8 @@ use margin_shared::context::{
 use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
 use margin_shared::text::for_model;
+use margin_shared::{AGENT_PREFIX, PERSON_PREFIX};
+use margin_shared::{Audience, PersonState, access_code, agent_id, is_group_path, person_id};
 use serde::Deserialize;
 
 use crate::db;
@@ -242,6 +248,135 @@ async fn existing_agent_document(
     Ok(found.into_iter().next())
 }
 
+fn audience_error(code: &'static str, message: String) -> AppError {
+    AppError::new(StatusCode::BAD_REQUEST, code, message)
+}
+
+/// Who always reads a document `p` ingests: its person, and the agent that wrote it.
+fn ingest_base(p: &Principal) -> Vec<String> {
+    let mut base = vec![person_id(&p.person_id)];
+    if let crate::principal::PrincipalKind::Agent { agent_id: id, .. } = &p.kind {
+        base.push(agent_id(id));
+    }
+    base
+}
+
+/// 400 naming `entry` unless it is an existing group, an active person or one of
+/// `owner`'s agents (`unknown_group`, `unknown_person`, `unknown_agent`).
+async fn check_exists(state: &AppState, owner: &str, entry: &str) -> AppResult<()> {
+    if is_group_path(entry) {
+        if crate::groups::group_exists(&state.store, entry).await? {
+            return Ok(());
+        }
+        return Err(audience_error(
+            access_code::UNKNOWN_GROUP,
+            format!("There's no group {entry}. Create it first under Organisation → Groups."),
+        ));
+    }
+    if let Some(id) = entry.strip_prefix(PERSON_PREFIX) {
+        let active = match crate::people::person_row(state, id).await? {
+            Some(r) => r.person.state == PersonState::Active,
+            // The bootstrap owner before `people-v1` has no row.
+            None => {
+                id == crate::principal::BOOTSTRAP_PERSON_ID
+                    && crate::people::owner_row(state).await?.is_none()
+            }
+        };
+        if active {
+            return Ok(());
+        }
+        return Err(audience_error(
+            access_code::UNKNOWN_PERSON,
+            format!("There's no active person {entry}. Pick someone from the people list."),
+        ));
+    }
+    if let Some(id) = entry.strip_prefix(AGENT_PREFIX) {
+        let own = state
+            .store
+            .get::<crate::agents::AgentRow>(db::AGENT, id)
+            .await?
+            .is_some_and(|r| r.agent.owner_id == owner);
+        if own {
+            return Ok(());
+        }
+        return Err(audience_error(
+            access_code::UNKNOWN_AGENT,
+            format!(
+                "{entry} isn't one of your agents. Name one of yours under Organisation → Agents."
+            ),
+        ));
+    }
+    Err(audience_error(
+        access_code::BAD_ACCESS,
+        format!("“{entry}” isn't a group, a person or an agent. Pick one from the list."),
+    ))
+}
+
+/// The audience an ingested document is stored with (L2 D3): `asked` validated
+/// (`margin_shared::validate`; an agent may name in `access` only paths it reads itself,
+/// else 400 `bad_access`; a person any existing group, active person or own agent), with
+/// the caller's person (and, on an agent token, the agent) always reading it and never
+/// denied. `None` is that base alone: private to the person and the agent.
+pub async fn ingest_audience(
+    state: &AppState,
+    p: &Principal,
+    asked: Option<Audience>,
+) -> AppResult<Audience> {
+    let base = ingest_base(p);
+    let Some(asked) = asked else {
+        return Ok(Audience {
+            access: base,
+            deny: Vec::new(),
+        });
+    };
+    if let Err(message) = margin_shared::validate(&asked) {
+        let code = if asked.access.len() > margin_shared::AUDIENCE_MAX
+            || asked.deny.len() > margin_shared::AUDIENCE_MAX
+        {
+            access_code::AUDIENCE_TOO_LARGE
+        } else {
+            access_code::BAD_ACCESS
+        };
+        return Err(audience_error(code, message));
+    }
+    for entry in &asked.access {
+        if base.contains(entry) {
+            continue;
+        }
+        if p.is_agent() {
+            // An agent never widens past what it reads (its owner's ∩ its ceiling).
+            if !p.paths.contains(entry) {
+                return Err(audience_error(
+                    access_code::BAD_ACCESS,
+                    format!(
+                        "This agent can't share with {entry}: it doesn't read it. Name only groups the agent reads, or leave out the audience."
+                    ),
+                ));
+            }
+        } else {
+            check_exists(state, &p.person_id, entry).await?;
+        }
+    }
+    for entry in &asked.deny {
+        if !base.contains(entry) {
+            check_exists(state, &p.person_id, entry).await?;
+        }
+    }
+    let mut access = base.clone();
+    for entry in asked.access {
+        if !access.contains(&entry) {
+            access.push(entry);
+        }
+    }
+    let mut deny: Vec<String> = Vec::new();
+    for entry in asked.deny {
+        if !base.contains(&entry) && !deny.contains(&entry) {
+            deny.push(entry);
+        }
+    }
+    Ok(Audience { access, deny })
+}
+
 /// `POST routes::CONTEXT_INGEST`: `ingest::ingest_text` (the same agent and name
 /// replaces that document's text; the diff keeps unchanged passages). On a device token
 /// the origin's name is the agent's and `actor` is `agent:<name>`; on an agent token the
@@ -277,16 +412,24 @@ pub async fn ingest(
     if text.trim().is_empty() {
         return Err(AppError::bad_request("The document has no text."));
     }
-    let req = ContextIngest {
+    let asked = doc.audience.clone();
+    let mut req = ContextIngest {
         origin: Origin::Agent { name: agent },
         name,
         text,
+        audience: None,
         ..doc
     };
-    if let Some(existing) = existing_agent_document(&state, &req.origin, req.name.trim()).await?
+    let existing = existing_agent_document(&state, &req.origin, req.name.trim()).await?;
+    if let Some(existing) = &existing
         && existing.owner.as_ref().is_some_and(|o| o != &p.person_id)
     {
         return Err(not_owner());
+    }
+    // A replacement without an audience keeps the document's; a new document without
+    // one is private to its person and the agent that wrote it.
+    if asked.is_some() || existing.is_none() {
+        req.audience = Some(ingest_audience(&state, &p, asked).await?);
     }
     // Whose it is, and (on an agent token) which agent wrote it: written in the same
     // write as the document, so no reader sees it without its owner.
@@ -308,9 +451,11 @@ pub struct ChangesQuery {
     pub limit: Option<usize>,
 }
 
-/// `GET routes::CONTEXT_CHANGES?since`: `ingest::changes_since`.
+/// `GET routes::CONTEXT_CHANGES?since`: `ingest::changes_page` as the caller reads
+/// it (documents and deletions it can't read aren't listed).
 pub async fn changes(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Query(q): Query<ChangesQuery>,
 ) -> AppResult<Json<ContextChanges>> {
     use margin_shared::context::{CHANGES_PAGE_DEFAULT, CHANGES_PAGE_MAX};
@@ -321,7 +466,7 @@ pub async fn changes(
         )));
     }
     Ok(Json(
-        crate::ingest::changes_page(&state, q.since, limit).await?,
+        crate::ingest::changes_page(&state, &Reader::of(&p), q.since, limit).await?,
     ))
 }
 

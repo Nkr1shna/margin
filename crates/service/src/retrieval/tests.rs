@@ -1168,3 +1168,222 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
     let nobody = Reader::sorted(Vec::new(), Vec::new());
     assert!(scope_names(&s, &library, &nobody).await.is_empty());
 }
+
+// -- L2: readers on by-id reads, the cache key, the rewriter's names ------------------
+
+fn doc_row(id: &str, owner: Option<&str>, access: &[&str], deny: &[&str]) -> Document {
+    let now = Utc::now();
+    Document {
+        owner: owner.map(str::to_string),
+        id: id.into(),
+        project_id: DEFAULT_PROJECT_ID.into(),
+        origin: Origin::Agent { name: "t".into() },
+        name: format!("{id}.md"),
+        kind: SourceKind::Text,
+        status: margin_shared::context::DocumentStatus::Ready { passages: 1 },
+        generation: 1,
+        bytes: 1,
+        actor: "owner".into(),
+        access: access.iter().map(|a| a.to_string()).collect(),
+        deny: deny.iter().map(|d| d.to_string()).collect(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn person_reader(person: &str, groups: &[&str]) -> Reader {
+    let mut paths: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+    paths.push(format!("person/{person}"));
+    Reader::sorted(paths.clone(), paths)
+}
+
+/// Every by-id read answers nothing for a document the reader can't read (so routes
+/// answer 404, never 403): by audience, and by a denial naming the reader.
+#[tokio::test]
+async fn every_by_id_read_refuses_an_unreadable_document() {
+    let s = Store::memory().await.unwrap();
+    let audience = |mut r: PassageRow| {
+        r.access = vec!["company/sales".into()];
+        r.deny = vec!["person/bob".into()];
+        r
+    };
+    s.insert_many(
+        db::PASSAGE,
+        &[
+            audience(row(P {
+                id: "s0",
+                doc: "sd",
+                scope: &[],
+                modality: "text",
+                ord: 0,
+                page: Some(1),
+                text: "pipeline forecast",
+                v: unit(0),
+            })),
+            audience(row(P {
+                id: "s1",
+                doc: "sd",
+                scope: &[],
+                modality: "picture",
+                ord: 1,
+                page: Some(1),
+                text: "a chart",
+                v: unit(1),
+            })),
+        ],
+    )
+    .await
+    .unwrap();
+    s.put(
+        db::DOCUMENT,
+        "sd",
+        &doc_row("sd", Some("alice"), &["company/sales"], &["person/bob"]),
+    )
+    .await
+    .unwrap();
+    let sales = person_reader("sam", &["company", "company/sales"]);
+    let bob = person_reader("bob", &["company", "company/sales"]);
+    let engineer = person_reader("eve", &["company", "company/engineering"]);
+    // Sam (in sales) reads it all.
+    assert!(matches!(
+        doc_state(&s, &sales, "sd").await.unwrap(),
+        DocState::Ready
+    ));
+    assert!(doc_info(&s, &sales, "sd").await.unwrap().is_some());
+    assert_eq!(
+        read_passages(&s, &sales, "sd", Selector::Page(1), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(document_outline(&s, &sales, "sd").await.unwrap().len(), 1);
+    assert!(
+        document_picture(&s, &sales, "sd", None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // An engineer (not in sales) and Bob (denied by name) read nothing of it.
+    for reader in [&engineer, &bob] {
+        assert!(matches!(
+            doc_state(&s, reader, "sd").await.unwrap(),
+            DocState::Unknown
+        ));
+        assert!(doc_info(&s, reader, "sd").await.unwrap().is_none());
+        for sel in [Selector::Page(1), Selector::Ords { from: 0, to: 9 }] {
+            assert!(
+                read_passages(&s, reader, "sd", sel, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            passages_on_page(&s, reader, "sd", 1, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(document_outline(&s, reader, "sd").await.unwrap().is_empty());
+        for page in [None, Some(1)] {
+            assert!(
+                document_picture(&s, reader, "sd", page)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    // A document row the reader can't read is Unknown even when a passage of it is
+    // readable (rows out of step mid-publish never open the document).
+    let mut stray = text("x0", "xd", &[], 0, "stray", unit(2));
+    stray.access = vec!["company".into()];
+    s.insert_many(db::PASSAGE, &[stray]).await.unwrap();
+    s.put(
+        db::DOCUMENT,
+        "xd",
+        &doc_row("xd", Some("alice"), &["person/alice"], &[]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        doc_state(&s, &engineer, "xd").await.unwrap(),
+        DocState::Unknown
+    ));
+    // A document stored without an audience is its owner's alone.
+    s.put(db::DOCUMENT, "od", &doc_row("od", Some("sam"), &[], &[]))
+        .await
+        .unwrap();
+    assert!(doc_info(&s, &sales, "od").await.unwrap().is_some());
+    assert!(doc_info(&s, &engineer, "od").await.unwrap().is_none());
+}
+
+/// The cache key holds the reader (paths and denials): a packed result never crosses
+/// readers, and the same reader finds it again.
+#[test]
+fn the_cache_key_crosses_no_reader() {
+    let req = |reader: Reader| Request {
+        plan: QueryPlan::single("entropy"),
+        scope: Scope::Library,
+        reader,
+        modalities: Vec::new(),
+        k: 8,
+        budget: Budget::default(),
+        window_tokens: 100_000,
+        reserve_output: 1_000,
+        trace_id: "t".into(),
+        caller: None,
+        purpose: RetrievalPurpose::Context,
+        provider: None,
+    };
+    let key = |r: Reader| cache_key(&req(r), "p", Some("e".into()), "g");
+    let alice = person_reader("alice", &["company"]);
+    assert_eq!(key(alice.clone()), key(alice.clone()));
+    // The same arrays in another order, with repeats, are the same reader.
+    assert_eq!(
+        key(alice.clone()),
+        key(Reader::sorted(
+            vec!["person/alice".into(), "company".into(), "company".into()],
+            vec!["person/alice".into(), "company".into()],
+        ))
+    );
+    assert_ne!(key(alice.clone()), key(person_reader("bob", &["company"])));
+    // Same paths, other denials (alice's agent: its deny holds `agent/<id>`).
+    let agent = Reader::sorted(
+        vec!["company".into(), "person/alice".into()],
+        vec!["agent/a1".into(), "company".into(), "person/alice".into()],
+    );
+    assert_ne!(key(alice.clone()), key(agent));
+    // The rest of the key still counts.
+    assert_ne!(
+        cache_key(&req(alice.clone()), "p", Some("e".into()), "g"),
+        cache_key(&req(alice), "p", Some("e".into()), "g2")
+    );
+}
+
+/// The rewriter's names come from a statement with the reader's two conjuncts: denials
+/// count, and a document stored without an audience is its owner's.
+#[tokio::test]
+async fn the_rewriters_names_respect_denials_and_owners() {
+    let s = Store::memory().await.unwrap();
+    for d in [
+        doc_row("d1", None, &["company"], &[]),
+        doc_row("d2", None, &["company"], &["person/bob"]),
+        doc_row("d3", Some("bob"), &[], &[]),
+        doc_row("d4", Some("alice"), &[], &[]),
+    ] {
+        s.put(db::DOCUMENT, &d.id.clone(), &d).await.unwrap();
+    }
+    let library = Resolved {
+        library: true,
+        ..Default::default()
+    };
+    let bob = person_reader("bob", &["company"]);
+    assert_eq!(scope_names(&s, &library, &bob).await, ["d1.md", "d3.md"]);
+    let alice = person_reader("alice", &["company"]);
+    assert_eq!(
+        scope_names(&s, &library, &alice).await,
+        ["d1.md", "d2.md", "d4.md"]
+    );
+}

@@ -121,6 +121,27 @@ pub struct Request {
     pub provider: Option<Provider>,
 }
 
+/// The retrieval cache's key: everything that changes what `retrieve` returns, the
+/// reader's paths and denials among them (L2 D1), so a packed result never crosses
+/// readers.
+fn cache_key(req: &Request, pipeline: &str, embedder: Option<String>, generation: &str) -> String {
+    let key = json!({
+        "q": req.plan.queries,
+        "scope": req.scope,
+        "reader": req.reader,
+        "modalities": req.modalities,
+        "k": req.k,
+        "budget": req.budget,
+        "window": req.window_tokens,
+        "reserve": req.reserve_output,
+        "pipeline": pipeline,
+        "embedder": embedder,
+        "generation": generation,
+    })
+    .to_string();
+    crate::state::sha256_hex(&key)
+}
+
 /// The reranker's query (R2, `docs/r2-brief.md` D1): the plan's first string, then the
 /// others as "Also asked:" lines, at most `RERANK_QUERY_CHARS` characters.
 pub fn rerank_query(plan: &QueryPlan) -> String {
@@ -456,7 +477,23 @@ pub fn document_access(d: &Document) -> Vec<String> {
     }
 }
 
-/// Whether `reader` reads the document row `d` (the Rust twin of `Reader::doc_sql()`,
+/// The reader's two conjuncts on a `document` (or `document_deleted`) row, inside the
+/// statement: `Reader::doc_sql()` with a document read without an audience counting as
+/// private to its owner (`document_access`) and a row from before `deny` existed as
+/// denying no one. Bound by `doc_reader_binds`.
+pub const DOC_READER_SQL: &str = " AND ((doc.access ?? []) CONTAINSANY $paths \
+     OR (array::len(doc.access ?? []) = 0 \
+         AND string::concat('person/', doc.owner ?? $bootstrap) IN $paths)) \
+     AND (doc.deny ?? []) CONTAINSNONE $deny";
+
+/// What `DOC_READER_SQL` reads: the reader's `$paths` and `$deny`, and `$bootstrap`.
+pub fn doc_reader_binds(reader: &Reader) -> Vec<(&'static str, Value)> {
+    let mut binds = reader.binds();
+    binds.push(("bootstrap", json!(crate::principal::BOOTSTRAP_PERSON_ID)));
+    binds
+}
+
+/// Whether `reader` reads the document row `d` (the Rust twin of `DOC_READER_SQL`,
 /// for a row already read by id).
 pub fn reads_document(reader: &Reader, d: &Document) -> bool {
     reader.allows(&document_access(d), &d.deny)
@@ -1630,21 +1667,12 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
 
     let legacy = legacy_sources(state, &resolved).await?;
     let embedder = crate::embedding::embedder(state).await.ok().flatten();
-    let key = json!({
-        "q": req.plan.queries,
-        "scope": req.scope,
-        "reader": req.reader,
-        "modalities": req.modalities,
-        "k": req.k,
-        "budget": req.budget,
-        "window": req.window_tokens,
-        "reserve": req.reserve_output,
-        "pipeline": pipeline.hash,
-        "embedder": embedder.as_ref().map(|e| e.version().to_string()),
-        "generation": index_generation(&state.store).await?,
-    })
-    .to_string();
-    let key = crate::state::sha256_hex(&key);
+    let key = cache_key(
+        req,
+        &pipeline.hash,
+        embedder.as_ref().map(|e| e.version().to_string()),
+        &index_generation(&state.store).await?,
+    );
     if legacy.is_empty()
         && let Some(hit) = state.retrieval_cache.get(&key)
     {
@@ -1813,7 +1841,16 @@ pub fn reranked_count(fused: &[Hit], reranked: &[Hit]) -> Option<u32> {
 /// rewriter's prompt: names (through `text::for_model`), never passage text, and never a
 /// document the caller can't read.
 pub async fn scope_names(store: &Store, resolved: &Resolved, reader: &Reader) -> Vec<String> {
-    let documents: Vec<Document> = match store.list(db::DOCUMENT).await {
+    if reader.is_empty() {
+        return Vec::new();
+    }
+    let documents: Vec<Document> = match store
+        .query_rows(
+            &format!("SELECT VALUE doc FROM document WHERE true{DOC_READER_SQL}"),
+            doc_reader_binds(reader),
+        )
+        .await
+    {
         Ok(d) => d,
         Err(e) => {
             tracing::debug!("couldn't list documents for the rewriter: {e:#}");
@@ -1822,10 +1859,8 @@ pub async fn scope_names(store: &Store, resolved: &Resolved, reader: &Reader) ->
     };
     let mut names: Vec<String> = Vec::new();
     for d in documents {
-        let visible = reads_document(reader, &d);
         let name = for_model(&d.name);
         if (resolved.library || resolved.keys.contains(&d.id))
-            && visible
             && !name.trim().is_empty()
             && !names.contains(&name)
         {

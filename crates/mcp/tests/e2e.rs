@@ -476,6 +476,7 @@ async fn ingest_dir_follows_the_repository() {
         &client,
         &repo.join("docs"),
         &["../docs".into(), "../PLAN.md".into()],
+        None,
         true,
         &mut quiet,
     )
@@ -488,7 +489,7 @@ async fn ingest_dir_follows_the_repository() {
         "a dry run writes nothing"
     );
 
-    let first = ingest::ingest_dir(&client, &repo, &paths, false, &mut quiet)
+    let first = ingest::ingest_dir(&client, &repo, &paths, None, false, &mut quiet)
         .await
         .unwrap();
     assert_eq!(
@@ -512,7 +513,7 @@ async fn ingest_dir_follows_the_repository() {
             name: "repo".into()
         }));
 
-    let again = ingest::ingest_dir(&client, &repo, &paths, false, &mut quiet)
+    let again = ingest::ingest_dir(&client, &repo, &paths, None, false, &mut quiet)
         .await
         .unwrap();
     assert!(again.ingested.is_empty());
@@ -520,7 +521,7 @@ async fn ingest_dir_follows_the_repository() {
 
     // An edit not yet committed is ingested as -dirty, replacing by name on re-runs.
     std::fs::write(repo.join("docs/a.md"), "# A\n\nAlpha two.\n").unwrap();
-    let dirty = ingest::ingest_dir(&client, &repo, &paths, false, &mut quiet)
+    let dirty = ingest::ingest_dir(&client, &repo, &paths, None, false, &mut quiet)
         .await
         .unwrap();
     assert_eq!(dirty.ingested, [format!("docs/a.md@{sha1}-dirty")]);
@@ -530,7 +531,7 @@ async fn ingest_dir_follows_the_repository() {
     git(&repo, &["rm", "-q", "docs/b.md"]);
     git(&repo, &["commit", "-q", "-am", "two"]);
     let sha2 = short_sha(&repo, "docs/a.md");
-    let second = ingest::ingest_dir(&client, &repo, &paths, false, &mut quiet)
+    let second = ingest::ingest_dir(&client, &repo, &paths, None, false, &mut quiet)
         .await
         .unwrap();
     assert_eq!(second.ingested, [format!("docs/a.md@{sha2}")]);
@@ -579,17 +580,44 @@ async fn the_ingest_command_writes_as_claude_code_and_refuses_empty_text() {
         "Session 12",
         Some("handoff"),
         "Did things.".into(),
+        None,
     )
     .await
     .unwrap();
     assert_eq!(doc.name, "Handoff: Session 12");
     assert_eq!(doc.actor, "agent:claude-code");
     assert!(
-        ingest::ingest_text(&client, "claude-code", "x", None, "  ".into())
+        ingest::ingest_text(&client, "claude-code", "x", None, "  ".into(), None)
             .await
             .is_err()
     );
     assert_eq!(fake.names(), ["Handoff: Session 12"]);
+}
+
+#[tokio::test]
+async fn the_ingest_command_sends_the_audience_it_was_given() {
+    let (fake, base) = Fake::start().await;
+    let client = signed_in(&base);
+    let audience =
+        ingest::parse_audience(Some("company/engineering, person/bob"), Some("agent/a1")).unwrap();
+    let doc = ingest::ingest_text(
+        &client,
+        ingest::CLAUDE_CODE,
+        "Shared",
+        None,
+        "For the engineers.".into(),
+        audience,
+    )
+    .await
+    .unwrap();
+    assert_eq!(doc.access, ["company/engineering", "person/bob"]);
+    assert_eq!(doc.deny, ["agent/a1"]);
+    // Without one, the service decides (the fake keeps its own default).
+    let doc = ingest::ingest_text(&client, ingest::CLAUDE_CODE, "Mine", None, "x".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(doc.access, ["company"]);
+    assert_eq!(fake.names(), ["Mine", "Shared"]);
 }
 
 #[test]
