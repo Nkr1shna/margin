@@ -1,8 +1,8 @@
 # Installs a build-service artifact in the dev VM (docs/plan-deploy.md §4).
 # Runs after build-service succeeds on the `dev` branch (or by hand with a build run id of
 # that branch). Only ever reaches margin-dev: MARGIN_DEPLOY_ONLY=dev makes deploy.sh refuse
-# anything else. The binary it installed is uploaded again as `deployed-dev-<sha>`, which
-# apps.yml builds the matching "Margin Dev" app from. Prod deploys from `release`
+# anything else. The binary it installed is uploaded again as `deployed-dev-<sha>`, as a record
+# of what dev runs. Prod deploys from `release`
 # (deploy-prod.yml).
 name: deploy-dev
 
