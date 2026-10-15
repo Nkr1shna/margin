@@ -16,7 +16,7 @@ use margin_embed::{CHUNK_TOKENS, Purpose, SourceKind};
 use margin_service::db::{INSERT_MANY_MAX, PASSAGE, PassageRow, Store};
 use margin_service::pipeline::{
     ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Reader, Registry,
-    RerankRequest, RewriteRequest, StageDeps,
+    RerankRequest, Retriever, RewriteRequest, StageDeps,
 };
 use margin_service::retrieval::QueryPlan;
 use margin_shared::context::{ACCESS_COMPANY, Scope};
@@ -391,6 +391,20 @@ impl<'v> EvalIndex<'v> {
         scope: &Scope,
         purpose: RetrievalPurpose,
     ) -> anyhow::Result<Ranked> {
+        self.search_with(&*self.pipeline.retriever, reader, plan, scope, purpose)
+            .await
+    }
+
+    /// `search_as` with another retriever in the pipeline's place (the access suite's
+    /// unfiltered replay, `unfiltered::UnfilteredRetriever`).
+    pub async fn search_with(
+        &self,
+        retriever: &dyn Retriever,
+        reader: &Reader,
+        plan: &[String],
+        scope: &Scope,
+        purpose: RetrievalPurpose,
+    ) -> anyhow::Result<Ranked> {
         anyhow::ensure!(!plan.is_empty(), "a search needs a query");
         self.meter.take();
         // The strings as given (what the recorded vectors are keyed by).
@@ -433,7 +447,7 @@ impl<'v> EvalIndex<'v> {
                 images_max: 0,
                 diversity: Diversity::default(),
             };
-            legs.push(self.pipeline.retriever.search(&q).await?);
+            legs.push(retriever.search(&q).await?);
         }
         let fused = self.pipeline.fusion.fuse(
             legs,
