@@ -5,6 +5,10 @@
 version = "agent-v2"
 constant_hash = "ca6e5d65fa16c565"
 
+[condense]
+version = "condense-v1"
+constant_hash = "b14550917590c618"
+
 [judge]
 version = "judge-v1"
 constant_hash = "31c13acc7298d7c2"

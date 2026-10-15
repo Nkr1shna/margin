@@ -202,6 +202,27 @@ impl Renderer for VideoRenderer {
     }
 }
 
+/// Opens the ONNX cross-encoder in `files` (`SourceTools::load_reranker`'s default).
+#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
+pub fn load_onnx_reranker(
+    files: &margin_embed::RerankerFiles,
+) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+    let m = margin_embed::onnx::OnnxReranker::load(files, &margin_embed::OnnxOptions::default())?;
+    Ok(Arc::new(m))
+}
+
+/// Without ONNX Runtime in the build (a Mac build without `speech-onnx`) no
+/// cross-encoder opens.
+#[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
+pub fn load_onnx_reranker(
+    files: &margin_embed::RerankerFiles,
+) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+    let _ = files;
+    Err(EmbedError::Load(
+        "this build has no ONNX runtime for the reranker (the service runs on Linux)".into(),
+    ))
+}
+
 /// Where `margin_embed`'s Linux readers find their programs and library.
 #[cfg(any(target_os = "linux", feature = "linux-readers"))]
 pub fn reader_tools() -> margin_video::ReaderTools {
@@ -287,6 +308,16 @@ pub trait SourceTools: Send + Sync + 'static {
     /// Unloads what has been unused for a while (the speech model). The service calls it
     /// every minute. Blocking.
     fn sweep(&self) {}
+    /// Opens a downloaded reranker model (R2, the `"onnx-crossencoder"` reranker; the
+    /// caller has checked `files.is_complete()`). The ONNX cross-encoder where this
+    /// build has the runtime; tests stand in `margin_embed::fake::FakeReranker`.
+    /// Blocking.
+    fn load_reranker(
+        &self,
+        files: &margin_embed::RerankerFiles,
+    ) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+        load_onnx_reranker(files)
+    }
     /// An image file as the lesson writer is shown it: (media type, bytes), at most
     /// `WRITER_IMAGE_SIDE` px. Blocking.
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError>;

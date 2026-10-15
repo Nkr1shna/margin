@@ -7,8 +7,9 @@
 //! from, so the state is bound after (`bind`).
 //!
 //! It also finds the local cross-encoder (`"onnx-crossencoder"`): the download under
-//! `data_dir/models`, loaded on its first `score` (blocking, on the caller's blocking
-//! thread) and kept per model; the ONNX session unloads itself when idle.
+//! `data_dir/models`, opened by `SourceTools::load_reranker` on its first `score`
+//! (blocking, on the caller's blocking thread) and kept per model; the ONNX session
+//! unloads itself when idle.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -27,7 +28,9 @@ use crate::trace::{self, SpanGuard};
 /// `SmallModels` over the running service's settings and generator.
 #[derive(Default)]
 pub struct StateModels {
-    state: OnceLock<Weak<App>>,
+    /// Shared with the cross-encoders handed out, which may be built before the bind
+    /// (the pipeline in Settings is built at start) and find the service through it.
+    state: Arc<OnceLock<Weak<App>>>,
     /// The cross-encoders handed out, per model (loaded lazily).
     encoders: Mutex<HashMap<RerankerModel, Arc<dyn margin_embed::Reranker>>>,
 }
@@ -163,78 +166,50 @@ impl SmallModels for StateModels {
         let mut encoders = self.encoders.lock().unwrap();
         let encoder = encoders
             .entry(model)
-            .or_insert_with(|| Arc::new(LazyEncoder::new(self.models_dir(), model)));
+            .or_insert_with(|| Arc::new(LazyEncoder::new(self.state.clone(), model)));
         Ok(encoder.clone())
     }
 }
 
-impl StateModels {
-    /// Where the reranker downloads are (`None` until bound).
-    fn models_dir(&self) -> Option<std::path::PathBuf> {
-        self.state
-            .get()
-            .and_then(Weak::upgrade)
-            .map(|app| app.config.models_dir())
-    }
-}
-
-/// A cross-encoder opened on its first `score`, from the download it names.
+/// A cross-encoder opened on its first `score`, from the download it names, through the
+/// service's `SourceTools::load_reranker`. A removed download is noticed then: the
+/// model stays loaded until it unloads itself, and the next open fails.
 struct LazyEncoder {
     model: RerankerModel,
-    dir: Option<std::path::PathBuf>,
-    loaded: OnceLock<Arc<dyn margin_embed::Reranker>>,
-    /// Serializes the first load.
-    loading: Mutex<()>,
+    state: Arc<OnceLock<Weak<App>>>,
+    loaded: Mutex<Option<Arc<dyn margin_embed::Reranker>>>,
 }
 
 impl LazyEncoder {
-    fn new(dir: Option<std::path::PathBuf>, model: RerankerModel) -> Self {
+    fn new(state: Arc<OnceLock<Weak<App>>>, model: RerankerModel) -> Self {
         Self {
             model,
-            dir,
-            loaded: OnceLock::new(),
-            loading: Mutex::new(()),
+            state,
+            loaded: Mutex::new(None),
         }
     }
 
     fn get(&self) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
-        if let Some(m) = self.loaded.get() {
+        let mut loaded = self.loaded.lock().unwrap();
+        if let Some(m) = loaded.as_ref() {
             return Ok(m.clone());
         }
-        let _guard = self.loading.lock().unwrap();
-        if let Some(m) = self.loaded.get() {
-            return Ok(m.clone());
-        }
-        let Some(dir) = &self.dir else {
+        let Some(app) = self.state.get().and_then(Weak::upgrade) else {
             return Err(EmbedError::Load(
                 "the service isn't ready to load the reranker model yet".into(),
             ));
         };
-        let files = RerankerFiles::new(dir, self.model);
+        let files = RerankerFiles::new(&app.config.models_dir(), self.model);
         if !files.is_complete() {
             return Err(EmbedError::Load(format!(
                 "the reranker model \"{}\" isn't downloaded; download the reranker model in Settings → Sources first",
                 self.model.name()
             )));
         }
-        let m = load(&files)?;
-        let _ = self.loaded.set(m.clone());
+        let m = app.source_tools.load_reranker(&files)?;
+        *loaded = Some(m.clone());
         Ok(m)
     }
-}
-
-#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
-fn load(files: &RerankerFiles) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
-    let m = margin_embed::onnx::OnnxReranker::load(files, &margin_embed::OnnxOptions::default())?;
-    Ok(Arc::new(m))
-}
-
-#[cfg(not(any(target_os = "linux", feature = "speech-onnx")))]
-fn load(files: &RerankerFiles) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
-    let _ = files;
-    Err(EmbedError::Load(
-        "this build has no ONNX runtime for the reranker (the service runs on Linux)".into(),
-    ))
 }
 
 impl margin_embed::Reranker for LazyEncoder {

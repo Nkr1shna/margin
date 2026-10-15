@@ -26,6 +26,8 @@ Usage:
                                                      (ms-marco-minilm-l6-v2,
                                                      bge-reranker-base) for the
                                                      onnx-crossencoder reranker
+                                                     (bge-reranker-base needs ~1.3 GB
+                                                     of memory loaded)
   margin-service scrub-restored                      After a prod -> dev restore, with the
                                                      service stopped: delete devices and traces
                                                      (a dev config only)

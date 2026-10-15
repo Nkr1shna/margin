@@ -735,6 +735,22 @@ mod tests {
         }
     }
 
+    /// The eval's own keys (`params.purpose` in `evals/variants/rerank-small.toml`)
+    /// sit beside the stage's: the stage ignores keys it doesn't know.
+    #[test]
+    fn listwise_params_ignore_keys_they_dont_know() {
+        let cfg = StageCfg {
+            name: LISTWISE_SMALL.into(),
+            params: serde_json::json!({"apply_to": ["lesson"], "purpose": "lesson", "x": 1})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        };
+        let p = ListwiseParams::from_cfg(&cfg).unwrap();
+        assert_eq!(p.apply_to, [RetrievalPurpose::Lesson]);
+        assert_eq!(p.max_candidates, RERANK_MAX_CANDIDATES);
+    }
+
     #[test]
     fn rescoring_puts_grades_first_and_keeps_the_list_sorted() {
         let out = rescore(

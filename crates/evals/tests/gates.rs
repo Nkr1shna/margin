@@ -153,9 +153,10 @@ mod claude_prefix {
     use margin_ai::prompts::{self, Prompt};
     use margin_ai::{
         CallOptions, ClaudeClient, DocumentContents, FailedScene, Image, LessonContext, Passage,
-        PlanRequest, RerankCandidate, RouteModels, SceneRequest, TextModel,
+        PlanRequest, RerankCandidate, RewriteInput, RouteModels, SceneRequest, TextModel,
     };
     use margin_evals::prefix::{check_call, check_recorded, identical_prefixes, known_constants};
+    use margin_shared::pipeline::RetrievalPurpose;
     use margin_shared::pipeline::Route;
     use margin_shared::{Level, OutlineLesson};
     use serde_json::{Value, json};
@@ -292,7 +293,7 @@ mod claude_prefix {
     /// Varied calls of every constant-first prompt the Claude client's `TextModel`
     /// runs: lessons (first, middle, last; intro and advanced; with and without quiz,
     /// passages and a picture), scenes (first try and repair), the planner, the
-    /// reranker.
+    /// reranker, the query rewriter.
     fn prompts_sent() -> Vec<Prompt> {
         let mut out = Vec::new();
         for index in 0..3 {
@@ -358,13 +359,32 @@ mod claude_prefix {
                 ],
             ));
         }
+        for (query, purpose, scope_names) in [
+            (
+                "gibbs",
+                RetrievalPurpose::Agent,
+                vec!["dsp.pdf".to_string()],
+            ),
+            (
+                "Fourier coefficients",
+                RetrievalPurpose::Lesson,
+                vec!["dsp.pdf".to_string(), "notes/waves.md".to_string()],
+            ),
+        ] {
+            out.push(prompts::rewrite(&RewriteInput {
+                query: query.into(),
+                purpose,
+                scope_names,
+                max_added: 2,
+            }));
+        }
         out
     }
 
     /// The route a prompt's calls run on (D10: lessons, scenes and the planner on
-    /// Write; the reranker is a small task).
+    /// Write; the reranker and the rewriter are small tasks).
     fn route(p: &Prompt) -> Route {
-        if p.job == "rerank" {
+        if p.job == "rerank" || p.job == "rewrite" {
             Route::Small
         } else {
             Route::Write
@@ -404,6 +424,7 @@ mod claude_prefix {
         assert_eq!(report.per_version[prompts::SCENE_VERSION], 2);
         assert_eq!(report.per_version[prompts::PLAN_VERSION], 2);
         assert_eq!(report.per_version[prompts::RERANK_VERSION], 2);
+        assert_eq!(report.per_version[prompts::REWRITE_VERSION], 2);
         let models = RouteModels::claude_default();
         for (i, (p, body)) in sent.iter().zip(&bodies).enumerate() {
             let v = check_call(body, p);

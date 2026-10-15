@@ -5,8 +5,10 @@
 //! `MARGIN_RERANKER_DIR` (default `~/Library/Caches/margin-embed-test/rerankers` on
 //! macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) unless it is there already, loaded
 //! on the CPU, checked to rank the relevant passage first, and measured: the resident
-//! memory it adds (budget 400 MB, the 4–8 GB guests of `docs/plan-linux-service.md` §3)
-//! and the milliseconds per pair, printed into the test log. Run with
+//! memory it adds (budget 400 MB for `ms-marco-minilm-l6-v2`, the 4–8 GB guests of
+//! `docs/plan-linux-service.md` §3; `bge-reranker-base` needs ~1.3 GB and is reported,
+//! not failed: it is an opt-in variant) and the milliseconds per pair, printed into the
+//! test log. Run with
 //! `MARGIN_REAL_MODEL=1 cargo test -p margin-embed --features onnx --test onnx_rerank --
 //! --nocapture` (no `--features` on Linux).
 #![cfg(any(target_os = "linux", feature = "onnx"))]
@@ -17,8 +19,15 @@ use std::time::Instant;
 use margin_embed::onnx::OnnxReranker;
 use margin_embed::{EmbedError, OnnxOptions, Reranker, RerankerFiles, RerankerModel};
 
-/// Most resident memory the loaded reranker may add.
-const RSS_BUDGET_MB: f64 = 400.0;
+/// Most resident memory the loaded reranker may add, per model; `None` = reported only
+/// (`bge-reranker-base` measured 1266 MB: the opt-in `rerank-xenc-bge` variant says it
+/// needs ~1.3 GB).
+fn rss_budget_mb(model: RerankerModel) -> Option<f64> {
+    match model {
+        RerankerModel::MsMarcoMiniLmL6 => Some(400.0),
+        RerankerModel::BgeRerankerBase => None,
+    }
+}
 
 #[test]
 fn loading_without_a_download_says_so() {
@@ -174,15 +183,21 @@ fn real_model_ranks_the_relevant_passage_first_within_the_memory_budget() {
     }
     let ms_per_pair = start.elapsed().as_secs_f64() * 1000.0 / (runs * 24) as f64;
     let added = rss_mb() - before;
+    let budget = rss_budget_mb(files.model);
     eprintln!(
-        "reranker {}: {ms_per_pair:.1} ms per pair ({} intra-op threads), {added:.0} MB resident added (budget {RSS_BUDGET_MB} MB)",
+        "reranker {}: {ms_per_pair:.1} ms per pair ({} intra-op threads), {added:.0} MB resident added ({})",
         reranker.name(),
-        opts.threads()
+        opts.threads(),
+        budget.map_or("no budget: reported only".to_string(), |b| format!(
+            "budget {b} MB"
+        ))
     );
-    assert!(
-        added <= RSS_BUDGET_MB,
-        "the reranker added {added:.0} MB, over the {RSS_BUDGET_MB} MB budget"
-    );
+    if let Some(budget) = budget {
+        assert!(
+            added <= budget,
+            "the reranker added {added:.0} MB, over the {budget} MB budget"
+        );
+    }
 
     // Batched or one at a time, a pair scores nearly the same: the int8 export
     // quantizes activations dynamically, over the whole batch, so a batch's other rows

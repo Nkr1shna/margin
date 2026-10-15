@@ -132,6 +132,10 @@ pub struct StoredVideo {
     /// written before posters existed.
     #[serde(default)]
     pub has_poster: bool,
+    /// What wrote the scene (R2, `docs/r2-brief.md` D4.3: the scene prompt's version, the
+    /// pipeline, the provider and model); `None` until one is written. Service-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_with: Option<margin_shared::WrittenWith>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +310,9 @@ pub struct App {
     pub speech_job: Mutex<ModelJob>,
     /// Bytes the speech model's download fetches, once Hugging Face has told us.
     pub speech_download_bytes: Mutex<Option<u64>>,
+    /// The reranker models' downloads in progress or their last failures, and their
+    /// sizes once Hugging Face has said (R2, `embedding::RerankerJobs`).
+    pub reranker_jobs: Mutex<crate::embedding::RerankerJobs>,
     /// The re-index with a new embedder (`ingest::reembed`) while it runs.
     pub reindex: Mutex<Option<margin_shared::ReindexProgress>>,
     /// The last `EmbeddingModel` sent, so a progress event changes only its own part.

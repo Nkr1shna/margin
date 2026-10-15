@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -329,29 +329,31 @@ pub async fn start_speech_download(
 
 /// The reranker downloads' state, by the model's folder (`RerankerFiles::dir`, so one
 /// entry per model per service): a download running or how the last one failed, and the
-/// bytes a download fetches once Hugging Face has said. Kept here rather than on `App`,
-/// which the R2 areas don't change.
+/// bytes a download fetches once Hugging Face has said. Lives on `App`
+/// (`App::reranker_jobs`).
 #[derive(Default)]
-struct RerankerJobs {
+pub struct RerankerJobs {
     jobs: HashMap<PathBuf, ModelJob>,
     download_bytes: HashMap<PathBuf, u64>,
 }
 
-fn reranker_jobs() -> std::sync::MutexGuard<'static, RerankerJobs> {
-    static JOBS: LazyLock<Mutex<RerankerJobs>> = LazyLock::new(Default::default);
-    JOBS.lock().unwrap_or_else(|e| e.into_inner())
+fn reranker_jobs(state: &AppState) -> std::sync::MutexGuard<'_, RerankerJobs> {
+    state
+        .reranker_jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
-fn reranker_job(files: &RerankerFiles) -> ModelJob {
-    reranker_jobs()
+fn reranker_job(state: &AppState, files: &RerankerFiles) -> ModelJob {
+    reranker_jobs(state)
         .jobs
         .get(&files.dir)
         .cloned()
         .unwrap_or(ModelJob::Idle)
 }
 
-fn set_reranker_job(files: &RerankerFiles, job: ModelJob) {
-    let mut jobs = reranker_jobs();
+fn set_reranker_job(state: &AppState, files: &RerankerFiles, job: ModelJob) {
+    let mut jobs = reranker_jobs(state);
     if job == ModelJob::Idle {
         jobs.jobs.remove(&files.dir);
     } else {
@@ -384,7 +386,7 @@ fn pipeline_reranker(state: &AppState) -> Option<RerankerModel> {
 async fn shown_reranker(state: &AppState) -> RerankerModel {
     let models_dir = state.config.models_dir();
     let busy = {
-        let jobs = reranker_jobs();
+        let jobs = reranker_jobs(state);
         RerankerModel::ALL.into_iter().find(|m| {
             jobs.jobs
                 .contains_key(&RerankerFiles::new(&models_dir, *m).dir)
@@ -421,12 +423,12 @@ async fn reranker_on_disk(files: &RerankerFiles) -> (bool, u64) {
 /// Bytes `files`' download fetches: asked of Hugging Face once, then remembered. 0
 /// while it can't be reached.
 async fn reranker_download_bytes(state: &AppState, files: &RerankerFiles) -> u64 {
-    if let Some(bytes) = reranker_jobs().download_bytes.get(&files.dir) {
+    if let Some(bytes) = reranker_jobs(state).download_bytes.get(&files.dir) {
         return *bytes;
     }
     match files.remote_size(&state.http, &state.hf_base).await {
         Ok(bytes) => {
-            reranker_jobs()
+            reranker_jobs(state)
                 .download_bytes
                 .insert(files.dir.clone(), bytes);
             bytes
@@ -449,7 +451,7 @@ async fn reranker(state: &AppState) -> RerankerModelState {
 
 async fn reranker_state(state: &AppState, model: RerankerModel) -> RerankerModelState {
     let files = reranker_files(state, model);
-    let model_state = match reranker_job(&files) {
+    let model_state = match reranker_job(state, &files) {
         ModelJob::Downloading { received, total } => {
             EmbeddingModelState::Downloading { received, total }
         }
@@ -525,7 +527,7 @@ pub async fn start_reranker_download(
         let other = RerankerModel::ALL.into_iter().find(|m| {
             *m != model
                 && matches!(
-                    reranker_job(&RerankerFiles::new(&models_dir, *m)),
+                    reranker_job(&state, &RerankerFiles::new(&models_dir, *m)),
                     ModelJob::Downloading { .. }
                 )
         });
@@ -539,16 +541,16 @@ pub async fn start_reranker_download(
                 ),
             ));
         }
-        let downloading = matches!(reranker_job(&files), ModelJob::Downloading { .. });
+        let downloading = matches!(reranker_job(&state, &files), ModelJob::Downloading { .. });
         if downloading || reranker_on_disk(&files).await.0 {
             false
         } else {
-            let total = reranker_jobs()
+            let total = reranker_jobs(&state)
                 .download_bytes
                 .get(&files.dir)
                 .copied()
                 .unwrap_or(0);
-            set_reranker_job(&files, ModelJob::Downloading { received: 0, total });
+            set_reranker_job(&state, &files, ModelJob::Downloading { received: 0, total });
             true
         }
     };
@@ -564,10 +566,10 @@ async fn run_reranker_download(state: AppState, files: RerankerFiles) {
     let name = files.model.name();
     let last_sent = Mutex::new(Instant::now());
     let progress = |received: u64, total: u64| {
-        if !matches!(reranker_job(&files), ModelJob::Downloading { .. }) {
+        if !matches!(reranker_job(&state, &files), ModelJob::Downloading { .. }) {
             return;
         }
-        set_reranker_job(&files, ModelJob::Downloading { received, total });
+        set_reranker_job(&state, &files, ModelJob::Downloading { received, total });
         let mut last = last_sent.lock().unwrap();
         if last.elapsed() < PROGRESS_INTERVAL {
             return;
@@ -585,11 +587,12 @@ async fn run_reranker_download(state: AppState, files: RerankerFiles) {
     match &result {
         Ok(()) => {
             tracing::info!("the reranker model {name} is downloaded");
-            set_reranker_job(&files, ModelJob::Idle);
+            set_reranker_job(&state, &files, ModelJob::Idle);
         }
         Err(e) => {
             tracing::warn!("reranker model {name} download failed: {e}");
             set_reranker_job(
+                &state,
                 &files,
                 ModelJob::Failed {
                     error: e.to_string(),
@@ -612,7 +615,7 @@ pub async fn delete_reranker(
     let files = reranker_files(&state, model);
     {
         let _w = state.write_lock.lock().await;
-        if matches!(reranker_job(&files), ModelJob::Downloading { .. }) {
+        if matches!(reranker_job(&state, &files), ModelJob::Downloading { .. }) {
             return Err(AppError::conflict(
                 "model_downloading",
                 "The reranker model is still downloading. Delete it once the download finishes.",
@@ -623,7 +626,7 @@ pub async fn delete_reranker(
             .await
             .map_err(AppError::internal)?
             .map_err(AppError::internal)?;
-        set_reranker_job(&files, ModelJob::Idle);
+        set_reranker_job(&state, &files, ModelJob::Idle);
     }
     let current = model_showing(&state, model).await;
     emit_model(&state, &current);

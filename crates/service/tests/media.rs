@@ -1135,3 +1135,68 @@ async fn the_reranker_model_shows_downloads_and_can_be_deleted() {
         })
     );
 }
+
+/// A download that succeeds (the fake Hugging Face has the default reranker's repo):
+/// the size is asked once, only the files the model needs are fetched, progress and the
+/// finish arrive as events, and the files are a complete download on disk.
+#[tokio::test]
+async fn the_reranker_model_downloads_from_hugging_face() {
+    use margin_embed::RerankerModel;
+    use margin_shared::EmbeddingModelState;
+    let h = start().await;
+    h.hf.has_reranker
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let t = h.sign_in("Mac").await;
+
+    let m = embedding_model(&h, &t, routes::RERANKER_MODEL).await;
+    assert_eq!(
+        m.reranker.unwrap().state,
+        EmbeddingModelState::NotDownloaded {
+            download_bytes: fake_reranker_bytes()
+        }
+    );
+
+    let mut socket = h.socket(&t).await;
+    let m: margin_shared::EmbeddingModel = h
+        .post(&t, routes::RERANKER_MODEL_DOWNLOAD)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        m.reranker.unwrap().state,
+        EmbeddingModelState::Downloading { .. }
+    ));
+    socket
+        .until(|e| {
+            matches!(e, Event::EmbeddingModelChanged { model }
+                if matches!(model.reranker.as_ref().map(|r| &r.state), Some(EmbeddingModelState::Ready { .. })))
+        })
+        .await;
+
+    let files =
+        margin_embed::RerankerFiles::new(&h.data_dir.join("models"), RerankerModel::DEFAULT);
+    assert!(files.is_complete());
+    assert!(
+        !files.dir.join("onnx/model.onnx").exists(),
+        "not a file the model needs"
+    );
+    assert_eq!(
+        h.hf.reranker_fetches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        RerankerModel::DEFAULT.files().len() as u32
+    );
+    let r = embedding_model(&h, &t, "/api/embedding")
+        .await
+        .reranker
+        .unwrap();
+    assert_eq!(r.name, RerankerModel::DEFAULT.name());
+    assert_eq!(
+        r.state,
+        EmbeddingModelState::Ready {
+            bytes: files.size_on_disk()
+        }
+    );
+}

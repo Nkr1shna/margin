@@ -680,10 +680,33 @@ pub struct FakeHf {
     pub fail: AtomicBool,
     pub size_requests: AtomicU32,
     pub downloads: AtomicU32,
+    /// When set, the default reranker's repo (`RerankerModel::DEFAULT`) is there, with
+    /// `FAKE_RERANKER_FILES` at its pinned revision; unset, it answers 404 (R2).
+    pub has_reranker: AtomicBool,
+    /// Files of the reranker repo fetched.
+    pub reranker_fetches: AtomicU32,
 }
 
 fn model_path() -> String {
     format!("/{}/resolve/main/{MODEL_FILE}", margin_embed::REPO)
+}
+
+/// The fake reranker repo's files: what `RerankerModel::files` needs, plus one the
+/// download skips.
+pub const FAKE_RERANKER_FILES: [(&str, usize); 4] = [
+    ("config.json", 20),
+    ("tokenizer.json", 500),
+    ("onnx/model_quantized.onnx", 3000),
+    ("onnx/model.onnx", 9000),
+];
+
+/// Bytes a download of the fake reranker repo fetches (the files it needs).
+pub fn fake_reranker_bytes() -> u64 {
+    FAKE_RERANKER_FILES
+        .iter()
+        .filter(|(p, _)| margin_embed::RerankerModel::DEFAULT.files().contains(p))
+        .map(|(_, n)| *n as u64)
+        .sum()
 }
 
 pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
@@ -706,6 +729,34 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
             .body(Body::from_stream(parts))
             .unwrap()
     }
+    async fn reranker_tree(State(hf): State<Arc<FakeHf>>) -> Response {
+        if !hf.has_reranker.load(Ordering::SeqCst) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let entries: Vec<serde_json::Value> =
+            std::iter::once(json!({"type": "directory", "path": "onnx", "size": 0}))
+                .chain(
+                    FAKE_RERANKER_FILES
+                        .iter()
+                        .map(|(path, size)| json!({"type": "file", "path": path, "size": size})),
+                )
+                .collect();
+        Json(serde_json::Value::Array(entries)).into_response()
+    }
+    async fn reranker_file(
+        State(hf): State<Arc<FakeHf>>,
+        axum::extract::Path(path): axum::extract::Path<String>,
+    ) -> Response {
+        if !hf.has_reranker.load(Ordering::SeqCst) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        hf.reranker_fetches.fetch_add(1, Ordering::SeqCst);
+        match FAKE_RERANKER_FILES.iter().find(|(p, _)| *p == path) {
+            Some((_, size)) => vec![b'r'; *size].into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    let reranker = margin_embed::RerankerModel::DEFAULT;
     let hf = Arc::new(FakeHf::default());
     let app = Router::new()
         .route(&format!("/api/models/{}", margin_embed::REPO), get(size))
@@ -714,6 +765,22 @@ pub async fn start_fake_hf() -> (String, Arc<FakeHf>) {
             get(size),
         )
         .route(&model_path(), get(file))
+        .route(
+            &format!(
+                "/api/models/{}/tree/{}",
+                reranker.repo(),
+                reranker.revision()
+            ),
+            get(reranker_tree),
+        )
+        .route(
+            &format!(
+                "/{}/resolve/{}/{{*path}}",
+                reranker.repo(),
+                reranker.revision()
+            ),
+            get(reranker_file),
+        )
         .with_state(hf.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -755,6 +822,8 @@ pub struct FakeSourceTools {
     pub speech: FakeSpeechModel,
     /// When set, pictures are read without OCR (as on Linux without tesseract).
     pub no_ocr: AtomicBool,
+    /// Cross-encoders opened (`load_reranker`, R2).
+    pub reranker_loads: AtomicU32,
 }
 
 /// A speech model of `FAKE_SPEECH_BYTES` "downloaded" in two progress steps, kept in
@@ -1053,6 +1122,15 @@ impl SourceTools for FakeSourceTools {
             "tesseract isn't installed on the service (Settings → Tools shows how to install it)"
                 .to_string()
         })
+    }
+
+    /// `FakeReranker` (shared-word counts) stands in for any downloaded cross-encoder.
+    fn load_reranker(
+        &self,
+        _files: &margin_embed::RerankerFiles,
+    ) -> Result<Arc<dyn margin_embed::Reranker>, EmbedError> {
+        self.reranker_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(margin_embed::fake::FakeReranker))
     }
 
     fn image_for_model(&self, path: &Path) -> Result<(String, Vec<u8>), EmbedError> {

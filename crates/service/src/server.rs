@@ -28,6 +28,7 @@ use crate::ingest::IngestQueue;
 use crate::pipeline::{Pipeline, Registry, StageDeps};
 use crate::retrieval::RetrievalCache;
 use crate::secrets::{SecretStore, media_signing_key};
+use crate::small;
 use crate::state::{App, AppState, INTERRUPTED, LESSON_CONCURRENCY, StoredLesson, StoredVideo};
 use crate::state::{SETTINGS_ID, SettingsRow};
 use crate::trace::Tracer;
@@ -89,9 +90,13 @@ impl Service {
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let model_files = opts.config.model_files();
-        // The small-tasks models (`StageDeps.models`) are R2-retrieve's to wire
-        // (`small.rs`); until then a model-backed stage is unavailable here.
-        let registry = Registry::standard(StageDeps::new(opts.store.clone()));
+        // The small-tasks models (`StageDeps.models`, R2): built before the `App` they
+        // read from, bound to it once it exists (below).
+        let models = Arc::new(small::StateModels::default());
+        let registry = Registry::standard(StageDeps {
+            models: Some(models.clone()),
+            ..StageDeps::new(opts.store.clone())
+        });
         let settings: SettingsRow = opts
             .store
             .get(db::SETTINGS, SETTINGS_ID)
@@ -131,6 +136,7 @@ impl Service {
             model_download_bytes: Mutex::new(None),
             speech_job: Mutex::new(ModelJob::Idle),
             speech_download_bytes: Mutex::new(None),
+            reranker_jobs: Mutex::new(Default::default()),
             reindex: Mutex::new(None),
             last_model: Mutex::new(None),
             source_queue: source_tx,
@@ -146,6 +152,8 @@ impl Service {
             sources_replaced: Mutex::new(Default::default()),
             providers: providers::Providers::new(),
         });
+
+        models.bind(Arc::downgrade(&state));
 
         // Traces first, so recovery and the workers are traced.
         trace::start(&state);

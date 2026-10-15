@@ -680,33 +680,25 @@ impl Packer for TakeK {
     }
 }
 
-/// A hit's label for the reranker: "notes/paper.pdf, p. 3, Fourier series >
-/// Coefficients" (the document's name from `names`, else its id; then the page and the
-/// section when it has them).
-pub fn rerank_label(hit: &Hit, names: &HashMap<String, String>) -> String {
-    let p = &hit.passage;
-    let mut label = names
-        .get(&p.document_id)
-        .filter(|n| !n.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| p.document_id.clone());
-    if let Some(page) = p.page {
-        label.push_str(&format!(", p. {page}"));
-    }
-    if let Some(section) = citation_section_path(hit) {
-        label.push_str(", ");
-        label.push_str(&section);
-    }
-    label
-}
-
-/// The hits as the rerank prompt's candidates (ids are passage ids).
+/// The hits as the rerank prompt's candidates (ids are passage ids), labelled by
+/// `RerankCandidate::new`: "notes/paper.pdf, p. 3, Fourier series > Coefficients" (the
+/// document's name from `names`, else its id; then the page and the section when it
+/// has them).
 pub fn rerank_candidates(hits: &[Hit], names: &HashMap<String, String>) -> Vec<RerankCandidate> {
     hits.iter()
-        .map(|h| RerankCandidate {
-            id: h.passage.id.clone(),
-            label: rerank_label(h, names),
-            text: h.passage.text.clone(),
+        .map(|h| {
+            let p = &h.passage;
+            let document = names
+                .get(&p.document_id)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(&p.document_id);
+            RerankCandidate::new(
+                &p.id,
+                document,
+                p.page.and_then(|n| u32::try_from(n).ok()),
+                &p.section_path,
+                p.text.clone(),
+            )
         })
         .collect()
 }

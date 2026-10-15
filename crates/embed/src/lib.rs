@@ -818,7 +818,8 @@ pub trait Reranker: Send + Sync {
 pub enum RerankerModel {
     /// `ms-marco-minilm-l6-v2`: 22 M params, English, ~23 MB int8. The default.
     MsMarcoMiniLmL6,
-    /// `bge-reranker-base`: 278 M params, multilingual, ~280 MB int8.
+    /// `bge-reranker-base`: 278 M params, multilingual, ~280 MB int8; needs ~1.3 GB
+    /// loaded (1266 MB resident measured), so it is opt-in only (`rerank-xenc-bge`).
     BgeRerankerBase,
 }
 

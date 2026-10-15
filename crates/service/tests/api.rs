@@ -42,6 +42,7 @@ async fn the_prompt_catalog_lists_every_prompt_with_its_version_and_hash() {
         ("rerank", "rerank-v1"),
         ("rewrite", "rewrite-v1"),
         ("agent", "agent-v2"),
+        ("condense", "condense-v1"),
     ] {
         let p = catalog
             .iter()
@@ -51,6 +52,9 @@ async fn the_prompt_catalog_lists_every_prompt_with_its_version_and_hash() {
         assert_eq!(p.constant_hash.len(), 16);
         assert!(p.constant_chars > 0);
     }
+    // The chat title versions itself by the hash of its instructions.
+    let title = catalog.iter().find(|p| p.job == "title").expect("title");
+    assert!(title.version.starts_with("title-"), "{}", title.version);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1381,6 +1385,7 @@ async fn videos_stored_before_posters_existed_still_load() {
         },
         has_captions: true,
         has_poster: true,
+        written_with: None,
     })
     .unwrap();
     assert!(row.as_object_mut().unwrap().remove("has_poster").is_some());
@@ -1678,6 +1683,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         },
         has_captions: false,
         has_poster: false,
+        written_with: None,
     };
     store
         .put(

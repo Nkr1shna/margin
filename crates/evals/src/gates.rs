@@ -192,14 +192,20 @@ pub struct LockedPrompt {
 pub type PromptLock = BTreeMap<String, LockedPrompt>;
 
 /// Every prompt with a hand-bumped version: `margin_ai`'s catalog plus the agent's
-/// system prompt (`AGENT_PROMPT_VERSION`). The title and condense prompts version
-/// themselves by hash (`trace::prompt_version`), so they need no lock.
+/// system prompt (`AGENT_PROMPT_VERSION`) and its condense call
+/// (`SUMMARY_PROMPT_VERSION`). The chat title versions itself by hash
+/// (`trace::prompt_version` in the service), so it needs no lock.
 pub fn locked_catalog() -> Vec<margin_shared::context::PromptInfo> {
     let mut catalog = margin_ai::prompts::catalog();
     catalog.push(margin_ai::prompts::prompt_info(
         "agent",
         margin_agent::AGENT_PROMPT_VERSION,
         margin_agent::system_prompt(),
+    ));
+    catalog.push(margin_ai::prompts::prompt_info(
+        "condense",
+        margin_agent::SUMMARY_PROMPT_VERSION,
+        margin_agent::SUMMARY_INSTRUCTIONS,
     ));
     catalog
 }

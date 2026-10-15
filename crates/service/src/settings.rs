@@ -338,13 +338,26 @@ pub fn prompts_catalog() -> Vec<margin_shared::context::PromptInfo> {
 }
 
 /// The prompts the service itself sends, beside `margin_ai`'s: the agent's system
-/// prompt.
+/// prompt, the chat title (versioned by its hash, `trace::prompt_version`) and the
+/// agent loop's condense call.
 fn service_prompts() -> Vec<margin_shared::context::PromptInfo> {
-    vec![margin_ai::prompts::prompt_info(
-        "agent",
-        margin_agent::AGENT_PROMPT_VERSION,
-        margin_agent::system_prompt(),
-    )]
+    vec![
+        margin_ai::prompts::prompt_info(
+            "agent",
+            margin_agent::AGENT_PROMPT_VERSION,
+            margin_agent::system_prompt(),
+        ),
+        margin_ai::prompts::prompt_info(
+            "title",
+            &crate::trace::prompt_version("title", crate::turns::TITLE_INSTRUCTIONS),
+            crate::turns::TITLE_INSTRUCTIONS,
+        ),
+        margin_ai::prompts::prompt_info(
+            "condense",
+            margin_agent::SUMMARY_PROMPT_VERSION,
+            margin_agent::SUMMARY_INSTRUCTIONS,
+        ),
+    ]
 }
 
 /// `GET /api/pipeline/prompts` → `prompts_catalog()`.
