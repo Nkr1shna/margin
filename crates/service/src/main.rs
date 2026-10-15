@@ -41,6 +41,9 @@ Usage:
   margin-service version                             Print the build's version and commit
 ";
 
+/// How long a stopping service waits for queued audit rows to be written.
+const AUDIT_FLUSH_ON_STOP: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Where the config is read from, for the help text.
 fn config_help() -> String {
     format!(
@@ -187,7 +190,17 @@ fn serve(allow_unsandboxed_render: bool) -> anyhow::Result<()> {
             allow_unsandboxed_render,
         })
         .await?;
-        service.serve(listener, shutdown_signal()).await
+        let state = service.state.clone();
+        let served = service.serve(listener, shutdown_signal()).await;
+        // Audit rows are written off a queue: every row recorded before the stop is in
+        // the store before the process exits (traces may be cut short; audit rows not).
+        if !margin_service::audit::flush(&state, AUDIT_FLUSH_ON_STOP).await {
+            tracing::error!(
+                "audit rows were still being written when the service stopped; the log above \
+                 names any that weren't"
+            );
+        }
+        served
     })
 }
 

@@ -170,6 +170,8 @@ pub struct Tracer {
     done: AtomicU64,
     dropped: AtomicU64,
     written: Notify,
+    /// The audit trail's writer queue (`audit::record`), started with the tracer's.
+    pub audit: crate::audit::Auditor,
 }
 
 impl Tracer {
@@ -185,6 +187,7 @@ impl Tracer {
             done: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             written: Notify::new(),
+            audit: crate::audit::Auditor::new(),
         }
     }
 
