@@ -29,11 +29,11 @@ labelled `verified-on-dev`; the **promote-release** workflow cherry-picks verifi
 `release` (prod) in one PR, and labels them `shipped` when that PR is merged. PRs labelled
 `needs-flag` ship dark: off in prod until their setting is turned on.
 
-**Starting point.** `release` is at `85b861f` (2026-10-14). The 84 commits on `dev` after it
-came from PRs #1–#14 (#12 was closed), merged with merge commits before squash merging was
+**Starting point.** `release` is at `85b861f` (2026-10-14). The 86 commits on `dev` after it
+came from PRs #1–#15 (#12 was closed), merged with merge commits before squash merging was
 the rule, so they are not promoted one by one: the first release is a one-time block
-promotion (a PR from `dev` into `release`) when the owner decides; those PRs are then
-labelled `shipped`. Until then promote-release refuses a later PR that touches the same
+promotion (a PR from `dev` into `release`, merged with a merge commit) when the owner
+decides; those PRs are then labelled `shipped`. Until then promote-release refuses a later PR that touches the same
 files (it may depend on them).
 
 EOF

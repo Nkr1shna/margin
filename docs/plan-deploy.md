@@ -68,6 +68,7 @@ Cargo builds keep their output in `~/.cache/margin-ci/target-{test,release}` on 
 3. Settings → Environments → `prod`: deployment branches = **Selected branches: `release`**, so only a build of `release` can reach prod (deploy-prod.yml also checks the build run's branch).
 4. Settings → Environments → `dev`: deployment branches = `dev`.
 5. Settings → Actions → General → Workflow permissions: **Read repository contents** (the default token stays read-only).
+6. Settings → General → Pull Requests: **Allow squash merging** only (default message: pull request title), so every PR becomes one commit on `dev` that promote-release can cherry-pick (§4a). Merge commits are turned back on just for the one-time block promotion into `release`, then off again.
 6. Settings → Actions → Runners: the `mac-mini-host` runner in the default group, used only by this repository.
 
 The apps pick the environment on the sign-in screen: **Prod / Dev / Custom** (`config::PRESETS`, `ui/signin.rs`). The device token is stored per URL (`app/secrets.rs`), so one desktop app switches between dev and prod without mixing tokens.
@@ -81,7 +82,8 @@ of PRs, and `docs/RELEASES.md` says which PR is where.
 **Contributing (the rules).**
 
 1. **One PR = one commit on `dev`: squash merge.** The squash commit is what gets promoted,
-   so a PR must stand on its own; if it needs another PR, say so in its description and
+   so a PR must stand on its own (the repository setting below makes squash the only merge
+   button); if it needs another PR, say so in its description and
    promote the two together.
 2. After the merge, `build-service` → `deploy-dev` → **`smoke-dev`** run. smoke-dev comments
    on the PR: a pass means devmargin is up with that build (`/health`, `/api/version` sha and
@@ -129,10 +131,11 @@ push commits that change `.github/workflows/`, so promoting such a PR needs `PRO
 a fine-grained token for this repository with Contents, Pull requests and Workflows
 read/write. With it, the PRs trigger CI as usual.
 
-**Starting point.** `release` is at `85b861f`. The 84 commits on dev after it came from PRs
-#1–#14, merged with merge commits, and `release` has no `ci.yml` yet. The first release is
-a one-time block promotion the owner decides on: a PR from `dev` into `release`, then label
-those PRs `shipped`. Until then promote-release refuses most PRs (they touch files those
+**Starting point.** `release` is at `85b861f`. The 86 commits on dev after it came from PRs
+#1–#15, merged with merge commits, and `release` has no `ci.yml` yet. The first release is
+a one-time block promotion the owner decides on: a PR from `dev` into `release` merged with
+a **merge commit** (not a squash, so `release` contains dev's commits and promote-release's
+"dev since release" range starts empty), then label those PRs `shipped`. Until then promote-release refuses most PRs (they touch files those
 earlier PRs changed) and can't run CI on its branch.
 
 Check the cherry-pick rules locally (a throwaway repository, no network):
