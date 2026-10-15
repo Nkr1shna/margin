@@ -15,6 +15,10 @@
 //!   characters); anything else is recorded as `other`, so an error message (which can
 //!   quote a prompt) never lands in a trace.
 //! - A job step's name (`render`, …) is in `tool`.
+//! - `principal` is who the work is for (`person/<id>` or `agent/<id>`, L1): a row
+//!   recorded inside `with_principal` gets it when it doesn't name one, so a request
+//!   handler or a turn task scopes itself once and every row under it is stamped.
+//!   `GET /api/traces` and the rollups are for organisation admins only.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -40,7 +44,30 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::db::{self, Store};
 use crate::error::{AppError, AppResult};
+use crate::principal::RequireAdmin;
 use crate::state::AppState;
+
+tokio::task_local! {
+    /// The principal id the current task works for (`with_principal`).
+    static PRINCIPAL: String;
+}
+
+/// Runs `f` with `principal` (`person/<id>` or `agent/<id>`) as the principal of every
+/// trace row recorded inside it that doesn't name one.
+pub async fn with_principal<F: std::future::Future>(principal: String, f: F) -> F::Output {
+    PRINCIPAL.scope(principal, f).await
+}
+
+/// The principal `with_principal` set for this task, if any.
+pub fn current_principal() -> Option<String> {
+    PRINCIPAL.try_with(Clone::clone).ok()
+}
+
+/// Whether a row's `actor` is an outside agent's: `agent:<name>` (a device token naming
+/// its agent) or `agent/<id>` (an agent token).
+fn is_agent_actor(actor: &str) -> bool {
+    actor.starts_with("agent:") || actor.starts_with(margin_shared::AGENT_PREFIX)
+}
 
 /// Rows waiting for the writer; when it is full new rows are dropped (and counted), so
 /// tracing never slows a turn.
@@ -172,12 +199,11 @@ impl Tracer {
         {
             row.cost_usd = cost_usd(&self.prices.load(), row.provider.as_deref(), model, usage);
         }
+        if row.principal.is_none() {
+            row.principal = current_principal();
+        }
         // A query is kept only for an agent's context-API search, and only so long.
-        let agent = row.via.is_some()
-            && row
-                .actor
-                .as_deref()
-                .is_some_and(|a| a.starts_with("agent:"));
+        let agent = row.via.is_some() && row.actor.as_deref().is_some_and(is_agent_actor);
         row.query = row.query.filter(|_| agent).map(|q| {
             q.chars()
                 .take(margin_shared::context::TRACE_QUERY_MAX)
@@ -203,6 +229,8 @@ impl Tracer {
     pub fn span(&self, kind: TraceKind, trace_id: &str) -> TraceSpan {
         let mut row = TraceRow::new(kind, new_row_id(), Utc::now());
         row.trace_id = trace_id.to_string();
+        // Spans can finish in another task (a stream dropped elsewhere): stamp now.
+        row.principal = current_principal();
         TraceSpan {
             row,
             started: Instant::now(),
@@ -655,10 +683,11 @@ fn bad_range() -> AppError {
     )
 }
 
-/// `GET routes::TRACES`: JSON lines, oldest first. Rows recorded before the request
-/// are written first (up to 2 s), so a reader sees its own calls.
+/// `GET routes::TRACES` (admins): JSON lines, oldest first. Rows recorded before the
+/// request are written first (up to 2 s), so a reader sees its own calls.
 pub async fn list_traces(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(q): Query<TracesQuery>,
 ) -> AppResult<Response> {
     state.tracer.flush(READ_FLUSH_WAIT).await;
@@ -886,9 +915,10 @@ struct StoredRollup {
 }
 
 /// `GET routes::TRACES_ROLLUP`: the view's buckets plus those kept from rows retention
-/// deleted, oldest first.
+/// deleted, oldest first. Admins only.
 pub async fn rollup(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(q): Query<RollupQuery>,
 ) -> AppResult<Json<Vec<TraceRollup>>> {
     state.tracer.flush(READ_FLUSH_WAIT).await;
@@ -1131,6 +1161,52 @@ mod tests {
         let mut r = TraceRow::new(kind, new_row_id(), at(at_text));
         r.trace_id = trace_id.into();
         r
+    }
+
+    #[tokio::test]
+    async fn rows_inside_with_principal_are_stamped() {
+        let tracer = Tracer::new();
+        let mut rx = tracer.take_receiver().unwrap();
+        tracer.record(row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t0"));
+        let span = with_principal("agent/a1".into(), async {
+            tracer.record(row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t1"));
+            let mut named = row(TraceKind::ToolCall, "2026-10-14T08:00:00Z", "t2");
+            named.principal = Some("person/p".into());
+            tracer.record(named);
+            assert_eq!(current_principal().as_deref(), Some("agent/a1"));
+            tracer.span(TraceKind::ModelCall, "t3")
+        })
+        .await;
+        // Finished outside the scope: stamped when it started.
+        span.finish(&tracer, true);
+        let got: Vec<Option<String>> = (0..4).map(|_| rx.try_recv().unwrap().principal).collect();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("agent/a1".into()),
+                Some("person/p".into()),
+                Some("agent/a1".into())
+            ]
+        );
+        assert!(current_principal().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_agent_tokens_query_is_kept() {
+        let tracer = Tracer::new();
+        let mut rx = tracer.take_receiver().unwrap();
+        for actor in ["agent/a1", "agent:claude-code", "owner"] {
+            let mut r = row(TraceKind::Retrieval, "2026-10-14T08:00:00Z", "t");
+            r.actor = Some(actor.into());
+            r.via = Some(margin_shared::context::VIA_MCP.into());
+            r.query = Some("carnot".into());
+            tracer.record(r);
+        }
+        let kept: Vec<bool> = (0..3)
+            .map(|_| rx.try_recv().unwrap().query.is_some())
+            .collect();
+        assert_eq!(kept, vec![true, true, false]);
     }
 
     #[test]
