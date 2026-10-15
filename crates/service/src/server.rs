@@ -89,9 +89,9 @@ impl Service {
             .user_agent(concat!("margin-service/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let model_files = opts.config.model_files();
-        let registry = Registry::standard(StageDeps {
-            store: opts.store.clone(),
-        });
+        // The small-tasks models (`StageDeps.models`) are R2-retrieve's to wire
+        // (`small.rs`); until then a model-backed stage is unavailable here.
+        let registry = Registry::standard(StageDeps::new(opts.store.clone()));
         let settings: SettingsRow = opts
             .store
             .get(db::SETTINGS, SETTINGS_ID)
@@ -231,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .route(routes::TOOLS, get(settings::tools))
         // `routes::PIPELINE_VARIANTS` once crates/shared names it.
         .route(routes::PIPELINE_VARIANTS, get(settings::pipeline_variants))
+        .route(routes::PIPELINE_PROMPTS, get(settings::pipeline_prompts))
         .route("/api/providers/{provider}/models", get(providers::models))
         .route(
             routes::PROVIDERS_CHATGPT,
@@ -268,6 +269,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             routes::SPEECH_MODEL_DOWNLOAD,
             post(embedding::start_speech_download),
+        )
+        .route(
+            routes::RERANKER_MODEL,
+            get(embedding::get_reranker).delete(embedding::delete_reranker),
+        )
+        .route(
+            routes::RERANKER_MODEL_DOWNLOAD,
+            post(embedding::start_reranker_download),
         )
         .route(
             routes::CHATS,

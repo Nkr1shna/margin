@@ -738,6 +738,7 @@ pub(crate) mod tests {
             status,
             created_at: ts(position),
             updated_at: ts(position),
+            written_with: None,
         }
     }
 
@@ -907,6 +908,7 @@ pub(crate) mod tests {
             },
             speech: None,
             reindex: None,
+            reranker: None,
         };
         s.apply(Event::EmbeddingModelChanged {
             model: model.clone(),
@@ -1076,6 +1078,7 @@ pub(crate) mod tests {
             outline: None,
             created_at: ts(0),
             chat_id: None,
+            written_with: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -1111,6 +1114,7 @@ pub(crate) mod tests {
             outline: None,
             created_at: ts(0),
             chat_id: None,
+            written_with: None,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),

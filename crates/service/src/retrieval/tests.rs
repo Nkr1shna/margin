@@ -140,7 +140,7 @@ fn query(text: &str, vector: Vec<f32>, scope: Scope) -> Query {
 }
 
 fn retriever(s: &Store, name: &str) -> Arc<dyn Retriever> {
-    let reg = Registry::standard(StageDeps { store: s.clone() });
+    let reg = Registry::standard(StageDeps::new(s.clone()));
     let cfg = PipelineConfig {
         retriever: StageCfg::named(name),
         ..PipelineConfig::default()
@@ -269,7 +269,7 @@ async fn hybrid_linear_weighs_both_legs_inside_the_scope() {
     assert!(hits[0].score >= 1.0 - 1e-4);
     assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
     // The weights come from the retriever's params.
-    let reg = Registry::standard(StageDeps { store: s.clone() });
+    let reg = Registry::standard(StageDeps::new(s.clone()));
     let mut cfg = PipelineConfig {
         retriever: StageCfg::named("hybrid-linear"),
         ..PipelineConfig::default()

@@ -166,6 +166,9 @@ DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
 DEFINE FIELD IF NOT EXISTS via            ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS query          ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS read_range     ON trace TYPE option<array<int>>;
+DEFINE FIELD IF NOT EXISTS queries        ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS reranked       ON trace TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS reranker       ON trace TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 

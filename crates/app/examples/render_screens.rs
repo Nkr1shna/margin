@@ -251,6 +251,7 @@ fn Harness(props: HarnessProps) -> Element {
                     done: 212,
                     total: 1480,
                 }),
+                reranker: None,
             });
         let uploads = match std::env::var("RENDER_SOURCES") {
             Ok(topic_id) if std::env::var_os("RENDER_UPLOADS").is_some() => {

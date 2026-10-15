@@ -36,7 +36,7 @@ use margin_agent::{
     TypedTool,
 };
 use margin_shared::context::{self, ContextQuery, Modality, Scope};
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::routes::{TOOL_OUTPUT_PASSAGE_CHARS, TOOL_READ_PASSAGES_MAX, TOOL_SEARCH_K_MAX};
 use margin_shared::{
     AcceptProposal, AskRequest, Card, Chat, Citation, LessonPatch, LessonStatus, Level, NewNote,
@@ -789,6 +789,7 @@ impl TypedTool for Search {
                     &q,
                     Route::Chat,
                     provider,
+                    RetrievalPurpose::Agent,
                     &ctx.turn_id,
                     None,
                 )

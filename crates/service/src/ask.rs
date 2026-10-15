@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use margin_ai::{CallOptions, DocumentContents, Generated, LessonContext, PlanRequest};
 use margin_shared::context::{LibraryKind, Scope};
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
     Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
@@ -154,6 +154,7 @@ pub async fn propose_planned(
         outline: Some(outline),
         created_at: Utc::now(),
         chat_id: Some(chat_id.to_string()),
+        written_with: None,
     };
     let stored = StoredProposal {
         proposal: proposal.clone(),
@@ -407,6 +408,7 @@ pub async fn accept_proposal(
                     status: LessonStatus::Queued,
                     created_at: now,
                     updated_at: now,
+                    written_with: None,
                 },
                 proposal_id: Some(proposal.id.clone()),
                 previous_body: None,
@@ -536,6 +538,7 @@ pub async fn append_lesson(state: &AppState, req: NewLesson) -> AppResult<Lesson
                 status: LessonStatus::Queued,
                 created_at: now,
                 updated_at: now,
+                written_with: None,
             },
             proposal_id: None,
             previous_body: None,
@@ -715,6 +718,8 @@ async fn lesson_passages(
             reserve_output: window.reserve_output,
             trace_id: lesson.id.clone(),
             caller: None,
+            purpose: RetrievalPurpose::Lesson,
+            provider: None,
         };
         retrieval::retrieve(state, &req).await
     };
@@ -831,6 +836,8 @@ pub async fn survey(
             reserve_output: window.reserve_output,
             trace_id: trace_id.to_string(),
             caller: None,
+            purpose: RetrievalPurpose::Plan,
+            provider: None,
         },
     )
     .await?;

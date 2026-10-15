@@ -14,10 +14,11 @@ use anyhow::Context;
 use margin_embed::{CHUNK_TOKENS, Purpose, SourceKind};
 use margin_service::db::{INSERT_MANY_MAX, PASSAGE, PassageRow, Store};
 use margin_service::pipeline::{
-    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry, StageDeps,
+    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry,
+    RerankRequest, StageDeps,
 };
 use margin_shared::context::{ACCESS_COMPANY, Scope};
-use margin_shared::pipeline::PipelineConfig;
+use margin_shared::pipeline::{PipelineConfig, RetrievalPurpose};
 use margin_shared::routes::{RETRIEVAL_K_FUSED, RRF_K};
 use sha2::{Digest, Sha256};
 
@@ -88,9 +89,7 @@ impl<'v> EvalIndex<'v> {
         docs: &[CorpusDoc],
         extraction: &Extraction,
     ) -> anyhow::Result<Self> {
-        let mut reg = Registry::standard(StageDeps {
-            store: store.clone(),
-        });
+        let mut reg = Registry::standard(StageDeps::new(store.clone()));
         extra(&mut reg);
         let pipeline = Pipeline::build(cfg, &reg)?;
         let mut index = Self {
@@ -301,7 +300,20 @@ impl<'v> EvalIndex<'v> {
                 params: self.pipeline.config.fusion.params.clone(),
             },
         );
-        let hits = self.pipeline.reranker.rerank(&plan[0], fused).await?;
+        // The reranker's request as `retrieve` builds it. The purpose per suite
+        // (`retrieval` → agent unless the variant's `params.purpose` says otherwise,
+        // `courses` → lesson) and the rewriter are R2-evals'.
+        let query = margin_service::retrieval::rerank_query(
+            &margin_service::retrieval::QueryPlan::from_strings(plan.iter().cloned()),
+        );
+        let req = RerankRequest {
+            query: &query,
+            purpose: RetrievalPurpose::Agent,
+            provider: None,
+            trace_id: "eval",
+            job_id: None,
+        };
+        let hits = self.pipeline.reranker.rerank(&req, fused).await?;
         Ok(Ranked {
             hits,
             query_vector: vectors.into_iter().next().unwrap_or_default(),

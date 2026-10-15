@@ -76,6 +76,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let allow = margin_evals::compare::Allow {
                 embedder_change: *allow_embedder_change,
                 provider_change: *allow_provider_change,
+                prompt_change: false,
             };
             print!(
                 "{}",

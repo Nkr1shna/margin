@@ -136,6 +136,7 @@ async fn the_pipeline_variants_are_listed() {
     let v: PipelineVariants = r.json().await.unwrap();
     for kind in [
         "chunker",
+        "rewriter",
         "retriever",
         "fusion",
         "reranker",
@@ -147,5 +148,14 @@ async fn the_pipeline_variants_are_listed() {
     assert!(v.stages["retriever"].contains(&"hybrid-linear".to_string()));
     let hybrid = v.variants.iter().find(|n| n.name == "hybrid").unwrap();
     assert_eq!(hybrid.config.retriever.name, "hybrid-linear");
-    assert!(v.variants.iter().all(|n| n.unavailable.is_none()));
+    // R2's model-backed variants are listed; until R2-retrieve wires the small-tasks
+    // models (and R2-xenc the download) they are unavailable, with the reason.
+    use margin_service::settings::MODEL_BACKED_VARIANTS;
+    for n in &v.variants {
+        if MODEL_BACKED_VARIANTS.contains(&n.name.as_str()) {
+            assert!(n.unavailable.is_some(), "{}", n.name);
+        } else {
+            assert_eq!(n.unavailable, None, "{}", n.name);
+        }
+    }
 }

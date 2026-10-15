@@ -2023,6 +2023,7 @@ mod lesson_retrieval {
             outline: Some(outline),
             created_at: now,
             chat_id: None,
+            written_with: None,
         };
         let stored = StoredProposal {
             proposal,
@@ -2069,6 +2070,7 @@ mod lesson_retrieval {
                 status: LessonStatus::Ready,
                 created_at: now,
                 updated_at: now,
+                written_with: None,
             },
             proposal_id: Some("prop".into()),
             previous_body: None,

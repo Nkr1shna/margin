@@ -19,7 +19,8 @@ use margin_agent::scripted::{text_reply, tool_calls_reply};
 use margin_agent::{ModelClient, Scripted, ScriptedModel};
 use margin_ai::{
     AiError, CallOptions, CoursePlan, Generated, InputPart, LessonContext, ModelInfo, PlanRequest,
-    ProviderConfig, RouteModels, SceneRequest, TextModel, TextOutput,
+    ProviderConfig, Ranked, RerankCandidate, RewriteInput, RouteModels, SceneRequest, TextModel,
+    TextOutput,
 };
 use margin_embed::fake::FakeEmbedder;
 use margin_embed::{
@@ -158,6 +159,32 @@ pub struct FakeGenerator {
     /// When set, lessons are written by the real `AiGenerator` (point the provider at a
     /// fake server).
     pub jobs_over_http: AtomicBool,
+    /// Every listwise rerank call (R2).
+    pub rerank_requests: Mutex<Vec<RerankCall>>,
+    /// The rerank's answer (completed like the real one: every candidate once); `None`
+    /// fails the call, which keeps the fused order.
+    pub rerank_reply: Mutex<Option<Vec<Ranked>>>,
+    /// Every query rewrite call (R2).
+    pub rewrite_requests: Mutex<Vec<RewriteCall>>,
+    /// The rewrite's added queries; `None` fails the call, which keeps the plan.
+    pub rewrite_reply: Mutex<Option<Vec<String>>>,
+}
+
+/// A listwise rerank call the fake got (R2).
+#[derive(Debug, Clone)]
+pub struct RerankCall {
+    pub query: String,
+    pub candidates: Vec<RerankCandidate>,
+    pub opts: CallOptions,
+    pub choice: ModelChoice,
+}
+
+/// A query rewrite call the fake got (R2).
+#[derive(Debug, Clone)]
+pub struct RewriteCall {
+    pub input: RewriteInput,
+    pub opts: CallOptions,
+    pub choice: ModelChoice,
 }
 
 /// A plain text call a test model got.
@@ -412,6 +439,66 @@ impl Generator for FakeGenerator {
                     usage: fake_usage(),
                 }),
                 None => Err(AiError::Incomplete("no plan scripted".into())),
+            }
+        })
+    }
+
+    fn rerank<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<Ranked>>, AiError>> {
+        Box::pin(async move {
+            self.rerank_requests.lock().unwrap().push(RerankCall {
+                query: query.to_string(),
+                candidates: candidates.to_vec(),
+                opts: opts.clone(),
+                choice: m.clone(),
+            });
+            let reply = self.rerank_reply.lock().unwrap().clone();
+            match reply {
+                Some(mut ranked) => {
+                    // Completed as `margin_ai::rerank` does: every candidate once.
+                    ranked.retain(|r| candidates.iter().any(|c| c.id == r.id));
+                    for c in candidates {
+                        if !ranked.iter().any(|r| r.id == c.id) {
+                            ranked.push(Ranked {
+                                id: c.id.clone(),
+                                grade: 0,
+                            });
+                        }
+                    }
+                    Ok(Generated {
+                        value: ranked,
+                        usage: fake_usage(),
+                    })
+                }
+                None => Err(AiError::Incomplete("no rerank scripted".into())),
+            }
+        })
+    }
+
+    fn rewrite_queries<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<String>>, AiError>> {
+        Box::pin(async move {
+            self.rewrite_requests.lock().unwrap().push(RewriteCall {
+                input: input.clone(),
+                opts: opts.clone(),
+                choice: m.clone(),
+            });
+            let reply = self.rewrite_reply.lock().unwrap().clone();
+            match reply {
+                Some(queries) => Ok(Generated {
+                    value: queries,
+                    usage: fake_usage(),
+                }),
+                None => Err(AiError::Incomplete("no rewrite scripted".into())),
             }
         })
     }

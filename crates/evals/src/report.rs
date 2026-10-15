@@ -543,6 +543,7 @@ mod tests {
             finished_at: None,
             judges: vec!["openai:j".into()],
             providers: vec!["claude".into()],
+            prompt_versions: Vec::new(),
             valid,
             notes: vec!["a note <b>".into()],
             summary: serde_json::Value::Null,

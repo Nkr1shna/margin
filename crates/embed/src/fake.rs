@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use crate::{DIM, EmbedError, Embedder, ImageTokens, Purpose};
+use crate::{DIM, EmbedError, Embedder, ImageTokens, Purpose, Reranker};
 
 #[derive(Debug, Default, Clone)]
 pub struct FakeEmbedder;
@@ -79,6 +79,30 @@ impl Embedder for FakeEmbedder {
         Ok(windows
             .iter()
             .map(|w| one_hot(hash(w.iter().flat_map(|s| s.to_le_bytes()))))
+            .collect())
+    }
+}
+
+/// A deterministic stand-in for the cross-encoder (R2): a passage scores the number of
+/// distinct query words it contains. Not a real model.
+#[derive(Debug, Default, Clone)]
+pub struct FakeReranker;
+
+impl Reranker for FakeReranker {
+    fn name(&self) -> &str {
+        "fake-reranker"
+    }
+
+    fn score(&self, query: &str, passages: &[String]) -> Result<Vec<f32>, EmbedError> {
+        let mut asked: Vec<String> = words(query).collect();
+        asked.sort();
+        asked.dedup();
+        Ok(passages
+            .iter()
+            .map(|p| {
+                let have: Vec<String> = words(p).collect();
+                asked.iter().filter(|w| have.contains(w)).count() as f32
+            })
             .collect())
     }
 }
@@ -561,6 +585,29 @@ impl Embedder for RecordedEmbedder {
 mod tests {
     use super::*;
     use crate::cosine;
+
+    #[test]
+    fn the_fake_reranker_counts_shared_words() {
+        let scores = FakeReranker
+            .score(
+                "Gibbs phenomenon gibbs",
+                &[
+                    "The Gibbs phenomenon is an overshoot.".into(),
+                    "Fourier series converge.".into(),
+                    "gibbs".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(scores, vec![2.0, 0.0, 1.0]);
+        assert_eq!(
+            crate::RerankerModel::DEFAULT.name(),
+            "ms-marco-minilm-l6-v2"
+        );
+        for m in crate::RerankerModel::ALL {
+            assert_eq!(crate::RerankerModel::from_name(m.name()), Some(m));
+        }
+        assert_eq!(crate::RerankerModel::from_name("nope"), None);
+    }
 
     #[test]
     fn half_precision_matches_the_half_crate() {

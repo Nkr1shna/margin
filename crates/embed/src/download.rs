@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::{Backend, EmbedError, OnnxDtype};
+use crate::{Backend, EmbedError, OnnxDtype, RerankerModel};
 
 /// The Core ML package the text functions live in.
 pub(crate) const TEXT_PACKAGE: &str = "EmbeddingGemma2Text.mlpackage";
@@ -78,18 +78,29 @@ fn package_of(path: &str) -> Option<&'static str> {
     })
 }
 
-/// Which repo files a backend downloads and which it can't do without.
+/// Which repo files a download fetches and which it can't do without: the embedding
+/// model of a backend, or a reranker model (R2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Manifest(pub Backend);
+pub(crate) enum Manifest {
+    Model(Backend),
+    Reranker(RerankerModel),
+}
 
 impl Manifest {
     fn repo(self) -> &'static str {
-        self.0.repo()
+        match self {
+            Manifest::Model(backend) => backend.repo(),
+            Manifest::Reranker(model) => model.repo(),
+        }
     }
 
     /// Whether a download fetches `path`.
     fn wanted(self, path: &str) -> bool {
-        match self.0 {
+        let backend = match self {
+            Manifest::Model(backend) => backend,
+            Manifest::Reranker(model) => return model.files().contains(&path),
+        };
+        match backend {
             Backend::CoreMl => TOP_FILES.contains(&path) || package_of(path).is_some(),
             Backend::Onnx(dtype) => {
                 ONNX_TOP_FILES.contains(&path)
@@ -102,7 +113,17 @@ impl Manifest {
     /// The first required file (or package) `files` lacks.
     fn missing(self, files: &[RemoteFile]) -> Option<String> {
         let listed = |name: &str| files.iter().any(|f| f.path == name);
-        match self.0 {
+        let backend = match self {
+            Manifest::Model(backend) => backend,
+            Manifest::Reranker(model) => {
+                return model
+                    .files()
+                    .iter()
+                    .find(|f| !listed(f))
+                    .map(|f| f.to_string());
+            }
+        };
+        match backend {
             Backend::CoreMl => TOP_FILES
                 .iter()
                 .find(|f| !listed(f))
@@ -123,9 +144,9 @@ impl Manifest {
 
     /// The compiled copy a new file makes stale (Core ML packages only).
     fn compiled_of(self, path: &str) -> Option<&'static str> {
-        match self.0 {
-            Backend::CoreMl => package_of(path),
-            Backend::Onnx(_) => None,
+        match self {
+            Manifest::Model(Backend::CoreMl) => package_of(path),
+            Manifest::Model(Backend::Onnx(_)) | Manifest::Reranker(_) => None,
         }
     }
 }
@@ -695,8 +716,8 @@ mod tests {
 
     #[test]
     fn the_onnx_manifest_takes_one_format_and_its_data() {
-        let q8 = Manifest(Backend::Onnx(OnnxDtype::Q8));
-        let fp32 = Manifest(Backend::Onnx(OnnxDtype::Fp32));
+        let q8 = Manifest::Model(Backend::Onnx(OnnxDtype::Q8));
+        let fp32 = Manifest::Model(Backend::Onnx(OnnxDtype::Fp32));
         assert_eq!(
             onnx_graph("model", OnnxDtype::Q8),
             "onnx/model_quantized.onnx"
@@ -714,7 +735,7 @@ mod tests {
         assert!(!fp32.wanted("onnx/model.onnx.bak"));
         assert!(!fp32.wanted("onnx/model_quantized.onnx"));
         assert!(!fp32.wanted("onnx/model_fp16.onnx_data"));
-        assert!(!Manifest(Backend::CoreMl).wanted("onnx/model.onnx"));
+        assert!(!Manifest::Model(Backend::CoreMl).wanted("onnx/model.onnx"));
         assert_eq!(q8.compiled_of("onnx/model_quantized.onnx"), None);
     }
 
@@ -730,7 +751,7 @@ mod tests {
         let client = reqwest::Client::new();
         let backend = Backend::Onnx(OnnxDtype::Q8);
         let files = ModelFiles::with_backend(temp_dir("onnx-download"), backend);
-        let manifest = Manifest(backend);
+        let manifest = Manifest::Model(backend);
         let wanted: Vec<(String, Vec<u8>)> = fake_onnx_files()
             .into_iter()
             .filter(|(p, _)| manifest.wanted(p))

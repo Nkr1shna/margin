@@ -1,0 +1,42 @@
+# Every prompt's version and the FNV-1a 64 hash of its constant block (docs/r2-brief.md D4.2).
+# A changed constant block needs a new version; rewrite this file with `margin-eval prompts --write-lock`.
+
+[agent]
+version = "agent-v2"
+constant_hash = "ca6e5d65fa16c565"
+
+[judge]
+version = "judge-v1"
+constant_hash = "31c13acc7298d7c2"
+
+[lesson]
+version = "lesson-v2"
+constant_hash = "15b55eef836777b6"
+
+[pair]
+version = "pair-v1"
+constant_hash = "0a98e7de5bf37774"
+
+[plan]
+version = "plan-v1"
+constant_hash = "44fddeda9e2cf55a"
+
+[rerank]
+version = "rerank-v1"
+constant_hash = "ebf96f7055604120"
+
+[rewrite]
+version = "rewrite-v1"
+constant_hash = "86972960ae1f627f"
+
+[scene]
+version = "scene-v2"
+constant_hash = "ef51855e4c3bc2e3"
+
+[seriousness]
+version = "seriousness-v1"
+constant_hash = "4580a980e3a0f802"
+
+[synth]
+version = "synth-v1"
+constant_hash = "faa33ff8dfe8320c"

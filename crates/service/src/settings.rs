@@ -194,6 +194,38 @@ pub const BUILTIN_VARIANTS: &[(&str, &str)] = &[
         "hybrid",
         include_str!("../../../evals/variants/hybrid.toml"),
     ),
+    // R2 (`docs/r2-brief.md` D6): listed everywhere, unavailable where the service has
+    // no small-tasks model or no reranker download.
+    (
+        "r2-full",
+        include_str!("../../../evals/variants/r2-full.toml"),
+    ),
+    (
+        "rerank-small",
+        include_str!("../../../evals/variants/rerank-small.toml"),
+    ),
+    (
+        "rerank-xenc",
+        include_str!("../../../evals/variants/rerank-xenc.toml"),
+    ),
+    (
+        "rerank-xenc-bge",
+        include_str!("../../../evals/variants/rerank-xenc-bge.toml"),
+    ),
+    (
+        "rewrite-small",
+        include_str!("../../../evals/variants/rewrite-small.toml"),
+    ),
+];
+
+/// The built-in variants that need a model-backed stage (R2): unavailable in a registry
+/// without `StageDeps.models` or the reranker download.
+pub const MODEL_BACKED_VARIANTS: &[&str] = &[
+    "r2-full",
+    "rerank-small",
+    "rerank-xenc",
+    "rerank-xenc-bge",
+    "rewrite-small",
 ];
 
 /// A folder of more variants: `MARGIN_EVALS_DIR`, when set (its `variants/*.toml` add to
@@ -295,6 +327,21 @@ pub async fn pipeline_variants(State(state): State<AppState>) -> Json<PipelineVa
     Json(PipelineVariants { stages, variants })
 }
 
+/// Every prompt the service sends (R2, `docs/r2-brief.md` D4.1): `margin_ai`'s catalog
+/// plus the service's own (`agent` with `AGENT_PROMPT_VERSION`, `title` and `condense`
+/// with their `trace::prompt_version` names). R2-retrieve builds it.
+pub fn prompts_catalog() -> Vec<margin_shared::context::PromptInfo> {
+    unimplemented!("R2-retrieve, prompts_catalog")
+}
+
+/// `GET /api/pipeline/prompts` → `prompts_catalog()`. R2-retrieve builds it.
+pub async fn pipeline_prompts(
+    State(state): State<AppState>,
+) -> Json<Vec<margin_shared::context::PromptInfo>> {
+    let _ = state;
+    unimplemented!("R2-retrieve, GET /api/pipeline/prompts")
+}
+
 #[cfg(test)]
 mod variant_tests {
     use super::*;
@@ -303,22 +350,34 @@ mod variant_tests {
     #[tokio::test]
     async fn the_repositorys_variants_are_listed_and_buildable() {
         let store = crate::db::Store::memory().await.unwrap();
-        let reg = Registry::standard(StageDeps { store });
+        let reg = Registry::standard(StageDeps::new(store));
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
         let variants = named_variants(Some(&repo), &reg);
         let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
         for n in ["baseline", "bm25", "dense", "hybrid"] {
             assert!(names.contains(&n), "{n} missing from {names:?}");
         }
+        // R2's model-backed variants can't be built without small-tasks models (or the
+        // reranker download); every other one can.
         for v in &variants {
-            assert_eq!(v.unavailable, None, "{}", v.name);
+            if MODEL_BACKED_VARIANTS.contains(&v.name.as_str()) {
+                assert!(v.unavailable.is_some(), "{}", v.name);
+            } else {
+                assert_eq!(v.unavailable, None, "{}", v.name);
+            }
         }
         // A deployed service has no evals folder: the built-in variants are still there.
+        let all: Vec<&str> = BUILTIN_VARIANTS.iter().map(|(n, _)| *n).collect();
         for dir in [None, Some(std::path::Path::new("/nonexistent"))] {
             let built_in = named_variants(dir, &reg);
             let names: Vec<&str> = built_in.iter().map(|v| v.name.as_str()).collect();
-            assert_eq!(names, ["baseline", "bm25", "dense", "hybrid"]);
-            assert!(built_in.iter().all(|v| v.unavailable.is_none()));
+            assert_eq!(names, all);
+            assert!(
+                built_in
+                    .iter()
+                    .filter(|v| !MODEL_BACKED_VARIANTS.contains(&v.name.as_str()))
+                    .all(|v| v.unavailable.is_none())
+            );
         }
         // Every variant file in the repository is built in.
         let files = std::fs::read_dir(repo.join("variants")).unwrap().count();

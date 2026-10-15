@@ -41,6 +41,21 @@ async fn ci_gates_on_the_recorded_corpus() {
     );
 }
 
+/// The prompt lock (R2, `docs/r2-brief.md` D4.2): every prompt's constant block hashes
+/// as `evals/prompts.lock` says under its version. Needs no recording; always on.
+#[test]
+fn prompt_lock() {
+    use margin_evals::gates::{PROMPT_LOCK_FILE, PromptLock, check_prompt_lock, locked_catalog};
+    let path = evals_dir().join(PROMPT_LOCK_FILE);
+    let lock: PromptLock = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let violations = check_prompt_lock(&lock, &locked_catalog());
+    assert!(
+        violations.is_empty(),
+        "evals/prompts.lock disagrees with the prompts:\n{}",
+        violations.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The Claude prompt-prefix gate (docs/agent-providers-brief.md D12)
 // ---------------------------------------------------------------------------

@@ -68,7 +68,8 @@ phase; a phase is done when the four parts are merged and its tests pass.
 | **4 Folders** | — | 4-agent: `FOLDER_TOOLS` = `list_files`, `find_files` (service `Read` tools over the folder's rows and sources) and `sync_folder` (the one device tool); a folder's text is searched with R1's `search` scoped to the workspace | 4-S: folder files are sources (`Source.workspace_id`, upload rules, no size cap), the manifest route and `Workspace.sync`, scoping and deletion, folders in courses; ingest and retrieval are R1's (`docs/agent-rag-architecture.md` §2.7, §6.6) | 4-core: handle store, sync engine over `Dir`, Attach folder, the strip, the Folders pane, folder citations in the viewer; 4a macOS + Linux, 4b iOS/iPadOS, 4c Android: `pick_folder`, `folders::open`/`forget` |
 | **5 Hardening** | — | Compaction (`ContextManagement`), fallback trim when a base URL rejects it, prompt-injection tests | Tracing spans per turn/model call/tool with usage, compaction fallback storage | iOS continued processing for long folder scans (`BGContinuedProcessingTask`, owner decision) |
 | **Providers** | One seam (`model.rs`: `CallOptions`, `TextModel`, `Provider`, `ModelRequest`, `ModelEvent`); `ResponsesClient` on it (OpenAI, ChatGPT bearer), `ClaudeClient` (Messages API, D2/D12), `list_models` with windows | The loop on neutral `ModelEvent`s, `replay::claude`, Claude tool gating (D5), web rows/cards/citations, pause/pending continuation, window-scaled compaction | `model_for`/`provider_config` per provider with the window cache, three Keychain entries, the SIWC flow, chats on their provider, traces per provider (D14) | Settings: default provider and three slots per provider, ChatGPT sign-in, Claude key; New chat provider picker; web card and citations |
-| **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
+| **R1 Retrieval core** | `CallOptions { route, cache_key, max_output_tokens }`, constant-first prompts with `prompt_version`, `plan_course` and rerank prompts, eval prompts | — (the `search` tool family lives in the service) | `passage`/`document`/`project`/`trace` storage with HNSW + FULLTEXT indexes, `ingest` (hash diff, batched writes, one-pass migration), hybrid retrieval with RRF and MMR packing, the `search`/`read_passage`/`document_outline`/`view_picture` tools, the outline planner, traces and rollups, the context API lines | R1-app after phase 4's app areas: three model slots, Pipeline settings, trace retention, Passages card locators, line highlights |
+| **R2 Rerank, rewriting, prompt versions** (`docs/r2-brief.md`) | R2-ai: the `rewrite-v1` prompt and `rewrite_queries`, `prompts::catalog()` (versions and constant hashes), the rerank label with the page | — | R2-retrieve: `"listwise-small"` and `"small-expand-v1"` on the `Small` route, the `"onnx-crossencoder"` stage, `RerankRequest`/`RewriteRequest` with purpose and provider, `written_with` on lessons, proposals and videos, `GET /api/pipeline/prompts`; R2-xenc: the ONNX cross-encoder and its download routes; R2-evals: `evals/prompts.lock` in CI, recorded reranks and rewrites, `compare` on prompt versions | R2-app: the Rewriter row, Settings → Sources' reranker model row, "Written with …" in a lesson's details |
 
 Between the phase 1 and phase 2 merges courses can't be created (the old composer is
 unrouted until phase 2 reuses its outline editor); no release happens in between.
@@ -160,6 +161,21 @@ R1 shared types: `Settings.pipeline: pipeline::PipelineConfig` and
 sockets); `context.rs`: `Project`, `Document` (with `generation`, `actor`, `access`),
 `Origin`, `Modality`, `Scope`, `ContextQuery` (with the caller's `access`), `Hit`,
 `DocumentOutline`, `ContextIngest`, `ContextChanges`, `TraceRow`, `TraceRollup`.
+
+R2 shared types (`docs/r2-brief.md`, all additive): `WrittenWith { prompt_version,
+pipeline_hash, provider, model, at }` on `Lesson.written_with` and
+`Proposal.written_with` (`None` before R2 and while pending; regenerating overwrites
+it); `PipelineConfig.rewriter: StageCfg` (default `"none"`, left out of the JSON and the
+hash while default, so pre-R2 hashes keep their meaning; `STAGE_KINDS` is 8 with
+`"rewriter"` after `"embedder"`); `pipeline::RetrievalPurpose { Lesson, Plan, Agent,
+Context }`; `EmbeddingModel.reranker: Option<RerankerModelState { name, repo, state }>`;
+`context::PromptInfo { job, version, constant_hash, constant_chars }`; `TraceRow` gains
+`queries`, `reranked`, `reranker` and `RetrievalLegs.rewrite_ms`. Service seams
+(`pipeline.rs`): `Reranker::rerank(&RerankRequest { query, purpose, provider, trace_id,
+job_id }, hits)`, `Rewriter::rewrite(&RewriteRequest { purpose, provider, trace_id,
+job_id, scope_names }, plan)`, `SmallModels`/`SmallModel`, `StageDeps { store, models,
+tracer }` (`StageDeps::new(store)` has neither), `retrieval::Request { purpose, provider
+}`, `Generator::{rerank, rewrite_queries}` (defaulted).
 
 Title (owner decision): set from the first message, its first line cut to
 `CHAT_TITLE_MAX` (60) characters (`title_by: FirstLine`; the app shows it in placeholder
@@ -619,6 +635,14 @@ token: version, sha, environment); a search or passage read sent with
 `GET /api/traces/rollup?bucket&from&to`. The handlers call the same functions as the
 agent's tools: one retrieval path for Margin's agent, external agents and the GUI.
 
+### R2 routes
+
+`GET /api/pipeline/prompts` → `Vec<context::PromptInfo>` (every prompt the service
+sends, with its version and constant hash); `GET`/`DELETE /api/embedding/reranker` and
+`POST /api/embedding/reranker/download` (answer the whole `EmbeddingModel`, progress as
+`Event::EmbeddingModelChanged`, 409 `no_reranker_model` where the service offers none:
+the first commit's stubs answer that until R2-xenc).
+
 ## 7. Limits (constants)
 
 `margin_agent`: `MAX_STEPS` 40, `TOOL_OUTPUT_MAX_BYTES` 64 KB, `TURN_OUTPUT_MAX_BYTES`
@@ -644,6 +668,9 @@ Providers, `margin_ai`: `CLAUDE_MAX_OUTPUT_TOKENS` 32 000 (a text call: 64 000),
 (GPT-6 family: 1 050 000 / 128 000). Model defaults (`margin_shared`): Claude
 `claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI small
 `gpt-6-luna`; ChatGPT `gpt-6.1-sol`.
+R2, `margin_shared::routes`: `RERANK_MAX_CANDIDATES` 24, `RERANK_QUERY_CHARS` 800,
+`RERANK_MAX_OUTPUT_TOKENS` 400, `REWRITE_MAX_ADDED` 2, `REWRITE_MIN_WORDS` 5,
+`REWRITE_MAX_OUTPUT_TOKENS` 120, `RERANK_PAIR_TOKENS` 512.
 
 ## 8. Tests each owner adds
 
@@ -699,6 +726,16 @@ the pipeline by name; `margin-evals` metrics against hand-worked values and the 
 set's anchors against the corpus. Each R1 area adds the tests of §6.2/§6.4 of the
 architecture doc; the eval gates (`cargo test -p margin-evals`) run on
 `RecordedEmbedder` and `kv-mem` only.
+
+**R2** (`docs/r2-brief.md` §5). The first commit has: a config without `rewriter`, or
+with `"none"`, hashes as before (the pinned default hash), `"small-expand-v1"`
+differently; `WrittenWith`, `EmbeddingModel.reranker`, the trace fields and
+`PromptInfo` round trips; the trivial `"none"` reranker and rewriter through the new
+seams; `FakeReranker` scores by shared words; `prompts::catalog()` lists each job once;
+the prompt lock (`crates/evals/tests/gates.rs::prompt_lock`, always on) and its checker
+(same version with another hash fails). The areas add §5's e2e (`tests/r2_e2e.rs`) on
+`FakeGenerator.{rerank_reply, rewrite_reply}` and `FakeReranker`; nothing calls a model
+API or Hugging Face.
 
 ## 9. Open points for the owner
 

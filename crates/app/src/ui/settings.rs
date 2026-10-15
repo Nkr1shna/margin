@@ -1555,6 +1555,7 @@ pub fn stage_label(kind: &str) -> &'static str {
     match kind {
         "chunker" => "Chunker",
         "embedder" => "Embedder",
+        "rewriter" => "Rewriter",
         "retriever" => "Retriever",
         "fusion" => "Fusion",
         "reranker" => "Reranker",
@@ -1573,6 +1574,7 @@ pub fn stage_help(kind: &str) -> &'static str {
         "embedder" => {
             "The model passages are embedded with. It is set in the service's config (embedder in service.toml), not here; changing it there re-indexes every source once."
         }
+        "rewriter" => "Extra phrasings of a query, tried beside it.",
         "retriever" => "How passages are found: by meaning, by words, or both.",
         "fusion" => "How the meaning and word results are merged into one list.",
         "reranker" => "Whether the merged list is reordered before packing.",
@@ -3315,6 +3317,7 @@ mod tests {
             state: EmbeddingModelState::Ready { bytes: 1_000 },
             speech: None,
             reindex: None,
+            reranker: None,
         };
         let html = sources(mac.clone());
         assert!(html.contains("<h2>Embedding model</h2>"), "{html}");

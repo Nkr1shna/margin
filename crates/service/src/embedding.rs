@@ -94,6 +94,8 @@ pub async fn model(state: &AppState) -> EmbeddingModel {
         repo: state.model_files.backend.repo().into(),
         state: model_state,
         speech: speech(state).await,
+        // The reranker model is R2-xenc's to offer.
+        reranker: None,
         reindex: *state.reindex.lock().unwrap(),
     };
     *state.last_model.lock().unwrap() = Some(model.clone());
@@ -317,6 +319,36 @@ pub async fn start_speech_download(
         tokio::spawn(run_speech_download(state.clone()));
     }
     Ok(Json(current))
+}
+
+/// `GET routes::RERANKER_MODEL` (R2): the `EmbeddingModel` with its `reranker` part.
+/// 409 "no_reranker_model" until R2-xenc offers the cross-encoder's download.
+pub async fn get_reranker(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+    let _ = state;
+    Err(no_reranker_model())
+}
+
+/// `POST routes::RERANKER_MODEL_DOWNLOAD` (R2): starts the reranker model's download.
+/// 409 "no_reranker_model" until R2-xenc.
+pub async fn start_reranker_download(
+    State(state): State<AppState>,
+) -> AppResult<Json<EmbeddingModel>> {
+    let _ = state;
+    Err(no_reranker_model())
+}
+
+/// `DELETE routes::RERANKER_MODEL` (R2): removes the reranker model's files. 409
+/// "no_reranker_model" until R2-xenc.
+pub async fn delete_reranker(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+    let _ = state;
+    Err(no_reranker_model())
+}
+
+fn no_reranker_model() -> AppError {
+    AppError::conflict(
+        "no_reranker_model",
+        "This service has no reranker model to download.",
+    )
 }
 
 fn no_speech_model(state: &AppState) -> AppResult<()> {

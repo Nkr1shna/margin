@@ -680,6 +680,7 @@ async fn read_tools_answer_from_the_library() {
                 file: None,
                 section_path: None,
             }],
+            written_with: None,
         },
         proposal_id: None,
         previous_body: None,

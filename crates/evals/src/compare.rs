@@ -47,6 +47,8 @@ pub struct Allow {
     pub embedder_change: bool,
     /// `--allow-provider-change`.
     pub provider_change: bool,
+    /// `--allow-prompt-change` (R2): runs whose `prompt_versions` differ.
+    pub prompt_change: bool,
 }
 
 /// A provider's name as trace rows and `EvalRun.providers` spell it: "openai",
@@ -245,6 +247,7 @@ mod tests {
             finished_at: None,
             judges: vec![],
             providers: vec![],
+            prompt_versions: Vec::new(),
             valid: true,
             notes: vec![],
             summary: serde_json::Value::Null,
@@ -254,6 +257,7 @@ mod tests {
     const STRICT: Allow = Allow {
         embedder_change: false,
         provider_change: false,
+        prompt_change: false,
     };
 
     fn rows(run: &str, vals: &[(&str, f64)]) -> Vec<EvalResult> {

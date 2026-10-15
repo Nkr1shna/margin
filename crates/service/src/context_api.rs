@@ -15,7 +15,7 @@ use margin_shared::context::{
     AGENT_HEADER, ContextChanges, ContextIngest, ContextQuery, Document, DocumentOutline, Hit,
     Origin, Project, TraceKind, TraceRow, VIA_MCP, is_agent_name,
 };
-use margin_shared::pipeline::Route;
+use margin_shared::pipeline::{RetrievalPurpose, Route};
 use margin_shared::routes::TOOL_READ_PASSAGES_MAX;
 use serde::Deserialize;
 
@@ -77,8 +77,16 @@ pub async fn search(
     if q.k == 0 {
         return Err(AppError::bad_request("k must be at least 1."));
     }
-    match retrieval::context_search(&state, &q, Route::Chat, None, &new_id(), caller(&headers))
-        .await
+    match retrieval::context_search(
+        &state,
+        &q,
+        Route::Chat,
+        None,
+        RetrievalPurpose::Context,
+        &new_id(),
+        caller(&headers),
+    )
+    .await
     {
         Ok(packed) => Ok(Json(packed.iter().map(retrieval::packed_hit).collect())),
         Err(e) => match e.downcast_ref::<BadScope>() {

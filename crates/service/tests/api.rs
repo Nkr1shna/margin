@@ -1594,6 +1594,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
                 status,
                 created_at: now,
                 updated_at: now,
+                written_with: None,
             },
             proposal_id: None,
             previous_body: prev.map(Into::into),
@@ -1668,6 +1669,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         outline: None,
         created_at: now,
         chat_id: None,
+        written_with: None,
     };
     store.put(db::PROPOSAL, "p1", &proposal).await.unwrap();
     store

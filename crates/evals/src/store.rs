@@ -46,6 +46,12 @@ pub struct EvalRun {
     /// whose providers differ unless `--allow-provider-change`.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// The prompt versions of every job the run's model calls used ("lesson-v2",
+    /// "rerank-v1", …), sorted (R2, `docs/r2-brief.md` D4.4); empty for runs recorded
+    /// before R2. `compare` refuses runs whose versions differ unless
+    /// `--allow-prompt-change`.
+    #[serde(default)]
+    pub prompt_versions: Vec<String>,
     /// False when a judge's canaries failed (the report says which).
     #[serde(default = "yes")]
     pub valid: bool,
@@ -171,6 +177,7 @@ mod tests {
             finished_at: None,
             judges: vec![],
             providers: vec![],
+            prompt_versions: Vec::new(),
             valid: true,
             notes: vec![],
             summary: serde_json::json!({"x": 1}),

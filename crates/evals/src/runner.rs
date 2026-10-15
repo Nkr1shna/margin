@@ -179,6 +179,7 @@ fn new_run(
         finished_at: None,
         judges: Vec::new(),
         providers: Vec::new(),
+        prompt_versions: Vec::new(),
         valid: true,
         notes: Vec::new(),
         summary: serde_json::Value::Null,

@@ -36,8 +36,8 @@ pub mod windows;
 
 pub use prompts::evals;
 pub use prompts::{
-    CoursePlan, DocumentContents, JsonFormat, PlanRequest, PlannedLesson, Prompt, Ranked,
-    RerankCandidate, SectionRef,
+    CoursePlan, DocumentContents, JsonFormat, PlanRequest, PlannedLesson, Prompt, PromptInfo,
+    Ranked, RerankCandidate, RewriteInput, SectionRef,
 };
 
 pub use messages::{
@@ -1080,6 +1080,21 @@ pub async fn rerank(
         value: prompts::complete_ranking(value, candidates),
         usage,
     })
+}
+
+/// Query rewriting (R2, `docs/r2-brief.md` D3): up to `input.max_added` alternative
+/// phrasings or sub-questions of `input.query` for retrieval to try beside it, on the
+/// route the caller gives (`Small` in the product), as one strict-JSON call with the
+/// key `rewrite:rewrite-v1` unless the options name another. The answer is completed
+/// in Rust: trimmed, empty and repeated strings (and the query itself) dropped, capped
+/// at `max_added`. R2-ai builds it.
+pub async fn rewrite_queries(
+    model: &dyn TextModel,
+    input: &RewriteInput,
+    opts: &CallOptions,
+) -> Result<Generated<Vec<String>>, AiError> {
+    let _ = (model, input, opts);
+    unimplemented!("R2-ai, rewrite_queries")
 }
 
 #[cfg(test)]

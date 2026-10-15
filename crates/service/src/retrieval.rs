@@ -28,8 +28,10 @@ use margin_shared::Provider;
 use margin_shared::context::{
     ACCESS_COMPANY, Document, Modality, Origin, Project, RetrievalLegs, Scope, TraceKind, TraceRow,
 };
-use margin_shared::pipeline::{Budget, Route};
-use margin_shared::routes::{RETRIEVAL_K_DENSE, RETRIEVAL_K_FUSED, RETRIEVAL_K_LEX, RRF_K};
+use margin_shared::pipeline::{Budget, RetrievalPurpose, Route};
+use margin_shared::routes::{
+    RERANK_QUERY_CHARS, RETRIEVAL_K_DENSE, RETRIEVAL_K_FUSED, RETRIEVAL_K_LEX, RRF_K,
+};
 use margin_shared::{
     Chat, Citation, Event, Id, Proposal, ProposalStatus, Source, SourceKind, SourceStatus, Topic,
     Workspace, WorkspaceFile,
@@ -41,8 +43,8 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::db::{self, PassageRow, Store};
 use crate::engines::BoxFuture;
 use crate::pipeline::{
-    Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Registry, Retriever, StageCtor,
-    hit_citation,
+    Diversity, FusionCfg, Hit, PackBudget, Packed, Packer, Query, Registry, RerankRequest,
+    Retriever, RewriteRequest, StageCtor, hit_citation,
 };
 use crate::sources::{ChunkRow, MediaKind, MediaRow};
 use crate::state::{AppState, SOURCE_ORIGINAL, new_id};
@@ -111,6 +113,25 @@ pub struct Request {
     /// An agent calling the context API from outside (`margin-mcp`): its trace row says
     /// who and keeps the query (dogfood plan §6). `None` for the app's own retrievals.
     pub caller: Option<Caller>,
+    /// Why it runs (R2): the reranker and the rewriter may act per purpose.
+    pub purpose: RetrievalPurpose,
+    /// The chat's provider for agent searches, whose small model a model-backed stage
+    /// uses; `None` = the default provider (jobs, the context API).
+    pub provider: Option<Provider>,
+}
+
+/// The reranker's query (R2, `docs/r2-brief.md` D1): the plan's first string, then the
+/// others as "Also asked:" lines, at most `RERANK_QUERY_CHARS` characters.
+pub fn rerank_query(plan: &QueryPlan) -> String {
+    let mut q = plan.queries.first().cloned().unwrap_or_default();
+    for other in plan.queries.iter().skip(1) {
+        q.push_str("\nAlso asked: ");
+        q.push_str(other);
+    }
+    match q.char_indices().nth(RERANK_QUERY_CHARS) {
+        Some((end, _)) => q[..end].to_string(),
+        None => q,
+    }
 }
 
 /// Who called the context API, for its trace rows.
@@ -1626,15 +1647,40 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         return Ok(hit.as_ref().clone());
     }
 
+    // The rewriter (R2): after the cache check, whose key stays on the original plan
+    // (`pipeline.hash` names the rewriter), and before embedding. A failure keeps the
+    // plan as it was.
+    let t = Instant::now();
+    let rewrite = RewriteRequest {
+        purpose: req.purpose,
+        provider: req.provider,
+        trace_id: &req.trace_id,
+        job_id: None,
+        scope_names: &[],
+    };
+    let plan = match pipeline.rewriter.rewrite(&rewrite, req.plan.clone()).await {
+        Ok(plan) if !plan.queries.is_empty() => plan,
+        Ok(_) => req.plan.clone(),
+        Err(e) => {
+            tracing::warn!(
+                "the rewriter \"{}\" failed; retrieving with the plan as it was: {e:#}",
+                pipeline.rewriter.name()
+            );
+            req.plan.clone()
+        }
+    };
+    let rewrite_ms = t.elapsed().as_secs_f64() * 1000.0;
+    row.queries = Some(plan.queries.len() as u32);
+
     let vectors: Vec<Vec<f32>> = match &embedder {
         Some(e) => {
             let e = e.clone();
-            let texts = req.plan.queries.clone();
+            let texts = plan.queries.clone();
             tokio::task::spawn_blocking(move || e.embed(&texts, Purpose::Query))
                 .await?
                 .context("couldn't embed the query")?
         }
-        None => vec![Vec::new(); req.plan.queries.len()],
+        None => vec![Vec::new(); plan.queries.len()],
     };
     let fusion_params = &pipeline.config.fusion.params;
     let fusion_cfg = FusionCfg {
@@ -1645,7 +1691,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     let budget = pack_budget_reserving(&req.budget, req.window_tokens, req.reserve_output, req.k);
     let mut legs = Vec::new();
     let t = Instant::now();
-    for (text, vector) in req.plan.queries.iter().zip(vectors) {
+    for (text, vector) in plan.queries.iter().zip(vectors) {
         let q = Query {
             text: text.clone(),
             embedder: embedder
@@ -1675,11 +1721,33 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     let fuse_ms = t.elapsed().as_secs_f64() * 1000.0;
     row.hit_ids = fused.iter().map(|h| h.passage.id.clone()).collect();
     row.scores = fused.iter().map(|h| h.score).collect();
+    // The reranker (R2): a failure keeps the fused order, traced as "rerank_failed".
     let t = Instant::now();
-    let reranked = pipeline
-        .reranker
-        .rerank(&req.plan.queries[0], fused)
-        .await?;
+    let query = rerank_query(&plan);
+    let rerank = RerankRequest {
+        query: &query,
+        purpose: req.purpose,
+        provider: req.provider,
+        trace_id: &req.trace_id,
+        job_id: None,
+    };
+    row.reranker = Some(pipeline.reranker.name().to_string());
+    let reranked = match pipeline.reranker.rerank(&rerank, fused.clone()).await {
+        Ok(hits) => {
+            if hits.iter().any(|h| h.rerank.is_some()) {
+                row.reranked = Some(hits.iter().filter(|h| h.rerank.is_some()).count() as u32);
+            }
+            hits
+        }
+        Err(e) => {
+            tracing::warn!(
+                "the reranker \"{}\" failed; keeping the fused order: {e:#}",
+                pipeline.reranker.name()
+            );
+            row.error_code = Some("rerank_failed".into());
+            fused
+        }
+    };
     let rerank_ms = t.elapsed().as_secs_f64() * 1000.0;
     let mut packed = pipeline.packer.pack(reranked, &budget);
     describe_packed(state, &mut packed).await?;
@@ -1689,6 +1757,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
         lex_ms: 0.0,
         fuse_ms,
         rerank_ms,
+        rewrite_ms,
     });
     row.cache_hit = Some(false);
     fill_packed_trace(&mut row, &packed);
@@ -2309,6 +2378,7 @@ pub async fn context_search(
     q: &margin_shared::context::ContextQuery,
     route: Route,
     provider: Option<Provider>,
+    purpose: RetrievalPurpose,
     trace_id: &str,
     caller: Option<Caller>,
 ) -> anyhow::Result<Vec<Packed>> {
@@ -2327,6 +2397,8 @@ pub async fn context_search(
             reserve_output: window.reserve_output,
             trace_id: trace_id.to_string(),
             caller,
+            purpose,
+            provider,
         },
     )
     .await

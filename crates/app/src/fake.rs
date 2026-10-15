@@ -312,6 +312,7 @@ pub fn sample_library() -> Library {
         status,
         created_at: ts(position),
         updated_at: ts(position),
+        written_with: None,
     };
     Library {
         topics: vec![
@@ -617,6 +618,7 @@ impl FakeState {
                 state,
             }),
             reindex: self.reindex,
+            reranker: None,
         }
     }
 
@@ -1545,6 +1547,7 @@ impl FakeState {
                 status: LessonStatus::Queued,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                written_with: None,
             };
             self.library.lessons.push(lesson.clone());
             events.push(Event::LessonChanged {
@@ -1894,6 +1897,7 @@ async fn patch_settings(
 pub const FAKE_STAGES: &[(&str, &[&str])] = &[
     ("chunker", &["pages-v1", "sections-v2"]),
     ("embedder", &["coreml"]),
+    ("rewriter", &["none"]),
     (
         "retriever",
         &["bm25", "dense", "hybrid-linear", "hybrid-rrf"],
@@ -3716,6 +3720,7 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         outline: Some(outline),
         created_at: ts(60),
         chat_id: Some(chat_id.into()),
+        written_with: None,
     }
 }
 
@@ -4377,6 +4382,7 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
                 outline: Some(outline.clone()),
                 created_at: Utc::now(),
                 chat_id: Some(chat_id.into()),
+                written_with: None,
             };
             // Only the chat's newest outline can create a course.
             let mut events = Vec::new();
@@ -4645,6 +4651,7 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             status: LessonStatus::Queued,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            written_with: None,
         };
         s.library.lessons.push(lesson.clone());
         (

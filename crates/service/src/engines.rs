@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use margin_ai::{
     AiError, CallOptions, ClaudeClient, CoursePlan, Generated, LessonContext, ModelWindow,
-    PlanRequest, Provider, ProviderConfig, ProviderKind, ResponsesClient, SceneRequest, TextModel,
+    PlanRequest, Provider, ProviderConfig, ProviderKind, Ranked, RerankCandidate, ResponsesClient,
+    RewriteInput, SceneRequest, TextModel,
 };
 use margin_embed::{Chunk, EmbedError, Embedder, Extracted, ModelFiles, Transcript};
 use margin_shared::{SourceKind, ToolStatus};
@@ -71,6 +72,35 @@ pub trait Generator: Send + Sync + 'static {
     /// The provider's plain text model (titles, condense summaries; lessons, scenes and
     /// the planner once they move onto it).
     fn text_model(&self, config: &ProviderConfig) -> Arc<dyn TextModel>;
+
+    /// The listwise rerank (R2, `"listwise-small"`): one strict-JSON call on the
+    /// `Small` route grading `candidates` for `query`, every candidate once, best first.
+    /// Tests script it (`FakeGenerator.rerank_reply`).
+    fn rerank<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        query: &'a str,
+        candidates: &'a [RerankCandidate],
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<Ranked>>, AiError>> {
+        Box::pin(async move {
+            margin_ai::rerank(&*self.text_model(&m.config), query, candidates, opts).await
+        })
+    }
+
+    /// Query rewriting (R2, `"small-expand-v1"`): one strict-JSON call on the `Small`
+    /// route for alternative phrasings of `input.query`. Tests script it
+    /// (`FakeGenerator.rewrite_reply`).
+    fn rewrite_queries<'a>(
+        &'a self,
+        m: &'a ModelChoice,
+        input: &'a RewriteInput,
+        opts: &'a CallOptions,
+    ) -> BoxFuture<'a, Result<Generated<Vec<String>>, AiError>> {
+        Box::pin(async move {
+            margin_ai::rewrite_queries(&*self.text_model(&m.config), input, opts).await
+        })
+    }
 }
 
 pub trait Renderer: Send + Sync + 'static {
