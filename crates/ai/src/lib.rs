@@ -46,12 +46,13 @@ pub use messages::{
     WEB_FETCH_TOOL, WEB_SEARCH_MAX_USES, WEB_SEARCH_TOOL,
 };
 pub use model::{
-    CallOptions, Credential, Delta, ItemView, MODEL_WINDOW_FALLBACK, ModelEvent, ModelInfo,
-    ModelItem, ModelRequest, ModelStream, ModelWindow, Next, Provider, ProviderConfig,
-    ProviderKind, RouteModels, StartKind, TextModel, TextOutput, ToolChoice, ToolDef, WebTools,
+    Backoff, CallOptions, Credential, Delta, ItemView, MODEL_WINDOW_FALLBACK, ModelEvent,
+    ModelInfo, ModelItem, ModelRequest, ModelStream, ModelWindow, Next, OnWait, Provider,
+    ProviderConfig, ProviderKind, Retrying, RouteModels, StartKind, TextModel, TextOutput,
+    ToolChoice, ToolDef, WebTools,
 };
 pub use responses::{
-    Backoff, ContextManagement, HOSTED_TOOLS, INCLUDE_ENCRYPTED_REASONING, INCLUDE_WEB_SOURCES,
+    ContextManagement, HOSTED_TOOLS, INCLUDE_ENCRYPTED_REASONING, INCLUDE_WEB_SOURCES,
     ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream, ResponsesToolChoice,
     StreamEvent, function_tool, model_events, models_list, responses_request, to_model_events,
     web_search_tool,
@@ -120,6 +121,16 @@ impl AiError {
         match self {
             AiError::Http { retry_after, .. } => *retry_after,
             _ => None,
+        }
+    }
+
+    /// Why a retry of this failure waits, in a short sentence for the owner
+    /// (`Waiting.reason`; the agent loop's words for the same causes).
+    pub fn wait_reason(&self) -> &'static str {
+        match self {
+            AiError::Http { status: 429, .. } => "The model API asked Margin to slow down.",
+            AiError::Network(_) => "Margin couldn't reach the model API.",
+            _ => "The model API had a problem.",
         }
     }
 }
@@ -355,7 +366,15 @@ impl ResponsesClient {
         let mut state = StreamState::default();
         let mut bytes = resp.bytes_stream();
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(network)?;
+            // reqwest reports a body cut mid-chunk as a decode error; it is the
+            // connection that failed (and a retry may succeed), not the content.
+            let chunk = chunk.map_err(|e| {
+                if e.is_decode() || e.is_body() {
+                    AiError::Network(format!("the connection broke: {}", error_chain(&e)))
+                } else {
+                    network(e)
+                }
+            })?;
             for event in parser.push(&chunk) {
                 if let Some(done) = state.handle(&event, &mut on_delta)? {
                     return Ok(done);
@@ -1215,6 +1234,7 @@ mod tests {
             retries: 3,
             base_delay: Duration::from_secs(2),
             max_delay: Duration::from_secs(5),
+            jitter: Duration::ZERO,
         };
         let busy = AiError::Http {
             status: 503,
@@ -1226,21 +1246,6 @@ mod tests {
         assert_eq!(b.delay(1, &busy), Some(Duration::from_secs(4)));
         assert_eq!(b.delay(2, &busy), Some(Duration::from_secs(5)));
         assert_eq!(b.delay(3, &busy), None);
-        let limited = AiError::Http {
-            status: 429,
-            message: "slow".into(),
-            retry_after: Some(Duration::from_secs(9)),
-            code: None,
-        };
-        // Retry-After is honoured up to the cap.
-        assert_eq!(b.delay(0, &limited), Some(Duration::from_secs(5)));
-        let soon = AiError::Http {
-            status: 429,
-            message: "slow".into(),
-            retry_after: Some(Duration::from_secs(3)),
-            code: None,
-        };
-        assert_eq!(b.delay(0, &soon), Some(Duration::from_secs(3)));
         assert_eq!(
             b.delay(0, &AiError::Network("x".into())),
             Some(Duration::from_secs(2))
@@ -1253,9 +1258,59 @@ mod tests {
         };
         assert_eq!(b.delay(0, &bad), None);
         assert_eq!(b.delay(0, &AiError::Parse("x".into())), None);
+        let spent = AiError::Http {
+            status: 429,
+            message: "spent".into(),
+            retry_after: Some(Duration::from_secs(1)),
+            code: Some("enforced_spend_limit_reached".into()),
+        };
+        assert_eq!(b.delay(0, &spent), None);
         let huge = Backoff { retries: 100, ..b };
         assert_eq!(huge.delay(60, &busy), Some(Duration::from_secs(5)));
-        assert_eq!(Backoff::default().retries, 3);
+        let d = Backoff::default();
+        assert_eq!(
+            (d.retries, d.base_delay, d.max_delay, d.jitter),
+            (
+                3,
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+                Duration::from_secs(1)
+            )
+        );
+        assert_eq!(Backoff::immediate().pause(3, None), Duration::ZERO);
+    }
+
+    /// `Retry-After` is waited as the server asks, however long (past `max_delay`),
+    /// plus up to `jitter`.
+    #[test]
+    fn retry_after_is_uncapped() {
+        let b = Backoff {
+            max_delay: Duration::from_secs(5),
+            ..Backoff::default()
+        };
+        let limited = |secs| AiError::Http {
+            status: 429,
+            message: "slow".into(),
+            retry_after: Some(Duration::from_secs(secs)),
+            code: None,
+        };
+        let within = |wait: Duration, asked: u64| {
+            wait >= Duration::from_secs(asked) && wait <= Duration::from_millis(asked * 1000 + 1000)
+        };
+        for _ in 0..50 {
+            assert!(within(b.delay(0, &limited(9)).unwrap(), 9));
+            assert!(within(b.delay(2, &limited(600)).unwrap(), 600));
+            assert!(within(b.delay(0, &limited(3)).unwrap(), 3));
+        }
+        let waits: std::collections::HashSet<Duration> =
+            (0..20).map(|_| b.delay(0, &limited(1)).unwrap()).collect();
+        assert!(waits.len() > 1, "{waits:?}");
+        assert_eq!(b.pause(0, Some(Duration::MAX)), Duration::MAX);
+        let exact = Backoff {
+            jitter: Duration::ZERO,
+            ..b
+        };
+        assert_eq!(exact.delay(0, &limited(9)), Some(Duration::from_secs(9)));
     }
 
     #[test]

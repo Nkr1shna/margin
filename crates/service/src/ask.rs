@@ -12,6 +12,7 @@
 //! model's window: no fixed number of passages.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,11 +25,12 @@ use margin_shared::context::{LibraryKind, Scope};
 use margin_shared::pipeline::Route;
 use margin_shared::{
     AcceptProposal, AskRequest, Chat, ChatItemKind, Event, Id, ItemStatus, Lesson, LessonStatus,
-    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic,
+    Level, Outline, OutlineLesson, Proposal, ProposalStatus, Source, Topic, Waiting,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::chats::{self, StoredChatItem};
+use crate::engines::{JobCalls, JobWait, failed_attempts, ordered_waits, waiting_line};
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::library::{self, create_topic_locked, is_busy, topic_lessons};
 use crate::pipeline::Packed;
@@ -923,7 +925,18 @@ pub async fn plan_course(
         state,
     );
     call.row().chat_id = Some(chat_id.to_string());
-    match state.generator.plan_course(&ai, &req, &opts).await {
+    // The planner runs inside the chat's `propose_course` call: a wait shows on the
+    // chat (`Chat.waiting`, with Stop) like the agent's own.
+    let calls = JobCalls {
+        backoff: job_backoff(state),
+        on_wait: chat_waits(state, chat_id),
+        on_failed: failed_attempts(state, call.row().clone()),
+        clock: Some(call.clock()),
+    };
+    match calls
+        .run(state.generator.plan_course(&ai, &req, &opts))
+        .await
+    {
         Ok(Generated { value, usage }) => {
             call.row().usage = Some(trace::trace_usage(&usage));
             call.finish(true);
@@ -1011,9 +1024,14 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         state,
     );
     call.row().job_id = Some(lesson_id.to_string());
-    let result = state
-        .generator
-        .write_lesson(&ai, &ctx, &opts, on_delta)
+    let calls = JobCalls {
+        backoff: job_backoff(state),
+        on_wait: lesson_waits(state, &row.lesson),
+        on_failed: failed_attempts(state, call.row().clone()),
+        clock: Some(call.clock()),
+    };
+    let result = calls
+        .run(state.generator.write_lesson(&ai, &ctx, &opts, on_delta))
         .await
         .map(|Generated { value, usage }| {
             call.row().usage = Some(trace::trace_usage(&usage));
@@ -1082,6 +1100,80 @@ async fn write_lesson(state: &AppState, lesson_id: &str, first_write: bool) -> a
         );
     }
     Ok(())
+}
+
+/// The retry policy of job calls: the agent loop's (`Turns.retry`, the one `Backoff`).
+pub fn job_backoff(state: &AppState) -> margin_ai::Backoff {
+    *state.turns.retry.lock().unwrap()
+}
+
+/// A lesson job's waits, shown as its progress text: while the call waits to retry
+/// (always before any text streamed) the Generating lesson's body is the waiting line
+/// ("Waiting for the model until 14:03 UTC. …", in a `LessonChanged`, never stored),
+/// and empty again when the wait ends. Only while this task is still the lesson's job:
+/// a lesson deleted or restarted meanwhile isn't touched.
+fn lesson_waits(state: &AppState, lesson: &Lesson) -> JobWait {
+    let state = state.clone();
+    let lesson = lesson.clone();
+    let job = tokio::task::try_id();
+    let shown = AtomicBool::new(false);
+    Arc::new(move |wait| {
+        let current = job.is_some_and(|me| {
+            state
+                .lesson_jobs
+                .lock()
+                .unwrap()
+                .get(&lesson.id)
+                .is_some_and(|h| h.id() == me)
+        });
+        if !current {
+            return;
+        }
+        let mut showing = lesson.clone();
+        match wait {
+            Some(wait) => {
+                showing.body_md = waiting_line(&wait);
+                shown.store(true, Ordering::SeqCst);
+            }
+            None if shown.swap(false, Ordering::SeqCst) => {}
+            None => return,
+        }
+        showing.updated_at = Utc::now();
+        state.emit_lesson(&showing);
+    })
+}
+
+/// The waits of a job a chat's turn runs (the outline planner inside
+/// `propose_course`): `Chat.waiting` while its turn is in progress, as the agent's own
+/// waits show (until when, why, with Stop).
+pub fn chat_waits(state: &AppState, chat_id: &str) -> JobWait {
+    let state = state.clone();
+    let chat_id = chat_id.to_string();
+    ordered_waits(move |wait| {
+        let (state, chat_id) = (state.clone(), chat_id.clone());
+        async move {
+            if let Err(e) = set_chat_waiting(&state, &chat_id, wait).await {
+                tracing::warn!("couldn't show the wait on chat {chat_id}: {e:#}");
+            }
+        }
+    })
+}
+
+async fn set_chat_waiting(
+    state: &AppState,
+    chat_id: &str,
+    waiting: Option<Waiting>,
+) -> anyhow::Result<()> {
+    let _w = state.write_lock.lock().await;
+    let Some(mut chat) = state.store.get::<Chat>(db::CHAT, chat_id).await? else {
+        return Ok(());
+    };
+    // A turn that ended meanwhile cleared its wait; don't show one after it.
+    if (waiting.is_some() && !chat.state.is_busy()) || chat.waiting == waiting {
+        return Ok(());
+    }
+    chat.waiting = waiting;
+    chats::save_chat_locked(state, &mut chat).await
 }
 
 /// Saves the streamed text every second so a library reload shows progress.

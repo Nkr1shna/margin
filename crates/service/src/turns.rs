@@ -2,9 +2,9 @@
 //! stores what it produces (`ServiceSink`), and handles stop, continue, confirmations,
 //! the pending message and recovery. See `docs/agent-contract.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,9 +17,9 @@ use margin_agent::{
 };
 use margin_ai::{
     AiError, CallOptions, InputPart, ModelInfo, ModelRequest, ModelStream, ProviderConfig,
-    ProviderKind, TextModel, TextOutput,
+    ProviderKind, Retrying, TextModel, TextOutput,
 };
-use margin_shared::context::TraceKind;
+use margin_shared::context::{Compaction, TraceKind};
 use margin_shared::pipeline::Route;
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
@@ -100,6 +100,9 @@ pub struct Turns {
     /// `(provider, base_url)`s that rejected server-side compaction since the service
     /// started (D3): their turns condense locally.
     pub no_server_compaction: Mutex<HashSet<(Provider, String)>>,
+    /// turn id → step → the compaction the loop reported (`TurnSink::compaction`) for a
+    /// step whose `model_call` row hasn't started yet; dropped when the turn ends.
+    pub compactions: Mutex<HashMap<Id, BTreeMap<u32, Compaction>>>,
     /// chat id → who hears about its items (the chat's audience, L1 D8), kept by
     /// `chats::save_chat_locked` so streaming deltas need no store read.
     pub audiences: Mutex<HashMap<Id, Vec<String>>>,
@@ -119,6 +122,7 @@ impl Turns {
             title_model: Mutex::new(None),
             titled: Mutex::new(HashSet::new()),
             no_server_compaction: Mutex::new(HashSet::new()),
+            compactions: Mutex::new(HashMap::new()),
             audiences: Mutex::new(HashMap::new()),
         }
     }
@@ -462,6 +466,7 @@ async fn run_as(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef, ac
     .catch_unwind()
     .await;
     drop(slot.lock().unwrap().take());
+    state.turns.compactions.lock().unwrap().remove(&turn_id);
     let (outcome, early) = match result {
         Ok(Ok(outcome)) => (outcome, None),
         Ok(Err(early)) => (
@@ -682,13 +687,20 @@ async fn small_text_model(
             (chat_config.clone(), chat_config.models.small.clone())
         }
     };
-    Arc::new(TracedText {
+    let traced = TracedText {
         inner: state.generator.text_model(&config),
         trace: trace.clone(),
         model,
         provider: config.provider.as_str(),
         purpose: "condense",
-    })
+    };
+    // Retried silently (a side call; the turn shows its own waits): each attempt is its
+    // own `model_call` row.
+    Arc::new(Retrying::new(
+        traced,
+        crate::ask::job_backoff(state),
+        Box::new(|_| {}),
+    ))
 }
 
 /// The agent client of `config`; on ChatGPT, one that refreshes the plan token once and
@@ -1810,6 +1822,21 @@ impl TurnSink for ServiceSink {
     fn clear_waiting(&self) -> BoxFuture<'_, Result<(), SinkError>> {
         Box::pin(self.set_waiting(None))
     }
+
+    /// Kept for step `step`'s `model_call` row (`TraceRow.compaction`), stamped when
+    /// that row starts (`TracedModel::span`); a later report for the same step replaces
+    /// an earlier one.
+    fn compaction(&self, step: u32, kind: Compaction) {
+        tracing::debug!(chat = %self.chat_id, step, ?kind, "history shortened");
+        self.state
+            .turns
+            .compactions
+            .lock()
+            .unwrap()
+            .entry(self.turn_id.clone())
+            .or_default()
+            .insert(step, kind);
+    }
 }
 
 impl ServiceSink {
@@ -1932,19 +1959,25 @@ async fn ask_title(
         Some(make) => make(&small.config),
         None => state.generator.text_model(&small.config),
     };
-    let model = TracedText {
-        inner,
-        trace: TurnTrace::new(
-            state,
-            chat_id,
-            turn_id,
-            None,
-            &chat_actor(state, chat_id).await,
-        ),
-        model: small.model.clone(),
-        provider: small.config.provider.as_str(),
-        purpose: "title",
-    };
+    // Retried silently (a side call): each attempt is its own `model_call` row; when
+    // the retries run out the first-line title stays.
+    let model = Retrying::new(
+        TracedText {
+            inner,
+            trace: TurnTrace::new(
+                state,
+                chat_id,
+                turn_id,
+                None,
+                &chat_actor(state, chat_id).await,
+            ),
+            model: small.model.clone(),
+            provider: small.config.provider.as_str(),
+            purpose: "title",
+        },
+        crate::ask::job_backoff(state),
+        Box::new(|_| {}),
+    );
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
     let mut opts = CallOptions::new(Route::Small)
@@ -1967,8 +2000,11 @@ async fn ask_title(
 }
 
 /// A title from the model's reply: its first line without quotes or an ending period,
-/// cut like a first-line title (`chats::title_from`). `None` when nothing is left.
+/// cut like a first-line title (`chats::title_from`), normalised first
+/// (`text::for_model`: the model may have copied hidden characters from the chat's
+/// sources). `None` when nothing is left.
 pub fn model_title(reply: &str) -> Option<String> {
+    let reply = margin_shared::text::for_model(reply);
     let line = reply.trim().lines().next().unwrap_or("");
     let quotes: &[char] = &['"', '\'', '“', '”', '‘', '’', '«', '»', '`', '*'];
     let line = line.trim().trim_matches(quotes).trim();
@@ -2011,6 +2047,18 @@ impl TurnTrace {
             pipeline_hash: state.pipeline.load().hash.clone(),
             actor: actor.to_string(),
         }
+    }
+
+    /// The compaction the loop reported for step `step` of this turn, taken for its
+    /// `model_call` row (`Turns.compactions`).
+    fn take_compaction(&self, step: u32) -> Option<Compaction> {
+        let mut all = self.state.turns.compactions.lock().unwrap();
+        let steps = all.get_mut(&self.turn_id)?;
+        let kind = steps.remove(&step);
+        if steps.is_empty() {
+            all.remove(&self.turn_id);
+        }
+        kind
     }
 
     /// A row of `kind` under the turn.
@@ -2107,6 +2155,10 @@ pub struct TracedModel {
     provider: &'static str,
     purpose: Option<Purpose>,
     steps: AtomicU32,
+    /// The last step call failed before any output: the loop retries that step (after
+    /// a wait, a too-long condense or a compaction rejection), so the next step call
+    /// keeps its number.
+    step_failed: Arc<AtomicBool>,
     /// Where the loop's condense calls go: the small-tasks route
     /// (`pipeline.routes.small`), when it differs from the turn's.
     small: Option<SmallRoute>,
@@ -2134,6 +2186,7 @@ impl TracedModel {
             provider,
             purpose,
             steps: AtomicU32::new(0),
+            step_failed: Arc::new(AtomicBool::new(false)),
             small: None,
         }
     }
@@ -2169,7 +2222,16 @@ impl TracedModel {
                 row.prompt_version = Some(req.opts.prompt_version.clone().unwrap_or_else(|| {
                     trace::prompt_version("agent", margin_agent::system_prompt())
                 }));
-                row.step = Some(self.steps.fetch_add(1, Ordering::Relaxed) + 1);
+                // A retried step keeps the loop's step number (its first attempt's row
+                // already took the step's compaction, if any).
+                let step = if self.step_failed.swap(false, Ordering::Relaxed) {
+                    self.steps.load(Ordering::Relaxed).max(1)
+                } else {
+                    self.steps.fetch_add(1, Ordering::Relaxed) + 1
+                };
+                row.step = Some(step);
+                // A local condense reported before this step's call.
+                row.compaction = self.trace.take_compaction(step);
             }
             None => {
                 // The loop's condense call: its system prompt is its fixed
@@ -2197,12 +2259,19 @@ impl ModelClient for TracedModel {
                 span.row.model = Some(small.model.clone());
                 span.row.provider = Some(small.provider.to_string());
             }
+            let is_step = span.row.step.is_some();
             match client.stream(req).await {
-                Ok(stream) => Ok(
-                    Box::pin(TracedStream::new(stream, span, self.trace.state.clone()))
-                        as ModelStream,
-                ),
+                Ok(stream) => {
+                    let mut traced = TracedStream::new(stream, span, self.trace.state.clone());
+                    if is_step {
+                        traced = traced.flag_failure_without_output(self.step_failed.clone());
+                    }
+                    Ok(Box::pin(traced) as ModelStream)
+                }
                 Err(e) => {
+                    if is_step {
+                        self.step_failed.store(true, Ordering::Relaxed);
+                    }
                     span.fail(&self.trace.state.tracer, trace::ai_error_code(&e));
                     Err(e)
                 }
@@ -2299,5 +2368,18 @@ mod tests {
         let long = model_title(&"word ".repeat(30)).unwrap();
         assert_eq!(long.chars().count(), margin_shared::CHAT_TITLE_MAX);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn model_titles_are_normalised() {
+        // Bidi overrides, zero-width characters and controls go; the visible text stays.
+        assert_eq!(
+            model_title("\u{202E}Fou\u{200B}rier\u{0007} series\u{202C}.").as_deref(),
+            Some("Fourier series")
+        );
+        // Only invisible characters: no title.
+        assert_eq!(model_title("\u{200B}\u{FEFF}\u{202E}"), None);
+        // NFC: a decomposed é is stored composed.
+        assert_eq!(model_title("Caf\u{0065}\u{0301}").as_deref(), Some("Café"));
     }
 }

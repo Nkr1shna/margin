@@ -8,12 +8,12 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use margin_shared::{ReasoningEffort, Usage};
 use serde_json::{Value, json};
 
+pub use crate::model::Backoff;
 use crate::model::{
     BoxFuture, Delta, ItemView, ModelEvent, ModelInfo, ModelItem, ModelRequest, ModelStream, Next,
     Provider, ProviderKind, StartKind, ToolChoice, ToolDef,
@@ -343,49 +343,6 @@ impl ResponsesClient {
                 },
             }
         }
-    }
-}
-
-/// How a failed model call is retried: `retries` more attempts after the first, each
-/// after the pause the API asked for (`Retry-After`) or else `base_delay · 2^n`, capped
-/// at `max_delay`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Backoff {
-    pub retries: u32,
-    pub base_delay: Duration,
-    pub max_delay: Duration,
-}
-
-impl Default for Backoff {
-    /// 3 retries, 2 s doubling up to 60 s.
-    fn default() -> Self {
-        Self {
-            retries: 3,
-            base_delay: Duration::from_secs(2),
-            max_delay: Duration::from_secs(60),
-        }
-    }
-}
-
-impl Backoff {
-    /// The pause before the next attempt after `err`, where `attempt` counts the retries
-    /// already made; `None` when `err` isn't worth retrying or the retries are used up.
-    /// A `Retry-After` from the API is honoured up to `max_delay`. (The agent loop's
-    /// `RetryPolicy` no longer caps it: a turn waits as asked and its chat says so.)
-    pub fn delay(&self, attempt: u32, err: &AiError) -> Option<Duration> {
-        if attempt >= self.retries || !err.is_retryable() {
-            return None;
-        }
-        if let Some(after) = err.retry_after() {
-            return Some(after.min(self.max_delay));
-        }
-        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
-        Some(
-            self.base_delay
-                .checked_mul(factor)
-                .unwrap_or(self.max_delay)
-                .min(self.max_delay),
-        )
     }
 }
 

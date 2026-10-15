@@ -56,6 +56,11 @@ pub const TRACE: &str = "trace";
 /// Hourly and daily rollups of `trace`, as table views.
 pub const TRACE_HOURLY: &str = "trace_hourly";
 pub const TRACE_DAILY: &str = "trace_daily";
+/// The version of the stored data's shape this build writes (`SettingsRow.schema_version`):
+/// bumped when a `DEFINE` or a one-pass migration changes. A store with a higher one
+/// refuses to serve; a lower one is backed up, then migrated (`docs/phase5-brief.md` D5).
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
 
@@ -199,6 +204,8 @@ DEFINE FIELD IF NOT EXISTS embed_ms       ON trace TYPE option<number>;
 DEFINE FIELD IF NOT EXISTS via            ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS query          ON trace TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS read_range     ON trace TYPE option<array<int>>;
+DEFINE FIELD IF NOT EXISTS compaction     ON trace TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS provider_ms    ON trace TYPE option<number>;
 DEFINE INDEX IF NOT EXISTS trace_trace_id ON trace FIELDS trace_id;
 "#;
 
@@ -329,6 +336,102 @@ impl Store {
             .await
             .context("couldn't start the in-memory database")?;
         Self::init(db).await
+    }
+
+    /// Opens the on-disk database in `dir` as it is: no `DEFINE`, no index or view
+    /// change, no row written. For reading the stored schema version before this build
+    /// decides whether it may migrate the data (`restore::open_guarded`), and for
+    /// checking a copy of a backup (`restore::check_data`). `None` when `dir` holds no
+    /// Margin database (no namespace and database `margin`).
+    pub async fn open_existing(dir: &Path) -> anyhow::Result<Option<Self>> {
+        let db = Surreal::new::<SurrealKv>(dir.to_path_buf())
+            .await
+            .context("couldn't open the database")?;
+        let mut res = db
+            .query("INFO FOR ROOT")
+            .await
+            .context("couldn't read the database's namespaces")?
+            .check()
+            .context("couldn't read the database's namespaces")?;
+        let root: surrealdb::types::Value = res.take(0)?;
+        if !has_key(&root.into_json_value(), "namespaces", "margin") {
+            return Ok(None);
+        }
+        db.use_ns("margin")
+            .await
+            .context("couldn't select the namespace")?;
+        let mut res = db
+            .query("INFO FOR NS")
+            .await
+            .context("couldn't read the namespace")?
+            .check()
+            .context("couldn't read the namespace")?;
+        let ns: surrealdb::types::Value = res.take(0)?;
+        if !has_key(&ns.into_json_value(), "databases", "margin") {
+            return Ok(None);
+        }
+        db.use_ns("margin")
+            .use_db("margin")
+            .await
+            .context("couldn't select the database")?;
+        Ok(Some(Self { db }))
+    }
+
+    /// The tables defined in the database.
+    pub async fn table_names(&self) -> anyhow::Result<Vec<String>> {
+        let info: Vec<serde_json::Value> = self.query_rows("INFO FOR DB", vec![]).await?;
+        let mut names: Vec<String> = info
+            .first()
+            .and_then(|i| i.get("tables"))
+            .and_then(|t| t.as_object())
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        Ok(names)
+    }
+
+    /// The settings row's `schema_version` as stored: `None` without a settings row (a
+    /// new store), 0 for a row written before the field existed.
+    pub async fn stored_schema_version(&self) -> anyhow::Result<Option<u32>> {
+        if !self.table_names().await?.iter().any(|t| t == SETTINGS) {
+            return Ok(None);
+        }
+        let Some(found) = self
+            .get::<serde_json::Value>(SETTINGS, crate::state::SETTINGS_ID)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let version = found
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(Some(u32::try_from(version).unwrap_or(u32::MAX)))
+    }
+
+    /// Stamps `SCHEMA_VERSION` on the settings row when there is one (a new store gets
+    /// it with its first settings row, `SettingsRow::default`).
+    pub async fn record_schema_version(&self) -> anyhow::Result<()> {
+        if self
+            .get::<serde_json::Value>(SETTINGS, crate::state::SETTINGS_ID)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.retrying(|| {
+            self.db
+                .query("UPDATE $rid SET doc.schema_version = $v RETURN NONE")
+                .bind((
+                    "rid",
+                    RecordId::new(SETTINGS, crate::state::SETTINGS_ID.to_string()),
+                ))
+                .bind(("v", SCHEMA_VERSION))
+                .into_future()
+        })
+        .await
+        .context("couldn't record the schema version")?;
+        Ok(())
     }
 
     async fn init(db: Surreal<Db>) -> anyhow::Result<Self> {
@@ -902,6 +1005,13 @@ impl Store {
             .with_context(|| format!("couldn't remove the table {table}"))?;
         Ok(())
     }
+}
+
+/// Whether an `INFO FOR …` result lists `name` under `section`.
+fn has_key(info: &serde_json::Value, section: &str, name: &str) -> bool {
+    info.get(section)
+        .and_then(|s| s.as_object())
+        .is_some_and(|s| s.contains_key(name))
 }
 
 /// `table:[$f0, …]..=[$t0, …]` and the parameters it names.

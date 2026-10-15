@@ -59,6 +59,77 @@ pub struct Config {
     /// GitHub Environment secrets. Unset, `SECRETS_FILE` beside `data_dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets_file: Option<PathBuf>,
+    /// `[alerts]`: the thresholds the alert job compares the last window of traces with
+    /// (`docs/phase5-brief.md` D6). Every key has a default.
+    #[serde(default)]
+    pub alerts: AlertConfig,
+}
+
+/// `[alerts]` in `service.toml` (`docs/phase5-brief.md` D6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertConfig {
+    /// The window each tick looks back over.
+    pub window_minutes: u32,
+    /// Fewer calls of a kind than this in the window raise nothing (an idle service).
+    pub min_calls: u32,
+    /// Share of failed rows (`ok: false`) per kind.
+    pub error_rate_max: f64,
+    /// 95th percentile of `duration_ms` per kind.
+    pub p95_ms: AlertP95,
+    /// Share of model calls that ended `rate_limited`.
+    pub rate_limited_share_max: f64,
+    /// Documents waiting in the ingest queue.
+    pub ingest_backlog_max: u32,
+    /// Resident memory; `None`: the systemd unit's `MemoryMax` less 10 %, or no alert
+    /// when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_bytes_max: Option<u64>,
+    /// HTTP 5xx answers in the window.
+    pub http_5xx_per_window_max: u32,
+    /// An alert clears after this long without a breach.
+    pub clear_after_minutes: u32,
+    /// Each rise and clear is `POST`ed here as JSON (10 s timeout, no retry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            window_minutes: 15,
+            min_calls: 5,
+            error_rate_max: 0.2,
+            p95_ms: AlertP95::default(),
+            rate_limited_share_max: 0.3,
+            ingest_backlog_max: 50,
+            rss_bytes_max: None,
+            http_5xx_per_window_max: 5,
+            clear_after_minutes: 30,
+            webhook_url: None,
+        }
+    }
+}
+
+/// `[alerts.p95_ms]`: the 95th-percentile duration per trace kind, in ms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertP95 {
+    pub model_call: f64,
+    pub retrieval: f64,
+    pub tool_call: f64,
+    pub ingest: f64,
+}
+
+impl Default for AlertP95 {
+    fn default() -> Self {
+        Self {
+            model_call: 90_000.0,
+            retrieval: 400.0,
+            tool_call: 30_000.0,
+            ingest: 120_000.0,
+        }
+    }
 }
 
 fn default_public_url() -> String {
@@ -127,6 +198,7 @@ impl Default for Config {
             embedder: default_embedder(),
             secrets: default_secrets(),
             secrets_file: None,
+            alerts: AlertConfig::default(),
         }
     }
 }
@@ -420,6 +492,26 @@ mod tests {
         // A config from before deploys is the owner's own instance: prod.
         assert_eq!(c.environment, "prod");
         c.validate_for_serving().unwrap();
+    }
+
+    #[test]
+    fn alerts_default_and_parse() {
+        let c: Config = toml::from_str("github_client_id = \"abc\"").unwrap();
+        assert_eq!(c.alerts, AlertConfig::default());
+        assert_eq!(c.alerts.min_calls, 5);
+        assert_eq!(c.alerts.p95_ms.retrieval, 400.0);
+        let c: Config = toml::from_str(
+            "github_client_id = \"abc\"\n[alerts]\nerror_rate_max = 0.5\nwebhook_url = \"https://ntfy.example/margin\"\n[alerts.p95_ms]\nretrieval = 250\n",
+        )
+        .unwrap();
+        assert_eq!(c.alerts.error_rate_max, 0.5);
+        assert_eq!(c.alerts.p95_ms.retrieval, 250.0);
+        assert_eq!(c.alerts.p95_ms.model_call, 90_000.0);
+        assert_eq!(c.alerts.min_calls, 5);
+        assert_eq!(
+            c.alerts.webhook_url.as_deref(),
+            Some("https://ntfy.example/margin")
+        );
     }
 
     #[test]

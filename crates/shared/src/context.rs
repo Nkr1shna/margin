@@ -293,16 +293,21 @@ pub enum TraceKind {
     Ingest,
     JobStep,
     Turn,
+    /// An alert rising or clearing (`docs/phase5-brief.md` D6): `error_code` is the
+    /// alert's name, `ok: false` when it rose and `true` when it cleared,
+    /// `duration_ms` the value that crossed the threshold.
+    Alert,
 }
 
 impl TraceKind {
-    pub const ALL: [TraceKind; 6] = [
+    pub const ALL: [TraceKind; 7] = [
         TraceKind::ModelCall,
         TraceKind::Retrieval,
         TraceKind::ToolCall,
         TraceKind::Ingest,
         TraceKind::JobStep,
         TraceKind::Turn,
+        TraceKind::Alert,
     ];
 
     /// The first element of a trace row's array id.
@@ -314,8 +319,19 @@ impl TraceKind {
             TraceKind::Ingest => "ingest",
             TraceKind::JobStep => "job_step",
             TraceKind::Turn => "turn",
+            TraceKind::Alert => "alert",
         }
     }
+}
+
+/// How a model call's history was shortened (`TraceRow.compaction`): the provider
+/// compacted it server-side (its output carried a compaction item), or Margin condensed
+/// it locally before the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compaction {
+    Server,
+    Condensed,
 }
 
 /// Token counts of one model call.
@@ -409,6 +425,14 @@ pub struct TraceRow {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub step: Option<u32>,
+    /// Set on the step whose output carried a compaction item, or that followed a
+    /// local condense.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<Compaction>,
+    /// The provider's own time within `duration_ms` (first byte to last event), so
+    /// `duration_ms − provider_ms` is Margin's overhead per step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ms: Option<f64>,
 
     // Retrievals.
     #[serde(default)]
@@ -490,6 +514,8 @@ impl TraceRow {
             cost_usd: None,
             stop_reason: None,
             step: None,
+            compaction: None,
+            provider_ms: None,
             query_hash: None,
             scope: None,
             legs: None,
@@ -561,6 +587,50 @@ pub struct TraceRollup {
     pub cost_usd: f64,
     #[serde(default)]
     pub mean_ms: f64,
+    /// The bucket's 95th percentile of `duration_ms`; `None` where the store can't
+    /// compute it (rollups kept from deleted rows, or before phase 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Alerts (`docs/phase5-brief.md` D6)
+// ---------------------------------------------------------------------------
+
+/// A threshold from `[alerts]` in `service.toml` that the last window crossed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    /// `error_rate`, `p95_ms`, `rate_limited_share`, `ingest_backlog`, `rss_bytes`,
+    /// `http_5xx`.
+    pub name: String,
+    /// The trace kind it's about; `None` for the service-wide ones (backlog, memory,
+    /// HTTP errors).
+    #[serde(default)]
+    pub kind: Option<TraceKind>,
+    pub value: f64,
+    pub threshold: f64,
+    /// When it rose.
+    pub since: DateTime<Utc>,
+    /// The last tick that still saw it crossed.
+    pub last_seen: DateTime<Utc>,
+}
+
+/// An alert rising (`raised: true`) or clearing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertEvent {
+    pub alert: Alert,
+    pub raised: bool,
+    pub at: DateTime<Utc>,
+}
+
+/// `GET routes::ALERTS`: the alerts now active and the last rises and clears, newest
+/// first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AlertList {
+    #[serde(default)]
+    pub active: Vec<Alert>,
+    #[serde(default)]
+    pub recent: Vec<AlertEvent>,
 }
 
 #[cfg(test)]
@@ -701,6 +771,61 @@ mod tests {
             output: 1,
             cost_usd: 0.5,
             mean_ms: 12.5,
+            p95_ms: Some(40.0),
         });
+    }
+
+    #[test]
+    fn phase5_trace_fields_are_additive() {
+        let mut row = TraceRow::new(TraceKind::ModelCall, "01J1", at());
+        row.compaction = Some(Compaction::Condensed);
+        row.provider_ms = Some(812.5);
+        let json = round_trip(&row);
+        assert_eq!(json["compaction"], "condensed");
+        let plain = serde_json::to_value(TraceRow::new(TraceKind::Turn, "x", at())).unwrap();
+        assert!(plain.get("compaction").is_none());
+        assert!(plain.get("provider_ms").is_none());
+        // A row written before phase 5 parses without them.
+        let old: TraceRow = serde_json::from_value(json!({
+            "id": "x", "kind": "model_call", "at": "2025-10-09T08:53:20Z",
+            "duration_ms": 10.0, "step": 2
+        }))
+        .unwrap();
+        assert_eq!((old.compaction, old.provider_ms), (None, None));
+        assert_eq!(TraceKind::Alert.as_str(), "alert");
+        assert_eq!(serde_json::to_value(TraceKind::Alert).unwrap(), "alert");
+        assert!(TraceKind::ALL.contains(&TraceKind::Alert));
+        let old_rollup: TraceRollup = serde_json::from_value(json!({
+            "kind": "retrieval", "bucket": "2025-10-09T08:00:00Z", "calls": 2
+        }))
+        .unwrap();
+        assert_eq!(old_rollup.p95_ms, None);
+    }
+
+    #[test]
+    fn alerts_round_trip() {
+        let alert = Alert {
+            name: "error_rate".into(),
+            kind: Some(TraceKind::ModelCall),
+            value: 0.4,
+            threshold: 0.2,
+            since: at(),
+            last_seen: at(),
+        };
+        let json = round_trip(&alert);
+        assert_eq!(json["kind"], "model_call");
+        round_trip(&AlertList {
+            active: vec![alert.clone()],
+            recent: vec![AlertEvent {
+                alert: Alert {
+                    kind: None,
+                    ..alert
+                },
+                raised: true,
+                at: at(),
+            }],
+        });
+        let empty: AlertList = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, AlertList::default());
     }
 }
