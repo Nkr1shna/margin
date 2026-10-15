@@ -7,8 +7,9 @@
 //! cargo run -p margin-app --example render_screens -- /chat/c1 out.html dark
 //! ```
 //!
-//! The sample chats are `c1` (an answered conversation with a tool call and passages)
-//! and `c2` (interrupted); `/` is a new chat.
+//! The sample chats are `c1` (an answered conversation with a tool call and passages),
+//! `c2` (interrupted) and `c3` (on Claude: a web search and a cited answer); `/` is a
+//! new chat.
 //!
 //! Optional environment, for screens that open over the routes:
 //! - `RENDER_SETTINGS=<pane>` opens Settings at a pane (`sources`, `ai`, …).
@@ -24,10 +25,18 @@
 //!   Markdown note and 2: a script open on their cited lines in the file);
 //!   `RENDER_VIEWER=folder` (or `folder-gone`) on a passage of a folder's PDF (or of a
 //!   file whose folder was removed).
-//! - `RENDER_PIPELINE=changed` sets the three model slots and a changed pipeline budget
-//!   (Settings → AI, `RENDER_SETTINGS=ai`; Reset to default is offered then), and the
-//!   hybrid variant's stages with `take-k` packing ("Custom" in the variant picker).
-//!   Settings → AI always shows the stage pickers, over the fake's variants.
+//! - `RENDER_PIPELINE=changed` sets OpenAI's three model slots, a variant's override of
+//!   the small-tasks route and a changed pipeline budget (Settings → AI,
+//!   `RENDER_SETTINGS=ai`; Reset to default is offered then), and the hybrid variant's
+//!   stages with `take-k` packing ("Custom" in the variant picker). Settings → AI always
+//!   shows the stage pickers, over the fake's variants, and each provider's models (with
+//!   their windows) where it has a credential.
+//! - `RENDER_PROVIDER=claude` makes Claude the default provider, with its key set (the new
+//!   chat's picker preset to it; `RENDER_PROVIDER=claude-nokey` without the key, so the
+//!   new chat says to set it up). Chat `c3` is on Claude, with a web search, its results
+//!   card and an answer citing the pages.
+//! - `RENDER_CHATGPT=waiting|signed_in|failed` sets where "Sign in with ChatGPT" is
+//!   (Settings → AI); signed in, ChatGPT can be picked for a new chat.
 //! - `RENDER_SETTINGS=advanced` shows trace retention.
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
@@ -151,8 +160,11 @@ fn Harness(props: HarnessProps) -> Element {
         if std::env::var("RENDER_PIPELINE").as_deref() == Ok("changed")
             && let Some(settings) = lib.settings.as_mut()
         {
-            settings.agent_model = Some("gpt-6.1-sol".into());
-            settings.pipeline.routes.write = Some("gpt-6".into());
+            settings.openai_models = margin_shared::RouteModels {
+                chat: "gpt-6.1-sol".into(),
+                write: "gpt-6-astra".into(),
+                small: "gpt-6-luna".into(),
+            };
             settings.pipeline.routes.small = Some("gpt-6-luna".into());
             settings.pipeline.budget.share_of_window = 0.75;
             settings.pipeline.budget.images_max = 24;
@@ -162,6 +174,39 @@ fn Harness(props: HarnessProps) -> Element {
                     .pipeline
                     .with_stages_of(&hybrid.config)
                     .with_stage("packer", "take-k");
+            }
+        }
+        if let Some(settings) = lib.settings.as_mut() {
+            match std::env::var("RENDER_PROVIDER").as_deref() {
+                Ok("claude") => {
+                    settings.default_provider = margin_shared::Provider::Claude;
+                    settings.has_claude_api_key = true;
+                }
+                Ok("claude-nokey") => settings.default_provider = margin_shared::Provider::Claude,
+                _ => {}
+            }
+            let status = match std::env::var("RENDER_CHATGPT").as_deref() {
+                Ok("waiting") => Some(margin_shared::ChatGptStatus::Waiting {
+                    authorize_url: "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client&agent_name_hint=Margin&response_type=code&state=st-1&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback".into(),
+                }),
+                Ok("signed_in") => {
+                    let account = fake::fake_account("owner@example.com");
+                    settings.chatgpt = Some(account.clone());
+                    Some(margin_shared::ChatGptStatus::SignedIn { account })
+                }
+                Ok("failed") => Some(margin_shared::ChatGptStatus::Failed {
+                    message: "The sign-in was cancelled in the browser.".into(),
+                }),
+                _ => None,
+            };
+            let settings = settings.clone();
+            lib.chatgpt = status;
+            // Each provider's models, where it has a key or a sign-in (the fetch that
+            // fills them doesn't run here).
+            for p in margin_shared::Provider::ALL {
+                if settings.has_credential(p) {
+                    lib.provider_models.insert(p, fake::fake_models(p));
+                }
             }
         }
         lib.pipeline_variants = Some(fake::fake_pipeline_variants());

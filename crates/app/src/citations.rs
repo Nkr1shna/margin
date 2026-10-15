@@ -1,8 +1,9 @@
 //! Citations in a lesson: their order, how their place in a source reads ("p. 3",
 //! "1:05–1:20"), and what the source viewer shows for one. Pure data: no Dioxus here, so
-//! it is unit-tested directly.
+//! it is unit-tested directly. The web pages a chat answer cites (numbered, with the
+//! markers placed in the answer's text) are here too.
 
-use margin_shared::{Citation, SourceKind, TranscriptSegment};
+use margin_shared::{Citation, SourceKind, TranscriptSegment, WebCitation};
 
 /// The lesson's citations by number, each number once (the first wins).
 pub fn ordered(citations: &[Citation]) -> Vec<Citation> {
@@ -426,6 +427,178 @@ pub fn transcript(c: &Citation, all: &[Citation]) -> Vec<Segment> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Web citations: the pages a hosted web tool cited in a chat answer
+// (`AssistantText.citations`, `docs/agent-providers-brief.md` D8).
+// ---------------------------------------------------------------------------
+
+/// A page an answer cites, numbered by first appearance: one number per address, however
+/// many passages of it are cited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSource {
+    pub n: u32,
+    pub url: String,
+    /// The page's title, else its host.
+    pub title: String,
+    /// "en.wikipedia.org" (without "www.").
+    pub host: String,
+    /// The cited passages, in order, each once.
+    pub quotes: Vec<String>,
+}
+
+/// The host of `url` without "www.": "https://www.example.com/a" → "example.com"; the
+/// address itself when it has none.
+pub fn host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    if host.is_empty() {
+        url.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// The pages `citations` cite, numbered in order of first appearance.
+pub fn web_sources(citations: &[WebCitation]) -> Vec<WebSource> {
+    let mut out: Vec<WebSource> = Vec::new();
+    for c in citations {
+        let quote = c
+            .cited_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        if let Some(source) = out.iter_mut().find(|s| s.url == c.url) {
+            if let Some(q) = quote
+                && !source.quotes.iter().any(|have| have == q)
+            {
+                source.quotes.push(q.to_string());
+            }
+            continue;
+        }
+        let host = host(&c.url);
+        let title = c
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| host.clone());
+        out.push(WebSource {
+            n: out.len() as u32 + 1,
+            url: c.url.clone(),
+            title,
+            host,
+            quotes: quote.map(|q| vec![q.to_string()]).unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// A source's tooltip: its cited passages, quoted, else its address.
+pub fn web_tooltip(source: &WebSource) -> String {
+    if source.quotes.is_empty() {
+        return source.url.clone();
+    }
+    source
+        .quotes
+        .iter()
+        .map(|q| format!("“{q}”"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Where a marker for a cited span ending at byte `end` goes in `text`: on a character
+/// boundary, after the word it would split, and before the whitespace the span ends with
+/// (so a span that ends a paragraph keeps its marker in that paragraph).
+fn marker_at(text: &str, end: usize) -> usize {
+    let mut at = end.min(text.len());
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    // Don't split a word.
+    if text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+    {
+        at += text[at..]
+            .char_indices()
+            .find(|(_, c)| !c.is_alphanumeric())
+            .map_or(text.len() - at, |(i, _)| i);
+    }
+    // Back over trailing whitespace.
+    while at > 0
+        && text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        at -= text[..at].chars().next_back().map_or(1, char::len_utf8);
+    }
+    at
+}
+
+/// The answer's text with a `[^n]` marker where each cited span ends (citations that
+/// give offsets; the others are only listed under the answer). Markers at one place are
+/// in number order, each once.
+pub fn web_marked(text: &str, citations: &[WebCitation]) -> String {
+    let sources = web_sources(citations);
+    let mut marks: Vec<(usize, u32)> = citations
+        .iter()
+        .filter_map(|c| {
+            let end = c.end? as usize;
+            let n = sources.iter().find(|s| s.url == c.url)?.n;
+            Some((marker_at(text, end), n))
+        })
+        .collect();
+    marks.sort();
+    marks.dedup();
+    let mut out = String::with_capacity(text.len() + marks.len() * 4);
+    let mut from = 0;
+    for (at, n) in marks {
+        out.push_str(&text[from..at]);
+        out.push_str(&format!("[^{n}]"));
+        from = at;
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// The sources as citations the lesson renderer makes marker buttons for
+/// (`markdown::render_lesson`): numbered alike, named "Title · host".
+pub fn web_marker_citations(sources: &[WebSource]) -> Vec<Citation> {
+    sources
+        .iter()
+        .map(|s| Citation {
+            n: s.n,
+            source_id: s.url.clone(),
+            source_name: if s.title == s.host {
+                s.host.clone()
+            } else {
+                format!("{} · {}", s.title, s.host)
+            },
+            kind: SourceKind::Text,
+            page: None,
+            start_ms: None,
+            end_ms: None,
+            excerpt: s.quotes.join(" "),
+            image_url: None,
+            document_id: None,
+            start_line: None,
+            end_line: None,
+            file: None,
+            section_path: None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +989,78 @@ mod tests {
         );
         c.page = Some(4);
         assert_eq!(locator(&c).as_deref(), Some("p. 4"));
+    }
+
+    fn web(
+        url: &str,
+        title: Option<&str>,
+        quote: Option<&str>,
+        span: Option<(u32, u32)>,
+    ) -> WebCitation {
+        WebCitation {
+            url: url.into(),
+            title: title.map(String::from),
+            cited_text: quote.map(String::from),
+            start: span.map(|s| s.0),
+            end: span.map(|s| s.1),
+        }
+    }
+
+    #[test]
+    fn web_sources_number_each_page_once() {
+        assert_eq!(host("https://www.example.com/a?b#c"), "example.com");
+        assert_eq!(host("https://user@en.wikipedia.org"), "en.wikipedia.org");
+        assert_eq!(host("not a url"), "not a url");
+        let cites = [
+            web("https://a.org/x", Some("A page"), Some("one"), None),
+            web("https://b.org/", None, None, None),
+            web("https://a.org/x", Some("A page"), Some("two"), None),
+            web("https://a.org/x", Some("A page"), Some("one"), None),
+        ];
+        let sources = web_sources(&cites);
+        assert_eq!(sources.len(), 2);
+        assert_eq!((sources[0].n, sources[1].n), (1, 2));
+        assert_eq!(sources[0].quotes, vec!["one", "two"]);
+        assert_eq!(sources[1].title, "b.org");
+        assert_eq!(web_tooltip(&sources[0]), "“one”\n“two”");
+        assert_eq!(web_tooltip(&sources[1]), "https://b.org/");
+        let markers = web_marker_citations(&sources);
+        assert_eq!(markers[0].source_name, "A page · a.org");
+        assert_eq!(markers[1].source_name, "b.org");
+    }
+
+    #[test]
+    fn web_markers_go_where_cited_spans_end() {
+        let text = "First fact. Second fact.\n\nThird.";
+        let cites = [
+            web("https://a.org", None, None, Some((0, 11))),
+            web("https://b.org", None, None, Some((12, 26))),
+            // Mid-word: after the word. Same place and page twice: one marker.
+            web("https://a.org", None, None, Some((28, 30))),
+            web("https://a.org", None, None, Some((28, 30))),
+            // No offsets: listed, not marked.
+            web("https://c.org", None, None, None),
+        ];
+        assert_eq!(
+            web_marked(text, &cites),
+            "First fact.[^1] Second fact.[^2]\n\nThird[^1]."
+        );
+        // Offsets past the end or inside a character are safe.
+        let cites = [web("https://a.org", None, None, Some((0, 99)))];
+        assert_eq!(web_marked("Ünï", &cites), "Ünï[^1]");
+        let cites = [web("https://a.org", None, None, Some((0, 1)))];
+        assert_eq!(web_marked("Ü x", &cites), "Ü[^1] x");
+        // The sample answer: every marker lands at the end of its sentence.
+        let (text, cites) = crate::fake::sample_web_answer();
+        let marked = web_marked(&text, &cites);
+        assert!(
+            marked.contains("(July and October).[^1] It defined"),
+            "{marked}"
+        );
+        assert!(
+            marked.contains("into print.[^2]\n\nA year later"),
+            "{marked}"
+        );
+        assert!(marked.ends_with("Warren Weaver.[^1]"), "{marked}");
     }
 }

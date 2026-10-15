@@ -8,12 +8,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use margin_shared::{
-    AcceptProposal, ApiError, Chat, ChatDetail, ChatPatch, ConfirmRequest, Device, EmbeddingModel,
-    Id, Lesson, LessonPatch, Library, LoginState, Me, MessageSent, NewChat, NewMessage, NewNote,
-    NewTopic, NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal, SearchHit, Settings,
-    SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest, SyncManifest,
-    SyncPlan, ToolOutputText, ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace,
-    routes,
+    AcceptProposal, ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatPatch,
+    ConfirmRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library, LoginState, Me,
+    MessageSent, ModelInfo, NewChat, NewMessage, NewNote, NewTopic, NewWorkspace, Note, NotePatch,
+    PollLoginRequest, Proposal, Provider, SearchHit, Settings, SettingsPatch, Source, SourceKind,
+    SourceUpload, StartLogin, StartLoginRequest, SyncManifest, SyncPlan, ToolOutputText,
+    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -37,11 +37,19 @@ impl ApiFailure {
         self.code == "no_api_key"
     }
 
-    /// The Settings pane that fixes this error, if one does.
+    /// The Settings pane that fixes this error, if one does: a missing key or model, a
+    /// refused credential, a spend or plan limit (Settings → AI, the provider's block).
     pub fn settings_pane(&self) -> Option<crate::ui::settings::SettingsPane> {
         use crate::ui::settings::SettingsPane;
+        use margin_shared::error_code;
         match self.code.as_str() {
-            "no_api_key" | "no_model" => Some(SettingsPane::Ai),
+            error_code::NO_API_KEY
+            | error_code::NO_MODEL
+            | error_code::AUTH_FAILED
+            | error_code::SPEND_LIMIT_REACHED
+            | error_code::PLAN_LIMIT_REACHED
+            | error_code::PLAN_INELIGIBLE
+            | "not_configured" => Some(SettingsPane::Ai),
             "no_embedding_model" => Some(SettingsPane::Sources),
             c if c.contains("tool") => Some(SettingsPane::Tools),
             _ => None,
@@ -298,6 +306,28 @@ impl Api {
 
     pub async fn patch_settings(&self, body: &SettingsPatch) -> ApiResult<Settings> {
         self.patch(routes::SETTINGS, body).await
+    }
+
+    /// The models `provider` offers, with their windows when known; 409
+    /// `not_configured` while it has no key or sign-in.
+    pub async fn provider_models(&self, provider: Provider) -> ApiResult<Vec<ModelInfo>> {
+        self.get(&routes::providers_models(provider)).await
+    }
+
+    /// Where "Sign in with ChatGPT" is.
+    pub async fn chatgpt_status(&self) -> ApiResult<ChatGptStatus> {
+        self.get(routes::PROVIDERS_CHATGPT).await
+    }
+
+    /// Start a "Sign in with ChatGPT" on the service's machine: the link to open there.
+    pub async fn start_chatgpt(&self) -> ApiResult<ChatGptStart> {
+        self.post_empty(routes::PROVIDERS_CHATGPT_START).await
+    }
+
+    /// Sign Margin out of ChatGPT (the service deletes its tokens), or give up a sign-in
+    /// that is waiting.
+    pub async fn sign_out_chatgpt(&self) -> ApiResult<()> {
+        self.delete(routes::PROVIDERS_CHATGPT).await
     }
 
     /// The stages and named variants Settings can pick the pipeline from.
@@ -1865,34 +1895,52 @@ mod tests {
     #[tokio::test]
     async fn model_slots_pipeline_budget_and_trace_retention() {
         use crate::ui::settings::{
-            budget_fields, parse_budget, reset_pipeline, slot_value, slots_patch, stages_patch,
+            budget_fields, models_patch, parse_budget, reset_pipeline, stages_patch,
         };
         use margin_shared::pipeline::{Budget, PipelineConfig, Route, StageCfg};
+        use margin_shared::{Provider, RouteModels};
         let fake = FakeService::start().await;
         let api = Api::with_token(&fake.url, crate::fake::TOKEN);
         let settings = api.settings().await.unwrap();
         assert_eq!(settings.pipeline, PipelineConfig::default());
 
-        // The three slots: chats on agent_model, writing and small tasks on the routes.
-        let wanted = [
-            "gpt-6.1-sol".to_string(),
-            " gpt-6 ".to_string(),
-            "gpt-6-luna".to_string(),
-        ];
+        // The three slots of a provider, saved together (trimmed); OpenAI's writing slot
+        // is mirrored into `openai_model` for older apps. The pipeline's routes stay.
+        let wanted = RouteModels {
+            chat: "gpt-6.1-sol".into(),
+            write: " gpt-6-astra ".into(),
+            small: "gpt-6-luna".into(),
+        };
         let settings = api
-            .patch_settings(&slots_patch(&settings, &wanted))
+            .patch_settings(&models_patch(Provider::OpenAi, wanted))
             .await
             .unwrap();
-        assert_eq!(settings.agent_model.as_deref(), Some("gpt-6.1-sol"));
-        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
-        assert_eq!(
-            settings.pipeline.routes.get(Route::Small),
-            Some("gpt-6-luna")
-        );
-        assert_eq!(settings.pipeline.routes.get(Route::Chat), None);
-        assert_eq!(slot_value(&settings, Route::Write), "gpt-6");
-        // Nothing changed: nothing to send.
-        assert_eq!(slots_patch(&settings, &wanted), SettingsPatch::default());
+        assert_eq!(settings.openai_models.get(Route::Chat), "gpt-6.1-sol");
+        assert_eq!(settings.openai_models.get(Route::Write), "gpt-6-astra");
+        assert_eq!(settings.openai_model, "gpt-6-astra");
+        assert_eq!(settings.pipeline.routes.get(Route::Write), None);
+        let claude = RouteModels {
+            write: "claude-sonnet-5-5".into(),
+            ..RouteModels::claude_default()
+        };
+        let settings = api
+            .patch_settings(&models_patch(Provider::Claude, claude.clone()))
+            .await
+            .unwrap();
+        assert_eq!(settings.claude_models, claude);
+        // An empty slot is refused, naming it.
+        let err = api
+            .patch_settings(&models_patch(
+                Provider::ChatGpt,
+                RouteModels {
+                    small: " ".into(),
+                    ..RouteModels::chatgpt_default()
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert_eq!(err.message, "Choose a ChatGPT model for small tasks.");
 
         // The budget's numbers, saved with the rest of the pipeline kept.
         let mut fields = budget_fields(&settings.pipeline.budget);
@@ -1912,10 +1960,7 @@ mod tests {
             .unwrap();
         assert_eq!(settings.pipeline.budget.share_of_window, 0.75);
         assert_eq!(settings.pipeline.budget.images_max, 24);
-        assert_eq!(
-            settings.pipeline.routes.get(Route::Small),
-            Some("gpt-6-luna")
-        );
+        assert_eq!(settings.pipeline.routes, Default::default());
         assert_ne!(settings.pipeline.hash(), PipelineConfig::default().hash());
 
         // A stage the service doesn't have is refused, naming it.
@@ -1940,7 +1985,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settings.pipeline.budget, Budget::default());
-        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
+        assert_eq!(settings.openai_models.get(Route::Write), "gpt-6-astra");
         assert_eq!(reset_pipeline(&settings.pipeline), settings.pipeline);
 
         // The stage picker: the service's choices, a variant picked and one stage changed.
@@ -1964,7 +2009,7 @@ mod tests {
         assert_eq!(settings.pipeline.retriever, hybrid.config.retriever);
         assert_eq!(settings.pipeline.fusion.name, "linear");
         assert_eq!(settings.pipeline.packer.name, "take-k");
-        assert_eq!(settings.pipeline.routes.get(Route::Write), Some("gpt-6"));
+        assert_eq!(settings.openai_models.get(Route::Write), "gpt-6-astra");
         // A variant naming a stage the service lacks is refused like any other.
         let listwise = variants
             .variants
@@ -2259,7 +2304,7 @@ mod tests {
         {
             let mut s = fake.state.lock().unwrap();
             s.has_api_key = true;
-            s.settings.openai_model = String::new();
+            s.settings.openai_models.chat = String::new();
         }
         let resumed = api.continue_chat(&id).await;
         assert!(resumed.is_ok());
@@ -2420,5 +2465,256 @@ mod tests {
             Api::anonymous("http://127.0.0.1:8787").events_url(),
             "ws://127.0.0.1:8787/api/events"
         );
+    }
+
+    /// Settings → AI's provider routes through the fake: each provider's models (409
+    /// until it has a key or a sign-in), keys sent to the service and never returned.
+    #[tokio::test]
+    async fn provider_models_and_keys() {
+        use margin_shared::Provider;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let openai = api.provider_models(Provider::OpenAi).await.unwrap();
+        assert!(
+            openai
+                .iter()
+                .any(|m| m.id == "gpt-6-luna" && m.context_window == Some(1_050_000))
+        );
+        // A model the table doesn't know: no window.
+        assert!(
+            openai
+                .iter()
+                .any(|m| m.id == "gpt-5" && m.context_window.is_none())
+        );
+        let err = api.provider_models(Provider::Claude).await.unwrap_err();
+        assert_eq!(
+            (err.status, err.code.as_str()),
+            (Some(409), "not_configured")
+        );
+        assert_eq!(
+            err.settings_pane(),
+            Some(crate::ui::settings::SettingsPane::Ai)
+        );
+        assert_eq!(
+            api.provider_models(Provider::ChatGpt)
+                .await
+                .unwrap_err()
+                .code,
+            "not_configured"
+        );
+
+        // The Claude key goes to the service once; settings only say it is there.
+        let settings = api
+            .patch_settings(&crate::ui::settings::key_patch(
+                Provider::Claude,
+                "sk-ant-test".into(),
+            ))
+            .await
+            .unwrap();
+        assert!(settings.has_claude_api_key);
+        assert!(
+            !serde_json::to_string(&settings)
+                .unwrap()
+                .contains("sk-ant-test")
+        );
+        let claude = api.provider_models(Provider::Claude).await.unwrap();
+        assert_eq!(claude[1].id, "claude-opus-5-5");
+        assert_eq!(claude[1].context_window, Some(1_000_000));
+        let settings = api
+            .patch_settings(&crate::ui::settings::key_patch(
+                Provider::Claude,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(!settings.has_claude_api_key);
+
+        // The default provider.
+        let settings = api
+            .patch_settings(&SettingsPatch {
+                default_provider: Some(Provider::Claude),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.default_provider, Provider::Claude);
+    }
+
+    /// "Sign in with ChatGPT": signed out → waiting (with the link to open on the service
+    /// Mac) → signed in, settings carrying the account; sign out; a failed sign-in.
+    #[tokio::test]
+    async fn chatgpt_sign_in_states() {
+        use margin_shared::{ChatGptStatus, Provider};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        assert_eq!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::SignedOut
+        );
+        let started = api.start_chatgpt().await.unwrap();
+        assert!(
+            started
+                .authorize_url
+                .starts_with("https://auth.openai.com/")
+        );
+        assert_eq!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::Waiting {
+                authorize_url: started.authorize_url.clone()
+            }
+        );
+        fake.state.lock().unwrap().chatgpt_finish = Some(Ok("owner@example.com".into()));
+        let ChatGptStatus::SignedIn { account } = api.chatgpt_status().await.unwrap() else {
+            panic!("not signed in");
+        };
+        assert_eq!(account.email, "owner@example.com");
+        let settings = api.settings().await.unwrap();
+        assert_eq!(
+            settings.chatgpt.as_ref().map(|a| a.email.as_str()),
+            Some("owner@example.com")
+        );
+        assert!(settings.has_credential(Provider::ChatGpt));
+        assert!(
+            !api.provider_models(Provider::ChatGpt)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        api.sign_out_chatgpt().await.unwrap();
+        assert_eq!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::SignedOut
+        );
+        assert_eq!(api.settings().await.unwrap().chatgpt, None);
+
+        api.start_chatgpt().await.unwrap();
+        fake.state.lock().unwrap().chatgpt_finish = Some(Err("The sign-in was cancelled.".into()));
+        assert_eq!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::Failed {
+                message: "The sign-in was cancelled.".into()
+            }
+        );
+        // Try again: waiting once more; Cancel gives it up.
+        api.start_chatgpt().await.unwrap();
+        assert!(matches!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::Waiting { .. }
+        ));
+        api.sign_out_chatgpt().await.unwrap();
+        assert_eq!(
+            api.chatgpt_status().await.unwrap(),
+            ChatGptStatus::SignedOut
+        );
+        assert_eq!(fake.state.lock().unwrap().chatgpt_starts, 3);
+    }
+
+    /// A chat is created on the provider asked for (else the default) and keeps it; a
+    /// web search on it leaves its row, the results card, a cited answer and the count.
+    #[tokio::test]
+    async fn chats_run_on_their_provider_with_web_search() {
+        use margin_shared::{Card, ChatItemKind, Provider, error_code};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let first_error = |items: &[margin_shared::ChatItem]| {
+            items.iter().find_map(|i| match &i.kind {
+                ChatItemKind::Error {
+                    code, retryable, ..
+                } => Some((code.clone(), *retryable)),
+                _ => None,
+            })
+        };
+        // Claude without a key: the turn stops on no_api_key, which Settings fixes.
+        let detail = api
+            .create_chat(&NewChat {
+                message: Some(message("Search the web for Shannon")),
+                provider: Some(Provider::Claude),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.chat.provider, Provider::Claude);
+        let items = api.chat(&detail.chat.id).await.unwrap().items;
+        assert_eq!(
+            first_error(&items).unwrap().0.as_deref(),
+            Some(error_code::NO_API_KEY)
+        );
+
+        api.patch_settings(&SettingsPatch {
+            anthropic_api_key: Some("sk-ant-test".into()),
+            default_provider: Some(Provider::Claude),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // No provider asked for: the default.
+        let detail = api
+            .create_chat(&NewChat {
+                message: Some(message("What's the latest on Claude Shannon's paper?")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.chat.provider, Provider::Claude);
+        let detail = api.chat(&detail.chat.id).await.unwrap();
+        let items = &detail.items;
+        assert!(items.iter().any(|i| matches!(&i.kind,
+            ChatItemKind::ToolCall { name, label, .. }
+                if name == "web_search" && label.starts_with("Searching the web for"))));
+        assert!(items.iter().any(|i| matches!(&i.kind,
+            ChatItemKind::Card { card: Card::WebResults(c), .. } if c.results.len() == 5)));
+        assert!(items.iter().any(|i| matches!(&i.kind,
+            ChatItemKind::AssistantText { citations, .. } if citations.len() == 3)));
+        assert_eq!(detail.chat.usage.web_search_requests, 1);
+        // Settings' default changing moves no chat.
+        api.patch_settings(&SettingsPatch {
+            default_provider: Some(Provider::OpenAi),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            api.chat(&detail.chat.id).await.unwrap().chat.provider,
+            Provider::Claude
+        );
+        // Signed out of ChatGPT: a chat on it stops on auth_failed.
+        let detail = api
+            .create_chat(&NewChat {
+                message: Some(message("Hello")),
+                provider: Some(Provider::ChatGpt),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let items = api.chat(&detail.chat.id).await.unwrap().items;
+        assert_eq!(
+            first_error(&items).unwrap().0.as_deref(),
+            Some(error_code::AUTH_FAILED)
+        );
+
+        // The provider refusing: the four codes, not retryable, fixed in Settings.
+        for (text, code) in [
+            ("auth failed please", error_code::AUTH_FAILED),
+            ("spend limit test", error_code::SPEND_LIMIT_REACHED),
+            ("plan limit test", error_code::PLAN_LIMIT_REACHED),
+            ("plan ineligible test", error_code::PLAN_INELIGIBLE),
+        ] {
+            let detail = api
+                .create_chat(&NewChat {
+                    message: Some(message(text)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let items = api.chat(&detail.chat.id).await.unwrap().items;
+            let (got, retryable) = first_error(&items).unwrap();
+            assert_eq!(got.as_deref(), Some(code));
+            assert!(!retryable);
+            assert_eq!(
+                crate::ui::chat::error_fix(Some(code)),
+                Some(crate::ui::settings::SettingsPane::Ai)
+            );
+        }
     }
 }
