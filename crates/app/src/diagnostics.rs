@@ -13,6 +13,8 @@
 //! - `running` (desktop): there while the app runs, removed on a clean quit (`end_run`).
 //!   Left behind, it tells the next launch the app ended some other way than a panic
 //!   (killed, a crash in native code, the machine stopping), which leaves no report.
+//!   Two copies share the folder (a development build beside the installed app): one
+//!   whose marker names a live process leaves it be, and each removes only its own.
 //!
 //! Each launch logs how the previous run ended (`PreviousRun`), so a crash is findable
 //! in `margin.log` too. The log is written straight to the file, unbuffered, so nothing
@@ -93,6 +95,7 @@ pub fn init() {
     // app can tell an unclean exit from an ordinary one.
     let previous = PreviousRun::read(&dir);
     if cfg!(feature = "desktop")
+        && !matches!(previous, PreviousRun::Running(_))
         && let Err(error) = start_run(&dir)
     {
         tracing::warn!("couldn't mark the run as started: {error}");
@@ -110,6 +113,8 @@ enum PreviousRun {
     /// It ended without a clean quit and without a panic report: the `running` marker,
     /// holding what `start_run` wrote.
     Unclean(String),
+    /// It hasn't ended: another copy of the app, this process id, is running.
+    Running(u32),
 }
 
 impl PreviousRun {
@@ -117,7 +122,10 @@ impl PreviousRun {
         if dir.join(LAST_CRASH).exists() {
             Self::Panicked
         } else if let Ok(run) = std::fs::read_to_string(dir.join(RUNNING)) {
-            Self::Unclean(run.trim().to_string())
+            match marker_pid(&run) {
+                Some(pid) if is_alive(pid) => Self::Running(pid),
+                _ => Self::Unclean(run.trim().to_string()),
+            }
         } else {
             Self::Clean
         }
@@ -134,6 +142,7 @@ impl PreviousRun {
                 "the last run ({run}) ended without quitting cleanly and left no crash report; \
                  macOS may have one in ~/Library/Logs/DiagnosticReports"
             ),
+            Self::Running(pid) => tracing::info!("another instance (pid {pid}) is running"),
         }
     }
 }
@@ -158,7 +167,43 @@ pub fn end_run() {
 }
 
 fn end_run_in(dir: &Path) {
-    let _ = std::fs::remove_file(dir.join(RUNNING));
+    let path = dir.join(RUNNING);
+    let ours = std::fs::read_to_string(&path)
+        .is_ok_and(|run| marker_pid(&run) == Some(std::process::id()));
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The process id a `running` marker names (`start_run`).
+fn marker_pid(run: &str) -> Option<u32> {
+    run.strip_prefix("pid ")?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether a process with this id is running. A reused id reads as running, which only
+/// skips one unclean-exit line.
+fn is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Record which screen is on show (a route's path, or "sign-in"), for crash reports.
@@ -579,12 +624,22 @@ mod tests {
         start_run(&dir).unwrap();
         end_run_in(&dir);
         assert_eq!(PreviousRun::read(&dir), PreviousRun::Clean);
-        // A run that was killed: the marker says which.
+        // A copy still running (here, this process): not a crash.
         start_run(&dir).unwrap();
-        let PreviousRun::Unclean(run) = PreviousRun::read(&dir) else {
-            panic!("expected an unclean exit");
-        };
-        assert!(run.starts_with(&format!("pid {}, {VERSION}", std::process::id())));
+        assert_eq!(
+            PreviousRun::read(&dir),
+            PreviousRun::Running(std::process::id())
+        );
+        // A run that was killed: the marker names a process that's gone.
+        let dead = "pid 1000000, 0.1.0 (build x), started 2026-10-15T00:00:00Z\n";
+        std::fs::write(dir.join(RUNNING), dead).unwrap();
+        assert_eq!(
+            PreviousRun::read(&dir),
+            PreviousRun::Unclean(dead.trim().to_string())
+        );
+        // Quitting leaves another process's marker alone.
+        end_run_in(&dir);
+        assert!(dir.join(RUNNING).exists());
         // A run a panic quit: its report wins over the marker it also left.
         save_crash(&dir, "report", true).unwrap();
         assert_eq!(PreviousRun::read(&dir), PreviousRun::Panicked);
