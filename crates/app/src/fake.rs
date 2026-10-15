@@ -960,10 +960,6 @@ pub fn router(fake: Fake) -> Router {
         )
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
-        .layer(axum::middleware::from_fn_with_state(
-            fake.clone(),
-            refuse_disabled,
-        ))
         .with_state(fake)
 }
 
@@ -978,18 +974,12 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// As the service's `require_principal`: a device token the fake handed out (the sample
+/// ones, or one minted at sign-in), on a device that still exists, of an active person.
 #[allow(clippy::result_large_err)]
-fn authorized(headers: &HeaderMap) -> Result<(), Response> {
-    let ok = bearer(headers).is_some_and(|t| t == TOKEN || t == TOKEN_BOB);
-    if ok {
-        Ok(())
-    } else {
-        Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Sign in again.",
-        ))
-    }
+fn authorized(fake: &Fake, headers: &HeaderMap) -> Result<(), Response> {
+    let s = fake.state.lock().unwrap();
+    caller(&s, headers).map(|_| ())
 }
 
 fn not_found() -> Response {
@@ -1031,18 +1021,46 @@ async fn auth_poll(State(fake): State<Fake>, Json(req): Json<PollLoginRequest>) 
     }
     let auto = s.auto_approve_after.is_some_and(|n| s.polls > n);
     if s.approve || auto {
-        s.token_collected = true;
         let login_as = s.login_as.clone();
-        let token = s
+        let Some(person) = s.person(&login_as).cloned() else {
+            return Json(LoginState::Denied {
+                reason: "The GitHub account isn't allowed to use this Margin. Ask an admin to \
+                         invite you."
+                    .into(),
+            })
+            .into_response();
+        };
+        // As the service's admission: a disabled person is refused at the callback.
+        if person.state == PersonState::Disabled {
+            return Json(LoginState::Denied {
+                reason: format!(
+                    "The GitHub account @{} is disabled on this Margin. Ask an admin.",
+                    person.github_login
+                ),
+            })
+            .into_response();
+        }
+        s.token_collected = true;
+        // The person's token while its device is still there; else a new device (a
+        // person disabled and enabled again signs in afresh).
+        let existing = s
             .tokens
             .iter()
-            .find(|(_, (_, person))| *person == login_as)
-            .map(|(t, _)| t.clone())
-            .unwrap_or_else(|| TOKEN.into());
-        let github_login = s
-            .person(&login_as)
-            .map(|p| p.github_login.clone())
-            .unwrap_or_default();
+            .filter(|(_, (_, p))| *p == login_as)
+            .find(|(_, (device, _))| s.devices.iter().any(|d| d.id == *device))
+            .map(|(t, _)| t.clone());
+        let token = match existing {
+            Some(t) => t,
+            None => {
+                let name = if s.device_name.is_empty() {
+                    "New device".to_string()
+                } else {
+                    s.device_name.clone()
+                };
+                s.new_device_token(&login_as, &name)
+            }
+        };
+        let github_login = person.github_login;
         return Json(LoginState::Approved {
             token,
             github_login,
@@ -1086,7 +1104,7 @@ fn fake_media(s: &FakeState, video_id: &Id) -> VideoMedia {
 }
 
 async fn library(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1100,7 +1118,7 @@ async fn create_topic(
     headers: HeaderMap,
     Json(req): Json<NewTopic>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let topic = {
@@ -1141,7 +1159,7 @@ async fn patch_topic(
     Path(id): Path<String>,
     Json(req): Json<TopicPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let topic = {
@@ -1175,7 +1193,7 @@ async fn delete_topic(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1201,7 +1219,7 @@ async fn patch_lesson(
     Path(id): Path<String>,
     Json(req): Json<LessonPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let lesson = {
@@ -1234,7 +1252,7 @@ async fn delete_lesson(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1258,7 +1276,7 @@ async fn regenerate(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (lesson, simulate) = {
@@ -1341,7 +1359,7 @@ async fn make_video(
     headers: HeaderMap,
     Path(lesson_id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (video, simulate) = {
@@ -1451,7 +1469,7 @@ async fn get_video(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1466,7 +1484,7 @@ async fn create_note(
     headers: HeaderMap,
     Json(req): Json<NewNote>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let note = {
@@ -1497,7 +1515,7 @@ async fn patch_note(
     Path(id): Path<String>,
     Json(req): Json<NotePatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let note = {
@@ -1523,7 +1541,7 @@ async fn delete_note(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -1558,7 +1576,7 @@ async fn get_proposal(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1823,7 +1841,7 @@ async fn accept(
     Path(id): Path<String>,
     Json(req): Json<AcceptProposal>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let accepted = {
@@ -1855,7 +1873,7 @@ async fn search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -1926,7 +1944,7 @@ async fn search(
 }
 
 async fn get_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -2227,7 +2245,7 @@ pub fn pipeline_variants_with(
 
 /// `GET /api/pipeline/variants`.
 async fn pipeline_variants(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let reranker = fake.state.lock().unwrap().reranker.clone();
@@ -2316,7 +2334,7 @@ async fn provider_models(
     headers: HeaderMap,
     Path(provider): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let Some(provider) = Provider::ALL.into_iter().find(|p| p.as_str() == provider) else {
@@ -2431,8 +2449,8 @@ async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Respo
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn tools(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn tools(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(vec![
@@ -2519,7 +2537,7 @@ async fn upload_source(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let kind = match check_upload(&fake, &query, body.len() as u64) {
@@ -2747,7 +2765,7 @@ async fn start_part_upload(
     headers: HeaderMap,
     Query(q): Query<StartPartsQuery>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let query = UploadQuery {
@@ -2787,7 +2805,7 @@ async fn get_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -2814,7 +2832,7 @@ async fn put_part(
     Query(q): Query<PartQuery>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let delay = fake.state.lock().unwrap().part_delay;
@@ -2854,7 +2872,7 @@ async fn finish_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let upload = {
@@ -2889,7 +2907,7 @@ async fn cancel_part_upload(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     match fake.state.lock().unwrap().part_uploads.remove(&id) {
@@ -2905,7 +2923,7 @@ async fn reprocess_source(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (source, process, workspace) = {
@@ -2950,7 +2968,7 @@ async fn source_transcript(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -3046,7 +3064,7 @@ async fn delete_source(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     {
@@ -3063,7 +3081,7 @@ async fn delete_source(
 }
 
 async fn get_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(fake.state.lock().unwrap().embedding_model()).into_response()
@@ -3282,7 +3300,7 @@ fn no_reranker_model() -> Response {
 
 /// `GET routes::RERANKER_MODEL`.
 async fn get_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -3293,9 +3311,10 @@ async fn get_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response 
 }
 
 /// `POST routes::RERANKER_MODEL_DOWNLOAD`: as the speech model's, a few steps of
-/// progress when simulating (tests drive the state themselves).
+/// progress when simulating (tests drive the state themselves). Admins only (L1), as
+/// the service has it.
 async fn download_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -3346,9 +3365,9 @@ async fn download_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Resp
     Json(model).into_response()
 }
 
-/// `DELETE routes::RERANKER_MODEL`.
+/// `DELETE routes::RERANKER_MODEL`. Admins only (L1).
 async fn delete_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     match set_reranker(
@@ -3363,7 +3382,7 @@ async fn delete_reranker(State(fake): State<Fake>, headers: HeaderMap) -> Respon
 }
 
 async fn events(State(fake): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let rx = fake.events.subscribe();
@@ -5696,7 +5715,7 @@ fn chat_detail(s: &FakeState, id: &str) -> Option<ChatDetail> {
 }
 
 async fn list_chats(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let mut chats = fake.state.lock().unwrap().chats.clone();
@@ -5709,7 +5728,7 @@ async fn create_chat(
     headers: HeaderMap,
     Json(req): Json<NewChat>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     if let Some(message) = &req.message
@@ -5774,7 +5793,7 @@ async fn get_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     match chat_detail(&fake.state.lock().unwrap(), &id) {
@@ -5789,7 +5808,7 @@ async fn patch_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let chat = {
@@ -5873,7 +5892,7 @@ async fn delete_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let orphans = {
@@ -5917,7 +5936,7 @@ async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<NewMessage>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     if let Err(r) = check_message(&req) {
@@ -5980,7 +5999,7 @@ async fn drop_pending(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let chat = {
@@ -6001,7 +6020,7 @@ async fn stop_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (events, chat) = {
@@ -6050,7 +6069,7 @@ async fn continue_chat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (chat, turn_id, text) = {
@@ -6102,7 +6121,7 @@ async fn confirm(
     Path(id): Path<String>,
     Json(req): Json<ConfirmRequest>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (events, chat, turn_id) = {
@@ -6259,7 +6278,7 @@ async fn chat_item_output(
     headers: HeaderMap,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -6276,7 +6295,7 @@ async fn chat_item_output(
 }
 
 async fn list_workspaces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     Json(fake.state.lock().unwrap().workspaces.clone()).into_response()
@@ -6287,7 +6306,7 @@ async fn create_workspace(
     headers: HeaderMap,
     Json(req): Json<NewWorkspace>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let workspace = {
@@ -6324,7 +6343,7 @@ async fn delete_workspace(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let gone: Vec<Id> = {
@@ -6548,7 +6567,7 @@ async fn sync_workspace(
     Path(id): Path<String>,
     Json(manifest): Json<SyncManifest>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let (plan, events) = {
@@ -6649,7 +6668,7 @@ async fn workspace_files(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = authorized(&fake, &headers) {
         return r;
     }
     let s = fake.state.lock().unwrap();
@@ -6672,7 +6691,8 @@ async fn workspace_files(
 // person per run), so the per-principal filter is the service's test.
 // ---------------------------------------------------------------------------
 
-/// Alice, the owner, and Bob, a member; both in engineering.
+/// Alice, the owner, and Bob, a member; both in `company` (everyone is, as the service's
+/// migration and admission make them) and in engineering.
 pub fn sample_people() -> Vec<Person> {
     vec![
         Person {
@@ -6684,7 +6704,7 @@ pub fn sample_people() -> Vec<Person> {
             avatar_url: None,
             org_role: OrgRole::Owner,
             state: PersonState::Active,
-            groups: vec!["company/engineering".into()],
+            groups: vec![ROOT_GROUP.into(), "company/engineering".into()],
             settings: PersonSettings::default(),
             created_at: ts(0),
         },
@@ -6697,7 +6717,7 @@ pub fn sample_people() -> Vec<Person> {
             avatar_url: None,
             org_role: OrgRole::Member,
             state: PersonState::Active,
-            groups: vec!["company/engineering".into()],
+            groups: vec![ROOT_GROUP.into(), "company/engineering".into()],
             settings: PersonSettings::default(),
             created_at: ts(10),
         },
@@ -6710,7 +6730,7 @@ pub fn sample_groups() -> Vec<Group> {
             path: ROOT_GROUP.into(),
             name: "Company".into(),
             source: SOURCE_MANUAL.into(),
-            members: 0,
+            members: 2,
             created_at: ts(0),
         },
         Group {
@@ -6813,7 +6833,10 @@ fn unauthorized() -> Response {
     )
 }
 
-/// The 401 a disabled person's devices get, with the sentence the sign-in screen shows.
+/// The 401 `person_disabled` the service answers a disabled person's device in the moment
+/// before its devices are deleted (`principal_for_device_token`). The fake drops a
+/// disabled person's tokens with their devices, so it only answers this for a person
+/// disabled by hand in a test's `FakeState`.
 fn disabled(person: &Person) -> Response {
     api_error(
         StatusCode::UNAUTHORIZED,
@@ -6871,26 +6894,6 @@ fn admin(s: &FakeState, headers: &HeaderMap) -> Result<Caller, Response> {
         return Err(admin_required());
     }
     Ok(caller)
-}
-
-/// A disabled person's token is refused on every route, with the service's sentence.
-async fn refuse_disabled(
-    State(fake): State<Fake>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let refused = {
-        let s = fake.state.lock().unwrap();
-        bearer(request.headers())
-            .and_then(|t| s.tokens.get(t))
-            .and_then(|(_, person)| s.person(person))
-            .filter(|p| p.state == PersonState::Disabled)
-            .map(disabled)
-    };
-    match refused {
-        Some(response) => response,
-        None => next.run(request).await,
-    }
 }
 
 /// A person as others see them: their own settings are theirs alone.
@@ -6978,45 +6981,69 @@ impl FakeState {
             handle = format!("{}-{n}", handle_for_login(login));
         }
         let invitation = self.invitations[i].clone();
+        // The invited groups and `company`; groups deleted since the invitation are
+        // skipped (`people::admit`).
+        let groups: Vec<String> = invitation
+            .groups
+            .iter()
+            .cloned()
+            .chain([ROOT_GROUP.to_string()])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|g| self.groups.iter().any(|known| known.path == *g))
+            .collect();
+        let github_id = 2000 + self.people.len() as u64;
         let person = Person {
             id: id.clone(),
             github_login: login.into(),
-            github_id: None,
+            github_id: Some(github_id),
             handle,
             name: login.into(),
             avatar_url: None,
-            org_role: invitation.role,
+            org_role: match invitation.role {
+                OrgRole::Admin => OrgRole::Admin,
+                _ => OrgRole::Member,
+            },
             state: PersonState::Active,
-            groups: invitation.groups.clone(),
+            groups,
             settings: PersonSettings::default(),
             created_at: now,
         };
         self.people.push(person.clone());
         self.invitations[i].accepted_at = Some(now);
         self.invitations[i].accepted_by = Some(id.clone());
+        let token = self.new_device_token(&id, device_name);
+        Some((person, token))
+    }
+
+    /// A new device of `person_id` named `name`, and the token it signs in with.
+    pub fn new_device_token(&mut self, person_id: &str, name: &str) -> String {
+        let now = Utc::now();
         let device = self.id("d");
         self.devices.push(Device {
             id: device.clone(),
-            name: device_name.into(),
+            name: name.into(),
             created_at: now,
             last_seen_at: Some(now),
             current: false,
             online: false,
-            person_id: Some(id.clone()),
+            person_id: Some(person_id.into()),
         });
-        let token = format!("test-device-token-{id}");
-        self.tokens.insert(token.clone(), (device, id));
-        Some((person, token))
+        let token = format!("test-device-token-{device}");
+        self.tokens
+            .insert(token.clone(), (device, person_id.to_string()));
+        token
     }
 }
 
+/// `GET /api/people`: the directory, by handle; `settings` only on the caller's own row.
 async fn list_people(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     let s = fake.state.lock().unwrap();
     let caller = match caller(&s, &headers) {
         Ok(c) => c,
         Err(r) => return r,
     };
-    let list: Vec<Person> = s
+    let mut list: Vec<Person> = s
         .people
         .iter()
         .map(|p| {
@@ -7027,7 +7054,16 @@ async fn list_people(State(fake): State<Fake>, headers: HeaderMap) -> Response {
             }
         })
         .collect();
+    list.sort_by(|a, b| a.handle.cmp(&b.handle).then_with(|| a.id.cmp(&b.id)));
     Json(list).into_response()
+}
+
+fn person_not_found() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "That person doesn't exist.",
+    )
 }
 
 async fn get_person(
@@ -7043,12 +7079,59 @@ async fn get_person(
     match s.person(&id) {
         Some(p) if p.id == caller.person.id => Json(p.clone()).into_response(),
         Some(p) => Json(public(p)).into_response(),
-        None => not_found(),
+        None => person_not_found(),
     }
 }
 
-/// `PATCH /api/people/{id}`: self for name and settings; admins for state and role;
-/// the owner alone for making or removing an admin; the owner's role and state are fixed.
+/// The service's longest display name (`people::NAME_MAX`).
+const PERSON_NAME_MAX: usize = 100;
+/// The service's longest picture address (`people::AVATAR_URL_MAX`).
+const AVATAR_URL_MAX: usize = 2048;
+
+/// A display name as the service checks it (`people::check_name`).
+#[allow(clippy::result_large_err)]
+fn checked_person_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("bad_request", "Give a name."));
+    }
+    if name.chars().count() > PERSON_NAME_MAX {
+        return Err(bad_request(
+            "bad_request",
+            &format!("A name is at most {PERSON_NAME_MAX} characters."),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// A picture address as the service checks it (`people::check_avatar_url`).
+#[allow(clippy::result_large_err)]
+fn checked_avatar_url(url: &str) -> Result<String, Response> {
+    let url = url.trim();
+    let ok = url.len() <= AVATAR_URL_MAX
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && reqwest::Url::parse(url).is_ok();
+    if !ok {
+        return Err(bad_request(
+            "bad_request",
+            "A picture is an http(s) address of an image.",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn owner_fixed() -> Response {
+    bad_request(
+        access_code::OWNER_FIXED,
+        "The organisation owner's role and state can't change.",
+    )
+}
+
+/// `PATCH /api/people/{id}`, by field as the service (`people::patch_person`): self for
+/// name, picture and settings; admins for state and role; the owner alone for any role
+/// change; the owner's own role and state are fixed (a patch that leaves them as they
+/// are is fine); nobody disables themselves. Disabling deletes the person's devices and
+/// with them their tokens.
 async fn patch_person(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7060,70 +7143,83 @@ async fn patch_person(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let Some(target) = s.person(&id).cloned() else {
-        return not_found();
-    };
-    let me = target.id == caller.person.id;
+    let is_self = id == caller.person.id;
     let personal = patch.name.is_some() || patch.avatar_url.is_some() || patch.settings.is_some();
-    if personal && !me {
+    let governing = patch.org_role.is_some() || patch.state.is_some();
+    let name = match patch.name.as_deref().map(checked_person_name).transpose() {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let avatar_url = match &patch.avatar_url {
+        Some(Some(u)) => match checked_avatar_url(u) {
+            Ok(u) => Some(Some(u)),
+            Err(r) => return r,
+        },
+        Some(None) => Some(None),
+        None => None,
+    };
+    let Some(target) = s.person(&id).cloned() else {
+        return person_not_found();
+    };
+    if personal && !is_self {
         return api_error(
             StatusCode::FORBIDDEN,
             access_code::NOT_OWNER,
-            "Only they can change their own name and settings.",
+            &format!(
+                "Only @{} changes their own name, picture and settings.",
+                target.handle
+            ),
         );
     }
-    let admin_fields = patch.org_role.is_some() || patch.state.is_some();
-    if admin_fields && !caller.person.org_role.is_admin() {
-        return admin_required();
-    }
-    if admin_fields && target.org_role == OrgRole::Owner {
-        return bad_request(
-            access_code::OWNER_FIXED,
-            "The organisation owner's role and state can't change.",
-        );
-    }
-    if let Some(role) = patch.org_role {
-        if role == OrgRole::Owner {
-            return bad_request(
-                "bad_request",
-                "There is one owner; another person can't be made owner.",
-            );
+    let mut role_change = None;
+    let mut state_change = None;
+    if governing {
+        if !caller.person.org_role.is_admin() {
+            return admin_required();
         }
-        let admin_change = role == OrgRole::Admin || target.org_role == OrgRole::Admin;
-        if role != target.org_role && admin_change && caller.person.org_role != OrgRole::Owner {
-            return owner_required();
+        role_change = patch.org_role.filter(|r| *r != target.org_role);
+        state_change = patch.state.filter(|st| *st != target.state);
+        if target.org_role == OrgRole::Owner && (role_change.is_some() || state_change.is_some()) {
+            return owner_fixed();
+        }
+        match role_change {
+            Some(OrgRole::Owner) => return owner_fixed(),
+            Some(_) if caller.person.org_role != OrgRole::Owner => return owner_required(),
+            _ => {}
+        }
+        match state_change {
+            Some(PersonState::Invited) => {
+                return bad_request("bad_request", "A person is either active or disabled.");
+            }
+            Some(PersonState::Disabled) if is_self => {
+                return bad_request("bad_request", "You can't disable yourself.");
+            }
+            _ => {}
         }
     }
-    if patch.state == Some(PersonState::Invited) {
-        return bad_request("bad_request", "A person is active or disabled.");
-    }
-    if let Some(name) = &patch.name
-        && (name.trim().is_empty() || name.chars().count() > 80)
-    {
-        return bad_request("bad_request", "A name is 1 to 80 characters.");
-    }
-    let mut revoked = Vec::new();
     let person = {
         let p = s.person_mut(&id).unwrap();
-        if let Some(name) = patch.name {
-            p.name = name.trim().to_string();
+        if let Some(name) = name {
+            p.name = name;
         }
-        if let Some(avatar) = patch.avatar_url {
+        if let Some(avatar) = avatar_url {
             p.avatar_url = avatar;
         }
         if let Some(settings) = patch.settings {
             p.settings = settings;
         }
-        if let Some(role) = patch.org_role {
+        if let Some(role) = role_change {
             p.org_role = role;
         }
-        if let Some(state) = patch.state {
+        if let Some(state) = state_change {
             p.state = state;
         }
         p.clone()
     };
-    if person.state == PersonState::Disabled && target.state != PersonState::Disabled {
-        // Every device of a disabled person is revoked (their tokens stop working).
+    let mut revoked = Vec::new();
+    if state_change == Some(PersonState::Disabled) {
+        // Every device of a disabled person is deleted, and their tokens with them, so
+        // their next request is a plain 401 (`auth::revoke_person_devices`).
         s.devices.retain(|d| {
             let theirs = d.person_id.as_deref() == Some(&person.id);
             if theirs {
@@ -7131,6 +7227,7 @@ async fn patch_person(
             }
             !theirs
         });
+        s.tokens.retain(|_, (_, owner)| *owner != person.id);
     }
     drop(s);
     for id in revoked {
@@ -7142,7 +7239,7 @@ async fn patch_person(
             person: public(&person),
         },
     );
-    if admin_fields {
+    if role_change.is_some() || state_change.is_some() {
         publish(
             &fake,
             Event::AccessChanged {
@@ -7150,10 +7247,37 @@ async fn patch_person(
             },
         );
     }
-    Json(if me { person } else { public(&person) }).into_response()
+    Json(if is_self { person } else { public(&person) }).into_response()
+}
+
+/// The first of `paths` that isn't a group, as the 400 the service answers
+/// (`groups::check_groups_exist`).
+#[allow(clippy::result_large_err)]
+fn check_groups_exist(s: &FakeState, paths: &[String]) -> Result<(), Response> {
+    match paths
+        .iter()
+        .find(|p| !is_group_path(p) || !s.groups.iter().any(|g| g.path == **p))
+    {
+        Some(path) => Err(bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {path}. Create it first under Organisation → Groups."),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Trimmed, sorted and without repeats (`people::tidy_groups`).
+fn tidy_groups(groups: Vec<String>) -> Vec<String> {
+    groups
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// `PUT /api/people/{id}/groups` (admins): the person's direct memberships, replaced.
+/// The answer is the person as anyone sees them (no settings), as the service's.
 async fn put_person_groups(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7161,22 +7285,16 @@ async fn put_person_groups(
     Json(groups): Json<Vec<String>>,
 ) -> Response {
     let mut s = fake.state.lock().unwrap();
-    let caller = match admin(&s, &headers) {
-        Ok(c) => c,
-        Err(r) => return r,
-    };
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
     if s.person(&id).is_none() {
-        return not_found();
+        return person_not_found();
     }
-    if let Some(path) = s.unknown_group(&groups) {
-        return bad_request(
-            access_code::UNKNOWN_GROUP,
-            &format!("There's no group {path}. Add it under Groups first."),
-        );
+    let groups = tidy_groups(groups);
+    if let Err(r) = check_groups_exist(&s, &groups) {
+        return r;
     }
-    let mut groups = groups;
-    groups.sort();
-    groups.dedup();
     let person = {
         let p = s.person_mut(&id).unwrap();
         p.groups = groups.clone();
@@ -7191,12 +7309,7 @@ async fn put_person_groups(
         },
     );
     publish(&fake, Event::AccessChanged { person_id: id });
-    Json(if person.id == caller.person.id {
-        person
-    } else {
-        public(&person)
-    })
-    .into_response()
+    Json(public(&person)).into_response()
 }
 
 async fn get_my_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response {
@@ -7232,16 +7345,23 @@ async fn patch_my_settings(
     Json(settings).into_response()
 }
 
+/// `GET /api/invitations` (admins): pending and accepted, newest first.
 async fn list_invitations(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     let s = fake.state.lock().unwrap();
     if let Err(r) = admin(&s, &headers) {
         return r;
     }
     let mut list = s.invitations.clone();
-    list.sort_by_key(|i| std::cmp::Reverse(i.created_at));
+    list.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     Json(list).into_response()
 }
 
+/// `POST /api/invitations` (admins; an admin invitation needs the owner), checked in the
+/// service's order (`invitations::create_invitation`).
 async fn create_invitation(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7254,31 +7374,41 @@ async fn create_invitation(
     };
     let login = new.github_login.trim().trim_start_matches('@').to_string();
     if !crate::org::is_github_login(&login) {
-        return bad_request("bad_request", "That isn't a GitHub login.");
+        return bad_request(
+            "bad_request",
+            "Give the person's GitHub login, like octocat.",
+        );
     }
     match new.role {
         OrgRole::Owner => {
-            return bad_request("bad_request", "Invite someone as a member or an admin.");
+            return bad_request(
+                "bad_request",
+                "Invite someone as a member or an admin; there is one owner.",
+            );
         }
-        OrgRole::Admin if caller.person.org_role != OrgRole::Owner => return owner_required(),
+        OrgRole::Admin if caller.person.org_role != OrgRole::Owner => {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                access_code::ADMIN_REQUIRED,
+                "Only the organisation owner can invite an admin. Invite them as a member.",
+            );
+        }
         _ => {}
     }
+    let groups = tidy_groups(new.groups);
+    if let Err(r) = check_groups_exist(&s, &groups) {
+        return r;
+    }
     let key = login.to_ascii_lowercase();
-    if let Some(p) = s
-        .people
+    if s.people
         .iter()
-        .find(|p| p.github_login.to_ascii_lowercase() == key)
+        .any(|p| p.github_login.to_ascii_lowercase() == key)
     {
         return conflict(
             access_code::ALREADY_MEMBER,
             &format!(
-                "@{} is already a member{}.",
-                p.handle,
-                if p.state == PersonState::Disabled {
-                    " (disabled: enable them instead)"
-                } else {
-                    ""
-                }
+                "@{login} is already in this Margin. If they're disabled, enable them under \
+                 Organisation → People."
             ),
         );
     }
@@ -7289,20 +7419,14 @@ async fn create_invitation(
     {
         return conflict(
             access_code::ALREADY_INVITED,
-            &format!("@{login} is already invited."),
-        );
-    }
-    if let Some(path) = s.unknown_group(&new.groups) {
-        return bad_request(
-            access_code::UNKNOWN_GROUP,
-            &format!("There's no group {path}."),
+            &format!("@{login} is already invited. Revoke that invitation to send a new one."),
         );
     }
     let invitation = Invitation {
         id: s.id("inv"),
         github_login: login,
         role: new.role,
-        groups: new.groups,
+        groups,
         invited_by: caller.person.id,
         created_at: now,
         expires_at: now + chrono::Duration::days(INVITATION_DAYS),
@@ -7320,6 +7444,8 @@ async fn create_invitation(
     Json(invitation).into_response()
 }
 
+/// `DELETE /api/invitations/{id}` (admins): any invitation not yet accepted, an expired
+/// one included (204); an accepted or unknown one is 404.
 async fn delete_invitation(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7329,13 +7455,16 @@ async fn delete_invitation(
     if let Err(r) = admin(&s, &headers) {
         return r;
     }
-    let now = Utc::now();
     let Some(i) = s
         .invitations
         .iter()
-        .position(|i| i.id == id && crate::org::is_pending(i, now))
+        .position(|i| i.id == id && i.accepted_at.is_none())
     else {
-        return not_found();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "That invitation doesn't exist.",
+        );
     };
     s.invitations.remove(i);
     drop(s);
@@ -7351,6 +7480,43 @@ async fn list_groups(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     Json(s.groups_counted()).into_response()
 }
 
+/// The service's longest group name (`groups::GROUP_NAME_MAX`).
+const GROUP_NAME_MAX: usize = 80;
+
+/// A group's name as the service checks it (`groups::group_name`).
+#[allow(clippy::result_large_err)]
+fn checked_group_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("bad_request", "Give the group a name."));
+    }
+    if name.chars().count() > GROUP_NAME_MAX {
+        return Err(bad_request(
+            "bad_request",
+            &format!("A group's name is at most {GROUP_NAME_MAX} characters."),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn managed_by_source(source: &str) -> Response {
+    bad_request(
+        access_code::MANAGED_BY_SOURCE,
+        &format!("This group comes from {source}; change it there."),
+    )
+}
+
+fn group_not_found() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "That group doesn't exist.",
+    )
+}
+
+/// `POST /api/groups` (admins), checked in the service's order (`groups::create_group`):
+/// the path (400 `bad_path`), the name, a group already there (409 `exists`), then the
+/// parent (400 `unknown_group`).
 async fn create_group(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7360,31 +7526,33 @@ async fn create_group(
     if let Err(r) = admin(&s, &headers) {
         return r;
     }
-    if !is_group_path(&new.path) {
+    let path = new.path.trim().to_string();
+    if !is_group_path(&path) {
         return bad_request(
-            "bad_request",
-            "A group's path is company/… in lowercase letters, digits and dashes.",
+            "bad_path",
+            "A group's path is company/… in lowercase letters, digits and dashes, at most 8 levels deep.",
         );
     }
-    if s.groups.iter().any(|g| g.path == new.path) {
-        return conflict("exists", &format!("{} already exists.", new.path));
+    let name = match checked_group_name(&new.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if path == ROOT_GROUP || s.groups.iter().any(|g| g.path == path) {
+        return conflict("exists", &format!("There's already a group {path}."));
     }
-    let parent = new.path.rsplit_once('/').map(|(p, _)| p.to_string());
-    if let Some(parent) = parent
-        && !s.groups.iter().any(|g| g.path == parent)
-    {
+    let parent = path
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_else(|| ROOT_GROUP.to_string());
+    if !s.groups.iter().any(|g| g.path == parent) {
         return bad_request(
             access_code::UNKNOWN_GROUP,
-            &format!("There's no group {parent} to put it under."),
+            &format!("There's no group {parent} to put it under. Create that first."),
         );
     }
-    let name = new.name.trim();
-    if name.is_empty() || name.chars().count() > 80 {
-        return bad_request("bad_request", "A group's name is 1 to 80 characters.");
-    }
     let group = Group {
-        path: new.path,
-        name: name.into(),
+        path,
+        name,
         source: SOURCE_MANUAL.into(),
         members: 0,
         created_at: Utc::now(),
@@ -7400,6 +7568,7 @@ async fn create_group(
     Json(group).into_response()
 }
 
+/// `PATCH /api/groups/{*path}` (admins): rename.
 async fn patch_group(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7411,20 +7580,16 @@ async fn patch_group(
         return r;
     }
     let Some(i) = s.groups.iter().position(|g| g.path == path) else {
-        return not_found();
+        return group_not_found();
     };
     if s.groups[i].source != SOURCE_MANUAL {
-        return bad_request(
-            access_code::MANAGED_BY_SOURCE,
-            &format!("{path} comes from {}; change it there.", s.groups[i].source),
-        );
+        return managed_by_source(&s.groups[i].source);
     }
     if let Some(name) = patch.name {
-        let name = name.trim();
-        if name.is_empty() || name.chars().count() > 80 {
-            return bad_request("bad_request", "A group's name is 1 to 80 characters.");
+        match checked_group_name(&name) {
+            Ok(name) => s.groups[i].name = name,
+            Err(r) => return r,
         }
-        s.groups[i].name = name.into();
     }
     let group = s.group_counted(&path).unwrap();
     drop(s);
@@ -7437,6 +7602,8 @@ async fn patch_group(
     Json(group).into_response()
 }
 
+/// `DELETE /api/groups/{*path}` (admins): only an empty group with nothing under it,
+/// never `company` (400 `root_group`).
 async fn delete_group(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7446,21 +7613,42 @@ async fn delete_group(
     if let Err(r) = admin(&s, &headers) {
         return r;
     }
+    if path == ROOT_GROUP {
+        return bad_request(
+            "root_group",
+            "The company group holds everyone; it can't be deleted.",
+        );
+    }
     let Some(group) = s.group_counted(&path) else {
-        return not_found();
+        return group_not_found();
     };
-    let groups = s.groups_counted();
-    if let Some(reason) = crate::org::delete_blocker(&group, &groups) {
-        let code = if path == ROOT_GROUP {
-            "bad_request"
-        } else if group.source != SOURCE_MANUAL {
-            access_code::MANAGED_BY_SOURCE
-        } else if group.members > 0 && !reason.starts_with("Delete") {
-            access_code::HAS_MEMBERS
-        } else {
-            access_code::HAS_CHILDREN
-        };
-        return bad_request(code, &reason);
+    if group.source != SOURCE_MANUAL {
+        return managed_by_source(&group.source);
+    }
+    let under = format!("{path}/");
+    let children = s
+        .groups
+        .iter()
+        .filter(|g| g.path.starts_with(&under))
+        .count();
+    if children > 0 {
+        return bad_request(
+            access_code::HAS_CHILDREN,
+            &format!(
+                "{path} has {children} group{} under it. Delete those first.",
+                if children == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    if group.members > 0 {
+        let members = group.members;
+        return bad_request(
+            access_code::HAS_MEMBERS,
+            &format!(
+                "{path} has {members} member{}. Take them out of it first.",
+                if members == 1 { "" } else { "s" }
+            ),
+        );
     }
     s.groups.retain(|g| g.path != path);
     drop(s);
@@ -7468,66 +7656,99 @@ async fn delete_group(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `GET /api/agents`: the caller's; an admin sees everyone's. Never the tokens.
+/// `GET /api/agents`: the caller's; an admin sees everyone's. Never the tokens. Oldest
+/// first, as the service lists them.
 async fn list_agents(State(fake): State<Fake>, headers: HeaderMap) -> Response {
     let s = fake.state.lock().unwrap();
     let caller = match caller(&s, &headers) {
         Ok(c) => c,
         Err(r) => return r,
     };
-    let list: Vec<Agent> = s
+    let mut list: Vec<Agent> = s
         .agents
         .iter()
         .filter(|a| caller.person.org_role.is_admin() || a.owner_id == caller.person.id)
         .cloned()
         .collect();
+    list.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     Json(list).into_response()
 }
 
+/// The ceiling to store, as the service's `agents::normalise_ceiling`: the kind's
+/// default when none is asked; else each asked entry (trimmed) must be inside the
+/// owner's access (400 `outside_owner`), groups with their ancestors; never empty.
 #[allow(clippy::result_large_err)]
 fn checked_ceiling(
     owner: &Person,
     kind: AgentKind,
     asked: Option<Vec<String>>,
 ) -> Result<Vec<String>, Response> {
-    match asked {
-        None => Ok(crate::org::default_ceiling(kind, owner)),
-        Some(asked) => crate::org::normalise_ceiling(&crate::org::expansion(owner), &asked)
-            .map_err(|message| {
-                let code = if asked.is_empty() {
-                    "bad_request"
+    let ceiling: Vec<String> = match asked {
+        None => crate::org::default_ceiling(kind, owner),
+        Some(asked) => {
+            let paths = crate::org::expansion(owner);
+            let mut out = std::collections::BTreeSet::new();
+            for entry in asked {
+                let entry = entry.trim().to_string();
+                if !paths.contains(&entry) {
+                    return Err(bad_request(
+                        access_code::OUTSIDE_OWNER,
+                        &format!(
+                            "{entry} is outside what you can read; an agent can only have access you have."
+                        ),
+                    ));
+                }
+                if is_group_path(&entry) {
+                    out.extend(ancestors(&entry));
                 } else {
-                    access_code::OUTSIDE_OWNER
-                };
-                bad_request(code, &message)
-            }),
+                    out.insert(entry);
+                }
+            }
+            out.into_iter().collect()
+        }
+    };
+    if ceiling.is_empty() {
+        return Err(bad_request(
+            "bad_request",
+            "Give the agent access to at least one thing: a group or your private notes.",
+        ));
     }
+    Ok(ceiling)
 }
 
-fn agent_name_problem(
+/// An agent's name as the service checks it (`agents::check_name`): 400 `bad_name`.
+#[allow(clippy::result_large_err)]
+fn checked_agent_name(name: &str) -> Result<String, Response> {
+    let name = name.trim();
+    if !margin_shared::context::is_agent_name(name) {
+        return Err(bad_request(
+            "bad_name",
+            "An agent's name is 1 to 40 lowercase letters, digits, - and _ (like claude-code).",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// 409 `exists` when another agent of `owner` (not `except`) has `name`.
+fn agent_name_taken(
     s: &FakeState,
     owner: &str,
     name: &str,
     except: Option<&str>,
 ) -> Option<Response> {
-    if !margin_shared::context::is_agent_name(name) {
-        return Some(bad_request(
-            "bad_request",
-            "An agent's name is up to 40 lowercase letters, digits, - and _.",
-        ));
-    }
-    if s.agents
+    s.agents
         .iter()
         .any(|a| a.owner_id == owner && a.name == name && Some(a.id.as_str()) != except)
-    {
-        return Some(conflict(
-            "exists",
-            &format!("You already have an agent named {name}."),
-        ));
-    }
-    None
+        .then(|| {
+            conflict(
+                "exists",
+                &format!("You already have an agent called {name}."),
+            )
+        })
 }
 
+/// `POST /api/agents`, checked in the service's order: the name, the ceiling, then a
+/// name already taken.
 async fn create_agent(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7538,17 +7759,21 @@ async fn create_agent(
         Ok(c) => c,
         Err(r) => return r,
     };
-    if let Some(r) = agent_name_problem(&s, &caller.person.id, &new.name, None) {
-        return r;
-    }
+    let name = match checked_agent_name(&new.name) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
     let ceiling = match checked_ceiling(&caller.person, new.kind, new.ceiling) {
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Some(r) = agent_name_taken(&s, &caller.person.id, &name, None) {
+        return r;
+    }
     let agent = Agent {
         id: s.id("a"),
         owner_id: caller.person.id,
-        name: new.name,
+        name,
         kind: new.kind,
         ceiling,
         disabled: false,
@@ -7569,6 +7794,13 @@ async fn create_agent(
 /// The agent `id` for `caller`: `Ok(index, is_owner)`, 404 when they may not see it.
 #[allow(clippy::result_large_err)]
 fn agent_for(s: &FakeState, caller: &Caller, id: &str) -> Result<(usize, bool), Response> {
+    let not_found = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "That agent doesn't exist.",
+        )
+    };
     let i = s
         .agents
         .iter()
@@ -7585,10 +7817,11 @@ fn not_agent_owner() -> Response {
     api_error(
         StatusCode::FORBIDDEN,
         access_code::NOT_OWNER,
-        "Only the agent's owner can change it; an admin can only disable it.",
+        "Only the agent's owner can do this; an admin can only disable it.",
     )
 }
 
+/// `PATCH /api/agents/{id}`: its owner; an admin may only set `disabled`.
 async fn patch_agent(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -7607,11 +7840,10 @@ async fn patch_agent(
     if !owner && (patch.name.is_some() || patch.ceiling.is_some()) {
         return not_agent_owner();
     }
-    if let Some(name) = &patch.name
-        && let Some(r) = agent_name_problem(&s, &caller.person.id, name, Some(&id))
-    {
-        return r;
-    }
+    let name = match patch.name.as_deref().map(checked_agent_name).transpose() {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
     let ceiling = match patch.ceiling {
         Some(asked) => match checked_ceiling(&caller.person, s.agents[i].kind, Some(asked)) {
             Ok(c) => Some(c),
@@ -7619,9 +7851,14 @@ async fn patch_agent(
         },
         None => None,
     };
+    if let Some(name) = &name
+        && let Some(r) = agent_name_taken(&s, &s.agents[i].owner_id, name, Some(&id))
+    {
+        return r;
+    }
     let agent = {
         let a = &mut s.agents[i];
-        if let Some(name) = patch.name {
+        if let Some(name) = name {
             a.name = name;
         }
         if let Some(ceiling) = ceiling {

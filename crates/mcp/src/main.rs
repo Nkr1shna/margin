@@ -1,6 +1,6 @@
 //! The `margin-mcp` command. See `docs/plan-dogfood.md` §2 and `USAGE` below.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
@@ -15,9 +15,12 @@ margin-mcp: Margin as Claude Code's knowledge base
 
 USAGE:
   margin-mcp serve                     MCP server on stdin/stdout (for .mcp.json)
-  margin-mcp token <mga_…> | -          use an agent token (Settings → Organisation → Agents;
-                                       - reads it from stdin); checked with the service, then
-                                       kept in the secret store and used before a device sign-in
+  margin-mcp token -                   use an agent token (Settings → Organisation → Agents),
+                                       read from stdin: paste it when asked, or pipe it in
+                                       (pbpaste | margin-mcp token -); checked with the
+                                       service, then kept in the secret store and used before
+                                       a device sign-in. `token <mga_…>` works too but leaves
+                                       the token in the shell history
   margin-mcp token --forget            remove the stored agent token
   margin-mcp whoami                    who margin-mcp signs in as, and what it may read
   margin-mcp login                     sign in with GitHub as a device (your whole access);
@@ -35,6 +38,25 @@ OPTIONS:
   --url <url>   the Margin service (default: `url` in ~/.config/margin/mcp.toml)
   -h, --help    this text
 ";
+
+/// `margin-mcp token -`: the token from stdin. At a terminal it asks for it and reads
+/// one line (paste, then Enter); piped in, it reads everything.
+fn read_token_from_stdin() -> anyhow::Result<String> {
+    let stdin = std::io::stdin();
+    let mut text = String::new();
+    if stdin.is_terminal() {
+        eprint!("Paste the agent token (mga_…) and press Enter: ");
+        stdin
+            .read_line(&mut text)
+            .context("couldn't read the token")?;
+    } else {
+        stdin
+            .lock()
+            .read_to_string(&mut text)
+            .context("couldn't read stdin")?;
+    }
+    Ok(text)
+}
 
 #[derive(Default)]
 struct Args {
@@ -102,11 +124,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 bail!("token takes one agent token, or - to read it from stdin");
             };
             let raw = if source == "-" {
-                let mut text = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut text)
-                    .context("couldn't read stdin")?;
-                text
+                read_token_from_stdin()?
             } else {
                 source.clone()
             };
