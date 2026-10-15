@@ -36,7 +36,8 @@
 //! | PATCH  | /api/settings                          | SettingsPatch      | Settings            |
 //! | GET    | /api/pipeline/variants                 |                    | pipeline::PipelineVariants |
 //! | GET    | /api/providers/{provider}/models       |                    | Vec<ModelInfo> (409 not_configured: no credential) |
-//! | POST   | /api/providers/chatgpt/start           |                    | ChatGptStart (sign in on the service Mac) |
+//! | POST   | /api/providers/chatgpt/start           | ChatGptStartRequest (optional) | ChatGptStart |
+//! | POST   | /api/providers/chatgpt/complete        | ChatGptComplete    | ChatGptStatus (400 invalid_callback / invalid_state / sign_in_failed, 409 no_sign_in) |
 //! | GET    | /api/providers/chatgpt                 |                    | ChatGptStatus       |
 //! | DELETE | /api/providers/chatgpt                 |                    | 204 (signs out)     |
 //! | GET    | /api/tools                             |                    | Vec<ToolStatus>     |
@@ -127,8 +128,12 @@ pub const PIPELINE_VARIANTS: &str = "/api/pipeline/variants";
 pub const PIPELINE_PROMPTS: &str = "/api/pipeline/prompts";
 /// The ChatGPT sign-in: `GET` → `ChatGptStatus`, `DELETE` signs out.
 pub const PROVIDERS_CHATGPT: &str = "/api/providers/chatgpt";
-/// `POST` → `ChatGptStart`: starts a "Sign in with ChatGPT" on the service Mac.
+/// `POST` `ChatGptStartRequest` → `ChatGptStart`: starts a "Sign in with ChatGPT"; the
+/// person opens the link on their own device.
 pub const PROVIDERS_CHATGPT_START: &str = "/api/providers/chatgpt/start";
+/// `POST` `ChatGptComplete` → `ChatGptStatus`: finishes it with the loopback callback's
+/// address (code and state); the service exchanges the code and stores the tokens.
+pub const PROVIDERS_CHATGPT_COMPLETE: &str = "/api/providers/chatgpt/complete";
 pub const TOOLS: &str = "/api/tools";
 pub const DEVICES: &str = "/api/devices";
 pub const EVENTS: &str = "/api/events";
@@ -516,6 +521,7 @@ mod tests {
             "/api/providers/chatgpt/models"
         );
         assert!(PROVIDERS_CHATGPT_START.starts_with(PROVIDERS_CHATGPT));
+        assert!(PROVIDERS_CHATGPT_COMPLETE.starts_with(PROVIDERS_CHATGPT));
     }
 
     #[test]

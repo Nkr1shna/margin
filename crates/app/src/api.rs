@@ -9,12 +9,13 @@ use chrono::{DateTime, Utc};
 
 use margin_shared::context::{AuditKind, AuditRow, ContextChanges, Document, Origin};
 use margin_shared::{
-    AcceptProposal, ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatPatch,
-    ConfirmRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library, LoginState, Me,
-    MessageSent, ModelInfo, NewChat, NewMessage, NewNote, NewTopic, NewWorkspace, Note, NotePatch,
-    PollLoginRequest, Proposal, Provider, SearchHit, Settings, SettingsPatch, Source, SourceKind,
-    SourceUpload, StartLogin, StartLoginRequest, SyncManifest, SyncPlan, ToolOutputText,
-    ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
+    AcceptProposal, ApiError, Chat, ChatDetail, ChatGptComplete, ChatGptStart, ChatGptStartRequest,
+    ChatGptStatus, ChatPatch, ConfirmRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch,
+    Library, LoginState, Me, MessageSent, ModelInfo, NewChat, NewMessage, NewNote, NewTopic,
+    NewWorkspace, Note, NotePatch, PollLoginRequest, Proposal, Provider, SearchHit, Settings,
+    SettingsPatch, Source, SourceKind, SourceUpload, StartLogin, StartLoginRequest, SyncManifest,
+    SyncPlan, ToolOutputText, ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace,
+    routes,
 };
 use margin_shared::{
     Agent, AgentPatch, AgentToken, Audience, AudienceUnit, AudienceView, Group, GroupPatch,
@@ -332,9 +333,25 @@ impl Api {
         self.get(routes::PROVIDERS_CHATGPT).await
     }
 
-    /// Start a "Sign in with ChatGPT" on the service's machine: the link to open there.
-    pub async fn start_chatgpt(&self) -> ApiResult<ChatGptStart> {
-        self.post_empty(routes::PROVIDERS_CHATGPT_START).await
+    /// Start a "Sign in with ChatGPT": the link to open in this device's browser, which
+    /// comes back to `http://127.0.0.1:<callback_port>/auth/callback` (the usual port
+    /// when `None`).
+    pub async fn start_chatgpt(&self, callback_port: Option<u16>) -> ApiResult<ChatGptStart> {
+        self.post(
+            routes::PROVIDERS_CHATGPT_START,
+            &ChatGptStartRequest { callback_port },
+        )
+        .await
+    }
+
+    /// Finish it with the address the browser came back to (it carries the code and
+    /// state; the service exchanges the code and keeps the tokens).
+    pub async fn complete_chatgpt(&self, callback_url: String) -> ApiResult<ChatGptStatus> {
+        self.post(
+            routes::PROVIDERS_CHATGPT_COMPLETE,
+            &ChatGptComplete { callback_url },
+        )
+        .await
     }
 
     /// Sign Margin out of ChatGPT (the service deletes its tokens), or give up a sign-in
@@ -2969,7 +2986,7 @@ mod tests {
             api.chatgpt_status().await.unwrap(),
             ChatGptStatus::SignedOut
         );
-        let started = api.start_chatgpt().await.unwrap();
+        let started = api.start_chatgpt(None).await.unwrap();
         assert!(
             started
                 .authorize_url
@@ -2999,7 +3016,7 @@ mod tests {
                 .is_empty()
         );
         // A sign-in that fails while signed in keeps the account and says why.
-        api.start_chatgpt().await.unwrap();
+        api.start_chatgpt(None).await.unwrap();
         fake.state.lock().unwrap().chatgpt_finish = Some(Err("The owner declined.".into()));
         let ChatGptStatus::SignedIn { last_error, .. } = api.chatgpt_status().await.unwrap() else {
             panic!("still signed in");
@@ -3014,7 +3031,7 @@ mod tests {
         );
         assert_eq!(api.settings().await.unwrap().chatgpt, None);
 
-        api.start_chatgpt().await.unwrap();
+        api.start_chatgpt(None).await.unwrap();
         fake.state.lock().unwrap().chatgpt_finish = Some(Err("The sign-in was cancelled.".into()));
         assert_eq!(
             api.chatgpt_status().await.unwrap(),
@@ -3023,7 +3040,7 @@ mod tests {
             }
         );
         // Try again: waiting once more; Cancel gives it up.
-        api.start_chatgpt().await.unwrap();
+        api.start_chatgpt(None).await.unwrap();
         assert!(matches!(
             api.chatgpt_status().await.unwrap(),
             ChatGptStatus::Waiting { .. }
@@ -3034,6 +3051,124 @@ mod tests {
             ChatGptStatus::SignedOut
         );
         assert_eq!(fake.state.lock().unwrap().chatgpt_starts, 4);
+    }
+
+    /// Finishing a sign-in from this device: the callback's address (pasted, or caught
+    /// by the desktop app's loopback listener) goes to `complete`; another sign-in's
+    /// address, something else pasted, or a second use are refused with their codes.
+    #[tokio::test]
+    async fn chatgpt_sign_in_completes_with_the_callback_address() {
+        use margin_shared::ChatGptStatus;
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        let code = |e: ApiFailure| e.code;
+
+        // Nothing waiting.
+        let e = api
+            .complete_chatgpt("http://127.0.0.1:1455/auth/callback?code=c&state=st-0".into())
+            .await
+            .unwrap_err();
+        assert_eq!(code(e), "no_sign_in");
+
+        // A phone: the usual port; the person pastes the address.
+        let started = api.start_chatgpt(None).await.unwrap();
+        assert_eq!(started.redirect_uri, "http://127.0.0.1:1455/auth/callback");
+        let e = api.complete_chatgpt("hello".into()).await.unwrap_err();
+        assert_eq!(code(e), "invalid_callback");
+        let e = api
+            .complete_chatgpt(format!("{}?code=c&state=st-old", started.redirect_uri))
+            .await
+            .unwrap_err();
+        assert_eq!(code(e), "invalid_state");
+        let callback = format!("{}?code=c&state={}", started.redirect_uri, started.state);
+        let ChatGptStatus::SignedIn { account, .. } = api
+            .complete_chatgpt(format!(" {callback}\n"))
+            .await
+            .unwrap()
+        else {
+            panic!("not signed in");
+        };
+        assert_eq!(account.email, "owner@example.com");
+        assert!(api.settings().await.unwrap().chatgpt.is_some());
+        let e = api.complete_chatgpt(callback).await.unwrap_err();
+        assert_eq!(code(e), "no_sign_in", "used once");
+
+        // Declined in the browser: why, and the account stays.
+        let started = api.start_chatgpt(None).await.unwrap();
+        let e = api
+            .complete_chatgpt(format!(
+                "{}?error=access_denied&error_description=The+owner+declined.&state={}",
+                started.redirect_uri, started.state
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(code(e), "sign_in_failed");
+        let ChatGptStatus::SignedIn { last_error, .. } = api.chatgpt_status().await.unwrap() else {
+            panic!("still signed in");
+        };
+        assert_eq!(last_error.as_deref(), Some("The owner declined."));
+    }
+
+    /// The desktop app's round trip: it listens on a loopback port, asks for that
+    /// redirect, catches the browser's return and forwards it; the tab gets the answer.
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn the_desktop_app_catches_the_browsers_return_and_forwards_it() {
+        use margin_shared::ChatGptStatus;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fake = FakeService::start().await;
+        let api = Api::with_token(&fake.url, crate::fake::TOKEN);
+        // Any free port (the usual one may be taken while tests run).
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let started = api.start_chatgpt(Some(port)).await.unwrap();
+        assert_eq!(
+            started.redirect_uri,
+            format!("http://127.0.0.1:{port}/auth/callback")
+        );
+        assert!(
+            started
+                .authorize_url
+                .contains(&format!("127.0.0.1%3A{port}"))
+        );
+
+        let state = started.state.clone();
+        let app = tokio::spawn(async move {
+            let cb =
+                crate::chatgpt_callback::accept(&listener, &state, crate::chatgpt_callback::WAIT)
+                    .await
+                    .unwrap();
+            let status = api.complete_chatgpt(cb.url.clone()).await.unwrap();
+            let ChatGptStatus::SignedIn { account, .. } = &status else {
+                panic!("not signed in")
+            };
+            cb.finish(
+                true,
+                "Margin is signed in with ChatGPT",
+                &format!("Signed in as {}.", account.email),
+            )
+            .await;
+        });
+        // The browser, redirected after the person approved.
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let target = format!(
+            "/auth/callback?code=c1&state={}&scope=openid",
+            started.state
+        );
+        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut page = String::new();
+        s.read_to_string(&mut page).await.unwrap();
+        app.await.unwrap();
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("Signed in as owner@example.com."), "{page}");
+        let completes = fake.state.lock().unwrap().chatgpt_completes.clone();
+        assert_eq!(completes, [format!("http://127.0.0.1:{port}{target}")]);
     }
 
     /// A chat is created on the provider asked for (else the default) and keeps it; a

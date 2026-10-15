@@ -812,9 +812,25 @@ pub fn key_patch(provider: Provider, key: String) -> SettingsPatch {
     }
 }
 
-/// Whether this app runs on a Mac, where "Continue with ChatGPT" opens the sign-in in
-/// the browser (the service usually runs on the same Mac).
-pub const OPENS_SIGN_IN_HERE: bool = cfg!(all(feature = "desktop", target_os = "macos"));
+/// Whether this app listens on the loopback for the browser's return from "Sign in
+/// with ChatGPT" (`crate::chatgpt_callback`): on computers. Phones can't count on
+/// listening while the browser is in front, so there the person pastes the address the
+/// browser ends on.
+pub const LISTENS_FOR_SIGN_IN: bool = cfg!(feature = "desktop");
+
+#[cfg(test)]
+thread_local! {
+    /// Render tests draw the phone's sign-in on a computer.
+    pub static LISTENS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn sign_in_listens() -> bool {
+    #[cfg(test)]
+    if let Some(listens) = LISTENS_OVERRIDE.with(std::cell::Cell::get) {
+        return listens;
+    }
+    LISTENS_FOR_SIGN_IN
+}
 
 /// Fetch `provider`'s models into the store (Settings and the slots show them).
 async fn load_models(app: crate::state::AppCtx, provider: Provider) -> Result<(), String> {
@@ -1225,7 +1241,9 @@ fn ModelSlots(provider: Provider, settings: Settings) -> Element {
 }
 
 /// Ask the service where the ChatGPT sign-in is, and keep asking every 2 s while it
-/// waits for the browser. One poller at a time.
+/// waits for the browser. One poller at a time. When it stops waiting (finished here,
+/// on another device or by paste, cancelled, or out of time) this device's loopback
+/// listener stops too.
 async fn poll_chatgpt(app: crate::state::AppCtx, mut polling: Signal<bool>) {
     if *polling.peek() {
         return;
@@ -1244,6 +1262,7 @@ async fn poll_chatgpt(app: crate::state::AppCtx, mut polling: Signal<bool>) {
         let mut lib = app.lib;
         lib.write().chatgpt = Some(status);
         if !waiting {
+            stop_listening();
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1251,8 +1270,97 @@ async fn poll_chatgpt(app: crate::state::AppCtx, mut polling: Signal<bool>) {
     polling.set(false);
 }
 
-/// ChatGPT: "Continue with ChatGPT" (the sign-in runs on the service's machine), its state,
-/// sign out, and the three slots from the account's models.
+#[cfg(feature = "desktop")]
+thread_local! {
+    /// The loopback listener of the sign-in in progress (UI thread).
+    static LISTENER: std::cell::Cell<Option<dioxus::core::Task>> = const { std::cell::Cell::new(None) };
+}
+
+/// Stops listening for a sign-in's callback (it finished, was replaced or cancelled).
+fn stop_listening() {
+    #[cfg(feature = "desktop")]
+    if let Some(task) = LISTENER.with(|l| l.take()) {
+        task.cancel();
+    }
+}
+
+/// Listens on `listener` for the callback of the sign-in whose state is `state`, sends
+/// its address to the service, and answers the browser tab with how it went. Outlives
+/// the Settings pane (the person is in the browser meanwhile).
+#[cfg(feature = "desktop")]
+fn listen_for_callback(
+    app: crate::state::AppCtx,
+    listener: tokio::net::TcpListener,
+    state: String,
+) {
+    use crate::chatgpt_callback;
+    stop_listening();
+    let task = dioxus::core::spawn_forever(async move {
+        let Some(callback) =
+            chatgpt_callback::accept(&listener, &state, chatgpt_callback::WAIT).await
+        else {
+            return;
+        };
+        drop(listener);
+        let Some(api) = app.api() else {
+            callback
+                .finish(
+                    false,
+                    "Margin isn't signed in",
+                    "Open Margin and sign in first.",
+                )
+                .await;
+            return;
+        };
+        let mut lib = app.lib;
+        match api.complete_chatgpt(callback.url.clone()).await {
+            Ok(status) => {
+                let text = match &status {
+                    ChatGptStatus::SignedIn { account, .. } => format!(
+                        "Signed in as {}. You can close this tab and go back to Margin.",
+                        account.email
+                    ),
+                    _ => "You can close this tab and go back to Margin.".to_string(),
+                };
+                callback
+                    .finish(true, "Margin is signed in with ChatGPT", &text)
+                    .await;
+                lib.write().chatgpt = Some(status);
+                if let Ok(settings) = api.settings().await {
+                    lib.write().apply(Event::SettingsChanged { settings });
+                }
+            }
+            Err(e) => {
+                let message = app.failure(&e);
+                callback
+                    .finish(
+                        false,
+                        "The ChatGPT sign-in didn't work",
+                        &format!("{message} Try again from Margin's Settings."),
+                    )
+                    .await;
+                if let Ok(status) = api.chatgpt_status().await {
+                    lib.write().chatgpt = Some(status);
+                }
+            }
+        }
+        LISTENER.with(|l| l.set(None));
+    });
+    LISTENER.with(|l| l.set(Some(task)));
+}
+
+/// The text on how a waiting sign-in finishes on this device.
+pub fn waiting_help(listens: bool) -> &'static str {
+    if listens {
+        "Approve Margin in the browser that opened. Margin finishes signing in when the browser comes back to this computer. Signing in on another device instead? Open the link there, then paste the address its browser ends on below."
+    } else {
+        "Approve Margin in the browser. It then ends on a page that doesn't load, whose address starts with http://127.0.0.1:1455/auth/callback. Copy that whole address from the address bar and paste it below."
+    }
+}
+
+/// ChatGPT: "Continue with ChatGPT" (the person approves in their own browser; the
+/// service keeps the tokens), its state, sign out, and the three slots from the
+/// account's models.
 #[component]
 fn ChatGptSection(settings: Settings) -> Element {
     let app = use_app();
@@ -1263,9 +1371,13 @@ fn ChatGptSection(settings: Settings) -> Element {
     let mut copies = use_signal(|| 0u32);
     let mut copied = use_signal(|| None::<Result<(), String>>);
     let mut open_error = use_signal(|| None::<String>);
+    let mut pasted = use_signal(String::new);
+    let mut paste_error = use_signal(|| None::<String>);
+    let mut finishing = use_signal(|| false);
     // Where the sign-in is now (and, while it waits, again every 2 s).
     use_future(move || poll_chatgpt(app, polling));
     let status = app.lib.read().chatgpt_status();
+    let listens = sign_in_listens();
 
     let start = move |_| async move {
         if *busy.peek() {
@@ -1275,24 +1387,69 @@ fn ChatGptSection(settings: Settings) -> Element {
         busy.set(true);
         error.set(None);
         open_error.set(None);
-        match api.start_chatgpt().await {
+        paste_error.set(None);
+        pasted.set(String::new());
+        stop_listening();
+        // On a computer the app listens for the browser's return itself.
+        #[cfg(feature = "desktop")]
+        let listener = crate::chatgpt_callback::bind().await;
+        #[cfg(feature = "desktop")]
+        let port = listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port());
+        #[cfg(not(feature = "desktop"))]
+        let port = None;
+        match api.start_chatgpt(port).await {
             Ok(started) => {
                 let mut lib = app.lib;
                 lib.write().chatgpt = Some(ChatGptStatus::Waiting {
                     authorize_url: started.authorize_url.clone(),
                 });
-                if OPENS_SIGN_IN_HERE {
-                    open_error.set(open_external(&started.authorize_url).err());
+                #[cfg(feature = "desktop")]
+                if let Some(listener) = listener {
+                    listen_for_callback(app, listener, started.state.clone());
                 }
+                open_error.set(open_external(&started.authorize_url).err());
                 spawn(poll_chatgpt(app, polling));
             }
             Err(e) => error.set(Some(app.failure(&e))),
         }
         busy.set(false);
     };
+    let finish = move || async move {
+        let text = pasted.peek().trim().to_string();
+        if text.is_empty() || *finishing.peek() {
+            return;
+        }
+        let Some(api) = app.api() else { return };
+        finishing.set(true);
+        paste_error.set(None);
+        match api.complete_chatgpt(text).await {
+            Ok(status) => {
+                stop_listening();
+                pasted.set(String::new());
+                let mut lib = app.lib;
+                lib.write().chatgpt = Some(status);
+                if let Ok(settings) = api.settings().await {
+                    lib.write().apply(Event::SettingsChanged { settings });
+                }
+            }
+            Err(e) => {
+                paste_error.set(Some(app.failure(&e)));
+                // A refused code ends the sign-in: show where it is now.
+                if let Ok(status) = api.chatgpt_status().await {
+                    let mut lib = app.lib;
+                    lib.write().chatgpt = Some(status);
+                }
+            }
+        }
+        finishing.set(false);
+    };
     let sign_out = move || async move {
         let Some(api) = app.api() else { return };
         busy.set(true);
+        stop_listening();
         match api.sign_out_chatgpt().await {
             Ok(()) => {
                 error.set(None);
@@ -1324,7 +1481,7 @@ fn ChatGptSection(settings: Settings) -> Element {
                         }
                     }
                     p { class: "faint", style: "margin: 0; font-size: 13px",
-                        "You finish signing in in a browser on the machine that runs Margin's service. Margin never sees your password, and no token is kept on this device."
+                        "You approve Margin in your browser on this device. Margin never sees your password, and the sign-in is kept by Margin's service, not on this device."
                     }
                 },
                 ChatGptStatus::Waiting { authorize_url } => rsx! {
@@ -1332,17 +1489,18 @@ fn ChatGptSection(settings: Settings) -> Element {
                         span { class: "spinner xs", "aria-hidden": "true" }
                         span { "Waiting for you to finish signing in…" }
                     }
-                    p { class: "faint", style: "margin: 0; font-size: 13px",
-                        if OPENS_SIGN_IN_HERE {
-                            "The sign-in opened in your browser. If the service runs on another Mac, open this link on that Mac instead:"
-                        } else {
-                            "Open this link on the machine that runs Margin's service:"
-                        }
-                    }
-                    div { class: "copy-wrap",
-                        pre { class: "code", style: "padding-right: 90px; white-space: pre-wrap; word-break: break-all", code { id: "chatgpt-link", "{authorize_url}" } }
+                    p { class: "faint", style: "margin: 0; font-size: 13px", {waiting_help(listens)} }
+                    div { class: "row-actions",
                         button {
-                            class: "btn btn-secondary btn-sm copy",
+                            class: "btn btn-secondary btn-sm",
+                            onclick: {
+                                let url = authorize_url.clone();
+                                move |_| open_error.set(open_external(&url).err())
+                            },
+                            "Open in browser"
+                        }
+                        button {
+                            class: "btn btn-secondary btn-sm",
                             "aria-label": "Copy the sign-in link",
                             onclick: {
                                 let url = authorize_url.clone();
@@ -1367,8 +1525,14 @@ fn ChatGptSection(settings: Settings) -> Element {
                             Icon { name: "copy" }
                             match copied.read().clone() {
                                 Some(Ok(())) => "Copied",
-                                _ => "Copy",
+                                _ => "Copy link",
                             }
+                        }
+                        button {
+                            class: "btn btn-ghost btn-sm",
+                            disabled: *busy.read(),
+                            onclick: move |_| sign_out(),
+                            "Cancel"
                         }
                     }
                     span { class: "sr-only", role: "status",
@@ -1380,22 +1544,41 @@ fn ChatGptSection(settings: Settings) -> Element {
                     if let Some(err) = open_error.read().clone() {
                         span { class: "save-state error", role: "alert", "{err}" }
                     }
-                    div { class: "row-actions",
-                        if OPENS_SIGN_IN_HERE {
-                            button {
-                                class: "btn btn-secondary btn-sm",
-                                onclick: {
-                                    let url = authorize_url.clone();
-                                    move |_| open_error.set(open_external(&url).err())
+                    form {
+                        class: "field chatgpt-paste",
+                        onsubmit: move |e: FormEvent| {
+                            e.prevent_default();
+                            finish()
+                        },
+                        label { class: "label", r#for: "chatgpt-callback", "The address the browser ended on" }
+                        div { class: "row-actions",
+                            input {
+                                id: "chatgpt-callback",
+                                class: "input",
+                                style: "flex: 1; min-width: 220px",
+                                r#type: "url",
+                                inputmode: "url",
+                                autocomplete: "off",
+                                autocapitalize: "off",
+                                spellcheck: "false",
+                                placeholder: "http://127.0.0.1:1455/auth/callback?code=…",
+                                "aria-invalid": paste_error.read().is_some().to_string(),
+                                value: "{pasted}",
+                                oninput: move |e| {
+                                    pasted.set(e.value());
+                                    paste_error.set(None);
                                 },
-                                "Open in browser"
+                            }
+                            button {
+                                class: "btn btn-primary btn-sm",
+                                r#type: "submit",
+                                disabled: pasted.read().trim().is_empty() || *finishing.read(),
+                                if *finishing.read() { span { class: "spinner" } }
+                                "Finish signing in"
                             }
                         }
-                        button {
-                            class: "btn btn-ghost btn-sm",
-                            disabled: *busy.read(),
-                            onclick: move |_| sign_out(),
-                            "Cancel"
+                        if let Some(err) = paste_error.read().clone() {
+                            span { class: "save-state error", role: "alert", "{err}" }
                         }
                     }
                 },
@@ -3807,27 +3990,43 @@ mod tests {
         // Signed out (as the settings say before the status arrives).
         let html = pane(None, false);
         assert!(html.contains(">Continue with ChatGPT<"));
-        assert!(html.contains("in a browser on the machine that runs Margin&#39;s service"));
-        // Waiting: the link, to open on the service's machine, with Copy and Cancel.
+        assert!(html.contains("You approve Margin in your browser on this device."));
+        assert!(html.contains("kept by Margin&#39;s service, not on this device"));
+        // Waiting, on a computer (the app listens) and on a phone (the person pastes):
+        // Open in browser, Copy link, Cancel, and the field for the address either way.
         let url = "https://auth.openai.com/api/accounts/authorize?state=st-1";
-        let html = pane(
-            Some(ChatGptStatus::Waiting {
-                authorize_url: url.into(),
-            }),
-            false,
-        );
-        assert!(
-            html.contains("Waiting for you to finish signing in…"),
-            "{html}"
-        );
-        assert!(html.contains(url));
-        assert!(html.contains(r#"aria-label="Copy the sign-in link""#));
-        assert!(html.contains(">Cancel<"));
-        if OPENS_SIGN_IN_HERE {
+        for listens in [true, false] {
+            LISTENS_OVERRIDE.with(|o| o.set(Some(listens)));
+            let html = pane(
+                Some(ChatGptStatus::Waiting {
+                    authorize_url: url.into(),
+                }),
+                false,
+            );
+            LISTENS_OVERRIDE.with(|o| o.set(None));
+            assert!(
+                html.contains("Waiting for you to finish signing in…"),
+                "{html}"
+            );
+            assert!(
+                html.contains(&waiting_help(listens).replace('\'', "&#39;")),
+                "{html}"
+            );
             assert!(html.contains(">Open in browser<"));
-        } else {
-            assert!(html.contains("Open this link on the machine that runs Margin&#39;s service:"));
+            assert!(html.contains(r#"aria-label="Copy the sign-in link""#));
+            assert!(html.contains(">Copy link<"));
+            assert!(html.contains(">Cancel<"));
+            assert!(html.contains(r#"<label class="label" for="chatgpt-callback">The address the browser ended on</label>"#), "{html}");
+            assert!(html.contains(r#"id="chatgpt-callback""#));
+            assert!(html.contains(r#"placeholder="http://127.0.0.1:1455/auth/callback?code=…""#));
+            assert!(html.contains(">Finish signing in<"));
+            // Nothing pasted yet: Finish is off.
+            let finish = html.find(">Finish signing in<").unwrap();
+            let button = &html[html[..finish].rfind("<button").unwrap()..finish];
+            assert!(button.contains("disabled"), "{button}");
         }
+        assert!(waiting_help(true).contains("finishes signing in when the browser comes back"));
+        assert!(waiting_help(false).contains("http://127.0.0.1:1455/auth/callback"));
         // Signed in: the account, when, Sign out; the slots on the account's models.
         let html = pane(None, true);
         assert!(html.contains("<b>owner@example.com</b>"), "{html}");

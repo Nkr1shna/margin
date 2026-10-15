@@ -72,6 +72,9 @@
 
 #[path = "../src/api.rs"]
 mod api;
+#[cfg(feature = "desktop")]
+#[path = "../src/chatgpt_callback.rs"]
+mod chatgpt_callback;
 #[path = "../src/citations.rs"]
 mod citations;
 #[path = "../src/commands.rs"]

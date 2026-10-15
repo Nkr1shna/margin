@@ -412,6 +412,7 @@ async fn admin_events_and_settings_need_an_admin() {
         ("DELETE", "/api/embedding/speech"),
         ("GET", "/api/providers/chatgpt"),
         ("POST", "/api/providers/chatgpt/start"),
+        ("POST", "/api/providers/chatgpt/complete"),
         ("DELETE", "/api/providers/chatgpt"),
     ] {
         let req = match method {
