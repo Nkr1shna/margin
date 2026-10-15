@@ -43,11 +43,13 @@ Commands:
   grade-questions [--prune]
                         Grade every golden question with every grader: distribution,
                         inter-grader kappa, canaries; --prune drops generated rows now < 2
-  run --suite retrieval|courses|agent|dogfood --service-url URL [--variant NAME]
+  run --suite retrieval|courses|agent|dogfood [--service-url URL] [--variant NAME]
       [--write-baseline] [--no-judge]
                         Run a suite with evals/variants/NAME.toml (default baseline)
-                        beside the dev service at URL; dogfood runs the retrieval suite
-                        over the repository's docs/ with evals/golden/dogfood.jsonl
+                        beside the dev service at URL (required for courses and agent;
+                        retrieval and dogfood need no service); dogfood runs the
+                        retrieval suite over the repository's docs/ with
+                        evals/golden/dogfood.jsonl
   harvest --service-url URL [--since T] [--out FILE]
                         Turn agents' context-API searches and the passages they read
                         after them (trace rows with via \"mcp\") into candidate questions,
@@ -145,16 +147,22 @@ pub struct Cli {
 }
 
 impl Command {
-    /// Whether it reads the service, so `--service-url` is required: `run`, `export`,
-    /// `harvest` and `report --service`.
+    /// Whether it reads the service, so `--service-url` is required: `run` of the
+    /// courses and agent suites, `export`, `harvest` and `report --service`. The
+    /// retrieval and dogfood suites run on the runner's own index and embedder only, so
+    /// for them it is optional (checked when given).
     pub fn needs_service_url(&self) -> bool {
-        matches!(
-            self,
-            Command::Run { .. }
-                | Command::Export { .. }
-                | Command::Harvest { .. }
-                | Command::Report { service: true, .. }
-        )
+        match self {
+            Command::Run { suite, .. } => !matches!(suite, Suite::Retrieval | Suite::Dogfood),
+            Command::Export { .. } | Command::Harvest { .. } => true,
+            Command::Report { service, .. } => *service,
+            _ => false,
+        }
+    }
+
+    /// Whether `--service-url` applies at all.
+    pub fn takes_service_url(&self) -> bool {
+        matches!(self, Command::Run { .. }) || self.needs_service_url()
     }
 
     /// Whether it calls a real model or loads the real embedder.
@@ -306,6 +314,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Cli> {
         (true, None) => bail!(
             "this command reads the service: add --service-url (the dev service, {DEV_SERVICE_URL})"
         ),
+        (false, Some(url)) if command.takes_service_url() => Some(check_service_url(&url)?),
         (false, Some(_)) if command != Command::Help => {
             bail!("--service-url doesn't apply here")
         }
@@ -524,6 +533,25 @@ mod tests {
         assert!(p("export --kind bogus").is_err());
         assert!(p("export --from yesterday").is_err());
         assert!(p("run --suite retrieval --variant").is_err());
+        // Writing and the agent read the service; retrieval needs none, but a URL
+        // given is still checked (never prod).
+        assert!(
+            p("run --suite courses")
+                .unwrap_err()
+                .to_string()
+                .contains("--service-url")
+        );
+        assert!(p("run --suite agent").is_err());
+        let r = p("run --suite retrieval --write-baseline").unwrap();
+        assert_eq!(r.service_url, None);
+        assert!(p("run --suite dogfood").is_ok());
+        assert!(
+            p("run --suite retrieval --service-url https://margin.krishnanelloore.com")
+                .unwrap_err()
+                .to_string()
+                .contains("prod")
+        );
+        assert!(p("record-embeddings --service-url http://127.0.0.1:8787").is_err());
     }
 
     async fn fake_service(environment: Option<&'static str>) -> String {
@@ -564,7 +592,7 @@ mod tests {
 
     #[test]
     fn service_url_is_required_and_never_prod() {
-        for cmd in ["run --suite retrieval", "export", "report --service"] {
+        for cmd in ["run --suite courses", "export", "report --service"] {
             let err = p(cmd).unwrap_err().to_string();
             assert!(err.contains("--service-url"), "{cmd}: {err}");
         }
