@@ -2870,6 +2870,12 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         steps.iter().map(|c| c.step).collect::<Vec<_>>(),
         [Some(1), Some(2)]
     );
+    // The provider's share of each step: within the step, so the overhead
+    // (`duration_ms − provider_ms`) is never negative.
+    for c in &steps {
+        let p = c.provider_ms.expect("provider_ms on a step");
+        assert!(p >= 0.0 && p <= c.duration_ms, "{p} of {}", c.duration_ms);
+    }
     assert!(steps.iter().all(|c| c.prompt_version.as_deref()
         == Some(margin_agent::AGENT_PROMPT_VERSION)
         && c.parent_id.as_deref() == Some(turn[0].id.as_str())));
@@ -2967,6 +2973,11 @@ async fn a_turn_is_traced_with_ids_and_numbers_only() {
         .collect();
     assert_eq!(model_calls.iter().map(|r| r.calls).sum::<u64>(), 3);
     assert_eq!(model_calls.iter().map(|r| r.input).sum::<u64>(), 300);
+    // Each bucket's p95 of its rows' durations (computed from the raw rows on read).
+    for r in &model_calls {
+        let p95 = r.p95_ms.expect("a p95 per bucket");
+        assert!(p95 >= 0.0 && p95 <= calls.iter().map(|c| c.duration_ms).fold(0.0, f64::max));
+    }
     let cost: f64 = model_calls.iter().map(|r| r.cost_usd).sum();
     let recorded: f64 = calls.iter().map(|c| c.cost_usd.unwrap()).sum();
     assert!((cost - recorded).abs() < 1e-12, "{cost} vs {recorded}");
@@ -3060,4 +3071,107 @@ async fn failed_and_stopped_calls_are_traced_with_codes() {
         assert!(!r.ok);
         assert_eq!(r.error_code.as_deref(), Some("cancelled"), "{r:#?}");
     }
+}
+
+/// `docs/phase5-brief.md` D6: failed calls in the window raise `error_rate`, which
+/// `GET /api/alerts`, `GET /api/version` and an `alert` trace row show; it clears once
+/// `clear_after_minutes` pass without a breach.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_calls_raise_an_alert_that_clears() {
+    use margin_service::alerts;
+    use margin_service::version::VersionInfo;
+    use margin_shared::context::AlertList;
+    let (h, t) = signed_in().await;
+    let now = Utc::now();
+    let rows: Vec<TraceRow> = (0..20)
+        .map(|i| {
+            let mut r = TraceRow::new(
+                TraceKind::ModelCall,
+                trace::new_row_id(),
+                now - chrono::Duration::seconds(60 + i),
+            );
+            r.ok = false;
+            r.error_code = Some("server_error".into());
+            r.duration_ms = 50.0;
+            r
+        })
+        .collect();
+    trace::write_rows(&h.state.store, &rows).await.unwrap();
+
+    let events = alerts::tick(&h.state, now).await.unwrap();
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let list: AlertList = h
+        .get(&t, routes::ALERTS)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.active.len(), 1);
+    let a = &list.active[0];
+    assert_eq!(
+        (a.name.as_str(), a.kind, a.value, a.threshold),
+        ("error_rate", Some(TraceKind::ModelCall), 1.0, 0.2)
+    );
+    assert_eq!(list.recent.len(), 1);
+    assert!(list.recent[0].raised);
+    // Public, and a count only.
+    let v: VersionInfo = h
+        .http
+        .get(h.u(routes::VERSION))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v.alerts_active, 1);
+    assert_eq!(v.alerts_since, Some(a.since));
+    let r = h.http.get(h.u(routes::ALERTS)).send().await.unwrap();
+    assert_eq!(r.status(), 401, "the list needs a device token");
+
+    // A second tick still sees it: nothing new.
+    assert!(alerts::tick(&h.state, now).await.unwrap().is_empty());
+    // 31 minutes on, the window holds nothing: it clears.
+    let later = now + chrono::Duration::minutes(31);
+    let events = alerts::tick(&h.state, later).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].raised);
+    let list: AlertList = h
+        .get(&t, routes::ALERTS)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.active.is_empty());
+    assert_eq!(
+        list.recent.iter().map(|e| e.raised).collect::<Vec<_>>(),
+        [false, true],
+        "newest first"
+    );
+    // Both are trace rows.
+    h.state.tracer.flush(Duration::from_secs(5)).await;
+    let (alert_rows, _) = traces(
+        &h,
+        &t,
+        &[
+            ("kind", "alert".into()),
+            ("to", (later + chrono::Duration::hours(1)).to_rfc3339()),
+        ],
+    )
+    .await;
+    assert_eq!(alert_rows.len(), 2);
+    assert!(
+        alert_rows
+            .iter()
+            .all(|r| r.error_code.as_deref() == Some("error_rate")
+                && r.tool.as_deref() == Some("model_call"))
+    );
+    assert_eq!(
+        alert_rows.iter().map(|r| r.ok).collect::<Vec<_>>(),
+        [false, true]
+    );
 }
