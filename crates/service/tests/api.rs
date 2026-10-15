@@ -224,7 +224,9 @@ async fn version_reports_the_build_and_environment_without_a_token() {
     let v: margin_service::version::VersionInfo = r.json().await.unwrap();
     assert_eq!(v.environment, "dev");
     assert_eq!(v.sha, margin_service::version::BUILD_SHA);
-    assert_eq!(v.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(v.version, margin_service::version::VERSION);
+    assert_eq!(v.api_version, margin_shared::API_VERSION);
+    assert!(!v.app_too_old());
     assert!(v.started_at <= chrono::Utc::now());
     if cfg!(target_os = "linux") {
         assert!(v.rss_bytes.is_some_and(|b| b > 0));

@@ -36,8 +36,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::config::APP_NAME;
 
-/// The app's version and the commit it was built from (build.rs).
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The app's version (docs/versioning.md) and the commit it was built from (build.rs).
+pub const VERSION: &str = env!("MARGIN_VERSION");
 pub const BUILD: &str = env!("MARGIN_BUILD_SHA");
 
 /// The log rotates at this size; `LOG_FILES` files are kept in all.

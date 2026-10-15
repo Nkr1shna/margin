@@ -19,11 +19,24 @@ const FILES: &[&str] = &["MarginPicker.kt", "proguard-margin.pro"];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     build_sha();
+    build_version();
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("android") => android(),
         Ok("ios") if is_simulator() => simulator_entitlements(),
         _ => {}
     }
+}
+
+/// The build's semantic version (`MARGIN_VERSION`, src/diagnostics.rs): apps.yml's, which
+/// `scripts/version.sh at` computes from dev's history (docs/versioning.md), else
+/// Cargo.toml's version for a local build.
+fn build_version() {
+    println!("cargo:rerun-if-env-changed=MARGIN_VERSION");
+    let version = std::env::var("MARGIN_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!("cargo:rustc-env=MARGIN_VERSION={}", version.trim());
 }
 
 /// The commit this build is from, for crash reports (`MARGIN_BUILD_SHA`, src/diagnostics.rs):

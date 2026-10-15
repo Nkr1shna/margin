@@ -1,7 +1,9 @@
 # Builds margin-service for the Linux guests (docs/plan-deploy.md §4,
 # docs/plan-linux-service.md): a release build on the Linux runner VM, stamped with the
-# commit (MARGIN_BUILD_SHA, reported by GET /api/version). deploy-dev.yml / deploy-prod.yml
-# install the artifact (from the Mac host runner, which holds the deploy key).
+# commit (MARGIN_BUILD_SHA) and its version (MARGIN_VERSION, computed from dev's history by
+# scripts/version.sh at, docs/versioning.md), both reported by GET /api/version.
+# deploy-dev.yml / deploy-prod.yml install the artifact (from the Mac host runner, which
+# holds the deploy key).
 name: build-service
 
 on:
@@ -50,7 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Version
+        run: |
+          version="$(sh scripts/version.sh at "$GITHUB_SHA")"
+          echo "Version $version."
+          echo "MARGIN_VERSION=$version" >> "$GITHUB_ENV"
       # Cargo's build output lives outside the checkout, named after the environment (pinned
       # Rust + the image build), so each build only recompiles what changed; caches unused
       # for a week, or in the way when the disk is tight, are removed.
@@ -72,7 +80,7 @@ jobs:
           file "$bin" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "::error::not a Linux arm64 binary"; exit 1; }
           out="$("$bin" version)"
           echo "$out"
-          case "$out" in *"($MARGIN_BUILD_SHA)"*) ;; *) echo "::error::the binary isn't stamped with $MARGIN_BUILD_SHA"; exit 1 ;; esac
+          case "$out" in *" $MARGIN_VERSION ($MARGIN_BUILD_SHA)"*) ;; *) echo "::error::the binary isn't stamped with $MARGIN_VERSION ($MARGIN_BUILD_SHA)"; exit 1 ;; esac
       - name: Package
         run: |
           mkdir -p dist
