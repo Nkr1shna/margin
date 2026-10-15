@@ -394,7 +394,7 @@ pub enum SourceKind {
     Text,
     /// Source code, chunked along lines.
     Code,
-    /// Text from PDFKit (Vision OCR for pages without text), plus each page as an image.
+    /// Text from pdfium (tesseract OCR for pages without text), plus each page as an image.
     Pdf,
     /// .png, .jpg, .heic, .webp, .gif, .tiff, .bmp: embedded with the image encoder.
     Image,
