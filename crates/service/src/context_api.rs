@@ -12,8 +12,9 @@
 //! agent's `mga_` token (the agent: `agent/<id>`, the header ignored). A search reads
 //! the caller's access paths; a caller-supplied `access` must be a subset of them (400
 //! `bad_access`). An ingested document belongs to the caller's person (an agent's: its
-//! owner) and only that person deletes or replaces it. Every trace row a request records
-//! names its principal.
+//! owner) and only that person deletes or replaces it: agent documents are keyed by
+//! owner, agent name and document name, so another person's document of the same name
+//! is a different document. Every trace row a request records names its principal.
 //!
 //! L2 (`docs/l2-brief.md` D5, D6): every read carries the caller's `Reader`, so outline
 //! and passages of a document the caller can't read are 404, and the change feed lists
@@ -226,22 +227,31 @@ pub async fn passages(
     ))
 }
 
-/// The document an agent's ingest of `name` would replace.
+/// The document an ingest of `name` by `owner`'s agent would replace: agent documents
+/// are keyed by owner, agent name and document name, so another person's document of
+/// the same name is neither found nor replaced (and its existence isn't told).
 async fn existing_agent_document(
     state: &AppState,
     origin: &Origin,
     name: &str,
+    owner: &str,
 ) -> AppResult<Option<Document>> {
     let found: Vec<Document> = state
         .store
         .query_rows(
-            "SELECT VALUE doc FROM document WHERE doc.origin = $origin AND doc.name = $name",
+            "SELECT VALUE doc FROM document WHERE doc.origin = $origin AND doc.name = $name \
+             AND (doc.owner ?? $bootstrap) = $owner",
             vec![
                 (
                     "origin",
                     serde_json::to_value(origin).map_err(AppError::internal)?,
                 ),
                 ("name", serde_json::json!(name)),
+                (
+                    "bootstrap",
+                    serde_json::json!(crate::principal::BOOTSTRAP_PERSON_ID),
+                ),
+                ("owner", serde_json::json!(owner)),
             ],
         )
         .await?;
@@ -381,8 +391,9 @@ pub async fn ingest_audience(
 /// replaces that document's text; the diff keeps unchanged passages). On a device token
 /// the origin's name is the agent's and `actor` is `agent:<name>`; on an agent token the
 /// origin is that agent's name and `actor` is `agent/<id>`. Either way the document's
-/// `owner` is the caller's person, and someone else's document isn't replaced (403
-/// `not_owner`).
+/// `owner` is the caller's person, and the document found again is the caller's own of
+/// that agent and name: someone else's of the same name is neither replaced nor
+/// revealed (L2).
 pub async fn ingest(
     State(state): State<AppState>,
     CurrentPrincipal(p): CurrentPrincipal,
@@ -420,12 +431,10 @@ pub async fn ingest(
         audience: None,
         ..doc
     };
-    let existing = existing_agent_document(&state, &req.origin, req.name.trim()).await?;
-    if let Some(existing) = &existing
-        && existing.owner.as_ref().is_some_and(|o| o != &p.person_id)
-    {
-        return Err(not_owner());
-    }
+    // The caller's own document of that name, if any (another person's of the same
+    // name is theirs alone: this one is created beside it).
+    let existing =
+        existing_agent_document(&state, &req.origin, req.name.trim(), &p.person_id).await?;
     // A replacement without an audience keeps the document's; a new document without
     // one is private to its person and the agent that wrote it.
     if asked.is_some() || existing.is_none() {

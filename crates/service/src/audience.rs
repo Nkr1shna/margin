@@ -189,6 +189,7 @@ async fn library_document(
             id: id.to_string(),
         },
         "",
+        None,
     )
     .await
 }

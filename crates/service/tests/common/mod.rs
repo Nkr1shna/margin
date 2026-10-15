@@ -1444,10 +1444,15 @@ impl Harness {
         let s = self.start_login(device).await;
         let r = self.callback(code, &Self::state_param(&s)).await;
         assert_eq!(r.status(), 200);
-        match self.poll(&s).await {
+        let token = match self.poll(&s).await {
             LoginState::Approved { token, .. } => token,
             other => panic!("expected approval, got {other:?}"),
-        }
+        };
+        // The sign-in's audit rows are written (and their `AuditAppended` sent) off a
+        // queue: wait for them, so a socket a test opens next never gets them as its
+        // first frame instead of the event the test is waiting for.
+        margin_service::audit::flush(&self.state, std::time::Duration::from_secs(5)).await;
+        token
     }
 
     /// `POST /api/invitations` as `admin_token`; panics unless it succeeds.

@@ -437,7 +437,9 @@ pub fn AudienceDialog(target: AudienceTarget, on_close: EventHandler<()>) -> Ele
         let owner = owner.clone();
         let what = what.clone();
         async move {
-            if *busy.peek() {
+            // Until the directory is here, who would lose access can't be counted, so
+            // nothing is saved (the button is disabled too).
+            if *busy.peek() || !app.lib.peek().org_loaded {
                 return;
             }
             let body = if *sharing.peek() {
@@ -591,7 +593,9 @@ pub fn AudienceDialog(target: AudienceTarget, on_close: EventHandler<()>) -> Ele
                         button {
                             r#type: "button",
                             class: "btn btn-primary btn-sm",
-                            disabled: *busy.read(),
+                            // Disabled until the directory loaded: the "n people will
+                            // lose access" warning needs it.
+                            disabled: *busy.read() || !app.lib.read().org_loaded,
                             onclick: move |_| save_now(false),
                             if *busy.read() { span { class: "spinner" } }
                             "Save"
@@ -757,6 +761,40 @@ pub(crate) mod tests {
     fn dialog(html: &str) -> &str {
         let at = html.find("aud-dialog").expect("the Audience control");
         &html[at..]
+    }
+
+    /// Save waits for the directory: without it the "n people will lose access"
+    /// warning can't be counted, so it is disabled until `org_loaded`, enabled after.
+    #[test]
+    fn save_waits_for_the_directory() {
+        let save_button = |html: &str| -> String {
+            let d = dialog(html);
+            let at = d.find(">Save<").expect("Save");
+            d[d[..at].rfind("<button").unwrap()..at].to_string()
+        };
+        let mut lib = lib_of(ALICE);
+        let target = AudienceTarget::topic(&lib.topics["signals"]);
+        lib.org_loaded = false;
+        let html = render_with(
+            "/",
+            lib,
+            None,
+            Extra {
+                audience: Some(target.clone()),
+                ..as_person(TOKEN)
+            },
+        );
+        assert!(save_button(&html).contains("disabled"), "{html}");
+        let html = render_with(
+            "/",
+            lib_of(ALICE),
+            None,
+            Extra {
+                audience: Some(target),
+                ..as_person(TOKEN)
+            },
+        );
+        assert!(!save_button(&html).contains("disabled"), "{html}");
     }
 
     #[test]

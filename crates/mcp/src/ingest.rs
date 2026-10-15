@@ -333,9 +333,18 @@ pub async fn purge(
     };
     let actor = format!("agent:{agent}");
     let verb = if dry_run { "would delete" } else { "delete" };
+    // Only the caller's own documents: the feed also lists other people's that they
+    // shared (L2), which are theirs to purge.
+    let me = client.me().await?.person.map(|p| p.id);
     let mut names = Vec::new();
     for doc in client.documents().await? {
         if doc.actor != actor {
+            continue;
+        }
+        if let (Some(me), Some(owner)) = (&me, &doc.owner)
+            && owner != me
+        {
+            say(&format!("skip {} ({}): not yours", doc.name, doc.id));
             continue;
         }
         say(&format!("{verb} {} ({})", doc.name, doc.id));

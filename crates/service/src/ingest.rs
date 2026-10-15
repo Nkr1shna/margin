@@ -214,11 +214,15 @@ fn new_document(id: Id, project_id: Id, origin: Origin, name: &str, kind: Source
     }
 }
 
-/// The document of `origin`, found by its origin (and, for an agent's, its name).
+/// The document of `origin`, found by its origin (and, for an agent's, its name and its
+/// `owner`: an agent document is keyed by owner, agent name and document name, so two
+/// people's `claude-code` each have their own `notes.md`; `None` is the bootstrap
+/// owner's, as a document written without one is).
 pub async fn find_by_origin(
     state: &AppState,
     origin: &Origin,
     name: &str,
+    owner: Option<&str>,
 ) -> anyhow::Result<Option<Document>> {
     if let Origin::Source { source_id } = origin {
         return document(state, source_id).await;
@@ -226,8 +230,16 @@ pub async fn find_by_origin(
     let mut sql = "SELECT VALUE doc FROM document WHERE doc.origin = $origin".to_string();
     let mut binds = vec![("origin", serde_json::to_value(origin)?)];
     if matches!(origin, Origin::Agent { .. }) {
-        sql.push_str(" AND doc.name = $name");
+        sql.push_str(" AND doc.name = $name AND (doc.owner ?? $bootstrap) = $owner");
         binds.push(("name", serde_json::json!(name)));
+        binds.push((
+            "bootstrap",
+            serde_json::json!(crate::principal::BOOTSTRAP_PERSON_ID),
+        ));
+        binds.push((
+            "owner",
+            serde_json::json!(owner.unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID)),
+        ));
     }
     let found: Vec<Document> = state.store.query_rows(&sql, binds).await?;
     Ok(found.into_iter().next())
@@ -275,8 +287,9 @@ async fn upsert_document_locked(
     actor: &str,
     owner: Option<&str>,
 ) -> anyhow::Result<Document> {
+    let found = find_by_origin(state, &origin, name, owner).await?;
     let owner = owner.map(str::to_string);
-    let doc = match find_by_origin(state, &origin, name).await? {
+    let doc = match found {
         Some(mut doc) => {
             let new_owner = owner.is_some() && doc.owner != owner;
             if doc.name != name
@@ -634,7 +647,7 @@ pub async fn delete_library_document_locked(
         kind,
         id: id.to_string(),
     };
-    if let Some(doc) = find_by_origin(state, &origin, "").await? {
+    if let Some(doc) = find_by_origin(state, &origin, "", None).await? {
         delete_document_locked(state, &doc.id).await?;
     }
     Ok(())
