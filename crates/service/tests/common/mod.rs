@@ -492,7 +492,13 @@ impl Renderer for FakeRenderer {
     fn detect_tools(&self) -> BoxFuture<'_, Vec<ToolStatus>> {
         Box::pin(async move {
             let missing = self.missing.lock().unwrap().clone();
-            ["manimgx", "fluidaudiocli"]
+            // Each OS's narration tool, as Settings → Tools lists it there.
+            let voice = if cfg!(target_os = "macos") {
+                "fluidaudiocli"
+            } else {
+                "margin-tts"
+            };
+            ["manimgx", voice]
                 .into_iter()
                 .map(|name| {
                     let found = !missing.contains(name);
@@ -1079,6 +1085,10 @@ pub struct Setup {
     /// `EmbedTools` (Core ML, PDFKit, ImageIO, AVFoundation, fluidaudiocli) and this
     /// model, linked into its data folder, instead of the fakes.
     pub real_model: Option<PathBuf>,
+    /// The embedder backend to configure; `None` = this OS's default (Core ML on macOS,
+    /// ONNX elsewhere). The fake Hugging Face serves the Core ML repo's one-file layout,
+    /// so download tests pin `"coreml"` to run the same on every OS.
+    pub embedder: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -1089,6 +1099,7 @@ impl Default for Setup {
             model_downloaded: true,
             files: Vec::new(),
             real_model: None,
+            embedder: None,
         }
     }
 }
@@ -1104,7 +1115,7 @@ pub async fn start_with(setup: Setup) -> Harness {
     let url = format!("http://{addr}");
     let data_dir =
         std::env::temp_dir().join(format!("margin-service-test-{}", uuid::Uuid::new_v4()));
-    let config = Config {
+    let mut config = Config {
         public_url: url.clone(),
         bind: addr.to_string(),
         data_dir: data_dir.clone(),
@@ -1115,6 +1126,9 @@ pub async fn start_with(setup: Setup) -> Harness {
         environment: "dev".into(),
         ..Config::default()
     };
+    if let Some(embedder) = setup.embedder {
+        config.embedder = embedder.into();
+    }
     let store = match setup.store {
         Some(s) => s,
         None => Store::memory().await.unwrap(),

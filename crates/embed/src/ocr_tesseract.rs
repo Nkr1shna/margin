@@ -117,7 +117,9 @@ pub(crate) mod tests {
                  [ \"$2\" = stdout ] && [ \"$3\" = --psm ] && [ \"$4\" = 3 ] && [ \"$6\" = eng ] || exit 2\n\
                  [ \"$OMP_THREAD_LIMIT\" = 1 ] || exit 3\n\
                  head -c 8 \"$1\" | od -c | head -1 > '{}'\n\
+                 printf '%s' \"$1\" > '{}.path'\n\
                  printf '%s\\n\\n\\n\\f' '{}'\n",
+                seen.display(),
                 seen.display(),
                 text.replace('\'', "")
             ),
@@ -137,16 +139,10 @@ pub(crate) mod tests {
         // It was handed a PNG, and the PNG is gone.
         let seen = std::fs::read_to_string(dir.join("seen")).unwrap();
         assert!(seen.contains("P   N   G"), "{seen}");
-        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(&format!("margin-ocr-{}-", std::process::id()))
-            })
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
+        // Only this call's PNG: other tests in the process (the real-tesseract one) may
+        // have their own temporary PNG in flight at the same moment.
+        let given = std::fs::read_to_string(dir.join("seen.path")).unwrap();
+        assert!(!Path::new(&given).exists(), "{given} was left behind");
 
         // A failing tesseract is an error with its message.
         let bad = dir.join("bad");
