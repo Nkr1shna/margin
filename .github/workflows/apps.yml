@@ -9,8 +9,9 @@
 #   workflow_dispatch     -> on dev with "dev" / on release with "prod": publishes as above;
 #                            otherwise workflow artifacts only
 #
-# A fresh install starts on the service named by MARGIN_DEFAULT_SERVICE_URL at build time;
-# the sign-in screen still offers Prod, Dev and Custom. Desktop: a .dmg of the bundled
+# Each build is pinned to the service named by MARGIN_DEFAULT_SERVICE_URL at build time
+# (docs/plan-deploy.md §10): its sign-in screen has no service picker. Only a developer
+# build, made without that variable, asks for an address. Desktop: a .dmg of the bundled
 # Margin.app (Margin Dev.app for dev: its own name, bundle id, settings and Keychain
 # entries, so both install side by side), signed ad hoc (Developer ID and iOS TestFlight
 # wait on the Apple Developer account, owner question 7). Android: the APK, skipped while
@@ -33,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Which service a fresh install starts on"
+        description: "Which service the app is built for (pinned)"
         required: true
         default: prod
         type: choice
