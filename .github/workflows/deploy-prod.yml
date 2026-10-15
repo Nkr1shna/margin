@@ -64,11 +64,11 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       # The deploy scripts of the commit being deployed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.build.outputs.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: margin-service-${{ steps.build.outputs.sha }}
           path: dist
@@ -84,7 +84,7 @@ jobs:
           [ "$(cat dist/BUILD_SHA)" = "$SHA" ] || { echo "::error::the artifact is stamped $(cat dist/BUILD_SHA), not $SHA"; exit 1; }
           chmod +x dist/margin-service
           deploy/scripts/deploy.sh prod dist/margin-service "$SHA"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: deployed-prod-${{ steps.build.outputs.sha }}
           path: dist/
