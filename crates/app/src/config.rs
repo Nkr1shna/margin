@@ -6,16 +6,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The prod service (`docs/plan-deploy.md` §2).
-pub const PROD_SERVICE_URL: &str = "https://margin.krishnanelloore.com";
-/// The dev service, where agents and evals run.
-pub const DEV_SERVICE_URL: &str = "https://devmargin.krishnanelloore.com";
+/// The service this build is pinned to: `MARGIN_DEFAULT_SERVICE_URL` at build time
+/// (`apps.yml` sets it per environment, so "Margin" talks to prod and "Margin Dev" to
+/// dev, and nothing else can be chosen). `None` for a developer build (`dx serve`,
+/// `cargo run`), which asks for the address instead (`docs/plan-deploy.md` §10).
+pub const PINNED_SERVICE_URL: Option<&str> = option_env!("MARGIN_DEFAULT_SERVICE_URL");
 
-/// The address a fresh install starts with: `MARGIN_DEFAULT_SERVICE_URL` when the app
-/// was built (`apps.yml` builds one per environment), else prod.
-pub const DEFAULT_SERVICE_URL: &str = match option_env!("MARGIN_DEFAULT_SERVICE_URL") {
-    Some(url) => url,
-    None => PROD_SERVICE_URL,
+/// Where a developer build looks first: a service run on this machine
+/// (`margin-service serve` binds 127.0.0.1:8787). The Android emulator reaches its host
+/// as 10.0.2.2.
+pub const LOCAL_SERVICE_URL: &str = if cfg!(target_os = "android") {
+    "http://10.0.2.2:8787"
+} else {
+    "http://localhost:8787"
 };
 
 /// The app's name, and its folder in the platform data directory: "Margin", or what
@@ -26,15 +29,11 @@ pub const APP_NAME: &str = match option_env!("MARGIN_APP_NAME") {
     None => "Margin",
 };
 
-/// The sign-in screen's named services; anything else is "Custom".
-pub const PRESETS: [(&str, &str); 2] = [("Prod", PROD_SERVICE_URL), ("Dev", DEV_SERVICE_URL)];
-
-/// The preset whose address `url` is (after normalizing), if any.
-pub fn preset_for(url: &str) -> Option<usize> {
-    let url = normalize_service_url(url).ok()?;
-    PRESETS
-        .iter()
-        .position(|(_, preset)| preset.eq_ignore_ascii_case(&url))
+/// `url` without its scheme, for saying where the app connects: "devmargin.example.com".
+pub fn service_host(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -93,6 +92,19 @@ pub struct LocalConfig {
 
 fn default_zoom() -> u32 {
     crate::zoom::DEFAULT
+}
+
+impl LocalConfig {
+    /// The service this app talks to: the build's pinned service; in a developer build,
+    /// the address confirmed at sign-in, or the local service until one is. A pinned
+    /// build ignores any address an older install saved (its token for that address stays
+    /// in the keychain, unused) and signs in to its own service.
+    pub fn service_url(&self) -> String {
+        PINNED_SERVICE_URL
+            .map(String::from)
+            .or_else(|| self.service_url.clone())
+            .unwrap_or_else(|| LOCAL_SERVICE_URL.to_string())
+    }
 }
 
 impl Default for LocalConfig {
@@ -225,20 +237,32 @@ mod tests {
     }
 
     #[test]
-    fn presets_match_their_addresses() {
-        assert_eq!(preset_for("https://margin.krishnanelloore.com"), Some(0));
-        assert_eq!(preset_for("margin.krishnanelloore.com/"), Some(0));
-        assert_eq!(preset_for("https://DevMargin.krishnanelloore.com"), Some(1));
-        assert_eq!(preset_for("http://127.0.0.1:8787"), None);
-        assert_eq!(preset_for(""), None);
-        // Every preset is already a normalized address, and the default is one of
-        // them unless a build named another.
-        for (_, url) in PRESETS {
-            assert_eq!(normalize_service_url(url).unwrap(), url);
+    fn the_service_is_the_pinned_one_or_what_was_saved() {
+        let saved = LocalConfig {
+            service_url: Some("http://127.0.0.1:8787".into()),
+            ..LocalConfig::default()
+        };
+        match PINNED_SERVICE_URL {
+            Some(pinned) => {
+                // A pinned address is already normalized and wins over a saved one.
+                assert_eq!(normalize_service_url(pinned).unwrap(), pinned);
+                assert_eq!(LocalConfig::default().service_url(), pinned);
+                assert_eq!(saved.service_url(), pinned);
+            }
+            None => {
+                assert_eq!(LocalConfig::default().service_url(), LOCAL_SERVICE_URL);
+                assert_eq!(saved.service_url(), "http://127.0.0.1:8787");
+            }
         }
-        if option_env!("MARGIN_DEFAULT_SERVICE_URL").is_none() {
-            assert_eq!(preset_for(DEFAULT_SERVICE_URL), Some(0));
-        }
+        assert_eq!(
+            normalize_service_url(LOCAL_SERVICE_URL).unwrap(),
+            LOCAL_SERVICE_URL
+        );
+        assert_eq!(
+            service_host("https://devmargin.example.com"),
+            "devmargin.example.com"
+        );
+        assert_eq!(service_host("http://localhost:8787"), "localhost:8787");
     }
 
     #[test]

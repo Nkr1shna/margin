@@ -41,6 +41,9 @@
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
+//! - `RENDER_PINNED=<url>` renders `connect` as a release build pinned to that service
+//!   (`RENDER_PINNED=dev`: as a developer build, with the address field); otherwise it
+//!   has this build's shape.
 //! - `RENDER_JS=<script>` runs a script once the page has loaded (scrolling, opening a
 //!   tooltip…), since effects don't run here.
 //!
@@ -365,7 +368,14 @@ fn Harness(props: HarnessProps) -> Element {
     });
     let sources_topic = std::env::var("RENDER_SOURCES").ok();
     if connect {
-        rsx! { ui::signin::ConnectScreen {} }
+        // The build's shape unless RENDER_PINNED names a service (or `dev` for a
+        // developer build).
+        let pinned = match std::env::var("RENDER_PINNED").ok().as_deref() {
+            None => config::PINNED_SERVICE_URL.map(String::from),
+            Some("dev") => None,
+            Some(url) => Some(url.to_string()),
+        };
+        rsx! { ui::signin::ConnectScreen { pinned } }
     } else {
         rsx! {
             Router::<routes::Route> {}
