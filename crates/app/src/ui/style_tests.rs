@@ -333,6 +333,50 @@ fn chat_transcript_never_scrolls_sideways() {
     );
 }
 
+/// The text of every `@media (<query>) { … }` block with that exact query.
+fn media_blocks(query: &str) -> Vec<&'static str> {
+    let head = format!("@media ({query}) {{");
+    CSS.match_indices(&head)
+        .map(|(at, _)| {
+            let body = &CSS[at + head.len()..];
+            // Blocks close with a `}` at the start of a line.
+            let end = body.find("\n}").unwrap_or(body.len());
+            &body[..end]
+        })
+        .collect()
+}
+
+/// L2 at phone width: the Audience control comes up from the bottom as a sheet with
+/// the room to scroll its pickers, an audit row is a card of lines, a summary line
+/// isn't indented; at desktop width the audit log is a five-column table. Touch gets
+/// 44pt targets.
+#[test]
+fn audiences_and_the_audit_log_fit_phones_and_computers() {
+    let phone = media_blocks("max-width: 719px").join("\n");
+    assert!(
+        phone.contains(".modal-scrim.sheet { place-items: end stretch;"),
+        "the sheet"
+    );
+    assert!(phone.contains(".modal-scrim.sheet > .modal { width: 100%; max-height: 100%;"));
+    assert!(phone.contains(".audit-row { grid-template-columns: minmax(0, 1fr);"));
+    assert!(phone.contains(".audit-head { display: none; }"));
+    assert!(phone.contains(".aud-scroll { max-height: 40vh; }"));
+    assert!(phone.contains(".aud-under { padding-left: 0; }"));
+    // Desktop: the table, and pickers that scroll inside the dialog.
+    assert_eq!(
+        token(block(".audit-row {"), "grid-template-columns"),
+        "136px 128px 120px minmax(0, 1fr) minmax(0, 1.4fr)"
+    );
+    assert_eq!(token(block(".aud-scroll {"), "overflow"), "auto");
+    assert_eq!(token(block(".org-dialog {"), "overflow"), "auto");
+    assert_eq!(token(block(".aud-line {"), "flex-wrap"), "wrap");
+    let touch = media_blocks("pointer: coarse").join("\n");
+    assert!(touch.contains(
+        ".aud-line .link-btn, .aud-deny > summary, .agent-docs > summary { min-height: 44px; }"
+    ));
+    assert!(touch.contains(".aud-dialog .check-row { min-height: 44px; }"));
+}
+
 /// A title that only repeats an element's own text (a tool row's label) shows as a
 /// tooltip only while that text is cut off.
 #[test]

@@ -15,8 +15,8 @@ use anyhow::Context;
 use margin_embed::{CHUNK_TOKENS, Purpose, SourceKind};
 use margin_service::db::{INSERT_MANY_MAX, PASSAGE, PassageRow, Store};
 use margin_service::pipeline::{
-    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Registry,
-    RerankRequest, RewriteRequest, StageDeps,
+    ChunkerCfg, Diversity, FusionCfg, Hit, PackBudget, Packed, Pipeline, Query, Reader, Registry,
+    RerankRequest, Retriever, RewriteRequest, StageDeps,
 };
 use margin_service::retrieval::QueryPlan;
 use margin_shared::context::{ACCESS_COMPANY, Scope};
@@ -186,6 +186,13 @@ impl<'v> EvalIndex<'v> {
         self.docs.get(document_id)
     }
 
+    /// Every indexed document's path (its document id), sorted.
+    pub fn document_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.docs.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
     /// The chunks of `doc` the pipeline's chunker cuts, as the eval chunks them (the
     /// same token count in recording and replay).
     pub fn chunks(
@@ -224,6 +231,7 @@ impl<'v> EvalIndex<'v> {
             origin: if doc.in_folder { "folder" } else { "source" }.into(),
             scope_ids: scope_ids.clone(),
             access: vec![ACCESS_COMPANY.into()],
+            deny: Vec::new(),
             unit_id,
             modality: modality.into(),
             ord,
@@ -359,9 +367,16 @@ impl<'v> EvalIndex<'v> {
         names
     }
 
-    /// Searches for the retrieval suite's purpose (`retrieval_purpose`).
+    /// Searches for the retrieval suite's purpose (`retrieval_purpose`) as the reader of
+    /// an index that keeps every passage at `company` (`access::company_reader`).
     pub async fn search(&self, plan: &[String], scope: &Scope) -> anyhow::Result<Ranked> {
-        self.search_as(plan, scope, self.retrieval_purpose()).await
+        self.search_as(
+            &crate::access::company_reader(),
+            plan,
+            scope,
+            self.retrieval_purpose(),
+        )
+        .await
     }
 
     /// What `retrieval::retrieve` does before packing, for `purpose`: rewrites the plan
@@ -371,6 +386,21 @@ impl<'v> EvalIndex<'v> {
     /// keep the input themselves when a live call fails, as the service does.
     pub async fn search_as(
         &self,
+        reader: &Reader,
+        plan: &[String],
+        scope: &Scope,
+        purpose: RetrievalPurpose,
+    ) -> anyhow::Result<Ranked> {
+        self.search_with(&*self.pipeline.retriever, reader, plan, scope, purpose)
+            .await
+    }
+
+    /// `search_as` with another retriever in the pipeline's place (the access suite's
+    /// unfiltered replay, `unfiltered::UnfilteredRetriever`).
+    pub async fn search_with(
+        &self,
+        retriever: &dyn Retriever,
+        reader: &Reader,
         plan: &[String],
         scope: &Scope,
         purpose: RetrievalPurpose,
@@ -410,14 +440,14 @@ impl<'v> EvalIndex<'v> {
                 vector: vector.clone(),
                 embedder: self.vectors.version().to_string(),
                 scope: scope.clone(),
-                access: None,
+                reader: reader.clone(),
                 modalities: Vec::new(),
                 k: RETRIEVAL_K_FUSED,
                 budget_tokens: 0,
                 images_max: 0,
                 diversity: Diversity::default(),
             };
-            legs.push(self.pipeline.retriever.search(&q).await?);
+            legs.push(retriever.search(&q).await?);
         }
         let fused = self.pipeline.fusion.fuse(
             legs,
@@ -614,6 +644,7 @@ pub(crate) mod testing {
                 origin: "source".into(),
                 scope_ids: vec![],
                 access: vec![],
+                deny: Vec::new(),
                 unit_id: id.into(),
                 modality: "text".into(),
                 ord: 0,

@@ -14,6 +14,8 @@ mod events;
 mod fake;
 #[cfg(test)]
 mod guard_tests;
+#[cfg(test)]
+mod l2_tests;
 // `StdDir` and some `DirError`s are used by the platforms' `open` (4a, 4b, 4c), which
 // aren't built on every platform yet.
 #[allow(dead_code)]
@@ -136,7 +138,8 @@ fn main() {
 }
 
 /// Closing the window or quitting ends the app's runtime, and with it any note save
-/// still waiting on its debounce; send those edits first.
+/// still waiting on its debounce; send those edits first. Quitting is a clean exit
+/// (`diagnostics::end_run`).
 #[cfg(feature = "desktop")]
 fn flush_on_exit<T>(
     event: &dioxus::desktop::tao::event::Event<'_, T>,
@@ -152,6 +155,9 @@ fn flush_on_exit<T>(
             }
     ) {
         drafts::flush_blocking(Duration::from_secs(3));
+    }
+    if matches!(event, Event::LoopDestroyed) {
+        diagnostics::end_run();
     }
 }
 

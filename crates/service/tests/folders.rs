@@ -789,6 +789,7 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
                 section_path: None,
             }],
             written_with: None,
+            audience_narrowed: false,
         },
         proposal_id: None,
         previous_body: None,
@@ -796,6 +797,7 @@ async fn a_resync_replaces_changed_files_in_place_and_removes_deleted_ones() {
         author: Default::default(),
         prompt: None,
         with_quiz: false,
+        drew_on: Vec::new(),
         workspace_ids: vec![ws.id.clone()],
     };
     h.state
@@ -1501,4 +1503,125 @@ async fn the_manifest_body_stops_at_its_limit() {
     assert_eq!(send(MANIFEST_MAX_BYTES).await.unwrap().status(), 400);
     assert_eq!(send(MANIFEST_MAX_BYTES + 1).await.unwrap().status(), 413);
     const { assert!(MANIFEST_MAX_BYTES > routes::JSON_BODY_MAX_BYTES) };
+}
+
+// ---------------------------------------------------------------------------
+// L2: a lesson that draws on a folder's files takes the audience they allow (D4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lesson_drawing_on_a_private_folder_stays_private_until_the_folder_is_published() {
+    let (h, t, ws) = synced_notes().await;
+    let topic: margin_shared::Topic = h
+        .post(&t, "/api/topics")
+        .json(&json!({"title": "Plants"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let me = topic.access[0].clone();
+    let company = margin_shared::Audience {
+        access: vec!["company".into()],
+        deny: Vec::new(),
+    };
+    let r = h
+        .publish(&t, margin_shared::AudienceUnit::Topic, &topic.id, &company)
+        .await;
+    assert_eq!(r.status(), 200);
+    let now = Utc::now();
+    let row = StoredLesson {
+        lesson: Lesson {
+            access: vec![me.clone(), "company".into()],
+            deny: Vec::new(),
+            owner: topic.owner.clone(),
+            id: "l-plants".into(),
+            topic_id: topic.id.clone(),
+            title: "Plants and light".into(),
+            summary: "How plants make sugar.".into(),
+            position: 0,
+            level: margin_shared::Level::Intro,
+            minutes: 5,
+            body_md: String::new(),
+            status: LessonStatus::Queued,
+            created_at: now,
+            updated_at: now,
+            citations: Vec::new(),
+            written_with: None,
+            audience_narrowed: false,
+        },
+        proposal_id: None,
+        previous_body: None,
+        previous_citations: None,
+        author: Default::default(),
+        prompt: None,
+        with_quiz: false,
+        drew_on: Vec::new(),
+        workspace_ids: vec![ws.id.clone()],
+    };
+    h.state
+        .store
+        .put(db::LESSON, "l-plants", &row)
+        .await
+        .unwrap();
+    let mut socket = h.socket(&t).await;
+    margin_service::ask::spawn_lesson_job(&h.state, "l-plants".into(), true);
+    let lesson: StoredLesson = eventually(|| async {
+        let l: StoredLesson = h.state.store.get(db::LESSON, "l-plants").await.unwrap()?;
+        (l.lesson.status == LessonStatus::Ready).then_some(l)
+    })
+    .await;
+    // It drew on the folder's files, which are private: so is the lesson, before a
+    // word of it streamed.
+    let files: HashSet<String> = files(&h, &t, &ws.id)
+        .await
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        lesson.drew_on.iter().any(|d| files.contains(d)),
+        "{:?}",
+        lesson.drew_on
+    );
+    assert_eq!(lesson.lesson.access, [me.as_str()]);
+    assert!(lesson.lesson.audience_narrowed);
+    let events = socket
+        .until(|e| matches!(e, Event::LessonChanged { lesson } if lesson.id == "l-plants" && lesson.status == LessonStatus::Ready))
+        .await;
+    let generating = events
+        .iter()
+        .position(|e| matches!(e, Event::LessonChanged { lesson } if lesson.audience_narrowed))
+        .unwrap();
+    let first_delta = events
+        .iter()
+        .position(|e| matches!(e, Event::LessonDelta { .. }))
+        .unwrap_or(usize::MAX);
+    assert!(generating < first_delta);
+
+    // The folder is published to the company; publishing the topic again derives the
+    // lesson anew.
+    for (unit, id) in [
+        (margin_shared::AudienceUnit::Workspace, &ws.id),
+        (margin_shared::AudienceUnit::Topic, &topic.id),
+    ] {
+        assert_eq!(h.publish(&t, unit, id, &company).await.status(), 200);
+    }
+    let lesson: StoredLesson = h
+        .state
+        .store
+        .get(db::LESSON, "l-plants")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lesson.lesson.access, [me, "company".into()]);
+    assert!(!lesson.lesson.audience_narrowed);
+    // The folder's files and their passages followed the folder.
+    for id in &files {
+        let rows = h.state.store.passages_of(id).await.unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| r.access.contains(&"company".to_string()))
+        );
+    }
 }

@@ -333,7 +333,7 @@ fn lock_database(db_dir: &Path) -> anyhow::Result<Vec<std::fs::File>> {
 
 /// Waits until nothing holds the database open: a handle this process dropped lets go
 /// of its files from background tasks, a moment later.
-async fn wait_released(db_dir: &Path) -> anyhow::Result<()> {
+pub async fn wait_released(db_dir: &Path) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     loop {
         match lock_database(db_dir) {
@@ -342,6 +342,58 @@ async fn wait_released(db_dir: &Path) -> anyhow::Result<()> {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
         }
     }
+}
+
+/// A copy of a stopped data folder's database, opened as it is (`open_stopped_copy`).
+pub struct StoppedCopy {
+    pub store: Store,
+    db: PathBuf,
+    _dir: TempDir,
+}
+
+impl StoppedCopy {
+    /// Closes the copy and waits for its files to be let go before they are removed.
+    pub async fn close(self) {
+        let StoppedCopy { store, db, _dir } = self;
+        drop(store);
+        let _ = wait_released(&db).await;
+    }
+}
+
+/// Copies `<data_dir>/db` to a temporary folder while holding the database's lock (so
+/// it refuses while the service runs: a copy of a live database isn't consistent) and
+/// opens the copy as it is: nothing defined, migrated or written, and the live data is
+/// never opened. What `margin-service export` reads from.
+pub async fn open_stopped_copy(data_dir: &Path) -> anyhow::Result<StoppedCopy> {
+    let db_dir = data_dir.join("db");
+    anyhow::ensure!(
+        db_dir.is_dir(),
+        "{} has no db folder: not a Margin data folder",
+        data_dir.display()
+    );
+    let dir = TempDir::new("export")?;
+    let copy_db = dir.0.join("db");
+    {
+        let (from, to) = (db_dir.clone(), copy_db.clone());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let _held = lock_database(&from)?;
+            copy_tree(&from, &to, true).with_context(|| format!("couldn't copy {}", from.display()))
+        })
+        .await??;
+    }
+    let store = Store::open_existing(&copy_db)
+        .await?
+        .with_context(|| format!("{} holds no Margin database", db_dir.display()))?;
+    Ok(StoppedCopy {
+        store,
+        db: copy_db,
+        _dir: dir,
+    })
+}
+
+/// Copies the folder `src` to `dst` (created), keeping links; for the export's files.
+pub fn copy_folder(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_tree(src, dst, false)
 }
 
 /// Whether `dir` is missing or empty.
@@ -861,6 +913,7 @@ mod data_tests {
             bytes: 3,
             actor: "owner".into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -874,6 +927,7 @@ mod data_tests {
             origin: "source".into(),
             scope_ids: vec![],
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: "u".into(),
             modality: "text".into(),
             ord: 0,

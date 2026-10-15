@@ -177,7 +177,9 @@ async fn uploads_are_read_embedded_and_listed() {
     assert!(rows[1].scope_ids.is_empty());
     assert_eq!(rows[1].document_id, s.id);
     assert_eq!(rows[1].embedder, margin_service::ingest::EMBEDDER_VERSION);
-    assert_eq!(rows[1].access, ["company"]);
+    // The source's audience (L2: private to its owner unless published).
+    assert_eq!(rows[1].access, s.access);
+    assert!(rows[1].access[0].starts_with("person/"));
     assert_eq!(rows[1].vector.len(), margin_embed::DIM);
     assert_eq!(h.source_tools.loads.load(Ordering::SeqCst), 1);
 
@@ -996,7 +998,9 @@ async fn sources_become_documents_with_located_passages_in_the_default_project()
         }
     );
     assert_eq!(doc.actor, "owner");
-    assert_eq!(doc.access, ["company"]);
+    // The source's audience: its topic's, private to its owner (L2).
+    assert_eq!(doc.access, s.access);
+    assert_eq!(doc.access, topic.access);
     assert!(doc.generation > 0);
     // One project, "My library", holds it.
     let projects: Vec<Project> = h.state.store.list(db::PROJECT).await.unwrap();
@@ -1022,7 +1026,7 @@ async fn sources_become_documents_with_located_passages_in_the_default_project()
     assert_eq!(rows[2].start_line, Some(9));
     assert!(rows.iter().all(|r| r.project_id == projects[0].id
         && r.scope_ids == [topic.id.clone()]
-        && r.access == ["company"]
+        && r.access == doc.access
         && r.origin == "source"
         && r.chunk_hash.len() == 64
         && r.id == format!("{}:{}", s.id, r.chunk_hash)
@@ -1229,14 +1233,18 @@ async fn a_documents_access_is_copied_onto_its_passages() {
     let t = h.sign_in("Mac").await;
     let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
     wait_source(&h, &t, &s.id, is_ready).await;
-    let mut doc = document(&h, &s.id).await;
-    doc.access = vec!["company/engineering".into(), "company/research".into()];
-    h.state.store.put(db::DOCUMENT, &s.id, &doc).await.unwrap();
+    // The row that owns the document moved (L2 D2: a re-index stamps the document
+    // from it).
+    let mut source: Source = h.state.store.get(db::SOURCE, &s.id).await.unwrap().unwrap();
+    source.access = vec!["company/engineering".into(), "company/research".into()];
+    h.state.store.put(db::SOURCE, &s.id, &source).await.unwrap();
     let report = margin_service::ingest::ingest(&h.state, &s.id)
         .await
         .unwrap();
-    // Nothing is embedded again; every passage carries the new paths.
+    // Nothing is embedded again; the document and every passage carry the new paths.
     assert_eq!(report.chunks_new, 0);
+    let doc = document(&h, &s.id).await;
+    assert_eq!(doc.access, source.access);
     let rows = h.state.store.passages_of(&s.id).await.unwrap();
     assert!(rows.iter().all(|r| r.access == doc.access));
     // A query filtered by access finds them through the index.
@@ -1263,7 +1271,15 @@ async fn deleting_and_attaching_sources_follow_through_to_documents() {
         .unwrap()
         .generation;
     // Filed under a topic: its passages are searchable from the topic.
-    let topic = new_topic(&h, &t, None, "Signals").await;
+    let mut topic = new_topic(&h, &t, None, "Signals").await;
+    // A topic shared with the company but not with Bob (L2): the source takes both.
+    topic.access = vec!["person/bootstrap".into(), "company".into()];
+    topic.deny = vec!["person/bob".into()];
+    h.state
+        .store
+        .put(db::TOPIC, &topic.id, &topic)
+        .await
+        .unwrap();
     let events = {
         let _w = h.state.write_lock.lock().await;
         margin_service::sources::attach_locked(&h.state, std::slice::from_ref(&s.id), &topic)
@@ -1275,6 +1291,18 @@ async fn deleting_and_attaching_sources_follow_through_to_documents() {
             |e| matches!(&e.event, Event::DocumentChanged { document } if document.id == s.id)
         )
     );
+    // The `SourceChanged` goes to the topic's readers less its denials, never to Bob.
+    let moved = events
+        .iter()
+        .find(|e| matches!(&e.event, Event::SourceChanged { source } if source.id == s.id))
+        .expect("the attached source's SourceChanged");
+    match &moved.audience {
+        margin_service::state::Audience::Readers { access, deny } => {
+            assert!(access.contains(&"company".to_string()), "{access:?}");
+            assert_eq!(deny, &["person/bob".to_string()]);
+        }
+        other => panic!("SourceChanged went to {other:?}, not to the readers"),
+    }
     assert!(
         chunks(&h, &s.id)
             .await
@@ -1365,6 +1393,7 @@ async fn agents_documents_and_library_items_are_indexed_too() {
         },
         kind: SourceKind::Text,
         text: "Restart the queue worker.\n\nThen drain the dead letters.".into(),
+        audience: None,
     };
     let doc = margin_service::ingest::ingest_text(&h.state, &req)
         .await

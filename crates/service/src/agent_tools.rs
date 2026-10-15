@@ -52,7 +52,7 @@ use tokio::sync::oneshot;
 
 use crate::error::{AppError, AppResult};
 use crate::library::{self, sort_topics};
-use crate::pipeline::{Hit, Packed};
+use crate::pipeline::{Hit, Packed, Reader};
 use crate::principal::Principal;
 use crate::state::{AppState, Author, StoredLesson, StoredVideo, can_read, list_visible};
 use crate::{ask, db, folders, retrieval, search, sources, turns, video};
@@ -800,8 +800,8 @@ impl TypedTool for Search {
                     .collect(),
                 k: k as u32,
                 budget: None,
-                // The chat owner's access (L1; L2 enforces it inside the index).
-                access: Some(who.paths.clone()),
+                // The reader below is the chat owner's (L2 D1).
+                access: None,
             };
             let packed = if resolved.is_empty() {
                 Vec::new()
@@ -817,6 +817,7 @@ impl TypedTool for Search {
                 match retrieval::context_search(
                     state,
                     &q,
+                    &Reader::of(&who),
                     Route::Chat,
                     provider,
                     RetrievalPurpose::Agent,
@@ -1048,9 +1049,10 @@ async fn search_scope(
     }))
 }
 
-/// Whether `document_id` can be read: `Err` is the output saying why not.
-async fn readable(state: &AppState, document_id: &str) -> Result<(), ToolOutput> {
-    match retrieval::doc_state(&state.store, document_id).await {
+/// Whether `reader` can read `document_id`: `Err` is the output saying why not (a
+/// document it can't read reads as no such document).
+async fn readable(state: &AppState, reader: &Reader, document_id: &str) -> Result<(), ToolOutput> {
+    match retrieval::doc_state(&state.store, reader, document_id).await {
         Ok(retrieval::DocState::Ready) => Ok(()),
         Ok(retrieval::DocState::NotReady) => Err(ToolOutput::error(
             "That document is still being read. Try again in a moment.",
@@ -1089,10 +1091,12 @@ impl TypedTool for ReadPassage {
         }
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let state = &self.0;
-            if let Err(out) = readable(state, &args.document_id).await {
+            let who = acting!(state, ctx);
+            let reader = Reader::of(&who);
+            if let Err(out) = readable(state, &reader, &args.document_id).await {
                 return out;
             }
             let sel = match (args.page, args.from_ord) {
@@ -1109,6 +1113,7 @@ impl TypedTool for ReadPassage {
             };
             let rows = match retrieval::read_passages(
                 &state.store,
+                &reader,
                 &args.document_id,
                 sel,
                 TOOL_READ_PASSAGES_MAX,
@@ -1118,7 +1123,7 @@ impl TypedTool for ReadPassage {
                 Ok(r) => r,
                 Err(e) => return internal(e),
             };
-            let info = retrieval::doc_info(&state.store, &args.document_id)
+            let info = retrieval::doc_info(&state.store, &reader, &args.document_id)
                 .await
                 .ok()
                 .flatten();
@@ -1173,18 +1178,20 @@ impl TypedTool for DocumentOutlineTool {
         "Reading a document's outline".into()
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let state = &self.0;
-            if let Err(out) = readable(state, &args.document_id).await {
+            let who = acting!(state, ctx);
+            let reader = Reader::of(&who);
+            if let Err(out) = readable(state, &reader, &args.document_id).await {
                 return out;
             }
-            let sections = match retrieval::document_outline(&state.store, &args.document_id).await
-            {
-                Ok(s) => s,
-                Err(e) => return internal(e),
-            };
-            let info = retrieval::doc_info(&state.store, &args.document_id)
+            let sections =
+                match retrieval::document_outline(&state.store, &reader, &args.document_id).await {
+                    Ok(s) => s,
+                    Err(e) => return internal(e),
+                };
+            let info = retrieval::doc_info(&state.store, &reader, &args.document_id)
                 .await
                 .ok()
                 .flatten();
@@ -1245,24 +1252,31 @@ impl TypedTool for ViewPicture {
         }
     }
 
-    fn run<'a>(&'a self, _ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
+    fn run<'a>(&'a self, ctx: &'a ToolContext, args: Self::Args) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let state = &self.0;
-            if let Err(out) = readable(state, &args.document_id).await {
+            let who = acting!(state, ctx);
+            let reader = Reader::of(&who);
+            if let Err(out) = readable(state, &reader, &args.document_id).await {
                 return out;
             }
-            let picture =
-                match retrieval::document_picture(&state.store, &args.document_id, args.page).await
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        return ToolOutput::error(match args.page {
-                            Some(p) => format!("That document has no picture of page {p}."),
-                            None => "That document has no picture.".to_string(),
-                        });
-                    }
-                    Err(e) => return internal(e),
-                };
+            let picture = match retrieval::document_picture(
+                &state.store,
+                &reader,
+                &args.document_id,
+                args.page,
+            )
+            .await
+            {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return ToolOutput::error(match args.page {
+                        Some(p) => format!("That document has no picture of page {p}."),
+                        None => "That document has no picture.".to_string(),
+                    });
+                }
+                Err(e) => return internal(e),
+            };
             let hit = Hit {
                 passage: picture,
                 score: 1.0,
@@ -1277,7 +1291,7 @@ impl TypedTool for ViewPicture {
                 citation: crate::pipeline::hit_citation(&hit),
                 hits: vec![hit],
             }];
-            if let Err(e) = retrieval::describe_packed(state, &mut packed).await {
+            if let Err(e) = retrieval::describe_packed(state, &reader, &mut packed).await {
                 return internal(e);
             }
             let p = &packed[0];

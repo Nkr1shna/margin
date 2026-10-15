@@ -5,9 +5,13 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
+use margin_shared::context::AuditKind;
+use margin_shared::person_id;
 use margin_shared::{Event, INVITATION_DAYS, Id, Invitation, NewInvitation, OrgRole, access_code};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use crate::audit;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::people;
@@ -122,6 +126,23 @@ pub async fn create_invitation(
             .store
             .put(db::INVITATION, &row.invitation.id, &row)
             .await?;
+        // The login is joined by the Audit view, never journaled.
+        audit::record(
+            &state,
+            audit::by(
+                &p,
+                AuditKind::PersonChange,
+                "invitation",
+                &row.invitation.id,
+                Value::Null,
+                json!({
+                    "event": "invited",
+                    "role": row.invitation.role,
+                    "groups": row.invitation.groups,
+                    "invited_by": person_id(&row.invitation.invited_by),
+                }),
+            ),
+        );
         row.invitation
     };
     tracing::info!(invitation = %invitation.id, "invitation created");
@@ -137,7 +158,7 @@ pub async fn create_invitation(
 /// `DELETE /api/invitations/{id}` (admins): revokes a pending one.
 pub async fn delete_invitation(
     State(state): State<AppState>,
-    _admin: RequireAdmin,
+    RequireAdmin(admin): RequireAdmin,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
     {
@@ -146,6 +167,17 @@ pub async fn delete_invitation(
         match row {
             Some(r) if r.invitation.accepted_at.is_none() => {
                 state.store.delete(db::INVITATION, &id).await?;
+                audit::record(
+                    &state,
+                    audit::by(
+                        &admin,
+                        AuditKind::PersonChange,
+                        "invitation",
+                        &id,
+                        json!({"role": r.invitation.role, "groups": r.invitation.groups}),
+                        json!({"event": "invitation_revoked"}),
+                    ),
+                );
             }
             _ => return Err(AppError::not_found("invitation")),
         }

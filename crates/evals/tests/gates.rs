@@ -533,3 +533,83 @@ mod claude_prefix {
         );
     }
 }
+
+/// The access gates (L2, `docs/l2-brief.md` D8, `[access]` in `evals/gates.toml`):
+/// `margin-eval run --suite access` on the baseline variant. The fixture corpus is stamped
+/// with the audiences of `evals/access.toml` through the service's own writer; every
+/// golden query is searched as every principal there (expanded by the service's own
+/// functions) and every hit checked against the oracle (the fixture and the expansion, in
+/// Rust, independent of the SQL); every by-id read the oracle forbids must come back
+/// empty; the owner's ranked ids must equal the same statements' without the reader's
+/// conjuncts, with the p95 within the ratio; a principal who reads every relevant
+/// document sees the relevant hits in the owner's order.
+///
+/// Never ignored: on the recorded vectors when they are committed, else on the
+/// deterministic `FakeEmbedder` (leakage is a property of the predicate, not of the
+/// vectors). It fails if a prefix rule comes back (a reader in `company` reading
+/// `company/engineering`).
+#[tokio::test]
+async fn access_gates() {
+    use margin_evals::corpus::documents;
+    use margin_evals::recorded::{FakeVectors, Vectors};
+    use margin_evals::runner::run_access;
+    use margin_evals::store::EvalStore;
+
+    let evals = evals_dir();
+    let corpus = evals.join("corpus");
+    let docs = documents(&corpus).unwrap();
+    let recorded = RecordedVectors::open(&evals.join(EMBEDDINGS_FILE)).ok();
+    let fake = FakeVectors;
+    let vectors: &dyn Vectors = match &recorded {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "access: no {EMBEDDINGS_FILE} yet, so on the deterministic FakeEmbedder \
+                 (bag of words)"
+            );
+            &fake
+        }
+    };
+    let extraction = Extraction::load(&evals.join(EXTRACTED_FILE))
+        .unwrap_or_else(|_| Extraction::fixture(&corpus, &docs).unwrap());
+    let env = Env {
+        models: None,
+        paths: Paths::same(&evals),
+        vectors,
+        extraction,
+        register: &|_| {},
+        pack_budget: &margin_service::retrieval::pack_budget,
+    };
+    let store = EvalStore::memory().await.unwrap();
+    let (run, r, violations) = run_access(&env, "baseline", &store).await.unwrap();
+    eprintln!(
+        "access: {} principals x {} queries, {} leaks, {} by-id leaks of {} forbidden pairs, \
+         {} hits removed, owner ranks identical {}, rank consistent {} ({} searches), p95 \
+         owner/unfiltered {:.2}x ({:.2}/{:.2} ms)",
+        r.principals.len(),
+        r.queries,
+        r.leaks.len(),
+        r.by_id_leaks.len(),
+        r.by_id_checked,
+        r.removed(),
+        r.owner_rank_identical(),
+        r.rank_consistent(),
+        r.rank_checked,
+        r.latency_ratio(),
+        r.owner_p95_ms,
+        r.unfiltered_p95_ms
+    );
+    assert!(
+        violations.is_empty(),
+        "the access gates failed:\n{}",
+        violations.join("\n")
+    );
+    assert!(run.valid);
+    // The `[retrieval]` baseline doesn't move: the reader isn't a pipeline stage.
+    let (cfg, _) = Paths::same(&evals).variant("baseline").unwrap();
+    assert_eq!(run.pipeline_hash, cfg.hash());
+    assert_eq!(
+        cfg.hash(),
+        margin_shared::pipeline::PipelineConfig::default().hash()
+    );
+}

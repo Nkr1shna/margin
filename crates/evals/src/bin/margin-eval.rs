@@ -309,7 +309,7 @@ async fn live_command(
             | Command::RecordRewrites { .. }
             | Command::RecordReranks { .. }
             | Command::Run {
-                suite: Suite::Retrieval | Suite::Dogfood,
+                suite: Suite::Retrieval | Suite::Dogfood | Suite::Access,
                 ..
             }
     );
@@ -522,6 +522,46 @@ async fn live_command(
                     run.id,
                     scores.len(),
                     if run.valid { "" } else { "  INVALID" }
+                );
+            }
+            Suite::Access => {
+                anyhow::ensure!(
+                    !*write_baseline,
+                    "the access suite has no baseline: the owner's ranks are compared with \
+                     the unfiltered run in the same process"
+                );
+                let (run, r, violations) = runner::run_access(&env, variant, store).await?;
+                println!(
+                    "{}: {} principals x {} queries, {} leaks, {} by-id leaks of {} forbidden \
+                     pairs, {} hits removed, owner ranks identical: {}, rank consistent: {}, \
+                     p95 owner/unfiltered {:.2}x ({:.2}/{:.2} ms)",
+                    run.id,
+                    r.principals.len(),
+                    r.queries,
+                    r.leaks.len(),
+                    r.by_id_leaks.len(),
+                    r.by_id_checked,
+                    r.removed(),
+                    r.owner_rank_identical(),
+                    r.rank_consistent(),
+                    r.latency_ratio(),
+                    r.owner_p95_ms,
+                    r.unfiltered_p95_ms
+                );
+                println!(
+                    "{:<12} {:>6} {:>6} {:>8} {:>6}",
+                    "principal", "reads", "hits", "removed", "leaks"
+                );
+                for p in &r.principals {
+                    println!(
+                        "{:<12} {:>6} {:>6} {:>8} {:>6}",
+                        p.name, p.reads, p.hits, p.removed, p.leaks
+                    );
+                }
+                anyhow::ensure!(
+                    violations.is_empty(),
+                    "the access gates failed:\n{}",
+                    violations.join("\n")
                 );
             }
             Suite::Injection => {

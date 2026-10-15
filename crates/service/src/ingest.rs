@@ -37,13 +37,14 @@ use margin_embed::{
     audio_windows, sample_ms,
 };
 use margin_shared::context::{
-    ACCESS_COMPANY, ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality,
-    Origin, TraceKind, TraceRow,
+    ContextChanges, ContextIngest, Document, DocumentStatus, LibraryKind, Modality, Origin,
+    TraceKind, TraceRow,
 };
 use margin_shared::{Chat, ChatItemKind, Event, Id, Note, Source, SourceStatus};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::audience;
 use crate::chats::StoredChatItem;
 use crate::db::{self, INSERT_MANY_MAX, PassageRow};
 use crate::embedding;
@@ -51,8 +52,8 @@ use crate::library;
 use crate::pipeline::{Chunker, ChunkerCfg, Registry, StageCtor};
 use crate::sources;
 use crate::state::{
-    AppState, Audience, Emitted, Owned, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson, new_id,
-    sha256_hex,
+    AppState, Audience, Emitted, Owned, Ownership, SETTINGS_ID, SOURCE_ORIGINAL, StoredLesson,
+    new_id, sha256_hex,
 };
 
 /// The migration that moves sources from `chunk`/`media` to `passage`, by its name in
@@ -111,6 +112,12 @@ pub struct Tombstone {
     pub id: Id,
     pub generation: u64,
     pub deleted_at: DateTime<Utc>,
+    /// The deleted document's audience, copied at deletion: the change feed lists the
+    /// deletion only to readers who could read the document (L2 D5).
+    #[serde(default)]
+    pub access: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// Documents waiting to be indexed, one at a time (chat files ahead of folder files).
@@ -198,17 +205,24 @@ fn new_document(id: Id, project_id: Id, origin: Origin, name: &str, kind: Source
         status: DocumentStatus::Indexing { done: 0, total: 0 },
         generation: 0,
         bytes: 0,
-        access: vec![ACCESS_COMPANY.to_string()],
+        // Private until `upsert_document` stamps its owner's (L2 D2: nothing is
+        // `company` unless published).
+        access: Vec::new(),
+        deny: Vec::new(),
         created_at: now,
         updated_at: now,
     }
 }
 
-/// The document of `origin`, found by its origin (and, for an agent's, its name).
-async fn find_by_origin(
+/// The document of `origin`, found by its origin (and, for an agent's, its name and its
+/// `owner`: an agent document is keyed by owner, agent name and document name, so two
+/// people's `claude-code` each have their own `notes.md`; `None` is the bootstrap
+/// owner's, as a document written without one is).
+pub async fn find_by_origin(
     state: &AppState,
     origin: &Origin,
     name: &str,
+    owner: Option<&str>,
 ) -> anyhow::Result<Option<Document>> {
     if let Origin::Source { source_id } = origin {
         return document(state, source_id).await;
@@ -216,21 +230,28 @@ async fn find_by_origin(
     let mut sql = "SELECT VALUE doc FROM document WHERE doc.origin = $origin".to_string();
     let mut binds = vec![("origin", serde_json::to_value(origin)?)];
     if matches!(origin, Origin::Agent { .. }) {
-        sql.push_str(" AND doc.name = $name");
+        sql.push_str(" AND doc.name = $name AND (doc.owner ?? $bootstrap) = $owner");
         binds.push(("name", serde_json::json!(name)));
+        binds.push((
+            "bootstrap",
+            serde_json::json!(crate::principal::BOOTSTRAP_PERSON_ID),
+        ));
+        binds.push((
+            "owner",
+            serde_json::json!(owner.unwrap_or(crate::principal::BOOTSTRAP_PERSON_ID)),
+        ));
     }
     let found: Vec<Document> = state.store.query_rows(&sql, binds).await?;
     Ok(found.into_iter().next())
 }
 
-/// Who hears about a document (`DocumentChanged`): its owner (L1; L2 widens it to the
-/// document's audience). A document from before `people-v1` is the bootstrap owner's.
+/// Who hears about a document (`DocumentChanged`): its readers (L2 D3: its access less
+/// its denials; read empty, its owner, the bootstrap owner before `people-v1`).
 pub fn document_audience(doc: &Document) -> Audience {
-    Audience::Person(
-        doc.owner
-            .clone()
-            .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string()),
-    )
+    Audience::Readers {
+        access: crate::retrieval::document_access(doc),
+        deny: doc.deny.clone(),
+    }
 }
 
 /// Sends `DocumentChanged` to the document's audience.
@@ -266,8 +287,9 @@ async fn upsert_document_locked(
     actor: &str,
     owner: Option<&str>,
 ) -> anyhow::Result<Document> {
+    let found = find_by_origin(state, &origin, name, owner).await?;
     let owner = owner.map(str::to_string);
-    let doc = match find_by_origin(state, &origin, name).await? {
+    let doc = match found {
         Some(mut doc) => {
             let new_owner = owner.is_some() && doc.owner != owner;
             if doc.name != name
@@ -286,6 +308,8 @@ async fn upsert_document_locked(
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             }
+            // The audience of the row that owns it, which may have moved (L2 D2).
+            audience::restamp_locked(state, &mut doc).await?;
             doc
         }
         None => {
@@ -296,6 +320,11 @@ async fn upsert_document_locked(
             let mut doc = new_document(id, project_id.to_string(), origin, name, kind);
             doc.actor = actor.to_string();
             doc.owner = owner;
+            // The owning row's audience; an agent's document is private to its owner
+            // (L2 D2: nothing is `company` unless published).
+            let own = audience::of_document(state, &doc).await?;
+            doc.access = own.access;
+            doc.deny = own.deny;
             state.store.put(db::DOCUMENT, &doc.id.clone(), &doc).await?;
             doc
         }
@@ -342,6 +371,8 @@ pub async fn source_document_locked(
                 doc.updated_at = Utc::now();
                 state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             }
+            // The source's audience (L2 D2), which may have moved.
+            audience::stamp_locked(state, &mut doc, &Ownership::of(source)).await?;
             Ok(doc)
         }
         None => {
@@ -355,6 +386,10 @@ pub async fn source_document_locked(
             doc.bytes = source.bytes;
             doc.created_at = source.created_at;
             doc.owner = owner;
+            // The source's audience (L2 D2: the row that owns the document).
+            let own = Ownership::of(source);
+            doc.access = own.access;
+            doc.deny = own.deny;
             state.store.put(db::DOCUMENT, &source.id, &doc).await?;
             Ok(doc)
         }
@@ -414,6 +449,25 @@ pub async fn ingest_text_as(
             owner,
         )
         .await?;
+        // An audience given with the text (checked by the route against the caller's
+        // paths) replaces the document's; without one it keeps what it has (private
+        // when new).
+        if let Some(a) = &req.audience {
+            let owner = doc
+                .owner
+                .clone()
+                .unwrap_or_else(|| crate::principal::BOOTSTRAP_PERSON_ID.to_string());
+            let me = margin_shared::person_id(&owner);
+            let mut access = vec![me.clone()];
+            access.extend(a.access.iter().filter(|x| **x != me).cloned());
+            let deny = a.deny.iter().filter(|x| **x != me).cloned().collect();
+            let own = Ownership {
+                owner,
+                access,
+                deny,
+            };
+            audience::stamp_locked(state, &mut doc, &own).await?;
+        }
         let dir = document_dir(state, &doc.id);
         tokio::fs::create_dir_all(&dir)
             .await
@@ -565,12 +619,14 @@ async fn library_text(
 /// Call with the write lock held. Nothing happens for a document that doesn't exist.
 pub async fn delete_document_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
     state.store.delete_document_passages(id).await?;
-    if document(state, id).await?.is_some() {
+    if let Some(doc) = document(state, id).await? {
         state.store.delete(db::DOCUMENT, id).await?;
         let tomb = Tombstone {
             id: id.to_string(),
             generation: state.store.next_generation().await?,
             deleted_at: Utc::now(),
+            access: crate::retrieval::document_access(&doc),
+            deny: doc.deny,
         };
         state.store.put(db::DOCUMENT_DELETED, id, &tomb).await?;
         state.retrieval_cache.invalidate(id);
@@ -591,7 +647,7 @@ pub async fn delete_library_document_locked(
         kind,
         id: id.to_string(),
     };
-    if let Some(doc) = find_by_origin(state, &origin, "").await? {
+    if let Some(doc) = find_by_origin(state, &origin, "", None).await? {
         delete_document_locked(state, &doc.id).await?;
     }
     Ok(())
@@ -644,16 +700,30 @@ async fn rescope_locked(
     }))
 }
 
-/// Every document whose generation passed `since`, and those deleted since then.
+/// Every document whose generation passed `since`, and those deleted since then, as
+/// the organisation's owner reads them (the bootstrap owner before `people-v1`): what
+/// the owner's own tools and the tests read. Requests read their own principal's feed
+/// through `changes_page`.
 pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<ContextChanges> {
-    changes_page(state, since, usize::MAX).await
+    let owner = crate::people::owner_row(state).await?.map_or_else(
+        || crate::principal::BOOTSTRAP_PERSON_ID.to_string(),
+        |r| r.person.id,
+    );
+    let p = crate::state::person_principal(state, &owner)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    changes_page(state, &crate::pipeline::Reader::of(&p), since, usize::MAX).await
 }
 
-/// One page of the change feed (`routes::CONTEXT_CHANGES`): the first `limit` changes
-/// (documents and deletions) after `since`, by generation; `more` when others follow,
-/// and then `generation` is the page's last, so the next page starts after it.
+/// One page of the change feed (`routes::CONTEXT_CHANGES`) as `reader` reads it: the
+/// first `limit` changes (documents and deletions) after `since`, by generation; `more`
+/// when others follow, and then `generation` is the page's last, so the next page
+/// starts after it. Both statements carry the reader's two conjuncts (L2 D5): a
+/// document the reader can't read isn't listed, nor is its deletion (a tombstone keeps
+/// the deleted document's audience); the cursor still moves past them.
 pub async fn changes_page(
     state: &AppState,
+    reader: &crate::pipeline::Reader,
     since: u64,
     limit: usize,
 ) -> anyhow::Result<ContextChanges> {
@@ -665,33 +735,39 @@ pub async fn changes_page(
     let fetch = limit.saturating_add(1).min(i64::MAX as usize);
     let _w = state.write_lock.lock().await;
     let generation = state.store.generation().await?;
-    let rows: Vec<serde_json::Value> = state
-        .store
-        .query_rows(
-            "SELECT doc, doc.generation AS g FROM document WHERE doc.generation > $since \
+    let page = |table: &str| {
+        format!(
+            "SELECT doc, doc.generation AS g FROM {table} WHERE doc.generation > $since{} \
              ORDER BY g LIMIT $n",
-            vec![
-                ("since", serde_json::json!(since)),
-                ("n", serde_json::json!(fetch)),
-            ],
+            crate::retrieval::DOC_READER_SQL
         )
-        .await?;
+    };
+    let binds = || {
+        let mut b = crate::retrieval::doc_reader_binds(reader);
+        b.extend([
+            ("since", serde_json::json!(since)),
+            ("n", serde_json::json!(fetch)),
+        ]);
+        b
+    };
+    let rows: Vec<serde_json::Value> = if reader.is_empty() {
+        Vec::new()
+    } else {
+        state.store.query_rows(&page("document"), binds()).await?
+    };
     let mut changed: Vec<Document> = rows
         .into_iter()
         .map(|mut r| serde_json::from_value(r["doc"].take()))
         .collect::<Result<_, _>>()?;
     changed.sort_by_key(|d| d.generation);
-    let rows: Vec<serde_json::Value> = state
-        .store
-        .query_rows(
-            "SELECT doc, doc.generation AS g FROM document_deleted WHERE doc.generation > $since \
-             ORDER BY g LIMIT $n",
-            vec![
-                ("since", serde_json::json!(since)),
-                ("n", serde_json::json!(fetch)),
-            ],
-        )
-        .await?;
+    let rows: Vec<serde_json::Value> = if reader.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .query_rows(&page("document_deleted"), binds())
+            .await?
+    };
     let mut deleted: Vec<Tombstone> = rows
         .into_iter()
         .map(|mut r| serde_json::from_value(r["doc"].take()))
@@ -1137,7 +1213,8 @@ fn items_of(
         document_id: id.clone(),
         origin: origin_name(&doc.origin).to_string(),
         scope_ids: Vec::new(),
-        access: doc.access.clone(),
+        access: crate::retrieval::document_access(doc),
+        deny: doc.deny.clone(),
         unit_id: String::new(),
         modality: modality.as_str().to_string(),
         ord: 0,
@@ -1296,6 +1373,7 @@ fn moved(stored: &PassageRow, now: &PassageRow) -> bool {
         || stored.origin != now.origin
         || stored.scope_ids != now.scope_ids
         || stored.access != now.access
+        || stored.deny != now.deny
         || stored.unit_id != now.unit_id
         || stored.modality != now.modality
         || stored.ord != now.ord
@@ -1573,7 +1651,7 @@ pub async fn ingest(state: &AppState, document_id: &str) -> anyhow::Result<Inges
         let _ = fail(state, document_id, &e.to_string()).await;
     }
     let pipeline = state.pipeline.load();
-    let mut row = TraceRow::new(TraceKind::Ingest, ulid::Ulid::new().to_string(), at);
+    let mut row = TraceRow::new(TraceKind::Ingest, ulid::Ulid::generate().to_string(), at);
     row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     row.ok = result.is_ok();
     row.error_code = result.as_ref().err().map(|_| "ingest_failed".to_string());
@@ -1632,15 +1710,24 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
         };
         anyhow::bail!("{error}");
     }
-    // The document as it is now (access, project) and what may search it.
-    let Some(doc) = document(state, id).await? else {
-        return Ok(report);
+    // The document as it is now (access, project) and what may search it, stamped
+    // again from the row that owns it (L2 D2).
+    let doc = {
+        let _w = state.write_lock.lock().await;
+        let Some(mut doc) = document(state, id).await? else {
+            return Ok(report);
+        };
+        audience::restamp_locked(state, &mut doc).await?;
+        doc
     };
     let scope = scope_ids(state, &doc).await?;
+    // What the rows written below carry; a publish meanwhile is caught up at the end.
+    let stamped = (crate::retrieval::document_access(&doc), doc.deny.clone());
     let mut items = prepared.items;
     for item in &mut items {
         item.row.scope_ids = scope.clone();
-        item.row.access = doc.access.clone();
+        item.row.access = crate::retrieval::document_access(&doc);
+        item.row.deny = doc.deny.clone();
         item.row.project_id = doc.project_id.clone();
         // The backend that embeds them (`Embedder::version`), not the default constant.
         item.row.embedder = embedder.version().to_string();
@@ -1774,12 +1861,22 @@ async fn ingest_inner(state: &AppState, id: &str) -> anyhow::Result<IngestReport
     );
 
     // Done: a new generation when anything changed (or on the first read).
-    let changed = report.chunks_new > 0 || report.chunks_deleted > 0 || !moved_rows.is_empty();
+    let mut changed = report.chunks_new > 0 || report.chunks_deleted > 0 || !moved_rows.is_empty();
     let (doc, source) = {
         let _w = state.write_lock.lock().await;
         let Some(mut doc) = document(state, id).await? else {
             return Ok(report);
         };
+        // Its audience changed while it was read (a publish re-stamped the rows there
+        // were then): the rows written since carry the old one (L2 D3).
+        let access = crate::retrieval::document_access(&doc);
+        if (&access, &doc.deny) != (&stamped.0, &stamped.1) {
+            state
+                .store
+                .set_document_audience(id, &access, &doc.deny)
+                .await?;
+            changed = true;
+        }
         if changed || doc.generation == 0 {
             doc.generation = state.store.next_generation().await?;
         }
@@ -2098,6 +2195,7 @@ pub async fn reembed(state: &AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use margin_shared::context::ACCESS_COMPANY;
 
     #[test]
     fn stale_rows_are_rewritten_not_deleted() {
@@ -2137,6 +2235,7 @@ mod tests {
             origin: "source".into(),
             scope_ids: Vec::new(),
             access: vec![ACCESS_COMPANY.into()],
+            deny: Vec::new(),
             unit_id: id.into(),
             modality: "text".into(),
             ord,
@@ -2261,7 +2360,7 @@ mod tests {
         );
         assert_eq!(items[2].row.id, format!("d1:{}", items[2].row.chunk_hash));
         assert!(items.iter().all(|i| i.row.embedder == EMBEDDER_VERSION
-            && i.row.access == [ACCESS_COMPANY]
+            && i.row.access == ["person/bootstrap"]
             && i.row.origin == "source"));
     }
 
@@ -2335,6 +2434,11 @@ mod tests {
         assert!(moved(&a, &b));
         let c = PassageRow {
             access: vec!["company/engineering".into()],
+            ..a.clone()
+        };
+        assert!(moved(&a, &c));
+        let c = PassageRow {
+            deny: vec!["person/bob".into()],
             ..a.clone()
         };
         assert!(moved(&a, &c));

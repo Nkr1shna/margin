@@ -468,15 +468,28 @@ async fn an_agents_documents_belong_to_its_owner() {
         .unwrap();
     assert_eq!(stored.owner.as_deref(), Some("bob"));
 
-    // Carol can't replace or delete Bob's document.
-    let r = ingest(carol.clone(), "claude-code", "Overwritten.").await;
-    assert_eq!(error(r).await, (403, "not_owner".into()));
+    // Carol's `claude-code` document of the same name is her own, beside Bob's: his is
+    // neither replaced nor revealed.
+    let r = ingest(carol.clone(), "claude-code", "Carol's own handoff.").await;
+    assert_eq!(r.status(), 200);
+    let carols_handoff: Document = r.json().await.unwrap();
+    assert_ne!(carols_handoff.id, doc.id);
+    assert_eq!(carols_handoff.owner.as_deref(), Some("carol"));
+    let bobs: Document = h
+        .state
+        .store
+        .get(db::DOCUMENT, &doc.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bobs.owner.as_deref(), Some("bob"));
+    // Bob's document is private to him: to Carol it doesn't exist (404, not 403).
     let r = h
         .delete(&carol, &format!("/api/context/documents/{}", doc.id))
         .send()
         .await
         .unwrap();
-    assert_eq!(error(r).await, (403, "not_owner".into()));
+    assert_eq!(error(r).await, (404, "not_found".into()));
 
     // Carol's own agent document is hers; Bob's device replaces Bob's.
     let r = ingest(carol.clone(), "carols-bot", "Carol's notes.").await;

@@ -52,7 +52,7 @@ jobs:
           for f in $files; do
             case "$f" in
               crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
-              crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|deploy/ci/linux-ci.sh) run=true ;;
+              crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|deploy/ci/linux-ci.sh|deploy/ci/prune-cache.sh) run=true ;;
             esac
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -76,7 +76,7 @@ jobs:
           cache="$HOME/.cache/margin-ci"
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
-          find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          sh deploy/ci/prune-cache.sh "$cache/target-test-$env_id"
       # The same steps the local check runs (deploy/local/linux-check.sh).
       - name: Format, clippy, tests
         if: steps.scope.outputs.run == 'true'
@@ -116,7 +116,7 @@ jobs:
           for f in $files; do
             case "$f" in
               crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
-              crates/app/*) run=true ;;
+              crates/app/*|deploy/ci/prune-cache.sh) run=true ;;
             esac
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -139,7 +139,7 @@ jobs:
           cache="$HOME/.cache/margin-ci"
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
-          find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          sh deploy/ci/prune-cache.sh "$cache/target-test-$env_id"
       - name: Clippy (app)
         if: steps.scope.outputs.run == 'true'
         run: cargo clippy --locked -p margin-app --all-targets -- -D warnings

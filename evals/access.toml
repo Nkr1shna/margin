@@ -1,0 +1,50 @@
+# The access suite's principals and audiences over the fixture corpus (roadmap L2,
+# docs/l2-brief.md D8). `access_gates` (crates/evals/tests/gates.rs) stamps these
+# audiences on the corpus's passages, searches every golden query as every principal, and
+# fails on any hit the principal can't read by the oracle (this file and the expansion,
+# computed in Rust, independent of the SQL). Exact membership: a reader in `company` does
+# not read `company/engineering`; the hierarchy is in the reader's expansion.
+
+# The organisation's owner for `owner_rank_identical`: this person as a member of every
+# group (`[company, every group, person/<owner>]`), who reads every document below. Their
+# ranked ids must equal a run without the reader's conjuncts, to the id.
+owner = "alice"
+
+# The group tree (`company` is implicit).
+[groups]
+paths = ["company/engineering", "company/engineering/platform", "company/sales"]
+
+# People and their direct groups (every person is in `company`).
+[people.alice]
+groups = ["company/engineering/platform"]
+
+[people.bob]
+groups = ["company/sales"]
+
+[people.carol]
+groups = []
+
+# Agents: an owner and a ceiling (L1); the agent reads `owner ∩ ceiling ∪ {agent/<id>}`.
+[agents.eng-bot]
+owner = "alice"
+ceiling = ["company", "company/engineering"]
+
+[agents.alice-all]
+owner = "alice"
+ceiling = ["company", "company/engineering", "company/engineering/platform", "person/alice"]
+
+# Audiences by corpus path: an exact path, `dir/*` (one level) or `dir/**` (any depth).
+# An exact path wins over a pattern, a longer pattern over a shorter one.
+[documents]
+"fourier-series.md" = { access = ["company/engineering"] }
+"heat-engines.rst" = { access = ["company"], deny = ["person/bob"] }
+"bayes.md" = { access = ["person/alice"] }
+"photosynthesis.md" = { access = ["company/sales"] }
+"sorting.html" = { access = ["company"], deny = ["agent/eng-bot"] }
+"pdf/*" = { access = ["company/engineering/platform"] }
+"images/*" = { access = ["company"] }
+"folder/**" = { access = ["person/alice"] }
+
+# Everything not named above.
+[default]
+access = ["company"]

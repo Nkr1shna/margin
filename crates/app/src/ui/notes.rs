@@ -10,6 +10,7 @@ use crate::drafts;
 use crate::markdown;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
+use crate::ui::audience::FollowsLine;
 use crate::ui::common::{
     CrumbLink, DeleteNoteDialog, Icon, Loading, TopBar, ago, capitalize_first, focus_on_mount,
     render_math,
@@ -648,6 +649,7 @@ fn NoteEditor(id: Id, scope: Option<Id>) -> Element {
                     }
                 }
             }
+            FollowsLine { topic_id: note.topic_id.clone(), kind: "note" }
             // The page's heading for screen readers; the title field shows it.
             h1 { class: "sr-only",
                 if title.read().trim().is_empty() { "Untitled note" } else { "{title}" }

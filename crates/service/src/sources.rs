@@ -31,7 +31,7 @@ use axum::http::{HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
 use margin_ai::{Image, Passage};
 use margin_embed::{Purpose, Transcript};
-use margin_shared::context::{ACCESS_COMPANY, Modality};
+use margin_shared::context::Modality;
 use margin_shared::{
     Citation, Event, FOLDER_FILE_TYPES_TEXT, FileStamp, Id, SOURCE_KINDS, Source, SourceKind,
     SourceStatus, TranscriptSegment, Workspace, folder_file_type, routes,
@@ -822,18 +822,28 @@ pub async fn attach_locked(
         source.access = own.access;
         source.deny = own.deny;
         state.store.put(db::SOURCE, id, &source).await?;
+        // Its document and passages take the topic's audience too (L2 D2); the
+        // `DocumentChanged` below carries it.
+        if let Some(mut doc) = ingest::document(state, id).await? {
+            crate::audience::stamp_locked(state, &mut doc, &Ownership::of(&source)).await?;
+        }
         let mut audience = source.audience();
         for a in before {
             if !audience.contains(&a) {
                 audience.push(a);
             }
         }
-        events.push(Emitted::paths(
-            &audience,
-            Event::SourceChanged {
+        // The topic's denials hold here too (L2): someone the topic denies never hears
+        // of a source filed under it, even when the union of paths names them.
+        events.push(Emitted {
+            audience: crate::state::Audience::Readers {
+                access: audience,
+                deny: source.deny.clone(),
+            },
+            event: Event::SourceChanged {
                 source: state.public_source(&source),
             },
-        ));
+        });
         events.extend(ingest::add_scope_locked(state, id, &topic.id).await?);
     }
     Ok(events)
@@ -1006,6 +1016,16 @@ pub async fn candidates(state: &AppState, source_id: &str) -> anyhow::Result<Vec
     let mut rows: Vec<PassageRow> = chunks.into_iter().map(old_chunk_passage).collect();
     let offset = rows.len() as i64;
     rows.extend(media.into_iter().map(|m| old_media_passage(m, offset)));
+    // They carry the source's audience, as its passages will (L2 D2); a source that is
+    // gone, nobody's.
+    let (access, deny) = match state.store.get::<Source>(db::SOURCE, source_id).await? {
+        Some(s) => (s.audience(), s.deny().to_vec()),
+        None => (Vec::new(), Vec::new()),
+    };
+    for r in &mut rows {
+        r.access = access.clone();
+        r.deny = deny.clone();
+    }
     Ok(rows)
 }
 
@@ -1016,7 +1036,9 @@ fn old_passage(source_id: &str, modality: Modality, ord: i64, text: String) -> P
         document_id: source_id.to_string(),
         origin: "source".into(),
         scope_ids: Vec::new(),
-        access: vec![ACCESS_COMPANY.to_string()],
+        // Stamped from the source row by `candidates`.
+        access: Vec::new(),
+        deny: Vec::new(),
         unit_id: format!("{source_id}:old:{ord}"),
         modality: modality.as_str().into(),
         ord,

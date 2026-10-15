@@ -1444,10 +1444,15 @@ impl Harness {
         let s = self.start_login(device).await;
         let r = self.callback(code, &Self::state_param(&s)).await;
         assert_eq!(r.status(), 200);
-        match self.poll(&s).await {
+        let token = match self.poll(&s).await {
             LoginState::Approved { token, .. } => token,
             other => panic!("expected approval, got {other:?}"),
-        }
+        };
+        // The sign-in's audit rows are written (and their `AuditAppended` sent) off a
+        // queue: wait for them, so a socket a test opens next never gets them as its
+        // first frame instead of the event the test is waiting for.
+        margin_service::audit::flush(&self.state, std::time::Duration::from_secs(5)).await;
+        token
     }
 
     /// `POST /api/invitations` as `admin_token`; panics unless it succeeds.
@@ -1486,6 +1491,35 @@ impl Harness {
     }
     pub fn put(&self, token: &str, path: &str) -> reqwest::RequestBuilder {
         self.http.put(self.u(path)).bearer_auth(token)
+    }
+
+    /// `PUT routes::audience(unit, id)` as `token` (L2): the response, for the caller to
+    /// check (200 with the stored `Audience`, or the refusal).
+    pub async fn publish(
+        &self,
+        token: &str,
+        unit: margin_shared::AudienceUnit,
+        id: &str,
+        audience: &margin_shared::Audience,
+    ) -> reqwest::Response {
+        self.put(token, &margin_shared::routes::audience(unit, id))
+            .json(audience)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// `POST routes::CONTEXT_SEARCH` over the whole library as `token`'s principal (L2):
+    /// the hits, which must be only what that reader may read.
+    pub async fn reader_search(&self, token: &str, q: &str) -> Vec<margin_shared::context::Hit> {
+        let r = self
+            .post(token, margin_shared::routes::CONTEXT_SEARCH)
+            .json(&json!({"text": q, "scope": {"scope": "library"}, "k": 24}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap_or_default());
+        r.json().await.unwrap()
     }
 
     /// Stores an OpenAI API key and `test-model` in each of its slots.

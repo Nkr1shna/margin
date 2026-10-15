@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use margin_shared::context::{AuditKind, AuditRow, ContextChanges, Document, Origin};
 use margin_shared::{
     AcceptProposal, ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatPatch,
     ConfirmRequest, Device, EmbeddingModel, Id, Lesson, LessonPatch, Library, LoginState, Me,
@@ -16,8 +17,8 @@ use margin_shared::{
     ToolStatus, Topic, TopicPatch, TranscriptSegment, Video, Workspace, routes,
 };
 use margin_shared::{
-    Agent, AgentPatch, AgentToken, Group, GroupPatch, Invitation, NewAgent, NewGroup,
-    NewInvitation, Person, PersonPatch, PersonSettings,
+    Agent, AgentPatch, AgentToken, Audience, AudienceUnit, AudienceView, Group, GroupPatch,
+    Invitation, NewAgent, NewGroup, NewInvitation, Person, PersonPatch, PersonSettings,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
@@ -433,6 +434,122 @@ impl Api {
     /// Mint (or rotate) the agent's token: the token comes back this once.
     pub async fn mint_agent_token(&self, id: &str) -> ApiResult<AgentToken> {
         self.post_empty(&routes::agent_token(id)).await
+    }
+
+    // ------------------------------------------------------------------
+    // Audiences, agents' documents and the audit trail (L2)
+    // ------------------------------------------------------------------
+
+    /// Sets who may read a unit (its owner only); the service answers what it stored.
+    pub async fn set_audience(
+        &self,
+        unit: AudienceUnit,
+        id: &str,
+        body: &Audience,
+    ) -> ApiResult<Audience> {
+        self.put(&routes::audience(unit, id), body).await
+    }
+
+    /// Who may read a unit, for anyone who can read it (404 otherwise).
+    pub async fn audience(&self, unit: AudienceUnit, id: &str) -> ApiResult<AudienceView> {
+        self.get(&routes::audience(unit, id)).await
+    }
+
+    /// One page of the change feed (`routes::CONTEXT_CHANGES`) after `since`.
+    pub async fn context_changes(&self, since: u64, limit: usize) -> ApiResult<ContextChanges> {
+        self.json(
+            self.request(Method::GET, routes::CONTEXT_CHANGES)
+                .query(&[("since", since.to_string()), ("limit", limit.to_string())]),
+        )
+        .await
+    }
+
+    /// Every document agents ingested that the caller reads: the whole change feed,
+    /// page by page, `Origin::Agent` only (deleted ones dropped).
+    pub async fn agent_documents(&self) -> ApiResult<Vec<Document>> {
+        let mut docs: std::collections::BTreeMap<Id, Document> = Default::default();
+        let mut since = 0;
+        loop {
+            let page = self
+                .context_changes(since, margin_shared::context::CHANGES_PAGE_MAX)
+                .await?;
+            for d in page.changed {
+                if matches!(d.origin, Origin::Agent { .. }) {
+                    docs.insert(d.id.clone(), d);
+                }
+            }
+            for id in page.deleted {
+                docs.remove(&id);
+            }
+            if !page.more || page.generation <= since {
+                break;
+            }
+            since = page.generation;
+        }
+        Ok(docs.into_values().collect())
+    }
+
+    /// Deletes a document an agent ingested (its owner).
+    pub async fn delete_document(&self, id: &str) -> ApiResult<()> {
+        self.delete(&routes::context_document(id)).await
+    }
+
+    /// Audit rows (admins), oldest first: `kind`, from `from` to `to` (the service's
+    /// defaults when `None`: the start of time, and now).
+    pub async fn audit(
+        &self,
+        kind: Option<AuditKind>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> ApiResult<Vec<AuditRow>> {
+        self.audit_page(kind, from, to, None).await
+    }
+
+    /// The newest `limit` audit rows of the window (all of them when `None`), oldest
+    /// first. The Audit view pages back with `to` just before the oldest row it has.
+    pub async fn audit_page(
+        &self,
+        kind: Option<AuditKind>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> ApiResult<Vec<AuditRow>> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(kind) = kind {
+            query.push(("kind", kind.as_str().to_string()));
+        }
+        if let Some(from) = from {
+            query.push((
+                "from",
+                from.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ));
+        }
+        if let Some(to) = to {
+            query.push(("to", to.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)));
+        }
+        let response = self
+            .send(self.request(Method::GET, routes::AUDIT).query(&query))
+            .await?;
+        let text = response.text().await.map_err(|e| ApiFailure {
+            status: None,
+            code: "decode".into(),
+            message: format!("The audit log didn't arrive whole ({}).", root_cause(&e)),
+        })?;
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<AuditRow>(l).map_err(|e| ApiFailure {
+                    status: None,
+                    code: "decode".into(),
+                    message: format!(
+                        "The service sent an audit row this app doesn't understand ({e})."
+                    ),
+                })
+            })
+            .collect()
     }
 
     pub async fn revoke_agent_token(&self, id: &str) -> ApiResult<()> {

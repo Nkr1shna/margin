@@ -422,6 +422,7 @@ mod tests {
             bytes: 1,
             actor: "agent:repo".into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: at(0),
             updated_at: at(0),
         };

@@ -2339,7 +2339,24 @@ impl Tool for TracedTool {
             let mut span = SpanGuard::new(self.trace.span(TraceKind::ToolCall), &self.trace.state);
             span.row().tool = Some(self.inner.name().to_string());
             span.row().device_id = self.inner.device(ctx, &args).map(|d| d.device_id);
-            let out = self.inner.run(ctx, args).await;
+            // A note the chat's quoted passages are narrower than is refused (L2 D4.3).
+            let refusal = crate::audience::note_refusal(
+                &self.trace.state,
+                &ctx.chat_id,
+                self.inner.name(),
+                &args,
+            )
+            .await;
+            let out = match refusal {
+                Ok(Some(refusal)) => ToolOutput::error(refusal),
+                Ok(None) => self.inner.run(ctx, args).await,
+                Err(e) => {
+                    tracing::warn!("couldn't check what the note would quote: {e:#}");
+                    ToolOutput::error(
+                        "Couldn't check what the note would quote; try again in a moment.",
+                    )
+                }
+            };
             span.row().output_bytes = Some(out.output.len() as u64);
             if out.ok {
                 span.finish(true);

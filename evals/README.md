@@ -37,6 +37,7 @@ Two ways they run:
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
 | `recorded/reranks.jsonl`, `recorded/rewrites.jsonl` | R2: what the listwise reranker (`listwise-small`) and the query rewriter (`small-expand-v1`) answered on the small-tasks model, one record per search, keyed by `sha256(stage + params, prompt version, purpose, query [, candidate ids])`, with the call's time and cost. CI replays them under the real stage names; a search not recorded is an error, never a made-up answer. |
+| `access.toml` | L2: the access suite's principals over the corpus (groups, people, agents with owners and ceilings, the organisation's `owner`) and each document's audience (`access`/`deny`, by exact path, `dir/*` or `dir/**`). The oracle reads it: a principal reads a document when its expansion (the service's `groups::expand`, `agents::agent_principal`) holds one of the document's `access` entries and none of its `deny` entries; exact membership, no prefix rule. |
 | `prompts.lock` | Every prompt's version and the hash of its constant block; the always-on `prompt_lock` test fails when a constant block changes under an unchanged version. |
 
 The judge rubrics, the question-generation and seriousness-grading prompts and the
@@ -93,6 +94,32 @@ writer), the agent's model, the question generator; a retrieval run has none. A 
 recorded before providers were compares with a warning. ChatGPT is its own provider even
 on model ids OpenAI also serves. Commit the new `baseline.json` (and the report's summary
 table) with the change that improves it.
+
+## Access: the leakage gate (L2)
+
+```sh
+margin-eval run --suite access             # baseline; prints the gates and a row per principal
+margin-eval report                         # its "Access" section
+```
+
+The access suite (`docs/l2-brief.md` D8) stamps the corpus with the audiences of
+`access.toml` through the service's own writer (`Store::set_document_audience`) and
+checks `[access]` in `gates.toml`:
+
+| Gate | What |
+|---|---|
+| `leaks_max = 0` | Every golden query searched as every principal: a hit whose document the principal can't read by the oracle is a leak. |
+| `by_id_leaks_max = 0` | `read_passages` and `document_outline` for every (principal, document) pair the oracle forbids come back empty (and every allowed pair with text doesn't). |
+| `owner_rank_identical = true` | The owner (`access.toml`'s `owner` in every group, who reads every document) searched through the reader returns exactly the ranked ids of the same statements without `access CONTAINSANY $paths AND deny CONTAINSNONE $deny` (`crates/evals/src/unfiltered.rs`, the eval crate's replay of the service's index retrievers), same vectors, same process. So recall@5 and nDCG@10 are unchanged to the digit. |
+| `rank_consistent = true` | A principal who reads every relevant document of a query sees the relevant hits in the owner's relative order: the filter removes, never reorders. |
+| `p95_latency_max_ratio = 1.5` | The owner's p95 over the unfiltered run's (three interleaved rounds, each query's fastest). |
+
+A run that tests nothing fails too: nobody refused anything, a principal without hits,
+no forbidden by-id pair. In CI it is `crates/evals/tests/gates.rs::access_gates`, never
+ignored: on `recorded/embeddings.bin` when it is committed, else on the deterministic
+`FakeEmbedder` (leakage is a property of the predicate, not of the vectors). The other
+suites search as a `company` reader over an index left at `company`, so `[retrieval]`
+and `baseline.json` don't move (the reader isn't part of `PipelineConfig`).
 
 ## Alerts and performance budgets
 

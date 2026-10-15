@@ -274,6 +274,7 @@ pub async fn generate_lesson(
     };
     let ranked = index
         .search_as(
+            &crate::access::company_reader(),
             &query_plan(course, lesson),
             &scope,
             margin_shared::pipeline::RetrievalPurpose::Lesson,

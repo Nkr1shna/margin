@@ -170,6 +170,8 @@ pub struct Tracer {
     done: AtomicU64,
     dropped: AtomicU64,
     written: Notify,
+    /// The audit trail's writer queue (`audit::record`), started with the tracer's.
+    pub audit: crate::audit::Auditor,
 }
 
 impl Tracer {
@@ -185,6 +187,7 @@ impl Tracer {
             done: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             written: Notify::new(),
+            audit: crate::audit::Auditor::new(),
         }
     }
 
@@ -414,7 +417,7 @@ impl Drop for SpanGuard {
 
 /// A new row id: a ulid, so ids sort by time within a millisecond's kind and window.
 pub fn new_row_id() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::generate().to_string()
 }
 
 /// The token counts of a call as a trace records them.
