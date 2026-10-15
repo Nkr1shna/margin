@@ -313,7 +313,13 @@ impl Renderer for FakeRenderer {
     fn detect_tools(&self) -> BoxFuture<'_, Vec<ToolStatus>> {
         Box::pin(async move {
             let missing = self.missing.lock().unwrap().clone();
-            ["manimgx", "fluidaudiocli"]
+            // Each OS's narration tool, as Settings → Tools lists it there.
+            let voice = if cfg!(target_os = "macos") {
+                "fluidaudiocli"
+            } else {
+                "margin-tts"
+            };
+            ["manimgx", voice]
                 .into_iter()
                 .map(|name| {
                     let found = !missing.contains(name);
