@@ -3,6 +3,8 @@
 //! placeholder is a `#` heading), tables are `| a | b |` rows, and the slide's speaker
 //! notes follow a `Notes:` line.
 
+use std::collections::HashSet;
+
 use super::{Blocks, Node, Package, Tables, attr, collapse, inline, walk};
 use crate::{EmbedError, Extracted, Page, TextFormat};
 
@@ -26,10 +28,15 @@ pub(super) fn read(package: &mut Package) -> Result<Extracted, EmbedError> {
     })?;
     let rels = package.rels(&main)?;
     let mut pages = Vec::new();
+    // A slide part is read once, however many `sldId`s point at it.
+    let mut seen = HashSet::new();
     for (n, id) in ids.iter().enumerate() {
         let Some(slide) = rels.iter().find(|r| &r.id == id).map(|r| r.target.clone()) else {
             continue;
         };
+        if !seen.insert(slide.clone()) {
+            continue;
+        }
         let Some(xml) = package.part(&slide)? else {
             continue;
         };

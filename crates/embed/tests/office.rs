@@ -332,7 +332,7 @@ fn xlsx_rows_past_the_cap_are_counted() {
         lines[2 + OFFICE_SHEET_ROWS - 1],
         OFFICE_SHEET_ROWS.to_string()
     );
-    assert_eq!(*lines.last().unwrap(), "… 5 more rows");
+    assert_eq!(*lines.last().unwrap(), "… more rows");
 }
 
 #[test]
@@ -448,4 +448,103 @@ fn oversized_parts_are_refused() {
         .collect();
     write_zip(&xlsx, &entries);
     assert!(extract_err(&xlsx).contains("more than 64 MB"));
+}
+
+#[test]
+fn repeated_sheet_and_slide_references_are_read_once() {
+    let dir = Dir::new("repeats");
+    let limit = std::time::Duration::from_secs(20);
+
+    // A thousand sheets, every one naming the same big worksheet part.
+    let data: String = (1..=(OFFICE_SHEET_ROWS + 100) as u32)
+        .map(|r| row(r, &[("A", "x"), ("B", &r.to_string())]))
+        .collect();
+    let mut entries = xlsx_entries(&[("S0", data)]);
+    let sheet_list: String = (0..1000)
+        .map(|i| format!(r#"<sheet name="S{i}" sheetId="{}" r:id="rId1"/>"#, i + 1))
+        .collect();
+    entries[2].1 = format!(
+        r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_list}</sheets></workbook>"#
+    )
+    .into_bytes();
+    let entries: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.clone()))
+        .collect();
+    let xlsx = dir.path("repeats.xlsx");
+    write_zip(&xlsx, &entries);
+    let started = std::time::Instant::now();
+    let doc = office::extract(&xlsx).unwrap();
+    assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+    let text = &doc.pages[0].text;
+    assert_eq!(
+        text.matches("\n# ").count() + text.starts_with("# ") as usize,
+        1
+    );
+    assert!(text.starts_with("# S0\n"));
+    assert!(text.ends_with("\n… more rows"));
+
+    // Five thousand slides, every one the same slide part.
+    let mut entries = pptx_entries();
+    let ids: String = (0..5000)
+        .map(|i| format!(r#"<p:sldId id="{}" r:id="rId3"/>"#, 256 + i))
+        .collect();
+    entries[2].1 = format!(
+        r#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"#
+    )
+    .into_bytes();
+    let pptx = dir.path("repeats.pptx");
+    write_zip(&pptx, &entries);
+    let started = std::time::Instant::now();
+    let doc = office::extract(&pptx).unwrap();
+    assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+    assert_eq!(doc.pages.len(), 1);
+    assert!(doc.pages[0].text.starts_with("# Metrics"));
+}
+
+#[test]
+fn doctype_entities_are_not_expanded() {
+    let dir = Dir::new("doctype");
+    // A "billion laughs" document: each entity ten of the one before.
+    let mut entities = r#"<!ENTITY a0 "laugh">"#.to_string();
+    for i in 1..10 {
+        let refs = format!("&a{};", i - 1).repeat(10);
+        entities.push_str(&format!(r#"<!ENTITY a{i} "{refs}">"#));
+    }
+    let mut entries = docx_entries("");
+    entries[2].1 = format!(
+        r#"<?xml version="1.0"?><!DOCTYPE w:document [{entities}]><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Before &a9; after</w:t></w:r></w:p></w:body></w:document>"#
+    )
+    .into_bytes();
+    let path = dir.path("laughs.docx");
+    write_zip(&path, &entries);
+    let started = std::time::Instant::now();
+    let result = office::extract(&path);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    if let Ok(doc) = result {
+        let len: usize = doc.pages.iter().map(|p| p.text.len()).sum();
+        assert!(len < 1024, "an entity was expanded to {len} bytes");
+    }
+}
+
+#[test]
+fn dot_dot_targets_stay_inside_the_package() {
+    let dir = Dir::new("dotdot");
+    // `..` past the package root stays at the root: this names word/document.xml.
+    let mut entries = docx_entries(&para("", "Inside the zip."));
+    entries[1].1 = rels(&[rel("rId1", OFFICE_DOC, "../../../word/document.xml")]);
+    let path = dir.path("climb.docx");
+    write_zip(&path, &entries);
+    let doc = office::extract(&path).unwrap();
+    assert_eq!(doc.pages[0].text, "Inside the zip.");
+
+    // A target that only exists outside the package is a missing part, not a file read.
+    let outside = dir.path("outside.xml");
+    std::fs::write(&outside, b"<w:document/>").unwrap();
+    let mut entries = docx_entries(&para("", "x"));
+    entries[1].1 = rels(&[rel("rId1", OFFICE_DOC, "../outside.xml")]);
+    entries.remove(2);
+    let path = dir.path("escape.docx");
+    write_zip(&path, &entries);
+    assert!(extract_err(&path).contains("no body"));
 }

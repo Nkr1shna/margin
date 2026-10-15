@@ -29,7 +29,7 @@ pub const OFFICE_PART_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const OFFICE_TOTAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// The most entries an Office file's zip may hold.
 pub const OFFICE_ENTRIES_MAX: usize = 50_000;
-/// The most rows read from one sheet; the rest are counted ("… n more rows").
+/// The most rows read from one sheet; past it the sheet ends with "… more rows".
 pub const OFFICE_SHEET_ROWS: usize = 20_000;
 
 /// The three formats the readers know.
@@ -203,10 +203,17 @@ impl Package {
             let n = std::io::copy(&mut file.take(cap + 1), &mut std::io::sink())
                 .map_err(|_| extract_error(format!("the part {name} is damaged")))?;
             if n > cap {
-                return Err(extract_error(format!(
-                    "the part {name} unpacks to more than {} MB",
-                    cap >> 20
-                )));
+                return Err(extract_error(if cap < OFFICE_PART_MAX_BYTES {
+                    format!(
+                        "the file unpacks to more than {} MB",
+                        OFFICE_TOTAL_MAX_BYTES >> 20
+                    )
+                } else {
+                    format!(
+                        "the part {name} unpacks to more than {} MB",
+                        OFFICE_PART_MAX_BYTES >> 20
+                    )
+                }));
             }
             self.budget -= n;
         }
