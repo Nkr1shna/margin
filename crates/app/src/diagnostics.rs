@@ -11,6 +11,9 @@
 //! - `last-crash.log`: a copy of the report of a panic on the main thread, which quit
 //!   the app; the next launch takes it (`take_last_crash`) and says so (`CrashNotice`).
 //!
+//! In release builds such a panic then aborts (`ABORT_ON_QUIT`), so macOS keeps a crash
+//! report of its own in `~/Library/Logs/DiagnosticReports` as well.
+//!
 //! Reports carry the panic's message, place, thread and backtrace, the app's version and
 //! build, the platform and the screen. Never a token or document text: the app logs
 //! neither, and `scrub` takes out quoted text and anything token-shaped from a panic
@@ -58,7 +61,7 @@ static SCREEN: Mutex<String> = Mutex::new(String::new());
 /// Start the log and the panic hook. Call once, first thing in `main`.
 pub fn init() {
     let Some(dir) = log_dir() else {
-        install_panic_hook(None);
+        install_panic_hook(None, ABORT_ON_QUIT);
         return;
     };
     if let Err(error) = std::fs::create_dir_all(&dir) {
@@ -71,7 +74,7 @@ pub fn init() {
         LOG_FILES,
     )));
     init_tracing();
-    install_panic_hook(Some(dir));
+    install_panic_hook(Some(dir), ABORT_ON_QUIT);
     tracing::info!(
         "{APP_NAME} {VERSION} (build {BUILD}) on {} {} started",
         std::env::consts::OS,
@@ -141,11 +144,20 @@ impl Write for LogWriter {
     }
 }
 
-fn install_panic_hook(dir: Option<PathBuf>) {
+/// Release builds end the process with `abort` after a panic that quits the app, so the
+/// system records a crash too (macOS: a report in Console, under Crash Reports), not the
+/// quiet exit tao makes of a rethrown panic. Only the app: `panic = "abort"` in the
+/// release profile would apply to the whole workspace, the service included.
+const ABORT_ON_QUIT: bool = !cfg!(debug_assertions);
+
+fn install_panic_hook(dir: Option<PathBuf>, abort_on_quit: bool) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed").to_string();
+        // The main thread's panic ends the app (tao stops the event loop and rethrows it;
+        // on iOS it aborts); a background thread's doesn't.
+        let quits = thread == "main";
         let message = info
             .payload()
             .downcast_ref::<&str>()
@@ -170,12 +182,10 @@ fn install_panic_hook(dir: Option<PathBuf>) {
             time: &chrono::Utc::now().to_rfc3339(),
         }
         .report();
-        if let Some(dir) = &dir {
-            // The main thread's panic ends the app (tao stops the event loop and
-            // rethrows it; on iOS it aborts); a background thread's doesn't.
-            if let Err(error) = save_crash(dir, &report, thread == "main") {
-                eprintln!("couldn't save the crash report: {error}");
-            }
+        if let Some(dir) = &dir
+            && let Err(error) = save_crash(dir, &report, quits)
+        {
+            eprintln!("couldn't save the crash report: {error}");
         }
         if let Some(log) = LOG.get()
             && let Ok(mut log) = log.try_lock()
@@ -183,6 +193,9 @@ fn install_panic_hook(dir: Option<PathBuf>) {
             let _ = log.write_all(format!("PANIC\n{report}\n").as_bytes());
         }
         default(info);
+        if quits && abort_on_quit {
+            std::process::abort();
+        }
     }));
 }
 
@@ -465,7 +478,7 @@ mod tests {
     #[test]
     fn a_panic_on_the_main_thread_leaves_a_report_for_the_next_launch() {
         let dir = temp("hook");
-        install_panic_hook(Some(dir.clone()));
+        install_panic_hook(Some(dir.clone()), false);
         set_screen("/notes");
         let _ = std::thread::Builder::new()
             .name("main".into())
