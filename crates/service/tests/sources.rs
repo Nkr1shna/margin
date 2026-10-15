@@ -1233,14 +1233,18 @@ async fn a_documents_access_is_copied_onto_its_passages() {
     let t = h.sign_in("Mac").await;
     let s = upload_ok(&h, &t, "waves.md", None, SECTIONS).await;
     wait_source(&h, &t, &s.id, is_ready).await;
-    let mut doc = document(&h, &s.id).await;
-    doc.access = vec!["company/engineering".into(), "company/research".into()];
-    h.state.store.put(db::DOCUMENT, &s.id, &doc).await.unwrap();
+    // The row that owns the document moved (L2 D2: a re-index stamps the document
+    // from it).
+    let mut source: Source = h.state.store.get(db::SOURCE, &s.id).await.unwrap().unwrap();
+    source.access = vec!["company/engineering".into(), "company/research".into()];
+    h.state.store.put(db::SOURCE, &s.id, &source).await.unwrap();
     let report = margin_service::ingest::ingest(&h.state, &s.id)
         .await
         .unwrap();
-    // Nothing is embedded again; every passage carries the new paths.
+    // Nothing is embedded again; the document and every passage carry the new paths.
     assert_eq!(report.chunks_new, 0);
+    let doc = document(&h, &s.id).await;
+    assert_eq!(doc.access, source.access);
     let rows = h.state.store.passages_of(&s.id).await.unwrap();
     assert!(rows.iter().all(|r| r.access == doc.access));
     // A query filtered by access finds them through the index.
