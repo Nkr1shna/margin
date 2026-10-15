@@ -774,7 +774,13 @@ fn set_flow(app: &App, flow_state: &str, next: Flow) {
 }
 
 fn set_failed(app: &App, flow_state: &str, message: &str) {
-    tracing::warn!("ChatGPT sign-in failed: {message}");
+    // A pasted `error_description` lands here verbatim: one line, bounded, in the log.
+    let logged: String = message
+        .chars()
+        .take(200)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    tracing::warn!("ChatGPT sign-in failed: {logged}");
     set_flow(app, flow_state, Flow::Failed(message.to_string()));
 }
 

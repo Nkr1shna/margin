@@ -322,6 +322,18 @@ async fn an_agent_token_reads_context_within_its_ceiling() {
         let r = h.get(&token, path).send().await.unwrap();
         assert_eq!(error(r).await, (403, "agent_not_allowed".into()), "{path}");
     }
+    for path in [
+        "/api/providers/chatgpt/start",
+        "/api/providers/chatgpt/complete",
+    ] {
+        let r = h
+            .post(&token, path)
+            .json(&json!({ "callback_url": "http://127.0.0.1:1455/auth/callback?code=c&state=s" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(error(r).await, (403, "agent_not_allowed".into()), "{path}");
+    }
 
     // Its trace row says which agent, for whom; only admins read traces.
     let rows = traces(&h, &ada, "retrieval").await;
