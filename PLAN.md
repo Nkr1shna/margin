@@ -1,9 +1,9 @@
 # Margin — plan and decisions
 
 Margin is a personal study app: ask for a topic, get a course outline, generate lessons,
-take notes beside them, and turn lessons into narrated explainer videos. One service on
-the owner's Mac holds the data and does all generation; desktop, iOS and Android apps are
-thin, reactive clients.
+take notes beside them, and turn lessons into narrated explainer videos. One service (on
+a Linux VM; it started on the owner's Mac) holds the data and does all generation;
+desktop, iOS and Android apps are thin, reactive clients.
 
 Every decision below was made explicitly by the owner. Do not change one without asking.
 
@@ -15,24 +15,24 @@ Every decision below was made explicitly by the owner. Do not change one without
 | Layout | Mockup **Option D · Notebook + Ask** (`mockups/study-app/index.html`, `data-option="d"`), styled with openai.com's Oct 2026 tokens (the `.win` / `.app-scope` CSS block in that file). Sidebar becomes a drawer on narrow screens. |
 | Scope | Sidebar topic tree, Ask (outline → lessons), Lesson with Read / Notes / Video views, **margin notes from text selection**, Notes, Video, Settings, **⌘K search**. **No** document tabs, **no** separate Videos page. |
 | UI rule | Every UI element is fully functional. No mock or placeholder controls. If something can't be built, leave it out and ask. |
-| Data | A **service** on the owner's Mac with **SurrealDB embedded** (`kv-surrealkv` on disk; `kv-mem` in tests). Apps talk only to the service and receive live updates over a WebSocket. |
+| Data | A **service** on a Linux VM (`docs/plan-linux-service.md`, `docs/plan-deploy.md`) with **SurrealDB embedded** (`kv-surrealkv` on disk; `kv-mem` in tests). Apps talk only to the service and receive live updates over a WebSocket. |
 | Exposure | **Cloudflare Tunnel** to `margin.krishnanelloore.com`. No open ports. |
 | Accounts | Single user. Only GitHub login **`Nkr1shna`** is allowed. Each device gets its own revocable token (stored hashed). |
 | Sign-in | GitHub OAuth **browser redirect** to the service; the app **waits on the service** (start → open browser → poll). No custom URL schemes. |
 | AI | OpenAI **Responses API only**, configurable base URL, model and key. |
-| Secrets | **OS keychain**. The OpenAI key is entered in the app, sent to the service, stored in the Mac's Keychain, never returned. Devices keep their own token in their OS keychain (`keyring` crate). |
-| Video | **ManimGX** (`manimgx` CLI, Manim CE API) renders; narration via `self.say(...)`, voiced by **PocketTTS through the FluidAudio CLI** (`fluidaudiocli tts … --backend pocket`). |
-| Tool install | The app shows whether `manimgx` and `fluidaudiocli` are found on the service Mac, with **install commands to copy** — it never runs installers. |
-| Scene code | AI-written scene code renders **automatically, sandboxed** (macOS `sandbox-exec`: no network, writes only in the video's folder). Elsewhere rendering is refused unless the service runs with `--allow-unsandboxed-render` (tests only). |
+| Secrets | The service keeps its secrets in a **0600 secrets file** (`secrets.toml`). The OpenAI key is entered in the app, sent to the service, stored there, never returned. Devices keep their own token in their OS keychain (`keyring` crate). |
+| Video | **ManimGX** (`manimgx` CLI, Manim CE API) renders; narration via `self.say(...)`, voiced by **PocketTTS** through `margin-tts` (Kyutai's `pocket-tts` on the CPU). |
+| Tool install | The app shows whether `manimgx`, `margin-tts`, `tesseract`, `ffmpeg`, `bwrap` and `pdfium` are found on the service, with **install commands to copy** — it never runs installers. |
+| Scene code | AI-written scene code renders **automatically, sandboxed** (bubblewrap: no network, writes only in the video's folder). Where bubblewrap can't run, rendering is refused unless the service runs with `--allow-unsandboxed-render` (tests only). |
 | Playback | In-app `<video>` element (the Dioxus webview), streaming from the service's signed media URLs. |
 | Agent | Ask becomes a **chat with an agent**. The agent loop runs **on the service** (new `crates/agent`, custom Rust loop on the Responses API, `store: false` with full replay). Device-only tools run on a device over the events socket: **folder tools** on the device holding the folder, **app-control tools** on the device that sent the message. Full design: `docs/agent-architecture.md`. |
 | Chats | Stored on the service and synced live; one running turn per chat (a message sent meanwhile is queued); any device can stop/continue/confirm; "Chats" section in the sidebar; inline cards (editable outline card with chips, result cards). |
 | Agent permissions | Acts freely; **confirms deletes** and **overwrites of the owner's own writing**; no web search for now (an alternative provider will be integrated later); attached folders **read-only**, no shell commands. |
 | Folders (workspaces) | "Attach folder" on every platform (macOS/Linux path + bookmark, iOS/iPadOS security-scoped bookmark, Android persisted SAF tree URI); the handle stays on that device; **no folder upload**. Excerpts load on demand on other devices. Lessons can **cite folder files**, opened from the holding device. macOS stays directly distributed (unsandboxed). |
 | Sources | Files and folders added **in the Ask composer**, uploaded from the app to the service and **kept with the resulting topic** (the topic menu's "Sources…" adds/removes later). Types: **text, code, PDF (text and page images), images, audio, video** (frames + soundtrack). Used through **retrieval**: chunks embedded locally, the most relevant passages go into outline and lesson prompts. |
-| Embeddings | **EmbeddingGemma 2, Core ML** (`FluidInference/embeddinggemma-2-coreml`) run **inside the service** from Rust (`objc2-core-ml`, `tokenizers`); no helper process. **Never bundled**: downloaded from Hugging Face by a button in Settings. Text, image and audio encoders, all downloaded by one button (~1.4 GB). |
-| PDF text | Apple **PDFKit** (`objc2-pdf-kit`); pages without a text layer are rendered and read with **Vision OCR** (`objc2-vision`). |
-| Media in lessons | Retrieved images (image files, PDF pages, video frames) go to the writer as **image inputs**; audio is **transcribed locally** (FluidAudio `transcribe`, Parakeet) and its transcript span goes in as text. |
+| Embeddings | **EmbeddingGemma 2, ONNX** (`onnx-community/embeddinggemma-2-ONNX`, 8-bit) run **inside the service** from Rust (`ort`, `tokenizers`); no helper process. **Never bundled**: downloaded from Hugging Face by a button in Settings. Text, image and audio encoders, all downloaded by one button (~0.85 GB). |
+| PDF text | **pdfium** (`pdfium-render`); pages without a text layer are rendered and read with **tesseract** OCR. |
+| Media in lessons | Retrieved images (image files, PDF pages, video frames) go to the writer as **image inputs**; audio is **transcribed locally** (Parakeet on ONNX Runtime) and its transcript span goes in as text. |
 | Citations | Lessons cite with Markdown footnotes `[^n]`; no inline images. A **Sources** list follows the lesson and a **source viewer** opens the exact page / time / image / passage. |
 | Upload limits | **500 MB** per audio or video file, **50 MB** for every other kind (`routes::max_source_bytes`). Uploads stream to disk; files over 32 MB go up in parts (Cloudflare refuses bodies over 100 MB). One add (files or a folder) takes at most 300 files and 2 GB. |
 | Transcripts | The source viewer shows an audio/video source's **whole transcript**, the cited span marked and scrolled into view; any line seeks. A recording that couldn't be transcribed is **Ready with a warning** and offers **Read again**. |
@@ -46,7 +46,7 @@ Every decision below was made explicitly by the owner. Do not change one without
 margin/
 ├── crates/shared   # wire contract: records, requests, events, routes (DONE — the contract)
 ├── crates/ai       # Responses API client + prompts (outline, lesson, ManimGX scene)
-├── crates/video    # ManimGX + FluidAudio pipeline, sandbox, tool detection
+├── crates/video    # ManimGX + margin-tts pipeline, bubblewrap sandbox, tool detection
 ├── crates/service  # axum server, SurrealDB, auth, jobs, WebSocket, media
 └── crates/app      # Dioxus app (desktop / iOS / Android)
 ```
@@ -60,13 +60,13 @@ signatures (adding items is fine; changing existing ones requires updating every
 - Binary `margin-service`. Subcommands:
   - `serve [--allow-unsandboxed-render]` — run the server.
   - `setup` — interactive: writes the config file and stores the GitHub client secret in
-    the Keychain.
-- Config file: `~/Library/Application Support/Margin/service.toml` (path overridable with
+    the secrets file.
+- Config file: `/etc/margin/service.toml` (path overridable with
   `MARGIN_CONFIG`): `public_url` (default `https://margin.krishnanelloore.com`), `bind`
   (default `127.0.0.1:8787`; cloudflared points here), `data_dir`, `github_client_id`,
   `allowed_github_login` (default `Nkr1shna`), `github_api_url` / `github_oauth_url`
   (default github.com; overridden in tests by a fake GitHub).
-- Keychain items (service name `com.krishnanelloore.margin`): `github-client-secret`,
+- Secrets (the secrets file, `secrets.toml` beside `data_dir`): `github-client-secret`,
   `openai-api-key`, `media-signing-key` (generated on first run). Behind a `SecretStore`
   trait with an in-memory implementation for tests.
 - Data: SurrealDB embedded under `data_dir/db`; videos under `data_dir/videos/{id}/`.
@@ -84,15 +84,15 @@ signatures (adding items is fine; changing existing ones requires updating every
 
 ## Sources and embeddings
 
-- Crate `crates/embed` (macOS): `Embedder` (download from Hugging Face with progress,
-  compile the `.mlpackage` once, load with all compute units, `embed(texts, Purpose)`),
-  `extract` (text/code decode, PDFKit + Vision OCR), `chunk` (≤ 512 tokens with the Gemma
+- Crate `crates/embed` (Linux; it began on Core ML, see `docs/plan-linux-service.md`):
+  `Embedder` (download from Hugging Face with progress, ONNX Runtime on the CPU,
+  `embed(texts, Purpose)`), `extract` (text/code decode, pdfium + tesseract OCR, `image`,
+  ffmpeg), `chunk` (≤ 512 tokens with the Gemma
   tokenizer, prose by paragraphs, code by lines, PDFs per page then split).
 - Preprocessing per the model card: prefix `title: none | text: ` (documents) or
   `task: search result | query: ` (queries); tokenize with `tokenizer.json`, `<bos>`=2 …
-  `<eos>`=1; look up rows of `embeddings.bf16` (262144 × 512 bf16) × √512 → fp16; run the
-  smallest `embed_S` (32, 48, 64, 128, 256, 512) with `inputs_embeds` [1,S,512] and
-  `attention_mask` [1,S]; output `embedding` [1,768], L2-normalized.
+  `<eos>`=1; run the ONNX text graph on `input_ids`/`attention_mask` in real batches;
+  output `sentence_embedding` [batch,768], L2-normalized (`crates/embed/src/onnx`).
 - Service: `POST /api/sources` stores the file under `data_dir/sources/{id}`, then a
   background queue extracts, chunks and embeds (one source at a time; `Queued` while the
   model isn't downloaded). Chunks (text, page, vector) live in SurrealDB. Retrieval for a
@@ -118,9 +118,9 @@ signatures (adding items is fine; changing existing ones requires updating every
 
 ## Testing
 
-- Here (macOS): unit + integration tests per crate. The service's tests run against an
+- Here (macOS) and on the Linux runner: unit + integration tests per crate. The service's tests run against an
   in-memory SurrealDB, an in-memory secret store, a fake GitHub and a fake Responses
   API (local axum servers). Video tests render real ManimGX scenes with `Voice::Silent`;
-  PocketTTS tests run only when `fluidaudiocli` is installed (skipped otherwise, with a
+  PocketTTS tests run only when `margin-tts` is installed (skipped otherwise, with a
   message).
 - Manual: real GitHub OAuth app, real OpenAI key, Cloudflare Tunnel, iOS/Android builds.

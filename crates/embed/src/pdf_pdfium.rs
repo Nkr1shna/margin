@@ -1,20 +1,17 @@
-//! PDFs off macOS with pdfium (`pdfium-render` 0.9.4, MIT/Apache-2.0, binding
-//! `libpdfium` from `bblanchon/pdfium-binaries`, BSD-3-Clause, at run time), in place of
-//! PDFKit (`pdf.rs`, whose contract this keeps; `docs/plan-linux-service.md` §2.2).
-//! MuPDF is AGPL and isn't used.
+//! PDFs with pdfium (`pdfium-render` 0.9.4, MIT/Apache-2.0, binding `libpdfium` from
+//! `bblanchon/pdfium-binaries`, BSD-3-Clause, at run time; `docs/plan-linux-service.md`
+//! §2.2). MuPDF is AGPL and isn't used.
 //!
 //! - Text: each page's text layer; a page with fewer than `MIN_TEXT_CHARS` non-space
 //!   characters (a scan) is rendered in gray at 200 dpi and read with tesseract
 //!   (`ocr_tesseract.rs`), and the longer of the two is kept.
 //! - Pictures: each page rendered in color at 144 dpi, its longer side at most 2048 px
-//!   (as PDFKit renders them), written as PNG.
+//!   written as PNG.
 //!
 //! The library is looked for at `$MARGIN_PDFIUM` (the file or its folder), in the tools
 //! folder the service sets (`set_tools_dir`, `data_dir/tools`, so a user install needs no
 //! root), then in the system library folders, then wherever the loader finds it. It is
 //! bound once per process; a missing library is looked for again on the next call.
-// On macOS these build (the `linux-readers` feature) for their tests; Linux reads with them.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -298,7 +295,7 @@ mod tests {
     }
 
     /// With the pdfium library present (the Linux runner installs it; elsewhere this
-    /// skips): the corpus PDFs read as PDFKit reads them.
+    /// skips): the corpus PDFs read in full.
     #[test]
     fn real_pdfium_reads_the_corpus_when_installed() {
         if find_pdfium().is_none() {

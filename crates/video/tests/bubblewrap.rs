@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use margin_video::bubblewrap::{
     self, Host, RootEntry, args, parse_version, passed_env, tool_dirs, userns_blocker,
 };
-use margin_video::{RenderError, RenderJob, RenderProgress, SandboxMode, Voice, render};
 
 fn temp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -354,33 +353,20 @@ fn the_userns_blocker_is_named_with_its_fix() {
     ));
 }
 
-#[test]
-fn the_native_sandbox_follows_the_os() {
-    let expected = if cfg!(target_os = "linux") {
-        SandboxMode::LinuxBubblewrap
-    } else {
-        SandboxMode::MacosSandboxExec
-    };
-    assert_eq!(SandboxMode::native(), expected);
-}
-
-/// The other OS's sandbox is refused before anything runs (no manimgx needed), and the
-/// log says why.
+/// Off Linux bubblewrap is refused before anything runs (no manimgx needed), and the log
+/// says why.
+#[cfg(not(target_os = "linux"))]
 #[tokio::test]
-async fn the_other_os_sandbox_is_refused() {
-    let other = if cfg!(target_os = "linux") {
-        SandboxMode::MacosSandboxExec
-    } else {
-        SandboxMode::LinuxBubblewrap
-    };
+async fn bubblewrap_is_refused_off_linux() {
+    use margin_video::{RenderError, RenderJob, RenderProgress, SandboxMode, Voice, render};
     let job = RenderJob {
-        work_dir: temp("other-os"),
+        work_dir: temp("off-linux"),
         scene_code: String::new(),
     };
     let config = margin_video::RenderConfig {
         manimgx: PathBuf::from("/nonexistent/manimgx"),
         voice: Voice::Silent,
-        sandbox: other,
+        sandbox: SandboxMode::LinuxBubblewrap,
         width: 320,
         height: 180,
         fps: 15,
@@ -389,7 +375,7 @@ async fn the_other_os_sandbox_is_refused() {
     let result = render(&job, &config, |p| events.push(p)).await;
     assert!(matches!(result, Err(RenderError::Sandbox)), "{result:?}");
     let message = RenderError::Sandbox.to_string();
-    assert!(message.contains("bubblewrap on Linux"), "{message}");
+    assert!(message.contains("bubblewrap, on Linux"), "{message}");
     assert!(
         events.iter().any(|e| matches!(e, RenderProgress::Log(l)
             if l.starts_with("margin: ") && l.contains("only available on"))),

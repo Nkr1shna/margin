@@ -235,6 +235,11 @@ pub struct Registry {
 /// the test fake.
 pub const EMBEDDER_RECORDED: &str = "recorded";
 pub const EMBEDDER_FAKE: &str = "fake";
+/// The stage a config without an `embedder` names (`margin_shared::pipeline::
+/// DEFAULT_EMBEDDER`, `"coreml"`): the Mac service's Core ML backend, which no build runs
+/// any more. Still known so every stored config and `pipeline_hash` keeps its meaning;
+/// the service stamps its own backend on the pipeline it runs.
+pub const EMBEDDER_LEGACY_DEFAULT: &str = margin_shared::pipeline::DEFAULT_EMBEDDER;
 
 impl Registry {
     /// An empty registry.
@@ -247,8 +252,8 @@ impl Registry {
     }
 
     /// Every variant the service ships: the trivial ones here, the rest from the areas'
-    /// files, and every embedding backend (`margin_embed::Backend`) whether or not this
-    /// build runs it, since a pipeline names the vectors it's measured with.
+    /// files, and every embedding backend (`margin_embed::Backend`) plus the legacy
+    /// default, since a pipeline names the vectors it's measured with.
     pub fn standard(deps: StageDeps) -> Self {
         let mut reg = Self::new(deps);
         register_trivial(&mut reg);
@@ -257,6 +262,7 @@ impl Registry {
         for b in margin_embed::Backend::ALL {
             reg.register_embedder(b.name());
         }
+        reg.register_embedder(EMBEDDER_LEGACY_DEFAULT);
         reg.register_embedder(EMBEDDER_RECORDED);
         reg.register_embedder(EMBEDDER_FAKE);
         reg

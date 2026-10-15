@@ -1,13 +1,11 @@
-//! Pictures off macOS (`docs/plan-linux-service.md` §2.4), in place of ImageIO:
+//! Pictures (`docs/plan-linux-service.md` §2.4):
 //!
 //! - decoding with `image` 0.25 (PNG, JPEG, WebP, GIF, TIFF, BMP and the rest of its
 //!   default formats), turned upright by the EXIF orientation the decoder reports
-//!   (`ImageDecoder::orientation`), which is what ImageIO applied implicitly;
+//!   (`ImageDecoder::orientation`);
 //! - HEIC/HEIF (and AVIF, when libheif has a decoder for it) through libheif, with the
 //!   `heic` feature on Linux; libheif applies the file's own rotation and mirroring;
 //! - shrinking (never enlarging) with a triangle filter, and JPEG/PNG out.
-// On macOS these build (the `linux-readers` feature) for their tests; Linux reads with them.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::io::Cursor;
 use std::path::Path;
@@ -18,11 +16,11 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
 use crate::EmbedError;
 
-/// Longest side an image is read at for OCR (as `image.rs`).
+/// Longest side an image is read at for OCR.
 pub(crate) const OCR_MAX_SIDE: u32 = 4096;
-/// JPEG quality of `jpeg_for_model` (ImageIO's 0.85).
+/// JPEG quality of `jpeg_for_model`.
 pub(crate) const MODEL_JPEG_QUALITY: u8 = 85;
-/// JPEG quality of video frames (ImageIO's 0.8).
+/// JPEG quality of video frames.
 pub(crate) const FRAME_JPEG_QUALITY: u8 = 80;
 
 fn extract_error(what: &str, e: impl std::fmt::Display) -> EmbedError {

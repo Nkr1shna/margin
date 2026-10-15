@@ -1,18 +1,18 @@
 #!/bin/sh
 # Back up Margin's data folder: the one backup script (docs/plan-deploy.md §5,
-# docs/plan-dogfood.md §5). Used on the owner's Mac by hand, by deploy.sh before every
-# deploy, nightly by the margin-backup systemd timer in the guests, and by
-# restore-into-dev.sh before it replaces dev's data.
+# docs/plan-dogfood.md §5). Used in the Linux guests: by deploy.sh before every deploy,
+# nightly by the margin-backup systemd timer, by restore-into-dev.sh before it replaces
+# dev's data, and by hand.
 #
 #   backup-margin.sh [--label TEXT] [--keep N] [--stop-service]
 #
 # Copies `data_dir` from the service config to `<data_dir>/../backups/<date-time>[-label]/data`.
 # In a VM that is the persistent share, so backups live on the Mac mini's disk.
 # Refuses while the service is up (a copy of a live database isn't a backup) unless
-# --stop-service, which stops the service (the margin-service systemd unit in a guest,
-# the LaunchAgent on the owner's Mac), backs up, and starts it again even when the copy
-# fails. Keeps the newest N backups (default 10; 0 keeps all).
-# The config is $MARGIN_CONFIG, else ~/Library/Application Support/Margin/service.toml.
+# --stop-service, which stops the service (the margin-service systemd unit), backs up,
+# and starts it again even when the copy fails. Keeps the newest N backups (default 10;
+# 0 keeps all).
+# The config is $MARGIN_CONFIG, else /etc/margin/service.toml.
 set -eu
 
 label=""
@@ -31,7 +31,7 @@ case "$keep" in *[!0-9]*|"") echo "backup-margin: --keep takes a number" >&2; ex
 # Labels name a folder: commit ids, "pre-restore", "nightly".
 label="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-')"
 
-config="${MARGIN_CONFIG:-$HOME/Library/Application Support/Margin/service.toml}"
+config="${MARGIN_CONFIG:-/etc/margin/service.toml}"
 if [ ! -f "$config" ]; then
   echo "backup-margin: no service config at $config (set MARGIN_CONFIG)" >&2
   exit 1
@@ -44,7 +44,7 @@ value() {
 
 data_dir="$(value data_dir)"
 bind="$(value bind)"
-data_dir="${data_dir:-$(dirname "$config")/data}"
+data_dir="${data_dir:-/var/lib/margin/data}"
 bind="${bind:-127.0.0.1:8787}"
 port="${bind##*:}"
 
@@ -58,23 +58,16 @@ running() {
     || curl -fsS -m 2 "http://$bind/health" >/dev/null 2>&1
 }
 
-service="gui/$(id -u)/com.krishnanelloore.margin.service"
-plist="$HOME/Library/LaunchAgents/com.krishnanelloore.margin.service.plist"
 unit=/etc/systemd/system/margin-service.service
 sudo_cmd=""
 [ "$(id -u)" = 0 ] || sudo_cmd="sudo"
 restart_after=0
 if [ "$stop_service" = 1 ] && running; then
   restart_after=1
-  if [ -f "$unit" ]; then
-    $sudo_cmd systemctl stop margin-service.service
-    # Always start it again, whatever happens below.
-    trap '$sudo_cmd systemctl start margin-service.service || true' EXIT
-  else
-    [ -f "$plist" ] || { echo "backup-margin: the service runs but not from $plist or $unit; stop it by hand" >&2; exit 1; }
-    launchctl bootout "$service" 2>/dev/null || true
-    trap 'launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "$service" 2>/dev/null || true' EXIT
-  fi
+  [ -f "$unit" ] || { echo "backup-margin: the service runs but not from $unit; stop it by hand" >&2; exit 1; }
+  $sudo_cmd systemctl stop margin-service.service
+  # Always start it again, whatever happens below.
+  trap '$sudo_cmd systemctl start margin-service.service || true' EXIT
   i=0
   while running; do
     i=$((i + 1))

@@ -1,24 +1,22 @@
-//! Renders narrated lesson videos with ManimGX, voiced by PocketTTS through the
-//! FluidAudio CLI (`fluidaudiocli tts … --backend pocket`).
+//! Renders narrated lesson videos with ManimGX, voiced by PocketTTS through `margin-tts`
+//! (Kyutai's Python `pocket-tts` on the CPU, `margin_tts.py`).
 //!
 //! Pipeline for one render, all inside `RenderJob::work_dir`:
 //! 1. Write the scene (`scene.py`) plus a voice module the renderer controls.
 //! 2. Pass 1 (sandboxed): `manimgx inspect` with a collecting voice that records every
 //!    line the scene says (and returns silence), so the lines are known up front.
-//! 3. Voice each line with `fluidaudiocli` (NOT sandboxed: it downloads models and
-//!    caches them in the user's library). Report `Voicing { done, total }`.
+//! 3. Voice each line with `margin-tts` (NOT sandboxed: it downloads models and caches
+//!    them in the user's cache folder). Report `Voicing { done, total }`.
 //! 4. Pass 2 (sandboxed): `manimgx render` with a voice that returns the WAV made in
 //!    step 3 for each line. ManimGX mixes audio, writes the MP4, storyboard and captions;
 //!    the voice module also captures the poster during this render (no second render):
 //!    it draws each held frame as it is sent and, if the video ends on a hold of at
 //!    least half a second (the scene's closing poster shot), saves it as `poster.png`.
 //!
-//! Sandboxing (`sandbox.rs`): macOS `sandbox-exec` (no network, writes only inside
-//! `work_dir` plus the temp dirs Python needs, reads allowed) or Linux bubblewrap (no
-//! network, a read-only root of `/usr`, `/etc` and the tool, writes only inside
-//! `work_dir` and a private `/tmp`). `SandboxMode::native()` is this OS's; another
-//! sandbox, or one that can't start, is refused with `RenderError::Sandbox` unless
-//! `SandboxMode::Unsandboxed` is chosen explicitly (the service exposes that only
+//! Sandboxing (`sandbox.rs`): Linux bubblewrap (no network, a read-only root of `/usr`,
+//! `/etc` and the tool, writes only inside `work_dir` and a private `/tmp`). A sandbox
+//! that can't start (off Linux, without `bwrap`) is refused with `RenderError::Sandbox`
+//! unless `SandboxMode::Unsandboxed` is chosen explicitly (the service exposes that only
 //! through `--allow-unsandboxed-render`, for testing).
 //!
 //! Files in `work_dir` after a render:
@@ -54,22 +52,20 @@ use crate::process::{Stream, run_streaming};
 pub use crate::sandbox::linux as bubblewrap;
 pub use crate::tools::ReaderTools;
 
-/// Finds `manimgx` and `fluidaudiocli` on PATH (and in `~/.local/bin`), with versions
-/// and the install commands to show when missing.
+/// Finds the service's tools (`manimgx`, `margin-tts`, the readers, `bwrap`) on PATH
+/// (and in `~/.local/bin`), with versions and the install commands to show when missing.
 pub async fn detect_tools() -> Vec<ToolStatus> {
     tools::detect_tools(None).await
 }
 
-/// `detect_tools`, with the source readers' rows (Linux: tesseract, ffmpeg, pdfium) taken
-/// from where the readers found them.
+/// `detect_tools`, with the source readers' rows (tesseract, ffmpeg, pdfium) taken from
+/// where the readers found them.
 pub async fn detect_tools_with(readers: ReaderTools) -> Vec<ToolStatus> {
     tools::detect_tools(Some(readers)).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
-    /// macOS `sandbox-exec` profile. Rendering fails with `RenderError::Sandbox` elsewhere.
-    MacosSandboxExec,
     /// Linux bubblewrap (`bwrap`). Rendering fails with `RenderError::Sandbox` on other
     /// systems, without `bwrap`, or where user namespaces are not allowed.
     LinuxBubblewrap,
@@ -79,11 +75,10 @@ pub enum SandboxMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Voice {
-    /// PocketTTS through `cli`: the FluidAudio CLI (`fluidaudiocli`, Core ML, macOS) or
-    /// `margin-tts` (`MARGIN_TTS_SCRIPT`, Kyutai's Python `pocket-tts` on the CPU), told
-    /// apart by the file name. `voice` is passed as `--voice` when set.
+    /// PocketTTS through `cli`: `margin-tts` (`MARGIN_TTS_SCRIPT`, Kyutai's Python
+    /// `pocket-tts` on the CPU). `voice` is passed as `--voice` when set.
     PocketTts { cli: PathBuf, voice: Option<String> },
-    /// Silence of a plausible length per line. For tests on machines without FluidAudio.
+    /// Silence of a plausible length per line. For tests on machines without `margin-tts`.
     Silent,
 }
 
@@ -141,7 +136,7 @@ pub enum RenderError {
     Voice(String),
     /// The chosen sandbox can't run here; the video's log says why and how to fix it.
     #[error(
-        "rendering needs a sandbox (sandbox-exec on macOS, bubblewrap on Linux) and it can't run here; the video's log says why"
+        "rendering needs a sandbox (bubblewrap, on Linux) and it can't run here; the video's log says why"
     )]
     Sandbox,
     #[error("{0}")]
@@ -193,7 +188,7 @@ pub async fn render(
     if let Voice::PocketTts { cli, .. } = &config.voice
         && !cli.is_file()
     {
-        return Err(RenderError::ToolMissing(tts_name(cli).to_string()));
+        return Err(RenderError::ToolMissing(MARGIN_TTS.to_string()));
     }
 
     // 1. The scene, the voice module and the state folder.
@@ -437,30 +432,15 @@ async fn voice_lines(
     Ok(audio)
 }
 
-/// The command line that voices `line` into `out` with the PocketTTS tool `cli`, by its
-/// file name: `margin-tts --text <line> --output <wav> [--voice <name>]` (the Python
-/// `pocket-tts` script, `margin_tts.py`, used off the Mac), anything else
-/// `fluidaudiocli tts --backend pocket --text <line> --output <wav> [--voice <name>]`.
-fn tts_args(cli: &Path, voice: Option<&str>, line: &str, out: &Path) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if tts_name(cli) != MARGIN_TTS {
-        args.extend(["tts", "--backend", "pocket"].map(Into::into));
-    }
-    args.extend(["--text".into(), line.into(), "--output".into(), out.into()]);
+/// The arguments that voice `line` into `out` with `margin-tts` (the Python `pocket-tts`
+/// script, `margin_tts.py`): `--text <line> --output <wav> [--voice <name>]`.
+fn tts_args(voice: Option<&str>, line: &str, out: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        vec!["--text".into(), line.into(), "--output".into(), out.into()];
     if let Some(voice) = voice {
         args.extend(["--voice".into(), voice.into()]);
     }
     args
-}
-
-/// The PocketTTS tool's name for messages: `margin-tts` or `fluidaudiocli`.
-fn tts_name(cli: &Path) -> &'static str {
-    match cli.file_name().and_then(|n| n.to_str()) {
-        Some(n) if n == MARGIN_TTS || n.starts_with("margin-tts.") || n == "margin_tts.py" => {
-            MARGIN_TTS
-        }
-        _ => tools::FLUIDAUDIOCLI,
-    }
 }
 
 /// Voices one line with PocketTTS through `cli` (see `tts_args`), unsandboxed. Writes
@@ -472,12 +452,12 @@ async fn pocket_tts(
     out: &Path,
     on_progress: &mut (impl FnMut(RenderProgress) + Send),
 ) -> Result<(), RenderError> {
-    let name = tts_name(cli);
+    let name = MARGIN_TTS;
     tracing::debug!(line, tool = name, "voicing with PocketTTS");
     let partial = out.with_extension("partial.wav");
     remove_file(&partial)?;
     let mut cmd = Command::new(cli);
-    cmd.args(tts_args(cli, voice, line, &partial));
+    cmd.args(tts_args(voice, line, &partial));
     if let Some(dir) = out.parent() {
         cmd.current_dir(dir);
     }
@@ -660,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn tts_command_lines_by_tool() {
+    fn tts_command_lines() {
         let out = Path::new("/w/line.partial.wav");
         let strings = |args: Vec<std::ffi::OsString>| -> Vec<String> {
             args.into_iter()
@@ -668,16 +648,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            strings(tts_args(
-                Path::new("/x/fluidaudiocli"),
-                Some("alba"),
-                "Hi.",
-                out
-            )),
+            strings(tts_args(Some("alba"), "Hi.", out)),
             [
-                "tts",
-                "--backend",
-                "pocket",
                 "--text",
                 "Hi.",
                 "--output",
@@ -687,19 +659,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            strings(tts_args(
-                Path::new("/home/m/.local/bin/margin-tts"),
-                None,
-                "Hi.",
-                out
-            )),
+            strings(tts_args(None, "Hi.", out)),
             ["--text", "Hi.", "--output", "/w/line.partial.wav"]
-        );
-        assert_eq!(tts_name(Path::new("/a/margin-tts")), MARGIN_TTS);
-        assert_eq!(tts_name(Path::new("/a/margin_tts.py")), MARGIN_TTS);
-        assert_eq!(
-            tts_name(Path::new("/a/fluidaudiocli")),
-            tools::FLUIDAUDIOCLI
         );
     }
 

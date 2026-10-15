@@ -647,7 +647,6 @@ async fn outlines_and_lessons_use_the_sources_and_accepting_attaches_them() {
 async fn sources_wait_for_the_model_download() {
     let h = start_with(Setup {
         model_downloaded: false,
-        embedder: Some("coreml"),
         ..Setup::default()
     })
     .await;
@@ -715,16 +714,15 @@ async fn sources_wait_for_the_model_download() {
 async fn the_model_downloads_with_progress_and_can_be_deleted() {
     let h = start_with(Setup {
         model_downloaded: false,
-        embedder: Some("coreml"),
         ..Setup::default()
     })
     .await;
     let t = h.sign_in("Mac").await;
     h.hf.part_delay_ms.store(150, Ordering::SeqCst);
-    let model_dir = h.data_dir.join("models").join("embeddinggemma-2");
+    let model_dir = h.data_dir.join("models").join("embeddinggemma-2-onnx-q8");
 
     let m = embedding(&h, &t).await;
-    assert_eq!(m.repo, "FluidInference/embeddinggemma-2-coreml");
+    assert_eq!(m.repo, "onnx-community/embeddinggemma-2-ONNX");
     assert_eq!(
         m.state,
         EmbeddingModelState::NotDownloaded {
@@ -1643,7 +1641,6 @@ async fn without_the_model_the_migration_waits_and_retrieval_reads_the_old_rows(
     let h = start_with(Setup {
         store: Some(store),
         model_downloaded: false,
-        embedder: Some("coreml"),
         files: vec![("sources/s-a/file".into(), FOURIER.as_bytes().to_vec())],
         ..Setup::default()
     })
@@ -1688,7 +1685,7 @@ async fn the_speech_model_downloads_shows_and_can_be_deleted_where_the_service_u
     use margin_shared::SpeechModel;
     let h = start().await;
     let t = h.sign_in("Mac").await;
-    // A service that transcribes with an installed program has no speech model.
+    // Source tools without a speech model (a fake that has none) offer none.
     assert_eq!(embedding(&h, &t).await.speech, None);
     for r in [
         h.post(&t, routes::SPEECH_MODEL_DOWNLOAD),

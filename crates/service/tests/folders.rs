@@ -1223,7 +1223,6 @@ async fn revoking_the_holding_device_deletes_its_folders_files() {
 async fn a_chat_file_is_read_before_queued_folder_files() {
     let h = start_with(Setup {
         model_downloaded: false,
-        embedder: Some("coreml"),
         ..Setup::default()
     })
     .await;

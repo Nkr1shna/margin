@@ -1,6 +1,6 @@
-//! Audio and video off macOS, with the `ffmpeg`/`ffprobe` CLIs (apt `ffmpeg`), in place
-//! of AVFoundation (`av.rs`; `docs/plan-linux-service.md` §2.5). Subprocesses, not
-//! bindings, so no FFmpeg headers are needed to build.
+//! Audio and video with the `ffmpeg`/`ffprobe` CLIs (apt `ffmpeg`;
+//! `docs/plan-linux-service.md` §2.5). Subprocesses, not bindings, so no FFmpeg headers
+//! are needed to build.
 //!
 //! - Probe: `ffprobe -show_entries format=duration:stream=codec_type:…` as JSON; cover
 //!   art in an audio file (`attached_pic`) isn't video.
@@ -8,8 +8,6 @@
 //!   read from ffmpeg's stdout.
 //! - Frames: one `ffmpeg -ss <t> -i <file> -frames:v 1` per time, as PNG on stdout
 //!   (ffmpeg turns rotated phone videos upright itself), shrunk to `FRAME_MAX_SIDE`.
-// On macOS these build (the `linux-readers` feature) for their tests; Linux reads with them.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
