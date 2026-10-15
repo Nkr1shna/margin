@@ -20,10 +20,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    # Same-repository pull requests only; never code from a fork on the self-hosted runner.
+  # The workspace minus the app, on the Linux runner VM (margin-ci): the service is a
+  # Linux build now (docs/plan-linux-service.md).
+  linux:
+    # Same-repository pull requests only; never code from a fork on a self-hosted runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, margin]
+    runs-on: [self-hosted, Linux, ARM64, margin]
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
@@ -37,6 +39,33 @@ jobs:
           persist-credentials: false
       # Cargo's build output lives outside the checkout (actions/checkout wipes untracked
       # files on every run), so each run only rebuilds what changed.
+      - name: Put Rust on PATH, keep the build cache
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_DIR=$HOME/.cache/margin-ci/target-test" >> "$GITHUB_ENV"
+      - name: Toolchain
+        run: rustc --version
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --exclude margin-app --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --exclude margin-app
+
+  # The app (desktop, iOS) on the Mac host runner, and a check that the macOS backends of
+  # the service still build (the owner's Mac stays a full dev/eval box, plan Q8).
+  macos:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CI: "true"
+      MARGIN_EMBED_MODEL_DIR: /nonexistent/margin-embed-model
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Put Rust and Homebrew on PATH, keep the build cache
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -46,11 +75,26 @@ jobs:
         run: |
           rustc --version
           rustup target add aarch64-apple-ios-sim
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --workspace
+      - name: Clippy (app)
+        run: cargo clippy -p margin-app --all-targets -- -D warnings
+      - name: Tests (app)
+        run: cargo test -p margin-app
       - name: iOS simulator check
         run: cargo check -p margin-app --target aarch64-apple-ios-sim --no-default-features --features mobile
+      - name: macOS service still builds
+        run: cargo check -p margin-service
+
+  # The required check (repository ruleset): passes only when both platforms passed. A
+  # skipped job (a fork's PR) fails it.
+  test:
+    if: always()
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both platforms passed
+        env:
+          LINUX: ${{ needs.linux.result }}
+          MACOS: ${{ needs.macos.result }}
+        run: |
+          echo "linux: $LINUX, macos: $MACOS"
+          [ "$LINUX" = success ] && [ "$MACOS" = success ]
