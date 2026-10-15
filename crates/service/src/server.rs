@@ -285,7 +285,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             routes::PROVIDERS_CHATGPT_START,
-            post(providers::chatgpt_start),
+            post(providers::chatgpt_start).layer(limit(auth::CHATGPT_START_LIMIT)),
+        )
+        .route(
+            routes::PROVIDERS_CHATGPT_COMPLETE,
+            post(providers::chatgpt_complete).layer(limit(auth::CHATGPT_COMPLETE_LIMIT)),
         )
         .route(routes::DEVICES, get(auth::list_devices))
         .route("/api/devices/{id}", delete(auth::revoke_device))

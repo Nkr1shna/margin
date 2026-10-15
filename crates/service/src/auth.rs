@@ -190,6 +190,21 @@ pub const CONTEXT_INGEST_LIMIT: Limit = Limit {
     by: By::Principal,
     skip_folder_files: false,
 };
+/// `POST /api/providers/chatgpt/start`, per principal.
+pub const CHATGPT_START_LIMIT: Limit = Limit {
+    route: "chatgpt-start",
+    per_minute: 10,
+    by: By::Principal,
+    skip_folder_files: false,
+};
+/// `POST /api/providers/chatgpt/complete`, per principal: a pasted address may be
+/// retried, but state guessing can't be.
+pub const CHATGPT_COMPLETE_LIMIT: Limit = Limit {
+    route: "chatgpt-complete",
+    per_minute: 20,
+    by: By::Principal,
+    skip_folder_files: false,
+};
 /// `POST /api/sources` and `POST /api/source-uploads` together, per principal; a folder's
 /// files aren't counted.
 pub const SOURCES_LIMIT: Limit = Limit {

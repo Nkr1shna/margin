@@ -2,6 +2,8 @@
 
 mod api;
 mod background;
+#[cfg(feature = "desktop")]
+mod chatgpt_callback;
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 mod chrome;
 mod citations;

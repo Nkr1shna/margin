@@ -101,6 +101,10 @@ pub struct FakeState {
     pub chatgpt_polls: u32,
     /// Sign-ins started, for tests.
     pub chatgpt_starts: u32,
+    /// The waiting sign-in's state and loopback redirect (as the service keeps them).
+    pub chatgpt_waiting: Option<(String, String)>,
+    /// The callback addresses `complete` received, for tests.
+    pub chatgpt_completes: Vec<String>,
     /// Everyone who may sign in: Alice (owner) and Bob (member) to start with.
     pub people: Vec<Person>,
     /// Groups; `members` is counted from `people` when listed.
@@ -688,6 +692,8 @@ impl FakeState {
             chatgpt_finish: None,
             chatgpt_polls: 0,
             chatgpt_starts: 0,
+            chatgpt_waiting: None,
+            chatgpt_completes: Vec::new(),
             people: sample_people(),
             groups: sample_groups(),
             agents: sample_agents(),
@@ -875,6 +881,7 @@ pub fn router(fake: Fake) -> Router {
             get(chatgpt_status).delete(chatgpt_sign_out),
         )
         .route(routes::PROVIDERS_CHATGPT_START, post(chatgpt_start))
+        .route(routes::PROVIDERS_CHATGPT_COMPLETE, post(chatgpt_complete))
         .route(routes::PIPELINE_VARIANTS, get(pipeline_variants))
         .route(routes::TRACES, get(traces))
         .route(routes::TRACES_ROLLUP, get(traces_rollup))
@@ -2381,6 +2388,9 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
             let finish = s.chatgpt_finish.take().or_else(|| {
                 (s.simulate && s.chatgpt_polls >= 3).then(|| Ok("owner@example.com".to_string()))
             });
+            if finish.is_some() {
+                s.chatgpt_waiting = None;
+            }
             match finish {
                 Some(Ok(email)) => {
                     let account = fake_account(&email);
@@ -2413,28 +2423,126 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
     Json(status).into_response()
 }
 
-/// `POST /api/providers/chatgpt/start`: a sign-in waits for the owner's browser.
-async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+/// `POST /api/providers/chatgpt/start` (`ChatGptStartRequest`, optional): a sign-in
+/// waits for the callback from the person's device.
+async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
+    let request: ChatGptStartRequest = if body.is_empty() {
+        ChatGptStartRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return api_error(StatusCode::BAD_REQUEST, "bad_request", &e.to_string()),
+        }
+    };
+    let port = request.callback_port.unwrap_or(CHATGPT_CALLBACK_PORT);
     let mut s = fake.state.lock().unwrap();
     s.chatgpt_starts += 1;
     s.chatgpt_polls = 0;
     let state = format!("st-{}", s.chatgpt_starts);
+    let redirect_uri = format!("http://127.0.0.1:{port}{CHATGPT_CALLBACK_PATH}");
     let authorize_url = format!(
         "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client\
          &agent_name_hint=Margin&response_type=code&state={state}\
-         &redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fauth%2Fcallback"
     );
     s.chatgpt = ChatGptStatus::Waiting {
         authorize_url: authorize_url.clone(),
     };
+    s.chatgpt_waiting = Some((state.clone(), redirect_uri.clone()));
     Json(ChatGptStart {
         authorize_url,
         state,
+        redirect_uri,
     })
     .into_response()
+}
+
+/// `POST /api/providers/chatgpt/complete`: as the service, the callback's address must
+/// carry the waiting sign-in's state (used once). `code=…` signs in as
+/// owner@example.com; `error=…` fails the sign-in with `error_description`.
+async fn chatgpt_complete(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(body): Json<ChatGptComplete>,
+) -> Response {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
+        return r;
+    }
+    let text = body.callback_url.trim();
+    let query = text.split_once('?').map_or(text, |(_, q)| q);
+    let params: HashMap<String, String> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.replace('+', " ")))
+        .collect();
+    let looks_right = (text.starts_with("http://127.0.0.1:")
+        && text.contains(CHATGPT_CALLBACK_PATH))
+        || !text.contains("://");
+    if !looks_right || !params.contains_key("state") {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_callback",
+            "That isn't the address the sign-in came back to. Copy the whole address from the browser's address bar: it starts with http://127.0.0.1:1455/auth/callback?code=",
+        );
+    }
+    let (status, changed) = {
+        let mut s = fake.state.lock().unwrap();
+        s.chatgpt_completes.push(text.to_string());
+        let Some((state, _)) = s.chatgpt_waiting.clone() else {
+            return api_error(
+                StatusCode::CONFLICT,
+                "no_sign_in",
+                "No ChatGPT sign-in is waiting. Start again with Continue with ChatGPT.",
+            );
+        };
+        if params["state"] != state {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_state",
+                "That address is from another sign-in attempt. Use the address from the latest one, or start again.",
+            );
+        }
+        s.chatgpt_waiting = None;
+        match (params.get("error"), params.get("code")) {
+            (None, Some(_)) => {
+                let account = fake_account("owner@example.com");
+                s.settings.chatgpt = Some(account.clone());
+                s.chatgpt = ChatGptStatus::SignedIn {
+                    account,
+                    last_error: None,
+                };
+                s.sync_settings();
+                (Ok(s.chatgpt.clone()), Some(s.settings.clone()))
+            }
+            (error, _) => {
+                let message = params
+                    .get("error_description")
+                    .cloned()
+                    .or(error.map(|e| format!("ChatGPT answered {e}.")))
+                    .unwrap_or_else(|| "The sign-in came back without a code.".into());
+                s.chatgpt = match s.settings.chatgpt.clone() {
+                    Some(account) => ChatGptStatus::SignedIn {
+                        account,
+                        last_error: Some(message.clone()),
+                    },
+                    None => ChatGptStatus::Failed {
+                        message: message.clone(),
+                    },
+                };
+                (Err(message), None)
+            }
+        }
+    };
+    if let Some(settings) = changed {
+        publish(&fake, Event::SettingsChanged { settings });
+    }
+    match status {
+        Ok(status) => Json(status).into_response(),
+        Err(message) => api_error(StatusCode::BAD_REQUEST, "sign_in_failed", &message),
+    }
 }
 
 /// `DELETE /api/providers/chatgpt`: signs out (or gives up a waiting sign-in).
@@ -2446,6 +2554,7 @@ async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Respo
         let mut s = fake.state.lock().unwrap();
         s.chatgpt = ChatGptStatus::SignedOut;
         s.chatgpt_finish = None;
+        s.chatgpt_waiting = None;
         let was = s.settings.chatgpt.take();
         s.sync_settings();
         was.map(|_| s.settings.clone())

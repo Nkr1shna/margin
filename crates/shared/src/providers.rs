@@ -192,8 +192,10 @@ pub struct ChatGptAccount {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ChatGptStatus {
     SignedOut,
-    /// A sign-in was started; `authorize_url` must be opened on the machine that runs the
-    /// service (the OAuth callback is a loopback URL there).
+    /// A sign-in was started; `authorize_url` is opened in a browser on the person's own
+    /// device. The OAuth callback is a loopback URL on that device: the desktop app
+    /// listens there and forwards it, or the person pastes the address the browser
+    /// ends on (`ChatGptComplete`).
     Waiting {
         authorize_url: String,
     },
@@ -209,11 +211,42 @@ pub enum ChatGptStatus {
     },
 }
 
+/// The OAuth callback's usual loopback port. OpenAI's sign-in accepts only
+/// `http://127.0.0.1:<port>/auth/callback` as the redirect; only the port may vary.
+pub const CHATGPT_CALLBACK_PORT: u16 = 1455;
+/// The OAuth callback's path on the loopback.
+pub const CHATGPT_CALLBACK_PATH: &str = "/auth/callback";
+
+/// The body of `POST routes::PROVIDERS_CHATGPT_START` (optional: an empty body is
+/// `callback_port: None`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatGptStartRequest {
+    /// The loopback port the app listens on for the OAuth callback. `None`:
+    /// `CHATGPT_CALLBACK_PORT`, whose address a person pastes back from a phone's
+    /// browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+}
+
 /// `POST routes::PROVIDERS_CHATGPT_START`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatGptStart {
     pub authorize_url: String,
     pub state: String,
+    /// The loopback callback the authorization comes back to.
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
+/// `POST routes::PROVIDERS_CHATGPT_COMPLETE`: the address the browser came back to
+/// after the person approved (or declined) Margin, as the desktop app's loopback
+/// listener received it or as the person pasted it. It carries the authorization code
+/// and `state`, never a token: the service holds the PKCE verifier, exchanges the code
+/// and keeps the tokens. Answers `ChatGptStatus::SignedIn` on success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatGptComplete {
+    /// `http://127.0.0.1:<port>/auth/callback?code=…&state=…`, or only its query.
+    pub callback_url: String,
 }
 
 /// A page a hosted web tool cited in an answer (`AssistantText.citations`). Claude's

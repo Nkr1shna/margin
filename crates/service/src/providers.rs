@@ -1,40 +1,51 @@
 //! The provider routes and state (`docs/agent-providers-brief.md` D9, D10, D13): the
 //! models each provider offers, with their windows, the window cache `model_for`
-//! reads, and "Sign in with ChatGPT", which runs on the service Mac (its OAuth callback
-//! is a loopback URL there).
+//! reads, and "Sign in with ChatGPT".
+//!
+//! ChatGPT's sign-in only redirects to a loopback URL (`http://127.0.0.1:<port>/auth/callback`,
+//! only the port may vary), and that URL reaches the device whose browser signs in, not
+//! the service (a headless VM behind a tunnel). So the service runs the OAuth flow's
+//! secret half and the person's device carries the code back (`docs/agent-siwc-spike.md`,
+//! "Signing in when the service is remote"):
 //!
 //! - `GET routes::providers_models(provider)` → `Vec<ModelInfo>`; 409 `not_configured`
 //!   when the provider has no credential.
-//! - `POST routes::PROVIDERS_CHATGPT_START` → `ChatGptStart`: a fresh authorization URL
-//!   (PKCE S256, `state`, `nonce`) and a listener on `127.0.0.1:<port>/auth/callback`
-//!   for one callback or `SIGN_IN_WAIT`.
+//! - `POST routes::PROVIDERS_CHATGPT_START` (`ChatGptStartRequest`) → `ChatGptStart`: a
+//!   fresh authorization URL (PKCE S256, `state`, `nonce`) whose redirect is the app's
+//!   loopback port. The verifier, state and nonce stay here, for one completion within
+//!   `SIGN_IN_WAIT`.
+//! - `POST routes::PROVIDERS_CHATGPT_COMPLETE` (`ChatGptComplete`) → `ChatGptStatus`:
+//!   the callback's address (code and state), forwarded by the desktop app's loopback
+//!   listener or pasted by the person; checked against the waiting sign-in's state,
+//!   used once, the code exchanged here with the verifier, the tokens stored here.
 //! - `GET routes::PROVIDERS_CHATGPT` → `ChatGptStatus`.
 //! - `DELETE routes::PROVIDERS_CHATGPT` → 204: signs out (revokes the refresh token at
 //!   the auth server's `revocation_endpoint`, best effort, then forgets the tokens).
 //!
 //! Credentials stay on the service: the Anthropic key and the ChatGPT tokens are in the
 //! configured secret store (`secrets::ANTHROPIC_API_KEY`, `secrets::CHATGPT_TOKENS`),
-//! never in an event, a log line, a trace row or a response.
+//! never in an event, a log line, a trace row or a response. The authorization code
+//! and the PKCE verifier are never logged either.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use margin_ai::{
     AiError, MODEL_WINDOW_FALLBACK, ModelInfo, ModelWindow, ProviderConfig, ProviderKind,
 };
+pub use margin_shared::{CHATGPT_CALLBACK_PATH, CHATGPT_CALLBACK_PORT};
 use margin_shared::{
-    CLAUDE_LISTED_MODELS, ChatGptAccount, ChatGptStart, ChatGptStatus, Provider, error_code,
+    CLAUDE_LISTED_MODELS, ChatGptAccount, ChatGptComplete, ChatGptStart, ChatGptStartRequest,
+    ChatGptStatus, Provider, error_code,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
-use tokio::task::AbortHandle;
 
 use crate::error::{AppError, AppResult};
 use crate::principal::RequireAdmin;
@@ -45,10 +56,6 @@ use crate::state::{App, AppState, random_token};
 pub const CHATGPT_AUTH_URL: &str = "https://auth.openai.com";
 /// The Responses API a ChatGPT plan token calls (and the token's `resource`).
 pub const CHATGPT_API_URL: &str = "https://api.openai.com/v1";
-/// The loopback port of the OAuth callback. It never changes: the registered redirect
-/// URI's host, port and path must stay the same across sign-ins.
-pub const CHATGPT_CALLBACK_PORT: u16 = 1455;
-pub const CHATGPT_CALLBACK_PATH: &str = "/auth/callback";
 /// What a ChatGPT sign-in asks for. `chatgpt.tokens.use.direct` is what lets the token
 /// call the Responses API on the owner's plan; a sign-in without it fails.
 pub const CHATGPT_SCOPE: &str =
@@ -59,8 +66,11 @@ const DIRECT_SCOPE: &str = "chatgpt.tokens.use.direct";
 pub const DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
 /// `agent_name_hint` of the first sign-in.
 pub const AGENT_NAME: &str = "Margin";
-/// How long the callback listener waits for the owner's browser.
+/// How long a started sign-in may be completed (its state and verifier are forgotten
+/// after).
 pub const SIGN_IN_WAIT: Duration = Duration::from_secs(10 * 60);
+/// The longest callback address `complete` reads.
+const CALLBACK_MAX_LEN: usize = 8 * 1024;
 /// An access token is refreshed before a call when less than this is left of it.
 pub const REFRESH_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
 /// How long a refresh token lasts (it rotates on every refresh).
@@ -84,8 +94,6 @@ pub struct Endpoints {
     pub chatgpt_api: String,
     /// The OAuth server ChatGPT signs in with (also the `id_token` issuer).
     pub chatgpt_auth: String,
-    /// The loopback callback's port (`0` picks a free one: tests only).
-    pub chatgpt_callback_port: u16,
 }
 
 impl Default for Endpoints {
@@ -94,7 +102,6 @@ impl Default for Endpoints {
             anthropic: margin_ai::ANTHROPIC_BASE_URL.into(),
             chatgpt_api: CHATGPT_API_URL.into(),
             chatgpt_auth: CHATGPT_AUTH_URL.into(),
-            chatgpt_callback_port: CHATGPT_CALLBACK_PORT,
         }
     }
 }
@@ -104,6 +111,8 @@ pub struct Providers {
     endpoints: Mutex<Endpoints>,
     /// The ChatGPT sign-in in progress, or how the last one failed.
     flow: Mutex<Flow>,
+    /// How long a started sign-in may be completed (`SIGN_IN_WAIT`; tests shorten it).
+    sign_in_wait: Mutex<Duration>,
     /// Token refreshes, one at a time.
     refresh: tokio::sync::Mutex<()>,
     /// Each provider's model list, with the windows `model_for` uses (D13).
@@ -115,12 +124,37 @@ pub struct Providers {
 
 enum Flow {
     Idle,
-    Waiting {
+    /// Started: waiting for the callback's address.
+    Waiting(Box<Pending>),
+    /// A completion took this sign-in (it is used once) and is exchanging its code.
+    Exchanging {
         authorize_url: String,
         state: String,
-        task: AbortHandle,
     },
     Failed(String),
+}
+
+/// One started sign-in's secrets. They never leave the service.
+struct Pending {
+    authorize_url: String,
+    state: String,
+    nonce: String,
+    verifier: String,
+    redirect_uri: String,
+    /// The registered client id, for a sign-in after the first.
+    client_id: Option<String>,
+    started: Instant,
+}
+
+impl Flow {
+    /// The state of the sign-in in progress (waiting or exchanging), if any.
+    fn state(&self) -> Option<&str> {
+        match self {
+            Flow::Waiting(p) => Some(&p.state),
+            Flow::Exchanging { state, .. } => Some(state),
+            Flow::Idle | Flow::Failed(_) => None,
+        }
+    }
 }
 
 struct CachedModels {
@@ -140,6 +174,7 @@ impl Providers {
         Self {
             endpoints: Mutex::new(Endpoints::default()),
             flow: Mutex::new(Flow::Idle),
+            sign_in_wait: Mutex::new(SIGN_IN_WAIT),
             refresh: tokio::sync::Mutex::new(()),
             models: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
@@ -159,6 +194,26 @@ impl Providers {
     pub fn set_endpoints(&self, endpoints: Endpoints) {
         *self.endpoints.lock().unwrap() = endpoints;
         self.forget_models();
+    }
+
+    /// How long a started ChatGPT sign-in may be completed (tests shorten it).
+    pub fn set_sign_in_wait(&self, wait: Duration) {
+        *self.sign_in_wait.lock().unwrap() = wait;
+    }
+
+    /// The flow, with a waiting sign-in that ran out of time turned `Failed` (its
+    /// secrets dropped).
+    fn flow(&self) -> std::sync::MutexGuard<'_, Flow> {
+        let wait = *self.sign_in_wait.lock().unwrap();
+        let mut flow = self.flow.lock().unwrap();
+        if matches!(&*flow, Flow::Waiting(p) if p.started.elapsed() >= wait) {
+            tracing::info!("a ChatGPT sign-in wasn't finished in time");
+            *flow = Flow::Failed(format!(
+                "The sign-in wasn't finished within {} minutes. Try again.",
+                wait.as_secs().div_ceil(60)
+            ));
+        }
+        flow
     }
 
     /// Drops every cached model list: the next `model_for` fetches again. Called
@@ -624,18 +679,6 @@ fn jwks_url(e: &Endpoints) -> String {
 // Sign in with ChatGPT
 // ---------------------------------------------------------------------------
 
-/// One sign-in's secrets, held by its callback listener.
-struct Callback {
-    app: AppState,
-    state: String,
-    nonce: String,
-    verifier: String,
-    redirect_uri: String,
-    /// The registered client id, for a sign-in after the first.
-    client_id: Option<String>,
-    done: Notify,
-}
-
 /// PKCE: a random verifier and its S256 challenge.
 fn pkce() -> (String, String) {
     use base64::Engine;
@@ -646,26 +689,35 @@ fn pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-/// `POST /api/providers/chatgpt/start`. The ChatGPT sign-in is the organisation's
-/// (one set of provider credentials, plan §3): admins only (403 `admin_required`).
+/// `POST /api/providers/chatgpt/start`, with an optional `ChatGptStartRequest` (an
+/// empty body asks for `CHATGPT_CALLBACK_PORT`). The ChatGPT sign-in is the
+/// organisation's (one set of provider credentials, plan §3): admins only (403
+/// `admin_required`). A sign-in already waiting is replaced.
 pub async fn chatgpt_start(
     State(state): State<AppState>,
     _admin: RequireAdmin,
+    body: Bytes,
 ) -> AppResult<Json<ChatGptStart>> {
+    let request: ChatGptStartRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        ChatGptStartRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::bad_request(format!("The request can't be read: {e}")))?
+    };
+    let port = request.callback_port.unwrap_or(CHATGPT_CALLBACK_PORT);
+    if port == 0 {
+        return Err(AppError::bad_request(
+            "callback_port must be the port the app listens on.",
+        ));
+    }
     let endpoints = state.providers.endpoints();
     let mut tokens = load_tokens(&state).await?;
     if tokens.ext_agent_host_id.is_empty() {
+        // The service's own host id: the tokens live and refresh here, whichever
+        // device's browser signs in.
         tokens.ext_agent_host_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
         save_tokens(&state, &tokens).await?;
     }
-    // A sign-in already waiting is replaced (its listener closes, freeing the port).
-    if let Flow::Waiting { task, .. } =
-        std::mem::replace(&mut *state.providers.flow.lock().unwrap(), Flow::Idle)
-    {
-        task.abort();
-    }
-    let listener = bind_callback(endpoints.chatgpt_callback_port).await?;
-    let port = listener.local_addr().map_err(AppError::internal)?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}{CHATGPT_CALLBACK_PATH}");
     let (verifier, challenge) = pkce();
     let (flow_state, nonce) = (random_token(), random_token());
@@ -696,69 +748,27 @@ pub async fn chatgpt_start(
     }
     let authorize_url = url.to_string();
 
-    let cb = Arc::new(Callback {
-        app: state.clone(),
+    *state.providers.flow.lock().unwrap() = Flow::Waiting(Box::new(Pending {
+        authorize_url: authorize_url.clone(),
         state: flow_state.clone(),
         nonce,
         verifier,
-        redirect_uri,
+        redirect_uri: redirect_uri.clone(),
         client_id: tokens.client_id.clone(),
-        done: Notify::new(),
-    });
-    let task = tokio::spawn(serve_callback(listener, cb));
-    *state.providers.flow.lock().unwrap() = Flow::Waiting {
-        authorize_url: authorize_url.clone(),
-        state: flow_state.clone(),
-        task: task.abort_handle(),
-    };
-    tracing::info!(%port, "ChatGPT sign-in started; waiting for the browser on the loopback callback");
+        started: Instant::now(),
+    }));
+    tracing::info!(%port, "ChatGPT sign-in started; waiting for the callback from the person's device");
     Ok(Json(ChatGptStart {
         authorize_url,
         state: flow_state,
+        redirect_uri,
     }))
 }
 
-async fn bind_callback(port: u16) -> AppResult<tokio::net::TcpListener> {
-    // A listener just aborted may take a moment to let go of the port.
-    let mut last = None;
-    for _ in 0..20 {
-        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(l) => return Ok(l),
-            Err(e) => last = Some(e),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let e = last.map(|e| e.to_string()).unwrap_or_default();
-    Err(AppError::conflict(
-        "port_in_use",
-        format!(
-            "Margin can't listen for the ChatGPT sign-in on 127.0.0.1:{port} ({e}). Close what uses that port on the service Mac and try again."
-        ),
-    ))
-}
-
-/// Serves the loopback callback until one callback of this sign-in arrives or
-/// `SIGN_IN_WAIT` passes.
-async fn serve_callback(listener: tokio::net::TcpListener, cb: Arc<Callback>) {
-    let router = axum::Router::new()
-        .route(CHATGPT_CALLBACK_PATH, axum::routing::get(callback))
-        .with_state(cb.clone());
-    let done = cb.clone();
-    let served = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { done.done.notified().await });
-    if tokio::time::timeout(SIGN_IN_WAIT, served).await.is_err() {
-        set_failed(
-            &cb.app,
-            &cb.state,
-            "The sign-in wasn't finished within 10 minutes. Try again.",
-        );
-    }
-}
-
-/// Sets the flow's outcome, unless another sign-in replaced it meanwhile.
+/// Sets the flow's outcome, unless a sign-out or another sign-in replaced it meanwhile.
 fn set_flow(app: &App, flow_state: &str, next: Flow) {
     let mut flow = app.providers.flow.lock().unwrap();
-    if matches!(&*flow, Flow::Waiting { state, .. } if state == flow_state) {
+    if flow.state() == Some(flow_state) {
         *flow = next;
     }
 }
@@ -768,101 +778,156 @@ fn set_failed(app: &App, flow_state: &str, message: &str) {
     set_flow(app, flow_state, Flow::Failed(message.to_string()));
 }
 
-/// `GET http://127.0.0.1:<port>/auth/callback?code&state[&client_id][&scope]` from the
-/// owner's browser.
-async fn callback(
-    State(cb): State<Arc<Callback>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    if q.get("state").map(String::as_str) != Some(cb.state.as_str()) {
-        // Not this sign-in (an old tab): keep waiting for the right one.
-        return page(
-            StatusCode::BAD_REQUEST,
-            "This sign-in link is out of date",
-            "Start again from Margin's Settings → AI → ChatGPT.",
-        );
+/// The query of a callback address: `http://127.0.0.1:<port>/auth/callback?…`, or the
+/// query alone (with or without its `?`). Never logged: it holds the code.
+fn callback_query(text: &str) -> AppResult<HashMap<String, String>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > CALLBACK_MAX_LEN {
+        return Err(not_a_callback());
     }
-    let outcome = match (q.get("error"), q.get("code")) {
-        (Some(error), _) => Err(q
+    let url = if text.contains("://") {
+        let url = reqwest::Url::parse(text).map_err(|_| not_a_callback())?;
+        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        if url.scheme() != "http" || !loopback || url.path() != CHATGPT_CALLBACK_PATH {
+            return Err(not_a_callback());
+        }
+        url
+    } else {
+        let query = text.trim_start_matches('?');
+        reqwest::Url::parse(&format!("http://127.0.0.1{CHATGPT_CALLBACK_PATH}?{query}"))
+            .map_err(|_| not_a_callback())?
+    };
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    if !query.contains_key("state") {
+        return Err(not_a_callback());
+    }
+    Ok(query)
+}
+
+fn not_a_callback() -> AppError {
+    AppError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_callback",
+        format!(
+            "That isn't the address the sign-in came back to. Copy the whole address from the browser's address bar: it starts with http://127.0.0.1:{CHATGPT_CALLBACK_PORT}{CHATGPT_CALLBACK_PATH}?code="
+        ),
+    )
+}
+
+/// `POST /api/providers/chatgpt/complete`: the callback's address from the person's
+/// device. The waiting sign-in whose `state` it carries is taken (used once), its code
+/// exchanged here with the verifier only the service holds, the `id_token` checked and
+/// the tokens stored here. Admins only; rate limited (`auth::CHATGPT_COMPLETE_LIMIT`).
+///
+/// 400 `invalid_callback` (not a callback address) and 400 `invalid_state` (another
+/// sign-in's) leave the sign-in waiting; 409 `no_sign_in` when none is waiting (never
+/// started, finished, cancelled or out of time); 400 `sign_in_failed` when ChatGPT
+/// declined or the exchange failed, which ends the sign-in (`GET` then says why).
+pub async fn chatgpt_complete(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+    Json(body): Json<ChatGptComplete>,
+) -> AppResult<Json<ChatGptStatus>> {
+    let query = callback_query(&body.callback_url)?;
+    let pending = {
+        let mut flow = state.providers.flow();
+        let taken = matches!(&*flow, Flow::Waiting(p) if Some(&p.state) == query.get("state"));
+        if taken {
+            let Flow::Waiting(pending) = std::mem::replace(&mut *flow, Flow::Idle) else {
+                unreachable!("checked above")
+            };
+            *flow = Flow::Exchanging {
+                authorize_url: pending.authorize_url.clone(),
+                state: pending.state.clone(),
+            };
+            pending
+        } else {
+            return Err(match &*flow {
+                Flow::Waiting(_) => {
+                    tracing::warn!("a ChatGPT callback for another sign-in was refused");
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_state",
+                        "That address is from another sign-in attempt. Use the address from the latest one, or start again.",
+                    )
+                }
+                Flow::Exchanging { .. } => {
+                    AppError::conflict("no_sign_in", "This sign-in is already being finished.")
+                }
+                Flow::Failed(message) => AppError::conflict(
+                    "no_sign_in",
+                    format!("No ChatGPT sign-in is waiting. {message}"),
+                ),
+                Flow::Idle => AppError::conflict(
+                    "no_sign_in",
+                    "No ChatGPT sign-in is waiting. Start again with Continue with ChatGPT.",
+                ),
+            });
+        }
+    };
+    let outcome = match (query.get("error"), query.get("code")) {
+        (Some(error), _) => Err(query
             .get("error_description")
             .cloned()
             .unwrap_or_else(|| format!("ChatGPT answered {error}."))),
         (None, Some(code)) => {
             complete(
-                &cb,
+                &state,
+                &pending,
                 code,
-                q.get("client_id").cloned(),
-                q.get("scope").cloned(),
+                query.get("client_id").cloned(),
+                query.get("scope").cloned(),
             )
             .await
         }
         (None, None) => Err("The sign-in came back without a code.".to_string()),
     };
-    let response = match outcome {
+    match outcome {
         Ok(account) => {
-            set_flow(&cb.app, &cb.state, Flow::Idle);
-            cb.app.providers.forget_models();
-            crate::settings::emit_settings(&cb.app).await;
+            set_flow(&state, &pending.state, Flow::Idle);
+            state.providers.forget_models();
+            crate::settings::emit_settings(&state).await;
             tracing::info!("signed in with ChatGPT");
-            page(
-                StatusCode::OK,
-                "Margin is signed in with ChatGPT",
-                &format!(
-                    "Signed in as {}. You can close this tab.",
-                    html_escape(&account.email)
-                ),
-            )
+            Ok(Json(ChatGptStatus::SignedIn {
+                account,
+                last_error: None,
+            }))
         }
         Err(message) => {
-            set_failed(&cb.app, &cb.state, &message);
-            page(
+            set_failed(&state, &pending.state, &message);
+            Err(AppError::new(
                 StatusCode::BAD_REQUEST,
-                "The ChatGPT sign-in didn't work",
-                &format!(
-                    "{} Try again from Margin's Settings.",
-                    html_escape(&message)
-                ),
-            )
+                "sign_in_failed",
+                message,
+            ))
         }
-    };
-    cb.done.notify_one();
-    response
-}
-
-fn page(status: StatusCode, title: &str, text: &str) -> Response {
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
-         <body style=\"font-family:-apple-system,system-ui,sans-serif;margin:3em\">\
-         <h1 style=\"font-size:1.4em\">{title}</h1><p>{text}</p></body>"
-    );
-    (status, [(header::CONNECTION, "close")], Html(body)).into_response()
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    }
 }
 
 /// The authorization code → tokens, the `id_token` checked, the tokens stored.
 async fn complete(
-    cb: &Callback,
+    app: &App,
+    pending: &Pending,
     code: &str,
     issued_client_id: Option<String>,
     callback_scope: Option<String>,
 ) -> Result<ChatGptAccount, String> {
-    let app = &cb.app;
     let endpoints = app.providers.endpoints();
+    // A reauthorization may omit the client id; one that names another is refused.
+    if let (Some(issued), Some(known)) = (&issued_client_id, &pending.client_id)
+        && issued != known
+    {
+        return Err("ChatGPT answered for another registration of Margin.".into());
+    }
     let client_id = issued_client_id
-        .or_else(|| cb.client_id.clone())
+        .or_else(|| pending.client_id.clone())
         .ok_or("ChatGPT didn't say which client id it registered Margin as.")?;
     let form = [
         ("grant_type", "authorization_code"),
         ("client_id", client_id.as_str()),
         ("code", code),
-        ("code_verifier", cb.verifier.as_str()),
-        ("redirect_uri", cb.redirect_uri.as_str()),
+        ("code_verifier", pending.verifier.as_str()),
+        ("redirect_uri", pending.redirect_uri.as_str()),
         ("resource", CHATGPT_API_URL),
     ];
     let resp = app
@@ -872,7 +937,12 @@ async fn complete(
         .form(&form)
         .send()
         .await
-        .map_err(|e| format!("Couldn't reach ChatGPT's sign-in server ({e})."))?;
+        .map_err(|e| {
+            format!(
+                "Couldn't reach ChatGPT's sign-in server ({}).",
+                e.without_url()
+            )
+        })?;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
@@ -904,18 +974,15 @@ async fn complete(
         &app.providers.http,
         &endpoints,
         &client_id,
-        &cb.nonce,
+        &pending.nonce,
         &id_token,
     )
     .await?;
 
-    // Under the refresh lock and only while this sign-in is still the one waiting: a
-    // sign-out or a newer sign-in that came meanwhile wins.
+    // Under the refresh lock and only while this sign-in is still the one in progress:
+    // a sign-out or a newer sign-in that came meanwhile wins.
     let _one = app.providers.refresh.lock().await;
-    let current = matches!(
-        &*app.providers.flow.lock().unwrap(),
-        Flow::Waiting { state, .. } if *state == cb.state
-    );
+    let current = app.providers.flow.lock().unwrap().state() == Some(pending.state.as_str());
     if !current {
         return Err("The sign-in was cancelled or replaced by a newer one.".into());
     }
@@ -995,8 +1062,9 @@ pub async fn chatgpt_status(
     State(state): State<AppState>,
     _admin: RequireAdmin,
 ) -> AppResult<Json<ChatGptStatus>> {
-    let (waiting, failed) = match &*state.providers.flow.lock().unwrap() {
-        Flow::Waiting { authorize_url, .. } => (Some(authorize_url.clone()), None),
+    let (waiting, failed) = match &*state.providers.flow() {
+        Flow::Waiting(p) => (Some(p.authorize_url.clone()), None),
+        Flow::Exchanging { authorize_url, .. } => (Some(authorize_url.clone()), None),
         Flow::Failed(message) => (None, Some(message.clone())),
         Flow::Idle => (None, None),
     };
@@ -1014,16 +1082,12 @@ pub async fn chatgpt_status(
 }
 
 /// `DELETE /api/providers/chatgpt`: revokes the refresh token (best effort) and
-/// forgets the tokens; a sign-in in progress is cancelled. Admins only.
+/// forgets the tokens; a sign-in in progress is cancelled (its state and verifier
+/// dropped, so its callback can no longer complete it). Admins only.
 pub async fn chatgpt_sign_out(
     State(state): State<AppState>,
     _admin: RequireAdmin,
 ) -> AppResult<StatusCode> {
-    if let Flow::Waiting { task, .. } =
-        std::mem::replace(&mut *state.providers.flow.lock().unwrap(), Flow::Idle)
-    {
-        task.abort();
-    }
     *state.providers.flow.lock().unwrap() = Flow::Idle;
     let _one = state.providers.refresh.lock().await;
     let tokens = load_tokens(&state).await?;
@@ -1112,6 +1176,29 @@ mod tests {
             t.earliest_refresh_at.unwrap().to_rfc3339(),
             "2030-01-01T00:00:00+00:00"
         );
+    }
+
+    #[test]
+    fn callback_addresses_are_read_whole_or_as_their_query() {
+        let q = callback_query("http://127.0.0.1:1455/auth/callback?code=c%2B1&state=s").unwrap();
+        assert_eq!((q["code"].as_str(), q["state"].as_str()), ("c+1", "s"));
+        let q =
+            callback_query(" http://localhost:54321/auth/callback?state=s&error=access_denied\n")
+                .unwrap();
+        assert_eq!(q["error"], "access_denied");
+        assert_eq!(callback_query("?code=c&state=s").unwrap()["code"], "c");
+        assert_eq!(callback_query("code=c&state=s").unwrap()["state"], "s");
+        for bad in [
+            "",
+            "code=c",
+            "https://127.0.0.1:1455/auth/callback?code=c&state=s",
+            "http://example.com/auth/callback?code=c&state=s",
+            "http://127.0.0.1:1455/callback?code=c&state=s",
+            &format!("code=c&state={}", "s".repeat(CALLBACK_MAX_LEN)),
+        ] {
+            let e = callback_query(bad).unwrap_err();
+            assert_eq!(e.code, "invalid_callback", "{bad}");
+        }
     }
 
     #[test]

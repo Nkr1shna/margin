@@ -3,9 +3,10 @@
 //! route, the pipeline override staying with its provider, the model lists and the
 //! window cache, chats fixed on their provider, the small and writing routes following
 //! the default provider, traces per provider, and "Sign in with ChatGPT" end to end
-//! against a fake OAuth server (loopback callback, PKCE, id_token check, refresh with
-//! rotation and `earliest_refresh_at`, a refused refresh signing out, sign-out
-//! revoking). Fakes only: no real provider is called.
+//! against a fake OAuth server (the person's device carries the loopback callback's
+//! address to `complete`; state checked, used once and expiring; PKCE, id_token check,
+//! refresh with rotation and `earliest_refresh_at`, a refused refresh signing out,
+//! sign-out revoking). Fakes only: no real provider is called.
 
 mod common;
 
@@ -31,8 +32,8 @@ use margin_service::state::{SETTINGS_ID, SettingsRow};
 use margin_shared::context::{TraceKind, TraceRow};
 use margin_shared::pipeline::Route;
 use margin_shared::{
-    ApiError, Chat, ChatDetail, ChatGptStart, ChatGptStatus, ChatItemKind, ChatState, Event,
-    Provider, RouteModels, Settings, TitleSource, error_code, routes,
+    ApiError, Chat, ChatDetail, ChatGptComplete, ChatGptStart, ChatGptStatus, ChatItemKind,
+    ChatState, Event, Provider, RouteModels, Settings, TitleSource, error_code, routes,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -265,11 +266,10 @@ async fn signed_in() -> (Harness, String) {
     (h, t)
 }
 
-/// Points ChatGPT at the fake auth server (callback on a free port).
+/// Points ChatGPT at the fake auth server.
 fn use_fake_auth(h: &Harness, auth: &str) {
     h.state.providers.set_endpoints(Endpoints {
         chatgpt_auth: auth.to_string(),
-        chatgpt_callback_port: 0,
         ..Endpoints::default()
     });
 }
@@ -314,28 +314,54 @@ async fn start_sign_in(h: &Harness, t: &str) -> (ChatGptStart, HashMap<String, S
     (start, query)
 }
 
-/// What the owner's browser does: open the authorization URL, follow its redirect to
-/// the service's loopback callback. Returns the callback page.
-async fn browser(h: &Harness, authorize_url: &str) -> (u16, String) {
-    let r = h.http.get(authorize_url).send().await.unwrap();
+/// What the person's browser does: open the authorization URL (on their own device)
+/// and be redirected to the loopback callback. Returns that address; nothing of the
+/// service's listens there (the desktop app does, or the person copies it).
+async fn approve(http: &reqwest::Client, authorize_url: &str) -> String {
+    let r = http.get(authorize_url).send().await.unwrap();
     assert_eq!(r.status(), 302);
     let to = r.headers()[header::LOCATION].to_str().unwrap().to_string();
     assert!(to.starts_with("http://127.0.0.1:"), "{to}");
-    let page = h.http.get(&to).send().await.unwrap();
-    (page.status().as_u16(), page.text().await.unwrap())
+    to
+}
+
+/// What the app does with the callback's address: `POST complete`. Returns the status
+/// code and the body.
+async fn complete_with(h: &Harness, t: &str, callback_url: &str) -> (u16, String) {
+    let r = h
+        .post(t, routes::PROVIDERS_CHATGPT_COMPLETE)
+        .json(&ChatGptComplete {
+            callback_url: callback_url.into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+/// The browser, then the app: a sign-in's whole round trip from the person's device.
+async fn browser(h: &Harness, t: &str, authorize_url: &str) -> (u16, String) {
+    let to = approve(&h.http, authorize_url).await;
+    complete_with(h, t, &to).await
 }
 
 /// `browser` off the test's task (for a token exchange held at the fake's gate).
 fn browser_in_background(
-    http: reqwest::Client,
+    h: &Harness,
+    t: &str,
     authorize_url: String,
 ) -> tokio::task::JoinHandle<(u16, String)> {
+    let (http, url, t) = (h.http.clone(), h.url.clone(), t.to_string());
     tokio::spawn(async move {
-        let r = http.get(&authorize_url).send().await.unwrap();
-        assert_eq!(r.status(), 302);
-        let to = r.headers()[header::LOCATION].to_str().unwrap().to_string();
-        let page = http.get(&to).send().await.unwrap();
-        (page.status().as_u16(), page.text().await.unwrap())
+        let to = approve(&http, &authorize_url).await;
+        let r = http
+            .post(format!("{url}{}", routes::PROVIDERS_CHATGPT_COMPLETE))
+            .bearer_auth(t)
+            .json(&ChatGptComplete { callback_url: to })
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
     })
 }
 
@@ -347,7 +373,7 @@ async fn token_requests(fake: &FakeAuth, n: usize) {
 /// A whole sign-in.
 async fn sign_in_chatgpt(h: &Harness, t: &str) {
     let (start, _) = start_sign_in(h, t).await;
-    let (code, page) = browser(h, &start.authorize_url).await;
+    let (code, page) = browser(h, t, &start.authorize_url).await;
     assert_eq!(code, 200, "{page}");
     assert!(matches!(status(h, t).await, ChatGptStatus::SignedIn { .. }));
 }
@@ -1027,15 +1053,33 @@ async fn lessons_follow_the_default_provider_on_its_writing_slot() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
+async fn chatgpt_signs_in_from_the_device_and_refreshes_with_rotation() {
     let (auth, fake) = start_fake_auth().await;
     let (h, t) = signed_in().await;
     use_fake_auth(&h, &auth);
     assert_eq!(status(&h, &t).await, ChatGptStatus::SignedOut);
     let mut sock = h.socket(&t).await;
 
-    // The first sign-in registers Margin.
+    // The desktop app listens on a port of its own and asks for that redirect.
+    let r = h
+        .post(&t, routes::PROVIDERS_CHATGPT_START)
+        .json(&json!({"callback_port": 54321}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let custom: ChatGptStart = r.json().await.unwrap();
+    assert_eq!(custom.redirect_uri, "http://127.0.0.1:54321/auth/callback");
+    assert!(
+        custom
+            .authorize_url
+            .contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fauth%2Fcallback")
+    );
+
+    // The first sign-in registers Margin (an empty body: the usual port).
     let (start, q) = start_sign_in(&h, &t).await;
+    assert_eq!(start.redirect_uri, "http://127.0.0.1:1455/auth/callback");
+    assert_eq!(q["redirect_uri"], start.redirect_uri);
     assert!(
         start
             .authorize_url
@@ -1061,9 +1105,14 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
         }
     );
 
-    let (code, page) = browser(&h, &start.authorize_url).await;
+    // The browser on the person's device lands on the loopback address; the app sends
+    // it on. The answer is the account, never a token.
+    let (code, page) = browser(&h, &t, &start.authorize_url).await;
     assert_eq!(code, 200, "{page}");
     assert!(page.contains(OWNER_EMAIL), "{page}");
+    assert!(!page.contains("at-1") && !page.contains("rt-1"), "{page}");
+    let answered: ChatGptStatus = serde_json::from_str(&page).unwrap();
+    assert!(matches!(answered, ChatGptStatus::SignedIn { .. }));
     let ChatGptStatus::SignedIn {
         account,
         last_error: None,
@@ -1180,7 +1229,7 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
         q["ext_agent_host_id"], kept.ext_agent_host_id,
         "generated once"
     );
-    let (code, _) = browser(&h, &start.authorize_url).await;
+    let (code, _) = browser(&h, &t, &start.authorize_url).await;
     assert_eq!(code, 200);
 
     // Signing in again while signed in: the URL goes to devices and the clipboard, so
@@ -1195,7 +1244,7 @@ async fn chatgpt_signs_in_on_the_loopback_and_refreshes_with_rotation() {
         "{}?error=access_denied&error_description=The+owner+declined.&state={}",
         q["redirect_uri"], start.state
     );
-    assert_eq!(h.http.get(&denied).send().await.unwrap().status(), 400);
+    assert_eq!(complete_with(&h, &t, &denied).await.0, 400);
     let ChatGptStatus::SignedIn {
         account,
         last_error,
@@ -1227,33 +1276,69 @@ async fn a_chatgpt_sign_in_that_fails_says_why() {
     let (h, t) = signed_in().await;
     use_fake_auth(&h, &auth);
 
-    // A callback for another sign-in (an old tab) is refused and the sign-in waits on.
+    // No sign-in waiting: nothing to complete.
+    let (code, body) =
+        complete_with(&h, &t, "http://127.0.0.1:1455/auth/callback?code=x&state=y").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(api_error(&body).code, "no_sign_in");
+
     let (start, q) = start_sign_in(&h, &t).await;
+    // Something pasted that isn't the callback's address is refused; the sign-in waits on.
+    for pasted in [
+        "",
+        "hello",
+        "https://chatgpt.com/",
+        "http://127.0.0.1:1455/callback?code=x&state=y",
+        "http://evil.example/auth/callback?code=x&state=y",
+        "http://127.0.0.1:1455/auth/callback?code=x",
+    ] {
+        let (code, body) = complete_with(&h, &t, pasted).await;
+        assert_eq!(code, 400, "{pasted}: {body}");
+        assert_eq!(api_error(&body).code, "invalid_callback", "{pasted}");
+    }
+    // A callback for another sign-in (an old tab) is refused and the sign-in waits on.
     let stale = format!("{}?code=x&state=not-this-one", q["redirect_uri"]);
-    let r = h.http.get(&stale).send().await.unwrap();
-    assert_eq!(r.status(), 400);
+    let (code, body) = complete_with(&h, &t, &stale).await;
+    assert_eq!(code, 400);
+    assert_eq!(api_error(&body).code, "invalid_state");
     assert!(matches!(
         status(&h, &t).await,
         ChatGptStatus::Waiting { .. }
     ));
+    assert!(
+        fake.token_forms.lock().unwrap().is_empty(),
+        "nothing exchanged"
+    );
     // The owner declined in the browser.
     let denied = format!(
         "{}?error=access_denied&error_description=The+owner+declined.&state={}",
         q["redirect_uri"], start.state
     );
-    let r = h.http.get(&denied).send().await.unwrap();
-    assert_eq!(r.status(), 400);
+    let (code, body) = complete_with(&h, &t, &denied).await;
+    assert_eq!(code, 400);
+    let e = api_error(&body);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("sign_in_failed", "The owner declined.")
+    );
     assert_eq!(
         status(&h, &t).await,
         ChatGptStatus::Failed {
             message: "The owner declined.".into()
         }
     );
+    // The state was used: the same address again finds no sign-in.
+    let (code, _) = complete_with(&h, &t, &denied).await;
+    assert_eq!(code, 409);
+    assert!(
+        fake.token_forms.lock().unwrap().is_empty(),
+        "no code exchanged"
+    );
 
     // The plan permission wasn't granted.
     *fake.scope.lock().unwrap() = "openid profile email offline_access".into();
     let (start, _) = start_sign_in(&h, &t).await;
-    let (code, page) = browser(&h, &start.authorize_url).await;
+    let (code, page) = browser(&h, &t, &start.authorize_url).await;
     assert_eq!(code, 400);
     assert!(page.contains("chatgpt.tokens.use.direct"), "{page}");
     let ChatGptStatus::Failed { message } = status(&h, &t).await else {
@@ -1266,7 +1351,7 @@ async fn a_chatgpt_sign_in_that_fails_says_why() {
     *fake.scope.lock().unwrap() = CHATGPT_SCOPE.into();
     fake.wrong_nonce.store(true, Ordering::SeqCst);
     let (start, _) = start_sign_in(&h, &t).await;
-    let (code, _) = browser(&h, &start.authorize_url).await;
+    let (code, _) = browser(&h, &t, &start.authorize_url).await;
     assert_eq!(code, 400);
     let ChatGptStatus::Failed { message } = status(&h, &t).await else {
         panic!()
@@ -1276,14 +1361,61 @@ async fn a_chatgpt_sign_in_that_fails_says_why() {
     // Starting again replaces a waiting sign-in; this one works.
     fake.wrong_nonce.store(false, Ordering::SeqCst);
     let (old, _) = start_sign_in(&h, &t).await;
+    let old_callback = approve(&h.http, &old.authorize_url).await;
     let (start, _) = start_sign_in(&h, &t).await;
     assert_ne!(old.state, start.state);
-    let (code, _) = browser(&h, &start.authorize_url).await;
-    assert_eq!(code, 200);
+    let (code, body) = complete_with(&h, &t, &old_callback).await;
+    assert_eq!(code, 400);
+    assert_eq!(api_error(&body).code, "invalid_state");
+    // Pasted with spaces around it, and only its query, it still works.
+    let callback = approve(&h.http, &start.authorize_url).await;
+    let query = callback.split_once('?').unwrap().1;
+    let (code, body) = complete_with(&h, &t, &format!("  ?{query}\n")).await;
+    assert_eq!(code, 200, "{body}");
     assert!(matches!(
         status(&h, &t).await,
         ChatGptStatus::SignedIn { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chatgpt_sign_in_runs_out_of_time_and_completing_is_rate_limited() {
+    let (auth, fake) = start_fake_auth().await;
+    let (h, t) = signed_in().await;
+    use_fake_auth(&h, &auth);
+
+    // Not finished in time: the state and verifier are gone, the code can't be used.
+    h.state
+        .providers
+        .set_sign_in_wait(std::time::Duration::from_millis(200));
+    let (start, _) = start_sign_in(&h, &t).await;
+    let callback = approve(&h.http, &start.authorize_url).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let ChatGptStatus::Failed { message } = status(&h, &t).await else {
+        panic!("not failed")
+    };
+    assert!(message.contains("wasn't finished within"), "{message}");
+    let (code, body) = complete_with(&h, &t, &callback).await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(api_error(&body).code, "no_sign_in");
+    assert!(fake.token_forms.lock().unwrap().is_empty());
+
+    // A device may only try so often (state guessing): 429 with Retry-After.
+    h.state.providers.set_sign_in_wait(providers::SIGN_IN_WAIT);
+    start_sign_in(&h, &t).await;
+    let wrong = "http://127.0.0.1:1455/auth/callback?code=x&state=guess";
+    // (One completion counted above; `auth::CHATGPT_COMPLETE_LIMIT` is 20 a minute.)
+    let mut codes = Vec::new();
+    for _ in 0..20 {
+        codes.push(complete_with(&h, &t, wrong).await.0);
+    }
+    assert_eq!(codes[..19], [400; 19]);
+    assert_eq!(codes[19], 429);
+    // (Admins only: `events.rs`'s list of admin-written routes.)
+}
+
+fn api_error(body: &str) -> ApiError {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1461,7 +1593,7 @@ async fn a_code_exchange_in_flight_does_not_undo_a_sign_out_or_a_newer_sign_in()
     // when the owner signs out: the exchange's tokens are not stored.
     let (start, _) = start_sign_in(&h, &t).await;
     let gate = fake.gate.lock().await;
-    let page = browser_in_background(h.http.clone(), start.authorize_url.clone());
+    let page = browser_in_background(&h, &t, start.authorize_url.clone());
     token_requests(&fake, 1).await;
     let r = h
         .delete(&t, routes::PROVIDERS_CHATGPT)
@@ -1481,7 +1613,7 @@ async fn a_code_exchange_in_flight_does_not_undo_a_sign_out_or_a_newer_sign_in()
     // newer one is still waiting, then completes.
     let (old, _) = start_sign_in(&h, &t).await;
     let gate = fake.gate.lock().await;
-    let page = browser_in_background(h.http.clone(), old.authorize_url.clone());
+    let page = browser_in_background(&h, &t, old.authorize_url.clone());
     token_requests(&fake, 2).await;
     let (newer, _) = start_sign_in(&h, &t).await;
     drop(gate);
@@ -1494,7 +1626,7 @@ async fn a_code_exchange_in_flight_does_not_undo_a_sign_out_or_a_newer_sign_in()
             authorize_url: newer.authorize_url.clone()
         }
     );
-    let (code, body) = browser(&h, &newer.authorize_url).await;
+    let (code, body) = browser(&h, &t, &newer.authorize_url).await;
     assert_eq!(code, 200, "{body}");
     assert!(matches!(
         status(&h, &t).await,
@@ -1516,7 +1648,7 @@ async fn sign_out_cancels_a_sign_in_that_is_waiting() {
         ChatGptStatus::Waiting { .. }
     ));
 
-    // Cancel in Settings: back to signed out, the loopback wait is over.
+    // Cancel in Settings: back to signed out, the sign-in's state is forgotten.
     let r = h
         .delete(&t, routes::PROVIDERS_CHATGPT)
         .send()
@@ -1526,7 +1658,9 @@ async fn sign_out_cancels_a_sign_in_that_is_waiting() {
     assert_eq!(status(&h, &t).await, ChatGptStatus::SignedOut);
     assert!(fake.revoked.lock().unwrap().is_empty(), "nothing to revoke");
     let late = format!("{}?code=x&state={}", q["redirect_uri"], start.state);
-    eventually(|| async { h.http.get(&late).send().await.is_err().then_some(()) }).await;
+    let (code, body) = complete_with(&h, &t, &late).await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(api_error(&body).code, "no_sign_in");
     assert_eq!(status(&h, &t).await, ChatGptStatus::SignedOut);
     assert!(settings(&h, &t).await.chatgpt.is_none());
     // No code was exchanged.
@@ -1620,7 +1754,6 @@ async fn a_chatgpt_chat_signs_in_and_searches_the_web_through_the_real_client() 
     h.state.providers.set_endpoints(Endpoints {
         chatgpt_auth: auth.clone(),
         chatgpt_api: api,
-        chatgpt_callback_port: 0,
         ..Endpoints::default()
     });
     sign_in_chatgpt(&h, &t).await;

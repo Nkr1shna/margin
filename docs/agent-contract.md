@@ -112,6 +112,9 @@ All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
 - Providers (`margin_shared::providers`): `Provider { OpenAi, ChatGpt, Claude }` (wire
   `openai`/`chatgpt`/`claude`), `RouteModels { chat, write, small }`, `ModelInfo { id,
   display_name, context_window, max_output_tokens }`, `ChatGptAccount`, `ChatGptStatus`,
+  `ChatGptStartRequest { callback_port: Option<u16> }`, `ChatGptStart { authorize_url,
+  state, redirect_uri }`, `ChatGptComplete { callback_url }`, `CHATGPT_CALLBACK_PORT`
+  1455, `CHATGPT_CALLBACK_PATH` `/auth/callback`,
   `WebCitation`, `WebResult`; `Settings` gains `default_provider`, `openai_models`,
   `chatgpt_models`, `claude_models`, `has_claude_api_key`, `chatgpt` (a `Settings` without
   slots migrates `agent_model` into `openai_models.chat`); `SettingsPatch` the same plus
@@ -120,7 +123,22 @@ All in `margin_shared` (`chat.rs`, `device.rs`, `lib.rs`):
   `cache_write_input_tokens`, `web_search_requests`, `web_fetch_requests`;
   `context::TraceUsage.web_fetches`; `error_code::{AUTH_FAILED, SPEND_LIMIT_REACHED,
   PLAN_LIMIT_REACHED, PLAN_INELIGIBLE}`; routes `providers_models(provider)`,
-  `PROVIDERS_CHATGPT`, `PROVIDERS_CHATGPT_START`.
+  `PROVIDERS_CHATGPT`, `PROVIDERS_CHATGPT_START`, `PROVIDERS_CHATGPT_COMPLETE`.
+  "Sign in with ChatGPT" (`docs/agent-siwc-spike.md`, "Signing in when the service is
+  remote"): `POST start` (admin) keeps the PKCE verifier, `state` and `nonce` on the
+  service for one completion within 10 minutes and answers the authorize URL, whose
+  redirect is `http://127.0.0.1:<callback_port ?? 1455>/auth/callback` on the person's
+  device. The browser's return reaches the device, not the service: the desktop app
+  listens on that port during the sign-in (1455, else a free port it passes as
+  `callback_port`) and forwards the address; on phones the person pastes it. `POST
+  complete` (admin, `ChatGptComplete`) takes the waiting sign-in whose `state` matches
+  (used once), exchanges the code with the verifier and stores the tokens in the
+  service's secret store; it answers `ChatGptStatus::SignedIn`, or 400
+  `invalid_callback` (not a callback address) / 400 `invalid_state` (another sign-in's;
+  both leave it waiting), 409 `no_sign_in` (none waiting: never started, used,
+  cancelled or out of time), 400 `sign_in_failed` (declined, or the exchange or the
+  `id_token` check failed; `GET` then says why). No token, code or verifier crosses to
+  a device or a log. The service never listens on a loopback port itself.
   `ChatState`: `Idle | Running { turn_id, device_id, started_at } | WaitingForUser {
   turn_id, device_id, item_id } | Interrupted { turn_id } | Failed { turn_id, error }`.
 - `ChatItem { id, chat_id, turn_id, seq, status: InProgress|Done|Cancelled, … , kind }`,
@@ -779,7 +797,7 @@ test at its boundary:
 | `GET /api/traces` | paged by the server (500 rows a read) | `trace::PAGE` |
 | Condense summary | 8 000 characters | `routes::CONDENSE_SUMMARY_MAX_CHARS` |
 | Alert job tick | 60 s | `routes::ALERT_TICK_SECS` |
-| Per-principal rate limits (5-security; a person's devices share one window, an agent has its own) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min together (a folder's files, `?workspace_id=`, aren't counted: a sync sends every file of the folder); 429 `rate_limited` with `Retry-After` in seconds until the minute's window ends (`margin-mcp` waits it out); sign-in per IP: start 10/min, poll 90/min, same answer | `auth::{MESSAGES_LIMIT, CONTEXT_SEARCH_LIMIT, CONTEXT_INGEST_LIMIT, SOURCES_LIMIT, START_LIMIT, POLL_LIMIT}` through `auth::limit` |
+| Per-principal rate limits (5-security; a person's devices share one window, an agent has its own) | messages 30/min, context search 120/min, context ingest 60/min, source and upload starts 60/min together (a folder's files, `?workspace_id=`, aren't counted: a sync sends every file of the folder); 429 `rate_limited` with `Retry-After` in seconds until the minute's window ends (`margin-mcp` waits it out); ChatGPT sign-in per principal: start 10/min, complete 20/min; sign-in per IP: start 10/min, poll 90/min, same answer | `auth::{MESSAGES_LIMIT, CONTEXT_SEARCH_LIMIT, CONTEXT_INGEST_LIMIT, SOURCES_LIMIT, CHATGPT_START_LIMIT, CHATGPT_COMPLETE_LIMIT, START_LIMIT, POLL_LIMIT}` through `auth::limit` |
 | Signed media links | 6 h; `Cache-Control: private, max-age=<seconds left on the link>` | `state::MEDIA_URL_TTL_SECONDS`, `media::cache_control` |
 | Sign-in callback page | `Content-Security-Policy: default-src 'none'` (its one stylesheet by hash), `Referrer-Policy: no-referrer`, `no-store`; a replayed callback is refused (410) | `auth::page_csp` |
 | CORS | none: no route sets `Access-Control-*` (native apps and `margin-mcp` only) | — |
