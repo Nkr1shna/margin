@@ -8,19 +8,23 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use margin_shared::{Chat, Event, Id, NewWorkspace, Workspace};
 
-use crate::auth::CurrentDevice;
 use crate::chats;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::folders;
-use crate::state::{AppState, new_id};
+use crate::principal::{CurrentDevice, CurrentPrincipal, Principal};
+use crate::state::{AppState, Ownership, can_read, list_visible, new_id, readable};
 
 /// Longest folder name or location kept, in characters.
 const MAX_FIELD_CHARS: usize = 500;
 
-/// `GET /api/workspaces`: every device's folders, oldest first.
-pub async fn list_workspaces(State(state): State<AppState>) -> AppResult<Json<Vec<Workspace>>> {
-    let mut all: Vec<Workspace> = state.store.list(db::WORKSPACE).await?;
+/// `GET /api/workspaces`: the folders the caller may read (their own devices'), oldest
+/// first.
+pub async fn list_workspaces(
+    State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
+) -> AppResult<Json<Vec<Workspace>>> {
+    let mut all: Vec<Workspace> = list_visible(&state.store, db::WORKSPACE, &p).await?;
     all.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     Ok(Json(all))
 }
@@ -36,16 +40,19 @@ fn clean(value: &str, what: &str) -> AppResult<String> {
 }
 
 /// `POST /api/workspaces`: registers a folder held by the calling device (name and
-/// location trimmed, not empty). Emits `WorkspaceChanged`.
+/// location trimmed, not empty), private to the device's person. Emits
+/// `WorkspaceChanged`.
 pub async fn create_workspace(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     ApiJson(req): ApiJson<NewWorkspace>,
 ) -> AppResult<Json<Workspace>> {
+    let own = Ownership::private(&p);
     let workspace = Workspace {
-        access: Vec::new(),
-        deny: Vec::new(),
-        owner: None,
+        access: own.access,
+        deny: own.deny,
+        owner: Some(own.owner),
         id: new_id(),
         name: clean(&req.name, "name")?,
         device_id: device.id.clone(),
@@ -63,9 +70,12 @@ pub async fn create_workspace(
             .put(db::WORKSPACE, &workspace.id, &workspace)
             .await?;
     }
-    state.emit(Event::WorkspaceChanged {
-        workspace: workspace.clone(),
-    });
+    state.emit_owned(
+        &workspace,
+        Event::WorkspaceChanged {
+            workspace: workspace.clone(),
+        },
+    );
     Ok(Json(workspace))
 }
 
@@ -73,15 +83,12 @@ pub async fn create_workspace(
 /// otherwise). Detaches it from every chat (`ChatChanged`), emits `WorkspaceDeleted`.
 pub async fn delete_workspace(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
     let _w = state.write_lock.lock().await;
-    let workspace: Workspace = state
-        .store
-        .get(db::WORKSPACE, &id)
-        .await?
-        .ok_or_else(|| AppError::not_found("folder"))?;
+    let workspace: Workspace = readable(&p, state.store.get(db::WORKSPACE, &id).await?, "folder")?;
     if workspace.device_id != device.id {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
@@ -101,9 +108,8 @@ pub async fn delete_workspace(
 /// (`ChatChanged` each), then emits `WorkspaceDeleted`. Lessons keep their citations.
 /// Call with `write_lock` held.
 pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
-    for event in folders::delete_files_locked(state, id).await? {
-        state.emit(event);
-    }
+    let row: Option<Workspace> = state.store.get(db::WORKSPACE, id).await?;
+    state.emit_all(folders::delete_files_locked(state, id).await?);
     let chats: Vec<Chat> = state.store.list(db::CHAT).await?;
     for mut chat in chats {
         if chat.workspace_ids.iter().any(|w| w == id) {
@@ -112,7 +118,9 @@ pub async fn delete_locked(state: &AppState, id: &str) -> anyhow::Result<()> {
         }
     }
     state.store.delete(db::WORKSPACE, id).await?;
-    state.emit(Event::WorkspaceDeleted { id: id.to_string() });
+    if let Some(w) = row {
+        state.emit_owned(&w, Event::WorkspaceDeleted { id: id.to_string() });
+    }
     Ok(())
 }
 
@@ -126,6 +134,17 @@ pub async fn delete_for_device_locked(state: &AppState, device_id: &str) -> anyh
         delete_locked(state, &w.id).await?;
     }
     Ok(())
+}
+
+/// The workspaces with these ids that still exist and `p` may read, in the given order.
+pub async fn visible_by_ids(
+    state: &AppState,
+    p: &Principal,
+    ids: &[Id],
+) -> anyhow::Result<Vec<Workspace>> {
+    let mut all = by_ids(state, ids).await?;
+    all.retain(|w| can_read(p, w));
+    Ok(all)
 }
 
 /// The workspaces with these ids that still exist, in the given order.

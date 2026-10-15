@@ -236,6 +236,17 @@ fn output_for(h: &Harness, call_id: &str) -> Value {
     serde_json::from_str(out["output"].as_str().unwrap()).unwrap()
 }
 
+/// The principal of the owner whose rows a test seeds directly (no owner: the bootstrap
+/// owner's, L1).
+async fn owner(h: &Harness) -> Arc<margin_service::principal::Principal> {
+    margin_service::state::person_principal(
+        &h.state,
+        margin_service::principal::BOOTSTRAP_PERSON_ID,
+    )
+    .await
+    .unwrap()
+}
+
 fn tool_ctx(chat_id: &str) -> ToolContext {
     ToolContext {
         chat_id: chat_id.into(),
@@ -2087,7 +2098,7 @@ mod lesson_retrieval {
         h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
         *h.generator.lesson_body.lock().unwrap() = Some("Ringing.[^1]".into());
 
-        margin_service::ask::regenerate_lesson(&h.state, "l1")
+        margin_service::ask::regenerate_lesson(&h.state, &*owner(&h).await, "l1")
             .await
             .unwrap();
         let ctx =
@@ -2145,7 +2156,7 @@ mod lesson_retrieval {
     /// Regenerates l1 once its last job has let go of it.
     async fn regenerate(h: &Harness) {
         eventually(|| async {
-            margin_service::ask::regenerate_lesson(&h.state, "l1")
+            margin_service::ask::regenerate_lesson(&h.state, &*owner(h).await, "l1")
                 .await
                 .ok()
         })

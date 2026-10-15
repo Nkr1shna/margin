@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::library::{self, video_for_lesson};
+use crate::principal::{CurrentPrincipal, Principal};
 use crate::state::{
     AppState, CAPTIONS_FILE, MP4_FILE, POSTER_FILE, STORYBOARD_FILE, StoredVideo, new_id,
 };
@@ -43,11 +44,14 @@ pub fn in_progress(status: &VideoStatus) -> bool {
     )
 }
 
+/// `POST /api/lessons/{id}/video`: the lesson's owner asks for its video (a video
+/// follows its lesson: 404 outside the lesson's audience, 403 `not_owner`).
 pub async fn request_video(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(lesson_id): Path<Id>,
 ) -> AppResult<Json<Video>> {
-    let lesson = library::lesson(&state, &lesson_id).await?;
+    let lesson = own_lesson(&state, &p, &lesson_id).await?;
     if lesson.lesson.status != LessonStatus::Ready {
         return Err(AppError::conflict(
             "lesson_not_ready",
@@ -59,8 +63,21 @@ pub async fn request_video(
     Ok(Json(state.public_video(&video)))
 }
 
+/// The lesson `p` may read and owns: what asking for its video needs.
+pub async fn own_lesson(
+    state: &AppState,
+    p: &Principal,
+    lesson_id: &str,
+) -> AppResult<crate::state::StoredLesson> {
+    let lesson = library::lesson(state, p, lesson_id).await?;
+    crate::state::check_owner(p, &lesson)?;
+    Ok(lesson)
+}
+
+/// `GET /api/videos/{id}`: 404 unless the caller may read its lesson.
 pub async fn get_video(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Video>> {
     let v: StoredVideo = state
@@ -68,18 +85,26 @@ pub async fn get_video(
         .get(db::VIDEO, &id)
         .await?
         .ok_or_else(|| AppError::not_found("video"))?;
+    match library::lesson_row(&state, &v.video.lesson_id).await {
+        Ok(lesson) if crate::state::can_read(&p, &lesson) => {}
+        // A video whose lesson is gone (only rows from before deletes took their video)
+        // is the organisation owner's, as everything from before L1 is.
+        Err(_) if p.org_role == margin_shared::OrgRole::Owner => {}
+        _ => return Err(AppError::not_found("video")),
+    }
     Ok(Json(state.public_video(&v)))
 }
 
 /// Creates the lesson's video or re-queues it. A video already in the pipeline is
-/// returned unchanged.
+/// returned unchanged. Callers check who asks (`own_lesson`); a lesson job asks for its
+/// own lesson.
 pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo> {
-    let (video, queued) = {
+    let (video, queued, lesson) = {
         let _w = state.write_lock.lock().await;
-        library::lesson(state, lesson_id).await?;
+        let lesson = library::lesson_row(state, lesson_id).await?;
         let now = Utc::now();
         match video_for_lesson(state, lesson_id).await? {
-            Some(v) if in_progress(&v.video.status) => (v, false),
+            Some(v) if in_progress(&v.video.status) => (v, false, lesson),
             Some(mut v) => {
                 v.video.status = VideoStatus::Queued;
                 v.video.log = String::new();
@@ -88,7 +113,7 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
                 v.has_captions = false;
                 v.has_poster = false;
                 state.store.put(db::VIDEO, &v.video.id, &v).await?;
-                (v, true)
+                (v, true, lesson)
             }
             None => {
                 let v = StoredVideo {
@@ -107,12 +132,12 @@ pub async fn enqueue(state: &AppState, lesson_id: &str) -> AppResult<StoredVideo
                     has_poster: false,
                 };
                 state.store.put(db::VIDEO, &v.video.id, &v).await?;
-                (v, true)
+                (v, true, lesson)
             }
         }
     };
     if queued {
-        state.emit_video(&video);
+        state.emit_video(&video, &lesson.lesson);
         let _ = state.video_queue.send(video.video.id.clone());
     }
     Ok(video)
@@ -163,7 +188,10 @@ async fn update(
         state.store.put(db::VIDEO, id, &v).await?;
         v
     };
-    state.emit_video(&video);
+    // A video's event goes to whoever may read its lesson; with the lesson gone, nobody.
+    if let Ok(lesson) = library::lesson_row(state, &video.video.lesson_id).await {
+        state.emit_video(&video, &lesson.lesson);
+    }
     Ok(true)
 }
 
@@ -234,7 +262,7 @@ async fn pipeline(state: &AppState, id: &str) -> anyhow::Result<()> {
     if stored.video.status != VideoStatus::Queued {
         return Ok(());
     }
-    let Ok(lesson) = library::lesson(state, &stored.video.lesson_id).await else {
+    let Ok(lesson) = library::lesson_row(state, &stored.video.lesson_id).await else {
         return Ok(());
     };
     if lesson.lesson.status != LessonStatus::Ready {

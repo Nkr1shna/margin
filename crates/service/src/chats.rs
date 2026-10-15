@@ -1,9 +1,13 @@
 //! Chats with the agent: storage (tables `chat` and `chat_item`) and the chat routes.
 //! Turns themselves run in `turns`. See `docs/agent-contract.md`.
 //!
-//! Every change is stored under `write_lock` and then broadcast: `ChatChanged` for the
-//! chat record (not for `updated_at` alone), `ChatItemChanged` for items, `ChatDeleted`
-//! on delete.
+//! Every change is stored under `write_lock` and then broadcast to the chat's audience
+//! (its `access`, L1 D8): `ChatChanged` for the chat record (not for `updated_at`
+//! alone), `ChatItemChanged` for items, `ChatDeleted` on delete.
+//!
+//! A chat is private to the person who made it (L1 D6). Anyone in its audience may read
+//! it and stop or continue its turn; only its owner sends messages to it, confirms its
+//! tool calls, renames or deletes it (403 `not_owner`). Outside the audience it is 404.
 
 use std::collections::HashSet;
 
@@ -19,9 +23,11 @@ use margin_shared::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auth::CurrentDevice;
 use crate::error::{ApiJson, AppError, AppResult};
-use crate::state::{AppState, new_id};
+use crate::principal::{CurrentDevice, CurrentPrincipal, Principal};
+use crate::state::{
+    AppState, Emitted, Owned, Ownership, can_read, check_owner, list_visible, new_id, readable,
+};
 use crate::turns::{self, Start};
 use crate::{db, ingest, sources, workspaces};
 use margin_shared::context::LibraryKind;
@@ -55,13 +61,51 @@ pub struct StoredChatItem {
 // Loading and saving
 // ---------------------------------------------------------------------------
 
-/// The chat, or 404 "not_found".
-pub async fn chat(state: &AppState, id: &str) -> AppResult<Chat> {
+/// The chat, when `p` may read it; else 404 "not_found".
+pub async fn chat(state: &AppState, p: &Principal, id: &str) -> AppResult<Chat> {
+    readable(p, state.store.get(db::CHAT, id).await?, "chat")
+}
+
+/// The chat whoever asks (turns, which hold its id already), or 404 "not_found".
+pub async fn chat_row(state: &AppState, id: &str) -> AppResult<Chat> {
     state
         .store
         .get(db::CHAT, id)
         .await?
         .ok_or_else(|| AppError::not_found("chat"))
+}
+
+/// Who hears about `chat_id`'s items: the chat's audience, kept in memory by
+/// `save_chat_locked` (read from the store on first use). Empty (nobody) once the chat
+/// is gone.
+pub async fn chat_audience(state: &AppState, chat_id: &str) -> anyhow::Result<Vec<String>> {
+    if let Some(a) = state.turns.audiences.lock().unwrap().get(chat_id) {
+        return Ok(a.clone());
+    }
+    let Some(chat) = state.store.get::<Chat>(db::CHAT, chat_id).await? else {
+        return Ok(Vec::new());
+    };
+    let audience = chat.audience();
+    state
+        .turns
+        .audiences
+        .lock()
+        .unwrap()
+        .insert(chat_id.to_string(), audience.clone());
+    Ok(audience)
+}
+
+/// The cached audience of `chat_id` without a store read (empty when unknown). For the
+/// streaming deltas, which follow an item `save_item_locked` already saved.
+pub fn cached_audience(state: &AppState, chat_id: &str) -> Vec<String> {
+    state
+        .turns
+        .audiences
+        .lock()
+        .unwrap()
+        .get(chat_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// A chat's items, ordered by `seq`.
@@ -85,19 +129,29 @@ pub async fn save_chat_locked(state: &AppState, chat: &mut Chat) -> anyhow::Resu
         b.updated_at = chat.updated_at;
         b != *chat
     });
+    state
+        .turns
+        .audiences
+        .lock()
+        .unwrap()
+        .insert(chat.id.clone(), chat.audience());
     if changed {
-        state.emit(Event::ChatChanged { chat: chat.clone() });
+        state.emit_owned(&*chat, Event::ChatChanged { chat: chat.clone() });
     }
     Ok(())
 }
 
 /// Stores the item and emits `ChatItemChanged` (the wire item, without the stored
-/// extras). Call with `write_lock` held.
+/// extras) to the chat's audience (`chat_audience`). Call with `write_lock` held.
 pub async fn save_item_locked(state: &AppState, item: &StoredChatItem) -> anyhow::Result<()> {
     state.store.put(db::CHAT_ITEM, &item.item.id, item).await?;
-    state.emit(Event::ChatItemChanged {
-        item: public_item(state, &item.item),
-    });
+    let audience = chat_audience(state, &item.item.chat_id).await?;
+    state.emit_all([Emitted::paths(
+        &audience,
+        Event::ChatItemChanged {
+            item: public_item(state, &item.item),
+        },
+    )]);
     Ok(())
 }
 
@@ -177,9 +231,9 @@ pub fn title_from(text: &str) -> String {
     title
 }
 
-/// Trims the text and checks it and its sources (which must exist; duplicates are
-/// dropped).
-async fn check_message(state: &AppState, msg: NewMessage) -> AppResult<NewMessage> {
+/// Trims the text and checks it and its sources (which must exist and be `p`'s to
+/// read; duplicates are dropped).
+async fn check_message(state: &AppState, p: &Principal, msg: NewMessage) -> AppResult<NewMessage> {
     let text = msg.text.trim().to_string();
     if text.is_empty() {
         return Err(AppError::bad_request("Write a message first."));
@@ -190,16 +244,18 @@ async fn check_message(state: &AppState, msg: NewMessage) -> AppResult<NewMessag
             MAX_MESSAGE_BYTES / 1024
         )));
     }
-    let source_ids = check_sources(state, msg.source_ids).await?;
+    let source_ids = check_sources(state, p, msg.source_ids).await?;
     Ok(NewMessage { text, source_ids })
 }
 
-/// Every source must exist. Duplicates are dropped.
-async fn check_sources(state: &AppState, mut ids: Vec<Id>) -> AppResult<Vec<Id>> {
+/// Every source must exist and be readable by `p` (one that isn't doesn't exist for
+/// them). Duplicates are dropped.
+async fn check_sources(state: &AppState, p: &Principal, mut ids: Vec<Id>) -> AppResult<Vec<Id>> {
     let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     for id in &ids {
-        let Some(source) = state.store.get::<Source>(db::SOURCE, id).await? else {
+        let source = state.store.get::<Source>(db::SOURCE, id).await?;
+        let Some(source) = source.filter(|s| can_read(p, s)) else {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
                 "unknown_source",
@@ -217,11 +273,11 @@ async fn check_sources(state: &AppState, mut ids: Vec<Id>) -> AppResult<Vec<Id>>
     Ok(ids)
 }
 
-/// Every folder must still be attached. Duplicates are dropped.
-async fn check_workspaces(state: &AppState, mut ids: Vec<Id>) -> AppResult<Vec<Id>> {
+/// Every folder must still be attached and readable by `p`. Duplicates are dropped.
+async fn check_workspaces(state: &AppState, p: &Principal, mut ids: Vec<Id>) -> AppResult<Vec<Id>> {
     let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
-    let found = workspaces::by_ids(state, &ids).await?;
+    let found = workspaces::visible_by_ids(state, p, &ids).await?;
     if found.len() != ids.len() {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -279,7 +335,7 @@ async fn delete_chat_only_sources_locked(
     state: &AppState,
     chat_id: &str,
     ids: &[Id],
-) -> anyhow::Result<Vec<Event>> {
+) -> anyhow::Result<Vec<Emitted>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -305,9 +361,12 @@ async fn delete_chat_only_sources_locked(
 // Routes
 // ---------------------------------------------------------------------------
 
-/// `GET /api/chats`: newest `updated_at` first.
-pub async fn list_chats(State(state): State<AppState>) -> AppResult<Json<Vec<Chat>>> {
-    let mut chats: Vec<Chat> = state.store.list(db::CHAT).await?;
+/// `GET /api/chats`: the chats the caller may read, newest `updated_at` first.
+pub async fn list_chats(
+    State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
+) -> AppResult<Json<Vec<Chat>>> {
+    let mut chats: Vec<Chat> = list_visible(&state.store, db::CHAT, &p).await?;
     chats.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
@@ -316,29 +375,32 @@ pub async fn list_chats(State(state): State<AppState>) -> AppResult<Json<Vec<Cha
     Ok(Json(chats))
 }
 
-/// `POST /api/chats`: creates the chat (`ChatChanged`); with a message, also stores it
-/// and starts the first turn as `post_message` does.
+/// `POST /api/chats`: creates the chat, private to the caller (`ChatChanged`); with a
+/// message, also stores it and starts the first turn as `post_message` does.
 pub async fn create_chat(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     ApiJson(req): ApiJson<NewChat>,
 ) -> AppResult<Json<ChatDetail>> {
-    let workspace_ids = check_workspaces(&state, req.workspace_ids).await?;
+    let workspace_ids = check_workspaces(&state, &p, req.workspace_ids).await?;
     let message = match req.message {
-        Some(m) => Some(check_message(&state, m).await?),
+        Some(m) => Some(check_message(&state, &p, m).await?),
         None => None,
     };
-    // The provider asked for, else Settings' default; the chat stays on it for good.
-    let provider = match req.provider {
-        Some(p) => p,
+    // The provider asked for, else the person's default, else Settings' default (D9);
+    // the chat stays on it for good.
+    let provider = match req.provider.or(p.person.settings.default_provider) {
+        Some(provider) => provider,
         None => state.settings_row().await?.default_provider,
     };
+    let own = Ownership::private(&p);
     let _w = state.write_lock.lock().await;
     let now = Utc::now();
     let mut chat = Chat {
-        access: Vec::new(),
-        deny: Vec::new(),
-        owner: None,
+        access: own.access,
+        deny: own.deny,
+        owner: Some(own.owner),
         id: new_id(),
         title: String::new(),
         title_by: TitleSource::FirstLine,
@@ -367,9 +429,10 @@ pub async fn create_chat(
 /// `GET /api/chats/{id}`.
 pub async fn get_chat(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<ChatDetail>> {
-    let chat = chat(&state, &id).await?;
+    let chat = chat(&state, &p, &id).await?;
     let mut items: Vec<ChatItem> = items(&state, &id)
         .await?
         .into_iter()
@@ -399,9 +462,12 @@ pub async fn get_chat(
 /// (each must exist) or files.
 pub async fn patch_chat(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
     ApiJson(patch): ApiJson<ChatPatch>,
 ) -> AppResult<Json<Chat>> {
+    // Who may see it and whether it's theirs, before anything else is checked.
+    check_owner(&p, &chat(&state, &p, &id).await?)?;
     let title = match &patch.title {
         Some(t) => {
             let t = t.trim();
@@ -413,16 +479,17 @@ pub async fn patch_chat(
         None => None,
     };
     let workspace_ids = match patch.workspace_ids {
-        Some(ids) => Some(check_workspaces(&state, ids).await?),
+        Some(ids) => Some(check_workspaces(&state, &p, ids).await?),
         None => None,
     };
     let source_ids = match patch.source_ids {
-        Some(ids) => Some(check_sources(&state, ids).await?),
+        Some(ids) => Some(check_sources(&state, &p, ids).await?),
         None => None,
     };
     let (chat, events) = {
         let _w = state.write_lock.lock().await;
-        let mut chat = chat(&state, &id).await?;
+        let mut chat = chat(&state, &p, &id).await?;
+        check_owner(&p, &chat)?;
         if let Some(t) = title {
             chat.title = t;
             chat.title_by = TitleSource::Owner;
@@ -459,9 +526,7 @@ pub async fn patch_chat(
         events.extend(delete_chat_only_sources_locked(&state, &id, &dropped).await?);
         (chat, events)
     };
-    for e in events {
-        state.emit(e);
-    }
+    state.emit_all(events);
     Ok(Json(chat))
 }
 
@@ -470,11 +535,13 @@ pub async fn patch_chat(
 /// Jobs the chat started (lessons, videos) carry on.
 pub async fn delete_chat(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<StatusCode> {
-    let events = {
+    let (chat, events) = {
         let _w = state.write_lock.lock().await;
-        let chat = chat(&state, &id).await?;
+        let chat = chat(&state, &p, &id).await?;
+        check_owner(&p, &chat)?;
         // The items go too, so there is nothing to finish: just end the task.
         state.turns.abort(&id);
         {
@@ -498,25 +565,27 @@ pub async fn delete_chat(
             events.extend(ingest::remove_scope_locked(&state, source_id, &id).await?);
         }
         events.extend(delete_chat_only_sources_locked(&state, &id, &chat.source_ids).await?);
-        events
+        (chat, events)
     };
-    for e in events {
-        state.emit(e);
-    }
-    state.emit(Event::ChatDeleted { id });
+    state.emit_all(events);
+    state.emit_owned(&chat, Event::ChatDeleted { id });
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/chats/{id}/messages`: see `routes::chat_messages`.
 pub async fn post_message(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(msg): ApiJson<NewMessage>,
 ) -> AppResult<Json<MessageSent>> {
-    let msg = check_message(&state, msg).await?;
+    // The turn runs with the chat owner's access, so only the owner starts one.
+    check_owner(&p, &chat(&state, &p, &id).await?)?;
+    let msg = check_message(&state, &p, msg).await?;
     let _w = state.write_lock.lock().await;
-    let mut chat = chat(&state, &id).await?;
+    let mut chat = chat(&state, &p, &id).await?;
+    check_owner(&p, &chat)?;
     let sender = DeviceRef {
         device_id: device.id.clone(),
         name: device.name.clone(),
@@ -528,42 +597,47 @@ pub async fn post_message(
 /// `DELETE /api/chats/{id}/pending`.
 pub async fn cancel_pending(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Chat>> {
     let _w = state.write_lock.lock().await;
-    let mut chat = chat(&state, &id).await?;
+    let mut chat = chat(&state, &p, &id).await?;
+    check_owner(&p, &chat)?;
     if chat.pending.take().is_some() {
         save_chat_locked(&state, &mut chat).await?;
     }
     Ok(Json(chat))
 }
 
-/// `POST /api/chats/{id}/stop`: `turns::stop`.
+/// `POST /api/chats/{id}/stop`: `turns::stop`, by anyone in the chat's audience.
 pub async fn stop(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Chat>> {
-    Ok(Json(turns::stop(&state, &id, &device.id).await?))
+    Ok(Json(turns::stop(&state, &p, &id, &device.id).await?))
 }
 
-/// `POST /api/chats/{id}/continue`: `turns::resume`.
+/// `POST /api/chats/{id}/continue`: `turns::resume`, by anyone in the chat's audience.
 pub async fn continue_turn(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Chat>> {
-    Ok(Json(turns::resume(&state, &id).await?))
+    Ok(Json(turns::resume(&state, &p, &id).await?))
 }
 
-/// `POST /api/chats/{id}/confirm`: `turns::decide`.
+/// `POST /api/chats/{id}/confirm`: `turns::decide`, by the chat's owner only.
 pub async fn confirm(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(req): ApiJson<ConfirmRequest>,
 ) -> AppResult<Json<Chat>> {
     Ok(Json(
-        turns::decide(&state, &id, &req.item_id, req.approve, &device.id).await?,
+        turns::decide(&state, &p, &id, &req.item_id, req.approve, &device.id).await?,
     ))
 }
 
@@ -571,8 +645,13 @@ pub async fn confirm(
 /// this chat.
 pub async fn item_output(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path((chat_id, item_id)): Path<(Id, Id)>,
 ) -> AppResult<Json<ToolOutputText>> {
+    // A chat outside the caller's access has no items for them.
+    chat(&state, &p, &chat_id)
+        .await
+        .map_err(|_| AppError::not_found("tool result"))?;
     let row: Option<StoredChatItem> = state.store.get(db::CHAT_ITEM, &item_id).await?;
     let Some(row) = row.filter(|r| {
         r.item.chat_id == chat_id && matches!(r.item.kind, ChatItemKind::ToolResult { .. })

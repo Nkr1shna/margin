@@ -28,11 +28,11 @@ use margin_shared::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::auth::CurrentDevice;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
+use crate::principal::{CurrentDevice, CurrentPrincipal, Principal};
 use crate::sources;
-use crate::state::AppState;
+use crate::state::{AppState, Emitted, can_read, readable};
 
 /// `WorkspaceChanged` for a folder's counts goes out at most this often (one deferred
 /// emit carries what changed meanwhile).
@@ -294,12 +294,9 @@ pub async fn sources_of(state: &AppState, workspace_id: &str) -> anyhow::Result<
         .await
 }
 
-async fn workspace(state: &AppState, id: &str) -> AppResult<Workspace> {
-    state
-        .store
-        .get(db::WORKSPACE, id)
-        .await?
-        .ok_or_else(|| AppError::not_found("folder"))
+/// The folder, when `p` may read it (else 404).
+async fn workspace(state: &AppState, p: &Principal, id: &str) -> AppResult<Workspace> {
+    readable(p, state.store.get(db::WORKSPACE, id).await?, "folder")
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +306,7 @@ async fn workspace(state: &AppState, id: &str) -> AppResult<Workspace> {
 /// `POST /api/workspaces/{id}/sync`: the holding device's manifest → what to upload.
 pub async fn sync(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     CurrentDevice(device): CurrentDevice,
     Path(id): Path<Id>,
     ApiJson(manifest): ApiJson<SyncManifest>,
@@ -341,7 +339,7 @@ pub async fn sync(
     let now = Utc::now();
     let (plan, events, ws) = {
         let _w = state.write_lock.lock().await;
-        let mut ws = workspace(&state, &id).await?;
+        let mut ws = workspace(&state, &p, &id).await?;
         if ws.device_id != device.id {
             return Err(AppError::new(
                 StatusCode::FORBIDDEN,
@@ -379,9 +377,7 @@ pub async fn sync(
         };
         (plan, events, ws)
     };
-    for e in events {
-        state.emit(e);
-    }
+    state.emit_all(events);
     emit_changed(&state, ws);
     Ok(Json(plan))
 }
@@ -389,10 +385,12 @@ pub async fn sync(
 /// `GET /api/workspaces/{id}/files`: the folder's sources, newest first.
 pub async fn files(
     State(state): State<AppState>,
+    CurrentPrincipal(p): CurrentPrincipal,
     Path(id): Path<Id>,
 ) -> AppResult<Json<Vec<Source>>> {
-    workspace(&state, &id).await?;
+    workspace(&state, &p, &id).await?;
     let mut all = sources_of(&state, &id).await?;
+    all.retain(|s| can_read(&p, s));
     all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
     Ok(Json(all.iter().map(|s| state.public_source(s)).collect()))
 }
@@ -504,7 +502,12 @@ pub fn emit_changed(state: &AppState, ws: Workspace) {
         }
     };
     let Some(wait) = wait else {
-        state.emit(Event::WorkspaceChanged { workspace: ws });
+        state.emit_owned(
+            &ws,
+            Event::WorkspaceChanged {
+                workspace: ws.clone(),
+            },
+        );
         return;
     };
     let state = state.clone();
@@ -522,7 +525,12 @@ pub fn emit_changed(state: &AppState, ws: Workspace) {
                 },
             );
         match state.store.get::<Workspace>(db::WORKSPACE, &ws.id).await {
-            Ok(Some(now)) => state.emit(Event::WorkspaceChanged { workspace: now }),
+            Ok(Some(now)) => state.emit_owned(
+                &now,
+                Event::WorkspaceChanged {
+                    workspace: now.clone(),
+                },
+            ),
             Ok(None) => {}
             Err(e) => tracing::warn!("couldn't read folder {}: {e:#}", ws.id),
         }
@@ -534,7 +542,7 @@ pub fn emit_changed(state: &AppState, ws: Workspace) {
 pub async fn delete_files_locked(
     state: &AppState,
     workspace_id: &str,
-) -> anyhow::Result<Vec<Event>> {
+) -> anyhow::Result<Vec<Emitted>> {
     let mut events = Vec::new();
     for s in sources_of(state, workspace_id).await? {
         events.push(sources::delete_locked(state, &s.id).await?);
