@@ -1074,7 +1074,7 @@ mod tests {
         let api = Api::with_token(&fake.url, "wrong");
         let err = api.library().await.unwrap_err();
         assert!(err.is_unauthorized());
-        assert_eq!(err.message, "Sign in again.");
+        assert_eq!(err.message, "Sign in again: this device isn't signed in.");
     }
 
     #[tokio::test]
@@ -2914,7 +2914,26 @@ mod tests {
         assert_eq!(renamed.name, "Design team");
         let busy = alice.delete_group("company/engineering").await.unwrap_err();
         assert_eq!(busy.code, access_code::HAS_MEMBERS);
-        assert!(alice.delete_group("company").await.is_err());
+        assert_eq!(
+            alice.delete_group("company").await.unwrap_err().code,
+            "root_group"
+        );
+        let bad = alice
+            .create_group(&NewGroup {
+                path: "company/Not OK".into(),
+                name: "x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((bad.status, bad.code.as_str()), (Some(400), "bad_path"));
+        let taken = alice
+            .create_group(&NewGroup {
+                path: "company/engineering".into(),
+                name: "Again".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((taken.status, taken.code.as_str()), (Some(409), "exists"));
 
         // Memberships: Bob into design, then the group can't go.
         let bob_now = alice
@@ -2957,6 +2976,38 @@ mod tests {
         alice.delete_invitation(&dave.id).await.unwrap();
         let gone = alice.delete_invitation(&dave.id).await.unwrap_err();
         assert_eq!(gone.status, Some(404));
+        // An expired invitation can still be revoked (204); an accepted one can't.
+        let expired = {
+            let mut s = fake.state.lock().unwrap();
+            let carol = s
+                .invitations
+                .iter_mut()
+                .find(|i| i.id == "inv-carol")
+                .unwrap();
+            carol.expires_at = chrono::Utc::now() - chrono::Duration::days(1);
+            carol.clone()
+        };
+        alice.delete_invitation(&expired.id).await.unwrap();
+        assert_eq!(
+            alice.delete_invitation("inv-bob").await.unwrap_err().status,
+            Some(404)
+        );
+        // Unknown groups are refused before a login already in use.
+        let refused = alice
+            .create_invitation(&NewInvitation {
+                github_login: "bob".into(),
+                role: OrgRole::Member,
+                groups: vec!["company/nope".into()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, access_code::UNKNOWN_GROUP);
+        // carol-dev is invited again for the sign-in below.
+        alice
+            .create_invitation(&invite("carol-dev", OrgRole::Member))
+            .await
+            .map(|_| ())
+            .unwrap();
 
         // Roles: only the owner makes admins; the owner is fixed.
         let role = |r: OrgRole| PersonPatch {
@@ -2976,6 +3027,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(fixed.code, access_code::OWNER_FIXED);
+        // A patch that leaves the owner's role and state as they are is fine.
+        let same = PersonPatch {
+            org_role: Some(OrgRole::Owner),
+            state: Some(PersonState::Active),
+            ..Default::default()
+        };
+        assert_eq!(
+            alice.patch_person(ALICE, &same).await.unwrap().org_role,
+            OrgRole::Owner
+        );
+        // Names are 1 to 100 characters; a picture is an http(s) address.
+        let long = "x".repeat(101);
+        assert_eq!(
+            alice
+                .patch_person(ALICE, &name(&long))
+                .await
+                .unwrap_err()
+                .status,
+            Some(400)
+        );
+        alice
+            .patch_person(ALICE, &name(&"x".repeat(100)))
+            .await
+            .unwrap();
+        let picture = |u: &str| PersonPatch {
+            avatar_url: Some(Some(u.into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            alice
+                .patch_person(ALICE, &picture("javascript:alert(1)"))
+                .await
+                .unwrap_err()
+                .status,
+            Some(400)
+        );
+        alice
+            .patch_person(ALICE, &picture("https://example.com/a.png"))
+            .await
+            .unwrap();
         let bob_admin = alice
             .patch_person(BOB, &role(OrgRole::Admin))
             .await
@@ -2992,6 +3083,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.code, access_code::OWNER_FIXED);
+        // Nobody disables themselves.
+        let refused = bob
+            .patch_person(BOB, &state(PersonState::Disabled))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str()),
+            (Some(400), "You can't disable yourself.")
+        );
         // Names are one's own.
         let refused = bob.patch_person(ALICE, &name("A")).await.unwrap_err();
         assert_eq!(refused.code, access_code::NOT_OWNER);
@@ -3033,6 +3133,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(dup.status, Some(409));
+        let bad = alice
+            .create_agent(&NewAgent {
+                name: "Not OK".into(),
+                kind: AgentKind::External,
+                ceiling: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!((bad.status, bad.code.as_str()), (Some(400), "bad_name"));
         let minted = alice.mint_agent_token(&agent.id).await.unwrap();
         assert!(minted.token.starts_with("mga_"));
         let info = minted.agent.token.clone().unwrap();
@@ -3064,19 +3173,42 @@ mod tests {
                 .all(|a| a.id != agent.id)
         );
 
-        // Disabling a person signs out their devices; their token is refused with the
-        // service's sentence.
+        // Disabling a person deletes their devices and so their tokens: their next
+        // request is a plain 401, as the service's (D10).
         alice
             .patch_person(BOB, &state(PersonState::Disabled))
             .await
             .unwrap();
         let refused = bob.me().await.unwrap_err();
         assert!(refused.is_unauthorized());
-        assert!(
-            crate::state::signed_out_reason(&refused).contains("@bob is disabled"),
-            "{refused:?}"
-        );
+        assert_eq!(refused.code, "unauthorized");
+        assert!(!fake.state.lock().unwrap().tokens.contains_key(TOKEN_BOB));
         assert_eq!(alice.devices().await.unwrap().len(), 2);
+        // Signing in again is refused with the sentence, at the callback.
+        {
+            let mut s = fake.state.lock().unwrap();
+            s.login_as = BOB.into();
+            s.approve = true;
+        }
+        let anon = Api::anonymous(&fake.url);
+        let login = anon.start_login("Bob's laptop").await.unwrap();
+        match anon.poll_login(&login).await.unwrap() {
+            LoginState::Denied { reason } => assert!(reason.contains("@bob is disabled")),
+            other => panic!("{other:?}"),
+        }
+        // Enabled again, Bob signs in afresh on a new device.
+        alice
+            .patch_person(BOB, &state(PersonState::Active))
+            .await
+            .unwrap();
+        let login = anon.start_login("Bob's laptop").await.unwrap();
+        let LoginState::Approved { token, .. } = anon.poll_login(&login).await.unwrap() else {
+            panic!("not approved");
+        };
+        assert_ne!(token, TOKEN_BOB);
+        let bob_again = Api::with_token(&fake.url, &token);
+        assert_eq!(bob_again.me().await.unwrap().person.unwrap().id, BOB);
+        assert!(bob_again.library().await.is_ok());
         // An invitation turns into a person at sign-in.
         let (carol, token) = fake
             .state
@@ -3087,6 +3219,11 @@ mod tests {
         let carol_api = Api::with_token(&fake.url, &token);
         let carol_me = carol_api.me().await.unwrap().person.unwrap();
         assert_eq!(carol_me.groups, carol.groups);
+        // Invited to no group, she is in `company` all the same.
+        assert_eq!(carol_me.groups, vec!["company"]);
         assert_eq!(carol_me.org_role, OrgRole::Member);
+        // A token the fake minted works everywhere a sample one does.
+        assert!(carol_api.library().await.is_ok());
+        assert!(carol_api.chats().await.is_ok());
     }
 }

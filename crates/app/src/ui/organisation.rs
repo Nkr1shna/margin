@@ -85,18 +85,56 @@ fn store_person(app: AppCtx, person: Person) {
         .and_then(|s| s.me.as_ref())
         .and_then(|m| m.person.as_ref())
         .is_some_and(|p| p.id == person.id);
-    if mine {
-        let p = person.clone();
-        app.update_person(move |me| {
-            let settings = me.settings.clone();
-            *me = p;
-            if me.settings == PersonSettings::default() {
-                me.settings = settings;
-            }
-        });
-    }
     let mut lib = app.lib;
-    lib.write().upsert_person(person);
+    lib.write().upsert_person(person.clone());
+    if mine {
+        follow_own_person(app, person);
+    }
+}
+
+/// The signed-in person's row after an event or an answer about them: their settings
+/// aren't in every answer and never in an event (`org::merge_own_person`), so they're
+/// fetched again when the row can't say: a reset on another device shows here too.
+pub fn follow_own_person(app: AppCtx, person: Person) {
+    let mut fetch = false;
+    app.update_person(|me| {
+        let (merged, unknown) = org::merge_own_person(me, person);
+        *me = merged;
+        fetch = unknown;
+    });
+    if fetch {
+        spawn(refresh_my_settings(app));
+    }
+}
+
+/// `GET /api/me/settings` into the session and the store.
+pub async fn refresh_my_settings(app: AppCtx) {
+    let Some(api) = app.api() else { return };
+    match api.my_settings().await {
+        Ok(settings) => set_my_settings(app, settings),
+        Err(e) => {
+            app.failure(&e);
+        }
+    }
+}
+
+/// The signed-in person's own settings, as the service holds them now.
+pub fn set_my_settings(app: AppCtx, settings: PersonSettings) {
+    let s2 = settings.clone();
+    app.update_person(move |p| p.settings = s2);
+    let me = app
+        .session
+        .peek()
+        .as_ref()
+        .and_then(|s| s.me.as_ref())
+        .and_then(|m| m.person.as_ref())
+        .map(|p| p.id.clone());
+    let mut lib = app.lib;
+    if let Some(id) = me
+        && let Some(p) = lib.write().people.get_mut(&id)
+    {
+        p.settings = settings;
+    }
 }
 
 /// "@bob", or the id when the person isn't known.
@@ -305,15 +343,17 @@ pub fn OrganisationPane() -> Element {
         Some(Err(e)) => Some(e.clone()),
         _ => None,
     };
+    // "Loading…" only while the load runs: once it failed, the notice above says so.
+    let loading = load.read().is_none();
     rsx! {
         if let Some(err) = failed {
             section { class: "set-sec",
                 ErrorNotice { message: err, on_retry: move |_| load.restart() }
             }
         }
-        PeopleSection {}
+        PeopleSection { loading }
         InvitationsSection {}
-        GroupsSection {}
+        GroupsSection { loading }
         AgentsSection {}
     }
 }
@@ -323,7 +363,7 @@ pub fn OrganisationPane() -> Element {
 // ---------------------------------------------------------------------------
 
 #[component]
-fn PeopleSection() -> Element {
+fn PeopleSection(loading: bool) -> Element {
     let app = use_app();
     let me = app.person();
     let my_role = me.as_ref().map(|p| p.org_role).unwrap_or(OrgRole::Member);
@@ -369,7 +409,7 @@ fn PeopleSection() -> Element {
             if let Some(err) = error.read().clone() {
                 ErrorNotice { message: err }
             }
-            if people.is_empty() {
+            if loading && people.is_empty() {
                 p { class: "faint", "Loading people…" }
             }
             div { class: "org-list", role: "list",
@@ -598,8 +638,7 @@ fn EditGroupsDialog(person: Person, on_close: EventHandler<()>) -> Element {
 #[component]
 fn InvitationsSection() -> Element {
     let app = use_app();
-    let me = app.person();
-    let admin = app.is_admin() && me.is_some();
+    let admin = app.is_admin();
     let lib = app.lib.read();
     let invitations: Vec<Invitation> = lib.invitations_in_order().into_iter().cloned().collect();
     let people: Vec<Person> = lib.people.values().cloned().collect();
@@ -893,9 +932,9 @@ pub fn members_text(group: &Group, people: usize) -> String {
 }
 
 #[component]
-fn GroupsSection() -> Element {
+fn GroupsSection(loading: bool) -> Element {
     let app = use_app();
-    let admin = app.is_admin() && app.person().is_some();
+    let admin = app.is_admin();
     let groups: Vec<Group> = app.lib.read().groups.values().cloned().collect();
     let everyone = app.lib.read().people.len();
     let tree = org::tree_order(&groups);
@@ -916,7 +955,7 @@ fn GroupsSection() -> Element {
             if let Some(err) = error.read().clone() {
                 ErrorNotice { message: err }
             }
-            if tree.is_empty() {
+            if loading && tree.is_empty() {
                 p { class: "faint", "Loading groups…" }
             }
             div { class: "org-list", role: "tree", "aria-label": "Groups",
@@ -1762,7 +1801,7 @@ fn AgentDialog(
 #[component]
 fn TokenDialog(name: String, token: String, on_close: EventHandler<()>) -> Element {
     let app = use_app();
-    let command = org::token_command(&token, &app.service_url());
+    let command = org::token_command(&app.service_url());
     let mut copied = use_signal(|| None::<(&'static str, Result<(), String>)>);
     let copy = move |what: &'static str, text: String| async move {
         let result = copy_to_clipboard(text).await;
@@ -1800,6 +1839,7 @@ fn TokenDialog(name: String, token: String, on_close: EventHandler<()>) -> Eleme
             }
             div { class: "field",
                 span { class: "label", "On the computer the agent runs on" }
+                p { class: "help", "Run this there and paste the token when it asks; it stays out of the shell history." }
                 div { class: "token-line",
                     code { class: "mono token-command", "{command}" }
                     button {
@@ -1949,15 +1989,7 @@ pub fn MySettingsSection(person: Person) -> Element {
             Ok(settings) => {
                 error.set(None);
                 saved.set(true);
-                let s2 = settings.clone();
-                app.update_person(move |p| p.settings = s2);
-                let me = app.person().map(|p| p.id);
-                let mut lib = app.lib;
-                if let Some(id) = me
-                    && let Some(p) = lib.write().people.get_mut(&id)
-                {
-                    p.settings = settings;
-                }
+                set_my_settings(app, settings);
             }
             Err(e) => error.set(Some(app.failure(&e))),
         }
@@ -2140,11 +2172,19 @@ pub fn EveryonesDevices(
 // The organisation's settings, as a member reads them
 // ---------------------------------------------------------------------------
 
-/// Whether a provider can answer, in words.
-fn setup_text(settings: &Settings, provider: Provider) -> String {
+/// Whether a member reads which ChatGPT account the organisation signed in with. Off by
+/// default (the account's email is the admin's business); the owner may turn it on.
+pub const MEMBERS_SEE_CHATGPT_EMAIL: bool = false;
+
+/// Whether a provider can answer, in words, as a member reads it: the ChatGPT account's
+/// email only when `MEMBERS_SEE_CHATGPT_EMAIL`.
+pub fn setup_text(settings: &Settings, provider: Provider) -> String {
     match (provider, &settings.chatgpt) {
         _ if !settings.has_credential(provider) => "Not set up".into(),
-        (Provider::ChatGpt, Some(account)) => format!("Signed in as {}", account.email),
+        (Provider::ChatGpt, Some(account)) if MEMBERS_SEE_CHATGPT_EMAIL => {
+            format!("Signed in as {}", account.email)
+        }
+        (Provider::ChatGpt, Some(_)) => "Yes, signed in to the organisation's account".into(),
         _ => "Yes".into(),
     }
 }
@@ -2399,6 +2439,54 @@ mod tests {
         assert!(pane_html.contains("role=\"radiogroup\""));
         assert!(pane_html.contains("<input"));
         assert!(!html.contains("Only an organisation admin changes"));
+    }
+
+    #[test]
+    fn nobody_is_an_admin_until_me_has_loaded() {
+        // `me` without a person yet: the member's read-only pane, no admin controls.
+        let mut me = sample_me(TOKEN);
+        me.person = None;
+        let html = render_with(
+            "/",
+            org_lib(),
+            Some(SettingsPane::Ai),
+            Extra {
+                me: Some(me.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            html.contains("Only an organisation admin changes"),
+            "{html}"
+        );
+        let pane_html = &html[html.find("class=\"settings\"").unwrap()..];
+        assert!(!pane_html.contains("<input"));
+        let html = render_with(
+            "/",
+            org_lib(),
+            Some(SettingsPane::Organisation),
+            Extra {
+                me: Some(me),
+                ..Default::default()
+            },
+        );
+        assert!(!html.contains(">Invite…<") && !html.contains(">Add group…<"));
+    }
+
+    #[test]
+    fn a_member_doesnt_read_the_chatgpt_accounts_email() {
+        let mut lib = org_lib();
+        let mut settings = lib.settings.clone().unwrap();
+        settings.chatgpt = Some(crate::fake::fake_account("owner@example.com"));
+        lib.settings = Some(settings.clone());
+        let extra = as_member(&mut lib);
+        let html = render_with("/", lib, Some(SettingsPane::Ai), extra);
+        assert!(!html.contains("owner@example.com"), "{html}");
+        assert!(html.contains("Yes, signed in to the organisation&#39;s account"));
+        assert_eq!(
+            setup_text(&settings, Provider::ChatGpt),
+            "Yes, signed in to the organisation's account"
+        );
     }
 
     #[test]

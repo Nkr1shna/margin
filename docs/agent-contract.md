@@ -646,9 +646,21 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
 **Accepted L1 gaps (closed by L2):** agent tools that read a library row by id
 (`get_topic`, `read_note`, `list_sources`, …) still take any id; `read_passage`/
 `document_outline`/`passages` by `document_id` likewise; passages all say `company` so a
-search by B finds A's private note's passages. A second *trusted* person (a tester) is
+search by B finds A's private note's passages. `GET /api/context/changes` lists every
+document's metadata (name, origin, owner, generation; not the text) to every principal,
+whatever its access, agent tokens included. Documents from the context API are keyed by
+agent name and document name across the whole organisation: when B's agent has the
+same name as A's (both `claude-code`, say) and ingests a document with the same name as
+one of A's, the ingest is refused with 403 `not_owner` instead of being kept as B's own
+document (B renames the agent or the document). A second *trusted* person (a tester) is
 fine on L1; a second *untrusted* one is not until L2 ships (plan §8.3 still stands for
 untrusted accounts).
+
+**Disabling a person** deletes their devices (and closes their sockets), so their next
+request is 401 `unauthorized`; 401 `person_disabled` (with "The GitHub account @x is
+disabled on this Margin. Ask an admin.") is answered only in the moment before the
+devices go, and the app shows that sentence when it gets it. The sentence is promised
+only at sign-in: a disabled person's GitHub callback is refused with it.
 
 ## 6. Device tool transport
 

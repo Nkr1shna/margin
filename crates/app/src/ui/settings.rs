@@ -109,6 +109,15 @@ impl SettingsPane {
         }
     }
 
+    /// A pane whose controls only an organisation admin has (a member reads its values):
+    /// no fix to send a member to.
+    pub fn admin_only(self) -> bool {
+        matches!(
+            self,
+            SettingsPane::Ai | SettingsPane::Video | SettingsPane::Advanced
+        )
+    }
+
     fn icon(self) -> &'static str {
         match self {
             SettingsPane::General => "half",
@@ -411,9 +420,13 @@ pub fn presence_text(device: &Device) -> String {
 #[component]
 fn AccountSection() -> Element {
     let app = use_app();
-    // The list comes from the service once; DeviceChanged / DeviceDeleted keep it (and
-    // who is online) current from then on.
+    // Whether the list is everyone's: it changes when an event promotes or demotes the
+    // signed-in person, and the list is fetched again then (an admin's has everyone's).
+    let admin_now = use_memo(move || app.is_admin());
+    // The list comes from the service once (again on a change of role); DeviceChanged /
+    // DeviceDeleted keep it (and who is online) current from then on.
     let mut devices = use_resource(move || async move {
+        let _admin = admin_now();
         let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
         let list = api.devices().await.map_err(|e| app.failure(&e))?;
         let mut lib = app.lib;

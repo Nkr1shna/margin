@@ -1,4 +1,5 @@
-//! `margin-mcp token <mga_…>`, `margin-mcp token --forget` and `margin-mcp whoami`:
+//! `margin-mcp token -` (the token from stdin; `token <mga_…>` also takes it as an
+//! argument), `margin-mcp token --forget` and `margin-mcp whoami`:
 //! running on an agent token (`docs/l1-brief.md` D11). An agent token is minted in
 //! Settings → Organisation → Agents; it reads and writes context only, within the
 //! agent's ceiling. It is checked against `GET /api/me` before it is stored, stored in
@@ -73,7 +74,7 @@ pub fn forget_agent_token(
 pub async fn whoami(base: &str, store: &dyn TokenStore) -> anyhow::Result<String> {
     let (token, kind) = stored_token(store, base)?.ok_or_else(|| {
         anyhow!(
-            "not signed in to {base}: run `margin-mcp token <token>` with an agent token, or `margin-mcp login`"
+            "not signed in to {base}: run `margin-mcp token -` and paste an agent token, or `margin-mcp login`"
         )
     })?;
     let client = Client::new(base, Some(token))?;
