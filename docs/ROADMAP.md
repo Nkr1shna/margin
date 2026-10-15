@@ -20,6 +20,7 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Linux service**: ONNX EmbeddingGemma, pdfium, tesseract, ffmpeg, Parakeet, pocket-tts, bubblewrap, file secrets, systemd guests | `docs/plan-linux-service.md` |
 | ✅ | **macOS service leftovers removed** (Core ML, PDFKit/Vision/ImageIO/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd): Linux is the only service platform; the apps stay on Mac, iPhone, Android. Core ML-era passages are re-embedded by the one-pass re-embed | `docs/plan-linux-service.md` §0 |
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
+| ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
 | ✅ | **R2 — rerank, query rewriting, prompt-version tracking**: `listwise-small` and `small-expand-v1` on the Small route, the `onnx-crossencoder` stage (ms-marco-MiniLM, downloaded on demand), `written_with` on lessons/proposals/videos, the prompt catalog and `evals/prompts.lock` in CI, recorded reranks/rewrites in the eval. Every stage stays `"none"` by default: variants until the eval promotes them | `docs/r2-brief.md` |
 
 ## In progress
@@ -33,7 +34,6 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | | Item | Plan | Notes |
 |---|---|---|---|
 | ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **L1 — accounts and principals**: people, groups, agents owned by a person, invitations by GitHub login, per-principal events | `docs/plan-live-context.md` | Fixes events going to every device |
 | ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
 | ⏳ | **Phase 5 — hardening** | `docs/phase5-brief.md` | iOS background continuation for folders, prompt-injection tests, job retries, backups/drills, alerts from traces, security review, performance budgets |
 | ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |

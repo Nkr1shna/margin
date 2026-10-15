@@ -50,6 +50,10 @@ pub struct Document {
     /// retrieval filters by it inside the index query. Not enforced yet (the seam only).
     #[serde(default = "company")]
     pub access: Vec<String>,
+    /// The person whose row the document indexes (an agent's documents: its owner).
+    /// `None` only before the `people-v1` migration.
+    #[serde(default)]
+    pub owner: Option<Id>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -376,6 +380,9 @@ pub struct TraceRow {
     /// `owner` or `agent:<name>`.
     #[serde(default)]
     pub actor: Option<String>,
+    /// The principal the row was done for (`person/<id>` or `agent/<id>`, L1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     /// The way in when it isn't the app: `mcp` for the context API as `margin-mcp`
     /// calls it (dogfood plan §6). `route` stays the model slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -483,6 +490,7 @@ impl TraceRow {
             job_id: None,
             document_id: None,
             actor: None,
+            principal: None,
             via: None,
             pipeline_hash: None,
             prompt_version: None,
@@ -622,6 +630,7 @@ mod tests {
             },
         ] {
             let doc = Document {
+                owner: None,
                 id: "d".into(),
                 project_id: "p".into(),
                 origin,

@@ -45,6 +45,10 @@
 //! - `RENDER_CHATGPT=waiting|signed_in|failed` sets where "Sign in with ChatGPT" is
 //!   (Settings → AI); signed in, ChatGPT can be picked for a new chat.
 //! - `RENDER_SETTINGS=advanced` shows trace retention.
+//! - `RENDER_SETTINGS=organisation` shows people, invitations, groups and agents (and
+//!   `account` the person, My settings and devices per person) as the owner;
+//!   `RENDER_AS=member` signs in as Bob, a member, instead (Settings → AI, Voice & video
+//!   and Advanced then show the organisation's values read-only).
 //! - The sample folders (two devices', every sync state) are always there: Settings →
 //!   Folders (`RENDER_SETTINGS=folders`) and chat `c1`'s strip show them.
 //! - `RENDER_SOURCE_WARNING=1` shows the sample recording (s5) read without a transcript.
@@ -78,6 +82,8 @@ mod fake;
 mod folders;
 #[path = "../src/markdown.rs"]
 mod markdown;
+#[path = "../src/org.rs"]
+mod org;
 #[path = "../src/picker/mod.rs"]
 mod picker;
 #[path = "../src/routes.rs"]
@@ -330,19 +336,33 @@ fn Harness(props: HarnessProps) -> Element {
                 .into_iter()
                 .find(|p| format!("{p:?}").eq_ignore_ascii_case(&name))
         });
+        // The organisation: Alice (owner) and Bob (member), their groups, agents and
+        // devices; RENDER_AS=member signs in as Bob, who sees only his own agents and
+        // devices and no invitations.
+        let member = std::env::var("RENDER_AS").as_deref() == Ok("member");
+        let org = fake::FakeState::new();
+        lib.replace_people(org.people.clone());
+        lib.replace_groups(org.groups.clone());
+        lib.replace_agents(org.agents.clone());
+        lib.replace_invitations(org.invitations.clone());
+        lib.replace_devices(org.devices.clone());
+        if member {
+            lib.agents.retain(|_, a| a.owner_id == fake::BOB);
+            lib.invitations.clear();
+            lib.devices
+                .retain(|_, d| d.person_id.as_deref() == Some(fake::BOB));
+        }
+        let mut me = fake::sample_me(if member { fake::TOKEN_BOB } else { fake::TOKEN });
+        if let Some(device) = me.device.as_mut()
+            && !member
+        {
+            device.name = "Krishna's MacBook".into();
+            device.last_seen_at = Some(Utc::now());
+            device.online = true;
+        }
         let session = (!connect).then(|| Session {
             api: Api::with_token("http://127.0.0.1:9", "x"),
-            me: Some(Me {
-                github_login: "Nkr1shna".into(),
-                device: Device {
-                    id: "d1".into(),
-                    name: "Krishna's MacBook".into(),
-                    created_at: Utc::now(),
-                    last_seen_at: Some(Utc::now()),
-                    current: true,
-                    online: true,
-                },
-            }),
+            me: Some(me),
         });
         AppCtx {
             config: Signal::new(config::LocalConfig {
@@ -505,6 +525,9 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
     };
     let done = |mut upload: Upload, id: &str, status: SourceStatus, lib: &mut LibraryState| {
         let source = margin_shared::Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: None,
             id: id.into(),
             topic_id: Some(topic_id.to_string()),
@@ -518,7 +541,7 @@ fn sample_uploads(lib: &mut LibraryState, topic_id: &str) -> Vec<sources::Upload
             modified: None,
         };
         lib.sources.insert(source.id.clone(), source.clone());
-        upload.state = UploadState::Done(source);
+        upload.state = UploadState::Done(Box::new(source));
         upload
     };
     let mut failed = file("scan.pdf", None, 9_800_000);

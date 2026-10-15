@@ -969,6 +969,9 @@ mod tests {
         });
         assert_eq!(locator(&c).as_deref(), Some("ch1/intro.md"));
         let ws = Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: "w1".into(),
             name: "notes".into(),
             device_id: "d1".into(),

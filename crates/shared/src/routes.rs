@@ -5,6 +5,10 @@
 //! the signed query string the service puts in `VideoMedia` URLs. Errors use `ApiError`
 //! as the body.
 //!
+//! An agent token (`mga_…`, `principal::AGENT_TOKEN_PREFIX`) may call only `/api/me`,
+//! `/api/projects` and `/api/context/*`; anything else answers 403 "agent_not_allowed".
+//! Admin-only routes answer 403 "admin_required" to members (L1, `docs/l1-brief.md`).
+//!
 //! | Method | Path                                   | Body               | Response            |
 //! |--------|----------------------------------------|--------------------|---------------------|
 //! | GET    | /health                                |                    | "ok"                |
@@ -74,7 +78,26 @@
 //! | GET    | /api/context/changes?since&limit       |                    | context::ContextChanges (one page by generation: limit 1-500, default 100; `more`; 400 outside) |
 //! | GET    | /api/traces?kind&from&to&trace_id      |                    | JSONL of context::TraceRow, oldest first (400 bad_range) |
 //! | GET    | /api/traces/rollup?bucket&from&to      |                    | Vec<context::TraceRollup> (400 bad_range) |
-//! | GET    | /api/events  (WebSocket upgrade; `?traces=1` adds Event::Trace) | DeviceFrame frames | ServerFrame frames  |
+//! | GET    | /api/events  (WebSocket upgrade, devices only; `?traces=1` adds Event::Trace for admins) | DeviceFrame frames | ServerFrame frames  |
+//! | GET    | /api/people                            |                    | Vec<Person> (`settings` only on the caller's own) |
+//! | GET    | /api/people/{id}                       |                    | Person (404)        |
+//! | PATCH  | /api/people/{id}                       | PersonPatch        | Person (self: name, avatar, settings; admin: state, role; owner: the Admin role; 400 owner_fixed) |
+//! | PUT    | /api/people/{id}/groups                | Vec<String>        | Person (admin; 400 unknown_group, managed_by_source) |
+//! | GET    | /api/me/settings                       |                    | PersonSettings      |
+//! | PATCH  | /api/me/settings                       | PersonSettings     | PersonSettings      |
+//! | GET    | /api/invitations                       |                    | Vec<Invitation> (admin; newest first) |
+//! | POST   | /api/invitations                       | NewInvitation      | Invitation (admin; role admin: owner; 409 already_member, already_invited; 400 unknown_group) |
+//! | DELETE | /api/invitations/{id}                  |                    | 204 (admin; 404)    |
+//! | GET    | /api/groups                            |                    | Vec<Group> (sorted by path) |
+//! | POST   | /api/groups                            | NewGroup           | Group (admin; 400 bad_request, unknown_group: no parent; 409 exists) |
+//! | PATCH  | /api/groups/{*path}                    | GroupPatch         | Group (admin; 404; 400 managed_by_source) |
+//! | DELETE | /api/groups/{*path}                    |                    | 204 (admin; 400 has_children, has_members, managed_by_source; `company` refused) |
+//! | GET    | /api/agents                            |                    | Vec<Agent> (own; admin: everyone's) |
+//! | POST   | /api/agents                            | NewAgent           | Agent (400 outside_owner; 409 exists) |
+//! | PATCH  | /api/agents/{id}                       | AgentPatch         | Agent (owner; admin: `disabled` only; 400 outside_owner) |
+//! | DELETE | /api/agents/{id}                       |                    | 204 (owner)         |
+//! | POST   | /api/agents/{id}/token                 |                    | AgentToken (owner; replaces any token; shown once) |
+//! | DELETE | /api/agents/{id}/token                 |                    | 204 (owner)         |
 //! | GET    | /media/videos/{id}/{file}?exp&sig      |                    | video.mp4, poster.png, storyboard.png, captions.srt (range requests) |
 //! | GET    | /media/sources/{id}/{file}?exp&sig     |                    | original, page-{n}.png, frame-{ms}.jpg (range requests) |
 
@@ -169,6 +192,17 @@ pub const SPEECH_MODEL_DOWNLOAD: &str = "/api/embedding/speech/download";
 /// service that offers none (`EmbeddingModel.reranker` is `None`).
 pub const RERANKER_MODEL: &str = "/api/embedding/reranker";
 pub const RERANKER_MODEL_DOWNLOAD: &str = "/api/embedding/reranker/download";
+/// `GET` → `Vec<Person>`: everyone who may sign in (a directory: handles, names, roles,
+/// groups; never content).
+pub const PEOPLE: &str = "/api/people";
+/// The caller's own `PersonSettings`: `GET`, and `PATCH` with the whole value.
+pub const ME_SETTINGS: &str = "/api/me/settings";
+/// `GET` → `Vec<Invitation>`; `POST NewInvitation` → `Invitation`. Admins only.
+pub const INVITATIONS: &str = "/api/invitations";
+/// `GET` → `Vec<Group>`; `POST NewGroup` → `Group` (admins).
+pub const GROUPS: &str = "/api/groups";
+/// `GET` → `Vec<Agent>`; `POST NewAgent` → `Agent`.
+pub const AGENTS: &str = "/api/agents";
 
 const MB: u64 = 1024 * 1024;
 /// Largest audio or video source.
@@ -331,6 +365,32 @@ pub fn context_document_passages(id: &str) -> String {
     format!("/api/context/documents/{id}/passages")
 }
 
+/// `GET` one person; `PATCH PersonPatch`.
+pub fn person(id: &str) -> String {
+    format!("/api/people/{id}")
+}
+/// `PUT Vec<String>`: the person's direct memberships, replaced (admins).
+pub fn person_groups(id: &str) -> String {
+    format!("/api/people/{id}/groups")
+}
+/// `DELETE` revokes a pending invitation (admins).
+pub fn invitation(id: &str) -> String {
+    format!("/api/invitations/{id}")
+}
+/// `PATCH GroupPatch` renames; `DELETE` removes an empty group (admins). The path's
+/// slashes stay as they are ("/api/groups/company/engineering").
+pub fn group(path: &str) -> String {
+    format!("/api/groups/{path}")
+}
+/// `PATCH AgentPatch`; `DELETE`.
+pub fn agent(id: &str) -> String {
+    format!("/api/agents/{id}")
+}
+/// `POST` mints (or rotates) the agent's token → `AgentToken`; `DELETE` revokes it.
+pub fn agent_token(id: &str) -> String {
+    format!("/api/agents/{id}/token")
+}
+
 // Retrieval constants (`docs/agent-rag-architecture.md` §2.2, §2.3, §2.8). Defaults the
 // pipeline's stages start from; `PipelineConfig` params override them per variant.
 
@@ -420,6 +480,20 @@ mod tests {
     fn workspace_routes() {
         assert_eq!(workspace_sync("w1"), "/api/workspaces/w1/sync");
         assert_eq!(workspace_files("w1"), "/api/workspaces/w1/files");
+    }
+
+    #[test]
+    fn principal_routes() {
+        assert_eq!(person("p1"), "/api/people/p1");
+        assert_eq!(person_groups("p1"), "/api/people/p1/groups");
+        assert_eq!(invitation("i1"), "/api/invitations/i1");
+        assert_eq!(group("company/eng"), "/api/groups/company/eng");
+        assert_eq!(agent("a1"), "/api/agents/a1");
+        assert_eq!(agent_token("a1"), "/api/agents/a1/token");
+        assert!(ME_SETTINGS.starts_with(ME));
+        for path in [PEOPLE, INVITATIONS, GROUPS, AGENTS] {
+            assert!(path.starts_with("/api/"), "{path}");
+        }
     }
 
     #[test]

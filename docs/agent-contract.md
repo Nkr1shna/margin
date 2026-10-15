@@ -52,6 +52,27 @@ the model call sites of `ask.rs`, `tests/{chats,agent_e2e,api,media}.rs` and
 `examples/render_screens.rs`, `assets/`; **P-evals** `crates/evals/**` but the price
 types, and `evals/README.md`.
 
+**L1 (accounts and principals; `docs/l1-brief.md` §3).** Frozen after L1's first commit
+and changed only through the orchestrator: `crates/shared` (all of it), `server.rs` (a
+route an area needs that isn't there is reported), and the seams below. Merge order:
+L1-auth → L1-groups → L1-events → L1-mcp → L1-app.
+
+| Area | Owns (exclusively) |
+|---|---|
+| **L1-auth** | `crates/service/src/{auth,principal,people,invitations}.rs`, `tests/{auth,api}.rs`, `tests/common/mod.rs` |
+| **L1-groups** | `crates/service/src/{groups,agents,access,context_api,trace}.rs`, `tests/{groups,agents}.rs` |
+| **L1-events** | `crates/service/src/{events,state,chats,library,turns,ask,search,sources,uploads,folders,workspaces,agent_tools,ingest,settings,video,embedding}.rs`, `tests/{events,chats,courses,sources,folders,media,r1_e2e,agent_e2e,claude_e2e,providers,routes}.rs` |
+| **L1-mcp** | `crates/mcp/**` |
+| **L1-app** | `crates/app/**` |
+
+Seams: `principal::require_principal` calls `agents::principal_for_token(state, token) ->
+AppResult<Option<Arc<Principal>>>` (stub `Ok(None)`) and `groups::expansion(state,
+person_id) -> AppResult<Arc<Expansion>>` (stub: `[company, person/<id>]` with the stored
+role); L1-auth and L1-groups emit only through `App::{emit, emit_to, emit_row}` and add
+no field to `App` (`expansions`, `access_sources` are there); `Harness::sign_in_as(code,
+device)` and `BOB_CODE` (`bob-dev`) are in `tests/common/mod.rs`. Handlers of the new
+routes are `unimplemented!("L1, <area>")` until their area lands.
+
 `crates/shared` is the contract and is changed only through the orchestrator. It already
 contains everything below; `crates/video` and `crates/embed` are untouched.
 
@@ -161,6 +182,30 @@ R1 shared types: `Settings.pipeline: pipeline::PipelineConfig` and
 sockets); `context.rs`: `Project`, `Document` (with `generation`, `actor`, `access`),
 `Origin`, `Modality`, `Scope`, `ContextQuery` (with the caller's `access`), `Hit`,
 `DocumentOutline`, `ContextIngest`, `ContextChanges`, `TraceRow`, `TraceRollup`.
+
+L1 (`principal.rs`, re-exported at the crate root): `PrincipalId` (`person/<id>`,
+`agent/<id>` or a group path), `person_id`, `agent_id`, `is_group_path` (1–8 segments of
+`[a-z0-9-]{1,40}`, the first `company`), `ancestors`, `is_handle`, `handle_for_login`,
+`ROOT_GROUP`, `AGENT_TOKEN_PREFIX` (`mga_`), `MENTION_RECIPIENTS_MAX` (50, L3),
+`INVITATION_DAYS` (30); `OrgRole { Owner, Admin, Member }`, `PersonState { Invited,
+Active, Disabled }`, `Person { id, github_login, github_id, handle, name, avatar_url,
+org_role, state, groups, settings, created_at }`, `PersonSettings { default_provider,
+reasoning_effort }`, `PersonPatch`, `Group { path, name, source, members, created_at }`,
+`NewGroup`, `GroupPatch`, `AgentKind { Margin, External, Voice }`, `Agent { id, owner_id,
+name, kind, ceiling, disabled, token: Option<AgentTokenInfo>, created_at }`, `NewAgent`,
+`AgentPatch`, `AgentToken { token, agent }`, `Invitation`, `NewInvitation`; the API codes
+`access_code::{ADMIN_REQUIRED, DEVICE_REQUIRED, AGENT_NOT_ALLOWED, NOT_OWNER, OWNER_FIXED,
+OUTSIDE_OWNER, BAD_ACCESS, UNKNOWN_GROUP, HAS_CHILDREN, HAS_MEMBERS, ALREADY_MEMBER,
+ALREADY_INVITED, MANAGED_BY_SOURCE}`. `Topic`, `Lesson`, `Note`, `Chat`, `Source`,
+`Workspace`, `Proposal` gain `owner: Option<Id>`, `access: Vec<String>`, `deny:
+Vec<String>` (all `#[serde(default)]`; read empty, `access` means private to `owner`);
+`Document.owner`; `TraceRow.principal`; `Device.person_id`; `Me { github_login, device:
+Option<Device>, person: Option<Person>, agent: Option<Agent> }` (`device` is `Some` for a
+device token, so the wire is unchanged for today's apps); `Event::{PersonChanged,
+GroupChanged, GroupDeleted, MembershipChanged, AgentChanged, AgentDeleted,
+InvitationChanged, InvitationDeleted, AccessChanged}`; routes `PEOPLE`, `person`,
+`person_groups`, `ME_SETTINGS`, `INVITATIONS`, `invitation`, `GROUPS`, `group`, `AGENTS`,
+`agent`, `agent_token`. `margin_agent::TurnInput.actor` (`person/<id>` or `agent/<id>`).
 
 R2 shared types (`docs/r2-brief.md`, all additive): `WrittenWith { prompt_version,
 pipeline_hash, provider, model, at }` on `Lesson.written_with` and
@@ -587,6 +632,30 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
 → the stored picture, counted against the turn's picture budget. Each output ≤ 16 KB;
 `search_library` keeps its name and runs on the FULLTEXT index.
 
+### L1, what is and isn't enforced (`docs/l1-brief.md` D6)
+
+- **List routes** return the principal's slice: `GET /api/library` with `WHERE doc.access
+  CONTAINSANY $paths` on each table, `GET /api/chats`, `GET /api/workspaces`, `GET
+  /api/workspaces/{id}/files`, `GET /api/search`. `deny` is written and read back; it is
+  not evaluated until L2.
+- **Item routes** answer 404 outside the principal's access; writing (patch/delete) also
+  needs `owner == principal.person_id` (403 `not_owner`); admins are not exempt.
+- **Chat controls:** stop and continue by anyone in the chat's audience; confirm only by
+  the chat's owner.
+- **Settings:** `PATCH /api/settings` admin-only; `GET` for anyone.
+- **Traces:** `GET /api/traces`, `/api/traces/rollup` and `?traces=1` admin-only; every
+  trace row gets `principal`.
+- **Retrieval plumbing, not enforcement:** the agent's `search` and the context API pass
+  the principal's paths; a caller-supplied `access` that isn't a subset is 400
+  `bad_access`.
+
+**Accepted L1 gaps (closed by L2):** agent tools that read a library row by id
+(`get_topic`, `read_note`, `list_sources`, …) still take any id; `read_passage`/
+`document_outline`/`passages` by `document_id` likewise; passages all say `company` so a
+search by B finds A's private note's passages. A second *trusted* person (a tester) is
+fine on L1; a second *untrusted* one is not until L2 ships (plan §8.3 still stands for
+untrusted accounts).
+
 ## 6. Device tool transport
 
 - The events socket registers with `DeviceHub::register` on open (`DeviceChanged` with
@@ -740,3 +809,11 @@ API or Hugging Face.
 ## 9. Open points for the owner
 
 Listed in the build report; nothing above depends on them being answered differently.
+
+L1 (`docs/l1-brief.md` §8; the owner accepted every recommendation): the bootstrap owner
+is fixed (no ownership transfer in L1); no person switcher (Sign out → sign in); only the
+owner grants or removes the Admin role and invites admins; everyone may list people and
+groups (names and handles, never content); invitations expire after 30 days and can be
+re-sent; traces are admin-only, `?traces=1` included; members see the org AI settings
+read-only with the sentence; `margin-mcp login` (device token) stays beside `margin-mcp
+token` (agent token, the one to use).

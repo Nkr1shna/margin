@@ -1662,7 +1662,7 @@ pub async fn retrieve(state: &AppState, req: &Request) -> anyhow::Result<Vec<Pac
     let names = if pipeline.rewriter.name() == "none" {
         Vec::new()
     } else {
-        scope_names(&state.store, &resolved).await
+        scope_names(&state.store, &resolved, req.access.as_deref()).await
     };
     let rewrite = RewriteRequest {
         purpose: req.purpose,
@@ -1801,8 +1801,14 @@ pub fn reranked_count(fused: &[Hit], reranked: &[Hit]) -> Option<u32> {
 }
 
 /// Up to `REWRITE_SCOPE_NAMES` names of the documents in `resolved` (every document for
-/// the whole library), for the query rewriter's prompt: names, never passage text.
-pub async fn scope_names(store: &Store, resolved: &Resolved) -> Vec<String> {
+/// the whole library) that a reader with `access` may see (L1; `None` = no filter), for
+/// the query rewriter's prompt: names, never passage text, and never a document the
+/// caller can't read.
+pub async fn scope_names(
+    store: &Store,
+    resolved: &Resolved,
+    access: Option<&[String]>,
+) -> Vec<String> {
     let documents: Vec<Document> = match store.list(db::DOCUMENT).await {
         Ok(d) => d,
         Err(e) => {
@@ -1812,7 +1818,9 @@ pub async fn scope_names(store: &Store, resolved: &Resolved) -> Vec<String> {
     };
     let mut names: Vec<String> = Vec::new();
     for d in documents {
+        let visible = access.is_none_or(|paths| d.access.iter().any(|a| may_see(paths, a)));
         if (resolved.library || resolved.keys.contains(&d.id))
+            && visible
             && !d.name.trim().is_empty()
             && !names.contains(&d.name)
         {
@@ -2275,7 +2283,7 @@ pub async fn wait_until_read(
         }
         let changed = async {
             loop {
-                match events.recv().await {
+                match events.recv().await.map(|e| e.event) {
                     Ok(
                         Event::SourceChanged { .. }
                         | Event::SourceDeleted { .. }

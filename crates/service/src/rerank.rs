@@ -804,6 +804,7 @@ mod tests {
                 db::DOCUMENT,
                 "d2",
                 &Document {
+                    owner: None,
                     id: "d2".into(),
                     project_id: "p".into(),
                     origin: margin_shared::context::Origin::Source {

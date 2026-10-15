@@ -236,6 +236,19 @@ fn output_for(h: &Harness, call_id: &str) -> Value {
     serde_json::from_str(out["output"].as_str().unwrap()).unwrap()
 }
 
+/// The principal of the owner whose rows a test seeds directly (no owner: the bootstrap
+/// owner's, L1).
+/// The organisation owner (made by `people-v1` at start) acting for themself.
+async fn owner(h: &Harness) -> Arc<margin_service::principal::Principal> {
+    let id = match margin_service::people::owner_row(&h.state).await.unwrap() {
+        Some(row) => row.person.id,
+        None => margin_service::principal::BOOTSTRAP_PERSON_ID.to_string(),
+    };
+    margin_service::state::person_principal(&h.state, &id)
+        .await
+        .unwrap()
+}
+
 fn tool_ctx(chat_id: &str) -> ToolContext {
     ToolContext {
         chat_id: chat_id.into(),
@@ -870,7 +883,7 @@ async fn tool_cards_and_outputs_land_in_the_chat() {
 async fn replacing_the_owners_note_asks_and_appending_never_does() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let topic = new_topic(&h, &t, None, "Optics").await;
     let mine = owner_note(&h, &t, &topic.id, "Lenses", "My own words about lenses.").await;
     assert_eq!(
@@ -1057,12 +1070,15 @@ async fn rows_from_before_authorship_read_as_the_owners() {
     let note = json!({
         "id": "n-old", "topic_id": topic.id, "lesson_id": null, "title": "Old note",
         "body_md": "Written long ago.", "quote": null, "created_at": now, "updated_at": now,
+        // Stamped by `people-v1` like every row from before L1.
+        "owner": topic.owner, "access": topic.access,
     });
     h.state.store.put(db::NOTE, "n-old", &note).await.unwrap();
     let lesson = json!({
         "id": "l-old", "topic_id": topic.id, "title": "Old lesson", "summary": "",
         "position": 0, "level": "intro", "minutes": 5, "body_md": "Old body.",
         "status": {"state": "ready"}, "created_at": now, "updated_at": now, "citations": [],
+        "owner": topic.owner, "access": topic.access,
     });
     h.state
         .store
@@ -1155,7 +1171,7 @@ async fn rows_from_before_authorship_read_as_the_owners() {
 async fn deleting_a_topic_asks_first_and_any_device_approves() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let subject = new_topic(&h, &t, None, "Signals").await;
     let p = {
         let mut req = ask_request("Fourier", 2, false);
@@ -1245,7 +1261,7 @@ async fn deleting_a_topic_asks_first_and_any_device_approves() {
 async fn denied_and_stopped_deletes_leave_things_as_they_were() {
     let (h, t) = signed_in().await;
     let phone = h.sign_in("iPhone").await;
-    let phone_id = me(&h, &phone).await.device.id;
+    let phone_id = me(&h, &phone).await.device.unwrap().id;
     let p = h.propose(&t, &ask_request("Optics", 1, false)).await;
     let r = h
         .post(&t, &format!("/api/proposals/{}/accept", p.id))
@@ -1822,6 +1838,7 @@ async fn make_video_makes_a_ready_lessons_video() {
         "id": "l-q", "topic_id": topic.id, "title": "Waiting", "summary": "",
         "position": 5, "level": "intro", "minutes": 5, "body_md": "",
         "status": {"state": "queued"}, "created_at": now, "updated_at": now, "citations": [],
+        "owner": topic.owner, "access": topic.access,
     });
     h.state.store.put(db::LESSON, "l-q", &queued).await.unwrap();
     let registry = agent_tools::registry(&h.state);
@@ -2015,6 +2032,10 @@ mod lesson_retrieval {
             }],
         };
         let proposal = Proposal {
+            // The signed-in owner's, private to them (as `POST /api/proposals` stamps).
+            access: topic.access.clone(),
+            deny: Vec::new(),
+            owner: topic.owner.clone(),
             id: "prop".into(),
             request,
             status: ProposalStatus::Accepted {
@@ -2058,6 +2079,9 @@ mod lesson_retrieval {
         assert_eq!(plain.id, "prop");
         let lesson = StoredLesson {
             lesson: Lesson {
+                access: topic.access.clone(),
+                deny: Vec::new(),
+                owner: topic.owner.clone(),
                 citations: Vec::new(),
                 id: "l1".into(),
                 topic_id: topic.id.clone(),
@@ -2083,7 +2107,7 @@ mod lesson_retrieval {
         h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();
         *h.generator.lesson_body.lock().unwrap() = Some("Ringing.[^1]".into());
 
-        margin_service::ask::regenerate_lesson(&h.state, "l1")
+        margin_service::ask::regenerate_lesson(&h.state, &*owner(&h).await, "l1")
             .await
             .unwrap();
         let ctx =
@@ -2141,7 +2165,7 @@ mod lesson_retrieval {
     /// Regenerates l1 once its last job has let go of it.
     async fn regenerate(h: &Harness) {
         eventually(|| async {
-            margin_service::ask::regenerate_lesson(&h.state, "l1")
+            margin_service::ask::regenerate_lesson(&h.state, &*owner(h).await, "l1")
                 .await
                 .ok()
         })

@@ -1132,6 +1132,24 @@ async fn the_reranker_model_shows_downloads_and_can_be_deleted() {
     let dir = h.data_dir.join("models").join(RerankerModel::DEFAULT.dir());
     assert!(!dir.exists());
 
+    // The models are the organisation's (L1): a member may look, not download or remove.
+    h.invite(&t, "bob-dev", margin_shared::OrgRole::Member, &[])
+        .await;
+    let bob = h.sign_in_as(BOB_CODE, "Bob's laptop").await;
+    let r = h.get(&bob, routes::RERANKER_MODEL).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    for r in [
+        h.post(&bob, routes::RERANKER_MODEL_DOWNLOAD)
+            .send()
+            .await
+            .unwrap(),
+        h.delete(&bob, routes::RERANKER_MODEL).send().await.unwrap(),
+    ] {
+        assert_eq!(r.status(), 403);
+        let err: margin_shared::ApiError = r.json().await.unwrap();
+        assert_eq!(err.code, margin_shared::access_code::ADMIN_REQUIRED);
+    }
+
     // With only the multilingual model on disk, that is the one shown.
     let bytes = place_reranker(&h, RerankerModel::BgeRerankerBase);
     assert_eq!(

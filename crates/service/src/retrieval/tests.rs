@@ -156,6 +156,9 @@ async fn put_topic(s: &Store, id: &str, parent: Option<&str>) {
         db::TOPIC,
         id,
         &Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             parent_id: parent.map(str::to_string),
             title: id.into(),
@@ -173,6 +176,9 @@ async fn put_source(s: &Store, id: &str, topic: Option<&str>, workspace: Option<
         db::SOURCE,
         id,
         &Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: topic.map(str::to_string),
             name: format!("{id}.md"),
@@ -452,6 +458,7 @@ async fn scopes_resolve_to_keys_and_unknown_ids_are_bad() {
     .await
     .unwrap();
     let doc = Document {
+        owner: None,
         id: "doc-s1".into(),
         project_id: DEFAULT_PROJECT_ID.into(),
         origin: Origin::Source {
@@ -1031,16 +1038,17 @@ fn the_trace_counts_what_the_reranker_saw_and_dropped() {
 #[tokio::test]
 async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
     let s = Store::memory().await.unwrap();
-    for (id, name) in [
-        ("d1", "b-notes.pdf"),
-        ("d2", "a-paper.pdf"),
-        ("d3", "other.md"),
+    for (id, name, access) in [
+        ("d1", "b-notes.pdf", ACCESS_COMPANY),
+        ("d2", "a-paper.pdf", "company/eng"),
+        ("d3", "other.md", "person/p"),
     ] {
         let now = Utc::now();
         s.put(
             db::DOCUMENT,
             id,
             &Document {
+                owner: None,
                 id: id.into(),
                 project_id: DEFAULT_PROJECT_ID.into(),
                 origin: Origin::Agent { name: "t".into() },
@@ -1050,7 +1058,7 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
                 generation: 1,
                 bytes: 1,
                 actor: "owner".into(),
-                access: vec![ACCESS_COMPANY.into()],
+                access: vec![access.into()],
                 created_at: now,
                 updated_at: now,
             },
@@ -1063,12 +1071,23 @@ async fn the_rewriter_sees_the_names_of_the_documents_in_scope() {
         ..Default::default()
     };
     assert_eq!(
-        scope_names(&s, &resolved).await,
+        scope_names(&s, &resolved, None).await,
         ["a-paper.pdf", "b-notes.pdf"]
     );
     let library = Resolved {
         library: true,
         ..Default::default()
     };
-    assert_eq!(scope_names(&s, &library).await.len(), 3);
+    assert_eq!(scope_names(&s, &library, None).await.len(), 3);
+    // A reader's access (L1) keeps the names of documents they can't read out of the
+    // rewriter's prompt: "company" sees company/eng, not person/p.
+    let company = vec![ACCESS_COMPANY.to_string()];
+    assert_eq!(
+        scope_names(&s, &library, Some(&company)).await,
+        ["a-paper.pdf", "b-notes.pdf"]
+    );
+    let eng = vec!["company/eng".to_string()];
+    assert_eq!(scope_names(&s, &resolved, Some(&eng)).await, ["a-paper.pdf"]);
+    let nobody: Vec<String> = Vec::new();
+    assert!(scope_names(&s, &library, Some(&nobody)).await.is_empty());
 }

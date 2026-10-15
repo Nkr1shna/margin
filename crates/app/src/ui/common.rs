@@ -40,6 +40,11 @@ const ICONS: &[(&str, &str)] = &[
         "globe",
         r#"<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/>"#,
     ),
+    // Settings → Organisation: two people.
+    (
+        "users",
+        r#"<circle cx="9" cy="8.5" r="3.2"/><path d="M3 19c.9-3 3.2-4.6 6-4.6s5.1 1.6 6 4.6"/><path d="M15.2 5.6a3.1 3.1 0 0 1 0 5.8M17.2 14.6c1.8.6 3.1 2.1 3.8 4.4"/>"#,
+    ),
     (
         "more",
         r#"<circle cx="6" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="18" cy="12" r="1" fill="currentColor"/>"#,
@@ -703,6 +708,9 @@ mod tests {
 
     fn note(id: &str, quote: Option<&str>) -> Note {
         Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             topic_id: "t".into(),
             lesson_id: Some("l".into()),

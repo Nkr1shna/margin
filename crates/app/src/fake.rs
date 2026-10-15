@@ -20,7 +20,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use margin_shared::*;
 use tokio::sync::broadcast;
 
+/// Alice's device token (`d1`, "test-mac"): the organisation's owner.
 pub const TOKEN: &str = "test-device-token";
+/// Bob's device token (`d3`): a member.
+pub const TOKEN_BOB: &str = "test-device-token-bob";
+/// The owner's person id.
+pub const ALICE: &str = "p-alice";
+/// The member's person id.
+pub const BOB: &str = "p-bob";
 
 pub struct FakeState {
     pub device_name: String,
@@ -88,6 +95,18 @@ pub struct FakeState {
     pub chatgpt_polls: u32,
     /// Sign-ins started, for tests.
     pub chatgpt_starts: u32,
+    /// Everyone who may sign in: Alice (owner) and Bob (member) to start with.
+    pub people: Vec<Person>,
+    /// Groups; `members` is counted from `people` when listed.
+    pub groups: Vec<Group>,
+    pub agents: Vec<Agent>,
+    /// The last token minted for each agent (the fake keeps it; the service keeps a hash).
+    pub agent_tokens: HashMap<Id, String>,
+    pub invitations: Vec<Invitation>,
+    /// Device tokens: the device and the person each signs in as.
+    pub tokens: HashMap<String, (Id, Id)>,
+    /// Who the next approved sign-in is (`ALICE` or `BOB`).
+    pub login_as: Id,
 }
 
 /// An upload in parts the fake is receiving.
@@ -332,6 +351,9 @@ pub fn sample_citations() -> Vec<Citation> {
 
 pub fn sample_library() -> Library {
     let topic = |id: &str, parent: Option<&str>, title: &str, position| Topic {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         parent_id: parent.map(Into::into),
         title: title.into(),
@@ -340,6 +362,9 @@ pub fn sample_library() -> Library {
         updated_at: ts(0),
     };
     let lesson = |id: &str, topic_id: &str, title: &str, position, status, body: &str| Lesson {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         citations: Vec::new(),
         id: id.into(),
         topic_id: topic_id.into(),
@@ -408,7 +433,7 @@ pub fn sample_library() -> Library {
             ),
         ],
         notes: vec![
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n1".into(),
                 topic_id: "fourier".into(),
                 lesson_id: Some("l1".into()),
@@ -418,7 +443,7 @@ pub fn sample_library() -> Library {
                 created_at: ts(10),
                 updated_at: ts(10),
             },
-            Note {
+            Note { access: Vec::new(), deny: Vec::new(), owner: None,
                 id: "n2".into(),
                 topic_id: "fourier".into(),
                 lesson_id: None,
@@ -443,7 +468,7 @@ pub fn sample_library() -> Library {
             updated_at: ts(0),
         }],
         sources: vec![
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s1", "original")),
                 id: "s1".into(),
                 topic_id: Some("fourier".into()),
@@ -460,7 +485,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s2", "original")),
                 id: "s2".into(),
                 topic_id: Some("fourier".into()),
@@ -477,7 +502,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: None,
                 id: "s3".into(),
                 topic_id: Some("fourier".into()),
@@ -492,7 +517,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s7", "original")),
                 id: "s7".into(),
                 topic_id: Some("fourier".into()),
@@ -509,7 +534,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s4", "original")),
                 id: "s4".into(),
                 topic_id: Some("fourier".into()),
@@ -526,7 +551,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s5", "original")),
                 id: "s5".into(),
                 topic_id: Some("fourier".into()),
@@ -543,7 +568,7 @@ pub fn sample_library() -> Library {
                 workspace_id: None,
                 modified: None,
             },
-            Source {
+            Source { access: Vec::new(), deny: Vec::new(), owner: None,
                 media_url: Some(media_url("s6", "original")),
                 id: "s6".into(),
                 topic_id: Some("fourier".into()),
@@ -597,6 +622,7 @@ impl FakeState {
             settings: default_settings(),
             devices: vec![
                 Device {
+                    person_id: Some(ALICE.into()),
                     id: "d1".into(),
                     name: "test-mac".into(),
                     created_at: ts(0),
@@ -605,10 +631,20 @@ impl FakeState {
                     online: true,
                 },
                 Device {
+                    person_id: Some(ALICE.into()),
                     id: "d2".into(),
                     name: "iPhone".into(),
                     created_at: ts(5),
                     last_seen_at: None,
+                    current: false,
+                    online: false,
+                },
+                Device {
+                    person_id: Some(BOB.into()),
+                    id: "d3".into(),
+                    name: "Bob's laptop".into(),
+                    created_at: ts(12),
+                    last_seen_at: Some(ts(150)),
                     current: false,
                     online: false,
                 },
@@ -644,6 +680,17 @@ impl FakeState {
             chatgpt_finish: None,
             chatgpt_polls: 0,
             chatgpt_starts: 0,
+            people: sample_people(),
+            groups: sample_groups(),
+            agents: sample_agents(),
+            agent_tokens: HashMap::new(),
+            invitations: sample_invitations(Utc::now()),
+            tokens: [
+                (TOKEN.to_string(), ("d1".to_string(), ALICE.to_string())),
+                (TOKEN_BOB.to_string(), ("d3".to_string(), BOB.to_string())),
+            ]
+            .into(),
+            login_as: ALICE.into(),
         };
         for (chat, items) in sample_chats() {
             for item in &items {
@@ -878,8 +925,45 @@ pub fn router(fake: Fake) -> Router {
         .route("/api/workspaces/{id}/sync", post(sync_workspace))
         .route("/api/workspaces/{id}/files", get(workspace_files))
         .route("/api/events", get(events))
+        // Accounts and principals (L1).
+        .route(routes::PEOPLE, get(list_people))
+        .route("/api/people/{id}", get(get_person).patch(patch_person))
+        .route(
+            "/api/people/{id}/groups",
+            axum::routing::put(put_person_groups),
+        )
+        .route(
+            routes::ME_SETTINGS,
+            get(get_my_settings).patch(patch_my_settings),
+        )
+        .route(
+            routes::INVITATIONS,
+            get(list_invitations).post(create_invitation),
+        )
+        .route(
+            "/api/invitations/{id}",
+            axum::routing::delete(delete_invitation),
+        )
+        .route(routes::GROUPS, get(list_groups).post(create_group))
+        .route(
+            "/api/groups/{*path}",
+            axum::routing::patch(patch_group).delete(delete_group),
+        )
+        .route(routes::AGENTS, get(list_agents).post(create_agent))
+        .route(
+            "/api/agents/{id}",
+            axum::routing::patch(patch_agent).delete(delete_agent),
+        )
+        .route(
+            "/api/agents/{id}/token",
+            post(mint_agent_token).delete(revoke_agent_token),
+        )
         .route("/media/videos/{id}/{file}", get(media))
         .route("/media/sources/{id}/{file}", get(source_media))
+        .layer(axum::middleware::from_fn_with_state(
+            fake.clone(),
+            refuse_disabled,
+        ))
         .with_state(fake)
 }
 
@@ -896,10 +980,7 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
 
 #[allow(clippy::result_large_err)]
 fn authorized(headers: &HeaderMap) -> Result<(), Response> {
-    let ok = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {TOKEN}"));
+    let ok = bearer(headers).is_some_and(|t| t == TOKEN || t == TOKEN_BOB);
     if ok {
         Ok(())
     } else {
@@ -951,9 +1032,20 @@ async fn auth_poll(State(fake): State<Fake>, Json(req): Json<PollLoginRequest>) 
     let auto = s.auto_approve_after.is_some_and(|n| s.polls > n);
     if s.approve || auto {
         s.token_collected = true;
+        let login_as = s.login_as.clone();
+        let token = s
+            .tokens
+            .iter()
+            .find(|(_, (_, person))| *person == login_as)
+            .map(|(t, _)| t.clone())
+            .unwrap_or_else(|| TOKEN.into());
+        let github_login = s
+            .person(&login_as)
+            .map(|p| p.github_login.clone())
+            .unwrap_or_default();
         return Json(LoginState::Approved {
-            token: TOKEN.into(),
-            github_login: "Nkr1shna".into(),
+            token,
+            github_login,
         })
         .into_response();
     }
@@ -961,19 +1053,12 @@ async fn auth_poll(State(fake): State<Fake>, Json(req): Json<PollLoginRequest>) 
 }
 
 async fn me(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
     let s = fake.state.lock().unwrap();
-    let device = s.devices.iter().find(|d| d.current).cloned();
-    match device {
-        Some(device) => Json(Me {
-            github_login: "Nkr1shna".into(),
-            device,
-        })
-        .into_response(),
-        None => api_error(StatusCode::UNAUTHORIZED, "unauthorized", "Sign in again."),
-    }
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(s.me_for(&caller)).into_response()
 }
 
 fn with_media(s: &FakeState, mut video: Video) -> Video {
@@ -1028,6 +1113,9 @@ async fn create_topic(
             .filter(|t| t.parent_id == req.parent_id)
             .count() as i64;
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id,
             parent_id: req.parent_id,
             title: req.title,
@@ -1384,6 +1472,9 @@ async fn create_note(
     let note = {
         let mut s = fake.state.lock().unwrap();
         let note = Note {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("note"),
             topic_id: req.topic_id,
             lesson_id: req.lesson_id,
@@ -1566,6 +1657,9 @@ impl FakeState {
                     Some(id) => id,
                     None => {
                         let subject = Topic {
+                            access: Vec::new(),
+                            deny: Vec::new(),
+                            owner: None,
                             id: self.id("topic"),
                             parent_id: None,
                             title: req.outline.subject_title.clone(),
@@ -1582,6 +1676,9 @@ impl FakeState {
             }
         };
         let topic = Topic {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: self.id("topic"),
             parent_id: Some(parent),
             title: req.outline.topic_title.clone(),
@@ -1596,6 +1693,9 @@ impl FakeState {
         let mut lessons = Vec::new();
         for (i, l) in req.outline.lessons.iter().enumerate() {
             let lesson = Lesson {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 citations: Vec::new(),
                 id: self.id("lesson"),
                 topic_id: topic.id.clone(),
@@ -1840,7 +1940,7 @@ async fn patch_settings(
     headers: HeaderMap,
     Json(req): Json<SettingsPatch>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     // Checked as the service checks them, before anything changes.
@@ -2135,8 +2235,9 @@ async fn pipeline_variants(State(fake): State<Fake>, headers: HeaderMap) -> Resp
 }
 
 /// `GET /api/traces`: the fake records no traces, so none (JSON lines, oldest first).
-async fn traces(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn traces(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    // Admins only (L1).
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     (
@@ -2147,8 +2248,8 @@ async fn traces(headers: HeaderMap) -> Response {
 }
 
 /// `GET /api/traces/rollup`: no traces, so no buckets.
-async fn traces_rollup(headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+async fn traces_rollup(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     Json(Vec::<margin_shared::context::TraceRollup>::new()).into_response()
@@ -2244,7 +2345,7 @@ pub fn fake_account(email: &str) -> ChatGptAccount {
 /// `GET /api/providers/chatgpt`. A waiting sign-in ends here, as `chatgpt_finish` says
 /// (or, in manual runs, signed in on the third poll).
 async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (status, changed) = {
@@ -2289,7 +2390,7 @@ async fn chatgpt_status(State(fake): State<Fake>, headers: HeaderMap) -> Respons
 
 /// `POST /api/providers/chatgpt/start`: a sign-in waits for the owner's browser.
 async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let mut s = fake.state.lock().unwrap();
@@ -2313,7 +2414,7 @@ async fn chatgpt_start(State(fake): State<Fake>, headers: HeaderMap) -> Response
 
 /// `DELETE /api/providers/chatgpt`: signs out (or gives up a waiting sign-in).
 async fn chatgpt_sign_out(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let settings = {
@@ -2356,27 +2457,50 @@ async fn tools(headers: HeaderMap) -> Response {
     .into_response()
 }
 
+/// `GET /api/devices`: the caller's own; an admin's call lists everyone's.
 async fn devices(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
-    Json(fake.state.lock().unwrap().devices.clone()).into_response()
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let list: Vec<Device> = s
+        .devices
+        .iter()
+        .filter(|d| {
+            caller.person.org_role.is_admin() || d.person_id.as_deref() == Some(&caller.person.id)
+        })
+        .map(|d| Device {
+            current: d.id == caller.device_id,
+            ..d.clone()
+        })
+        .collect();
+    Json(list).into_response()
 }
 
+/// `DELETE /api/devices/{id}`: the caller's own device, or anyone's for an admin (404
+/// otherwise, so the id isn't confirmed).
 async fn revoke_device(
     State(fake): State<Fake>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorized(&headers) {
-        return r;
-    }
     let mut s = fake.state.lock().unwrap();
-    let before = s.devices.len();
-    s.devices.retain(|d| d.id != id);
-    if s.devices.len() == before {
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let allowed = s.devices.iter().any(|d| {
+        d.id == id
+            && (caller.person.org_role.is_admin()
+                || d.person_id.as_deref() == Some(&caller.person.id))
+    });
+    if !allowed {
         return not_found();
     }
+    s.devices.retain(|d| d.id != id);
+    drop(s);
+    publish(&fake, Event::DeviceDeleted { id });
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2523,6 +2647,9 @@ fn add_folder_source(
             .map(|w| w.name.clone());
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: None,
@@ -2573,6 +2700,9 @@ fn add_source(fake: &Fake, query: UploadQuery, kind: SourceKind, body: Vec<u8>) 
         let mut s = fake.state.lock().unwrap();
         let id = s.id("source");
         let source = Source {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             media_url: Some(format!("{}{}", s.public_url, media_url(&id, "original"))),
             id,
             topic_id: query.topic_id,
@@ -2955,7 +3085,7 @@ fn set_embedding(fake: &Fake, state: EmbeddingModelState) -> EmbeddingModel {
 }
 
 async fn download_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -3021,7 +3151,7 @@ async fn simulate_download(fake: Fake) {
 }
 
 async fn delete_embedding(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let model = set_embedding(
@@ -3059,7 +3189,7 @@ fn no_speech_model() -> Response {
 }
 
 async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     let (current, simulate) = {
@@ -3111,7 +3241,7 @@ async fn download_speech(State(fake): State<Fake>, headers: HeaderMap) -> Respon
 }
 
 async fn delete_speech(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorized(&headers) {
+    if let Err(r) = admin(&fake.state.lock().unwrap(), &headers) {
         return r;
     }
     match set_speech(
@@ -3459,6 +3589,9 @@ fn ranged(headers: &HeaderMap, mime: &'static str, bytes: Vec<u8>) -> Response {
 /// screenshots. Media URLs are relative until `rebase_chat_media`.
 pub fn sample_chats() -> Vec<(Chat, Vec<ChatItem>)> {
     let chat = |id: &str, title: &str, state, at| Chat {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         title: title.into(),
         title_by: Default::default(),
@@ -3968,6 +4101,9 @@ pub fn sample_proposal(chat_id: &str, created: Option<&str>) -> Proposal {
         lesson.summary = summary.into();
     }
     Proposal {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: "p-sample".into(),
         request,
         status: match created {
@@ -4635,6 +4771,9 @@ async fn propose_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt: &str
     let Some(proposal) =
         step(fake, chat_id, turn_id, |s| {
             let proposal = Proposal {
+                access: Vec::new(),
+                deny: Vec::new(),
+                owner: None,
                 id: s.id("proposal"),
                 request: request.clone(),
                 status: ProposalStatus::Ready,
@@ -4898,6 +5037,9 @@ async fn write_lesson_in_turn(fake: &Fake, chat_id: &str, turn_id: &str, prompt:
             .max()
             .unwrap_or(0);
         let lesson = Lesson {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             citations: Vec::new(),
             id: s.id("lesson"),
             topic_id: topic.id.clone(),
@@ -5584,6 +5726,9 @@ async fn create_chat(
         }
         let now = Utc::now();
         let chat = Chat {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("chat"),
             title: String::new(),
             title_by: Default::default(),
@@ -6149,6 +6294,9 @@ async fn create_workspace(
         let mut s = fake.state.lock().unwrap();
         let (device_id, device_name) = s.current_device();
         let workspace = Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: s.id("workspace"),
             name: req.name,
             device_id,
@@ -6213,6 +6361,9 @@ async fn delete_workspace(
 pub fn sample_workspaces() -> Vec<Workspace> {
     let ws =
         |id: &str, name: &str, device: (&str, &str), platform, location: &str, sync| Workspace {
+            access: Vec::new(),
+            deny: Vec::new(),
+            owner: None,
             id: id.into(),
             name: name.into(),
             device_id: device.0.into(),
@@ -6293,6 +6444,9 @@ pub fn sample_workspaces() -> Vec<Workspace> {
 /// The files of sample folder `w1` (“notes”), in every state.
 pub fn sample_folder_files() -> Vec<Source> {
     let file = |id: &str, name: &str, kind, bytes, status| Source {
+        access: Vec::new(),
+        deny: Vec::new(),
+        owner: None,
         id: id.into(),
         topic_id: None,
         name: name.into(),
@@ -6510,6 +6664,1071 @@ async fn workspace_files(
         .collect();
     files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.name.cmp(&b.name)));
     Json(files).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Accounts and principals (L1): people, invitations, groups, agents. The same rules as
+// the service (`docs/l1-brief.md` D3–D7); events carry no audience here (the fake is one
+// person per run), so the per-principal filter is the service's test.
+// ---------------------------------------------------------------------------
+
+/// Alice, the owner, and Bob, a member; both in engineering.
+pub fn sample_people() -> Vec<Person> {
+    vec![
+        Person {
+            id: ALICE.into(),
+            github_login: "alice".into(),
+            github_id: Some(1001),
+            handle: "alice".into(),
+            name: "Alice Martin".into(),
+            avatar_url: None,
+            org_role: OrgRole::Owner,
+            state: PersonState::Active,
+            groups: vec!["company/engineering".into()],
+            settings: PersonSettings::default(),
+            created_at: ts(0),
+        },
+        Person {
+            id: BOB.into(),
+            github_login: "bob".into(),
+            github_id: Some(1002),
+            handle: "bob".into(),
+            name: "Bob Chen".into(),
+            avatar_url: None,
+            org_role: OrgRole::Member,
+            state: PersonState::Active,
+            groups: vec!["company/engineering".into()],
+            settings: PersonSettings::default(),
+            created_at: ts(10),
+        },
+    ]
+}
+
+pub fn sample_groups() -> Vec<Group> {
+    vec![
+        Group {
+            path: ROOT_GROUP.into(),
+            name: "Company".into(),
+            source: SOURCE_MANUAL.into(),
+            members: 0,
+            created_at: ts(0),
+        },
+        Group {
+            path: "company/engineering".into(),
+            name: "Engineering".into(),
+            source: SOURCE_MANUAL.into(),
+            members: 2,
+            created_at: ts(1),
+        },
+    ]
+}
+
+/// Alice's Claude Code agent (with a token) and Bob's triage bot (without one).
+pub fn sample_agents() -> Vec<Agent> {
+    vec![
+        Agent {
+            id: "a-claude".into(),
+            owner_id: ALICE.into(),
+            name: "claude-code".into(),
+            kind: AgentKind::External,
+            ceiling: vec![ROOT_GROUP.into(), "company/engineering".into()],
+            disabled: false,
+            token: Some(AgentTokenInfo {
+                prefix: "mga_7f3a".into(),
+                created_at: ts(20),
+                last_used_at: Some(ts(200)),
+                expires_at: None,
+            }),
+            created_at: ts(20),
+        },
+        Agent {
+            id: "a-triage".into(),
+            owner_id: BOB.into(),
+            name: "triage-bot".into(),
+            kind: AgentKind::External,
+            ceiling: vec![ROOT_GROUP.into()],
+            disabled: false,
+            token: None,
+            created_at: ts(30),
+        },
+    ]
+}
+
+/// Bob's accepted invitation, and one for carol-dev still open at `now`.
+pub fn sample_invitations(now: DateTime<Utc>) -> Vec<Invitation> {
+    let days = |n: i64| chrono::Duration::days(n);
+    vec![
+        Invitation {
+            id: "inv-bob".into(),
+            github_login: "bob".into(),
+            role: OrgRole::Member,
+            groups: vec!["company/engineering".into()],
+            invited_by: ALICE.into(),
+            created_at: ts(5),
+            expires_at: ts(5) + days(INVITATION_DAYS),
+            accepted_at: Some(ts(10)),
+            accepted_by: Some(BOB.into()),
+        },
+        Invitation {
+            id: "inv-carol".into(),
+            github_login: "carol-dev".into(),
+            role: OrgRole::Member,
+            groups: vec!["company/engineering".into()],
+            invited_by: ALICE.into(),
+            created_at: now - days(1),
+            expires_at: now - days(1) + days(INVITATION_DAYS),
+            accepted_at: None,
+            accepted_by: None,
+        },
+    ]
+}
+
+/// What `GET /api/me` answers for `token` in a fresh fake (render tests and the
+/// screenshots use it).
+pub fn sample_me(token: &str) -> Me {
+    let s = FakeState::new();
+    let (device_id, person_id) = s.tokens[token].clone();
+    let person = s.person(&person_id).unwrap().clone();
+    s.me_for(&Caller { person, device_id })
+}
+
+/// The device and person a request comes from.
+pub struct Caller {
+    pub person: Person,
+    pub device_id: Id,
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+fn unauthorized() -> Response {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "Sign in again: this device isn't signed in.",
+    )
+}
+
+/// The 401 a disabled person's devices get, with the sentence the sign-in screen shows.
+fn disabled(person: &Person) -> Response {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        access_code::PERSON_DISABLED,
+        &format!(
+            "The GitHub account @{} is disabled on this Margin. Ask an admin.",
+            person.github_login
+        ),
+    )
+}
+
+fn admin_required() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::ADMIN_REQUIRED,
+        "Only an organisation admin can do this.",
+    )
+}
+
+fn owner_required() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::ADMIN_REQUIRED,
+        "Only the organisation owner can make someone an admin or remove an admin.",
+    )
+}
+
+fn bad_request(code: &str, message: &str) -> Response {
+    api_error(StatusCode::BAD_REQUEST, code, message)
+}
+
+fn conflict(code: &str, message: &str) -> Response {
+    api_error(StatusCode::CONFLICT, code, message)
+}
+
+#[allow(clippy::result_large_err)]
+fn caller(s: &FakeState, headers: &HeaderMap) -> Result<Caller, Response> {
+    let token = bearer(headers).ok_or_else(unauthorized)?;
+    let (device_id, person_id) = s.tokens.get(token).cloned().ok_or_else(unauthorized)?;
+    let person = s.person(&person_id).cloned().ok_or_else(unauthorized)?;
+    if person.state == PersonState::Disabled {
+        return Err(disabled(&person));
+    }
+    if !s.devices.iter().any(|d| d.id == device_id) {
+        return Err(unauthorized());
+    }
+    Ok(Caller { person, device_id })
+}
+
+/// The caller, when they are an admin (or the owner).
+#[allow(clippy::result_large_err)]
+fn admin(s: &FakeState, headers: &HeaderMap) -> Result<Caller, Response> {
+    let caller = caller(s, headers)?;
+    if !caller.person.org_role.is_admin() {
+        return Err(admin_required());
+    }
+    Ok(caller)
+}
+
+/// A disabled person's token is refused on every route, with the service's sentence.
+async fn refuse_disabled(
+    State(fake): State<Fake>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let refused = {
+        let s = fake.state.lock().unwrap();
+        bearer(request.headers())
+            .and_then(|t| s.tokens.get(t))
+            .and_then(|(_, person)| s.person(person))
+            .filter(|p| p.state == PersonState::Disabled)
+            .map(disabled)
+    };
+    match refused {
+        Some(response) => response,
+        None => next.run(request).await,
+    }
+}
+
+/// A person as others see them: their own settings are theirs alone.
+fn public(person: &Person) -> Person {
+    Person {
+        settings: PersonSettings::default(),
+        ..person.clone()
+    }
+}
+
+impl FakeState {
+    pub fn person(&self, id: &str) -> Option<&Person> {
+        self.people.iter().find(|p| p.id == id)
+    }
+
+    fn person_mut(&mut self, id: &str) -> Option<&mut Person> {
+        self.people.iter_mut().find(|p| p.id == id)
+    }
+
+    fn me_for(&self, caller: &Caller) -> Me {
+        let device = self
+            .devices
+            .iter()
+            .find(|d| d.id == caller.device_id)
+            .map(|d| Device {
+                current: true,
+                ..d.clone()
+            });
+        Me {
+            github_login: caller.person.github_login.clone(),
+            device,
+            person: Some(caller.person.clone()),
+            agent: None,
+        }
+    }
+
+    /// The groups with their direct member counts.
+    fn groups_counted(&self) -> Vec<Group> {
+        let mut list: Vec<Group> = self
+            .groups
+            .iter()
+            .map(|g| Group {
+                members: self
+                    .people
+                    .iter()
+                    .filter(|p| p.groups.contains(&g.path))
+                    .count() as u32,
+                ..g.clone()
+            })
+            .collect();
+        list.sort_by(|a, b| a.path.cmp(&b.path));
+        list
+    }
+
+    fn group_counted(&self, path: &str) -> Option<Group> {
+        self.groups_counted().into_iter().find(|g| g.path == path)
+    }
+
+    /// The first of `paths` that isn't a group, if any.
+    fn unknown_group(&self, paths: &[String]) -> Option<String> {
+        paths
+            .iter()
+            .find(|p| !self.groups.iter().any(|g| g.path == **p))
+            .cloned()
+    }
+
+    /// An invitation for `login` accepted at sign-in, as the service's admission does: a
+    /// person with its role and groups, the invitation marked accepted, and a token for
+    /// a new device. Returns the person and the token.
+    pub fn accept_invitation(
+        &mut self,
+        login: &str,
+        device_name: &str,
+    ) -> Option<(Person, String)> {
+        let now = Utc::now();
+        let key = login.to_ascii_lowercase();
+        let i = self.invitations.iter().position(|i| {
+            i.github_login.to_ascii_lowercase() == key && crate::org::is_pending(i, now)
+        })?;
+        let id = self.id("p");
+        let mut handle = handle_for_login(login);
+        let mut n = 1;
+        while self.people.iter().any(|p| p.handle == handle) {
+            n += 1;
+            handle = format!("{}-{n}", handle_for_login(login));
+        }
+        let invitation = self.invitations[i].clone();
+        let person = Person {
+            id: id.clone(),
+            github_login: login.into(),
+            github_id: None,
+            handle,
+            name: login.into(),
+            avatar_url: None,
+            org_role: invitation.role,
+            state: PersonState::Active,
+            groups: invitation.groups.clone(),
+            settings: PersonSettings::default(),
+            created_at: now,
+        };
+        self.people.push(person.clone());
+        self.invitations[i].accepted_at = Some(now);
+        self.invitations[i].accepted_by = Some(id.clone());
+        let device = self.id("d");
+        self.devices.push(Device {
+            id: device.clone(),
+            name: device_name.into(),
+            created_at: now,
+            last_seen_at: Some(now),
+            current: false,
+            online: false,
+            person_id: Some(id.clone()),
+        });
+        let token = format!("test-device-token-{id}");
+        self.tokens.insert(token.clone(), (device, id));
+        Some((person, token))
+    }
+}
+
+async fn list_people(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let list: Vec<Person> = s
+        .people
+        .iter()
+        .map(|p| {
+            if p.id == caller.person.id {
+                p.clone()
+            } else {
+                public(p)
+            }
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+async fn get_person(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match s.person(&id) {
+        Some(p) if p.id == caller.person.id => Json(p.clone()).into_response(),
+        Some(p) => Json(public(p)).into_response(),
+        None => not_found(),
+    }
+}
+
+/// `PATCH /api/people/{id}`: self for name and settings; admins for state and role;
+/// the owner alone for making or removing an admin; the owner's role and state are fixed.
+async fn patch_person(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<PersonPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(target) = s.person(&id).cloned() else {
+        return not_found();
+    };
+    let me = target.id == caller.person.id;
+    let personal = patch.name.is_some() || patch.avatar_url.is_some() || patch.settings.is_some();
+    if personal && !me {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            access_code::NOT_OWNER,
+            "Only they can change their own name and settings.",
+        );
+    }
+    let admin_fields = patch.org_role.is_some() || patch.state.is_some();
+    if admin_fields && !caller.person.org_role.is_admin() {
+        return admin_required();
+    }
+    if admin_fields && target.org_role == OrgRole::Owner {
+        return bad_request(
+            access_code::OWNER_FIXED,
+            "The organisation owner's role and state can't change.",
+        );
+    }
+    if let Some(role) = patch.org_role {
+        if role == OrgRole::Owner {
+            return bad_request(
+                "bad_request",
+                "There is one owner; another person can't be made owner.",
+            );
+        }
+        let admin_change = role == OrgRole::Admin || target.org_role == OrgRole::Admin;
+        if role != target.org_role && admin_change && caller.person.org_role != OrgRole::Owner {
+            return owner_required();
+        }
+    }
+    if patch.state == Some(PersonState::Invited) {
+        return bad_request("bad_request", "A person is active or disabled.");
+    }
+    if let Some(name) = &patch.name
+        && (name.trim().is_empty() || name.chars().count() > 80)
+    {
+        return bad_request("bad_request", "A name is 1 to 80 characters.");
+    }
+    let mut revoked = Vec::new();
+    let person = {
+        let p = s.person_mut(&id).unwrap();
+        if let Some(name) = patch.name {
+            p.name = name.trim().to_string();
+        }
+        if let Some(avatar) = patch.avatar_url {
+            p.avatar_url = avatar;
+        }
+        if let Some(settings) = patch.settings {
+            p.settings = settings;
+        }
+        if let Some(role) = patch.org_role {
+            p.org_role = role;
+        }
+        if let Some(state) = patch.state {
+            p.state = state;
+        }
+        p.clone()
+    };
+    if person.state == PersonState::Disabled && target.state != PersonState::Disabled {
+        // Every device of a disabled person is revoked (their tokens stop working).
+        s.devices.retain(|d| {
+            let theirs = d.person_id.as_deref() == Some(&person.id);
+            if theirs {
+                revoked.push(d.id.clone());
+            }
+            !theirs
+        });
+    }
+    drop(s);
+    for id in revoked {
+        publish(&fake, Event::DeviceDeleted { id });
+    }
+    publish(
+        &fake,
+        Event::PersonChanged {
+            person: public(&person),
+        },
+    );
+    if admin_fields {
+        publish(
+            &fake,
+            Event::AccessChanged {
+                person_id: person.id.clone(),
+            },
+        );
+    }
+    Json(if me { person } else { public(&person) }).into_response()
+}
+
+/// `PUT /api/people/{id}/groups` (admins): the person's direct memberships, replaced.
+async fn put_person_groups(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(groups): Json<Vec<String>>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if s.person(&id).is_none() {
+        return not_found();
+    }
+    if let Some(path) = s.unknown_group(&groups) {
+        return bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {path}. Add it under Groups first."),
+        );
+    }
+    let mut groups = groups;
+    groups.sort();
+    groups.dedup();
+    let person = {
+        let p = s.person_mut(&id).unwrap();
+        p.groups = groups.clone();
+        p.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::MembershipChanged {
+            person_id: id.clone(),
+            groups,
+        },
+    );
+    publish(&fake, Event::AccessChanged { person_id: id });
+    Json(if person.id == caller.person.id {
+        person
+    } else {
+        public(&person)
+    })
+    .into_response()
+}
+
+async fn get_my_settings(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    match caller(&s, &headers) {
+        Ok(c) => Json(c.person.settings).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn patch_my_settings(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(settings): Json<PersonSettings>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let person = {
+        let p = s.person_mut(&caller.person.id).unwrap();
+        p.settings = settings.clone();
+        p.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::PersonChanged {
+            person: public(&person),
+        },
+    );
+    Json(settings).into_response()
+}
+
+async fn list_invitations(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let mut list = s.invitations.clone();
+    list.sort_by_key(|i| std::cmp::Reverse(i.created_at));
+    Json(list).into_response()
+}
+
+async fn create_invitation(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewInvitation>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match admin(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let login = new.github_login.trim().trim_start_matches('@').to_string();
+    if !crate::org::is_github_login(&login) {
+        return bad_request("bad_request", "That isn't a GitHub login.");
+    }
+    match new.role {
+        OrgRole::Owner => {
+            return bad_request("bad_request", "Invite someone as a member or an admin.");
+        }
+        OrgRole::Admin if caller.person.org_role != OrgRole::Owner => return owner_required(),
+        _ => {}
+    }
+    let key = login.to_ascii_lowercase();
+    if let Some(p) = s
+        .people
+        .iter()
+        .find(|p| p.github_login.to_ascii_lowercase() == key)
+    {
+        return conflict(
+            access_code::ALREADY_MEMBER,
+            &format!(
+                "@{} is already a member{}.",
+                p.handle,
+                if p.state == PersonState::Disabled {
+                    " (disabled: enable them instead)"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    let now = Utc::now();
+    if s.invitations
+        .iter()
+        .any(|i| i.github_login.to_ascii_lowercase() == key && crate::org::is_pending(i, now))
+    {
+        return conflict(
+            access_code::ALREADY_INVITED,
+            &format!("@{login} is already invited."),
+        );
+    }
+    if let Some(path) = s.unknown_group(&new.groups) {
+        return bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {path}."),
+        );
+    }
+    let invitation = Invitation {
+        id: s.id("inv"),
+        github_login: login,
+        role: new.role,
+        groups: new.groups,
+        invited_by: caller.person.id,
+        created_at: now,
+        expires_at: now + chrono::Duration::days(INVITATION_DAYS),
+        accepted_at: None,
+        accepted_by: None,
+    };
+    s.invitations.push(invitation.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::InvitationChanged {
+            invitation: invitation.clone(),
+        },
+    );
+    Json(invitation).into_response()
+}
+
+async fn delete_invitation(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let now = Utc::now();
+    let Some(i) = s
+        .invitations
+        .iter()
+        .position(|i| i.id == id && crate::org::is_pending(i, now))
+    else {
+        return not_found();
+    };
+    s.invitations.remove(i);
+    drop(s);
+    publish(&fake, Event::InvitationDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_groups(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    if let Err(r) = caller(&s, &headers) {
+        return r;
+    }
+    Json(s.groups_counted()).into_response()
+}
+
+async fn create_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewGroup>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    if !is_group_path(&new.path) {
+        return bad_request(
+            "bad_request",
+            "A group's path is company/… in lowercase letters, digits and dashes.",
+        );
+    }
+    if s.groups.iter().any(|g| g.path == new.path) {
+        return conflict("exists", &format!("{} already exists.", new.path));
+    }
+    let parent = new.path.rsplit_once('/').map(|(p, _)| p.to_string());
+    if let Some(parent) = parent
+        && !s.groups.iter().any(|g| g.path == parent)
+    {
+        return bad_request(
+            access_code::UNKNOWN_GROUP,
+            &format!("There's no group {parent} to put it under."),
+        );
+    }
+    let name = new.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return bad_request("bad_request", "A group's name is 1 to 80 characters.");
+    }
+    let group = Group {
+        path: new.path,
+        name: name.into(),
+        source: SOURCE_MANUAL.into(),
+        members: 0,
+        created_at: Utc::now(),
+    };
+    s.groups.push(group.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::GroupChanged {
+            group: group.clone(),
+        },
+    );
+    Json(group).into_response()
+}
+
+async fn patch_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    Json(patch): Json<GroupPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let Some(i) = s.groups.iter().position(|g| g.path == path) else {
+        return not_found();
+    };
+    if s.groups[i].source != SOURCE_MANUAL {
+        return bad_request(
+            access_code::MANAGED_BY_SOURCE,
+            &format!("{path} comes from {}; change it there.", s.groups[i].source),
+        );
+    }
+    if let Some(name) = patch.name {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            return bad_request("bad_request", "A group's name is 1 to 80 characters.");
+        }
+        s.groups[i].name = name.into();
+    }
+    let group = s.group_counted(&path).unwrap();
+    drop(s);
+    publish(
+        &fake,
+        Event::GroupChanged {
+            group: group.clone(),
+        },
+    );
+    Json(group).into_response()
+}
+
+async fn delete_group(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    if let Err(r) = admin(&s, &headers) {
+        return r;
+    }
+    let Some(group) = s.group_counted(&path) else {
+        return not_found();
+    };
+    let groups = s.groups_counted();
+    if let Some(reason) = crate::org::delete_blocker(&group, &groups) {
+        let code = if path == ROOT_GROUP {
+            "bad_request"
+        } else if group.source != SOURCE_MANUAL {
+            access_code::MANAGED_BY_SOURCE
+        } else if group.members > 0 && !reason.starts_with("Delete") {
+            access_code::HAS_MEMBERS
+        } else {
+            access_code::HAS_CHILDREN
+        };
+        return bad_request(code, &reason);
+    }
+    s.groups.retain(|g| g.path != path);
+    drop(s);
+    publish(&fake, Event::GroupDeleted { path });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/agents`: the caller's; an admin sees everyone's. Never the tokens.
+async fn list_agents(State(fake): State<Fake>, headers: HeaderMap) -> Response {
+    let s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let list: Vec<Agent> = s
+        .agents
+        .iter()
+        .filter(|a| caller.person.org_role.is_admin() || a.owner_id == caller.person.id)
+        .cloned()
+        .collect();
+    Json(list).into_response()
+}
+
+#[allow(clippy::result_large_err)]
+fn checked_ceiling(
+    owner: &Person,
+    kind: AgentKind,
+    asked: Option<Vec<String>>,
+) -> Result<Vec<String>, Response> {
+    match asked {
+        None => Ok(crate::org::default_ceiling(kind, owner)),
+        Some(asked) => crate::org::normalise_ceiling(&crate::org::expansion(owner), &asked)
+            .map_err(|message| {
+                let code = if asked.is_empty() {
+                    "bad_request"
+                } else {
+                    access_code::OUTSIDE_OWNER
+                };
+                bad_request(code, &message)
+            }),
+    }
+}
+
+fn agent_name_problem(
+    s: &FakeState,
+    owner: &str,
+    name: &str,
+    except: Option<&str>,
+) -> Option<Response> {
+    if !margin_shared::context::is_agent_name(name) {
+        return Some(bad_request(
+            "bad_request",
+            "An agent's name is up to 40 lowercase letters, digits, - and _.",
+        ));
+    }
+    if s.agents
+        .iter()
+        .any(|a| a.owner_id == owner && a.name == name && Some(a.id.as_str()) != except)
+    {
+        return Some(conflict(
+            "exists",
+            &format!("You already have an agent named {name}."),
+        ));
+    }
+    None
+}
+
+async fn create_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(new): Json<NewAgent>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Some(r) = agent_name_problem(&s, &caller.person.id, &new.name, None) {
+        return r;
+    }
+    let ceiling = match checked_ceiling(&caller.person, new.kind, new.ceiling) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let agent = Agent {
+        id: s.id("a"),
+        owner_id: caller.person.id,
+        name: new.name,
+        kind: new.kind,
+        ceiling,
+        disabled: false,
+        token: None,
+        created_at: Utc::now(),
+    };
+    s.agents.push(agent.clone());
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(agent).into_response()
+}
+
+/// The agent `id` for `caller`: `Ok(index, is_owner)`, 404 when they may not see it.
+#[allow(clippy::result_large_err)]
+fn agent_for(s: &FakeState, caller: &Caller, id: &str) -> Result<(usize, bool), Response> {
+    let i = s
+        .agents
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or_else(not_found)?;
+    let owner = s.agents[i].owner_id == caller.person.id;
+    if !owner && !caller.person.org_role.is_admin() {
+        return Err(not_found());
+    }
+    Ok((i, owner))
+}
+
+fn not_agent_owner() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        access_code::NOT_OWNER,
+        "Only the agent's owner can change it; an admin can only disable it.",
+    )
+}
+
+async fn patch_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<AgentPatch>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let (i, owner) = match agent_for(&s, &caller, &id) {
+        Ok(found) => found,
+        Err(r) => return r,
+    };
+    if !owner && (patch.name.is_some() || patch.ceiling.is_some()) {
+        return not_agent_owner();
+    }
+    if let Some(name) = &patch.name
+        && let Some(r) = agent_name_problem(&s, &caller.person.id, name, Some(&id))
+    {
+        return r;
+    }
+    let ceiling = match patch.ceiling {
+        Some(asked) => match checked_ceiling(&caller.person, s.agents[i].kind, Some(asked)) {
+            Ok(c) => Some(c),
+            Err(r) => return r,
+        },
+        None => None,
+    };
+    let agent = {
+        let a = &mut s.agents[i];
+        if let Some(name) = patch.name {
+            a.name = name;
+        }
+        if let Some(ceiling) = ceiling {
+            a.ceiling = ceiling;
+        }
+        if let Some(disabled) = patch.disabled {
+            a.disabled = disabled;
+        }
+        a.clone()
+    };
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(agent).into_response()
+}
+
+async fn delete_agent(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match agent_for(&s, &caller, &id) {
+        Ok((_, true)) => {}
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    }
+    s.agents.retain(|a| a.id != id);
+    s.agent_tokens.remove(&id);
+    drop(s);
+    publish(&fake, Event::AgentDeleted { id });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/agents/{id}/token`: a new token (any earlier one stops working), shown once.
+async fn mint_agent_token(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let i = match agent_for(&s, &caller, &id) {
+        Ok((i, true)) => i,
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    };
+    let n = s.next_id;
+    s.next_id += 1;
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
+    let token = format!(
+        "{AGENT_TOKEN_PREFIX}{:016x}{:016x}",
+        nanos,
+        n.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    );
+    let now = Utc::now();
+    s.agents[i].token = Some(AgentTokenInfo {
+        prefix: token.chars().take(8).collect(),
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+    });
+    s.agent_tokens.insert(id, token.clone());
+    let agent = s.agents[i].clone();
+    drop(s);
+    publish(
+        &fake,
+        Event::AgentChanged {
+            agent: agent.clone(),
+        },
+    );
+    Json(AgentToken { token, agent }).into_response()
+}
+
+async fn revoke_agent_token(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let mut s = fake.state.lock().unwrap();
+    let caller = match caller(&s, &headers) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let i = match agent_for(&s, &caller, &id) {
+        Ok((i, true)) => i,
+        Ok((_, false)) => return not_agent_owner(),
+        Err(r) => return r,
+    };
+    // As the service: revoking an agent without a token is 204 too.
+    s.agents[i].token = None;
+    s.agent_tokens.remove(&id);
+    let agent = s.agents[i].clone();
+    drop(s);
+    publish(&fake, Event::AgentChanged { agent });
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]

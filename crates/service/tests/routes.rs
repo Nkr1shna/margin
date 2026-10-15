@@ -78,7 +78,7 @@ async fn condense_calls_go_to_the_small_route() {
     small.push(Scripted::Events(text_reply(&["summary"])));
     let model = TracedModel::new(
         chat.clone(),
-        TurnTrace::new(&h.state, "c", "turn", None),
+        TurnTrace::new(&h.state, "c", "turn", None, "person/bootstrap"),
         "chat-model",
         "openai",
         None,

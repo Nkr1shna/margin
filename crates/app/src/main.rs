@@ -15,6 +15,7 @@ mod fake;
 #[allow(dead_code)]
 mod folders;
 mod markdown;
+mod org;
 mod picker;
 mod routes;
 #[cfg(target_os = "ios")]
@@ -509,6 +510,7 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             drafts::resume(ctx, api);
             load_workspaces(ctx, api).await;
             load_chats(ctx, api).await;
+            let _ = ui::organisation::load_org(ctx, api).await;
             true
         }
         Err(e) => {
@@ -521,6 +523,38 @@ pub async fn load_library(ctx: AppCtx, api: &Api) -> bool {
             load_chats(ctx, api).await;
             false
         }
+    }
+}
+
+/// What an event says about the signed-in person: their row and groups follow it, and
+/// a change to what they may read reloads the library.
+fn follow_me(ctx: AppCtx, event: &Event) {
+    let me = ctx
+        .session
+        .peek()
+        .as_ref()
+        .and_then(|s| s.me.as_ref())
+        .and_then(|m| m.person.as_ref())
+        .map(|p| p.id.clone());
+    let Some(me) = me else { return };
+    match event {
+        Event::PersonChanged { person } if person.id == me => ctx.update_person(|p| {
+            // Events don't carry anyone's own settings.
+            let settings = p.settings.clone();
+            *p = person.clone();
+            if p.settings == margin_shared::PersonSettings::default() {
+                p.settings = settings;
+            }
+        }),
+        Event::MembershipChanged { person_id, groups } if *person_id == me => {
+            ctx.update_person(|p| p.groups = groups.clone())
+        }
+        Event::AccessChanged { person_id } if *person_id == me => {
+            let mut reload = ctx.reload;
+            let next = *reload.peek() + 1;
+            reload.set(next);
+        }
+        _ => {}
     }
 }
 
@@ -596,11 +630,11 @@ async fn load_devices(ctx: AppCtx, api: &Api) {
 /// online exactly while its socket is live.
 fn set_self_online(ctx: AppCtx, online: bool) {
     let mut lib = ctx.lib;
-    let me = ctx
-        .session
-        .peek()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|me| me.device.id.clone()));
+    let me = ctx.session.peek().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|me| me.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let id = me.or_else(|| {
         lib.peek()
             .devices
@@ -687,6 +721,7 @@ async fn live_loop(ctx: AppCtx) {
                                 {
                                     device_frames.set(Some(tx));
                                 }
+                                follow_me(ctx, &event);
                                 lib.write().apply(event);
                             }
                             // Device-tool requests for this device and their cancellations.
@@ -734,9 +769,15 @@ async fn live_loop(ctx: AppCtx) {
                 error
             }
             Err(ConnectError::Unauthorized) => {
-                ctx.forget_session(Some(
-                    "This device was signed out by the service. Sign in again.".into(),
-                ));
+                // The service's reason (a disabled person) comes with a request.
+                match api.me().await {
+                    Err(e) if e.is_unauthorized() => {
+                        ctx.forget_session(Some(state::signed_out_reason(&e)))
+                    }
+                    _ => ctx.forget_session(Some(
+                        "This device was signed out by the service. Sign in again.".into(),
+                    )),
+                }
                 return;
             }
             Err(ConnectError::Other(message)) => message,

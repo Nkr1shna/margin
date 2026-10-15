@@ -11,7 +11,7 @@ use crate::sources::{Destination, Tone, Upload, UploadState, human_bytes, status
 use crate::state::{AppCtx, use_app};
 use crate::store::LibraryState;
 use crate::ui::common::{ConfirmDialog, Icon, js};
-use crate::ui::settings::SettingsPane;
+use crate::ui::settings::{MODELS_ADMIN_ONLY, SettingsPane};
 
 /// Uploads running at once.
 const CONCURRENT_UPLOADS: usize = 3;
@@ -112,7 +112,7 @@ async fn upload(app: AppCtx, key: u64) {
                 // The topic's list shows it from the store from now on.
                 list.retain(|u| u.key != key);
             } else if let Some(u) = list.iter_mut().find(|u| u.key == key) {
-                u.state = UploadState::Done(source);
+                u.state = UploadState::Done(Box::new(source));
             }
         }
         Ok(source) => {
@@ -380,11 +380,11 @@ pub fn AddSourcesMenu(
             .unwrap_or_default(),
         None => app.ask_workspaces.read().clone(),
     };
-    let me = app
-        .session
-        .read()
-        .as_ref()
-        .and_then(|s| s.me.as_ref().map(|m| m.device.id.clone()));
+    let me = app.session.read().as_ref().and_then(|s| {
+        s.me.as_ref()
+            .and_then(|m| m.device.as_ref())
+            .map(|d| d.id.clone())
+    });
     let folders: Vec<margin_shared::Workspace> = app
         .lib
         .read()
@@ -755,6 +755,8 @@ pub fn EmbeddingNotice() -> Element {
     let Some(model) = app.lib.read().embedding.clone() else {
         return rsx! {};
     };
+    // Admins download the model; a member reads why sources wait and who to ask.
+    let admin = app.is_admin();
     let download = move |_| async move {
         if *busy.peek() {
             return;
@@ -783,8 +785,12 @@ pub fn EmbeddingNotice() -> Element {
                             },
                             _ => rsx! {},
                         }
+                        if !admin && !matches!(state, EmbeddingModelState::Downloading { .. }) {
+                            span { class: "muted", "{MODELS_ADMIN_ONLY}" }
+                        }
                         div { class: "row-actions",
                             match &state {
+                                _ if !admin => rsx! {},
                                 EmbeddingModelState::NotDownloaded { download_bytes } => rsx! {
                                     button {
                                         class: "btn btn-primary btn-sm",

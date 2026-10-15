@@ -17,6 +17,7 @@ use margin_shared::{EmbeddingModel, EmbeddingModelState, Event, RerankerModelSta
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::principal::RequireAdmin;
 use crate::state::AppState;
 use crate::{ingest, rerank, sources};
 
@@ -192,8 +193,12 @@ pub async fn get_model(State(state): State<AppState>) -> Json<EmbeddingModel> {
 }
 
 /// Starts downloading the model in the background. Asking again while it downloads, or
-/// once it's downloaded, changes nothing.
-pub async fn start_download(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// once it's downloaded, changes nothing. The models are the organisation's: admins
+/// only (403 `admin_required`), like `PATCH /api/settings`.
+pub async fn start_download(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     let started = {
         // Serializes with deleting the model.
         let _w = state.write_lock.lock().await;
@@ -267,8 +272,11 @@ async fn run_download(state: AppState) {
     }
 }
 
-/// Deletes the downloaded model and unloads it. Not while it downloads.
-pub async fn delete_model(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// Deletes the downloaded model and unloads it. Not while it downloads. Admins only.
+pub async fn delete_model(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     {
         let _w = state.write_lock.lock().await;
         if matches!(
@@ -299,6 +307,7 @@ pub async fn delete_model(State(state): State<AppState>) -> AppResult<Json<Embed
 /// source tools have no speech model (a test fake).
 pub async fn start_speech_download(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
 ) -> AppResult<Json<EmbeddingModel>> {
     no_speech_model(&state)?;
     let started = {
@@ -514,9 +523,11 @@ pub async fn get_reranker(
 /// `POST routes::RERANKER_MODEL_DOWNLOAD[?model=NAME]` (R2): starts downloading the
 /// reranker model in the background. Asking again while it downloads, or once it's
 /// downloaded, changes nothing; one reranker downloads at a time (409
-/// "model_downloading" while another does).
+/// "model_downloading" while another does). The models are the organisation's: admins
+/// only (403 `admin_required`), like the embedding and speech models.
 pub async fn start_reranker_download(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(query): Query<RerankerQuery>,
 ) -> AppResult<Json<EmbeddingModel>> {
     let model = pick_reranker(&state, &query).await?;
@@ -606,9 +617,11 @@ async fn run_reranker_download(state: AppState, files: RerankerFiles) {
 /// `DELETE routes::RERANKER_MODEL[?model=NAME]` (R2): removes the reranker model's
 /// files (and forgets a failed download). Not while it downloads. A pipeline running
 /// it fails its reranking from then on, which keeps the fused order (traced
-/// `rerank_failed`), until it is downloaded again or another reranker is picked.
+/// `rerank_failed`), until it is downloaded again or another reranker is picked. Admins
+/// only.
 pub async fn delete_reranker(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Query(query): Query<RerankerQuery>,
 ) -> AppResult<Json<EmbeddingModel>> {
     let model = pick_reranker(&state, &query).await?;
@@ -684,8 +697,12 @@ async fn run_speech_download(state: AppState) {
     emit_model(&state, &model(&state).await);
 }
 
-/// Deletes the downloaded speech model and unloads it. Not while it downloads.
-pub async fn delete_speech(State(state): State<AppState>) -> AppResult<Json<EmbeddingModel>> {
+/// Deletes the downloaded speech model and unloads it. Not while it downloads. Admins
+/// only.
+pub async fn delete_speech(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> AppResult<Json<EmbeddingModel>> {
     no_speech_model(&state)?;
     {
         let _w = state.write_lock.lock().await;
