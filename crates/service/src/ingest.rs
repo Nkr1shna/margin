@@ -661,16 +661,30 @@ async fn rescope_locked(
     }))
 }
 
-/// Every document whose generation passed `since`, and those deleted since then.
+/// Every document whose generation passed `since`, and those deleted since then, as
+/// the organisation's owner reads them (the bootstrap owner before `people-v1`): what
+/// the owner's own tools and the tests read. Requests read their own principal's feed
+/// through `changes_page`.
 pub async fn changes_since(state: &AppState, since: u64) -> anyhow::Result<ContextChanges> {
-    changes_page(state, since, usize::MAX).await
+    let owner = crate::people::owner_row(state).await?.map_or_else(
+        || crate::principal::BOOTSTRAP_PERSON_ID.to_string(),
+        |r| r.person.id,
+    );
+    let p = crate::state::person_principal(state, &owner)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    changes_page(state, &crate::pipeline::Reader::of(&p), since, usize::MAX).await
 }
 
-/// One page of the change feed (`routes::CONTEXT_CHANGES`): the first `limit` changes
-/// (documents and deletions) after `since`, by generation; `more` when others follow,
-/// and then `generation` is the page's last, so the next page starts after it.
+/// One page of the change feed (`routes::CONTEXT_CHANGES`) as `reader` reads it: the
+/// first `limit` changes (documents and deletions) after `since`, by generation; `more`
+/// when others follow, and then `generation` is the page's last, so the next page
+/// starts after it. Both statements carry the reader's two conjuncts (L2 D5): a
+/// document the reader can't read isn't listed, nor is its deletion (a tombstone keeps
+/// the deleted document's audience); the cursor still moves past them.
 pub async fn changes_page(
     state: &AppState,
+    reader: &crate::pipeline::Reader,
     since: u64,
     limit: usize,
 ) -> anyhow::Result<ContextChanges> {
@@ -682,33 +696,39 @@ pub async fn changes_page(
     let fetch = limit.saturating_add(1).min(i64::MAX as usize);
     let _w = state.write_lock.lock().await;
     let generation = state.store.generation().await?;
-    let rows: Vec<serde_json::Value> = state
-        .store
-        .query_rows(
-            "SELECT doc, doc.generation AS g FROM document WHERE doc.generation > $since \
+    let page = |table: &str| {
+        format!(
+            "SELECT doc, doc.generation AS g FROM {table} WHERE doc.generation > $since{} \
              ORDER BY g LIMIT $n",
-            vec![
-                ("since", serde_json::json!(since)),
-                ("n", serde_json::json!(fetch)),
-            ],
+            crate::retrieval::DOC_READER_SQL
         )
-        .await?;
+    };
+    let binds = || {
+        let mut b = crate::retrieval::doc_reader_binds(reader);
+        b.extend([
+            ("since", serde_json::json!(since)),
+            ("n", serde_json::json!(fetch)),
+        ]);
+        b
+    };
+    let rows: Vec<serde_json::Value> = if reader.is_empty() {
+        Vec::new()
+    } else {
+        state.store.query_rows(&page("document"), binds()).await?
+    };
     let mut changed: Vec<Document> = rows
         .into_iter()
         .map(|mut r| serde_json::from_value(r["doc"].take()))
         .collect::<Result<_, _>>()?;
     changed.sort_by_key(|d| d.generation);
-    let rows: Vec<serde_json::Value> = state
-        .store
-        .query_rows(
-            "SELECT doc, doc.generation AS g FROM document_deleted WHERE doc.generation > $since \
-             ORDER BY g LIMIT $n",
-            vec![
-                ("since", serde_json::json!(since)),
-                ("n", serde_json::json!(fetch)),
-            ],
-        )
-        .await?;
+    let rows: Vec<serde_json::Value> = if reader.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .query_rows(&page("document_deleted"), binds())
+            .await?
+    };
     let mut deleted: Vec<Tombstone> = rows
         .into_iter()
         .map(|mut r| serde_json::from_value(r["doc"].take()))

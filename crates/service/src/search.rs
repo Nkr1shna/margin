@@ -391,4 +391,106 @@ mod tests {
         s.put(db::TOPIC, "tc", &shared).await.unwrap();
         assert!(ids(find(&s, &bob, "fourier").await.unwrap()).contains(&"tc".to_string()));
     }
+
+    /// L2 D5: ⌘K evaluates `deny` inside both FULLTEXT statements and the topics' list:
+    /// a row shared with `company` that denies Bob (by name, or one of his groups) is
+    /// missing from his hits, and still found by everyone else.
+    #[tokio::test]
+    async fn search_leaves_out_what_denies_the_caller() {
+        let s = Store::memory().await.unwrap();
+        let now = chrono::Utc::now();
+        let put = |table: &'static str, id: &str, title: &str, deny: serde_json::Value| {
+            let row = serde_json::json!({
+                "id": id, "topic_id": "t", "parent_id": null, "title": title, "summary": "",
+                "position": 0, "level": "intro", "minutes": 5,
+                "body_md": format!("{title} body"), "quote": null, "lesson_id": null,
+                "status": {"state": "ready"}, "created_at": now, "updated_at": now,
+                "citations": [], "owner": "alice", "access": ["company"], "deny": deny,
+            });
+            let s = s.clone();
+            async move {
+                s.put(table, row["id"].as_str().unwrap(), &row)
+                    .await
+                    .unwrap()
+            }
+        };
+        put(db::TOPIC, "t1", "Fourier open", serde_json::json!([])).await;
+        put(
+            db::TOPIC,
+            "t2",
+            "Fourier not bob",
+            serde_json::json!(["person/bob"]),
+        )
+        .await;
+        put(db::LESSON, "l1", "Fourier open", serde_json::json!([])).await;
+        put(
+            db::LESSON,
+            "l2",
+            "Fourier not bob",
+            serde_json::json!(["person/bob"]),
+        )
+        .await;
+        put(
+            db::LESSON,
+            "l3",
+            "Fourier not sales",
+            serde_json::json!(["company/sales"]),
+        )
+        .await;
+        put(db::NOTE, "n1", "Fourier open", serde_json::json!([])).await;
+        put(
+            db::NOTE,
+            "n2",
+            "Fourier not bob",
+            serde_json::json!(["person/bob"]),
+        )
+        .await;
+        // A row from before `deny` existed denies no one.
+        let mut old = serde_json::json!({
+            "id": "l4", "topic_id": "t", "title": "Fourier old", "summary": "", "position": 0,
+            "level": "intro", "minutes": 5, "body_md": "Fourier old body",
+            "status": {"state": "ready"}, "created_at": now, "updated_at": now,
+            "citations": [], "owner": "alice", "access": ["company"],
+        });
+        old.as_object_mut().unwrap().remove("deny");
+        s.put(db::LESSON, "l4", &old).await.unwrap();
+        let ids = |hits: Vec<SearchHit>| {
+            let mut v: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+            v.sort();
+            v
+        };
+        let mut bob = crate::state::test_principal("bob", OrgRole::Member);
+        assert_eq!(
+            ids(find(&s, &bob, "fourier").await.unwrap()),
+            ["l1", "l3", "l4", "n1", "t1"]
+        );
+        // Bob joins sales: the group's denial reaches him through his expansion.
+        bob.paths.push("company/sales".into());
+        bob.deny_ids.push("company/sales".into());
+        assert_eq!(
+            ids(find(&s, &bob, "fourier").await.unwrap()),
+            ["l1", "l4", "n1", "t1"]
+        );
+        let carol = crate::state::test_principal("carol", OrgRole::Member);
+        assert_eq!(
+            ids(find(&s, &carol, "fourier").await.unwrap()),
+            ["l1", "l2", "l3", "l4", "n1", "n2", "t1", "t2"]
+        );
+        // The denial is inside the indexed statement: still a FULLTEXT lookup.
+        let mut binds = access_binds(&bob);
+        binds.push(("q", serde_json::json!("fourier")));
+        let plan: Vec<serde_json::Value> = s
+            .query_rows(
+                &format!(
+                    "SELECT VALUE doc FROM lesson \
+                     WHERE (doc.title @0@ $q OR doc.body_md @1@ $q) AND {ACCESS_WHERE} EXPLAIN"
+                ),
+                binds,
+            )
+            .await
+            .unwrap();
+        let plan = serde_json::to_string(&plan).unwrap();
+        assert!(plan.contains("lesson_title"), "{plan}");
+        assert!(plan.contains("CONTAINSNONE"), "{plan}");
+    }
 }
