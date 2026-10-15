@@ -77,6 +77,16 @@ jobs:
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          # The cache only grows: incremental state is never needed across runs, and when the
+          # runner's disk gets tight the whole cache goes (a cold build is slower, not wrong).
+          rm -rf "$cache/target-test-$env_id/debug/incremental" 2>/dev/null || true
+          mkdir -p "$cache"
+          free_gb=$(df -Pk "$cache" | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Free disk for the cache: ${free_gb} GB"
+          if [ "${free_gb:-0}" -lt 25 ]; then
+            echo "::warning::under 25 GB free on the runner; clearing the cargo caches"
+            find "$cache" -maxdepth 1 -name 'target-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
       # The same steps the local check runs (deploy/local/linux-check.sh).
       - name: Format, clippy, tests
         if: steps.scope.outputs.run == 'true'
@@ -140,6 +150,16 @@ jobs:
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          # The cache only grows: incremental state is never needed across runs, and when the
+          # runner's disk gets tight the whole cache goes (a cold build is slower, not wrong).
+          rm -rf "$cache/target-test-$env_id/debug/incremental" 2>/dev/null || true
+          mkdir -p "$cache"
+          free_gb=$(df -Pk "$cache" | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Free disk for the cache: ${free_gb} GB"
+          if [ "${free_gb:-0}" -lt 25 ]; then
+            echo "::warning::under 25 GB free on the runner; clearing the cargo caches"
+            find "$cache" -maxdepth 1 -name 'target-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
       - name: Clippy (app)
         if: steps.scope.outputs.run == 'true'
         run: cargo clippy --locked -p margin-app --all-targets -- -D warnings
