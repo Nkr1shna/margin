@@ -2,7 +2,7 @@
 //! stores what it produces (`ServiceSink`), and handles stop, continue, confirmations,
 //! the pending message and recovery. See `docs/agent-contract.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,9 +17,9 @@ use margin_agent::{
 };
 use margin_ai::{
     AiError, CallOptions, InputPart, ModelInfo, ModelRequest, ModelStream, ProviderConfig,
-    ProviderKind, TextModel, TextOutput,
+    ProviderKind, Retrying, TextModel, TextOutput,
 };
-use margin_shared::context::TraceKind;
+use margin_shared::context::{Compaction, TraceKind};
 use margin_shared::pipeline::Route;
 use margin_shared::{
     Card, Chat, ChatItem, ChatItemKind, ChatState, Decision, DeviceRef, Id, ItemStatus,
@@ -99,6 +99,9 @@ pub struct Turns {
     /// `(provider, base_url)`s that rejected server-side compaction since the service
     /// started (D3): their turns condense locally.
     pub no_server_compaction: Mutex<HashSet<(Provider, String)>>,
+    /// turn id → step → the compaction the loop reported (`TurnSink::compaction`) for a
+    /// step whose `model_call` row hasn't started yet; dropped when the turn ends.
+    pub compactions: Mutex<HashMap<Id, BTreeMap<u32, Compaction>>>,
 }
 
 impl Turns {
@@ -115,6 +118,7 @@ impl Turns {
             title_model: Mutex::new(None),
             titled: Mutex::new(HashSet::new()),
             no_server_compaction: Mutex::new(HashSet::new()),
+            compactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -442,6 +446,7 @@ pub async fn run(state: AppState, chat_id: Id, turn_id: Id, origin: DeviceRef) {
     .catch_unwind()
     .await;
     drop(slot.lock().unwrap().take());
+    state.turns.compactions.lock().unwrap().remove(&turn_id);
     let (outcome, early) = match result {
         Ok(Ok(outcome)) => (outcome, None),
         Ok(Err(early)) => (
@@ -626,13 +631,20 @@ async fn small_text_model(
             (chat_config.clone(), chat_config.models.small.clone())
         }
     };
-    Arc::new(TracedText {
+    let traced = TracedText {
         inner: state.generator.text_model(&config),
         trace: trace.clone(),
         model,
         provider: config.provider.as_str(),
         purpose: "condense",
-    })
+    };
+    // Retried silently (a side call; the turn shows its own waits): each attempt is its
+    // own `model_call` row.
+    Arc::new(Retrying::new(
+        traced,
+        crate::ask::job_backoff(state),
+        Box::new(|_| {}),
+    ))
 }
 
 /// The agent client of `config`; on ChatGPT, one that refreshes the plan token once and
@@ -1740,8 +1752,20 @@ impl TurnSink for ServiceSink {
         Box::pin(self.set_waiting(None))
     }
 
-    /// Stamping the step's trace row is phase 5's 5-retry (`docs/phase5-brief.md` §4).
-    fn compaction(&self, _step: u32, _kind: margin_shared::context::Compaction) {}
+    /// Kept for step `step`'s `model_call` row (`TraceRow.compaction`), stamped when
+    /// that row starts (`TracedModel::span`); a later report for the same step replaces
+    /// an earlier one.
+    fn compaction(&self, step: u32, kind: Compaction) {
+        tracing::debug!(chat = %self.chat_id, step, ?kind, "history shortened");
+        self.state
+            .turns
+            .compactions
+            .lock()
+            .unwrap()
+            .entry(self.turn_id.clone())
+            .or_default()
+            .insert(step, kind);
+    }
 }
 
 impl ServiceSink {
@@ -1864,13 +1888,19 @@ async fn ask_title(
         Some(make) => make(&small.config),
         None => state.generator.text_model(&small.config),
     };
-    let model = TracedText {
-        inner,
-        trace: TurnTrace::new(state, chat_id, turn_id, None),
-        model: small.model.clone(),
-        provider: small.config.provider.as_str(),
-        purpose: "title",
-    };
+    // Retried silently (a side call): each attempt is its own `model_call` row; when
+    // the retries run out the first-line title stays.
+    let model = Retrying::new(
+        TracedText {
+            inner,
+            trace: TurnTrace::new(state, chat_id, turn_id, None),
+            model: small.model.clone(),
+            provider: small.config.provider.as_str(),
+            purpose: "title",
+        },
+        crate::ask::job_backoff(state),
+        Box::new(|_| {}),
+    );
     let cut = |text: &str| text.chars().take(TITLE_INPUT_MAX_CHARS).collect::<String>();
     let data = json!({"owner_message": cut(first), "answer": cut(answer)}).to_string();
     let mut opts = CallOptions::new(Route::Small)
@@ -1928,6 +1958,18 @@ impl TurnTrace {
             parent,
             pipeline_hash: state.pipeline.load().hash.clone(),
         }
+    }
+
+    /// The compaction the loop reported for step `step` of this turn, taken for its
+    /// `model_call` row (`Turns.compactions`).
+    fn take_compaction(&self, step: u32) -> Option<Compaction> {
+        let mut all = self.state.turns.compactions.lock().unwrap();
+        let steps = all.get_mut(&self.turn_id)?;
+        let kind = steps.remove(&step);
+        if steps.is_empty() {
+            all.remove(&self.turn_id);
+        }
+        kind
     }
 
     /// A row of `kind` under the turn.
@@ -2085,7 +2127,10 @@ impl TracedModel {
                 row.prompt_version = Some(req.opts.prompt_version.clone().unwrap_or_else(|| {
                     trace::prompt_version("agent", margin_agent::system_prompt())
                 }));
-                row.step = Some(self.steps.fetch_add(1, Ordering::Relaxed) + 1);
+                let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+                row.step = Some(step);
+                // A local condense reported before this step's call.
+                row.compaction = self.trace.take_compaction(step);
             }
             None => {
                 // The loop's condense call: its system prompt is its fixed

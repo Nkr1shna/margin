@@ -2329,7 +2329,11 @@ async fn retrying_retries_5xx_and_network_and_gives_up_after_three() {
         .unwrap_err();
     assert!(matches!(err, AiError::Http { status: 503, .. }));
     assert_eq!(fake.requests.lock().unwrap().len(), 4, "1 call + 3 retries");
-    assert_eq!(seen.lock().unwrap().len(), 6, "three waits, each with its end");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        6,
+        "three waits, each with its end"
+    );
 }
 
 #[tokio::test]
