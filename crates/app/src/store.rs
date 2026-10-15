@@ -2,12 +2,12 @@
 //! applying every [`Event`] from the `/api/events` socket. Pure data: no Dioxus here,
 //! so the reducer is unit-tested directly.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use margin_shared::{
-    Chat, ChatDetail, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id, ItemStatus,
-    Lesson, LessonStatus, Library, Note, Proposal, ProposalStatus, Settings, Source, Topic, Video,
-    VideoStatus, Workspace,
+    Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event, Id,
+    ItemStatus, Lesson, LessonStatus, Library, ModelInfo, Note, Proposal, ProposalStatus, Provider,
+    Settings, Source, Topic, Video, VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -47,6 +47,12 @@ pub struct LibraryState {
     /// What Settings can pick the pipeline from (`GET /api/pipeline/variants`), once
     /// fetched; fetched again each time the Pipeline section opens.
     pub pipeline_variants: Option<margin_shared::pipeline::PipelineVariants>,
+    /// The models each provider offers (`GET routes::providers_models`), for the providers
+    /// whose list was fetched; dropped when the provider loses its credential.
+    pub provider_models: HashMap<Provider, Vec<ModelInfo>>,
+    /// The ChatGPT sign-in as last fetched (`GET routes::PROVIDERS_CHATGPT`) or started;
+    /// `None` until then (see [`LibraryState::chatgpt_status`]).
+    pub chatgpt: Option<ChatGptStatus>,
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -65,6 +71,45 @@ impl LibraryState {
         let mut state = Self::default();
         state.replace_library(library);
         state
+    }
+
+    /// New settings: the ChatGPT sign-in follows the account they carry (signed in, or
+    /// signed out where it was signed in; a sign-in still waiting or failed stays), and a
+    /// provider without its credential forgets its models.
+    pub fn set_settings(&mut self, settings: Settings) {
+        match (&settings.chatgpt, &self.chatgpt) {
+            (Some(account), _) => {
+                self.chatgpt = Some(ChatGptStatus::SignedIn {
+                    account: account.clone(),
+                })
+            }
+            (None, Some(ChatGptStatus::SignedIn { .. })) => {
+                self.chatgpt = Some(ChatGptStatus::SignedOut)
+            }
+            (None, _) => {}
+        }
+        self.provider_models
+            .retain(|p, _| settings.has_credential(*p));
+        self.settings = Some(settings);
+    }
+
+    /// Where the ChatGPT sign-in is: as fetched, else as the settings say.
+    pub fn chatgpt_status(&self) -> ChatGptStatus {
+        if let Some(status) = &self.chatgpt {
+            return status.clone();
+        }
+        match self.settings.as_ref().and_then(|s| s.chatgpt.clone()) {
+            Some(account) => ChatGptStatus::SignedIn { account },
+            None => ChatGptStatus::SignedOut,
+        }
+    }
+
+    /// Whether `provider` can answer (a key, or a ChatGPT sign-in); unknown settings
+    /// count as yes, so nothing is refused before they arrive.
+    pub fn provider_ready(&self, provider: Provider) -> bool {
+        self.settings
+            .as_ref()
+            .is_none_or(|s| s.has_credential(provider))
     }
 
     /// Replace topics, lessons, notes, videos and sources with a fresh library, keeping
@@ -174,7 +219,7 @@ impl LibraryState {
             Event::ProposalChanged { proposal } => {
                 self.proposals.insert(proposal.id.clone(), proposal);
             }
-            Event::SettingsChanged { settings } => self.settings = Some(settings),
+            Event::SettingsChanged { settings } => self.set_settings(settings),
             Event::SourceChanged { source } => match &source.workspace_id {
                 Some(workspace_id) => {
                     if let Some(files) = self.folder_files.get_mut(workspace_id) {
@@ -1457,7 +1502,44 @@ pub(crate) mod tests {
         s.apply(Event::SettingsChanged {
             settings: settings.clone(),
         });
-        assert_eq!(s.settings, Some(settings));
+        assert_eq!(s.settings, Some(settings.clone()));
+
+        // The ChatGPT sign-in follows the settings' account; a provider that loses its
+        // credential forgets its models; unknown settings refuse no provider.
+        assert!(LibraryState::default().provider_ready(Provider::Claude));
+        assert!(s.provider_ready(Provider::OpenAi));
+        assert!(!s.provider_ready(Provider::Claude));
+        assert_eq!(s.chatgpt_status(), ChatGptStatus::SignedOut);
+        s.chatgpt = Some(ChatGptStatus::Waiting {
+            authorize_url: "https://auth.example/a".into(),
+        });
+        s.provider_models
+            .insert(Provider::OpenAi, crate::fake::fake_models(Provider::OpenAi));
+        s.apply(Event::SettingsChanged {
+            settings: settings.clone(),
+        });
+        // Still waiting: settings without an account don't end a sign-in.
+        assert!(matches!(s.chatgpt_status(), ChatGptStatus::Waiting { .. }));
+        assert!(s.provider_models.contains_key(&Provider::OpenAi));
+        let account = crate::fake::fake_account("owner@example.com");
+        let signed_in = Settings {
+            chatgpt: Some(account.clone()),
+            has_api_key: false,
+            ..settings.clone()
+        };
+        s.apply(Event::SettingsChanged {
+            settings: signed_in,
+        });
+        assert_eq!(
+            s.chatgpt_status(),
+            ChatGptStatus::SignedIn {
+                account: account.clone()
+            }
+        );
+        assert!(s.provider_ready(Provider::ChatGpt));
+        assert!(!s.provider_models.contains_key(&Provider::OpenAi));
+        s.apply(Event::SettingsChanged { settings });
+        assert_eq!(s.chatgpt_status(), ChatGptStatus::SignedOut);
     }
 
     #[test]

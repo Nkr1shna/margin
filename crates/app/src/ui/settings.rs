@@ -1,5 +1,6 @@
-//! Settings: service, account and devices, AI provider and key, the three model slots
-//! and the retrieval pipeline's stages and budget, the embedding model for sources (and the
+//! Settings: service, account and devices, the AI providers (the default one; OpenAI's
+//! key, "Sign in with ChatGPT", Claude's key; each provider's three model slots) and the
+//! retrieval pipeline's stages and budget, the embedding model for sources (and the
 //! speech model a Linux service downloads), voice, render
 //! size, tools on the service, trace retention, and appearance.
 
@@ -8,9 +9,10 @@ use margin_shared::pipeline::{
     Budget, NamedVariant, PipelineConfig, PipelineVariants, Route, STAGE_KINDS,
 };
 use margin_shared::{
-    Device, EmbeddingModel, EmbeddingModelState, Event, FOLDER_FILE_TYPES_TEXT, Id,
-    ReasoningEffort, ReindexProgress, SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind,
-    SpeechModel, TRACE_RETENTION_DAYS, ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
+    CLAUDE_LISTED_MODELS, ChatGptStatus, Device, EmbeddingModel, EmbeddingModelState, Event,
+    FOLDER_FILE_TYPES_TEXT, Id, ModelInfo, Provider, ReasoningEffort, ReindexProgress, RouteModels,
+    SOURCE_KINDS, Settings, SettingsPatch, Source, SourceKind, SpeechModel, TRACE_RETENTION_DAYS,
+    ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
 };
 
 use crate::config::{Appearance, normalize_service_url};
@@ -18,7 +20,7 @@ use crate::folders::sync::SyncState;
 use crate::sources::{Tone, human_bytes, status_text};
 use crate::state::{LiveStatus, use_app};
 use crate::ui::common::{
-    ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js,
+    ConfirmDialog, ErrorNotice, Icon, ago, copy_to_clipboard, date, focus_first, js, open_external,
 };
 use crate::ui::sources::kind_icon;
 
@@ -226,8 +228,10 @@ pub fn SettingsDialog() -> Element {
                             SettingsPane::Account => rsx! { AccountSection {} },
                             SettingsPane::Service => rsx! { ServiceSection {} },
                             SettingsPane::Ai => service_settings(|s| rsx! {
-                                AiSection { settings: s.clone() }
-                                ModelsSection { settings: s.clone() }
+                                ProvidersSection { settings: s.clone() }
+                                OpenAiSection { settings: s.clone() }
+                                ChatGptSection { settings: s.clone() }
+                                ClaudeSection { settings: s.clone() }
                                 AgentSection { settings: s.clone() }
                                 PipelineSection { settings: s }
                             }),
@@ -547,189 +551,6 @@ async fn save_settings(
     ok
 }
 
-#[component]
-fn AiSection(settings: Settings) -> Element {
-    let app = use_app();
-    let mut base = use_signal(|| settings.openai_base_url.clone());
-    let mut model = use_signal(|| settings.openai_model.clone());
-    let mut key = use_signal(String::new);
-    // Bumped when the key field is cleared by code, to remount it empty.
-    let mut key_rev = use_signal(|| 0u64);
-    let mut replacing = use_signal(|| false);
-    let mut confirm_remove = use_signal(|| false);
-    let error = use_signal(|| None::<String>);
-    let key_error = use_signal(|| None::<String>);
-    let busy = use_signal(|| false);
-    let key_busy = use_signal(|| false);
-    let mut saved_note = use_signal(|| false);
-    let mut base_error = use_signal(|| None::<&'static str>);
-    let mut model_error = use_signal(|| None::<&'static str>);
-
-    let dirty = *base.read() != settings.openai_base_url || *model.read() != settings.openai_model;
-    let show_key_input = !settings.has_api_key || *replacing.read();
-
-    rsx! {
-        section { class: "set-sec",
-            h2 { "AI provider" }
-            p { class: "help", "Margin uses an OpenAI-compatible Responses API for chats, outlines, lessons and video scenes. The default model is used wherever a slot under Models names none." }
-            form {
-                style: "display: grid; gap: 14px",
-                onsubmit: {
-                    let settings = settings.clone();
-                    move |e: FormEvent| {
-                        e.prevent_default();
-                        let settings = settings.clone();
-                        async move {
-                            if *busy.peek() {
-                                return;
-                            }
-                            let b = base.peek().trim().to_string();
-                            let m = model.peek().trim().to_string();
-                            if b == settings.openai_base_url && m == settings.openai_model {
-                                return;
-                            }
-                            // Checked here, each under its own field, before anything is sent.
-                            let b_problem = base_url_problem(&b);
-                            let m_problem = m.is_empty().then_some("Enter a model name.");
-                            base_error.set(b_problem);
-                            model_error.set(m_problem);
-                            if b_problem.is_some() {
-                                focus_first("#ai-base");
-                                return;
-                            }
-                            if m_problem.is_some() {
-                                focus_first("#ai-model");
-                                return;
-                            }
-                            let patch = SettingsPatch {
-                                openai_base_url: (b != settings.openai_base_url).then_some(b),
-                                openai_model: (m != settings.openai_model).then_some(m),
-                                ..Default::default()
-                            };
-                            if save_settings(app, patch, error, busy).await {
-                                saved_note.set(true);
-                            }
-                        }
-                    }
-                },
-                div { class: "grid2",
-                    div { class: "field",
-                        label { r#for: "ai-base", "Base URL" }
-                        input {
-                            id: "ai-base",
-                            class: "input",
-                            r#type: "url",
-                            "aria-invalid": base_error.read().is_some().to_string(),
-                            "aria-describedby": base_error.read().is_some().then_some("ai-base-err"),
-                            initial_value: "{base}",
-                            oninput: move |e| { saved_note.set(false); base_error.set(None); base.set(e.value()) },
-                        }
-                        if let Some(err) = *base_error.read() {
-                            span { id: "ai-base-err", class: "field-error", "{err}" }
-                        }
-                    }
-                    div { class: "field",
-                        label { r#for: "ai-model", "Default model" }
-                        input {
-                            id: "ai-model",
-                            class: "input",
-                            "aria-invalid": model_error.read().is_some().to_string(),
-                            "aria-describedby": model_error.read().is_some().then_some("ai-model-err"),
-                            initial_value: "{model}",
-                            oninput: move |e| { saved_note.set(false); model_error.set(None); model.set(e.value()) },
-                        }
-                        if let Some(err) = *model_error.read() {
-                            span { id: "ai-model-err", class: "field-error", "{err}" }
-                        }
-                    }
-                }
-                if let Some(err) = error.read().clone() {
-                    span { class: "save-state error", role: "alert", "{err}" }
-                }
-                div { class: "row-actions",
-                    button {
-                        r#type: "submit",
-                        class: "btn btn-primary btn-sm",
-                        disabled: !dirty || *busy.read(),
-                        SaveLabel { busy: *busy.read() }
-                    }
-                    if *saved_note.read() && !dirty {
-                        span { class: "save-state", role: "status", "Saved" }
-                    }
-                }
-            }
-            div { class: "field",
-                label { r#for: "ai-key", "API key" }
-                if show_key_input {
-                    form {
-                        class: "row-actions",
-                        onsubmit: move |e: FormEvent| async move {
-                            e.prevent_default();
-                            let k = key.peek().trim().to_string();
-                            if k.is_empty() || *key_busy.peek() {
-                                return;
-                            }
-                            let patch = SettingsPatch { openai_api_key: Some(k), ..Default::default() };
-                            if save_settings(app, patch, key_error, key_busy).await {
-                                key.set(String::new());
-                                key_rev += 1;
-                                replacing.set(false);
-                            }
-                        },
-                        for rev in std::iter::once(key_rev()) {
-                        input {
-                            key: "{rev}",
-                            id: "ai-key",
-                            class: "input",
-                            style: "flex: 1; min-width: 220px",
-                            r#type: "password",
-                            autocomplete: "off",
-                            placeholder: "sk-…",
-                            initial_value: "{key}",
-                            oninput: move |e| key.set(e.value()),
-                        }
-                        }
-                        button {
-                            r#type: "submit",
-                            class: "btn btn-primary btn-sm",
-                            disabled: key.read().trim().is_empty() || *key_busy.read(),
-                            SaveLabel { busy: *key_busy.read(), label: "Save key" }
-                        }
-                        if settings.has_api_key {
-                            button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
-                        }
-                    }
-                    p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its secret store (the Keychain on a Mac, a private file on Linux). It is never shown again." }
-                } else {
-                    div { class: "key-saved",
-                        Icon { name: "check" }
-                        span { class: "grow", style: "white-space: normal", "Saved in the service's secret store" }
-                        button { class: "btn btn-secondary btn-sm", onclick: move |_| replacing.set(true), "Replace" }
-                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_remove.set(true), "Remove…" }
-                    }
-                }
-                if let Some(err) = key_error.read().clone() {
-                    span { class: "save-state error", "{err}" }
-                }
-            }
-        }
-        if *confirm_remove.read() {
-            ConfirmDialog {
-                title: "Remove the API key?",
-                message: "The key is deleted from the service's secret store. Asking and generating stop working until you add a key again.",
-                confirm_label: "Remove key",
-                busy: *key_busy.read(),
-                on_cancel: move |_| confirm_remove.set(false),
-                on_confirm: move |_| async move {
-                    let patch = SettingsPatch { openai_api_key: Some(String::new()), ..Default::default() };
-                    save_settings(app, patch, key_error, key_busy).await;
-                    confirm_remove.set(false);
-                },
-            }
-        }
-    }
-}
-
 /// How hard the agent thinks, in words.
 pub fn effort_label(effort: ReasoningEffort) -> &'static str {
     match effort {
@@ -751,7 +572,7 @@ pub fn shown_effort(effort: ReasoningEffort) -> ReasoningEffort {
     }
 }
 
-/// The label of a model slot (Settings → AI → Models).
+/// The label of a model slot (Settings → AI, each provider's block).
 pub fn slot_label(route: Route) -> &'static str {
     match route {
         Route::Chat => "Model for chats",
@@ -769,90 +590,246 @@ pub fn slot_help(route: Route) -> &'static str {
     }
 }
 
-/// The model a slot names now, "" for the default model. Chats run on the pipeline's
-/// chat route when it names one (the service gives it precedence), else `agent_model`;
-/// writing and small tasks on the pipeline's route for them.
-pub fn slot_value(settings: &Settings, route: Route) -> String {
-    match route {
-        Route::Chat => settings
-            .pipeline
-            .routes
-            .chat
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .or_else(|| settings.agent_model.clone())
-            .unwrap_or_default(),
-        Route::Write | Route::Small => settings
-            .pipeline
-            .routes
-            .get(route)
-            .unwrap_or_default()
-            .to_string(),
+/// The provider block Settings → AI scrolls to when it opens (an error's "Open Settings",
+/// the chat's "Set up" notice), then forgets.
+pub static AI_FOCUS: GlobalSignal<Option<Provider>> = Signal::global(|| None);
+
+/// Open Settings → AI at `provider`'s block.
+pub fn open_provider_settings(app: crate::state::AppCtx, provider: Provider) {
+    *AI_FOCUS.write() = Some(provider);
+    let mut open = app.settings_open;
+    open.set(Some(SettingsPane::Ai));
+}
+
+/// The id of a provider's block in Settings → AI: "ai-openai", "ai-chatgpt", "ai-claude".
+pub fn provider_block_id(provider: Provider) -> String {
+    format!("ai-{}", provider.as_str())
+}
+
+/// What a provider is, under its heading.
+pub fn provider_help(provider: Provider) -> &'static str {
+    match provider {
+        Provider::OpenAi => {
+            "OpenAI's Responses API (or an OpenAI-compatible one) with an API key you pay for by use."
+        }
+        Provider::ChatGpt => {
+            "Margin uses your ChatGPT plan for what you ask it here. You can cap Margin's share in ChatGPT → Settings → Usage."
+        }
+        Provider::Claude => "Anthropic's Messages API with an API key you pay for by use.",
     }
 }
 
-/// The patch that sets the slots to `wanted` (in `Route::ALL` order; "" = the default
-/// model): only what changed, the pipeline sent whole with its routes updated.
-pub fn slots_patch(settings: &Settings, wanted: &[String; 3]) -> SettingsPatch {
-    let mut patch = SettingsPatch::default();
-    let mut routes = settings.pipeline.routes.clone();
-    let mut routes_changed = false;
-    for (route, value) in Route::ALL.into_iter().zip(wanted) {
-        let value = value.trim();
-        if value == slot_value(settings, route) {
-            continue;
+/// What a provider needs before it answers, for the default-provider note and the chat's
+/// notice: "Add an OpenAI API key", "Sign in with ChatGPT", "Add a Claude API key".
+pub fn provider_setup(provider: Provider) -> &'static str {
+    match provider {
+        Provider::OpenAi => "Add an OpenAI API key",
+        Provider::ChatGpt => "Sign in with ChatGPT",
+        Provider::Claude => "Add a Claude API key",
+    }
+}
+
+/// "1M context", "200k context": a model's window, as Settings shows it beside the id.
+pub fn window_text(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        // One decimal at most, rounded down: 1 050 000 is "1M", 1 500 000 "1.5M".
+        let tenths = tokens / 100_000;
+        if tenths.is_multiple_of(10) {
+            format!("{}M context", tenths / 10)
+        } else {
+            format!("{}.{}M context", tenths / 10, tenths % 10)
         }
-        let model = (!value.is_empty()).then(|| value.to_string());
-        match route {
-            // The slot is `agent_model`; a chat route would win over it, so it's cleared.
-            Route::Chat => {
-                patch.agent_model = Some(model);
-                if routes.chat.is_some() {
-                    routes.chat = None;
-                    routes_changed = true;
-                }
-            }
-            Route::Write => {
-                routes.write = model;
-                routes_changed = true;
-            }
-            Route::Small => {
-                routes.small = model;
-                routes_changed = true;
+    } else if tokens >= 1000 {
+        format!("{}k context", tokens / 1000)
+    } else {
+        format!("{tokens} context")
+    }
+}
+
+/// What the service runs a model on when its provider doesn't say its window (D13).
+pub const WINDOW_UNKNOWN: &str = "window unknown, using 200k";
+
+/// The note beside a slot's model: its window when the provider's list has it, "window
+/// unknown, using 200k" when the list doesn't know it; nothing before the list is here
+/// or for an empty slot.
+pub fn window_note(models: Option<&[ModelInfo]>, id: &str) -> Option<String> {
+    let models = models?;
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(
+        match models
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.context_window)
+        {
+            Some(window) => window_text(window),
+            None => WINDOW_UNKNOWN.to_string(),
+        },
+    )
+}
+
+/// Whether `model` is one of `provider`'s: in its list when the list is here, else by
+/// name (Claude's ids start with "claude").
+pub fn model_belongs(provider: Provider, model: &str, models: Option<&[ModelInfo]>) -> bool {
+    match models {
+        Some(list) => list.iter().any(|m| m.id == model),
+        None => model.starts_with("claude") == (provider == Provider::Claude),
+    }
+}
+
+/// The model a pipeline variant pins for `route`, when it is `provider`'s: the service
+/// runs that instead of the slot (`pipeline.routes`, read-only here).
+pub fn slot_override(
+    settings: &Settings,
+    provider: Provider,
+    route: Route,
+    models: Option<&[ModelInfo]>,
+) -> Option<String> {
+    let id = settings.pipeline.routes.get(route)?.trim();
+    (!id.is_empty() && model_belongs(provider, id, models)).then(|| id.to_string())
+}
+
+/// The models a slot offers, in order: Claude's defaults first (Opus, Sonnet, Haiku 5.5),
+/// then the rest as the provider lists them.
+pub fn model_options(provider: Provider, models: &[ModelInfo]) -> Vec<ModelInfo> {
+    let mut out: Vec<ModelInfo> = Vec::with_capacity(models.len());
+    if provider == Provider::Claude {
+        for id in CLAUDE_LISTED_MODELS {
+            if let Some(m) = models.iter().find(|m| m.id == id) {
+                out.push(m.clone());
             }
         }
     }
-    if routes_changed {
-        patch.pipeline = Some(PipelineConfig {
-            routes,
-            ..settings.pipeline.clone()
-        });
+    for m in models {
+        if !out.iter().any(|o| o.id == m.id) {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+/// The patch that sets `provider`'s three slots.
+pub fn models_patch(provider: Provider, models: RouteModels) -> SettingsPatch {
+    let mut patch = SettingsPatch::default();
+    match provider {
+        Provider::OpenAi => patch.openai_models = Some(models),
+        Provider::ChatGpt => patch.chatgpt_models = Some(models),
+        Provider::Claude => patch.claude_models = Some(models),
     }
     patch
 }
 
-/// The three model slots: which model chats, writing and small tasks use.
+/// The patch that stores (or, with "", removes) `provider`'s API key. ChatGPT has none.
+pub fn key_patch(provider: Provider, key: String) -> SettingsPatch {
+    match provider {
+        Provider::Claude => SettingsPatch {
+            anthropic_api_key: Some(key),
+            ..Default::default()
+        },
+        _ => SettingsPatch {
+            openai_api_key: Some(key),
+            ..Default::default()
+        },
+    }
+}
+
+/// Whether this app runs on a Mac, where "Continue with ChatGPT" opens the sign-in in
+/// the browser (the service usually runs on the same Mac).
+pub const OPENS_SIGN_IN_HERE: bool = cfg!(all(feature = "desktop", target_os = "macos"));
+
+/// Fetch `provider`'s models into the store (Settings and the slots show them).
+async fn load_models(app: crate::state::AppCtx, provider: Provider) -> Result<(), String> {
+    let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
+    match api.provider_models(provider).await {
+        Ok(list) => {
+            let mut lib = app.lib;
+            lib.write().provider_models.insert(provider, list);
+            Ok(())
+        }
+        Err(e) => Err(app.failure(&e)),
+    }
+}
+
+/// The top of Settings → AI: which provider new chats and the jobs use.
 #[component]
-fn ModelsSection(settings: Settings) -> Element {
+fn ProvidersSection(settings: Settings) -> Element {
     let app = use_app();
-    let current = Route::ALL.map(|r| slot_value(&settings, r));
-    let mut values = use_signal(|| current.clone());
     let error = use_signal(|| None::<String>);
     let busy = use_signal(|| false);
-    let mut saved_note = use_signal(|| false);
-    let dirty = values
-        .read()
-        .iter()
-        .zip(current.iter())
-        .any(|(v, c)| v.trim() != c);
-    let default_model = settings.openai_model.clone();
+    let current = settings.default_provider;
+    // Scroll to the block an error or the chat asked for.
+    use_effect(move || {
+        if let Some(p) = *AI_FOCUS.read() {
+            let id = provider_block_id(p);
+            let _ = js(&format!(
+                "setTimeout(function () {{ var el = document.getElementById('{id}'); if (el) {{ el.scrollIntoView({{block: 'start'}}); var f = el.querySelector('input, button'); if (f) f.focus({{preventScroll: true}}); }} }}, 50);"
+            ));
+            *AI_FOCUS.write() = None;
+        }
+    });
 
     rsx! {
         section { class: "set-sec",
-            h2 { "Models" }
-            p { class: "help", "Which model each kind of work uses. Leave a slot empty to use the default model ({default_model})." }
+            h2 { "Providers" }
+            p { class: "help", "Margin can answer with OpenAI, your ChatGPT plan or Claude. Each chat stays on the provider it was started with; lessons, videos, outlines, chat titles and condensing use the default." }
+            div { class: "field",
+                span { class: "label", id: "ai-default-label", "Default provider" }
+                div { class: "seg", role: "radiogroup", "aria-labelledby": "ai-default-label", "aria-busy": busy.read().to_string(),
+                    for p in Provider::ALL {
+                        button {
+                            key: "{p.as_str()}",
+                            role: "radio",
+                            "aria-checked": (p == current).to_string(),
+                            tabindex: if p == current { "0" } else { "-1" },
+                            onclick: move |_| async move {
+                                if p == current || *busy.peek() {
+                                    return;
+                                }
+                                let patch = SettingsPatch { default_provider: Some(p), ..Default::default() };
+                                save_settings(app, patch, error, busy).await;
+                            },
+                            {p.label()}
+                        }
+                    }
+                }
+                if !settings.has_credential(current) {
+                    span { id: "ai-default-setup", class: "faint", style: "font-size: 13px",
+                        "{provider_setup(current)} to use it. "
+                        button {
+                            class: "link-btn",
+                            onclick: move |_| open_provider_settings(app, current),
+                            "Set it up below"
+                        }
+                    }
+                }
+                if let Some(err) = error.read().clone() {
+                    span { class: "save-state error", role: "alert", "{err}" }
+                }
+            }
+        }
+    }
+}
+
+/// OpenAI: the base URL, the API key and the three slots.
+#[component]
+fn OpenAiSection(settings: Settings) -> Element {
+    let app = use_app();
+    let mut base = use_signal(|| settings.openai_base_url.clone());
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
+    let mut base_error = use_signal(|| None::<&'static str>);
+    let dirty = base.read().trim() != settings.openai_base_url;
+
+    rsx! {
+        section { id: provider_block_id(Provider::OpenAi), class: "set-sec",
+            h2 { "OpenAI" }
+            p { class: "help", {provider_help(Provider::OpenAi)} }
             form {
-                style: "display: grid; gap: 14px",
+                class: "row-actions",
+                style: "align-items: flex-end",
                 onsubmit: {
                     let settings = settings.clone();
                     move |e: FormEvent| {
@@ -862,48 +839,525 @@ fn ModelsSection(settings: Settings) -> Element {
                             if *busy.peek() {
                                 return;
                             }
-                            let patch = slots_patch(&settings, &values.peek());
-                            if patch == SettingsPatch::default() {
+                            let b = base.peek().trim().to_string();
+                            if b == settings.openai_base_url {
                                 return;
                             }
+                            let problem = base_url_problem(&b);
+                            base_error.set(problem);
+                            if problem.is_some() {
+                                focus_first("#ai-base");
+                                return;
+                            }
+                            let patch = SettingsPatch { openai_base_url: Some(b), ..Default::default() };
                             if save_settings(app, patch, error, busy).await {
                                 saved_note.set(true);
                             }
                         }
                     }
                 },
-                for (i, route) in Route::ALL.into_iter().enumerate() {
-                    div { key: "{route.as_str()}", class: "field",
-                        label { r#for: "ai-slot-{route.as_str()}", {slot_label(route)} }
-                        input {
-                            id: "ai-slot-{route.as_str()}",
-                            class: "input",
-                            autocomplete: "off",
-                            "aria-describedby": "ai-slot-{route.as_str()}-help",
-                            placeholder: "Default model ({default_model})",
-                            initial_value: "{current[i]}",
-                            oninput: move |e| {
-                                saved_note.set(false);
-                                values.write()[i] = e.value();
-                            },
-                        }
-                        span { id: "ai-slot-{route.as_str()}-help", class: "faint", style: "font-size: 13px", {slot_help(route)} }
+                div { class: "field", style: "flex: 1; min-width: 220px",
+                    label { r#for: "ai-base", "Base URL" }
+                    input {
+                        id: "ai-base",
+                        class: "input",
+                        r#type: "url",
+                        "aria-invalid": base_error.read().is_some().to_string(),
+                        "aria-describedby": base_error.read().is_some().then_some("ai-base-err"),
+                        initial_value: "{base}",
+                        oninput: move |e| { saved_note.set(false); base_error.set(None); base.set(e.value()) },
+                    }
+                    if let Some(err) = *base_error.read() {
+                        span { id: "ai-base-err", class: "field-error", "{err}" }
                     }
                 }
-                if let Some(err) = error.read().clone() {
-                    span { class: "save-state error", role: "alert", "{err}" }
+                button {
+                    r#type: "submit",
+                    class: "btn btn-secondary btn-sm",
+                    disabled: !dirty || *busy.read(),
+                    SaveLabel { busy: *busy.read() }
                 }
-                div { class: "row-actions",
+                if *saved_note.read() && !dirty {
+                    span { class: "save-state", role: "status", "Saved" }
+                }
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+            ApiKeyField { provider: Provider::OpenAi, has_key: settings.has_api_key }
+            // Mounted again when the credential comes or goes, so the list is fetched then.
+            ModelSlots { key: "{settings.has_credential(Provider::OpenAi)}", provider: Provider::OpenAi, settings: settings.clone() }
+        }
+    }
+}
+
+/// Claude: the API key and the three slots.
+#[component]
+fn ClaudeSection(settings: Settings) -> Element {
+    rsx! {
+        section { id: provider_block_id(Provider::Claude), class: "set-sec",
+            h2 { "Claude" }
+            p { class: "help", {provider_help(Provider::Claude)} }
+            ApiKeyField { provider: Provider::Claude, has_key: settings.has_claude_api_key }
+            // Mounted again when the credential comes or goes, so the list is fetched then.
+            ModelSlots { key: "{settings.has_credential(Provider::Claude)}", provider: Provider::Claude, settings: settings.clone() }
+        }
+    }
+}
+
+/// A provider's API key: stored on the service (never on this device), replaced, removed.
+#[component]
+fn ApiKeyField(provider: Provider, has_key: bool) -> Element {
+    let app = use_app();
+    let mut key = use_signal(String::new);
+    // Bumped when the key field is cleared by code, to remount it empty.
+    let mut key_rev = use_signal(|| 0u64);
+    let mut replacing = use_signal(|| false);
+    let mut confirm_remove = use_signal(|| false);
+    let key_error = use_signal(|| None::<String>);
+    let key_busy = use_signal(|| false);
+    let show_key_input = !has_key || *replacing.read();
+    let id = format!("ai-key-{}", provider.as_str());
+    let placeholder = match provider {
+        Provider::Claude => "sk-ant-…",
+        _ => "sk-…",
+    };
+
+    rsx! {
+        div { class: "field",
+            label { r#for: "{id}", "API key" }
+            if show_key_input {
+                form {
+                    class: "row-actions",
+                    onsubmit: move |e: FormEvent| async move {
+                        e.prevent_default();
+                        let k = key.peek().trim().to_string();
+                        if k.is_empty() || *key_busy.peek() {
+                            return;
+                        }
+                        if save_settings(app, key_patch(provider, k), key_error, key_busy).await {
+                            key.set(String::new());
+                            key_rev += 1;
+                            replacing.set(false);
+                        }
+                    },
+                    for rev in std::iter::once(key_rev()) {
+                    input {
+                        key: "{rev}",
+                        id: "{id}",
+                        class: "input",
+                        style: "flex: 1; min-width: 220px",
+                        r#type: "password",
+                        autocomplete: "off",
+                        placeholder,
+                        initial_value: "{key}",
+                        oninput: move |e| key.set(e.value()),
+                    }
+                    }
                     button {
                         r#type: "submit",
                         class: "btn btn-primary btn-sm",
-                        disabled: !dirty || *busy.read(),
-                        SaveLabel { busy: *busy.read() }
+                        disabled: key.read().trim().is_empty() || *key_busy.read(),
+                        SaveLabel { busy: *key_busy.read(), label: "Save key" }
                     }
-                    if *saved_note.read() && !dirty {
-                        span { class: "save-state", role: "status", "Saved" }
+                    if has_key {
+                        button { r#type: "button", class: "btn btn-ghost btn-sm", onclick: move |_| { key.set(String::new()); key_rev += 1; replacing.set(false) }, "Cancel" }
                     }
                 }
+                p { class: "faint", style: "margin: 0; font-size: 13px", "Sent once to the service and kept in its secret store (the Keychain on a Mac, a private file on Linux), never on this device. It is never shown again." }
+            } else {
+                div { class: "key-saved",
+                    Icon { name: "check" }
+                    span { class: "grow", style: "white-space: normal", "Saved in the service's secret store" }
+                    button { class: "btn btn-secondary btn-sm", "aria-label": "Replace the {provider.label()} key", onclick: move |_| replacing.set(true), "Replace" }
+                    button { class: "btn btn-secondary btn-sm", "aria-label": "Remove the {provider.label()} key", onclick: move |_| confirm_remove.set(true), "Remove…" }
+                }
+            }
+            if let Some(err) = key_error.read().clone() {
+                span { class: "save-state error", "{err}" }
+            }
+        }
+        if *confirm_remove.read() {
+            ConfirmDialog {
+                title: "Remove the {provider.label()} API key?",
+                message: "The key is deleted from the service's secret store. Chats on {provider.label()} stop answering, and so do lessons and videos while it is the default, until you add a key again.",
+                confirm_label: "Remove key",
+                busy: *key_busy.read(),
+                on_cancel: move |_| confirm_remove.set(false),
+                on_confirm: move |_| async move {
+                    save_settings(app, key_patch(provider, String::new()), key_error, key_busy).await;
+                    confirm_remove.set(false);
+                },
+            }
+        }
+    }
+}
+
+/// A provider's three model slots: chats, writing, small tasks. Each is a combobox over
+/// the provider's models once they are here (free text otherwise), with the model's
+/// window beside it and, when a pipeline variant pins the route, the model it runs.
+#[component]
+fn ModelSlots(provider: Provider, settings: Settings) -> Element {
+    let app = use_app();
+    let has_credential = settings.has_credential(provider);
+    // The list, fetched while the provider has a credential (again when it gets one).
+    let mut list_load = use_resource(move || async move {
+        if has_credential {
+            load_models(app, provider).await
+        } else {
+            Ok(())
+        }
+    });
+    let list_error = match &*list_load.read() {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let models: Option<Vec<ModelInfo>> = app.lib.read().provider_models.get(&provider).cloned();
+    let current = settings.models(provider).clone();
+    let current_slots = Route::ALL.map(|r| current.get(r).to_string());
+    let mut values = use_signal(|| current_slots.clone());
+    let mut problems = use_signal(|| [None::<&'static str>; 3]);
+    let error = use_signal(|| None::<String>);
+    let busy = use_signal(|| false);
+    let mut saved_note = use_signal(|| false);
+    let dirty = values
+        .read()
+        .iter()
+        .zip(current_slots.iter())
+        .any(|(v, c)| v.trim() != c);
+    let p = provider.as_str();
+    let list_id = format!("ai-models-{p}");
+    let options = models
+        .as_deref()
+        .map(|m| model_options(provider, m))
+        .unwrap_or_default();
+
+    rsx! {
+        form {
+            class: "slots",
+            style: "display: grid; gap: 14px",
+            novalidate: true,
+            "aria-label": "{provider.label()} models",
+            onsubmit: move |e: FormEvent| async move {
+                e.prevent_default();
+                if *busy.peek() {
+                    return;
+                }
+                let wanted = values.peek().clone();
+                let found = wanted.clone().map(|v| v.trim().is_empty().then_some("Enter a model id."));
+                problems.set(found);
+                if let Some(i) = found.iter().position(Option::is_some) {
+                    focus_first(&format!("#ai-slot-{p}-{}", Route::ALL[i].as_str()));
+                    return;
+                }
+                let models = RouteModels {
+                    chat: wanted[0].trim().to_string(),
+                    write: wanted[1].trim().to_string(),
+                    small: wanted[2].trim().to_string(),
+                };
+                if save_settings(app, models_patch(provider, models), error, busy).await {
+                    saved_note.set(true);
+                }
+            },
+            if !options.is_empty() {
+                datalist { id: "{list_id}",
+                    for m in options.iter() {
+                        option { key: "{m.id}", value: "{m.id}",
+                            {m.display_name.clone().unwrap_or_default()}
+                        }
+                    }
+                }
+            }
+            div { style: "display: grid; gap: 14px",
+                for (i, route) in Route::ALL.into_iter().enumerate() {
+                    {
+                        let slot_id = format!("ai-slot-{p}-{}", route.as_str());
+                        let value = values.read()[i].clone();
+                        let note = window_note(models.as_deref(), &value);
+                        let pinned = slot_override(&settings, provider, route, models.as_deref());
+                        let problem = problems.read()[i];
+                        rsx! {
+                            div { key: "{route.as_str()}", class: "field",
+                                label { r#for: "{slot_id}", {slot_label(route)} }
+                                input {
+                                    id: "{slot_id}",
+                                    class: "input",
+                                    autocomplete: "off",
+                                    spellcheck: "false",
+                                    list: if !options.is_empty() { list_id.clone() },
+                                    "aria-invalid": problem.is_some().to_string(),
+                                    "aria-describedby": "{slot_id}-help",
+                                    placeholder: "A model id",
+                                    initial_value: "{current_slots[i]}",
+                                    oninput: move |e| {
+                                        saved_note.set(false);
+                                        problems.write()[i] = None;
+                                        values.write()[i] = e.value();
+                                    },
+                                }
+                                span { id: "{slot_id}-help", class: "faint", style: "font-size: 13px",
+                                    {slot_help(route)}
+                                    if let Some(note) = note {
+                                        " · "
+                                        span { class: "slot-window", "{note}" }
+                                    }
+                                }
+                                if let Some(problem) = problem {
+                                    span { class: "field-error", "{problem}" }
+                                }
+                                if let Some(id) = pinned {
+                                    span { class: "slot-pinned", "Overridden by the pipeline variant: "
+                                        span { class: "mono", "{id}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !has_credential {
+                p { class: "faint", style: "margin: 0; font-size: 13px",
+                    "{provider_setup(provider)} to choose from {provider.label()}'s models; until then type a model id."
+                }
+            }
+            if let Some(err) = list_error {
+                ErrorNotice { message: format!("Couldn't load {}'s models. {err}", provider.label()), on_retry: move |_| list_load.restart() }
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+            div { class: "row-actions",
+                button {
+                    r#type: "submit",
+                    class: "btn btn-primary btn-sm",
+                    disabled: !dirty || *busy.read(),
+                    SaveLabel { busy: *busy.read(), label: "Save models" }
+                }
+                if *saved_note.read() && !dirty {
+                    span { class: "save-state", role: "status", "Saved" }
+                }
+            }
+        }
+    }
+}
+
+/// Ask the service where the ChatGPT sign-in is, and keep asking every 2 s while it
+/// waits for the browser. One poller at a time.
+async fn poll_chatgpt(app: crate::state::AppCtx, mut polling: Signal<bool>) {
+    if *polling.peek() {
+        return;
+    }
+    polling.set(true);
+    loop {
+        let Some(api) = app.api() else { break };
+        let status = match api.chatgpt_status().await {
+            Ok(status) => status,
+            Err(e) => {
+                app.failure(&e);
+                break;
+            }
+        };
+        let waiting = matches!(status, ChatGptStatus::Waiting { .. });
+        let mut lib = app.lib;
+        lib.write().chatgpt = Some(status);
+        if !waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    polling.set(false);
+}
+
+/// ChatGPT: "Continue with ChatGPT" (the sign-in runs on the service's Mac), its state,
+/// sign out, and the three slots from the account's models.
+#[component]
+fn ChatGptSection(settings: Settings) -> Element {
+    let app = use_app();
+    let polling = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let mut confirm_signout = use_signal(|| false);
+    let mut copies = use_signal(|| 0u32);
+    let mut copied = use_signal(|| None::<Result<(), String>>);
+    let mut open_error = use_signal(|| None::<String>);
+    // Where the sign-in is now (and, while it waits, again every 2 s).
+    use_future(move || poll_chatgpt(app, polling));
+    let status = app.lib.read().chatgpt_status();
+
+    let start = move |_| async move {
+        if *busy.peek() {
+            return;
+        }
+        let Some(api) = app.api() else { return };
+        busy.set(true);
+        error.set(None);
+        open_error.set(None);
+        match api.start_chatgpt().await {
+            Ok(started) => {
+                let mut lib = app.lib;
+                lib.write().chatgpt = Some(ChatGptStatus::Waiting {
+                    authorize_url: started.authorize_url.clone(),
+                });
+                if OPENS_SIGN_IN_HERE {
+                    open_error.set(open_external(&started.authorize_url).err());
+                }
+                spawn(poll_chatgpt(app, polling));
+            }
+            Err(e) => error.set(Some(app.failure(&e))),
+        }
+        busy.set(false);
+    };
+    let sign_out = move || async move {
+        let Some(api) = app.api() else { return };
+        busy.set(true);
+        match api.sign_out_chatgpt().await {
+            Ok(()) => {
+                error.set(None);
+                let mut lib = app.lib;
+                lib.write().chatgpt = Some(ChatGptStatus::SignedOut);
+                if let Ok(settings) = api.settings().await {
+                    lib.write().apply(Event::SettingsChanged { settings });
+                }
+            }
+            Err(e) => error.set(Some(app.failure(&e))),
+        }
+        busy.set(false);
+        confirm_signout.set(false);
+    };
+
+    rsx! {
+        section { id: provider_block_id(Provider::ChatGpt), class: "set-sec",
+            h2 { "ChatGPT" }
+            p { class: "help", {provider_help(Provider::ChatGpt)} }
+            match status.clone() {
+                ChatGptStatus::SignedOut => rsx! {
+                    div { class: "row-actions",
+                        button {
+                            class: "btn btn-primary btn-sm",
+                            disabled: *busy.read(),
+                            onclick: start,
+                            if *busy.read() { span { class: "spinner" } }
+                            "Continue with ChatGPT"
+                        }
+                    }
+                    p { class: "faint", style: "margin: 0; font-size: 13px",
+                        "You finish signing in in a browser on the Mac that runs Margin's service. Margin never sees your password, and no token is kept on this device."
+                    }
+                },
+                ChatGptStatus::Waiting { authorize_url } => rsx! {
+                    div { class: "chatgpt-wait", role: "status",
+                        span { class: "spinner xs", "aria-hidden": "true" }
+                        span { "Waiting for you to finish signing in…" }
+                    }
+                    p { class: "faint", style: "margin: 0; font-size: 13px",
+                        if OPENS_SIGN_IN_HERE {
+                            "The sign-in opened in your browser. If the service runs on another Mac, open this link on that Mac instead:"
+                        } else {
+                            "Open this link on the Mac that runs Margin's service:"
+                        }
+                    }
+                    div { class: "copy-wrap",
+                        pre { class: "code", style: "padding-right: 90px; white-space: pre-wrap; word-break: break-all", code { id: "chatgpt-link", "{authorize_url}" } }
+                        button {
+                            class: "btn btn-secondary btn-sm copy",
+                            "aria-label": "Copy the sign-in link",
+                            onclick: {
+                                let url = authorize_url.clone();
+                                move |_| {
+                                    let url = url.clone();
+                                    async move {
+                                        let n = *copies.peek() + 1;
+                                        copies.set(n);
+                                        copied.set(None);
+                                        let result = copy_to_clipboard(url).await;
+                                        let ok = result.is_ok();
+                                        copied.set(Some(result));
+                                        if ok {
+                                            tokio::time::sleep(COPIED_FOR).await;
+                                            if *copies.peek() == n {
+                                                copied.set(None);
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            Icon { name: "copy" }
+                            match copied.read().clone() {
+                                Some(Ok(())) => "Copied",
+                                _ => "Copy",
+                            }
+                        }
+                    }
+                    span { class: "sr-only", role: "status",
+                        if matches!(*copied.read(), Some(Ok(()))) { "Copied to the clipboard" }
+                    }
+                    if let Some(Err(err)) = copied.read().clone() {
+                        span { class: "save-state error", role: "alert", "{err}" }
+                    }
+                    if let Some(err) = open_error.read().clone() {
+                        span { class: "save-state error", role: "alert", "{err}" }
+                    }
+                    div { class: "row-actions",
+                        if OPENS_SIGN_IN_HERE {
+                            button {
+                                class: "btn btn-secondary btn-sm",
+                                onclick: {
+                                    let url = authorize_url.clone();
+                                    move |_| open_error.set(open_external(&url).err())
+                                },
+                                "Open in browser"
+                            }
+                        }
+                        button {
+                            class: "btn btn-ghost btn-sm",
+                            disabled: *busy.read(),
+                            onclick: move |_| sign_out(),
+                            "Cancel"
+                        }
+                    }
+                },
+                ChatGptStatus::SignedIn { account } => rsx! {
+                    div { class: "key-saved",
+                        Icon { name: "check" }
+                        span { class: "grow", style: "white-space: normal",
+                            "Signed in as "
+                            b { "{account.email}" }
+                            span { class: "faint", " · Signed in {date(&account.signed_in_at)}" }
+                        }
+                        button { class: "btn btn-secondary btn-sm", onclick: move |_| confirm_signout.set(true), "Sign out…" }
+                    }
+                },
+                ChatGptStatus::Failed { message } => rsx! {
+                    div { class: "notice error", role: "alert",
+                        Icon { name: "alert" }
+                        div { class: "body",
+                            span { "Signing in with ChatGPT didn't work. {message}" }
+                            div { class: "row-actions",
+                                button {
+                                    class: "btn btn-secondary btn-sm",
+                                    disabled: *busy.read(),
+                                    onclick: start,
+                                    "Try again"
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            if let Some(err) = error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+            // Mounted again when the credential comes or goes, so the list is fetched then.
+            ModelSlots { key: "{settings.has_credential(Provider::ChatGpt)}", provider: Provider::ChatGpt, settings: settings.clone() }
+        }
+        if *confirm_signout.read() {
+            ConfirmDialog {
+                title: "Sign out of ChatGPT?",
+                message: "The service deletes its ChatGPT sign-in. Chats on ChatGPT stop answering, and so do lessons and videos while it is the default, until you sign in again.",
+                confirm_label: "Sign out",
+                busy: *busy.read(),
+                on_cancel: move |_| confirm_signout.set(false),
+                on_confirm: move |_| sign_out(),
             }
         }
     }
@@ -1061,7 +1515,7 @@ pub fn parse_budget(fields: &[String; 4]) -> Result<Budget, (BudgetField, &'stat
 }
 
 /// `cfg` with its stages, prompts and budget back to the defaults; the model slots (its
-/// routes) are kept, since Models sets them, and so is the embedder (the service's).
+/// routes) are kept (an eval variant's override), and so is the embedder (the service's).
 pub fn reset_pipeline(cfg: &PipelineConfig) -> PipelineConfig {
     PipelineConfig {
         routes: cfg.routes.clone(),
@@ -2823,7 +3277,7 @@ mod tests {
         lib.settings = Some(settings);
         let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
         assert!(html.contains("Model for chats"), "{html}");
-        assert!(html.contains("Default model (gpt-5)"));
+        assert!(html.contains(r#"value="gpt-5""#));
         for e in ReasoningEffort::ALL {
             assert!(html.contains(effort_label(e)));
         }
@@ -2902,48 +3356,218 @@ mod tests {
     }
 
     #[test]
-    fn ai_pane_has_three_model_slots() {
+    fn ai_pane_has_three_model_slots_per_provider() {
         let mut settings = crate::fake::FakeState::new().settings;
-        settings.agent_model = Some("gpt-6.1-sol".into());
-        settings.pipeline.routes.small = Some("gpt-6-luna".into());
+        settings.openai_models.chat = "gpt-6.1-sol".into();
         let html = ai_pane(settings.clone());
-        assert!(html.contains("<h2>Models</h2>"), "{html}");
+        for (provider, heading) in [
+            (Provider::OpenAi, "<h2>OpenAI</h2>"),
+            (Provider::ChatGpt, "<h2>ChatGPT</h2>"),
+            (Provider::Claude, "<h2>Claude</h2>"),
+        ] {
+            assert!(html.contains(heading), "{heading}");
+            assert!(html.contains(&format!(r#"id="{}""#, provider_block_id(provider))));
+            for route in Route::ALL {
+                let id = format!(r#"id="ai-slot-{}-{}""#, provider.as_str(), route.as_str());
+                assert!(html.contains(&id), "{id}");
+            }
+        }
         for route in Route::ALL {
             assert!(html.contains(slot_label(route)));
             assert!(html.contains(&slot_help(route).replace('\'', "&#39;")));
-            assert!(html.contains(&format!(r#"id="ai-slot-{}""#, route.as_str())));
         }
-        // Each slot shows the model it names; an empty one says it uses the default.
+        // Each slot shows the model it names.
         assert!(html.contains(r#"value="gpt-6.1-sol""#));
-        assert!(html.contains(r#"value="gpt-6-luna""#));
-        assert!(html.contains(r#"placeholder="Default model (gpt-5)""#));
-        assert_eq!(slot_value(&settings, Route::Write), "");
-        // Clearing a slot sends "the default"; a route keeps the rest of the pipeline.
-        let patch = slots_patch(&settings, &["".into(), "gpt-6".into(), "gpt-6-luna".into()]);
-        assert_eq!(patch.agent_model, Some(None));
-        let pipeline = patch.pipeline.unwrap();
-        assert_eq!(pipeline.routes.write.as_deref(), Some("gpt-6"));
-        assert_eq!(pipeline.routes.small.as_deref(), Some("gpt-6-luna"));
-        assert_eq!(pipeline.budget, settings.pipeline.budget);
-        let only_chat = slots_patch(&settings, &["gpt-6".into(), "".into(), "gpt-6-luna".into()]);
-        assert_eq!(only_chat.agent_model, Some(Some("gpt-6".into())));
-        assert_eq!(only_chat.pipeline, None);
+        assert!(html.contains(r#"value="claude-opus-5-5""#));
+        assert!(html.contains(r#"value="claude-haiku-5-5""#));
+        // Without the lists: free text, no window, and what to set up to get them.
+        assert!(!html.contains("<datalist"));
+        assert!(!html.contains("slot-window"), "{html}");
+        assert!(html.contains("Add a Claude API key to choose from Claude&#39;s models"));
+        assert!(html.contains("Sign in with ChatGPT to choose from ChatGPT&#39;s models"));
+        // The default provider, and the keys: OpenAI's saved, Claude's to add.
+        assert!(html.contains(r#"aria-labelledby="ai-default-label""#));
+        for p in Provider::ALL {
+            assert!(html.contains(&format!(">{}<", p.label())));
+        }
+        assert!(html.contains(r#"aria-label="Replace the OpenAI key""#));
+        assert!(html.contains(r#"id="ai-key-claude""#));
+        assert!(html.contains(r#"placeholder="sk-ant-…""#));
+        assert!(html.contains("never on this device"));
+        assert!(html.contains(">Continue with ChatGPT<"));
+        assert!(html.contains("You can cap Margin&#39;s share in ChatGPT → Settings → Usage."));
+        assert!(!html.contains("Set it up below"));
 
-        // A chat route set elsewhere (a variant, the pipeline editor) is what chats run
-        // on: the slot shows it, and saving the slot clears it so the slot takes effect.
-        settings.pipeline.routes.chat = Some("gpt-6-terra".into());
-        assert_eq!(slot_value(&settings, Route::Chat), "gpt-6-terra");
-        let patch = slots_patch(&settings, &["gpt-7".into(), "".into(), "gpt-6-luna".into()]);
-        assert_eq!(patch.agent_model, Some(Some("gpt-7".into())));
-        let pipeline = patch.pipeline.unwrap();
-        assert_eq!(pipeline.routes.chat, None);
-        assert_eq!(pipeline.routes.small.as_deref(), Some("gpt-6-luna"));
-        // Unchanged: nothing is sent.
-        let same = slots_patch(
-            &settings,
-            &["gpt-6-terra".into(), "".into(), "gpt-6-luna".into()],
+        // A default provider that isn't set up says so.
+        settings.default_provider = Provider::Claude;
+        let html = ai_pane(settings.clone());
+        assert!(html.contains("Add a Claude API key to use it."), "{html}");
+        assert!(html.contains(">Set it up below<"));
+    }
+
+    #[test]
+    fn slots_list_the_providers_models_with_their_windows_and_the_override() {
+        use crate::store::LibraryState;
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.has_claude_api_key = true;
+        settings.claude_models.small = "claude-instant-9".into();
+        settings.pipeline.routes.write = Some("claude-sonnet-5-5".into());
+        let mut lib = LibraryState::from_library(crate::fake::sample_library());
+        lib.settings = Some(settings.clone());
+        for p in [Provider::OpenAi, Provider::Claude] {
+            lib.provider_models.insert(p, crate::fake::fake_models(p));
+        }
+        let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
+        // The lists, Claude's defaults first; the inputs pick from them.
+        assert!(
+            html.contains(r#"<datalist id="ai-models-claude">"#),
+            "{html}"
         );
-        assert_eq!(same, SettingsPatch::default());
+        assert!(html.contains(r#"list="ai-models-openai""#));
+        let claude = &html[html.find(r#"<datalist id="ai-models-claude">"#).unwrap()..];
+        let at = |id: &str| claude.find(&format!(r#"value="{id}""#)).unwrap();
+        assert!(at("claude-opus-5-5") < at("claude-sonnet-5-5"));
+        assert!(at("claude-sonnet-5-5") < at("claude-haiku-5-5"));
+        assert!(at("claude-haiku-5-5") < at("claude-opus-4-1"));
+        // Windows beside known models; the fallback named for the others.
+        assert!(html.contains(">1M context<"), "{html}");
+        assert!(html.contains(">window unknown, using 200k<"));
+        // gpt-5 (OpenAI's writing slot here) has no window in the list.
+        assert_eq!(settings.openai_models.write, "gpt-5");
+        // The variant's route override, read-only under Claude's writing slot only.
+        assert_eq!(
+            html.matches("Overridden by the pipeline variant: ").count(),
+            1,
+            "{html}"
+        );
+        assert!(html.contains(r#"<span class="mono">claude-sonnet-5-5</span>"#));
+    }
+
+    #[test]
+    fn slot_helpers() {
+        assert_eq!(window_text(1_050_000), "1M context");
+        assert_eq!(window_text(1_500_000), "1.5M context");
+        assert_eq!(window_text(200_000), "200k context");
+        assert_eq!(window_text(512), "512 context");
+        let models = crate::fake::fake_models(Provider::OpenAi);
+        assert_eq!(window_note(None, "gpt-6-luna"), None);
+        assert_eq!(window_note(Some(&models), " "), None);
+        assert_eq!(
+            window_note(Some(&models), "gpt-6-luna").as_deref(),
+            Some("1M context")
+        );
+        assert_eq!(
+            window_note(Some(&models), "gpt-5").as_deref(),
+            Some(WINDOW_UNKNOWN)
+        );
+        assert_eq!(
+            window_note(Some(&models), "mine").as_deref(),
+            Some(WINDOW_UNKNOWN)
+        );
+        // An override applies to the provider whose model it names.
+        assert!(model_belongs(Provider::Claude, "claude-x", None));
+        assert!(!model_belongs(Provider::OpenAi, "claude-x", None));
+        assert!(model_belongs(Provider::ChatGpt, "gpt-6", None));
+        assert!(!model_belongs(Provider::OpenAi, "gpt-7", Some(&models)));
+        let mut settings = crate::fake::FakeState::new().settings;
+        settings.pipeline.routes.small = Some("gpt-6-luna".into());
+        assert_eq!(
+            slot_override(&settings, Provider::OpenAi, Route::Small, Some(&models)).as_deref(),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            slot_override(&settings, Provider::Claude, Route::Small, None),
+            None
+        );
+        assert_eq!(
+            slot_override(&settings, Provider::OpenAi, Route::Chat, None),
+            None
+        );
+        // Patches.
+        let m = RouteModels::claude_default();
+        assert_eq!(
+            models_patch(Provider::Claude, m.clone()).claude_models,
+            Some(m.clone())
+        );
+        assert_eq!(
+            models_patch(Provider::ChatGpt, m.clone()).chatgpt_models,
+            Some(m.clone())
+        );
+        assert_eq!(
+            models_patch(Provider::OpenAi, m.clone()).openai_models,
+            Some(m)
+        );
+        assert_eq!(
+            key_patch(Provider::Claude, "k".into())
+                .anthropic_api_key
+                .as_deref(),
+            Some("k")
+        );
+        assert_eq!(
+            key_patch(Provider::OpenAi, String::new())
+                .openai_api_key
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn chatgpt_block_in_every_state() {
+        use crate::store::LibraryState;
+        let pane = |status: Option<ChatGptStatus>, signed_in: bool| {
+            let mut settings = crate::fake::FakeState::new().settings;
+            if signed_in {
+                settings.chatgpt = Some(crate::fake::fake_account("owner@example.com"));
+            }
+            let mut lib = LibraryState::from_library(crate::fake::sample_library());
+            lib.settings = Some(settings);
+            lib.chatgpt = status;
+            crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai))
+        };
+        // Signed out (as the settings say before the status arrives).
+        let html = pane(None, false);
+        assert!(html.contains(">Continue with ChatGPT<"));
+        assert!(html.contains("in a browser on the Mac that runs Margin&#39;s service"));
+        // Waiting: the link, to open on the service's Mac, with Copy and Cancel.
+        let url = "https://auth.openai.com/api/accounts/authorize?state=st-1";
+        let html = pane(
+            Some(ChatGptStatus::Waiting {
+                authorize_url: url.into(),
+            }),
+            false,
+        );
+        assert!(
+            html.contains("Waiting for you to finish signing in…"),
+            "{html}"
+        );
+        assert!(html.contains(url));
+        assert!(html.contains(r#"aria-label="Copy the sign-in link""#));
+        assert!(html.contains(">Cancel<"));
+        if OPENS_SIGN_IN_HERE {
+            assert!(html.contains(">Open in browser<"));
+        } else {
+            assert!(html.contains("Open this link on the Mac that runs Margin&#39;s service:"));
+        }
+        // Signed in: the account, when, Sign out; the slots on the account's models.
+        let html = pane(None, true);
+        assert!(html.contains("<b>owner@example.com</b>"), "{html}");
+        assert!(html.contains(" · Signed in "));
+        assert!(html.contains(">Sign out…<"));
+        assert!(!html.contains(">Continue with ChatGPT<"));
+        assert!(!html.contains("Sign in with ChatGPT to choose"));
+        assert!(html.contains(r#"value="gpt-6.1-sol""#));
+        // Failed: why, and Try again.
+        let html = pane(
+            Some(ChatGptStatus::Failed {
+                message: "The sign-in was cancelled.".into(),
+            }),
+            false,
+        );
+        assert!(
+            html.contains("Signing in with ChatGPT didn&#39;t work. The sign-in was cancelled."),
+            "{html}"
+        );
+        assert!(html.contains(">Try again<"));
     }
 
     #[test]
@@ -3174,6 +3798,8 @@ mod tests {
         lib.settings = Some(settings);
         let html = crate::ui::test_render::render_with_settings("/", lib, Some(SettingsPane::Ai));
         // Exactly one option is chosen, and it's Low; Minimal is never offered.
+        let html = &html[html.find(r#"aria-labelledby="ai-effort-label""#).unwrap()..];
+        let html = &html[..html.find("</div>").unwrap()];
         assert_eq!(html.matches(r#"aria-checked="true""#).count(), 1, "{html}");
         assert!(
             html.contains(r#"aria-checked="true" tabindex="0">Low<"#),

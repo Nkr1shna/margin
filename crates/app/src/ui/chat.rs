@@ -10,8 +10,8 @@ use dioxus::prelude::*;
 use margin_shared::{
     AcceptProposal, Card, Chat, ChatItem, ChatItemKind, ChatState, ConfirmRequest,
     ConfirmationCard, Decision, Event, Id, ItemStatus, LessonStatus, NewChat, NewMessage,
-    PassagesCard, ProposalStatus, ResultCard, ResultTarget, TitleSource, Usage, VideoStatus,
-    Waiting, error_code,
+    PassagesCard, ProposalStatus, Provider, ResultCard, ResultTarget, TitleSource, Usage,
+    VideoStatus, Waiting, WebCitation, WebResultsCard, error_code,
 };
 
 use crate::api::ApiFailure;
@@ -21,10 +21,11 @@ use crate::routes::{Route, chat_title};
 use crate::state::{AppCtx, LoadStatus, use_app};
 use crate::ui::citations::CitationViewer;
 use crate::ui::common::{
-    ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, reveal_topic, sentence,
+    ErrorNotice, Icon, Loading, TopBar, ago, announce, focus_first, js, open_external,
+    reveal_topic, sentence,
 };
 use crate::ui::outline::{OutlineDraft, ProposalView};
-use crate::ui::settings::SettingsPane;
+use crate::ui::settings::{SettingsPane, open_provider_settings, provider_setup};
 use crate::ui::sources::{
     AddSourcesMenu, ChatAttachments, EmbeddingNotice, composer_files, detach_folder, forget_sent,
     kind_icon, refresh_embedding,
@@ -161,6 +162,9 @@ pub fn tool_words(name: &str) -> String {
         "read_passage" => "Reading a passage".into(),
         "document_outline" => "Reading a document's outline".into(),
         "view_picture" => "Looking at a picture".into(),
+        // The provider's hosted web tools, before their query or address arrives.
+        "web_search" => "Searching the web".into(),
+        "web_fetch" => "Fetching a page".into(),
         _ => crate::ui::common::capitalize_first(&name.replace('_', " ")),
     }
 }
@@ -168,6 +172,7 @@ pub fn tool_words(name: &str) -> String {
 /// The icon of a tool's row.
 fn tool_icon(name: &str) -> &'static str {
     match name {
+        "web_search" | "web_fetch" => "globe",
         "search" => "search",
         "read_passage" => "note",
         "document_outline" => "book",
@@ -224,8 +229,9 @@ pub fn tokens_text(n: u64) -> String {
 }
 
 /// What the chat has spent, for the footer under the composer, and in full for its
-/// tooltip; `None` before the first model call.
-pub fn usage_text(usage: &Usage) -> Option<(String, String)> {
+/// tooltip; `None` before the first model call. Web searches are counted when there were
+/// any, with what they cost on `provider`.
+pub fn usage_text(usage: &Usage, provider: Provider) -> Option<(String, String)> {
     if usage.model_calls == 0 {
         return None;
     }
@@ -233,16 +239,46 @@ pub fn usage_text(usage: &Usage) -> Option<(String, String)> {
         1 => "1 model call".to_string(),
         n => format!("{n} model calls"),
     };
-    let short = format!(
+    let searches = match usage.web_search_requests {
+        0 => None,
+        1 => Some("1 web search".to_string()),
+        n => Some(format!("{n} web searches")),
+    };
+    let mut short = format!(
         "{} tokens in · {} out · {calls}",
         tokens_text(usage.input_tokens),
         tokens_text(usage.output_tokens)
     );
-    let full = format!(
+    if let Some(searches) = &searches {
+        short.push_str(&format!(" · {searches}"));
+    }
+    let mut full = format!(
         "This chat so far: {} input tokens ({} from the prompt cache), {} output tokens ({} \
          of them reasoning), {calls}.",
         usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens
     );
+    if usage.cache_write_input_tokens > 0 {
+        full.push_str(&format!(
+            " {} input tokens were written to the prompt cache.",
+            usage.cache_write_input_tokens
+        ));
+    }
+    if let Some(searches) = searches {
+        let fetches = match usage.web_fetch_requests {
+            0 => String::new(),
+            1 => " and 1 page fetched".to_string(),
+            n => format!(" and {n} pages fetched"),
+        };
+        let price = match provider {
+            Provider::ChatGpt => "they count against your ChatGPT plan",
+            Provider::OpenAi | Provider::Claude => "web search costs $10 per 1 000 searches",
+        };
+        full.push_str(&format!(
+            " {}{fetches} on {} ({price}).",
+            crate::ui::common::capitalize_first(&searches),
+            provider.label()
+        ));
+    }
     Some((short, full))
 }
 
@@ -266,12 +302,51 @@ pub fn retry_when(until: &DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 /// The Settings pane that fixes an error the turn stopped on (`ChatItemKind::Error.code`):
-/// no API key, or no model.
+/// no API key or model, a refused credential or ended sign-in, a spend or plan limit —
+/// all in Settings → AI, at the chat's provider.
 pub fn error_fix(code: Option<&str>) -> Option<SettingsPane> {
     match code {
-        Some(error_code::NO_API_KEY | error_code::NO_MODEL) => Some(SettingsPane::Ai),
+        Some(
+            error_code::NO_API_KEY
+            | error_code::NO_MODEL
+            | error_code::AUTH_FAILED
+            | error_code::SPEND_LIMIT_REACHED
+            | error_code::PLAN_LIMIT_REACHED
+            | error_code::PLAN_INELIGIBLE,
+        ) => Some(SettingsPane::Ai),
         _ => None,
     }
+}
+
+/// The send button's tooltip while `provider` can't answer yet.
+pub fn setup_to_ask(provider: Provider) -> &'static str {
+    match provider {
+        Provider::OpenAi => "Add an OpenAI API key in Settings to ask",
+        Provider::ChatGpt => "Sign in with ChatGPT in Settings to ask",
+        Provider::Claude => "Add a Claude API key in Settings to ask",
+    }
+}
+
+/// The page web citation `n` of answer `item_id` names (as its Sources list numbers
+/// them), for the marker clicked.
+pub fn web_cite_url(lib: &crate::store::LibraryState, item_id: &str, n: u32) -> Option<String> {
+    lib.chat_items
+        .values()
+        .flatten()
+        .find_map(|item| match &item.kind {
+            ChatItemKind::AssistantText { citations, .. } if item.id == item_id => {
+                cite::web_sources(citations)
+                    .into_iter()
+                    .find(|s| s.n == n)
+                    .map(|s| s.url)
+            }
+            _ => None,
+        })
+}
+
+/// The new chat's provider: the one picked, else Settings' default.
+pub fn new_chat_provider(picked: Option<Provider>, default: Provider) -> Provider {
+    picked.unwrap_or(default)
 }
 
 /// The id of a confirmation card, which "Answer the question above first" jumps to.
@@ -335,6 +410,8 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let mut act_error = use_signal(|| None::<ApiFailure>);
     // What adding files left out ("Skipped 2 files Margin can't read").
     let mut sources_note = use_signal(|| None::<String>);
+    // The provider the new chat is started on, when not Settings' default.
+    let mut picked = use_signal(|| None::<Provider>);
 
     // Whether an API key is set, to say so before a message is sent rather than after
     // (SettingsChanged events keep it current).
@@ -383,6 +460,23 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
             let _ = js(&format!("MarginApp.followChat('{LOG_ID}');"));
         }
     });
+    // A web citation marker in an answer opens its page in the browser.
+    use_future(move || async move {
+        let mut eval = js(&format!(
+            "MarginApp.watchWebCites('{LOG_ID}', function (item, n) {{ dioxus.send([item, n]); }});\nawait new Promise(function () {{}});"
+        ));
+        while let Ok((item_id, n)) = eval.recv::<(Id, u32)>().await {
+            if let Some(url) = web_cite_url(&app.lib.peek(), &item_id, n)
+                && let Err(e) = open_external(&url)
+            {
+                let mut note = sources_note;
+                note.set(Some(e));
+            }
+        }
+    });
+    use_drop(|| {
+        let _ = js("MarginApp.stopWebCites();");
+    });
 
     let lib = app.lib.read();
     let chat: Option<Chat> = id.as_ref().and_then(|id| lib.chats.get(id).cloned());
@@ -390,7 +484,18 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         .as_ref()
         .and_then(|id| lib.chat_items.get(id).cloned())
         .unwrap_or_default();
-    let no_key = lib.settings.as_ref().is_some_and(|s| !s.has_api_key);
+    let default_provider = lib
+        .settings
+        .as_ref()
+        .map(|s| s.default_provider)
+        .unwrap_or_default();
+    // A chat runs on its own provider; a new one on the one picked (else the default).
+    let provider = chat
+        .as_ref()
+        .map(|c| c.provider)
+        .unwrap_or_else(|| new_chat_provider(*picked.read(), default_provider));
+    let ready = Provider::ALL.map(|p| lib.provider_ready(p));
+    let no_key = !lib.provider_ready(provider);
     let empty_library = lib.topics.is_empty() && *app.lib_status.read() == LoadStatus::Loaded;
     let chats_loaded = lib.chats_loaded;
     drop(lib);
@@ -435,7 +540,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                         let body = NewChat {
                             message: Some(message),
                             workspace_ids: app.ask_workspaces.peek().clone(),
-                            ..Default::default()
+                            provider: Some(provider),
                         };
                         match api.create_chat(&body).await {
                             Ok(detail) => {
@@ -538,7 +643,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let composer = move |placeholder: &'static str| {
         let can_send = !draft_empty && !is_sending && !no_key && !waiting && !uploading;
         let send_title = if no_key {
-            "Add an API key in Settings to ask"
+            setup_to_ask(provider)
         } else if waiting {
             "A message is already waiting for this answer to finish"
         } else if uploading {
@@ -591,16 +696,18 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
             div { id: "chat-no-key", class: "notice", role: "status",
                 Icon { name: "alert" }
                 div { class: "body",
-                    span { "Add an API key to ask. Margin needs one for your AI provider before it can answer." }
+                    span {
+                        "{provider_setup(provider)} to ask on {provider.label()}. Margin needs it before it can answer."
+                        if !chat_open && ready.iter().any(|r| *r) {
+                            " Or pick a provider that's set up."
+                        }
+                    }
                     div { class: "row-actions",
                         button {
                             class: "btn btn-secondary btn-sm",
-                            onclick: move |_| {
-                                let mut open = app.settings_open;
-                                open.set(Some(SettingsPane::Ai));
-                            },
+                            onclick: move |_| open_provider_settings(app, provider),
                             Icon { name: "gear" }
-                            "Open Settings → AI"
+                            "Open Settings → {provider.label()}"
                         }
                     }
                 }
@@ -622,6 +729,23 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
             div { class: "scroll",
                 div { class: "gen",
                     h1 { "What do you want to learn?" }
+                    div { class: "prov-pick",
+                        span { class: "label", id: "prov-pick-label", "Answer with" }
+                        div { class: "seg", role: "radiogroup", "aria-labelledby": "prov-pick-label",
+                            for (i, p) in Provider::ALL.into_iter().enumerate() {
+                                button {
+                                    key: "{p.as_str()}",
+                                    role: "radio",
+                                    "aria-checked": (p == provider).to_string(),
+                                    tabindex: if p == provider { "0" } else { "-1" },
+                                    disabled: !ready[i],
+                                    title: if !ready[i] { "Set up in Settings → AI" },
+                                    onclick: move |_| picked.set(Some(p)),
+                                    {p.label()}
+                                }
+                            }
+                        }
+                    }
                     {composer("A topic, a question, or what you already know…")}
                     {files}
                     if show_examples {
@@ -713,10 +837,17 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let acting_now = *acting.read();
     // Waiting before a retry (the model API asked it to slow down, or failed).
     let retry_wait = chat.waiting.clone().filter(|_| busy);
-    let usage = usage_text(&chat.usage);
+    let usage = usage_text(&chat.usage, chat.provider);
 
     rsx! {
-        TopBar { crumbs: vec![title], provisional: chat.title_by == TitleSource::FirstLine }
+        TopBar { crumbs: vec![title], provisional: chat.title_by == TitleSource::FirstLine,
+            span {
+                class: "prov-badge",
+                title: "This chat answers with {chat.provider.label()}",
+                "aria-label": "Answers with {chat.provider.label()}",
+                {chat.provider.label()}
+            }
+        }
         div { id: "{LOG_ID}", class: "scroll chat-scroll",
             div { class: "chat-col chat-log", role: "log", "aria-label": "Conversation",
                 if first_load {
@@ -1061,7 +1192,7 @@ fn ChatRow(row: Row, chat: Chat, on_retry: EventHandler<()>) -> Element {
     match row {
         Row::User(item) => rsx! { UserMessage { item } },
         Row::Text(item) => {
-            let ChatItemKind::AssistantText { text, .. } = &item.kind else {
+            let ChatItemKind::AssistantText { text, citations } = &item.kind else {
                 return rsx! {};
             };
             rsx! {
@@ -1069,6 +1200,7 @@ fn ChatRow(row: Row, chat: Chat, on_retry: EventHandler<()>) -> Element {
                     item_id: item.id.clone(),
                     text: text.clone(),
                     status: item.status,
+                    citations: citations.clone(),
                 }
             }
         }
@@ -1085,12 +1217,16 @@ fn ChatRow(row: Row, chat: Chat, on_retry: EventHandler<()>) -> Element {
             let ChatItemKind::Error { message, code, .. } = &item.kind else {
                 return rsx! {};
             };
-            // No key or no model: Settings fixes it (Retry then goes on).
-            let settings_pane = error_fix(code.as_deref());
+            // No key or model, a refused key or sign-in, a limit: Settings → AI at the
+            // chat's provider fixes it (Retry then goes on).
+            if error_fix(code.as_deref()).is_some() {
+                let retry = retry.then_some(on_retry);
+                return rsx! { ProviderErrorNotice { message: message.clone(), provider: chat.provider, on_retry: retry } };
+            }
             if retry {
-                rsx! { ErrorNotice { message: message.clone(), settings_pane, on_retry: move |_| on_retry.call(()) } }
+                rsx! { ErrorNotice { message: message.clone(), on_retry: move |_| on_retry.call(()) } }
             } else {
-                rsx! { ErrorNotice { message: message.clone(), settings_pane } }
+                rsx! { ErrorNotice { message: message.clone() } }
             }
         }
     }
@@ -1125,11 +1261,32 @@ fn UserMessage(item: ChatItem) -> Element {
     }
 }
 
+/// The answer's HTML: its Markdown, with a numbered marker where each cited web page's
+/// passage ends when it cites any.
+pub fn answer_html(text: &str, citations: &[WebCitation]) -> String {
+    if citations.is_empty() {
+        return markdown::render(text);
+    }
+    let sources = cite::web_sources(citations);
+    markdown::render_lesson(
+        &cite::web_marked(text, citations),
+        &cite::web_marker_citations(&sources),
+    )
+}
+
 /// The answer's text as Markdown. While it streams in, blocks that didn't change keep
-/// their (typeset) DOM, so math doesn't flash as raw TeX.
+/// their (typeset) DOM, so math doesn't flash as raw TeX. Web pages it cites are listed
+/// under it as numbered Sources, and its markers open them.
 #[component]
-fn AnswerText(item_id: Id, text: String, status: ItemStatus) -> Element {
-    let html = markdown::render(&text);
+fn AnswerText(
+    item_id: Id,
+    text: String,
+    status: ItemStatus,
+    #[props(default)] citations: Vec<WebCitation>,
+) -> Element {
+    let html = answer_html(&text, &citations);
+    let sources = cite::web_sources(&citations);
+    let mut open_error = use_signal(|| None::<String>);
     let dom_id = format!("md-{item_id}");
     let streaming = status == ItemStatus::InProgress;
     let effect_id = dom_id.clone();
@@ -1143,8 +1300,9 @@ fn AnswerText(item_id: Id, text: String, status: ItemStatus) -> Element {
             crate::ui::common::render_math(&effect_id);
         }
     }));
+    let sources_id = format!("src-{item_id}");
     rsx! {
-        div { class: "msg-answer",
+        div { class: "msg-answer", "data-answer": "{item_id}",
             if streaming {
                 div { id: "{dom_id}", class: "md chat-md", "aria-busy": "true" }
             } else {
@@ -1153,8 +1311,85 @@ fn AnswerText(item_id: Id, text: String, status: ItemStatus) -> Element {
             if status == ItemStatus::Cancelled {
                 p { class: "chat-cut", "Stopped before it finished." }
             }
+            if !sources.is_empty() {
+                section { class: "web-sources", "aria-labelledby": "{sources_id}",
+                    h4 { id: "{sources_id}", "Sources" }
+                    ol { class: "web-src-list",
+                        for src in sources {
+                            li { key: "{src.n}",
+                                button {
+                                    class: "web-src",
+                                    "data-n": "{src.n}",
+                                    title: "{cite::web_tooltip(&src)}",
+                                    "aria-label": "Source {src.n}: {src.title}, {src.host}. Opens in your browser.",
+                                    onclick: {
+                                        let url = src.url.clone();
+                                        move |_| open_error.set(open_external(&url).err())
+                                    },
+                                    span { class: "cite-n", "{src.n}" }
+                                    span { class: "web-src-title", "{src.title}" }
+                                    if src.title != src.host {
+                                        span { class: "web-src-host", "{src.host}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = open_error.read().clone() {
+                        span { class: "save-state error", role: "alert", "{err}" }
+                    }
+                }
+            }
         }
     }
+}
+
+/// An error a provider setting fixes (a missing key or model, a refused key or ChatGPT
+/// sign-in, a spend or plan limit): Open Settings lands on the chat's provider.
+#[component]
+fn ProviderErrorNotice(
+    message: String,
+    provider: Provider,
+    #[props(default)] on_retry: Option<EventHandler<()>>,
+) -> Element {
+    let app = use_app();
+    rsx! {
+        div { class: "notice error", role: "alert",
+            Icon { name: "alert" }
+            div { class: "body",
+                span { "{message}" }
+                div { class: "row-actions",
+                    button {
+                        class: "btn btn-secondary btn-sm",
+                        onclick: move |_| open_provider_settings(app, provider),
+                        Icon { name: "gear" }
+                        "Open Settings → {provider.label()}"
+                    }
+                    if let Some(retry) = on_retry {
+                        button {
+                            class: "btn btn-secondary btn-sm",
+                            onclick: move |_| retry.call(()),
+                            "Try again"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A globe, for the hosted web tools' rows and cards.
+const GLOBE_SVG: &str = r#"<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/></svg>"#;
+
+/// A tool row's icon: the app's icons, and the globe of the web tools.
+#[component]
+fn ToolIcon(name: &'static str, #[props(default)] class: &'static str) -> Element {
+    if name == "globe" {
+        return rsx! {
+            span { class: "ic {class}", "aria-hidden": "true", dangerous_inner_html: GLOBE_SVG }
+        };
+    }
+    rsx! { Icon { name, class } }
 }
 
 /// A summary of the model's reasoning, folded away under its first line.
@@ -1296,7 +1531,7 @@ fn ToolRow(chat_id: Id, call: Option<ChatItem>, result: Option<ChatItem>) -> Ele
                 "aria-expanded": open.read().to_string(),
                 "aria-controls": "{body_id}",
                 onclick: toggle,
-                Icon { name: tool_icon(&name), class: "tool-ic" }
+                ToolIcon { name: tool_icon(&name), class: "tool-ic" }
                 span { class: "tool-label", title: "{line}", "{line}" }
                 if let Some(d) = &device {
                     span { class: "tool-device", "on {d.name}" }
@@ -1357,9 +1592,60 @@ fn CardRow(item: ChatItem, chat: Chat) -> Element {
             rsx! { ConfirmationView { item: item.clone(), card, chat } }
         }
         Card::Outline(card) => rsx! { OutlineView { proposal_id: card.proposal_id } },
-        // Web results are drawn by area P-app (`docs/agent-providers-brief.md` D8); no
-        // provider sends them before then.
-        Card::WebResults(_) => rsx! {},
+        Card::WebResults(card) => rsx! { WebResultsView { item_id: item.id.clone(), card } },
+    }
+}
+
+/// What a hosted web search found: each page (host and title, how old it is) opens in
+/// the browser.
+#[component]
+fn WebResultsView(item_id: Id, card: WebResultsCard) -> Element {
+    let mut open_error = use_signal(|| None::<String>);
+    let card_id = format!("card-{item_id}");
+    rsx! {
+        section { id: "{card_id}", class: "chat-card", "aria-label": "Web results for {card.query}",
+            div { class: "chat-card-h",
+                ToolIcon { name: "globe" }
+                b { "Web results for “{card.query}”" }
+            }
+            if card.results.is_empty() {
+                p { class: "faint", style: "margin: 4px 0 0; font-size: 13.5px", "Nothing found." }
+            }
+            ol { class: "cite-list",
+                for (i, r) in card.results.iter().cloned().enumerate() {
+                    {
+                        let host = cite::host(&r.url);
+                        let title = r.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| host.clone());
+                        rsx! {
+                            li { key: "{i}",
+                                button {
+                                    class: "cite-item web-result",
+                                    title: "{r.url}",
+                                    "aria-label": "{title}, {host}. Opens in your browser.",
+                                    onclick: {
+                                        let url = r.url.clone();
+                                        move |_| open_error.set(open_external(&url).err())
+                                    },
+                                    span { class: "cite-n", "{i + 1}" }
+                                    span { class: "cite-main",
+                                        span { class: "cite-name", "{title}" }
+                                        span { class: "cite-meta",
+                                            "{host}"
+                                            if let Some(age) = r.page_age.as_deref().filter(|a| !a.trim().is_empty()) {
+                                                " · {age}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(err) = open_error.read().clone() {
+                span { class: "save-state error", role: "alert", "{err}" }
+            }
+        }
     }
 }
 
@@ -2624,17 +2910,21 @@ mod tests {
         assert_eq!(tokens_text(4_210), "4.2k");
         assert_eq!(tokens_text(18_400), "18k");
         assert_eq!(tokens_text(1_340_000), "1.3M");
-        assert_eq!(usage_text(&Usage::default()), None);
-        let (short, full) = usage_text(&Usage {
-            input_tokens: 18_400,
-            cached_input_tokens: 12_000,
-            output_tokens: 1_250,
-            reasoning_tokens: 640,
-            model_calls: 1,
-            ..Default::default()
-        })
+        assert_eq!(usage_text(&Usage::default(), Provider::OpenAi), None);
+        let (short, full) = usage_text(
+            &Usage {
+                input_tokens: 18_400,
+                cached_input_tokens: 12_000,
+                output_tokens: 1_250,
+                reasoning_tokens: 640,
+                model_calls: 1,
+                ..Default::default()
+            },
+            Provider::OpenAi,
+        )
         .unwrap();
         assert_eq!(short, "18k tokens in · 1.3k out · 1 model call");
+        assert!(!full.contains("web"), "{full}");
         assert!(full.contains("12000 from the prompt cache"), "{full}");
         // The sample chat has spent some; the footer says how much.
         let html = render_route("/chat/c1", sample());
@@ -2921,5 +3211,221 @@ mod tests {
     fn a_missing_chat_says_so() {
         let html = render_route("/chat/nope", sample());
         assert!(html.contains("This chat was deleted"), "{html}");
+    }
+
+    // ---- providers (`docs/agent-providers-brief.md` D8, D9) ----
+
+    #[test]
+    fn web_tools_have_their_words_and_globe() {
+        assert_eq!(tool_words("web_search"), "Searching the web");
+        assert_eq!(tool_words("web_fetch"), "Fetching a page");
+        assert_eq!(tool_icon("web_search"), "globe");
+        assert_eq!(tool_icon("web_fetch"), "globe");
+    }
+
+    #[test]
+    fn usage_counts_web_searches_with_their_price() {
+        let usage = Usage {
+            input_tokens: 24_800,
+            cached_input_tokens: 9_600,
+            output_tokens: 910,
+            model_calls: 3,
+            cache_write_input_tokens: 4_100,
+            web_search_requests: 2,
+            web_fetch_requests: 1,
+            ..Default::default()
+        };
+        let (short, full) = usage_text(&usage, Provider::Claude).unwrap();
+        assert_eq!(
+            short,
+            "25k tokens in · 910 out · 3 model calls · 2 web searches"
+        );
+        assert!(
+            full.contains("4100 input tokens were written to the prompt cache"),
+            "{full}"
+        );
+        assert!(
+            full.contains("2 web searches and 1 page fetched on Claude (web search costs $10 per 1 000 searches)."),
+            "{full}"
+        );
+        let one = Usage {
+            web_search_requests: 1,
+            web_fetch_requests: 0,
+            ..usage
+        };
+        let (short, full) = usage_text(&one, Provider::ChatGpt).unwrap();
+        assert!(short.ends_with(" · 1 web search"), "{short}");
+        assert!(
+            full.contains("1 web search on ChatGPT (they count against your ChatGPT plan)."),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn a_claude_chat_shows_its_badge_web_rows_card_and_cited_sources() {
+        let html = render_route("/chat/c3", sample());
+        // The header's provider badge.
+        assert!(html.contains(r#"class="prov-badge""#), "{html}");
+        assert!(html.contains(r#"aria-label="Answers with Claude""#));
+        // The web search and fetch rows, with their labels and summaries.
+        assert!(html.contains("Searching the web for “Claude Shannon 1948 paper”"));
+        assert!(html.contains(">5 results<"));
+        assert!(html.contains("Fetching en.wikipedia.org"));
+        assert!(html.contains("Fetched “A Mathematical Theory of Communication”"));
+        assert!(html.contains(GLOBE_SVG), "{html}");
+        // The results card: links with host, title and age.
+        assert!(html.contains(r#"aria-label="Web results for Claude Shannon 1948 paper""#));
+        assert!(html.contains("Web results for “Claude Shannon 1948 paper”"));
+        assert!(html.contains("ieeexplore.ieee.org · July 1948"));
+        assert!(html.contains(r#"title="https://www.britannica.com/biography/Claude-Shannon""#));
+        assert!(html.contains("Opens in your browser."));
+        // The answer: numbered markers where the passages end, and the Sources list.
+        assert!(html.contains(r#"data-answer="c3-i8""#));
+        assert!(html.contains(r#"class="cite" data-cite="1""#), "{html}");
+        assert!(html.contains(r#"data-cite="2""#));
+        assert!(!html.contains(r#"data-cite="3""#));
+        assert!(html.contains(">Sources<"));
+        assert!(html.contains(
+            r#"aria-label="Source 2: A Mathematical Theory of Communication | Bell System Technical Journal, ieeexplore.ieee.org. Opens in your browser.""#
+        ));
+        // Cited passages as the tooltip.
+        assert!(html.contains("“The fundamental problem of communication"));
+        // The footer counts the search.
+        assert!(
+            html.contains("910 out · 3 model calls · 1 web search"),
+            "{html}"
+        );
+        // A chat on OpenAI shows its badge too.
+        assert!(render_route("/chat/c1", sample()).contains(r#"aria-label="Answers with OpenAI""#));
+    }
+
+    #[test]
+    fn answer_html_marks_web_citations_only_when_there_are_some() {
+        let plain = answer_html("Just *text*[^1].", &[]);
+        assert!(!plain.contains("data-cite"), "{plain}");
+        let (text, citations) = fake::sample_web_answer();
+        let html = answer_html(&text, &citations);
+        assert_eq!(html.matches(r#"class="cite""#).count(), 3, "{html}");
+        assert!(html.contains("<strong>A Mathematical Theory of Communication</strong>"));
+        // The marker's id resolves the page it names.
+        let mut lib = sample();
+        assert_eq!(
+            web_cite_url(&lib, "c3-i8", 2).as_deref(),
+            Some("https://ieeexplore.ieee.org/document/6773024")
+        );
+        assert_eq!(web_cite_url(&lib, "c3-i8", 9), None);
+        lib.chat_items.clear();
+        assert_eq!(web_cite_url(&lib, "c3-i8", 1), None);
+    }
+
+    #[test]
+    fn the_new_chat_picks_a_provider() {
+        let mut lib = sample();
+        let mut settings = fake::FakeState::new().settings;
+        lib.settings = Some(settings.clone());
+        let html = render_route("/", lib.clone());
+        assert!(
+            html.contains(r#"aria-labelledby="prov-pick-label""#),
+            "{html}"
+        );
+        assert!(html.contains(">Answer with<"));
+        // Preset to the default; the providers without a credential can't be picked.
+        let radio = |html: &str, p: Provider| {
+            let at = html.find(&format!(">{}</button>", p.label())).unwrap();
+            let start = html[..at].rfind("<button").unwrap();
+            html[start..at].to_string()
+        };
+        assert!(radio(&html, Provider::OpenAi).contains(r#"aria-checked="true""#));
+        assert!(!radio(&html, Provider::OpenAi).contains("disabled"));
+        for p in [Provider::ChatGpt, Provider::Claude] {
+            let r = radio(&html, p);
+            assert!(r.contains(r#"aria-checked="false""#), "{r}");
+            assert!(r.contains("disabled"), "{r}");
+            assert!(r.contains(r#"title="Set up in Settings → AI""#), "{r}");
+        }
+        assert!(!html.contains("chat-no-key"));
+        assert_eq!(new_chat_provider(None, Provider::Claude), Provider::Claude);
+        assert_eq!(
+            new_chat_provider(Some(Provider::OpenAi), Provider::Claude),
+            Provider::OpenAi
+        );
+
+        // A default that isn't set up: the notice says what to do, and Send says so.
+        settings.default_provider = Provider::Claude;
+        lib.settings = Some(settings.clone());
+        let html = render_route("/", lib.clone());
+        assert!(radio(&html, Provider::Claude).contains(r#"aria-checked="true""#));
+        assert!(
+            html.contains("Add a Claude API key to ask on Claude. Margin needs it before it can answer. Or pick a provider that&#39;s set up."),
+            "{html}"
+        );
+        assert!(html.contains(">Open Settings → Claude<"));
+        assert!(html.contains(r#"title="Add a Claude API key in Settings to ask""#));
+        // Set up: nothing to say.
+        settings.has_claude_api_key = true;
+        lib.settings = Some(settings);
+        let html = render_route("/", lib);
+        assert!(!html.contains("chat-no-key"));
+        assert!(!radio(&html, Provider::Claude).contains("disabled"));
+    }
+
+    #[test]
+    fn an_open_chat_needs_its_own_providers_credential() {
+        let mut lib = sample();
+        let mut settings = fake::FakeState::new().settings;
+        // c3 is on Claude: no Claude key, so it can't answer, whatever the default.
+        lib.settings = Some(settings.clone());
+        let html = render_route("/chat/c3", lib.clone());
+        assert!(
+            html.contains("Add a Claude API key to ask on Claude."),
+            "{html}"
+        );
+        assert!(!html.contains("Or pick a provider"));
+        // c1 is on OpenAI, which has its key.
+        assert!(!render_route("/chat/c1", lib.clone()).contains("chat-no-key"));
+        settings.has_api_key = false;
+        lib.settings = Some(settings);
+        let html = render_route("/chat/c1", lib);
+        assert!(
+            html.contains("Add an OpenAI API key to ask on OpenAI."),
+            "{html}"
+        );
+        assert!(html.contains(">Open Settings → OpenAI<"));
+    }
+
+    #[test]
+    fn provider_errors_open_settings_at_the_chats_provider() {
+        for code in [
+            error_code::AUTH_FAILED,
+            error_code::SPEND_LIMIT_REACHED,
+            error_code::PLAN_LIMIT_REACHED,
+            error_code::PLAN_INELIGIBLE,
+        ] {
+            assert_eq!(error_fix(Some(code)), Some(SettingsPane::Ai), "{code}");
+            let failure = ApiFailure {
+                status: Some(409),
+                code: code.into(),
+                message: "x".into(),
+            };
+            assert_eq!(failure.settings_pane(), Some(SettingsPane::Ai), "{code}");
+        }
+        let mut lib = sample();
+        lib.chats.get_mut("c3").unwrap().state = ChatState::Failed {
+            turn_id: "t4".into(),
+            error: "Spend limit".into(),
+        };
+        let mut failure = error("e9", 30, false);
+        failure.chat_id = "c3".into();
+        failure.turn_id = "t4".into();
+        failure.kind = ChatItemKind::Error {
+            message: "Your Claude organization has reached its spend limit.".into(),
+            retryable: false,
+            code: Some(error_code::SPEND_LIMIT_REACHED.into()),
+        };
+        lib.chat_items.get_mut("c3").unwrap().push(failure);
+        let html = render_route("/chat/c3", lib);
+        assert!(html.contains("Your Claude organization has reached its spend limit."));
+        assert!(html.contains(">Open Settings → Claude<"), "{html}");
+        assert!(!html.contains("Try again"));
     }
 }
