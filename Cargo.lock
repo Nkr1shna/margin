@@ -5409,6 +5409,7 @@ dependencies = [
  "dioxus",
  "dioxus-ssr",
  "dirs",
+ "dispatch2",
  "futures-util",
  "gethostname",
  "globset",
@@ -6205,6 +6206,7 @@ checksum = "0ddeb0eb84c1714d4f50e5dc29cca57628c12cc40445a099c0cf05f4ee538473"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
+ "dispatch2",
  "objc2",
  "objc2-foundation",
 ]
