@@ -1,0 +1,56 @@
+# Builds the Linux guest image (deploy/image, Packer + Tart) on the Mac host runner and
+# publishes it to GitHub's container registry, so any Apple-silicon Mac can use it:
+#   tart pull ghcr.io/nkr1shna/margin-linux:latest
+# The CI runner VM, the dev/prod guests and the local check (deploy/local/linux-check.sh)
+# all start from it. Runs when a merge into dev changes the image or the pinned toolchain.
+# Pushes with this job's GITHUB_TOKEN (packages: write); the image holds no secrets.
+name: image
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "deploy/image/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: [self-hosted, macOS, ARM64, margin]
+    timeout-minutes: 60
+    env:
+      IMAGE: ghcr.io/nkr1shna/margin-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the image
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          name="margin-linux-build-$GITHUB_RUN_ID"
+          tag="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          echo "NAME=$name" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          packer init deploy/image/margin-linux.pkr.hcl
+          packer build -color=false -var vm_name="$name" deploy/image/margin-linux.pkr.hcl
+      - name: Publish
+        env:
+          TART_REGISTRY_USERNAME: ${{ github.actor }}
+          TART_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          tart push "$NAME" "$IMAGE:$TAG" "$IMAGE:latest"
+          echo "Published $IMAGE:$TAG and $IMAGE:latest"
+      - name: Remove the build VM
+        if: always()
+        run: /opt/homebrew/bin/tart delete "$NAME" 2>/dev/null || true
