@@ -869,13 +869,18 @@ async fn generation_needs_an_api_key_and_a_model() {
     let (status, e) = api_error(accept().await.unwrap()).await;
     assert_eq!((status, e.code.as_str()), (400, "no_api_key"));
     assert!(e.message.contains("API key"));
-    h.patch(&t, "/api/settings")
-        .json(&json!({"openai_api_key": API_KEY, "openai_model": ""}))
+    // A model cleared through the legacy field is the default again, never empty.
+    let s: Settings = h
+        .patch(&t, "/api/settings")
+        .json(&json!({"openai_model": ""}))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    let (status, e) = api_error(accept().await.unwrap()).await;
-    assert_eq!((status, e.code.as_str()), (400, "no_model"));
+    assert_eq!(s.openai_model, margin_shared::OPENAI_DEFAULT_MODEL);
+    assert_eq!(s.openai_models.write, margin_shared::OPENAI_DEFAULT_MODEL);
 
     h.configure_ai(&t).await;
     let (topic, _) = create_lessons(&h, &t, "x", 1, false).await;
@@ -982,7 +987,7 @@ async fn settings_store_the_key_but_never_return_it() {
         .await
         .unwrap();
     assert_eq!(s.openai_base_url, "https://api.openai.com/v1");
-    assert_eq!(s.openai_model, "");
+    assert_eq!(s.openai_model, margin_shared::OPENAI_DEFAULT_MODEL);
     assert!(!s.has_api_key);
     assert_eq!(
         (s.render_width, s.render_height, s.render_fps),
@@ -1635,6 +1640,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
                 created_at: now,
                 updated_at: now,
                 written_with: None,
+                audience_narrowed: false,
             },
             proposal_id: None,
             previous_body: prev.map(Into::into),
@@ -1643,6 +1649,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
             prompt: None,
             with_quiz: false,
             workspace_ids: Vec::new(),
+            drew_on: Vec::new(),
         };
     store
         .put(
@@ -1714,6 +1721,7 @@ async fn startup_marks_interrupted_jobs_failed_and_resumes_queued_work() {
         created_at: now,
         chat_id: None,
         written_with: None,
+        audience_narrowed: false,
     };
     store.put(db::PROPOSAL, "p1", &proposal).await.unwrap();
     store
@@ -1890,6 +1898,7 @@ mod retrieval_api {
             origin: "agent".into(),
             scope_ids: scope.iter().map(|s| s.to_string()).collect(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: format!("{doc}:{id}"),
             modality: "text".into(),
             ord,
@@ -1922,6 +1931,7 @@ mod retrieval_api {
             bytes: 10,
             actor: "agent:test".into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1951,6 +1961,8 @@ mod retrieval_api {
                     id: "gone".into(),
                     generation: 3,
                     deleted_at: Utc::now(),
+                    access: vec!["company".into()],
+                    deny: Vec::new(),
                 },
             )
             .await
@@ -2498,6 +2510,393 @@ mod retrieval_api {
         )
         .await;
         assert!(!out.ok);
+    }
+
+    // -- L2 (D5, D6): every read as the reader --------------------------------------
+
+    /// A member with a signed-in device, straight into the store; the device token.
+    async fn seed_member(h: &Harness, id: &str) -> String {
+        use margin_service::people::PersonRow;
+        use margin_service::state::{DeviceRow, sha256_hex};
+        let person = PersonRow {
+            person: margin_shared::Person {
+                id: id.into(),
+                github_login: format!("{id}-gh"),
+                github_id: None,
+                handle: format!("{id}-gh"),
+                name: id.into(),
+                avatar_url: None,
+                org_role: margin_shared::OrgRole::Member,
+                state: margin_shared::PersonState::Active,
+                groups: vec![],
+                settings: margin_shared::PersonSettings::default(),
+                created_at: Utc::now(),
+            },
+            login_key: format!("{id}-gh"),
+        };
+        h.state.store.put(db::PERSON, id, &person).await.unwrap();
+        let token = format!("device-token-{id}");
+        let device = DeviceRow {
+            id: format!("device-{id}"),
+            name: format!("{id}'s Mac"),
+            token_hash: sha256_hex(&token),
+            github_login: format!("{id}-gh"),
+            created_at: Utc::now(),
+            last_seen_at: None,
+            person_id: Some(id.into()),
+        };
+        h.state
+            .store
+            .put(db::DEVICE, &device.id, &device)
+            .await
+            .unwrap();
+        token
+    }
+
+    async fn principal_of(h: &Harness, token: &str) -> Arc<margin_service::principal::Principal> {
+        if token.starts_with(margin_shared::AGENT_TOKEN_PREFIX) {
+            return margin_service::agents::principal_for_token(&h.state, token)
+                .await
+                .unwrap()
+                .expect("an agent token");
+        }
+        margin_service::principal::principal_for_device_token(&h.state, token)
+            .await
+            .unwrap()
+            .expect("a device token")
+    }
+
+    /// A document with one passage of `text`, both with `access` and `deny`.
+    async fn put_shared(
+        h: &Harness,
+        id: &str,
+        generation: u64,
+        access: &[String],
+        deny: &[String],
+        text: &str,
+    ) {
+        let mut d = document(
+            id,
+            &format!("{id}.md"),
+            generation,
+            DocumentStatus::Ready { passages: 1 },
+        );
+        d.access = access.to_vec();
+        d.deny = deny.to_vec();
+        h.state.store.put(db::DOCUMENT, id, &d).await.unwrap();
+        let mut p = passage(&format!("{id}-0"), id, &[], 0, "Body", text);
+        p.access = access.to_vec();
+        p.deny = deny.to_vec();
+        h.state.store.insert_many(db::PASSAGE, &[p]).await.unwrap();
+    }
+
+    async fn feed(h: &Harness, t: &str, since: u64, limit: u32) -> ContextChanges {
+        let r = h
+            .get(t, "/api/context/changes")
+            .query(&[("since", since.to_string()), ("limit", limit.to_string())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        r.json().await.unwrap()
+    }
+
+    fn changed(c: &ContextChanges) -> Vec<String> {
+        c.changed.iter().map(|d| d.id.clone()).collect()
+    }
+
+    async fn status_of(h: &Harness, t: &str, path: &str) -> u16 {
+        h.get(t, path)
+            .query(&[("from", "0"), ("to", "5")])
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// Bob (a member) and the owner: search, by-id reads and the change feed list only
+    /// what each reads; a deletion is listed only to who could read the document.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn by_id_reads_and_the_feed_follow_the_reader() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let owner = principal_of(&h, &t).await.person_id.clone();
+        let bob = seed_member(&h, "bob").await;
+        let company = vec!["company".to_string()];
+        let private = vec![format!("person/{owner}")];
+        let not_bob = vec!["person/bob".to_string()];
+        put_shared(
+            &h,
+            "open",
+            1,
+            &company,
+            &[],
+            "Zebra stripes in the open notes",
+        )
+        .await;
+        put_shared(&h, "mine", 2, &private, &[], "Zebra diary kept private").await;
+        put_shared(
+            &h,
+            "nobob",
+            3,
+            &company,
+            &not_bob,
+            "Zebra budget kept from Bob",
+        )
+        .await;
+        for (id, generation, access) in [("gone-open", 4, &company), ("gone-mine", 5, &private)] {
+            h.state
+                .store
+                .put(
+                    db::DOCUMENT_DELETED,
+                    id,
+                    &margin_service::ingest::Tombstone {
+                        id: id.into(),
+                        generation,
+                        deleted_at: Utc::now(),
+                        access: access.clone(),
+                        deny: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // Writers bump the store's counter before they put a row; these were put by hand.
+        while h.state.store.generation().await.unwrap() < 5 {
+            h.state.store.next_generation().await.unwrap();
+        }
+
+        // The owner reads everything.
+        let all = feed(&h, &t, 0, 100).await;
+        assert_eq!(changed(&all), ["open", "mine", "nobob"]);
+        assert_eq!(all.deleted, ["gone-open", "gone-mine"]);
+        let mut hits: Vec<String> = h
+            .reader_search(&t, "zebra")
+            .await
+            .into_iter()
+            .map(|h| h.document_id)
+            .collect();
+        hits.sort();
+        hits.dedup();
+        assert_eq!(hits, ["mine", "nobob", "open"]);
+
+        // Bob: only the open document, its deletion, and a cursor past the rest.
+        let his = feed(&h, &bob, 0, 100).await;
+        assert_eq!(changed(&his), ["open"]);
+        assert_eq!(his.deleted, ["gone-open"]);
+        assert!(his.generation >= 5 && !his.more);
+        // Paged, his items only.
+        let p1 = feed(&h, &bob, 0, 1).await;
+        assert_eq!(
+            (changed(&p1), p1.generation, p1.more),
+            (vec!["open".into()], 1, true)
+        );
+        let p2 = feed(&h, &bob, p1.generation, 1).await;
+        assert_eq!(
+            (p2.deleted.clone(), p2.more),
+            (vec!["gone-open".to_string()], false)
+        );
+        let hits: Vec<String> = h
+            .reader_search(&bob, "zebra")
+            .await
+            .into_iter()
+            .map(|h| h.document_id)
+            .collect();
+        assert!(hits.iter().all(|d| d == "open"), "{hits:?}");
+        for doc in ["mine", "nobob"] {
+            for what in ["outline", "passages"] {
+                let path = format!("/api/context/documents/{doc}/{what}");
+                assert_eq!(status_of(&h, &bob, &path).await, 404, "{path}");
+                assert_eq!(status_of(&h, &t, &path).await, 200, "{path}");
+            }
+        }
+        assert_eq!(
+            status_of(&h, &bob, "/api/context/documents/open/outline").await,
+            200
+        );
+    }
+
+    /// D6: an agent reads its owner's access within its ceiling, plus rows shared with
+    /// it by name, never rows denying it; it ingests only for audiences it reads. A
+    /// person's ingest audience names existing groups, active people and own agents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_reads_within_its_ceiling_and_ingests_within_its_paths() {
+        let h = start().await;
+        let t = h.sign_in("Mac").await;
+        let owner = principal_of(&h, &t).await.person_id.clone();
+        for path in ["company/engineering", "company/sales"] {
+            let r = h
+                .post(&t, "/api/groups")
+                .json(&json!({"path": path, "name": path}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+        }
+        margin_service::groups::set_memberships(&h.state, &owner, &["company/engineering".into()])
+            .await
+            .unwrap();
+        let agent: margin_shared::Agent = h
+            .post(&t, "/api/agents")
+            .json(&json!({"name": "eng-bot", "kind": "external"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token: margin_shared::AgentToken = h
+            .post(&t, &format!("/api/agents/{}/token", agent.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mga = token.token.clone();
+        let me = format!("person/{owner}");
+        let it = format!("agent/{}", agent.id);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        put_shared(
+            &h,
+            "eng",
+            1,
+            &s(&["company/engineering"]),
+            &[],
+            "Zebra eng notes",
+        )
+        .await;
+        put_shared(&h, "priv", 2, &s(&[&me]), &[], "Zebra private notes").await;
+        put_shared(
+            &h,
+            "named",
+            3,
+            &s(&[&me, &it]),
+            &[],
+            "Zebra notes for the bot",
+        )
+        .await;
+        put_shared(
+            &h,
+            "noagent",
+            4,
+            &s(&["company"]),
+            &s(&[&it]),
+            "Zebra not for bots",
+        )
+        .await;
+
+        let mut hits: Vec<String> = h
+            .reader_search(&mga, "zebra")
+            .await
+            .into_iter()
+            .map(|h| h.document_id)
+            .collect();
+        hits.sort();
+        hits.dedup();
+        assert_eq!(hits, ["eng", "named"]);
+        let mut owners: Vec<String> = h
+            .reader_search(&t, "zebra")
+            .await
+            .into_iter()
+            .map(|h| h.document_id)
+            .collect();
+        owners.sort();
+        owners.dedup();
+        assert_eq!(owners, ["eng", "named", "noagent", "priv"]);
+        for (doc, status) in [
+            ("eng", 200),
+            ("named", 200),
+            ("priv", 404),
+            ("noagent", 404),
+        ] {
+            let path = format!("/api/context/documents/{doc}/outline");
+            assert_eq!(status_of(&h, &mga, &path).await, status, "{doc}");
+        }
+        assert_eq!(changed(&feed(&h, &mga, 0, 100).await), ["eng", "named"]);
+
+        // Ingest audiences.
+        let ingest = |token: &str, audience: Value| {
+            h.post(token, "/api/context/ingest")
+                .json(&json!({
+                    "name": "shared.md", "origin": {"origin": "agent", "name": "eng-bot"},
+                    "text": "Zebra shared", "audience": audience,
+                }))
+                .send()
+        };
+        let refused = |r: reqwest::Response| async move {
+            let (status, e) = api_error(r).await;
+            (status, e.code)
+        };
+        // The agent doesn't read sales: it can't share with it.
+        assert_eq!(
+            refused(
+                ingest(&mga, json!({"access": ["company/sales"]}))
+                    .await
+                    .unwrap()
+            )
+            .await,
+            (400, "bad_access".into())
+        );
+        let r = ingest(&mga, json!({"access": ["company/engineering"]}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+        // A person may name any group, but only existing ones, active people, own agents.
+        for (audience, code) in [
+            (json!({"access": ["company/nope"]}), "unknown_group"),
+            (json!({"access": ["person/ghost"]}), "unknown_person"),
+            (json!({"deny": ["agent/someone-elses"]}), "unknown_agent"),
+            (json!({"access": ["Not A Path"]}), "bad_access"),
+            (
+                json!({"access": (0..65).map(|i| format!("person/p{i}")).collect::<Vec<_>>()}),
+                "audience_too_large",
+            ),
+        ] {
+            assert_eq!(
+                refused(ingest(&t, audience.clone()).await.unwrap()).await,
+                (400, code.to_string()),
+                "{audience}"
+            );
+        }
+        let r = ingest(&t, json!({"access": ["company/sales", &it]}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+        // What is stored: the caller always reads it and is never denied.
+        let person = principal_of(&h, &t).await;
+        let bot = principal_of(&h, &mga).await;
+        use margin_service::context_api::ingest_audience as stored;
+        let a = stored(&h.state, &person, None).await.unwrap();
+        assert_eq!((a.access, a.deny), (vec![me.clone()], vec![]));
+        let a = stored(&h.state, &bot, None).await.unwrap();
+        assert_eq!((a.access, a.deny), (vec![me.clone(), it.clone()], vec![]));
+        let a = stored(
+            &h.state,
+            &person,
+            Some(margin_shared::Audience {
+                access: vec!["company/sales".into(), me.clone()],
+                deny: vec![me.clone(), "company/engineering".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.access, [me.clone(), "company/sales".to_string()]);
+        assert_eq!(a.deny, ["company/engineering"]);
+        let a = stored(
+            &h.state,
+            &bot,
+            Some(margin_shared::Audience {
+                access: vec!["company".into()],
+                deny: vec![it.clone()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.access, [me.clone(), it.clone(), "company".to_string()]);
+        assert!(a.deny.is_empty());
     }
 }
 

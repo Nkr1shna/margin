@@ -12,6 +12,7 @@ use margin_shared::{
 use crate::api::ApiFailure;
 use crate::routes::Route;
 use crate::state::{LoadStatus, use_app};
+use crate::ui::audience::ProposalAudience;
 use crate::ui::common::{ErrorNotice, Icon, Loading, focus_first, js, reveal_topic};
 
 pub fn level_label(level: Level) -> &'static str {
@@ -180,6 +181,7 @@ pub fn ProposalView(
             match current {
                 None => rsx! {},
                 Some(d) => rsx! {
+                    ProposalAudience { proposal: proposal.clone() }
                     OutlineEditor {
                         scope: proposal.id.clone(),
                         outline: d.outline,

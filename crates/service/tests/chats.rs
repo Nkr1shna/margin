@@ -489,24 +489,21 @@ async fn agent_settings_pick_the_model_and_reasoning_effort() {
         Some("gpt-6-luna")
     );
 
-    // Neither: the turn fails with `no_model`'s message.
+    // Neither: chats run on OpenAI's shipped default model, never on an empty slot.
     h.patch(&t, "/api/settings")
         .json(&json!({"agent_model": null}))
         .send()
         .await
         .unwrap();
+    h.generator
+        .agent
+        .push(Scripted::Events(text_reply(&["on the default"])));
     assert_eq!(send(&h, &t, &chat.id, "fourth").await.status(), 200);
-    let d = wait_chat(&h, &t, &chat.id, |d| {
-        matches!(d.chat.state, ChatState::Failed { .. })
-    })
-    .await;
-    assert!(
-        lines(&d)
-            .last()
-            .unwrap()
-            .starts_with("error (retry): Choose a model"),
-        "{:?}",
-        lines(&d)
+    let d = wait_chat(&h, &t, &chat.id, |d| d.items.len() == 8 && idle(d)).await;
+    assert_eq!(lines(&d)[7], "assistant: on the default");
+    assert_eq!(
+        h.generator.agent.requests()[3].model.as_deref(),
+        Some(margin_shared::OPENAI_DEFAULT_MODEL)
     );
 }
 
@@ -685,6 +682,7 @@ async fn read_tools_answer_from_the_library() {
                 section_path: None,
             }],
             written_with: None,
+            audience_narrowed: false,
         },
         proposal_id: None,
         previous_body: None,
@@ -692,6 +690,7 @@ async fn read_tools_answer_from_the_library() {
         author: Default::default(),
         prompt: None,
         with_quiz: false,
+        drew_on: Vec::new(),
         workspace_ids: Vec::new(),
     };
     h.state.store.put(db::LESSON, "l1", &lesson).await.unwrap();

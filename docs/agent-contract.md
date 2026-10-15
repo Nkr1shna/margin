@@ -73,6 +73,30 @@ no field to `App` (`expansions`, `access_sources` are there); `Harness::sign_in_
 device)` and `BOB_CODE` (`bob-dev`) are in `tests/common/mod.rs`. Handlers of the new
 routes are `unimplemented!("L1, <area>")` until their area lands.
 
+**L2 (access control inside search; `docs/l2-brief.md` §3, §4).** Frozen after L2's
+first commit and changed only through the orchestrator: `crates/shared` (all of it),
+`pipeline.rs`'s `Reader`, `db.rs`, `server.rs`, `principal.rs`, and the seams below.
+`tests/common/mod.rs` belongs to no area (`Harness::{publish, reader_search}` are there).
+Merge order: L2-write → L2-retrieve → L2-audit → L2-evals → L2-app.
+
+| Area | Owns (exclusively) |
+|---|---|
+| **L2-retrieve** | `crates/service/src/{retrieval,pipeline,search,context_api,agent_tools}.rs`, `src/retrieval/tests.rs`, `tests/{api,r1_e2e,r2_e2e,agent_e2e,claude_e2e}.rs`, `crates/mcp/**` |
+| **L2-write** | `crates/service/src/{audience,ingest,ask,library,sources,folders,workspaces,uploads,chats,turns,state,video,embedding}.rs`, `tests/{audience,courses,sources,folders,chats,events,media,providers,routes}.rs` |
+| **L2-audit** | `crates/service/src/{audit,export,trace,people,groups,agents,invitations,main,restore}.rs`, `tests/{audit,auth,groups,agents}.rs`, `docs/plan-deploy.md` (runbook rows only) |
+| **L2-evals** | `crates/evals/**`, `evals/**` |
+| **L2-app** | `crates/app/**` |
+
+Seams: `audit::record(state, AuditRow)` (a no-op until L2-audit; L2-write calls it from
+`audience::set`) and `audit::start` (a no-op); `audience::{of_document, set, view}`
+(`unimplemented!("L2-write: …")`) and `audience::migrate` (a no-op until L2-write);
+`audit::list` and `export::run` (`unimplemented!("L2-audit: …")`); `margin-eval run
+--suite access` (`unimplemented!("L2-evals: …")`); `retrieval::{read_passages,
+passages_by_ord, passages_on_page, document_outline, document_picture, doc_info,
+doc_state, describe_packed, scope_names, context_search}` take `&Reader` and already
+carry the two conjuncts; `retrieval::Request.reader` and `pipeline::Query.reader` are
+required.
+
 `crates/shared` is the contract and is changed only through the orchestrator. It already
 contains everything below; `crates/video` and `crates/embed` are untouched.
 
@@ -206,6 +230,26 @@ GroupChanged, GroupDeleted, MembershipChanged, AgentChanged, AgentDeleted,
 InvitationChanged, InvitationDeleted, AccessChanged}`; routes `PEOPLE`, `person`,
 `person_groups`, `ME_SETTINGS`, `INVITATIONS`, `invitation`, `GROUPS`, `group`, `AGENTS`,
 `agent`, `agent_token`. `margin_agent::TurnInput.actor` (`person/<id>` or `agent/<id>`).
+
+L2 (`docs/l2-brief.md` §3): `audience.rs` (re-exported at the crate root): `Audience {
+access, deny }` (the wire body of `routes::audience`), `AudienceUnit { Topic, Workspace,
+Source, Document }` (`as_str`, `parse`), `AudienceView { audience, inherited_from }`,
+`AUDIENCE_MAX` (64), `is_principal_id`, `validate`, `reads(paths, deny_ids, audience)`
+(exact membership), `derive(creator, sources) -> Derived { audience, narrowed }` (the
+only function that computes an audience from others; property-tested). `context.rs`:
+`Document.deny`, `Document.access` defaults to `[]` (read empty: private to `owner`),
+`ContextIngest.audience: Option<Audience>`, `AuditKind`, `AuditSubject { kind, id }`,
+`AuditRow { kind, at, actor, on_behalf_of, subject, before, after, device_id,
+subject_name }`. `Lesson.audience_narrowed`, `Proposal.audience_narrowed`;
+`Event::{AudienceRevoked { unit, ids }, AuditAppended { row }}`; routes `AUDIENCE`,
+`audience(unit, id)`, `AUDIT`; `access_code::{UNKNOWN_PERSON, UNKNOWN_AGENT,
+AUDIENCE_TOO_LARGE, NOT_A_UNIT}`. Service (`pipeline.rs`): `Reader { paths, deny_ids }`,
+`Reader::of(&Principal)` (the only constructor outside tests and the eval fixture),
+`Reader::{sql, doc_sql, binds, allows}`; `db.rs`: `passage.deny`, `passage.access`
+default `[]` (the fingerprinted `FIELDS` block), `passage_deny`, `document_deny` and the
+seven `<table>_deny` indexes, `PassageRow.deny`, `Store::set_document_audience`,
+`SCHEMA_VERSION` 2; `agents::agent_principal`: `paths = owner ∩ ceiling ∪ {agent/<id>}`,
+`deny_ids = owner.deny_ids ∪ {agent/<id>}`; `ingest::Tombstone.{access, deny}`.
 
 R2 shared types (`docs/r2-brief.md`, all additive): `WrittenWith { prompt_version,
 pipeline_hash, provider, model, at }` on `Lesson.written_with` and
@@ -659,6 +703,27 @@ ord range}` → up to `TOOL_READ_PASSAGES_MAX` adjacent passages. `document_outl
   the principal's paths; a caller-supplied `access` that isn't a subset is 400
   `bad_access`.
 
+### L2, what is enforced (`docs/l2-brief.md` D1, D5)
+
+The rule is two conjuncts, bound from a `Reader`, inside the scan, in every statement that
+reads `passage` or `document` content: `access CONTAINSANY $paths AND deny CONTAINSNONE
+$deny`. Exact membership: the hierarchy is in the reader's expansion (`groups::expand`), so
+a reader in `company` does not read `company/sales`; `may_see` and `visible_paths` are
+gone. Proven by `db::tests::the_readers_two_conjuncts_plan_inside_both_legs` (the
+`KnnScan`'s own predicate holds both conjuncts, and the k nearest are taken among the rows
+the reader may read; the FULLTEXT leg intersects `passage_text` with `passage_access` and
+applies both before any `LIMIT`), `retrieval::tests::access_is_exact_membership_with_denials`
+and `crates/evals/tests/gates.rs::access_gates` (never ignored). In the first commit: both
+legs of every retriever, `read_passages`/`passages_by_ord`/`passages_on_page`/
+`document_outline`/`document_picture`/`doc_state`/`doc_info`, the frame lookup behind a
+packed passage's picture, `scope_names`, the lesson and planner jobs (as the topic owner),
+the agent's `search` (as the chat owner), the context API (a narrowed `access` never
+loosens the principal's denials), and `can_read`/`ACCESS_WHERE` (⌘K, `list_visible`). The
+areas add the change feed, tombstones' audiences, publishing, derivation, the audit trail,
+and the e2e list of the brief §5. Writers by `document_id` under the write lock (ingest's
+diff, `set_document_audience`, `update_passages`, `rewrite_vectors`, delete, the
+migrations) read without a reader.
+
 **Accepted L1 gaps (closed by L2):** agent tools that read a library row by id
 (`get_topic`, `read_note`, `list_sources`, …) still take any id; `read_passage`/
 `document_outline`/`passages` by `document_id` likewise; passages all say `company` so a
@@ -757,8 +822,13 @@ Providers, `margin_ai`: `CLAUDE_MAX_OUTPUT_TOKENS` 32 000 (a text call: 64 000),
 `web_search_20260318`, `WEB_FETCH_TOOL` `web_fetch_20260318`, `CLAUDE_BETAS`
 `compact-2026-01-12,thinking-binding-controls-2026-08-01`; `windows::openai_window`
 (GPT-6 family: 1 050 000 / 128 000). Model defaults (`margin_shared`): Claude
-`claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI small
-`gpt-6-luna`; ChatGPT `gpt-6.1-sol`.
+`claude-opus-5-5` for chats and writing, `claude-haiku-5-5` for small tasks; OpenAI
+`gpt-6.1-sol` for chats and writing, `gpt-6-luna` for small tasks; ChatGPT `gpt-6.1-sol`.
+The service serves a slot never picked (missing or stored empty) as its default
+(`RouteModels::or_defaults`), and Settings' `default_provider`, until an admin picks one,
+as the first provider with a credential (OpenAI, ChatGPT, Claude; OpenAI when none).
+L2: `margin_shared::AUDIENCE_MAX` 64 entries in an audience's `access`, and in its `deny`
+(400 `audience_too_large`).
 R2, `margin_shared::routes`: `RERANK_MAX_CANDIDATES` 24, `RERANK_QUERY_CHARS` 800,
 `RERANK_MAX_OUTPUT_TOKENS` 400, `REWRITE_MAX_ADDED` 2, `REWRITE_MIN_WORDS` 5,
 `REWRITE_MAX_OUTPUT_TOKENS` 120, `RERANK_PAIR_TOKENS` 512.
@@ -867,3 +937,14 @@ groups (names and handles, never content); invitations expire after 30 days and 
 re-sent; traces are admin-only, `?traces=1` included; members see the org AI settings
 read-only with the sentence; `margin-mcp login` (device token) stays beside `margin-mcp
 token` (agent token, the one to use).
+
+L2 (`docs/l2-brief.md` §9; decided with the recommended answers, 2026-10-15): units of
+audience are topic (cascading), folder, standalone source and agent document, lessons and
+notes following their topic; an audience may name any group, any active person and the
+owner's own agents; chats stay private in L2; after the deploy the owner widens
+`claude-code`'s ceiling (the migration stays strictly private); export is a host command
+on a stopped copy, logged and shown as audit rows; if the deny conjunct couldn't plan in
+the KNN scan the dense leg would take a documented over-fetch exception (not needed: it
+plans); admins see audit subject names only for rows they can read; tombstones are
+filtered by the deleted document's audience; agent documents are private by default;
+p95 ≤ 1.5× unfiltered.

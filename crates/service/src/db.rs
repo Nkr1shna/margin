@@ -59,7 +59,7 @@ pub const TRACE_DAILY: &str = "trace_daily";
 /// The version of the stored data's shape this build writes (`SettingsRow.schema_version`):
 /// bumped when a `DEFINE` or a one-pass migration changes. A store with a higher one
 /// refuses to serve; a lower one is backed up, then migrated (`docs/phase5-brief.md` D5).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Bookkeeping of this module: the fingerprint of the index definitions last applied.
 const SCHEMA_META: &str = "schema_meta";
@@ -114,6 +114,7 @@ const SCHEMA: &str = r#"
 DEFINE TABLE IF NOT EXISTS schema_meta SCHEMALESS;
 DEFINE INDEX IF NOT EXISTS document_project ON document FIELDS doc.project_id;
 DEFINE INDEX IF NOT EXISTS document_access  ON document FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS document_deny    ON document FIELDS doc.deny.*;
 DEFINE INDEX IF NOT EXISTS document_generation ON document FIELDS doc.generation;
 DEFINE INDEX IF NOT EXISTS document_deleted_generation ON document_deleted FIELDS doc.generation;
 DEFINE INDEX IF NOT EXISTS folder_file_workspace ON folder_file FIELDS doc.workspace_id;
@@ -134,6 +135,13 @@ DEFINE INDEX IF NOT EXISTS chat_access       ON chat FIELDS doc.access.*;
 DEFINE INDEX IF NOT EXISTS source_access     ON source FIELDS doc.access.*;
 DEFINE INDEX IF NOT EXISTS workspace_access  ON workspace FIELDS doc.access.*;
 DEFINE INDEX IF NOT EXISTS proposal_access   ON proposal FIELDS doc.access.*;
+DEFINE INDEX IF NOT EXISTS topic_deny        ON topic FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS lesson_deny       ON lesson FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS note_deny         ON note FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS chat_deny         ON chat FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS source_deny       ON source FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS workspace_deny    ON workspace FIELDS doc.deny.*;
+DEFINE INDEX IF NOT EXISTS proposal_deny     ON proposal FIELDS doc.deny.*;
 DEFINE INDEX IF NOT EXISTS document_owner    ON document FIELDS doc.owner;
 
 DEFINE TABLE IF NOT EXISTS passage SCHEMAFULL;
@@ -141,7 +149,8 @@ DEFINE FIELD IF NOT EXISTS project_id   ON passage TYPE string;
 DEFINE FIELD IF NOT EXISTS document_id  ON passage TYPE string;
 DEFINE FIELD IF NOT EXISTS origin       ON passage TYPE string;
 DEFINE FIELD IF NOT EXISTS scope_ids    ON passage TYPE array<string>;
-DEFINE FIELD IF NOT EXISTS access       ON passage TYPE array<string> DEFAULT ['company'];
+DEFINE FIELD IF NOT EXISTS access       ON passage TYPE array<string> DEFAULT [];
+DEFINE FIELD IF NOT EXISTS deny         ON passage TYPE array<string> DEFAULT [];
 DEFINE FIELD IF NOT EXISTS unit_id      ON passage TYPE string;
 DEFINE FIELD IF NOT EXISTS modality     ON passage TYPE string;
 DEFINE FIELD IF NOT EXISTS ord          ON passage TYPE int;
@@ -159,6 +168,7 @@ DEFINE FIELD IF NOT EXISTS vector       ON passage TYPE array<float>;
 DEFINE INDEX IF NOT EXISTS passage_document ON passage FIELDS document_id;
 DEFINE INDEX IF NOT EXISTS passage_scope    ON passage FIELDS scope_ids.*;
 DEFINE INDEX IF NOT EXISTS passage_access   ON passage FIELDS access.*;
+DEFINE INDEX IF NOT EXISTS passage_deny     ON passage FIELDS deny.*;
 DEFINE INDEX IF NOT EXISTS passage_hash     ON passage FIELDS document_id, chunk_hash UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS trace SCHEMAFULL;
@@ -245,6 +255,14 @@ DEFINE TABLE OVERWRITE trace_daily TYPE NORMAL AS
   FROM trace GROUP BY kind, route, provider, model, bucket;
 "#;
 
+/// Field definitions that change on an existing store (`OVERWRITE`), applied only when
+/// this text changes, like `INDEXES` but apart from it so a field's default never
+/// rebuilds the vector or full-text index. L2: a passage written without an audience
+/// is visible to nobody (`[]`), not to everyone (`['company']`, before L2).
+const FIELDS: &str = r#"
+DEFINE FIELD OVERWRITE access ON passage TYPE array<string> DEFAULT [];
+"#;
+
 /// How often `Store::query_rows` retries a statement SurrealDB says can be retried.
 const CONFLICT_RETRIES: u32 = 5;
 
@@ -274,10 +292,15 @@ pub struct PassageRow {
     pub origin: String,
     /// What may search it: topic id, chat ids, workspace id.
     pub scope_ids: Vec<String>,
-    /// The document's access paths ("company", "company/engineering"), copied at
-    /// ingest; retrieval pre-filters on them inside the index query.
-    #[serde(default = "company_access")]
+    /// The document's access paths ("company/engineering", "person/<id>"), copied at
+    /// ingest; retrieval pre-filters on them inside the index query
+    /// (`access CONTAINSANY $paths`, exact membership). Empty: visible to nobody.
+    #[serde(default)]
     pub access: Vec<String>,
+    /// The document's denials, copied with `access`; retrieval requires
+    /// `deny CONTAINSNONE $deny` in the same scan.
+    #[serde(default)]
+    pub deny: Vec<String>,
     /// Shared by a page's text and its picture.
     pub unit_id: String,
     /// `margin_shared::context::Modality` as text.
@@ -303,10 +326,6 @@ pub struct PassageRow {
     /// Model and prefix version; rows with another version are re-embedded.
     pub embedder: String,
     pub vector: Vec<f32>,
-}
-
-fn company_access() -> Vec<String> {
-    vec![margin_shared::context::ACCESS_COMPANY.to_string()]
 }
 
 /// One element of an array record id, for `Store::range`.
@@ -459,6 +478,7 @@ impl Store {
             .context("couldn't define tables")?;
         let store = Self { db };
         store.define_old_tables().await?;
+        store.apply_fields().await?;
         store.apply_indexes().await?;
         store
             .db
@@ -493,6 +513,22 @@ impl Store {
             .get::<Vec<String>>(SCHEMA_META, "retired")
             .await?
             .unwrap_or_default())
+    }
+
+    /// Runs `FIELDS` when its text differs from the last one applied.
+    async fn apply_fields(&self) -> anyhow::Result<()> {
+        let fingerprint = crate::state::sha256_hex(FIELDS);
+        let applied: Option<String> = self.get(SCHEMA_META, "fields").await?;
+        if applied.as_deref() == Some(fingerprint.as_str()) {
+            return Ok(());
+        }
+        self.db
+            .query(FIELDS)
+            .await
+            .context("couldn't define the fields")?
+            .check()
+            .context("couldn't define the fields")?;
+        self.put(SCHEMA_META, "fields", &fingerprint).await
     }
 
     /// Runs `INDEXES` when its text differs from the last one applied.
@@ -895,7 +931,7 @@ impl Store {
         self.query_rows::<serde_json::Value>(
             "FOR $r IN $rows { UPDATE type::record('passage', $r.id) SET \
                project_id = $r.project_id, origin = $r.origin, scope_ids = $r.scope_ids, \
-               access = $r.access, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
+               access = $r.access, deny = $r.deny, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
                page = $r.page, start_line = $r.start_line, end_line = $r.end_line, \
                start_ms = $r.start_ms, end_ms = $r.end_ms, section_path = $r.section_path, \
                file = $r.file RETURN NONE; };",
@@ -922,7 +958,7 @@ impl Store {
             "FOR $r IN $rows { UPDATE type::record('passage', $r.id) SET \
                vector = $r.vector, embedder = $r.embedder, \
                project_id = $r.project_id, origin = $r.origin, scope_ids = $r.scope_ids, \
-               access = $r.access, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
+               access = $r.access, deny = $r.deny, unit_id = $r.unit_id, modality = $r.modality, ord = $r.ord, \
                page = $r.page, start_line = $r.start_line, end_line = $r.end_line, \
                start_ms = $r.start_ms, end_ms = $r.end_ms, section_path = $r.section_path, \
                file = $r.file RETURN NONE; };",
@@ -930,6 +966,52 @@ impl Store {
         )
         .await?;
         Ok(())
+    }
+
+    /// Re-stamps a document's audience: every passage of it (one indexed `UPDATE` on
+    /// `passage_document`) and the `document` row, which takes a new generation so
+    /// caches and the change feed move. A writer by document id: call under the write
+    /// lock, for a document the caller already passed the check for. Returns the new
+    /// generation, or `None` when there is no such document row (the passages are
+    /// re-stamped all the same).
+    pub async fn set_document_audience(
+        &self,
+        document_id: &str,
+        access: &[String],
+        deny: &[String],
+    ) -> anyhow::Result<Option<u64>> {
+        self.query_rows::<serde_json::Value>(
+            "UPDATE passage SET access = $a, deny = $d WHERE document_id = $id RETURN NONE",
+            vec![
+                ("id", serde_json::json!(document_id)),
+                ("a", serde_json::json!(access)),
+                ("d", serde_json::json!(deny)),
+            ],
+        )
+        .await?;
+        if self
+            .get::<serde_json::Value>(DOCUMENT, document_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let generation = self.next_generation().await?;
+        self.retrying(|| {
+            self.db
+                .query(
+                    "UPDATE $rid SET doc.access = $a, doc.deny = $d, doc.generation = $g \
+                     RETURN NONE",
+                )
+                .bind(("rid", RecordId::new(DOCUMENT, document_id.to_string())))
+                .bind(("a", access.to_vec()))
+                .bind(("d", deny.to_vec()))
+                .bind(("g", generation))
+                .into_future()
+        })
+        .await
+        .context("couldn't re-stamp the document")?;
+        Ok(Some(generation))
     }
 
     /// The documents with a passage whose `embedder` isn't `version`.
@@ -1234,6 +1316,7 @@ mod tests {
             origin: "source".into(),
             scope_ids: scope.iter().map(|s| s.to_string()).collect(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             unit_id: format!("{doc}/{id}"),
             modality: modality.into(),
             ord: 0,
@@ -1707,6 +1790,199 @@ mod tests {
         s.delete_document_passages("d1").await.unwrap();
         assert!(s.passages_of("d1").await.unwrap().is_empty());
         assert!(s.has_passages("d2").await.unwrap());
+    }
+
+    /// The first node of an `EXPLAIN` plan whose operator is `op` (depth first).
+    fn plan_node<'a>(v: &'a serde_json::Value, op: &str) -> Option<&'a serde_json::Value> {
+        if v.get("operator").and_then(|o| o.as_str()) == Some(op) {
+            return Some(v);
+        }
+        let children = v
+            .as_array()
+            .or_else(|| v.get("children").and_then(|c| c.as_array()))?;
+        children.iter().find_map(|c| plan_node(c, op))
+    }
+
+    /// The plan as text, for `EXPLAIN` assertions.
+    async fn plan(s: &Store, sql: &str, binds: Vec<(&'static str, serde_json::Value)>) -> String {
+        let plan: Vec<serde_json::Value> = s.query_rows(sql, binds).await.unwrap();
+        serde_json::to_string(&plan).unwrap()
+    }
+
+    /// L2 D1: the reader's two conjuncts (`access CONTAINSANY $paths AND deny
+    /// CONTAINSNONE $deny`) plan inside both legs of the hybrid query: the HNSW scan
+    /// (`KnnScan`, a pre-filter, not a post-filter) and the FULLTEXT scan on
+    /// `passage_text`. And they select by exact membership with denials.
+    #[tokio::test]
+    async fn the_readers_two_conjuncts_plan_inside_both_legs() {
+        let s = seeded().await;
+        // d2's picture is denied to bob; d1's rows are `company`, deny none.
+        s.set_document_audience("d2", &["company".into()], &["person/bob".into()])
+            .await
+            .unwrap();
+        let mut q = unit(0);
+        q[1] = 0.05;
+        let reader = |paths: &[&str], deny: &[&str]| {
+            vec![
+                ("q", serde_json::json!(q)),
+                ("paths", serde_json::json!(paths)),
+                ("deny", serde_json::json!(deny)),
+            ]
+        };
+
+        // The dense leg: the KnnScan's own predicate holds both conjuncts (a pre-filter:
+        // the k nearest among the rows the reader may read). The planner re-checks the
+        // same predicate in a `Filter` above it; the scan already applied it.
+        let dense = "SELECT id FROM passage WHERE vector <|3, 128|> $q \
+                     AND access CONTAINSANY $paths AND deny CONTAINSNONE $deny EXPLAIN";
+        let rows: Vec<serde_json::Value> = s
+            .query_rows(dense, reader(&["company"], &["person/bob"]))
+            .await
+            .unwrap();
+        let p = serde_json::Value::Array(rows);
+        let knn = plan_node(&p, "KnnScan").unwrap_or_else(|| panic!("no KnnScan: {p}"));
+        assert_eq!(knn["attributes"]["index"], "passage_vector", "{p}");
+        assert_eq!(
+            knn["attributes"]["predicate"],
+            "access CONTAINSANY ['company'] AND deny CONTAINSNONE ['person/bob']",
+            "{p}"
+        );
+
+        // The lexical leg: the FULLTEXT scan on `passage_text` intersected with the
+        // `passage_access` index (`BitmapAnd`), and the statement's predicate (both
+        // conjuncts) on the rows it resolves, before any `ORDER BY … LIMIT`.
+        let lexical = "SELECT id, search::score(0) AS s FROM passage WHERE text @0@ $text \
+                       AND access CONTAINSANY $paths AND deny CONTAINSNONE $deny EXPLAIN";
+        let mut binds = reader(&["company"], &["person/bob"]);
+        binds.push(("text", serde_json::json!("engine")));
+        let rows: Vec<serde_json::Value> = s.query_rows(lexical, binds).await.unwrap();
+        let p = serde_json::Value::Array(rows);
+        let fts =
+            plan_node(&p, "BitmapFullTextScan").unwrap_or_else(|| panic!("no FULLTEXT scan: {p}"));
+        assert_eq!(fts["attributes"]["index"], "passage_text", "{p}");
+        let access =
+            plan_node(&p, "BitmapIndexScan").unwrap_or_else(|| panic!("no access index scan: {p}"));
+        assert_eq!(access["attributes"]["index"], "passage_access", "{p}");
+        assert!(plan_node(&p, "BitmapAnd").is_some(), "{p}");
+        let filter = plan_node(&p, "Filter").unwrap_or_else(|| panic!("no predicate: {p}"));
+        assert_eq!(
+            filter["attributes"]["predicate"],
+            "text @0@ 'engine' AND access CONTAINSANY ['company'] \
+             AND deny CONTAINSNONE ['person/bob']",
+            "{p}"
+        );
+
+        let ids = |rows: Vec<Ranked>| {
+            let mut ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
+            ids.sort();
+            ids
+        };
+        // k = 2: the nearest are a, then c, then b.
+        let dense_ids = "SELECT record::id(id) AS id FROM passage WHERE vector <|2, 128|> $q \
+                         AND access CONTAINSANY $paths AND deny CONTAINSNONE $deny";
+        // An empty deny on both sides matches (`[] CONTAINSNONE []`).
+        let all: Vec<Ranked> = s
+            .query_rows(dense_ids, reader(&["company"], &[]))
+            .await
+            .unwrap();
+        assert_eq!(ids(all), ["a", "c"]);
+        // Bob is denied d2's picture, inside the scan: the 2 nearest he may read are a
+        // and b (a post-filter would have found a and c, then dropped c).
+        let bob: Vec<Ranked> = s
+            .query_rows(
+                dense_ids,
+                reader(
+                    &["company", "company/sales", "person/bob"],
+                    &["person/bob", "company", "company/sales"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(bob), ["a", "b"]);
+        // Exact membership: a reader of `company/engineering` alone reads nothing
+        // `company` holds (the hierarchy is in the reader's expansion, not here).
+        let eng: Vec<Ranked> = s
+            .query_rows(dense_ids, reader(&["company/engineering"], &[]))
+            .await
+            .unwrap();
+        assert!(eng.is_empty());
+        // The lexical leg drops the denied row too.
+        let lex_ids = "SELECT record::id(id) AS id FROM passage WHERE text @0@ $text \
+                       AND access CONTAINSANY $paths AND deny CONTAINSNONE $deny";
+        let mut binds = reader(&["company", "person/bob"], &["person/bob"]);
+        binds.push(("text", serde_json::json!("engine")));
+        let hits: Vec<Ranked> = s.query_rows(lex_ids, binds).await.unwrap();
+        assert_eq!(ids(hits), ["a"]);
+    }
+
+    /// L2: `passage.access` defaults to `[]` (visible to nobody) through the
+    /// fingerprinted `FIELDS` block, which changes the default and leaves stored rows
+    /// as they are; `set_document_audience` re-stamps a document's passages and row.
+    #[tokio::test]
+    async fn the_access_default_is_nobody_and_a_document_is_restamped_whole() {
+        let s = seeded().await;
+        // Re-applying the block over populated rows (as an upgraded store does once)
+        // rewrites no row.
+        s.put(SCHEMA_META, "fields", &"old").await.unwrap();
+        s.apply_fields().await.unwrap();
+        let rows = s.passages_of("d1").await.unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| r.access == ["company"] && r.deny.is_empty())
+        );
+        s.query_rows::<serde_json::Value>(
+            "CREATE passage:bare CONTENT { project_id: 'p', document_id: 'd3', origin: 'agent', \
+             scope_ids: [], unit_id: 'u', modality: 'text', ord: 0, section_path: '', \
+             text: 'bare', chunk_hash: 'h', embedder: 'e', vector: $v }",
+            vec![("v", serde_json::json!(unit(5)))],
+        )
+        .await
+        .unwrap();
+        let bare = s.passages_of("d3").await.unwrap();
+        assert!(bare[0].access.is_empty() && bare[0].deny.is_empty());
+
+        s.put(
+            DOCUMENT,
+            "d1",
+            &serde_json::json!({ "id": "d1", "access": ["company"], "generation": 1 }),
+        )
+        .await
+        .unwrap();
+        let g = s
+            .set_document_audience(
+                "d1",
+                &["person/alice".into(), "company/engineering".into()],
+                &["agent/bot".into()],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(g > 1);
+        let rows = s.passages_of("d1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(
+            |r| r.access == ["person/alice", "company/engineering"] && r.deny == ["agent/bot"]
+        ));
+        // Other documents' rows are untouched.
+        assert!(s.passages_of("d2").await.unwrap()[0].deny.is_empty());
+        let doc: serde_json::Value = s.get(DOCUMENT, "d1").await.unwrap().unwrap();
+        assert_eq!(doc["deny"], serde_json::json!(["agent/bot"]));
+        assert_eq!(doc["generation"], serde_json::json!(g));
+        // The document's deny index plans.
+        let p = plan(
+            &s,
+            "SELECT id FROM document WHERE doc.access CONTAINSANY $paths \
+             AND doc.deny CONTAINSNONE $deny EXPLAIN",
+            vec![
+                ("paths", serde_json::json!(["company"])),
+                ("deny", serde_json::json!(["person/bob"])),
+            ],
+        )
+        .await;
+        assert!(p.contains("document_access"), "{p}");
+        // No document row: the passages are re-stamped, no generation is taken.
+        assert_eq!(s.set_document_audience("d2", &[], &[]).await.unwrap(), None);
+        assert!(s.passages_of("d2").await.unwrap()[0].access.is_empty());
     }
 
     #[tokio::test]

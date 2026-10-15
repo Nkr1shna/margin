@@ -174,7 +174,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
                 .context("perf needs --service-url")?;
             margin_evals::perf::run(&reqwest::Client::new(), url, &token()?, &evals).await?;
         }
-        live_cmd => live_command(live_cmd, &paths, &store).await?,
+        live_cmd => live_command(live_cmd, &paths, &data, &store).await?,
     }
     Ok(())
 }
@@ -211,7 +211,12 @@ fn need_judges(js: &[Box<dyn Judge>]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow::Result<()> {
+async fn live_command(
+    cmd: &Command,
+    paths: &Paths,
+    data: &Path,
+    store: &EvalStore,
+) -> anyhow::Result<()> {
     let cfg = live::RunnerConfig::load(&paths.evals.join("runner.toml"))?;
     // The dogfood suite reads the repository's docs/ (next to evals/) as its corpus.
     let dogfood;
@@ -254,8 +259,9 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     let reader = live::reader_name();
     let recording_file = paths.evals.join(live::recording_file(backend));
     let extraction_file = paths.evals.join(live::extraction_file(reader));
-    let data = default_data_dir();
-    let media = media_dir(&data);
+    // Page renders and the recording's staging folder go under the runner's own data
+    // folder (`--data`), never the default one when another was given.
+    let media = media_dir(data);
     let corpus = paths.corpus();
     let docs = documents(&corpus)?;
     let embedder: &'static live::LiveVectors = Box::leak(Box::new(live::LiveVectors::load(
@@ -303,7 +309,7 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
             | Command::RecordRewrites { .. }
             | Command::RecordReranks { .. }
             | Command::Run {
-                suite: Suite::Retrieval | Suite::Dogfood,
+                suite: Suite::Retrieval | Suite::Dogfood | Suite::Access,
                 ..
             }
     );
@@ -516,6 +522,46 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                     run.id,
                     scores.len(),
                     if run.valid { "" } else { "  INVALID" }
+                );
+            }
+            Suite::Access => {
+                anyhow::ensure!(
+                    !*write_baseline,
+                    "the access suite has no baseline: the owner's ranks are compared with \
+                     the unfiltered run in the same process"
+                );
+                let (run, r, violations) = runner::run_access(&env, variant, store).await?;
+                println!(
+                    "{}: {} principals x {} queries, {} leaks, {} by-id leaks of {} forbidden \
+                     pairs, {} hits removed, owner ranks identical: {}, rank consistent: {}, \
+                     p95 owner/unfiltered {:.2}x ({:.2}/{:.2} ms)",
+                    run.id,
+                    r.principals.len(),
+                    r.queries,
+                    r.leaks.len(),
+                    r.by_id_leaks.len(),
+                    r.by_id_checked,
+                    r.removed(),
+                    r.owner_rank_identical(),
+                    r.rank_consistent(),
+                    r.latency_ratio(),
+                    r.owner_p95_ms,
+                    r.unfiltered_p95_ms
+                );
+                println!(
+                    "{:<12} {:>6} {:>6} {:>8} {:>6}",
+                    "principal", "reads", "hits", "removed", "leaks"
+                );
+                for p in &r.principals {
+                    println!(
+                        "{:<12} {:>6} {:>6} {:>8} {:>6}",
+                        p.name, p.reads, p.hits, p.removed, p.leaks
+                    );
+                }
+                anyhow::ensure!(
+                    violations.is_empty(),
+                    "the access gates failed:\n{}",
+                    violations.join("\n")
                 );
             }
             Suite::Injection => {

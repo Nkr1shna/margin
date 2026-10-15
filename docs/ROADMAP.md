@@ -4,7 +4,7 @@ The one place to see what's built, what's in flight and what's next. Update it i
 
 **Product:** a "Live context" app for a company's projects: humans through a voice-first GUI, agents through context, with learning (courses, lessons, quizzes) built in. Margin is a startup and the vision moves, so designs stay pluggable and every RAG/prompt/model change is measured by evals.
 
-**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
+**Branches:** work goes to a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
 
 Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting on the owner
 
@@ -23,12 +23,12 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
 | ✅ | **L1 — accounts and principals**: people (the `people-v1` migration makes the owner), invitations by GitHub login, groups, agents owned by a person with their own tokens (`margin-mcp token`), rows owned and private by default, per-principal events, Organisation pane in the app; a second *untrusted* account waits for L2 | `docs/l1-brief.md` |
 | ✅ | **R2 — rerank, query rewriting, prompt-version tracking**: `listwise-small` and `small-expand-v1` on the Small route, the `onnx-crossencoder` stage (ms-marco-MiniLM, downloaded on demand), `written_with` on lessons/proposals/videos, the prompt catalog and `evals/prompts.lock` in CI, recorded reranks/rewrites in the eval. Every stage stays `"none"` by default: variants until the eval promotes them | `docs/r2-brief.md` |
+| ✅ | **L2 — access control inside search**: the reader's two conjuncts (`access CONTAINSANY $paths AND deny CONTAINSNONE $deny`) inside both legs of the hybrid query, by-id reads, the change feed and ⌘K; exact group membership (no prefix rule); private by default with `passages-access-v1`; publishing (`PUT /api/audience/…`) with its cascade; derived lesson audiences; agents within owner ∩ ceiling and nameable in `deny`; the audit trail and the host-only export; the Audience control and Audit view in the app; the leakage gate in CI | [`docs/l2-brief.md`](l2-brief.md) |
 
 ## In progress
 
 | | Item | Notes |
 |---|---|---|
-| 🟡 | **L2 — access control inside search**: hierarchical groups, grants and denials, agents limited by their owner, private knowledge and publishing, audit log | `docs/l2-brief.md`; five areas building on `feat/l2` |
 | 🟡 | **App crash logging and the first panic fixes** (panic hook, log file, "quit unexpectedly" notice, the rename-while-saving crash) | branch `fix/app-crash-logs` |
 | 🟡 | **Provider settings defaults** (model slots filled, no Keychain copy, sensible default provider) | branch `fix/provider-defaults` |
 

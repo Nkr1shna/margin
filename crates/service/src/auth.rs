@@ -374,6 +374,19 @@ pub async fn poll(
     {
         let _w = state.write_lock.lock().await;
         state.store.put(db::DEVICE, &device.id, &device).await?;
+        // The admission row (`people::admit`) has no device yet; this one names it.
+        if let Some(person) = &device.person_id {
+            let mut row = crate::audit::row(
+                margin_shared::context::AuditKind::SignIn,
+                margin_shared::person_id(person),
+                "device",
+                &device.id,
+                serde_json::Value::Null,
+                serde_json::json!({"event": "device_signed_in", "person_id": person}),
+            );
+            row.device_id = Some(device.id.clone());
+            crate::audit::record(&state, row);
+        }
     }
     tracing::info!(device = %device.id, "device signed in");
     Ok(Json(LoginState::Approved {
@@ -800,6 +813,7 @@ pub async fn revoke_device(
             _ => return Err(AppError::not_found("device")),
         };
         delete_device_locked(&state, &id).await?;
+        crate::audit::record(&state, crate::audit::device_revoked(&p, &row));
         row
     };
     after_revoke(&state, &row);

@@ -25,6 +25,7 @@ use margin_shared::{Id, Note, NotePatch};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{Api, ApiResult};
+use crate::config;
 
 /// The title the service stores for a note whose title was cleared.
 pub const UNTITLED: &str = "Untitled note";
@@ -65,12 +66,10 @@ pub struct DraftFile {
 }
 
 impl DraftFile {
-    /// The file at `path`; empty when it's missing or unreadable.
+    /// The file at `path`; empty when it's missing, or when it was damaged (it is then
+    /// set aside rather than overwritten, see [`config::read_json`]).
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        config::read_json(path).unwrap_or_default()
     }
 
     /// Writes it to `path` (through a temporary file, so a crash never leaves half of
@@ -84,14 +83,7 @@ impl DraftFile {
                 _ => Ok(()),
             };
         }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
-        }
-        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("Couldn't write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("Couldn't save {}: {e}", path.display()))
+        config::write_json(path, self)
     }
 }
 
@@ -110,6 +102,9 @@ struct Registry {
     loaded: bool,
     /// Notes open in an editor, which sends their edits itself.
     editing: HashSet<Id>,
+    /// Why the last write of the file failed; `None` once one succeeds. The editor shows
+    /// it ([`local_failure`]): edits made meanwhile live only in this process.
+    save_error: Option<String>,
 }
 
 impl Registry {
@@ -146,9 +141,24 @@ impl Registry {
 
     fn persist(&mut self) {
         self.load();
-        let Some(path) = path() else { return };
-        if let Err(e) = self.file().save(&path) {
-            tracing::warn!("couldn't keep unsaved note edits: {e}");
+        let result = match path() {
+            Some(path) => self.file().save(&path),
+            None => Err("This platform has no app data directory.".into()),
+        };
+        self.saved(result);
+    }
+
+    /// Note how a write of the file went; a new failure is reported once, not on every
+    /// keystroke after it.
+    fn saved(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.save_error = None,
+            Err(e) => {
+                if self.save_error.as_ref() != Some(&e) {
+                    config::report_save_failure(&format!("couldn't keep unsaved note edits: {e}"));
+                }
+                self.save_error = Some(e);
+            }
         }
     }
 
@@ -235,6 +245,12 @@ pub fn get(id: &str) -> Option<NotePatch> {
             .or_else(|| r.sending.get(id))
             .map(|d| d.patch.clone())
     })
+}
+
+/// Why unsaved edits can't be kept on this device right now (the drafts file's last
+/// write failed), or `None` when they are.
+pub fn local_failure() -> Option<String> {
+    with(|r| r.save_error.clone())
 }
 
 /// Remove and return the note's unsaved edit to send it; it stays on disk until
@@ -528,6 +544,7 @@ mod tests {
     #[test]
     fn the_drafts_file_round_trips_and_clears() {
         let dir = std::env::temp_dir().join(format!("margin-drafts-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let file_path = dir.join(FILE_NAME);
         let mut file = DraftFile::default();
         file.drafts.insert(
@@ -543,13 +560,60 @@ mod tests {
         );
         file.save(&file_path).unwrap();
         assert_eq!(DraftFile::load(&file_path), file);
-        // Missing or damaged: empty.
+        // Damaged: empty, and set aside so the next save doesn't overwrite it.
         std::fs::write(&file_path, "{not json").unwrap();
         assert_eq!(DraftFile::load(&file_path), DraftFile::default());
+        assert!(!file_path.exists());
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), "{not json");
+        file.save(&file_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), "{not json");
         // Nothing left: the file goes.
         DraftFile::default().save(&file_path).unwrap();
         assert!(!file_path.exists());
         DraftFile::default().save(&file_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_is_remembered_until_one_succeeds() {
+        // A registry of its own: the shared one's file must keep working for the others.
+        let dir = std::env::temp_dir().join(format!("margin-drafts-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where the data folder should be: nothing can be written under it.
+        let blocked = dir.join("not-a-folder");
+        std::fs::write(&blocked, "").unwrap();
+        let mut r = Registry {
+            loaded: true,
+            ..Registry::default()
+        };
+        r.pending.insert(
+            "n1".into(),
+            Draft {
+                base: "http://x".into(),
+                token: "t".into(),
+                patch: NotePatch {
+                    title: None,
+                    body_md: Some("typed".into()),
+                },
+            },
+        );
+        let result = r.file().save(&blocked.join(FILE_NAME));
+        assert!(result.is_err());
+        r.saved(result);
+        let error = r.save_error.clone().expect("the failure is kept");
+        assert!(error.contains("not-a-folder"), "{error}");
+        // Still failing: still shown.
+        r.saved(r.file().save(&blocked.join(FILE_NAME)));
+        assert!(r.save_error.is_some());
+        // Writing works again: the warning goes.
+        r.saved(r.file().save(&dir.join(FILE_NAME)));
+        assert_eq!(r.save_error, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

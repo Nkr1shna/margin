@@ -57,7 +57,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking Linux." || echo "Nothing for Linux in this PR; passing."
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
@@ -77,6 +77,16 @@ jobs:
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          # The cache only grows: incremental state is never needed across runs, and when the
+          # runner's disk gets tight the whole cache goes (a cold build is slower, not wrong).
+          rm -rf "$cache/target-test-$env_id/debug/incremental" 2>/dev/null || true
+          mkdir -p "$cache"
+          free_gb=$(df -Pk "$cache" | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Free disk for the cache: ${free_gb} GB"
+          if [ "${free_gb:-0}" -lt 25 ]; then
+            echo "::warning::under 25 GB free on the runner; clearing the cargo caches"
+            find "$cache" -maxdepth 1 -name 'target-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
       # The same steps the local check runs (deploy/local/linux-check.sh).
       - name: Format, clippy, tests
         if: steps.scope.outputs.run == 'true'
@@ -121,7 +131,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking macOS." || echo "Nothing for macOS in this PR; passing."
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
@@ -140,6 +150,16 @@ jobs:
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          # The cache only grows: incremental state is never needed across runs, and when the
+          # runner's disk gets tight the whole cache goes (a cold build is slower, not wrong).
+          rm -rf "$cache/target-test-$env_id/debug/incremental" 2>/dev/null || true
+          mkdir -p "$cache"
+          free_gb=$(df -Pk "$cache" | awk 'NR==2 {print int($4 / 1048576)}')
+          echo "Free disk for the cache: ${free_gb} GB"
+          if [ "${free_gb:-0}" -lt 25 ]; then
+            echo "::warning::under 25 GB free on the runner; clearing the cargo caches"
+            find "$cache" -maxdepth 1 -name 'target-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
       - name: Clippy (app)
         if: steps.scope.outputs.run == 'true'
         run: cargo clippy --locked -p margin-app --all-targets -- -D warnings

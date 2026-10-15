@@ -595,6 +595,7 @@ async fn measure(svc: &Service<'_>, evals: &Path, made: &mut Made) -> anyhow::Re
                     origin: Origin::Agent { name: AGENT.into() },
                     kind: doc.kind,
                     text: text.clone(),
+                    audience: None,
                 },
             )
             .await?;
@@ -636,6 +637,7 @@ async fn measure(svc: &Service<'_>, evals: &Path, made: &mut Made) -> anyhow::Re
                 origin: Origin::Agent { name: AGENT.into() },
                 kind: doc.kind,
                 text: text.clone(),
+                audience: None,
             },
         )
         .await?;

@@ -7,12 +7,15 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
+use margin_shared::context::AuditKind;
 use margin_shared::{
     Event, Id, OrgRole, Person, PersonPatch, PersonSettings, PersonState, ROOT_GROUP, access_code,
     handle_for_login, is_group_path, is_handle, person_id,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
+use crate::audit;
 use crate::db;
 use crate::error::{ApiJson, AppError, AppResult};
 use crate::groups;
@@ -333,21 +336,47 @@ pub async fn admit(state: &AppState, login: &str, github_id: u64) -> AppResult<A
         let _w = state.write_lock.lock().await;
         match person_by_login(state, login).await? {
             Some(mut row) => match row.person.state {
-                PersonState::Disabled => Admission::Denied(format!(
-                    "The GitHub account @{login} is disabled on this Margin. Ask an admin."
-                )),
+                PersonState::Disabled => {
+                    record_sign_in(state, Some(&row.person.id), github_id, Err("disabled"));
+                    Admission::Denied(format!(
+                        "The GitHub account @{login} is disabled on this Margin. Ask an admin."
+                    ))
+                }
                 PersonState::Active | PersonState::Invited => match row.person.github_id {
-                    Some(id) if id != github_id => Admission::Denied(format!(
-                        "The GitHub account @{login} isn't the one that was invited."
-                    )),
+                    Some(id) if id != github_id => {
+                        record_sign_in(
+                            state,
+                            Some(&row.person.id),
+                            github_id,
+                            Err("another_github_account"),
+                        );
+                        Admission::Denied(format!(
+                            "The GitHub account @{login} isn't the one that was invited."
+                        ))
+                    }
                     _ => {
                         if row.person.github_id.is_none() || row.person.state != PersonState::Active
                         {
+                            let before = json!({"state": row.person.state});
                             row.person.github_id = Some(github_id);
                             row.person.state = PersonState::Active;
                             state.store.put(db::PERSON, &row.person.id, &row).await?;
+                            if before["state"] != json!(PersonState::Active) {
+                                audit::record(
+                                    state,
+                                    audit::row(
+                                        AuditKind::PersonChange,
+                                        person_id(&row.person.id),
+                                        "person",
+                                        &row.person.id,
+                                        before,
+                                        json!({"event": "activated", "state": PersonState::Active}),
+                                    ),
+                                );
+                            }
                             changed = Some(row.clone());
                         }
+                        record_sign_in(state, Some(&row.person.id), github_id, Ok(()));
                         Admission::Person(row.person)
                     }
                 },
@@ -394,14 +423,50 @@ pub async fn admit(state: &AppState, login: &str, github_id: u64) -> AppResult<A
                         .store
                         .put(db::INVITATION, &inv.invitation.id, &inv)
                         .await?;
+                    let me = person_id(&row.person.id);
+                    audit::record(
+                        state,
+                        audit::row(
+                            AuditKind::PersonChange,
+                            me.clone(),
+                            "person",
+                            &row.person.id,
+                            Value::Null,
+                            json!({
+                                "event": "joined",
+                                "invitation_id": inv.invitation.id,
+                                "invited_by": person_id(&inv.invitation.invited_by),
+                                "role": row.person.org_role,
+                                "state": row.person.state,
+                            }),
+                        ),
+                    );
+                    audit::record(
+                        state,
+                        audit::row(
+                            AuditKind::MembershipChange,
+                            me,
+                            "person",
+                            &row.person.id,
+                            json!({"groups": []}),
+                            json!({
+                                "groups": groups,
+                                "invitation_id": inv.invitation.id,
+                            }),
+                        ),
+                    );
+                    record_sign_in(state, Some(&row.person.id), github_id, Ok(()));
                     accepted = Some(inv);
                     changed = Some(row.clone());
                     Admission::Invited(row.person)
                 }
-                None => Admission::Denied(format!(
-                    "The GitHub account @{login} isn't allowed to use this Margin. Ask an \
-                     admin to invite you."
-                )),
+                None => {
+                    record_sign_in(state, None, github_id, Err("not_invited"));
+                    Admission::Denied(format!(
+                        "The GitHub account @{login} isn't allowed to use this Margin. Ask an \
+                         admin to invite you."
+                    ))
+                }
             },
         }
     };
@@ -425,6 +490,37 @@ pub async fn admit(state: &AppState, login: &str, github_id: u64) -> AppResult<A
         }
         other => other,
     })
+}
+
+/// Journals a GitHub sign-in: approved (`sign_in`, the person is the actor) or denied
+/// (`sign_in_denied` with a reason code; a login that matches no person is
+/// `github/<numeric id>`). Ids and codes only, never the login.
+fn record_sign_in(
+    state: &AppState,
+    person: Option<&str>,
+    github_id: u64,
+    outcome: Result<(), &str>,
+) {
+    let github = format!("github/{github_id}");
+    let (actor, subject_kind, subject_id) = match person {
+        Some(p) => (person_id(p), "person", p.to_string()),
+        None => (github.clone(), "github_account", github_id.to_string()),
+    };
+    let after = match outcome {
+        Ok(()) => json!({"event": "sign_in", "github_id": github_id}),
+        Err(reason) => json!({"event": "sign_in_denied", "reason": reason, "github_id": github_id}),
+    };
+    audit::record(
+        state,
+        audit::row(
+            AuditKind::SignIn,
+            actor,
+            subject_kind,
+            &subject_id,
+            Value::Null,
+            after,
+        ),
+    );
 }
 
 /// The newest open invitation for `login`.
@@ -552,6 +648,8 @@ pub async fn patch_person(
         }
         let mut revoke = false;
         let mut access_changed = false;
+        let before = json!({"role": row.person.org_role, "state": row.person.state});
+        let mut events: Vec<&str> = Vec::new();
         if governing {
             if !p.is_admin() {
                 return Err(admin_required());
@@ -572,6 +670,7 @@ pub async fn patch_person(
                 }
                 row.person.org_role = role;
                 access_changed = true;
+                events.push("role_changed");
             }
             if let Some(new_state) = state_change {
                 match new_state {
@@ -583,8 +682,11 @@ pub async fn patch_person(
                     PersonState::Disabled if is_self => {
                         return Err(AppError::bad_request("You can't disable yourself."));
                     }
-                    PersonState::Disabled => revoke = true,
-                    PersonState::Active => {}
+                    PersonState::Disabled => {
+                        revoke = true;
+                        events.push("disabled");
+                    }
+                    PersonState::Active => events.push("enabled"),
                 }
                 row.person.state = new_state;
                 access_changed = true;
@@ -600,10 +702,34 @@ pub async fn patch_person(
             row.person.settings = settings;
         }
         state.store.put(db::PERSON, &row.person.id, &row).await?;
+        if !events.is_empty() {
+            audit::record(
+                &state,
+                audit::by(
+                    &p,
+                    AuditKind::PersonChange,
+                    "person",
+                    &row.person.id,
+                    before,
+                    json!({
+                        "event": events.join(","),
+                        "role": row.person.org_role,
+                        "state": row.person.state,
+                    }),
+                ),
+            );
+        }
         (row, revoke, access_changed)
     };
     if revoke {
+        let devices: Vec<DeviceRow> = state
+            .store
+            .list_where(db::DEVICE, "person_id", &row.person.id)
+            .await?;
         crate::auth::revoke_person_devices(&state, &row.person.id).await?;
+        for device in &devices {
+            audit::record(&state, audit::device_revoked_with_person(&p, device));
+        }
         tracing::info!(person = %row.person.id, "person disabled");
     }
     state.expansions.invalidate_all();
@@ -623,16 +749,17 @@ pub async fn patch_person(
 /// `PUT /api/people/{id}/groups` (admins): replaces the direct `manual` memberships.
 pub async fn put_person_groups(
     State(state): State<AppState>,
-    _admin: RequireAdmin,
+    RequireAdmin(admin): RequireAdmin,
     Path(id): Path<Id>,
     ApiJson(groups): ApiJson<Vec<String>>,
 ) -> AppResult<Json<Person>> {
     let Some(row) = person_row(&state, &id).await? else {
         return Err(AppError::not_found("person"));
     };
-    // Replaces the manual memberships, clears the expansion cache and sends
-    // `MembershipChanged` (everyone) and `AccessChanged` (the person).
-    groups::set_memberships(&state, &id, &tidy_groups(groups)).await?;
+    // Replaces the manual memberships (journaled as a `MembershipChange`), clears the
+    // expansion cache and sends `MembershipChanged` (everyone) and `AccessChanged` (the
+    // person).
+    groups::set_memberships_by(&state, &admin, &id, &tidy_groups(groups)).await?;
     Ok(Json(public_person(&state, &row, false).await?))
 }
 

@@ -1,5 +1,6 @@
-//! The Margin service: an axum server on the owner's Mac with embedded SurrealDB,
-//! GitHub sign-in, background generation jobs, a live event socket and signed media.
+//! The Margin service: an axum server on Linux (an Ubuntu VM per environment) with
+//! embedded SurrealDB, GitHub sign-in, background generation jobs, a live event socket
+//! and signed media.
 //! See `PLAN.md` ("Service") and `margin_shared::routes`.
 
 pub mod access;
@@ -7,6 +8,8 @@ pub mod agent_tools;
 pub mod agents;
 pub mod alerts;
 pub mod ask;
+pub mod audience;
+pub mod audit;
 pub mod auth;
 pub mod chats;
 pub mod config;
@@ -17,6 +20,7 @@ pub mod embedding;
 pub mod engines;
 pub mod error;
 pub mod events;
+pub mod export;
 pub mod folders;
 pub mod groups;
 pub mod ingest;

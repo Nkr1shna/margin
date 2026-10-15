@@ -438,6 +438,66 @@ async fn add_claude_key(h: &Harness, t: &str) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slots_never_picked_are_served_as_the_defaults_and_the_default_provider_is_a_configured_one()
+ {
+    let h = start().await;
+    let t = h.sign_in("Mac").await;
+    // A new install with no credential: every slot holds its default, OpenAI is the
+    // default provider.
+    assert_eq!(
+        patch(&h, &t, json!({"openai_api_key": ""})).await.status(),
+        200
+    );
+    let s = settings(&h, &t).await;
+    assert!(!s.has_api_key);
+    assert_eq!(s.default_provider, Provider::OpenAi);
+    assert_eq!(s.openai_models, RouteModels::openai_default());
+    assert_eq!(s.openai_models.chat, "gpt-6.1-sol");
+    assert_eq!(s.openai_models.small, "gpt-6-luna");
+    assert_eq!(s.openai_model, "gpt-6.1-sol");
+    assert_eq!(s.chatgpt_models, RouteModels::chatgpt_default());
+    assert_eq!(s.claude_models, RouteModels::claude_default());
+
+    // Slots an older build stored empty are served as the defaults; picked ones stay.
+    let row = SettingsRow {
+        openai_models: Some(RouteModels::default()),
+        claude_models: Some(RouteModels {
+            chat: String::new(),
+            write: "claude-sonnet-5-5".into(),
+            small: " ".into(),
+        }),
+        ..SettingsRow::default()
+    };
+    h.state
+        .store
+        .put(margin_service::db::SETTINGS, SETTINGS_ID, &row)
+        .await
+        .unwrap();
+    let s = settings(&h, &t).await;
+    assert_eq!(s.openai_models, RouteModels::openai_default());
+    assert_eq!(
+        s.claude_models,
+        RouteModels {
+            chat: "claude-opus-5-5".into(),
+            write: "claude-sonnet-5-5".into(),
+            small: "claude-haiku-5-5".into(),
+        }
+    );
+
+    // Only Claude set up and no default picked: Claude is the default.
+    add_claude_key(&h, &t).await;
+    assert_eq!(settings(&h, &t).await.default_provider, Provider::Claude);
+    // A picked default stays, set up or not (the pane says "Set it up below").
+    let s: Settings = patch(&h, &t, json!({"default_provider": "chatgpt"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.default_provider, Provider::ChatGpt);
+    assert_eq!(settings(&h, &t).await.default_provider, Provider::ChatGpt);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settings_hold_three_slots_per_provider_and_the_keys_stay_on_the_service() {
     let h = start().await;
     let t = h.sign_in("Mac").await;
@@ -551,14 +611,10 @@ async fn model_for_names_the_missing_credential_or_slot_per_provider() {
         (m.config.provider, m.model.as_str()),
         (Provider::OpenAi, "test-model")
     );
-    // An empty OpenAI slot is `no_model`, naming the slot.
+    // An OpenAI slot cleared is the shipped default again, never empty.
     patch(&h, &t, json!({"openai_model": ""})).await;
-    let (code, message) = err(h.state.model_for(Route::Write, None).await);
-    assert_eq!(code, error_code::NO_MODEL);
-    assert!(
-        message.contains("for writing") && message.contains("OpenAI"),
-        "{message}"
-    );
+    let m = h.state.model_for(Route::Write, None).await.unwrap();
+    assert_eq!(m.model, margin_shared::OPENAI_DEFAULT_MODEL);
 
     // Claude once it has a key: its own slots, its own base URL, the key as the
     // credential; the default provider decides `None`.

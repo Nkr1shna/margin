@@ -4,10 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
+use margin_shared::context::{AuditRow, Document, Origin};
 use margin_shared::{
-    Agent, Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device, EmbeddingModel, Event,
-    Group, Id, Invitation, ItemStatus, Lesson, LessonStatus, Library, ModelInfo, Note, Person,
-    Proposal, ProposalStatus, Provider, Settings, Source, Topic, Video, VideoStatus, Workspace,
+    Agent, Audience, AudienceUnit, Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device,
+    EmbeddingModel, Event, Group, Id, Invitation, ItemStatus, Lesson, LessonStatus, Library,
+    ModelInfo, Note, Person, Proposal, ProposalStatus, Provider, Settings, Source, Topic, Video,
+    VideoStatus, Workspace,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -68,6 +71,21 @@ pub struct LibraryState {
     pub invitations: BTreeMap<Id, Invitation>,
     /// Whether `people`, `groups` and `agents` hold the service's lists yet.
     pub org_loaded: bool,
+    /// Documents agents ingested that the caller reads (`GET routes::CONTEXT_CHANGES`,
+    /// `Origin::Agent` only), kept current by `DocumentChanged` and `AudienceRevoked`.
+    pub agent_documents: BTreeMap<Id, Document>,
+    /// Whether `agent_documents` holds the service's list yet.
+    pub documents_loaded: bool,
+    /// Audit rows (admins, `GET routes::AUDIT`) as last fetched, with those
+    /// `AuditAppended` brought since; oldest first.
+    pub audit: Vec<AuditRow>,
+    /// Whether `audit` was fetched (rows only arrive live after that).
+    pub audit_loaded: bool,
+}
+
+/// The same audit row, whether or not a name was joined to it.
+fn same_audit_row(a: &AuditRow, b: &AuditRow) -> bool {
+    a.at == b.at && a.kind == b.kind && a.actor == b.actor && a.subject == b.subject
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -275,6 +293,22 @@ impl LibraryState {
             }
             // The live loop reloads the library when it is this person's (`main.rs`).
             Event::AccessChanged { .. } => {}
+            // The reader lost access: the units go, with what follows them.
+            Event::AudienceRevoked { unit, ids } => {
+                for id in ids {
+                    self.revoke(unit, &id);
+                }
+            }
+            // Live rows come without `subject_name` (the service joins names only when
+            // the log is read): name the subject from what this person already reads.
+            Event::AuditAppended { mut row } => {
+                if self.audit_loaded && !self.audit.iter().any(|r| same_audit_row(r, &row)) {
+                    if row.subject_name.is_none() {
+                        row.subject_name = self.local_subject_name(&row.subject);
+                    }
+                    self.audit.push(row);
+                }
+            }
             Event::Hello { server_version } => self.server_version = Some(server_version),
             Event::TopicChanged { topic } => {
                 self.topics.insert(topic.id.clone(), topic);
@@ -382,10 +416,192 @@ impl LibraryState {
                 let workspaces = &self.workspaces;
                 self.folder_files.retain(|w, _| workspaces.contains_key(w));
             }
-            // Documents and traces are for agents and the eval runner; the app shows
-            // neither (yet).
-            Event::DocumentChanged { .. } | Event::Trace { .. } => {}
+            // Organisation → Agents lists agents' documents; the others are the rows the
+            // library already has.
+            Event::DocumentChanged { document } => {
+                if matches!(document.origin, Origin::Agent { .. }) {
+                    self.agent_documents.insert(document.id.clone(), document);
+                }
+            }
+            // Traces are for admins' tools and the eval runner.
+            Event::Trace { .. } => {}
         }
+    }
+
+    /// Drops a unit the reader can no longer read, and what follows it: a topic's
+    /// subtree, lessons, notes and sources; a folder's files.
+    pub fn revoke(&mut self, unit: AudienceUnit, id: &str) {
+        match unit {
+            AudienceUnit::Topic => self.remove_topic(id),
+            AudienceUnit::Workspace => {
+                self.workspaces.remove(id);
+                self.folder_files.remove(id);
+                self.sources
+                    .retain(|_, s| s.workspace_id.as_deref() != Some(id));
+            }
+            AudienceUnit::Source => {
+                self.sources.remove(id);
+                for files in self.folder_files.values_mut() {
+                    files.remove(id);
+                }
+            }
+            AudienceUnit::Document => {
+                self.agent_documents.remove(id);
+            }
+        }
+    }
+
+    /// The audience the service stored for a unit, applied to the rows that follow it
+    /// here (the service's events follow): a topic's subtree, lessons (those not narrowed
+    /// by what they drew on), notes and sources; a folder's files.
+    pub fn apply_audience(&mut self, unit: AudienceUnit, id: &str, audience: &Audience) {
+        let (access, deny) = (audience.access.clone(), audience.deny.clone());
+        match unit {
+            AudienceUnit::Topic => {
+                let subtree = self.subtree(id);
+                for t in self.topics.values_mut().filter(|t| subtree.contains(&t.id)) {
+                    t.access = access.clone();
+                    t.deny = deny.clone();
+                }
+                for l in self
+                    .lessons
+                    .values_mut()
+                    .filter(|l| subtree.contains(&l.topic_id) && !l.audience_narrowed)
+                {
+                    l.access = access.clone();
+                    l.deny = deny.clone();
+                }
+                for n in self
+                    .notes
+                    .values_mut()
+                    .filter(|n| subtree.contains(&n.topic_id))
+                {
+                    n.access = access.clone();
+                    n.deny = deny.clone();
+                }
+                for s in self
+                    .sources
+                    .values_mut()
+                    .filter(|s| s.topic_id.as_ref().is_some_and(|t| subtree.contains(t)))
+                {
+                    s.access = access.clone();
+                    s.deny = deny.clone();
+                }
+            }
+            AudienceUnit::Workspace => {
+                if let Some(w) = self.workspaces.get_mut(id) {
+                    w.access = access.clone();
+                    w.deny = deny.clone();
+                }
+                for s in self
+                    .folder_files
+                    .get_mut(id)
+                    .into_iter()
+                    .flat_map(|f| f.values_mut())
+                {
+                    s.access = access.clone();
+                    s.deny = deny.clone();
+                }
+            }
+            AudienceUnit::Source => {
+                let folder = self.folder_files.values_mut().find_map(|f| f.get_mut(id));
+                if let Some(s) = self.sources.get_mut(id).or(folder) {
+                    s.access = access;
+                    s.deny = deny;
+                }
+            }
+            AudienceUnit::Document => {
+                if let Some(d) = self.agent_documents.get_mut(id) {
+                    d.access = access;
+                    d.deny = deny;
+                }
+            }
+        }
+    }
+
+    /// A topic and every topic under it.
+    pub fn subtree(&self, id: &str) -> HashSet<Id> {
+        let mut out: HashSet<Id> = HashSet::new();
+        out.insert(id.to_string());
+        loop {
+            let before = out.len();
+            for topic in self.topics.values() {
+                if let Some(parent) = &topic.parent_id
+                    && out.contains(parent)
+                {
+                    out.insert(topic.id.clone());
+                }
+            }
+            if out.len() == before {
+                return out;
+            }
+        }
+    }
+
+    /// Agents' documents as `GET routes::CONTEXT_CHANGES` lists them (every page).
+    pub fn replace_agent_documents(&mut self, documents: Vec<Document>) {
+        self.agent_documents = documents
+            .into_iter()
+            .filter(|d| matches!(d.origin, Origin::Agent { .. }))
+            .map(|d| (d.id.clone(), d))
+            .collect();
+        self.documents_loaded = true;
+    }
+
+    /// The documents `agent` ingested (its owner's, under its name), by name.
+    pub fn documents_of(&self, agent: &Agent) -> Vec<&Document> {
+        let mut list: Vec<&Document> = self
+            .agent_documents
+            .values()
+            .filter(|d| {
+                matches!(&d.origin, Origin::Agent { name } if *name == agent.name)
+                    && d.owner.as_deref() == Some(agent.owner_id.as_str())
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        list
+    }
+
+    /// Audit rows exactly as `GET routes::AUDIT` answered.
+    pub fn replace_audit(&mut self, rows: Vec<AuditRow>) {
+        self.audit = rows;
+        self.audit_loaded = true;
+    }
+
+    /// Older audit rows ("Load more"): added before those held, without repeats.
+    pub fn extend_audit(&mut self, rows: Vec<AuditRow>) {
+        for row in rows {
+            if !self.audit.iter().any(|r| same_audit_row(r, &row)) {
+                self.audit.push(row);
+            }
+        }
+        self.audit.sort_by_key(|r| r.at);
+        self.audit_loaded = true;
+    }
+
+    /// The oldest audit row held, for the next page's `to`.
+    pub fn oldest_audit(&self) -> Option<DateTime<Utc>> {
+        self.audit.iter().map(|r| r.at).min()
+    }
+
+    /// A subject's name from the library this person reads (a topic, folder, file or
+    /// agent document they hold); `None` when they don't hold it.
+    fn local_subject_name(&self, subject: &margin_shared::context::AuditSubject) -> Option<String> {
+        let id = subject.id.as_str();
+        match subject.kind.as_str() {
+            "topic" => self.topics.get(id).map(|t| t.title.clone()),
+            "workspace" => self.workspaces.get(id).map(|w| w.name.clone()),
+            "source" => self.sources.get(id).map(|s| s.name.clone()),
+            "document" => self.agent_documents.get(id).map(|d| d.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Audit rows, newest first.
+    pub fn audit_newest_first(&self) -> Vec<&AuditRow> {
+        let mut rows: Vec<&AuditRow> = self.audit.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.at));
+        rows
     }
 
     /// The folders exactly as `GET /api/workspaces` lists them.
@@ -532,22 +748,7 @@ impl LibraryState {
     }
 
     fn remove_topic(&mut self, id: &str) {
-        let mut doomed: HashSet<Id> = HashSet::new();
-        doomed.insert(id.to_string());
-        // Collect descendants (any depth).
-        loop {
-            let before = doomed.len();
-            for topic in self.topics.values() {
-                if let Some(parent) = &topic.parent_id
-                    && doomed.contains(parent)
-                {
-                    doomed.insert(topic.id.clone());
-                }
-            }
-            if doomed.len() == before {
-                break;
-            }
-        }
+        let doomed = self.subtree(id);
         self.topics.retain(|tid, _| !doomed.contains(tid));
         let lessons: Vec<Id> = self
             .lessons
@@ -860,6 +1061,7 @@ pub(crate) mod tests {
             created_at: ts(position),
             updated_at: ts(position),
             written_with: None,
+            audience_narrowed: false,
         }
     }
 
@@ -1242,6 +1444,7 @@ pub(crate) mod tests {
             created_at: ts(0),
             chat_id: None,
             written_with: None,
+            audience_narrowed: false,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -1281,6 +1484,7 @@ pub(crate) mod tests {
             created_at: ts(0),
             chat_id: None,
             written_with: None,
+            audience_narrowed: false,
         };
         s.apply(Event::ProposalChanged {
             proposal: p.clone(),
@@ -1903,5 +2107,124 @@ pub(crate) mod tests {
         s.apply(Event::AccessChanged {
             person_id: BOB.into(),
         });
+    }
+
+    /// L2: who reads what follows the service: a revoked unit goes with what follows it,
+    /// a new audience reaches the rows under its unit, audit rows arrive once the log
+    /// was fetched, agents' documents come and go.
+    #[test]
+    fn audiences_and_the_audit_log_follow_the_service() {
+        let mut s = LibraryState::from_library(crate::fake::sample_library());
+        s.replace_workspaces(crate::fake::sample_workspaces());
+        s.replace_folder_files("w1", crate::fake::sample_folder_files());
+        s.replace_agent_documents(crate::fake::sample_documents());
+        assert_eq!(s.agent_documents.len(), 3);
+
+        // Publishing a topic: its subtree, lessons (not a narrowed one), notes, sources.
+        let company = Audience {
+            access: vec!["person/p-alice".into(), "company".into()],
+            deny: vec!["person/p-bob".into()],
+        };
+        s.apply_audience(AudienceUnit::Topic, "signals", &company);
+        for id in ["signals", "complex", "fourier"] {
+            assert_eq!(s.topics[id].access, company.access, "{id}");
+            assert_eq!(s.topics[id].deny, company.deny, "{id}");
+        }
+        assert_eq!(s.lessons["l1"].access, company.access);
+        assert_eq!(s.lessons["l2"].access, ["person/p-alice"], "narrowed stays");
+        assert_eq!(s.notes["n1"].access, company.access);
+        assert_eq!(s.sources["s1"].access, company.access);
+        assert_eq!(
+            s.sources["s8"].access,
+            ["person/p-alice"],
+            "not the topic's"
+        );
+        assert_eq!(s.topics["linalg"].access, ["person/p-alice"]);
+        s.apply_audience(AudienceUnit::Workspace, "w1", &company);
+        assert_eq!(s.workspaces["w1"].access, company.access);
+        assert!(
+            s.folder_files["w1"]
+                .values()
+                .all(|f| f.access == company.access)
+        );
+        s.apply_audience(AudienceUnit::Document, "doc-arch", &company);
+        assert_eq!(s.agent_documents["doc-arch"].access, company.access);
+
+        // Revoked: a topic goes with its subtree; a folder with its files; a document.
+        s.apply(Event::AudienceRevoked {
+            unit: AudienceUnit::Topic,
+            ids: vec!["signals".into()],
+        });
+        assert!(!s.topics.contains_key("fourier"));
+        assert!(!s.lessons.contains_key("l1") && !s.notes.contains_key("n1"));
+        assert!(!s.sources.contains_key("s1") && s.sources.contains_key("s8"));
+        assert!(s.topics.contains_key("linalg"));
+        s.apply(Event::AudienceRevoked {
+            unit: AudienceUnit::Workspace,
+            ids: vec!["w1".into()],
+        });
+        assert!(!s.workspaces.contains_key("w1") && !s.folder_files.contains_key("w1"));
+        s.apply(Event::AudienceRevoked {
+            unit: AudienceUnit::Source,
+            ids: vec!["s8".into()],
+        });
+        assert!(!s.sources.contains_key("s8"));
+        s.apply(Event::AudienceRevoked {
+            unit: AudienceUnit::Document,
+            ids: vec!["doc-arch".into()],
+        });
+        assert!(!s.agent_documents.contains_key("doc-arch"));
+
+        // Agents' documents: an agent's own, by name; one changed arrives.
+        let claude = crate::fake::sample_agents().remove(0);
+        let names: Vec<&str> = s
+            .documents_of(&claude)
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(names, ["deploy-runbook.md"]);
+        let mut doc = crate::fake::sample_documents().remove(0);
+        doc.name = "again.md".into();
+        s.apply(Event::DocumentChanged { document: doc });
+        assert_eq!(s.documents_of(&claude).len(), 2);
+
+        // Audit rows: only once the log was fetched, newest first, no repeats.
+        let rows = crate::fake::sample_audit(Utc::now());
+        s.apply(Event::AuditAppended {
+            row: rows[0].clone(),
+        });
+        assert!(s.audit.is_empty());
+        s.replace_audit(rows[..2].to_vec());
+        s.apply(Event::AuditAppended {
+            row: rows[3].clone(),
+        });
+        s.apply(Event::AuditAppended {
+            row: rows[3].clone(),
+        });
+        assert_eq!(s.audit.len(), 3);
+        // Named from the agent document this person holds.
+        let mut named = rows[3].clone();
+        named.subject_name = s
+            .agent_documents
+            .get(&named.subject.id)
+            .map(|d| d.name.clone());
+        assert_eq!(s.audit_newest_first()[0], &named);
+        // A live row comes without a name: the subject is named from the library held.
+        s.topics
+            .insert("t-live".into(), topic("t-live", None, "Live topic", 0));
+        let mut live = rows[0].clone();
+        live.at = Utc::now() + chrono::Duration::seconds(5);
+        live.subject.kind = "topic".into();
+        live.subject.id = "t-live".into();
+        live.subject_name = None;
+        s.apply(Event::AuditAppended { row: live.clone() });
+        assert_eq!(
+            s.audit_newest_first()[0].subject_name.as_deref(),
+            Some("Live topic")
+        );
+        // The same row fetched later with a joined name is not a second row.
+        live.subject_name = Some("Live topic".into());
+        s.extend_audit(vec![live]);
+        assert_eq!(s.audit.len(), 4);
     }
 }

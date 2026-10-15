@@ -31,12 +31,13 @@ Two ways they run:
 | `variants/*.toml` | Pipeline configurations, the same shape as `Settings.pipeline`. `baseline` is the shipped default. |
 | `gates.toml`, `prices.toml` | CI allowances; USD per million tokens by model. |
 | `runner.toml` | The runner's endpoints, models per slot and provider, writing-model window. The service is `--service-url` (dev; prod is refused). |
-| `recorded/extracted.json` | What pdfium/tesseract read from each PDF and image (CI replays it; OCR isn't reproduced byte for byte elsewhere). |
-| `recorded/embeddings.bin` | Real EmbeddingGemma vectors of every corpus chunk, picture and golden query. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. |
+| `recorded/extracted.json` | What was read from each PDF and image; CI replays it (OCR isn't reproduced byte for byte elsewhere). The committed one was recorded with PDFKit/Vision on macOS 27.2, before the service moved to Linux; the service's readers are now pdfium/tesseract, which cut other chunks, so a `record-embeddings` run on Linux rewrites it and must re-record the embeddings and re-baseline in the same change (the gate says so). |
+| `recorded/embeddings.bin` | Real EmbeddingGemma 2 vectors (ONNX Runtime, 8-bit: the service's default embedder) of every corpus chunk, picture and golden query; the CI gate replays it. Format: `margin_embed::fake::Recording` (the one the service's `RecordedEmbedder` reads; see `crates/evals/src/recorded.rs`). A miss is an error, never a made-up vector. Another ONNX format records beside it under its own version (`live::recording_file`). |
 | `recorded/generations/<prompt version>/<model>/` | Recorded lessons with the passages they were sent, for the citation gate and `judge`. |
 | `baseline.json` | The committed retrieval baseline the CI gate compares against. |
 | `reports/` | `margin-eval report` output (Markdown + one self-contained HTML page per run). |
 | `recorded/reranks.jsonl`, `recorded/rewrites.jsonl` | R2: what the listwise reranker (`listwise-small`) and the query rewriter (`small-expand-v1`) answered on the small-tasks model, one record per search, keyed by `sha256(stage + params, prompt version, purpose, query [, candidate ids])`, with the call's time and cost. CI replays them under the real stage names; a search not recorded is an error, never a made-up answer. |
+| `access.toml` | L2: the access suite's principals over the corpus (groups, people, agents with owners and ceilings, the organisation's `owner`) and each document's audience (`access`/`deny`, by exact path, `dir/*` or `dir/**`). The oracle reads it: a principal reads a document when its expansion (the service's `groups::expand`, `agents::agent_principal`) holds one of the document's `access` entries and none of its `deny` entries; exact membership, no prefix rule. |
 | `prompts.lock` | Every prompt's version and the hash of its constant block; the always-on `prompt_lock` test fails when a constant block changes under an unchanged version. |
 
 The judge rubrics, the question-generation and seriousness-grading prompts and the
@@ -44,14 +45,27 @@ canary sets (10 trivial questions to reject, 5 serious ones to keep, 20 delibera
 lessons) are R1-ai's, in `margin_ai::evals`; the runner uses them through
 `crates/evals/src/ai_judge.rs`.
 
-## First run on the service (before R1 is called done)
+## Recording and re-baselining
+
+The embeddings and the baseline need no service and no model key: only the ONNX model
+(download it with `margin-service download-model --embedder onnx-q8`, or anywhere and
+point `MARGIN_EMBED_MODEL_DIR` at it) and, on Linux, the service's readers (pdfium,
+tesseract, ffmpeg):
 
 ```sh
-cargo run -p margin-evals --bin margin-eval -- record-embeddings
-cargo run -p margin-evals --bin margin-eval -- record-generations
-cargo run -p margin-evals --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline
-git add evals/recorded evals/baseline.json   # then remove the `ignore` in crates/evals/tests/gates.rs
+export MARGIN_EVAL_EMBEDDER=onnx-q8 MARGIN_EMBED_MODEL_DIR=<model folder>
+cargo run -p margin-evals --bin margin-eval -- record-embeddings --data <scratch>
+cargo run -p margin-evals --bin margin-eval -- run --suite retrieval --variant baseline --write-baseline --data <scratch>
+git add evals/recorded evals/baseline.json
 ```
+
+(`MARGIN_CONFIG` pointing at a scratch `service.toml` keeps the runner off the service's
+own config.) The three files are one unit: the recording's keys are the chunk texts cut
+from `extracted.json`, and the baseline's `corpus_hash`, `pipeline_hash` and
+`embedder_version` are checked by the gate, so a re-record always comes with a
+re-baseline in the same commit. `record-generations` calls the writing model with the
+owner's key; until `recorded/generations/<prompt version>/` exists the CI citation gate
+is skipped and the rest gate.
 
 ## Run, compare, report
 
@@ -80,6 +94,32 @@ writer), the agent's model, the question generator; a retrieval run has none. A 
 recorded before providers were compares with a warning. ChatGPT is its own provider even
 on model ids OpenAI also serves. Commit the new `baseline.json` (and the report's summary
 table) with the change that improves it.
+
+## Access: the leakage gate (L2)
+
+```sh
+margin-eval run --suite access             # baseline; prints the gates and a row per principal
+margin-eval report                         # its "Access" section
+```
+
+The access suite (`docs/l2-brief.md` D8) stamps the corpus with the audiences of
+`access.toml` through the service's own writer (`Store::set_document_audience`) and
+checks `[access]` in `gates.toml`:
+
+| Gate | What |
+|---|---|
+| `leaks_max = 0` | Every golden query searched as every principal: a hit whose document the principal can't read by the oracle is a leak. |
+| `by_id_leaks_max = 0` | `read_passages` and `document_outline` for every (principal, document) pair the oracle forbids come back empty (and every allowed pair with text doesn't). |
+| `owner_rank_identical = true` | The owner (`access.toml`'s `owner` in every group, who reads every document) searched through the reader returns exactly the ranked ids of the same statements without `access CONTAINSANY $paths AND deny CONTAINSNONE $deny` (`crates/evals/src/unfiltered.rs`, the eval crate's replay of the service's index retrievers), same vectors, same process. So recall@5 and nDCG@10 are unchanged to the digit. |
+| `rank_consistent = true` | A principal who reads every relevant document of a query sees the relevant hits in the owner's relative order: the filter removes, never reorders. |
+| `p95_latency_max_ratio = 1.5` | The owner's p95 over the unfiltered run's (three interleaved rounds, each query's fastest). |
+
+A run that tests nothing fails too: nobody refused anything, a principal without hits,
+no forbidden by-id pair. In CI it is `crates/evals/tests/gates.rs::access_gates`, never
+ignored: on `recorded/embeddings.bin` when it is committed, else on the deterministic
+`FakeEmbedder` (leakage is a property of the predicate, not of the vectors). The other
+suites search as a `company` reader over an index left at `company`, so `[retrieval]`
+and `baseline.json` don't move (the reader isn't part of `PipelineConfig`).
 
 ## Alerts and performance budgets
 

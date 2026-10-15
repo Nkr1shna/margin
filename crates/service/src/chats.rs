@@ -118,6 +118,30 @@ pub async fn items(state: &AppState, chat_id: &str) -> anyhow::Result<Vec<Stored
     Ok(rows)
 }
 
+/// The documents a chat's Passages cards quote, once each (a citation from before
+/// documents existed names its source, whose document has the same id): what the agent
+/// has read in the chat and may repeat (L2 D4.3, `audience::note_refusal`).
+pub async fn quoted_documents(state: &AppState, chat_id: &str) -> anyhow::Result<Vec<Id>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in items(state, chat_id).await? {
+        let ChatItemKind::Card {
+            card: Card::Passages(card),
+            ..
+        } = &row.item.kind
+        else {
+            continue;
+        };
+        for c in &card.passages {
+            let id = c.document_id.as_ref().unwrap_or(&c.source_id);
+            if seen.insert(id.clone()) {
+                out.push(id.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Stores the chat (bumping `updated_at`) and emits `ChatChanged` when something else
 /// changed (state, title, pending message, usage, attachments, waiting): a new item only
 /// bumps `updated_at`, which is saved silently. Call with `write_lock` held.
@@ -392,7 +416,7 @@ pub async fn create_chat(
     // the chat stays on it for good.
     let provider = match req.provider.or(p.person.settings.default_provider) {
         Some(provider) => provider,
-        None => state.settings_row().await?.default_provider,
+        None => state.default_provider().await?,
     };
     let own = Ownership::private(&p);
     let _w = state.write_lock.lock().await;

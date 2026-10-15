@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod audience;
 pub mod chat;
 pub mod context;
 pub mod device;
@@ -16,6 +17,7 @@ pub mod providers;
 pub mod routes;
 pub mod text;
 
+pub use audience::*;
 pub use chat::*;
 pub use device::*;
 pub use principal::*;
@@ -132,6 +134,11 @@ pub struct Lesson {
     /// written before R2 and for pending ones. Regenerating overwrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_with: Option<WrittenWith>,
+    /// The lesson drew on documents whose audiences share no reader with its topic's
+    /// (`audience::derive`), so it is private to its creator; the app says so with
+    /// "Publish…" (L2 D4).
+    #[serde(default)]
+    pub audience_narrowed: bool,
 }
 
 /// What wrote a lesson, a proposal's outline or a scene (R2, `docs/r2-brief.md` D4.3):
@@ -310,6 +317,9 @@ pub struct Proposal {
     /// The planner call that wrote the outline (R2); `None` before R2 or while drafting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_with: Option<WrittenWith>,
+    /// As `Lesson.audience_narrowed`, from the planner's retrieval (L2 D4).
+    #[serde(default)]
+    pub audience_narrowed: bool,
 }
 
 /// Accept a proposal, optionally with an edited outline and the outline card's chips.
@@ -763,6 +773,15 @@ impl Settings {
             Provider::Claude => self.has_claude_api_key,
         }
     }
+
+    /// The first provider (in `Provider::ALL` order) with a credential, else OpenAI: the
+    /// default provider until an admin picks one.
+    pub fn first_configured(&self) -> Provider {
+        Provider::ALL
+            .into_iter()
+            .find(|&p| self.has_credential(p))
+            .unwrap_or_default()
+    }
 }
 
 /// `Settings` as it may arrive: from an older service, without the provider slots.
@@ -803,7 +822,8 @@ impl From<SettingsWire> for Settings {
     fn from(w: SettingsWire) -> Self {
         let openai_models = w
             .openai_models
-            .unwrap_or_else(|| RouteModels::openai_from(&w.openai_model, w.agent_model.as_deref()));
+            .unwrap_or_else(|| RouteModels::openai_from(&w.openai_model, w.agent_model.as_deref()))
+            .or_defaults(Provider::OpenAi);
         Settings {
             openai_base_url: w.openai_base_url,
             openai_model: w.openai_model,
@@ -820,8 +840,12 @@ impl From<SettingsWire> for Settings {
             openai_models,
             chatgpt_models: w
                 .chatgpt_models
-                .unwrap_or_else(RouteModels::chatgpt_default),
-            claude_models: w.claude_models.unwrap_or_else(RouteModels::claude_default),
+                .unwrap_or_default()
+                .or_defaults(Provider::ChatGpt),
+            claude_models: w
+                .claude_models
+                .unwrap_or_default()
+                .or_defaults(Provider::Claude),
             has_claude_api_key: w.has_claude_api_key,
             chatgpt: w.chatgpt,
         }
@@ -1149,6 +1173,17 @@ pub enum Event {
     AccessChanged {
         person_id: Id,
     },
+    /// The readers this is sent to lost access to these units (and what follows them:
+    /// a topic's subtree, lessons, notes and sources; a folder's files): drop them
+    /// without a reload (L2 D3).
+    AudienceRevoked {
+        unit: AudienceUnit,
+        ids: Vec<Id>,
+    },
+    /// An audit row was written (admins only, L2 D7).
+    AuditAppended {
+        row: context::AuditRow,
+    },
 }
 
 /// Error body for every non-2xx API response.
@@ -1251,6 +1286,39 @@ mod tests {
             serde_json::from_value::<EmbeddingModel>(json).unwrap(),
             model
         );
+    }
+
+    #[test]
+    fn empty_slots_read_as_the_defaults_and_the_first_configured_provider() {
+        // An `openai_model` never picked and slots stored empty: the shipped defaults.
+        let stored = serde_json::json!({
+            "openai_base_url": "https://api.openai.com/v1", "openai_model": "",
+            "has_api_key": false, "voice": null,
+            "render_width": 1920, "render_height": 1080, "render_fps": 30,
+            "claude_models": {"chat": "", "write": "claude-sonnet-5-5", "small": " "}
+        });
+        let mut s: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(s.openai_models, RouteModels::openai_default());
+        assert_eq!(s.openai_models.chat, OPENAI_DEFAULT_MODEL);
+        assert_eq!(
+            s.claude_models,
+            RouteModels {
+                chat: "claude-opus-5-5".into(),
+                write: "claude-sonnet-5-5".into(),
+                small: "claude-haiku-5-5".into(),
+            }
+        );
+        for p in Provider::ALL {
+            assert_eq!(
+                RouteModels::default().or_defaults(p),
+                RouteModels::default_for(p)
+            );
+        }
+        assert_eq!(s.first_configured(), Provider::OpenAi);
+        s.has_claude_api_key = true;
+        assert_eq!(s.first_configured(), Provider::Claude);
+        s.has_api_key = true;
+        assert_eq!(s.first_configured(), Provider::OpenAi);
     }
 
     #[test]

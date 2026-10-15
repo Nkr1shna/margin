@@ -265,6 +265,7 @@ impl Fake {
             bytes: text.len() as u64,
             actor: actor.into(),
             access: vec!["company".into()],
+            deny: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -505,9 +506,14 @@ async fn ingest(
         }
         None => fake.add(&req.name, req.origin.clone(), &actor, &req.text),
     };
-    let s = fake.lock();
-    let doc = s.docs.iter().find(|(d, _)| d.id == id).unwrap().0.clone();
-    Json(doc).into_response()
+    let mut s = fake.lock();
+    let doc = &mut s.docs.iter_mut().find(|(d, _)| d.id == id).unwrap().0;
+    // The audience as asked (the service adds the owner and validates).
+    if let Some(a) = &req.audience {
+        doc.access.clone_from(&a.access);
+        doc.deny.clone_from(&a.deny);
+    }
+    Json(doc.clone()).into_response()
 }
 
 #[derive(Deserialize)]
