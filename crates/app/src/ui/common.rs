@@ -640,11 +640,17 @@ pub fn ErrorNotice(
     #[props(default)] on_retry: Option<EventHandler<()>>,
 ) -> Element {
     let mut app = use_app();
+    // A pane only an admin changes is no fix for a member: they're told to ask one.
+    let ask_admin = settings_pane.is_some_and(|p| p.admin_only()) && !app.is_admin();
+    let settings_pane = settings_pane.filter(|_| !ask_admin);
     rsx! {
         div { class: "notice error", role: "alert",
             Icon { name: "alert" }
             div { class: "body",
                 span { "{message}" }
+                if ask_admin {
+                    span { class: "faint", "Only an organisation admin can change this in Settings. Ask an admin." }
+                }
                 if settings_pane.is_some() || on_retry.is_some() {
                     div { class: "row-actions",
                         if let Some(pane) = settings_pane {

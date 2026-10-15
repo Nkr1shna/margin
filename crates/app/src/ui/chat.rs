@@ -330,14 +330,37 @@ pub fn error_fix(code: Option<&str>) -> Option<SettingsPane> {
     }
 }
 
-/// The send button's tooltip while `provider` can't answer yet.
-pub fn setup_to_ask(provider: Provider) -> &'static str {
-    match provider {
-        Provider::OpenAi => "Add an OpenAI API key in Settings to ask",
-        Provider::ChatGpt => "Sign in with ChatGPT in Settings to ask",
-        Provider::Claude => "Add a Claude API key in Settings to ask",
+/// The send button's tooltip while `provider` can't answer yet: what to set up for an
+/// admin; a member can't, so they're told to ask one.
+pub fn setup_to_ask(provider: Provider, admin: bool) -> &'static str {
+    match (provider, admin) {
+        (Provider::OpenAi, true) => "Add an OpenAI API key in Settings to ask",
+        (Provider::ChatGpt, true) => "Sign in with ChatGPT in Settings to ask",
+        (Provider::Claude, true) => "Add a Claude API key in Settings to ask",
+        (Provider::OpenAi, false) => "Ask an admin to add an OpenAI API key to ask",
+        (Provider::ChatGpt, false) => "Ask an admin to sign in with ChatGPT to ask",
+        (Provider::Claude, false) => "Ask an admin to add a Claude API key to ask",
     }
 }
+
+/// The chat's notice while `provider` can't answer, for a member (an admin is offered
+/// the setup itself).
+pub fn member_setup_text(provider: Provider) -> String {
+    let what = match provider {
+        Provider::OpenAi => "add an OpenAI API key",
+        Provider::ChatGpt => "sign in with ChatGPT",
+        Provider::Claude => "add a Claude API key",
+    };
+    format!(
+        "{} isn't set up on this Margin yet. Ask an organisation admin to {what}; Margin needs it before it can answer.",
+        provider.label()
+    )
+}
+
+/// What a member reads under a provider error only an admin can fix (a missing or
+/// refused key, a ChatGPT sign-in, a plan's limit).
+pub const ASK_AN_ADMIN: &str =
+    "Only an organisation admin can fix this in Settings → AI. Ask an admin.";
 
 /// The page web citation `n` of answer `item_id` names (as its Sources list numbers
 /// them), for the marker clicked.
@@ -509,6 +532,8 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
         .unwrap_or_else(|| new_chat_provider(*picked.read(), default_provider));
     let ready = Provider::ALL.map(|p| lib.provider_ready(p));
     let no_key = !lib.provider_ready(provider);
+    // Only an admin sets a provider up; a member is told to ask one.
+    let admin = app.is_admin();
     let empty_library = lib.topics.is_empty() && *app.lib_status.read() == LoadStatus::Loaded;
     let chats_loaded = lib.chats_loaded;
     drop(lib);
@@ -656,7 +681,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
     let composer = move |placeholder: &'static str| {
         let can_send = !draft_empty && !is_sending && !no_key && !waiting && !uploading;
         let send_title = if no_key {
-            setup_to_ask(provider)
+            setup_to_ask(provider, admin)
         } else if waiting {
             "A message is already waiting for this answer to finish"
         } else if uploading {
@@ -710,17 +735,23 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                 Icon { name: "alert" }
                 div { class: "body",
                     span {
-                        "{provider_setup(provider)} to ask on {provider.label()}. Margin needs it before it can answer."
+                        if admin {
+                            "{provider_setup(provider)} to ask on {provider.label()}. Margin needs it before it can answer."
+                        } else {
+                            "{member_setup_text(provider)}"
+                        }
                         if !chat_open && ready.iter().any(|r| *r) {
                             " Or pick a provider that's set up."
                         }
                     }
-                    div { class: "row-actions",
-                        button {
-                            class: "btn btn-secondary btn-sm",
-                            onclick: move |_| open_provider_settings(app, provider),
-                            Icon { name: "gear" }
-                            "Open Settings → {provider.label()}"
+                    if admin {
+                        div { class: "row-actions",
+                            button {
+                                class: "btn btn-secondary btn-sm",
+                                onclick: move |_| open_provider_settings(app, provider),
+                                Icon { name: "gear" }
+                                "Open Settings → {provider.label()}"
+                            }
                         }
                     }
                 }
@@ -752,7 +783,7 @@ pub fn ChatScreen(id: Option<Id>) -> Element {
                                     "aria-checked": (p == provider).to_string(),
                                     tabindex: if p == provider { "0" } else { "-1" },
                                     disabled: !ready[i],
-                                    title: if !ready[i] { "Set up in Settings → AI" },
+                                    title: if !ready[i] { if admin { "Set up in Settings → AI" } else { "Not set up: ask an admin" } },
                                     onclick: move |_| picked.set(Some(p)),
                                     {p.label()}
                                 }
@@ -1370,17 +1401,24 @@ fn ProviderErrorNotice(
     #[props(default)] on_retry: Option<EventHandler<()>>,
 ) -> Element {
     let app = use_app();
+    // Only an admin changes the providers; a member is told to ask one.
+    let admin = app.is_admin();
     rsx! {
         div { class: "notice error", role: "alert",
             Icon { name: "alert" }
             div { class: "body",
                 span { "{message}" }
+                if !admin {
+                    span { class: "faint", "{ASK_AN_ADMIN}" }
+                }
                 div { class: "row-actions",
-                    button {
-                        class: "btn btn-secondary btn-sm",
-                        onclick: move |_| open_provider_settings(app, provider),
-                        Icon { name: "gear" }
-                        "Open Settings → {provider.label()}"
+                    if admin {
+                        button {
+                            class: "btn btn-secondary btn-sm",
+                            onclick: move |_| open_provider_settings(app, provider),
+                            Icon { name: "gear" }
+                            "Open Settings → {provider.label()}"
+                        }
                     }
                     if let Some(retry) = on_retry {
                         button {
@@ -3390,6 +3428,34 @@ mod tests {
         let html = render_route("/", lib);
         assert!(!html.contains("chat-no-key"));
         assert!(!radio(&html, Provider::Claude).contains("disabled"));
+    }
+
+    #[test]
+    fn a_member_is_told_to_ask_an_admin() {
+        use crate::ui::test_render::{Extra, render_with};
+        let member = || Extra {
+            me: Some(fake::sample_me(fake::TOKEN_BOB)),
+            ..Default::default()
+        };
+        let mut lib = sample();
+        let mut settings = fake::FakeState::new().settings;
+        settings.default_provider = Provider::Claude;
+        lib.settings = Some(settings);
+        let html = render_with("/", lib.clone(), None, member());
+        assert!(
+            html.contains("Claude isn&#39;t set up on this Margin yet. Ask an organisation admin to add a Claude API key"),
+            "{html}"
+        );
+        // Nothing offered that only an admin can do.
+        assert!(!html.contains(">Open Settings → Claude<"));
+        assert!(!html.contains("Add a Claude API key to ask on Claude"));
+        assert!(html.contains(r#"title="Ask an admin to add a Claude API key to ask""#));
+        assert!(html.contains(r#"title="Not set up: ask an admin""#));
+        assert!(!html.contains("Set up in Settings → AI"));
+        // The same for an open chat's provider error.
+        let html = render_with("/chat/c3", lib, None, member());
+        assert!(html.contains("Ask an organisation admin to add a Claude API key"));
+        assert!(!html.contains(">Open Settings → Claude<"));
     }
 
     #[test]
