@@ -15,7 +15,7 @@ use margin_shared::{
     ToolStatus, UnreadableFile, Workspace, WorkspaceSync,
 };
 
-use crate::config::{Appearance, normalize_service_url};
+use crate::config::{APP_NAME, Appearance, PINNED_SERVICE_URL, normalize_service_url};
 use crate::folders::sync::SyncState;
 use crate::sources::{Tone, human_bytes, status_text};
 use crate::state::{LiveStatus, use_app};
@@ -267,7 +267,14 @@ fn ServiceSection() -> Element {
         section { class: "set-sec",
             h2 { "Service" }
             p { class: "help", "Where your library lives: the Margin service." }
-            if *editing.read() {
+            if PINNED_SERVICE_URL.is_some() {
+                // A release build is pinned to its service (config.rs): nothing to change.
+                p { class: "help", "This build of {APP_NAME} is made for this service; a developer build can connect to any." }
+                div { class: "kv",
+                    span { "Address" }
+                    span { class: "mono", "{current}" }
+                }
+            } else if *editing.read() {
                 form {
                     style: "display: grid; gap: 14px",
                     onsubmit: {

@@ -187,13 +187,9 @@ impl AppCtx {
         self.session.peek().as_ref().map(|s| s.api.clone())
     }
 
-    /// The service URL the app is configured for (or the default).
+    /// The service URL the app talks to (`LocalConfig::service_url`).
     pub fn service_url(&self) -> String {
-        self.config
-            .peek()
-            .service_url
-            .clone()
-            .unwrap_or_else(|| config::DEFAULT_SERVICE_URL.to_string())
+        self.config.peek().service_url()
     }
 
     /// Handle a failed request: a revoked token signs this device out.

@@ -1,7 +1,6 @@
-//! Measures how long a lesson video takes to render on this machine, in this OS's
-//! sandbox: on a Linux guest that is ManimGX on Mesa lavapipe (CPU Vulkan) under
-//! bubblewrap, the number `docs/plan-linux-service.md` §2.9 and risk 5 wait for; on the
-//! Mac it is the Metal baseline under `sandbox-exec`.
+//! Measures how long a lesson video takes to render on this machine: on a Linux guest
+//! that is ManimGX on Mesa lavapipe (CPU Vulkan) under bubblewrap, the number
+//! `docs/plan-linux-service.md` §2.9 and risk 5 wait for.
 //!
 //! A measurement, not a check, so it is ignored by default. On the guest (manimgx
 //! installed with `uv tool install --python 3.14 manimgx`, `bwrap` with user namespaces
@@ -114,7 +113,7 @@ async fn lavapipe_render_time() {
         });
     let scene = std::fs::read_to_string(&scene_path)
         .unwrap_or_else(|e| panic!("can't read {}: {e}", scene_path.display()));
-    let sandbox = SandboxMode::native();
+    let sandbox = SandboxMode::LinuxBubblewrap;
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("margin-video")
         .join("lavapipe");

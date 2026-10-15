@@ -1,8 +1,11 @@
 # Smoke test of devmargin after each dev deploy (docs/plan-deploy.md §4a). Runs when
 # deploy-dev succeeds (or by hand with a deploy-dev run id), checks the public URL without
 # signing in, and comments the result on every PR the deploy brought to dev: the squash
-# commits between the previous dev deploy and this one. A pass means dev is up with that
-# build; the owner then tries the change on devmargin and labels the PR `verified-on-dev`.
+# commits between the previous dev deploy and this one. It also records the result as the
+# commit status `smoke-dev` on the deployed sha: promote-release ships only a dev commit
+# whose smoke-dev passed. A pass means dev is up with that build; trying the change on
+# devmargin and labelling the PR `verified-on-dev` is optional. A failure means dev is red:
+# revert the PR that broke it (revert-pr.yml) and fix forward.
 # Uses no secrets and prints only status codes and the public /api/version fields.
 name: smoke-dev
 
@@ -37,6 +40,7 @@ jobs:
       contents: read
       actions: read
       pull-requests: write
+      statuses: write  # the `smoke-dev` commit status on the deployed sha
     env:
       GH_TOKEN: ${{ github.token }}
       URL: https://devmargin.krishnanelloore.com
@@ -110,6 +114,19 @@ jobs:
           cat "$report.full"
           echo "ok=$ok" >> "$GITHUB_OUTPUT"
 
+      # What promote-release reads: the newest dev commit with a passing `smoke-dev`.
+      - name: Record the result on the deployed commit
+        if: always() && steps.deployed.outputs.sha != ''
+        env:
+          SHA: ${{ steps.deployed.outputs.sha }}
+          OK: ${{ steps.smoke.outputs.ok }}
+        run: |
+          if [ "$OK" = true ]; then state=success; desc="devmargin is healthy at this commit"
+          else state=failure; desc="devmargin failed the smoke test at this commit"; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" -f context=smoke-dev \
+            -f description="$desc" -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
+          echo "smoke-dev: $state on $SHA"
+
       - uses: actions/checkout@v4
         with:
           ref: dev
@@ -133,10 +150,10 @@ jobs:
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           if [ "$OK" = true ]; then
             head="✅ **Dev smoke test passed** on $URL for \`${SHA:0:7}\`, which includes this PR."
-            next="Try the change on devmargin; when it works, add the \`verified-on-dev\` label so promote-release can ship it."
+            next="This dev commit can now be released (promote-release). Optionally try the change on devmargin and add the \`verified-on-dev\` label."
           else
             head="❌ **Dev smoke test failed** on $URL for \`${SHA:0:7}\`, which includes this PR."
-            next="Dev is unhealthy at this build; see the run before verifying anything."
+            next="Dev is red at this build and can't be released. If this PR broke it, revert it (Actions → revert-pr) and fix forward."
           fi
           for pr in $prs; do
             { echo "$head"; echo; cat "$RUNNER_TEMP/smoke.md.full"; echo; echo "$next ([run]($run_url))"; } > "$RUNNER_TEMP/comment.md"

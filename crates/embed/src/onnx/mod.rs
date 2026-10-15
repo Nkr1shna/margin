@@ -1,17 +1,15 @@
 //! EmbeddingGemma 2 on ONNX Runtime (`onnx-community/embeddinggemma-2-ONNX`), CPU
-//! execution provider: the Linux service's embedder, also buildable on macOS (the `onnx`
-//! feature) for the eval A/B (`docs/plan-linux-service.md` §2.1).
+//! execution provider: the service's embedder (`docs/plan-linux-service.md` §2.1).
 //!
-//! The text graph does what `coreml.rs` does by hand (token table lookup, scaling,
-//! pooling, projection) and returns `sentence_embedding` `[batch, 768]`, normalised; its
+//! The text graph does the whole model (token table lookup, scaling, pooling,
+//! projection) and returns `sentence_embedding` `[batch, 768]`, normalised; its
 //! media inputs (`image_features`, `video_features`, `audio_features`, `[n, 512]`) are
 //! empty for text. Text inputs are batched for real (`text.rs`). Pictures and sound go
 //! through the vision and audio encoders first (`vision.rs`, `audio.rs`, `mel.rs`;
 //! `onnx/vision_encoder*`, `onnx/audio_encoder*`), which load on first use and unload
 //! after `ENCODER_IDLE` (`IdleSlot`, swept on every call); their feature rows go into the
 //! text graph's `image_features`/`audio_features` input at the placeholder tokens of
-//! `<bos> <|image> <image>… <image|> <eos>` (or the audio tokens), one item per run, the
-//! wrapping `coreml.rs` uses.
+//! `<bos> <|image> <image>… <image|> <eos>` (or the audio tokens), one item per run.
 //!
 //! The encoders' input and output names are read from the graphs when they load;
 //! `describe_graph` prints any graph's inputs, and the real-model tests in
@@ -128,10 +126,6 @@ impl<T> IdleSlot<T> {
 
     /// Drops the value whenever it was last used (a model being deleted). Returns
     /// whether one was loaded.
-    #[cfg_attr(
-        not(any(test, target_os = "linux", feature = "speech-onnx")),
-        allow(dead_code)
-    )]
     pub fn clear(&self) -> bool {
         self.value.lock().unwrap().take().is_some()
     }
@@ -177,27 +171,15 @@ fn load_tokens(dir: &Path) -> Result<Tokens, EmbedError> {
 
 impl Model {
     pub(crate) fn load(files: &ModelFiles, opts: &OnnxOptions) -> Result<Self, EmbedError> {
-        let Backend::Onnx(_) = files.backend else {
-            return Err(EmbedError::Load(format!(
-                "{} isn't an ONNX download",
-                files.dir.display()
-            )));
-        };
         if !files.is_complete() {
             return Err(EmbedError::NotDownloaded);
         }
         let tokens = load_tokens(&files.dir)?;
-        let path = files
-            .graph_path(ONNX_TEXT_GRAPH)
-            .ok_or(EmbedError::NotDownloaded)?;
+        let path = files.graph_path(ONNX_TEXT_GRAPH);
         let graph = OrtTextGraph::load(&path, opts.threads())?;
         let threads = opts.threads();
-        let vision_path = files
-            .graph_path(ONNX_VISION_GRAPH)
-            .ok_or(EmbedError::NotDownloaded)?;
-        let audio_path = files
-            .graph_path(ONNX_AUDIO_GRAPH)
-            .ok_or(EmbedError::NotDownloaded)?;
+        let vision_path = files.graph_path(ONNX_VISION_GRAPH);
+        let audio_path = files.graph_path(ONNX_AUDIO_GRAPH);
         Ok(
             Self::from_parts(files.backend, tokens, Box::new(graph), opts).with_encoders(
                 Box::new(move || {
@@ -491,12 +473,6 @@ mod tests {
             Model::load(&files, &opts),
             Err(EmbedError::NotDownloaded)
         ));
-        let core_ml = ModelFiles::new(&dir);
-        assert!(matches!(
-            Model::load(&core_ml, &opts),
-            Err(EmbedError::Load(_))
-        ));
-        assert_eq!(core_ml.graph_path("model"), None);
     }
 
     /// A text graph that takes media: records each media run's ids and rows, and returns

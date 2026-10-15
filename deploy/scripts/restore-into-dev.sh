@@ -13,7 +13,7 @@
 #      data.before-restore-<time> beside it)
 #   5. in dev: margin-service scrub-restored (deletes devices: prod's devices must not
 #      sign in to dev; deletes traces: dev evals must not read prod usage), start
-# Secrets are not copied: dev keeps its own Keychain and media-signing-key, so old
+# Secrets are not copied: dev keeps its own secrets file and media-signing-key, so old
 # media links stop working in dev.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"

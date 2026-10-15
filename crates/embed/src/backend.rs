@@ -1,8 +1,10 @@
-//! Which runtime runs EmbeddingGemma 2 (`docs/plan-linux-service.md` §2.1, §2.11): Core
-//! ML on macOS (`FluidInference/embeddinggemma-2-coreml`, fp16) or ONNX Runtime on the CPU
-//! (`onnx-community/embeddinggemma-2-ONNX`, 8-bit by default). The two give close but not
-//! equal vectors, so each has its own `embedder_version`: rows stamped with another
-//! version are embedded again, and the dense leg only compares vectors of one version.
+//! Which runtime runs EmbeddingGemma 2 (`docs/plan-linux-service.md` §2.1, §2.11): ONNX
+//! Runtime on the CPU (`onnx-community/embeddinggemma-2-ONNX`), in one of the export's
+//! weight formats (8-bit by default). The formats give close but not equal vectors, so
+//! each has its own `embedder_version`: rows stamped with another version (including the
+//! Core ML vectors a Mac service wrote before the service moved to Linux,
+//! `LEGACY_COREML_VERSION`) are embedded again, and the dense leg only compares vectors of
+//! one version.
 
 use std::fmt;
 use std::str::FromStr;
@@ -42,31 +44,28 @@ impl OnnxDtype {
     }
 }
 
+/// The version the Core ML backend stamped on passages when the service ran on a Mac.
+/// No build runs it any more: rows carrying it are re-embedded by the one-pass re-embed
+/// (`margin_service::ingest::reembed`) like any other version that isn't the active one.
+pub const LEGACY_COREML_VERSION: &str = "embeddinggemma-2-coreml/title-prefix-v1";
+
 /// The embedding runtime, as `service.toml`'s `embedder` and the pipeline's `embedder`
-/// stage name it: `"coreml"`, `"onnx-q8"`, `"onnx-fp32"` or `"onnx-fp16"`.
+/// stage name it: `"onnx-q8"`, `"onnx-fp32"` or `"onnx-fp16"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
-    /// Core ML (Neural Engine and GPU). macOS only.
-    CoreMl,
-    /// ONNX Runtime on the CPU. Linux always; macOS with the `onnx` feature.
+    /// ONNX Runtime on the CPU.
     Onnx(OnnxDtype),
 }
 
 impl Default for Backend {
-    /// The backend this target runs unless configured otherwise: Core ML on macOS, ONNX
-    /// 8-bit everywhere else.
+    /// The backend unless configured otherwise: ONNX 8-bit.
     fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            Backend::CoreMl
-        } else {
-            Backend::Onnx(OnnxDtype::Q8)
-        }
+        Backend::Onnx(OnnxDtype::Q8)
     }
 }
 
 impl Backend {
-    pub const ALL: [Backend; 4] = [
-        Backend::CoreMl,
+    pub const ALL: [Backend; 3] = [
         Backend::Onnx(OnnxDtype::Q8),
         Backend::Onnx(OnnxDtype::Fp32),
         Backend::Onnx(OnnxDtype::Fp16),
@@ -75,7 +74,6 @@ impl Backend {
     /// The name configs use.
     pub fn name(self) -> &'static str {
         match self {
-            Backend::CoreMl => "coreml",
             Backend::Onnx(OnnxDtype::Q8) => "onnx-q8",
             Backend::Onnx(OnnxDtype::Fp32) => "onnx-fp32",
             Backend::Onnx(OnnxDtype::Fp16) => "onnx-fp16",
@@ -87,20 +85,10 @@ impl Backend {
         Backend::ALL.into_iter().find(|b| b.name() == name.trim())
     }
 
-    /// Whether this binary can run it: Core ML on macOS; ONNX on Linux, or on macOS
-    /// built with the `onnx` feature.
-    pub fn is_built(self) -> bool {
-        match self {
-            Backend::CoreMl => cfg!(target_os = "macos"),
-            Backend::Onnx(_) => cfg!(any(target_os = "linux", feature = "onnx")),
-        }
-    }
-
     /// The model, its format and the way inputs are prefixed: stored on every passage as
     /// `embedder`. Bump the `title-prefix` part when the prompts change.
     pub fn embedder_version(self) -> &'static str {
         match self {
-            Backend::CoreMl => "embeddinggemma-2-coreml/title-prefix-v1",
             Backend::Onnx(OnnxDtype::Q8) => "embeddinggemma-2-onnx-q8/title-prefix-v1",
             Backend::Onnx(OnnxDtype::Fp32) => "embeddinggemma-2-onnx-fp32/title-prefix-v1",
             Backend::Onnx(OnnxDtype::Fp16) => "embeddinggemma-2-onnx-fp16/title-prefix-v1",
@@ -116,17 +104,13 @@ impl Backend {
 
     /// The Hugging Face repo its files come from.
     pub fn repo(self) -> &'static str {
-        match self {
-            Backend::CoreMl => crate::REPO,
-            Backend::Onnx(_) => crate::ONNX_REPO,
-        }
+        crate::ONNX_REPO
     }
 
-    /// The folder under `data_dir/models` its files are kept in. Each backend (and each
-    /// ONNX format) has its own, so switching never mixes files.
+    /// The folder under `data_dir/models` its files are kept in. Each ONNX format has its
+    /// own, so switching never mixes files.
     pub fn dir_name(self) -> &'static str {
         match self {
-            Backend::CoreMl => "embeddinggemma-2",
             Backend::Onnx(OnnxDtype::Q8) => "embeddinggemma-2-onnx-q8",
             Backend::Onnx(OnnxDtype::Fp32) => "embeddinggemma-2-onnx-fp32",
             Backend::Onnx(OnnxDtype::Fp16) => "embeddinggemma-2-onnx-fp16",
@@ -136,7 +120,6 @@ impl Backend {
     /// How Settings names it.
     pub fn label(self) -> &'static str {
         match self {
-            Backend::CoreMl => "EmbeddingGemma 2 (Core ML)",
             Backend::Onnx(OnnxDtype::Q8) => "EmbeddingGemma 2 (ONNX, 8-bit)",
             Backend::Onnx(OnnxDtype::Fp32) => "EmbeddingGemma 2 (ONNX, 32-bit)",
             Backend::Onnx(OnnxDtype::Fp16) => "EmbeddingGemma 2 (ONNX, 16-bit)",
@@ -194,9 +177,10 @@ mod tests {
             assert_eq!(Backend::of_version(b.embedder_version()), Some(b));
         }
         let mut versions: Vec<_> = Backend::ALL.iter().map(|b| b.embedder_version()).collect();
+        versions.push(LEGACY_COREML_VERSION);
         versions.sort();
         versions.dedup();
-        assert_eq!(versions.len(), Backend::ALL.len());
+        assert_eq!(versions.len(), Backend::ALL.len() + 1);
         let mut dirs: Vec<_> = Backend::ALL.iter().map(|b| b.dir_name()).collect();
         dirs.sort();
         dirs.dedup();
@@ -210,29 +194,22 @@ mod tests {
     }
 
     #[test]
-    fn the_core_ml_version_is_unchanged() {
-        // Stored on every passage the Mac has written: changing it re-embeds everything.
+    fn core_ml_is_gone_but_its_version_is_unchanged() {
+        // Stored on every passage the Mac service wrote: re-embedded, never read as current.
         assert_eq!(
-            Backend::CoreMl.embedder_version(),
+            LEGACY_COREML_VERSION,
             "embeddinggemma-2-coreml/title-prefix-v1"
         );
-        assert_eq!(Backend::CoreMl.embedder_version(), crate::EMBEDDER_VERSION);
-        assert_eq!(Backend::CoreMl.dir_name(), "embeddinggemma-2");
+        assert_eq!(Backend::of_version(LEGACY_COREML_VERSION), None);
+        assert!("coreml".parse::<Backend>().is_err());
     }
 
     #[test]
-    fn the_default_is_per_target_and_built() {
-        let b = Backend::default();
-        assert!(b.is_built());
-        if cfg!(target_os = "macos") {
-            assert_eq!(b, Backend::CoreMl);
-        } else {
-            assert_eq!(b, Backend::Onnx(OnnxDtype::Q8));
-            assert!(!Backend::CoreMl.is_built());
-        }
+    fn the_default_is_onnx_8_bit() {
+        assert_eq!(Backend::default(), Backend::Onnx(OnnxDtype::Q8));
         assert_eq!(
-            Backend::Onnx(OnnxDtype::Q8).is_built(),
-            cfg!(any(target_os = "linux", feature = "onnx"))
+            Backend::default().embedder_version(),
+            crate::EMBEDDER_VERSION
         );
     }
 }

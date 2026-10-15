@@ -4,7 +4,7 @@ The one place to see what's built, what's in flight and what's next. Update it i
 
 **Product:** a "Live context" app for a company's projects: humans through a voice-first GUI, agents through context, with learning (courses, lessons, quizzes) built in. Margin is a startup and the vision moves, so designs stay pluggable and every RAG/prompt/model change is measured by evals.
 
-**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). Once tried on devmargin the PR is labelled `verified-on-dev`; the **promote-release** workflow cherry-picks verified PRs into one PR into `release` (deploys `margin.krishnanelloore.com`) and labels them `shipped` when it merges. Big features ship dark behind a setting (`needs-flag`). Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
+**Branches:** work goes to `claude/agent-build` or a feature branch, then a PR **squash-merged** into `dev` (deploys `devmargin.krishnanelloore.com`; `smoke-dev` comments on the PR). `dev` stays shippable (required CI, smoke-dev after each deploy, revert-on-red via the **revert-pr** workflow). To ship, the **promote-release** workflow opens a PR into `release` (deploys `margin.krishnanelloore.com`) at a dev commit whose smoke-dev passed, listing the PRs it brings; dev PRs squash, release PRs merge with a merge commit; merging tags `release-<date>-<sha>` and labels the PRs `shipped`. Unfinished features ship dark behind a setting (`needs-flag`); `verified-on-dev` is an optional label. Which PR is where: `docs/RELEASES.md`; how: `docs/plan-deploy.md` §4a. `main` is unused. Before a PR: `deploy/local/linux-check.sh`.
 
 Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting on the owner
 
@@ -18,14 +18,15 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 | ✅ | **Dogfooding**: `margin-mcp` (Claude Code reads and writes Margin), session summaries saved automatically | `docs/plan-dogfood.md` |
 | ✅ | **Deploy**: dev and prod on the Mac mini (Tart/Orchard), Cloudflare tunnels, CI per platform (Linux runner `margin-ci`, macOS for the app), CD per product, local Linux check | `docs/plan-deploy.md` |
 | ✅ | **Linux service**: ONNX EmbeddingGemma, pdfium, tesseract, ffmpeg, Parakeet, pocket-tts, bubblewrap, file secrets, systemd guests | `docs/plan-linux-service.md` |
+| ✅ | **macOS service leftovers removed** (Core ML, PDFKit/Vision/ImageIO/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd): Linux is the only service platform; the apps stay on Mac, iPhone, Android. Core ML-era passages are re-embedded by the one-pass re-embed | `docs/plan-linux-service.md` §0 |
+| ✅ | **Phase 5 — hardening**: injection guard (`text::for_model` at every edge, injection suite), one retry policy with visible waits, compaction trace markers, per-device rate limits and body limits, checked backups + schema guard + restore drill, alerts from traces + `perf`, iOS continued processing for folder syncs (on `feat/p5`) | [`docs/phase5-brief.md`](phase5-brief.md) |
 | ✅ | **Switchable providers**: OpenAI key, Sign in with ChatGPT, Claude; per chat, three model slots each, web search/fetch with citations | `docs/agent-providers-brief.md` |
 
 ## In progress
 
 | | Item | Notes |
 |---|---|---|
-| 🟡 | **Remove the macOS service leftovers** (Core ML, PDFKit/Vision/AVFoundation, FluidAudio, `sandbox-exec`, Keychain store, launchd) | Linux is the only service platform; the apps stay on Mac, iPhone, Android |
-| 🟡 | **Phase 5 — hardening** ([`docs/phase5-brief.md`](phase5-brief.md)) | First commit on `feat/p5` (seams, stubs, contract); areas 5-ios, 5-agent, 5-guard, 5-retry, 5-security, 5-data, 5-ops build from it |
+| | Nothing right now | |
 
 ## Next (in order)
 
@@ -53,4 +54,6 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 - 👤 `margin-eval record-embeddings` + baseline, then un-ignore the CI eval gate (`crates/evals/tests/gates.rs`).
 - 👤 Hands-on runs: phase 4's manual D13 checks (macOS scanned PDF, iOS iCloud folder, Android), the providers screens, a real course from a real PDF.
 - 👤 First real-provider runs (OpenAI, ChatGPT, Claude); ChatGPT's per-app cap doesn't list Margin yet.
+- 👤 Phase 5 manual checks (`docs/phase5-brief.md` §5): the iPhone continued task (iOS 26, a 1 000-file iCloud folder synced with Margin closed, expiry → Paused; the task identifier may need a `.*` wildcard), `restore-drill.sh dev` (first run with `--hard-stop`), `perf` against dev, an alert end to end, one 429 per provider.
+- 👤 Phase 5 D3d fixtures: the live 400 texts of a compaction rejection from OpenAI and Claude, copied into the fake servers so `rejects_compaction` is tested against real text.
 - 👤 Licence reads before selling: EmbeddingGemma terms; pocket-tts voices (cosette and jean are blocked as non-commercial).

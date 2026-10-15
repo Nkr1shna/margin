@@ -87,27 +87,8 @@ pub fn memory_warning(physical: Option<u64>) -> Option<String> {
     })
 }
 
-/// This process's resident set size.
-#[cfg(target_os = "macos")]
-pub fn resident_bytes() -> Option<u64> {
-    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    // SAFETY: `info` is a writable proc_taskinfo of exactly `size` bytes, which is what
-    // PROC_PIDTASKINFO fills; the call writes nothing else.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            std::process::id() as libc::c_int,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&mut info as *mut libc::proc_taskinfo).cast(),
-            size,
-        )
-    };
-    (written == size).then_some(info.pti_resident_size)
-}
-
-/// This process's resident set size, from `VmRSS` in `/proc/self/status`.
-#[cfg(target_os = "linux")]
+/// This process's resident set size, from `VmRSS` in `/proc/self/status` (`None` off
+/// Linux).
 pub fn resident_bytes() -> Option<u64> {
     proc_kib(
         &std::fs::read_to_string("/proc/self/status").ok()?,
@@ -115,13 +96,7 @@ pub fn resident_bytes() -> Option<u64> {
     )
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn resident_bytes() -> Option<u64> {
-    None
-}
-
 /// The `kB` value on the `/proc` line starting with `key`, in bytes.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn proc_kib(text: &str, key: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with(key))?;
     let mut parts = line[key.len()..].split_whitespace();
@@ -132,34 +107,9 @@ fn proc_kib(text: &str, key: &str) -> Option<u64> {
     }
 }
 
-/// `hw.memsize`: the physical memory macOS sees (the VM's size inside a guest).
-#[cfg(target_os = "macos")]
-pub fn physical_memory_bytes() -> Option<u64> {
-    let mut bytes: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: the name is NUL-terminated; `bytes` is a writable u64 and `len` its size,
-    // which is what hw.memsize returns.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut bytes as *mut u64).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0 && len == std::mem::size_of::<u64>()).then_some(bytes)
-}
-
-/// `MemTotal` from `/proc/meminfo`: the memory the guest sees.
-#[cfg(target_os = "linux")]
+/// `MemTotal` from `/proc/meminfo`: the memory the guest sees (`None` off Linux).
 pub fn physical_memory_bytes() -> Option<u64> {
     proc_kib(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn physical_memory_bytes() -> Option<u64> {
-    None
 }
 
 #[cfg(test)]
@@ -196,14 +146,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((v.alerts_active, v.alerts_since), (0, None));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn reads_memory_on_macos() {
-        let rss = resident_bytes().expect("rss");
-        let total = physical_memory_bytes().expect("hw.memsize");
-        assert!(rss > 0 && rss < total, "rss {rss}, total {total}");
     }
 
     #[cfg(target_os = "linux")]

@@ -332,16 +332,18 @@ fn App() -> Element {
     });
     let ctx = use_context_provider(|| {
         let config = config::load();
-        // Restore the session from the keychain, if this device signed in before.
-        let session = config.service_url.as_ref().and_then(|url| {
-            secrets::load_token(url)
+        // Restore the session from the keychain, if this device signed in to this
+        // service before (a pinned build looks up its own service's token).
+        let session = {
+            let url = config.service_url();
+            secrets::load_token(&url)
                 .ok()
                 .flatten()
                 .map(|token| Session {
-                    api: Api::with_token(url, &token),
+                    api: Api::with_token(&url, &token),
                     me: None,
                 })
-        });
+        };
         AppCtx {
             config: Signal::new(config),
             session: Signal::new(session),

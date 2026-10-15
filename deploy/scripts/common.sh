@@ -140,7 +140,7 @@ check_config() {
 # Writes the secrets the deploy job passes in (MARGIN_SECRET_*, from the GitHub
 # Environment's secrets) into the share's secrets.toml, readable only by the owner, and
 # points service.toml's secrets_file at it. Orchard re-clones a VM on every restart,
-# which empties its Keychain; the share keeps the secrets, and the media signing key the
+# which empties its disk; the share keeps the secrets, and the media signing key the
 # service generates there, across re-clones. Values never reach argv or the log.
 #   MARGIN_SECRET_GITHUB_CLIENT_SECRET -> github-client-secret
 #   MARGIN_SECRET_OPENAI_API_KEY       -> openai-api-key (optional; Settings can set it too)

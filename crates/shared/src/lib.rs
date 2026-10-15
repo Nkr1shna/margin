@@ -395,12 +395,12 @@ pub enum SourceKind {
     Text,
     /// Source code, chunked along lines.
     Code,
-    /// Text from PDFKit (Vision OCR for pages without text), plus each page as an image.
+    /// Text from pdfium (tesseract OCR for pages without text), plus each page as an image.
     Pdf,
     /// .png, .jpg, .heic, .webp, .gif, .tiff, .bmp: embedded with the image encoder.
     Image,
     /// .mp3, .m4a, .wav, .aiff, .flac, .caf: 10-second windows through the audio encoder,
-    /// plus a timestamped transcript (FluidAudio speech recognition).
+    /// plus a timestamped transcript (Parakeet speech recognition).
     Audio,
     /// .mp4, .mov, .m4v: sampled frames through the image encoder and the soundtrack as
     /// for audio.
@@ -521,18 +521,18 @@ pub struct SourceUpload {
     pub received: u64,
 }
 
-/// The local embedding model (EmbeddingGemma 2 on Core ML or ONNX Runtime), downloaded on
+/// The local embedding model (EmbeddingGemma 2 on ONNX Runtime), downloaded on
 /// demand from Hugging Face into the service's data folder. Never bundled. With it, the
 /// speech model where the service downloads one, and the re-index after the embedder
 /// changed while it runs (Settings → Sources shows all three).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingModel {
-    /// Hugging Face repo, "FluidInference/embeddinggemma-2-coreml".
+    /// Hugging Face repo, "onnx-community/embeddinggemma-2-ONNX".
     pub repo: String,
     pub state: EmbeddingModelState,
     /// The speech model recordings are transcribed with, when the service downloads one
-    /// (Parakeet on ONNX Runtime, a Linux service). `None` where an installed program
-    /// transcribes instead (`fluidaudiocli` on a Mac, Settings → Tools).
+    /// (Parakeet on ONNX Runtime). `None` from a service without one (an older Mac
+    /// service transcribed with an installed program).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech: Option<SpeechModel>,
     /// The one pass that re-embeds every source after `service.toml`'s `embedder`
@@ -610,10 +610,10 @@ pub struct Settings {
     /// The OpenAI provider's writing model before the slots existed; kept on the wire
     /// for older apps (it mirrors `openai_models.write`).
     pub openai_model: String,
-    /// Whether an OpenAI API key is stored in the service Mac's Keychain. The key itself
+    /// Whether an OpenAI API key is stored in the service's secrets. The key itself
     /// is never returned.
     pub has_api_key: bool,
-    /// PocketTTS voice name passed to `fluidaudiocli tts --voice`; `None` uses the default voice.
+    /// PocketTTS voice name passed to `margin-tts --voice`; `None` uses the default voice.
     pub voice: Option<String>,
     /// Render size, e.g. 1920x1080.
     pub render_width: u32,
@@ -645,7 +645,7 @@ pub struct Settings {
     pub chatgpt_models: RouteModels,
     /// The Claude provider's three slots.
     pub claude_models: RouteModels,
-    /// Whether an Anthropic API key is stored in the service Mac's Keychain.
+    /// Whether an Anthropic API key is stored in the service's secrets.
     #[serde(default)]
     pub has_claude_api_key: bool,
     /// The ChatGPT account Margin is signed in with, if any.
@@ -786,7 +786,7 @@ impl ReasoningEffort {
 pub struct SettingsPatch {
     pub openai_base_url: Option<String>,
     pub openai_model: Option<String>,
-    /// `Some(key)` stores the key in the Keychain; `Some("")` deletes it.
+    /// `Some(key)` stores the key in the service's secrets; `Some("")` deletes it.
     pub openai_api_key: Option<String>,
     #[serde(
         default,
@@ -821,14 +821,14 @@ pub struct SettingsPatch {
     pub chatgpt_models: Option<RouteModels>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_models: Option<RouteModels>,
-    /// `Some(key)` stores the Anthropic key in the Keychain; `Some("")` deletes it.
+    /// `Some(key)` stores the Anthropic key in the service's secrets; `Some("")` deletes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolStatus {
-    /// "manimgx" or "fluidaudiocli".
+    /// "manimgx", "margin-tts", "tesseract", "ffmpeg", "bwrap" or "pdfium".
     pub name: String,
     pub found: bool,
     pub path: Option<String>,

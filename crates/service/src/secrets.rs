@@ -1,11 +1,9 @@
-//! Secrets live in the macOS Keychain (service `com.krishnanelloore.margin`), or, when
-//! `service.toml` sets `secrets_file`, in that file (the dev and prod VMs: Orchard
-//! re-clones a VM on every restart, which empties its Keychain, so their secrets sit on
-//! the persistent share, written by the deploy jobs from GitHub Environment secrets).
-//! A headless Linux service uses the same file store (`secrets = "file"`,
-//! `docs/plan-linux-service.md` §2.8): the Secret Service needs an unlocked desktop
-//! session and the kernel keyring forgets on reboot. `open_store` picks the store from
-//! `service.toml`. Behind a trait so tests can use memory instead.
+//! Secrets live in a 0600 file (`FileStore`, `docs/plan-linux-service.md` §2.8): a
+//! headless Linux service has no unlocked keyring (the Secret Service needs a desktop
+//! session and the kernel keyring forgets on reboot). The dev and prod VMs set
+//! `secrets_file` to a file on the persistent share, written by the deploy jobs from
+//! GitHub Environment secrets; otherwise it sits beside the data folder. `open_store`
+//! opens it from `service.toml`. Behind a trait so tests can use memory instead.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -13,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
-pub const KEYCHAIN_SERVICE: &str = "com.krishnanelloore.margin";
 pub const GITHUB_CLIENT_SECRET: &str = "github-client-secret";
 pub const OPENAI_API_KEY: &str = "openai-api-key";
 /// The Claude provider's key (`docs/agent-providers-brief.md` D9).
@@ -24,8 +21,7 @@ pub const CHATGPT_TOKENS: &str = "chatgpt-tokens";
 pub const ELEVENLABS_API_KEY: &str = "elevenlabs-api-key";
 pub const MEDIA_SIGNING_KEY: &str = "media-signing-key";
 
-/// Blocking key-value secret storage. Calls are short; the Keychain store is called
-/// from async code through `tokio::task::spawn_blocking` where it matters.
+/// Blocking key-value secret storage. Calls are short (a small file read or write).
 pub trait SecretStore: Send + Sync + 'static {
     fn get(&self, name: &str) -> anyhow::Result<Option<String>>;
     fn set(&self, name: &str, value: &str) -> anyhow::Result<()>;
@@ -37,54 +33,9 @@ pub trait SecretStore: Send + Sync + 'static {
     }
 }
 
-/// The store `config` names: a `FileStore` at `Config::secrets_path` when `secrets` is
-/// `"file"` or `secrets_file` is set, else the login Keychain.
+/// The `FileStore` at `Config::secrets_path`.
 pub fn open_store(config: &crate::config::Config) -> anyhow::Result<Arc<dyn SecretStore>> {
-    match config.secrets_path()? {
-        Some(path) => Ok(Arc::new(FileStore::new(path))),
-        None => Ok(Arc::new(KeychainStore)),
-    }
-}
-
-/// The login Keychain, through the `keyring` crate (v4, `v1` feature: Apple's native
-/// keychain store on macOS).
-pub struct KeychainStore;
-
-impl KeychainStore {
-    fn entry(name: &str) -> anyhow::Result<keyring::Entry> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, name).context("couldn't open the Keychain")
-    }
-}
-
-impl SecretStore for KeychainStore {
-    fn get(&self, name: &str) -> anyhow::Result<Option<String>> {
-        match Self::entry(name)?.get_password() {
-            Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(
-                "couldn't read {name} from the Keychain: {e}"
-            )),
-        }
-    }
-
-    fn set(&self, name: &str, value: &str) -> anyhow::Result<()> {
-        Self::entry(name)?
-            .set_password(value)
-            .map_err(|e| anyhow::anyhow!("couldn't store {name} in the Keychain: {e}"))
-    }
-
-    fn delete(&self, name: &str) -> anyhow::Result<()> {
-        match Self::entry(name)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!(
-                "couldn't delete {name} from the Keychain: {e}"
-            )),
-        }
-    }
-
-    fn location(&self) -> String {
-        "the Keychain".into()
-    }
+    Ok(Arc::new(FileStore::new(config.secrets_path()?)))
 }
 
 /// A TOML file of `name = "value"` lines, readable only by its owner (0600). Read on
@@ -320,7 +271,7 @@ mod tests {
             store.location(),
             dir.join(crate::config::SECRETS_FILE).display().to_string()
         );
-        assert!(!c.secrets_path().unwrap().unwrap().starts_with(&c.data_dir));
+        assert!(!c.secrets_path().unwrap().starts_with(&c.data_dir));
         store.set(GITHUB_CLIENT_SECRET, "s").unwrap();
         assert!(dir.join(crate::config::SECRETS_FILE).is_file());
         // An explicit file wins, whatever `secrets` says (the deploy VMs set only it).
@@ -330,8 +281,9 @@ mod tests {
             open_store(&c).unwrap().location(),
             dir.join("share/secrets.toml").display().to_string()
         );
+        // Without one, the Keychain (gone with the Mac service) is refused, not ignored.
         c.secrets_file = None;
-        assert_eq!(open_store(&c).unwrap().location(), "the Keychain");
+        assert!(open_store(&c).is_err());
         c.secrets = "vault".into();
         assert!(open_store(&c).is_err());
         std::fs::remove_dir_all(dir).unwrap();

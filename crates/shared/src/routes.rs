@@ -256,7 +256,7 @@ pub fn source(id: &str) -> String {
     format!("/api/sources/{id}")
 }
 /// Read the source again in place (same id and topic): for one that failed or was read
-/// with a warning, e.g. once `fluidaudiocli` is installed.
+/// with a warning, e.g. once the speech model is downloaded.
 pub fn source_reprocess(id: &str) -> String {
     format!("/api/sources/{id}/reprocess")
 }

@@ -1,73 +1,47 @@
 //! Local embeddings for sources: EmbeddingGemma 2 run in-process for text, images and
-//! audio, on Core ML (macOS) or ONNX Runtime (Linux, and macOS with the `onnx` feature;
-//! `Backend`); reading sources (text and code, PDFKit + Vision OCR, ImageIO,
-//! AVFoundation, FluidAudio speech recognition); chunking; and ranking. See PLAN.md
-//! "Sources and embeddings".
+//! audio on ONNX Runtime (`Backend`); reading sources (text and code, pdfium, `image`
+//! (+ libheif), tesseract OCR, ffmpeg, Parakeet speech recognition); chunking; and
+//! ranking. See PLAN.md "Sources and embeddings" and `docs/plan-linux-service.md`.
 //!
 //! This file is the contract the service codes against. Implementations may add items but
 //! must keep these signatures.
 
 use std::path::{Path, PathBuf};
 
-/// The Linux readers' programs and library, for Settings → Tools and the service's
-/// warnings: `find_tesseract` (OCR; without it pictures ingest without text),
-/// `find_ffmpeg` (audio and video), `find_pdfium` (PDFs; `set_tools_dir` adds the
-/// service's tools folder to where the library is looked for).
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
+/// The readers' programs and library, for Settings → Tools and the service's warnings:
+/// `find_tesseract` (OCR; without it pictures ingest without text), `find_ffmpeg` (audio
+/// and video), `find_pdfium` (PDFs; `set_tools_dir` adds the service's tools folder to
+/// where the library is looked for).
 pub use av_ffmpeg::{FFMPEG, FFPROBE, Ffmpeg, find_ffmpeg};
-pub use backend::{Backend, OnnxDtype, UnknownBackend, embedder_version};
+pub use backend::{Backend, LEGACY_COREML_VERSION, OnnxDtype, UnknownBackend, embedder_version};
 /// `SourceKind::for_name` decides which files are sources.
 pub use margin_shared::SourceKind;
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 pub use ocr_tesseract::{TESSERACT, find_tesseract};
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 pub use pdf_pdfium::{find_pdfium, pdfium_library_name, set_tools_dir};
-pub use transcript::{FLUIDAUDIOCLI, Transcript, Word, find_fluidaudiocli, transcribe};
+pub use transcript::{Transcript, Word};
 
-#[cfg(target_os = "macos")]
-mod audio;
-#[cfg(target_os = "macos")]
-mod av;
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 mod av_ffmpeg;
 mod backend;
 mod chunk;
-#[cfg(target_os = "macos")]
-mod coreml;
 mod download;
 mod extract;
 pub mod fake;
-#[cfg(target_os = "macos")]
-mod image;
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 mod image_linux;
-#[cfg(all(test, target_os = "macos"))]
-mod media_tests;
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 mod ocr_tesseract;
-#[cfg(any(target_os = "linux", feature = "onnx"))]
 pub mod onnx;
-#[cfg(target_os = "macos")]
-mod pdf;
-#[cfg(any(target_os = "linux", feature = "linux-readers"))]
 mod pdf_pdfium;
 mod rank;
 mod transcript;
-#[cfg(any(target_os = "linux", feature = "speech-onnx"))]
 pub mod transcript_parakeet;
-#[cfg(target_os = "macos")]
-mod vision;
 
-/// Hugging Face repo the Core ML model is downloaded from.
-pub const REPO: &str = "FluidInference/embeddinggemma-2-coreml";
 /// Hugging Face repo the ONNX export is downloaded from.
 pub const ONNX_REPO: &str = "onnx-community/embeddinggemma-2-ONNX";
 /// Default Hugging Face base URL; tests point downloads at a local server instead.
 pub const HF_BASE: &str = "https://huggingface.co";
 /// Embedding size.
 pub const DIM: usize = 768;
-/// Most tokens one `embed` input may hold (the largest Core ML `embed_S` function),
-/// including the task prefix and `<bos>`/`<eos>`.
+/// Most tokens one `embed` input may hold, including the task prefix and
+/// `<bos>`/`<eos>`.
 pub const MAX_TOKENS: usize = 512;
 /// Chunk size the service cuts sources into, leaving room for the document prefix: the
 /// hard cap every chunker keeps.
@@ -87,11 +61,12 @@ pub const EMBED_BATCH: usize = 64;
 pub const DOCUMENT_PROMPT: &str = "title: none | text: ";
 /// The model's query prompt (`config.json` `prompts.search_query`).
 pub const QUERY_PROMPT: &str = "task: search result | query: ";
-/// The Core ML model and the way its inputs are prefixed
-/// (`Backend::CoreMl.embedder_version()`; each backend has its own,
+/// The default backend's model and the way its inputs are prefixed
+/// (`Backend::default().embedder_version()`, ONNX 8-bit; each backend has its own,
 /// `Backend::embedder_version`). Stored on every passage as `embedder`; rows with another
-/// version are embedded again, and recordings are only served for their own version.
-pub const EMBEDDER_VERSION: &str = "embeddinggemma-2-coreml/title-prefix-v1";
+/// version (the Core ML ones a Mac service wrote, `LEGACY_COREML_VERSION`) are embedded
+/// again, and recordings are only served for their own version.
+pub const EMBEDDER_VERSION: &str = "embeddinggemma-2-onnx-q8/title-prefix-v1";
 /// Sample rate of the audio the audio encoder and the speech recognizer take (mono).
 pub const SAMPLE_RATE: u32 = 16_000;
 /// One audio embedding covers this many samples: 10 seconds.
@@ -219,7 +194,8 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError>;
     /// Tokens `text` takes with the model's tokenizer (no prefix, no `<bos>`/`<eos>`).
     fn count_tokens(&self, text: &str) -> usize;
-    /// One vector per image file (any format ImageIO reads; its orientation applied).
+    /// One vector per image file (any format the image reader decodes; its orientation
+    /// applied).
     fn embed_images(
         &self,
         images: &[PathBuf],
@@ -233,9 +209,8 @@ pub trait Embedder: Send + Sync {
     /// title) and hands the vectors back `batch` at a time, in order:
     /// `on_batch(index of the batch's first input, vectors)`, on the calling thread, so
     /// the caller writes one batch while the next is embedded. An error from `on_batch`
-    /// (a cancelled ingest) stops the work and is returned. The Core ML embedder prepares
-    /// inputs (tokenizing, table lookups) on one thread while the model predicts on
-    /// another; this default embeds batch by batch.
+    /// (a cancelled ingest) stops the work and is returned. This default embeds batch by
+    /// batch.
     fn embed_pipelined(
         &self,
         inputs: &[(String, Purpose)],
@@ -265,51 +240,10 @@ pub trait Embedder: Send + Sync {
 
     /// The version stamped on what it embeds (`Backend::embedder_version`): rows of
     /// another version are embedded again, and the dense leg compares only vectors of
-    /// the active one. Fakes keep the Core ML version unless they say otherwise.
+    /// the active one. Fakes keep the default backend's version unless they say otherwise.
     fn version(&self) -> &str {
         EMBEDDER_VERSION
     }
-}
-
-/// Runs `prep` over `inputs` on a second thread while `run` turns each prepared input
-/// into a vector on this one, handing vectors to `on_batch` `batch` at a time (with the
-/// index of the batch's first input). The preparing thread stays at most `batch` inputs
-/// ahead. Errors from any of the three stop both threads.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn pipelined<I: Sync, P: Send>(
-    inputs: &[I],
-    batch: usize,
-    prep: &(dyn Fn(&I) -> Result<P, EmbedError> + Sync),
-    run: &mut dyn FnMut(P) -> Result<Vec<f32>, EmbedError>,
-    on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
-) -> Result<(), EmbedError> {
-    let batch = batch.max(1);
-    std::thread::scope(|scope| {
-        let (send, receive) = std::sync::mpsc::sync_channel::<Result<P, EmbedError>>(batch);
-        scope.spawn(move || {
-            for input in inputs {
-                let prepared = prep(input);
-                let failed = prepared.is_err();
-                // The receiver is gone when the other side stopped early.
-                if send.send(prepared).is_err() || failed {
-                    break;
-                }
-            }
-        });
-        let mut vectors = Vec::with_capacity(batch.min(inputs.len()));
-        let mut first = 0;
-        for prepared in receive.iter() {
-            vectors.push(run(prepared?)?);
-            if vectors.len() == batch {
-                on_batch(first, std::mem::take(&mut vectors))?;
-                first += batch;
-            }
-        }
-        if !vectors.is_empty() {
-            on_batch(first, vectors)?;
-        }
-        Ok(())
-    })
 }
 
 /// The downloaded model files of one backend in one folder
@@ -321,9 +255,9 @@ pub struct ModelFiles {
 }
 
 impl ModelFiles {
-    /// The Core ML download in `dir`.
+    /// The default backend's download in `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self::with_backend(dir, Backend::CoreMl)
+        Self::with_backend(dir, Backend::default())
     }
 
     /// `backend`'s download in `dir`.
@@ -341,25 +275,15 @@ impl ModelFiles {
     }
 
     /// Path of an ONNX graph (`"model"`, `"vision_encoder"`, `"audio_encoder"`) of this
-    /// download; `None` for a Core ML download.
-    pub fn graph_path(&self, graph: &str) -> Option<PathBuf> {
-        match self.backend {
-            Backend::Onnx(dtype) => Some(self.dir.join(download::onnx_graph(graph, dtype))),
-            Backend::CoreMl => None,
-        }
+    /// download.
+    pub fn graph_path(&self, graph: &str) -> PathBuf {
+        let Backend::Onnx(dtype) = self.backend;
+        self.dir.join(download::onnx_graph(graph, dtype))
     }
 
     /// Bytes on disk for the downloaded files.
     pub fn size_on_disk(&self) -> u64 {
         download::size_on_disk(&self.dir)
-    }
-
-    /// Total bytes the Core ML download fetches (from the Hugging Face API), for showing
-    /// before the user starts it. `remote_bytes` asks for this download's backend.
-    pub async fn remote_size(client: &reqwest::Client, hf_base: &str) -> Result<u64, EmbedError> {
-        ModelFiles::new(PathBuf::new())
-            .remote_bytes(client, hf_base)
-            .await
     }
 
     /// Total bytes this backend's download fetches (from the Hugging Face API).
@@ -394,62 +318,9 @@ impl ModelFiles {
         .await
     }
 
-    /// Deletes the downloaded files (and the compiled model cache).
+    /// Deletes the downloaded files.
     pub fn remove(&self) -> Result<(), EmbedError> {
         download::remove(&self.dir)
-    }
-}
-
-/// EmbeddingGemma 2 on Core ML (Neural Engine where possible; the encoders on the GPU).
-/// macOS only.
-#[cfg(target_os = "macos")]
-pub struct CoreMlEmbedder(coreml::Model);
-
-#[cfg(target_os = "macos")]
-impl CoreMlEmbedder {
-    /// Loads the tokenizer and token table and the Core ML text model, compiling the
-    /// `.mlpackage` on first use (cached next to it). The vision and audio encoders load
-    /// (and compile) the first time they're needed. Blocking.
-    pub fn load(files: &ModelFiles) -> Result<Self, EmbedError> {
-        if files.backend != Backend::CoreMl {
-            return Err(EmbedError::Load(format!(
-                "{} holds the {} model, not Core ML's",
-                files.dir.display(),
-                files.backend
-            )));
-        }
-        coreml::Model::load(files).map(CoreMlEmbedder)
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Embedder for CoreMlEmbedder {
-    fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.0.embed(texts, purpose)
-    }
-    fn count_tokens(&self, text: &str) -> usize {
-        self.0.count_tokens(text)
-    }
-    fn embed_images(
-        &self,
-        images: &[PathBuf],
-        tokens: ImageTokens,
-    ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.0.embed_images(images, tokens)
-    }
-    fn embed_audio(&self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.0.embed_audio(windows)
-    }
-    fn embed_pipelined(
-        &self,
-        inputs: &[(String, Purpose)],
-        batch: usize,
-        on_batch: &mut dyn FnMut(usize, Vec<Vec<f32>>) -> Result<(), EmbedError>,
-    ) -> Result<(), EmbedError> {
-        self.0.embed_pipelined(inputs, batch, on_batch)
-    }
-    fn version(&self) -> &str {
-        Backend::CoreMl.embedder_version()
     }
 }
 
@@ -491,30 +362,17 @@ impl OnnxOptions {
 }
 
 /// EmbeddingGemma 2 on ONNX Runtime, CPU execution provider (`docs/plan-linux-service.md`
-/// §2.1). Text batches for real; Linux always, macOS with the `onnx` feature.
-#[cfg(any(target_os = "linux", feature = "onnx"))]
+/// §2.1). Text batches for real.
 pub struct OnnxEmbedder(onnx::Model);
-
-#[cfg(not(any(target_os = "linux", feature = "onnx")))]
-pub struct OnnxEmbedder(std::convert::Infallible);
 
 impl OnnxEmbedder {
     /// Loads the tokenizer and the text graph of an ONNX download (`files.backend` names
     /// the format). The encoders load the first time they're needed. Blocking.
-    #[cfg(any(target_os = "linux", feature = "onnx"))]
     pub fn load(files: &ModelFiles, opts: &OnnxOptions) -> Result<Self, EmbedError> {
         onnx::Model::load(files, opts).map(OnnxEmbedder)
     }
-
-    #[cfg(not(any(target_os = "linux", feature = "onnx")))]
-    pub fn load(_files: &ModelFiles, _opts: &OnnxOptions) -> Result<Self, EmbedError> {
-        Err(EmbedError::Load(
-            "this build has no ONNX runtime (build margin-embed with the onnx feature)".into(),
-        ))
-    }
 }
 
-#[cfg(any(target_os = "linux", feature = "onnx"))]
 impl Embedder for OnnxEmbedder {
     fn embed(&self, texts: &[String], purpose: Purpose) -> Result<Vec<Vec<f32>>, EmbedError> {
         self.0.embed(texts, purpose)
@@ -546,8 +404,7 @@ impl Embedder for OnnxEmbedder {
 }
 
 /// Loads the embedder `files.backend` names, with default ONNX options: what the
-/// service's `SourceTools::load` calls. An error for a backend this binary wasn't built
-/// with (`Backend::is_built`). Blocking.
+/// service's `SourceTools::load` calls. Blocking.
 pub fn load_embedder(files: &ModelFiles) -> Result<std::sync::Arc<dyn Embedder>, EmbedError> {
     load_embedder_with(files, &OnnxOptions::default())
 }
@@ -557,26 +414,7 @@ pub fn load_embedder_with(
     files: &ModelFiles,
     opts: &OnnxOptions,
 ) -> Result<std::sync::Arc<dyn Embedder>, EmbedError> {
-    if !files.backend.is_built() {
-        return Err(EmbedError::Load(format!(
-            "this build can't run the {} embedder",
-            files.backend
-        )));
-    }
-    match files.backend {
-        #[cfg(target_os = "macos")]
-        Backend::CoreMl => Ok(std::sync::Arc::new(CoreMlEmbedder::load(files)?)),
-        #[cfg(any(target_os = "linux", feature = "onnx"))]
-        Backend::Onnx(_) => Ok(std::sync::Arc::new(OnnxEmbedder::load(files, opts)?)),
-        #[allow(unreachable_patterns)]
-        _ => {
-            let _ = opts;
-            Err(EmbedError::Load(format!(
-                "this build can't run the {} embedder",
-                files.backend
-            )))
-        }
-    }
+    Ok(std::sync::Arc::new(OnnxEmbedder::load(files, opts)?))
 }
 
 /// How a text document marks its structure, which decides how the `"sections-v2"`
@@ -683,11 +521,11 @@ pub fn frame_times(duration_ms: u64) -> (u64, Vec<u64>) {
 }
 
 /// Reads a source. Text and code are decoded as UTF-8 (lossy), with `format` set from
-/// the name or the contents; PDFs with PDFKit (Vision OCR for pages without a text
+/// the name or the contents; PDFs with pdfium (tesseract OCR for pages without a text
 /// layer), each page also rendered to `page_file(n)` in `media_dir`; images are checked
-/// to decode and their text read with Vision OCR (one page, when there is any); audio is
-/// decoded to 16 kHz mono; videos give `frame_file(ms)` pictures in `media_dir` (see
-/// `frame_times`) and their soundtrack. Blocking.
+/// to decode and their text read with tesseract (one page, when there is any); audio is
+/// decoded to 16 kHz mono with ffmpeg; videos give `frame_file(ms)` pictures in
+/// `media_dir` (see `frame_times`) and their soundtrack. Blocking.
 pub fn extract(path: &Path, kind: SourceKind, media_dir: &Path) -> Result<Extracted, EmbedError> {
     extract::extract(path, kind, media_dir, true)
 }
@@ -705,23 +543,9 @@ pub fn extract_lazy(
 
 /// Renders page `page` (from 1) of the PDF at `path` as the picture `extract` would have
 /// made of it (color, 144 dpi, longer side at most 2048 px) and writes it to `out` as
-/// PNG. An error for a page past the end. Blocking.
-#[cfg(target_os = "macos")]
-pub fn pdf_page_picture(path: &Path, page: u32, out: &Path) -> Result<(), EmbedError> {
-    pdf::page_picture(path, page, out)
-}
-
-/// On Linux with pdfium (`pdf_pdfium.rs`), at the same 144 dpi and 2048 px cap.
-#[cfg(target_os = "linux")]
+/// PNG, with pdfium (`pdf_pdfium.rs`). An error for a page past the end. Blocking.
 pub fn pdf_page_picture(path: &Path, page: u32, out: &Path) -> Result<(), EmbedError> {
     pdf_pdfium::page_picture(path, page, out)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn pdf_page_picture(_path: &Path, _page: u32, _out: &Path) -> Result<(), EmbedError> {
-    Err(EmbedError::Extract(
-        "reading PDFs needs macOS or Linux".into(),
-    ))
 }
 
 /// Splits 16 kHz mono samples into the windows the audio encoder embeds: consecutive
@@ -750,23 +574,10 @@ pub fn sample_ms(sample: usize) -> u64 {
 }
 
 /// An image file shrunk to at most `max_side` pixels (never enlarged) and upright, as
-/// JPEG: what the lesson writer is shown. Blocking.
-#[cfg(target_os = "macos")]
-pub fn jpeg_for_model(path: &Path, max_side: usize) -> Result<Vec<u8>, EmbedError> {
-    image::jpeg(path, max_side, 0.85)
-}
-
-/// On Linux with `image` (+ libheif), EXIF orientation applied (`image_linux.rs`).
-#[cfg(target_os = "linux")]
+/// JPEG: what the lesson writer is shown. Read with `image` (+ libheif), EXIF orientation
+/// applied (`image_linux.rs`). Blocking.
 pub fn jpeg_for_model(path: &Path, max_side: usize) -> Result<Vec<u8>, EmbedError> {
     image_linux::jpeg(path, max_side, image_linux::MODEL_JPEG_QUALITY)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn jpeg_for_model(_path: &Path, _max_side: usize) -> Result<Vec<u8>, EmbedError> {
-    Err(EmbedError::Extract(
-        "reading images needs macOS or Linux".into(),
-    ))
 }
 
 /// A piece of a source small enough to embed.
@@ -894,7 +705,7 @@ pub fn score(query_vec: &[f32], query_text: &str, chunk_vec: &[f32], chunk_text:
     cosine(query_vec, chunk_vec) + rank::term_boost(query_text, chunk_text)
 }
 
-/// Whether tests may load real models (the Core ML embedder, the speech recognizer):
+/// Whether tests may load real models (the embedder, the speech recognizer):
 /// only when `MARGIN_REAL_MODEL_TESTS=1`. A plain `cargo test` uses fakes and recordings
 /// only; the real-model tests skip with a message.
 #[cfg(test)]
@@ -988,7 +799,7 @@ mod tests {
             ..chunk
         };
         assert_eq!(chunk_title("notes.md", &chunk), "A > B");
-        assert_eq!(embedder_version(Backend::CoreMl), EMBEDDER_VERSION);
+        assert_eq!(embedder_version(Backend::default()), EMBEDDER_VERSION);
         assert_eq!(fake::FakeEmbedder.version(), EMBEDDER_VERSION);
     }
 
@@ -1019,84 +830,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EmbedError::Embed(m) if m == "cancelled"));
         assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn pipelined_prepares_on_another_thread_keeps_order_and_stops_early() {
-        let here = std::thread::current().id();
-        let inputs: Vec<u32> = (0..25).collect();
-        let prepared_on = std::sync::Mutex::new(Vec::new());
-        let prep = |i: &u32| -> Result<u32, EmbedError> {
-            prepared_on
-                .lock()
-                .unwrap()
-                .push(std::thread::current().id());
-            Ok(i * 2)
-        };
-        let mut ran = Vec::new();
-        let mut batches = Vec::new();
-        pipelined(
-            &inputs,
-            8,
-            &prep,
-            &mut |p| {
-                ran.push(p);
-                Ok(vec![p as f32])
-            },
-            &mut |first, vectors| {
-                batches.push((
-                    first,
-                    vectors.iter().map(|v| v[0] as u32).collect::<Vec<_>>(),
-                ));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(prepared_on.lock().unwrap().iter().all(|id| *id != here));
-        assert_eq!(ran, (0..25).map(|i| i * 2).collect::<Vec<_>>());
-        assert_eq!(batches.len(), 4);
-        assert_eq!(batches[3], (24, vec![48]));
-        assert_eq!(batches[1].0, 8);
-
-        // A failing `run` stops the preparing thread too (it never prepares everything).
-        let count = std::sync::atomic::AtomicUsize::new(0);
-        let many: Vec<u32> = (0..10_000).collect();
-        let err = pipelined(
-            &many,
-            4,
-            &|i: &u32| {
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(*i)
-            },
-            &mut |p| {
-                if p == 5 {
-                    Err(EmbedError::Embed("model failed".into()))
-                } else {
-                    Ok(vec![0.0])
-                }
-            },
-            &mut |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(matches!(err, EmbedError::Embed(_)));
-        assert!(count.load(std::sync::atomic::Ordering::SeqCst) < 100);
-
-        // A failing `prep` is returned as is.
-        let err = pipelined(
-            &inputs,
-            4,
-            &|i: &u32| {
-                if *i == 3 {
-                    Err(EmbedError::Extract("bad input".into()))
-                } else {
-                    Ok(*i)
-                }
-            },
-            &mut |p| Ok(vec![p as f32]),
-            &mut |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(matches!(err, EmbedError::Extract(_)));
     }
 
     #[test]
