@@ -1573,7 +1573,7 @@ pub async fn ingest(state: &AppState, document_id: &str) -> anyhow::Result<Inges
         let _ = fail(state, document_id, &e.to_string()).await;
     }
     let pipeline = state.pipeline.load();
-    let mut row = TraceRow::new(TraceKind::Ingest, ulid::Ulid::new().to_string(), at);
+    let mut row = TraceRow::new(TraceKind::Ingest, ulid::Ulid::generate().to_string(), at);
     row.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
     row.ok = result.is_ok();
     row.error_code = result.as_ref().err().map(|_| "ingest_failed".to_string());
