@@ -28,23 +28,28 @@ Status: ✅ done · 🟡 in progress · ⏳ next · 🗓 later · 👤 waiting o
 
 | | Item | Notes |
 |---|---|---|
-| | Nothing right now | |
+| 🟡 | **L2 — access control inside search**: hierarchical groups, grants and denials, agents limited by their owner, private knowledge and publishing, audit log | `docs/l2-brief.md`; five areas building on `feat/l2` |
+| 🟡 | **App crash logging and the first panic fixes** (panic hook, log file, "quit unexpectedly" notice, the rename-while-saving crash) | branch `fix/app-crash-logs` |
+| 🟡 | **Provider settings defaults** (model slots filled, no Keychain copy, sensible default provider) | branch `fix/provider-defaults` |
 
 ## Next (in order)
 
-| | Item | Plan | Notes |
-|---|---|---|---|
-| ⏳ | **Prod on Linux** | `docs/plan-deploy.md`, `plan-linux-service.md` §5.1 | Same as dev: a Linux `margin-prod` guest |
-| ⏳ | **L2 — access control inside search**: hierarchical groups, grants/denials, agents limited by their owner, private knowledge and publishing | `docs/plan-live-context.md` | |
-| ⏳ | **Q — serious quizzes**: graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | After L2 (needs per-person attempts) |
-| ⏳ | **L3 — inbox and @mentions** for people and agents | `docs/plan-live-context.md` | |
-| ⏳ | **L4 — meetings** on LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
-| ⏳ | **L5 — voice-first** with ElevenLabs | `docs/plan-live-context.md` | |
-| ⏳ | **L6 — permission sync from GitHub + repository source** (code comes in this way) | `docs/plan-live-context.md` | |
+Each step is a vertical slice: a person can use it end to end on desktop, iPhone and Android when it lands. Order: keep the app stable, finish who-sees-what, make the knowledge base usable day to day, get more knowledge in, then run it for a company and ship to prod, then the live features.
+
+| | Slice | Items | Plan | Notes |
+|---|---|---|---|---|
+| ⏳ | **S0 — Stability** (from the three quality reviews) | Request ids and an info-level request log with error reference ids; supervised background workers and a real `/health`; CI scope detection fails closed; a mutex-poison policy (ONNX load outside its lock); workspace `[lints]` against unwrap/expect/panic; corrupt drafts and config quarantined, save failures logged; the 24 fixed sleeps in tests replaced with condition waits; cargo-deny, Dependabot, SHA-pinned actions, Android build hard-fails; a route-table contract test between the app's fake and the service, and an `ErrorCode` enum; keep the last few dev builds; offsite backup reports copy failures; a README and a correct HANDOFF header | quality review page | Runs beside L2; small items |
+| ⏳ | **S1 — Find and manage your knowledge** | Search inside files and chats with highlighted matches on the EmbeddingGemma hybrid pipeline (not plain text); a Files screen (open, rename, download, sort); trash with undo and restore; move and reorder topics, lessons and notes; copy an answer and a code block; toasts, help, feedback and the version everywhere | `docs/basics-brief.md` | After L2 (results respect the reader) |
+| ⏳ | **S2 — Bring knowledge in** | Office formats (docx, pptx, xlsx); a web page as a source; the share sheet on iOS and Android; repository source and GitHub permission sync (L6) | `docs/basics-brief.md`, `docs/plan-live-context.md` | L6 moves up: code comes in this way |
+| ⏳ | **S3 — Run it for a company, and ship** | Usage per person on L2's audit log; offboarding session, then removal with content reassignment and per-person export; **prod on Linux** (`margin-prod` guest) with the infra review's settings and runner fixes | `docs/basics-brief.md`, `docs/plan-deploy.md` | The point where a second company can be invited |
+| ⏳ | **S4 — Learn it properly: Q, serious quizzes** | Graded answers, code editor, review-only code grading | `docs/phase-q-brief.md` | Needs L2's per-person attempts |
+| ⏳ | **S5 — L3 inbox and @mentions** | For people and agents, with push notifications and deep links | `docs/plan-live-context.md` | |
+| ⏳ | **S6 — L4 meetings** | LiveKit, per-speaker transcripts into knowledge | `docs/plan-live-context.md` | Zed's collab as inspiration only (GPL) |
+| ⏳ | **S7 — L5 voice-first** | ElevenLabs | `docs/plan-live-context.md` | |
 
 ## Later / ideas
 
-- 🗓 Office and e-book formats (`.docx .pptx .epub`) once an extractor exists.
+- 🗓 E-book formats (`.epub`) once an extractor exists.
 - 🗓 Audio and video in folders.
 - 🗓 R2's variants as defaults (listwise rerank for lessons, rewriting, the cross-encoder for agent search) once the eval earns it (`docs/r2-brief.md` §6); a `by-purpose` reranker if both rerankers win.
 - 🗓 Agents over MCP for other companies' tools (after L1's agent tokens).

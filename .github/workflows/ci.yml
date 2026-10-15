@@ -40,8 +40,16 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           run=false
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then run=true; fi
-          for f in $( [ "$run" = true ] || gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
+          files=""
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            run=true
+          else
+            # Fail closed: if the file list can't be read, the job fails instead of passing empty.
+            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')" || {
+              echo "::error::could not list this PR's files; failing rather than skipping the checks"; exit 1; }
+            [ -n "$files" ] || { echo "::error::this PR lists no files; failing rather than skipping the checks"; exit 1; }
+          fi
+          for f in $files; do
             case "$f" in
               crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
               crates/service/*|crates/agent/*|crates/ai/*|crates/embed/*|crates/video/*|crates/evals/*|crates/mcp/*|deploy/ci/linux-ci.sh) run=true ;;
@@ -49,7 +57,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking Linux." || echo "Nothing for Linux in this PR; passing."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
@@ -96,8 +104,16 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           run=false
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then run=true; fi
-          for f in $( [ "$run" = true ] || gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename'); do
+          files=""
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            run=true
+          else
+            # Fail closed: if the file list can't be read, the job fails instead of passing empty.
+            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')" || {
+              echo "::error::could not list this PR's files; failing rather than skipping the checks"; exit 1; }
+            [ -n "$files" ] || { echo "::error::this PR lists no files; failing rather than skipping the checks"; exit 1; }
+          fi
+          for f in $files; do
             case "$f" in
               crates/shared/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|.github/workflows/ci.yml) run=true ;;
               crates/app/*) run=true ;;
@@ -105,7 +121,7 @@ jobs:
           done
           echo "run=$run" >> "$GITHUB_OUTPUT"
           [ "$run" = true ] && echo "Checking macOS." || echo "Nothing for macOS in this PR; passing."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.scope.outputs.run == 'true'
         with:
           persist-credentials: false
