@@ -84,7 +84,11 @@ impl Tool for SearchTool {
             let k = args.k.map_or(8, |k| k as usize).clamp(1, TOOL_SEARCH_K_MAX);
             let ranked = match self
                 .index
-                .search(std::slice::from_ref(&args.query), &self.scope)
+                .search_as(
+                    std::slice::from_ref(&args.query),
+                    &self.scope,
+                    margin_shared::pipeline::RetrievalPurpose::Agent,
+                )
                 .await
             {
                 Ok(r) => r,

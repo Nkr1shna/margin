@@ -272,7 +272,13 @@ pub async fn generate_lesson(
     let scope = Scope::Sources {
         ids: course.documents.clone(),
     };
-    let ranked = index.search(&query_plan(course, lesson), &scope).await?;
+    let ranked = index
+        .search_as(
+            &query_plan(course, lesson),
+            &scope,
+            margin_shared::pipeline::RetrievalPurpose::Lesson,
+        )
+        .await?;
     let packed = index.pack(ranked.hits, budget);
     let passages: Vec<Passage> = packed
         .iter()

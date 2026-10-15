@@ -16,6 +16,7 @@ use margin_evals::judge::Judge;
 use margin_evals::live;
 use margin_evals::recorded::{EMBEDDINGS_FILE, Recording, RecordingVectors, Vectors};
 use margin_evals::runner::{self, Env, Paths};
+use margin_evals::small::SmallKind;
 use margin_evals::store::{EvalStore, default_data_dir};
 use margin_evals::traces::{self, TraceFilter};
 
@@ -72,15 +73,25 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             b,
             allow_embedder_change,
             allow_provider_change,
+            allow_prompt_change,
         } => {
             let allow = margin_evals::compare::Allow {
                 embedder_change: *allow_embedder_change,
                 provider_change: *allow_provider_change,
-                prompt_change: false,
+                prompt_change: *allow_prompt_change,
             };
             print!(
                 "{}",
                 runner::compare_runs(&store, a, b, allow).await?.markdown()
+            );
+        }
+        Command::Prompts { write_lock } => {
+            let (text, ok) = margin_evals::gates::prompts_command(&paths, *write_lock)?;
+            print!("{text}");
+            anyhow::ensure!(
+                ok,
+                "evals/prompts.lock disagrees with the prompts: bump the changed prompt's \
+                 version, then `margin-eval prompts --write-lock`"
             );
         }
         Command::Export { filter, out } => {
@@ -209,6 +220,8 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
     let variant_embedder = match cmd {
         Command::Run { variant, .. }
         | Command::RecordGenerations { variant }
+        | Command::RecordRewrites { variant }
+        | Command::RecordReranks { variant }
         | Command::SynthQuestions { variant, .. } => Some(paths.variant(variant)?.0.embedder.name),
         _ => None,
     };
@@ -268,6 +281,41 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
         }
         env_paths.out = stage.clone();
     }
+    let needs_models = !matches!(
+        cmd,
+        Command::RecordEmbeddings
+            | Command::RecordRewrites { .. }
+            | Command::RecordReranks { .. }
+            | Command::Run {
+                suite: Suite::Retrieval | Suite::Dogfood,
+                ..
+            }
+    );
+    let models = if needs_models {
+        Some(live::models(&cfg, &*live::secret_store(&service)?)?)
+    } else {
+        None
+    };
+    // The small-tasks models for the model-backed stages (R2): the record commands call
+    // them; a run whose variant has a listwise reranker or a rewriter is served from the
+    // recordings and calls them only for what wasn't recorded (no key: replay only).
+    let small_models = match cmd {
+        Command::RecordRewrites { .. } | Command::RecordReranks { .. } => Some(
+            live::small_models(&cfg, &*live::secret_store(&service)?)?.context(
+                "recording calls the small-tasks model: no openai-api-key or \
+                 anthropic-api-key in the service's secret store",
+            )?,
+        ),
+        Command::Run { variant, .. } | Command::RecordGenerations { variant } => {
+            let (pcfg, _) = paths.variant(variant)?;
+            if SmallKind::Reranks.is_small(&pcfg) || SmallKind::Rewrites.is_small(&pcfg) {
+                live::small_models(&cfg, &*live::secret_store(&service)?)?
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     let env = Env {
         paths: env_paths,
         vectors: if matches!(cmd, Command::RecordEmbeddings) {
@@ -278,19 +326,7 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
         extraction,
         register: &|_| {},
         pack_budget: &margin_service::retrieval::pack_budget,
-    };
-    let needs_models = !matches!(
-        cmd,
-        Command::RecordEmbeddings
-            | Command::Run {
-                suite: Suite::Retrieval | Suite::Dogfood,
-                ..
-            }
-    );
-    let models = if needs_models {
-        Some(live::models(&cfg, &*live::secret_store(&service)?)?)
-    } else {
-        None
+        models: small_models,
     };
     match cmd {
         Command::RecordEmbeddings => {
@@ -317,6 +353,36 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                 recording_file.display(),
                 extraction_file.display()
             );
+        }
+        Command::RecordRewrites { variant } | Command::RecordReranks { variant } => {
+            let kind = if matches!(cmd, Command::RecordRewrites { .. }) {
+                SmallKind::Rewrites
+            } else {
+                SmallKind::Reranks
+            };
+            let s = runner::record_small(&env, variant, kind).await?;
+            println!(
+                "{variant}: {} searches, {} small-model calls now (${:.4}), {} records → {}",
+                s.searches,
+                s.called,
+                s.cost_usd,
+                s.records,
+                s.file.display()
+            );
+            if s.fallbacks > 0 {
+                eprintln!(
+                    "warning: {} searches kept the fused order (the reranker's fallback: a \
+                     timeout, a refusal or bad JSON); the CI gate fails on them, so record \
+                     again",
+                    s.fallbacks
+                );
+            }
+            if kind == SmallKind::Rewrites {
+                println!(
+                    "next: `margin-eval record-embeddings` embeds the recorded rewrites, so CI \
+                     can replay them"
+                );
+            }
         }
         Command::RecordGenerations { variant } => {
             let m = models.as_ref().unwrap();
@@ -445,18 +511,7 @@ async fn live_command(cmd: &Command, paths: &Paths, store: &EvalStore) -> anyhow
                 }
                 let refs: Vec<&dyn Judge> = js.iter().map(|j| j.as_ref()).collect();
                 let (pcfg, _) = paths.variant(variant)?;
-                let index = Arc::new(
-                    margin_evals::index::EvalIndex::build(
-                        margin_service::db::Store::memory().await?,
-                        &pcfg,
-                        |_| {},
-                        vectors,
-                        &corpus,
-                        &docs,
-                        &env.extraction,
-                    )
-                    .await?,
-                );
+                let index = Arc::new(env.index(&pcfg).await?);
                 let (run, results) = runner::run_agent(
                     &env,
                     variant,

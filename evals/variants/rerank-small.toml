@@ -1,7 +1,9 @@
 # R2 (docs/r2-brief.md D2): the baseline plus the listwise rerank on the Small route,
 # for lessons and the planner only (apply_to). The agent tool and the context API pass
-# through it untouched unless a variant widens apply_to (params.purpose picks the
-# retrieval suite's purpose). Becomes the default only by §6's rule.
+# through it untouched unless a variant widens apply_to. params.purpose is the eval's,
+# not the stage's: the retrieval suite searches the golden questions as lessons do, so
+# it measures the rerank lessons get (else it would search as the agent tool, which this
+# variant leaves alone). Becomes the default only by §6's rule.
 prompts = "lesson-v2"
 
 [chunker]
@@ -21,6 +23,7 @@ apply_to = ["lesson", "plan"]
 max_candidates = 24
 drop_grade_0 = true
 timeout_secs = 20
+purpose = "lesson"
 
 [packer]
 name = "mmr-v1"

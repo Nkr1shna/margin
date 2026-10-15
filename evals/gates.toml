@@ -16,3 +16,17 @@ lexical_support_max_drop = 2.0
 
 [packing]
 tool_output_max_bytes = 16384
+
+# R2 (docs/r2-brief.md §6): on the recorded reranks (evals/recorded/reranks.jsonl) of the
+# model-backed rerankers, replayed over the golden set by the rerank-small gate.
+[rerank]
+# Points: the mean share of the top 10 places the reranker changed. More is a bug, not a
+# win.
+moved_at_10_max = 60.0
+# Points: searches the reranker applies to that it left in the fused order (a timeout, a
+# refusal, bad JSON at recording time): re-record.
+fallback_rate_max = 0.0
+
+# Every prompt's constant block hashes as evals/prompts.lock says under its version.
+[prompts]
+lock = true
