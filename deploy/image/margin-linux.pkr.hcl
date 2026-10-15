@@ -7,8 +7,8 @@
 #   packer init deploy/image/margin-linux.pkr.hcl
 #   packer build -var vm_name=margin-linux-v1 deploy/image/margin-linux.pkr.hcl
 #
-# The result is a local Tart VM (`tart list`); Orchard VMs use it by that name
-# (`orchard create vm … --image margin-linux-v1 --os linux`). Built the way Cirrus Labs
+# The result is a local Tart VM (`tart list`). CI (.github/workflows/image.yml) builds it
+# the same way and publishes it as ghcr.io/nkr1shna/margin-linux:<date>-<sha> and :latest. Built the way Cirrus Labs
 # builds its images (github.com/cirruslabs/macos-image-templates): Packer's tart-cli
 # source clones a base image and runs the provisioning scripts in it.
 
@@ -19,6 +19,11 @@ packer {
       source  = "github.com/cirruslabs/tart"
     }
   }
+}
+
+# The Rust version rust-toolchain.toml pins, so the image carries the toolchain CI uses.
+locals {
+  rust_toolchain = regex("channel = \"([^\"]+)\"", file(abspath("${path.root}/../../rust-toolchain.toml")))[0]
 }
 
 variable "vm_name" {
@@ -48,9 +53,10 @@ build {
     script           = "${path.root}/linux-system.sh"
   }
 
-  # Rust for the admin user, who runs CI jobs.
+  # Rust for the admin user, who runs CI jobs: the version rust-toolchain.toml pins.
   provisioner "shell" {
-    execute_command = "sh -eu '{{ .Path }}'"
+    environment_vars = ["RUST_TOOLCHAIN=${local.rust_toolchain}"]
+    execute_command  = "{{ .Vars }} sh -eu '{{ .Path }}'"
     script          = "${path.root}/linux-user.sh"
   }
 }

@@ -28,17 +28,6 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, margin]
     timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
-      # Fits the 6 GB runner VM: line tables instead of full debug info (most of the link's
-      # memory; backtraces keep their line numbers) and lld instead of GNU ld.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      RUSTFLAGS: -C link-arg=-fuse-ld=lld
-      # margin-eval's live commands refuse to run when CI is set; tests never load the
-      # real embedding model.
-      CI: "true"
-      MARGIN_EMBED_MODEL_DIR: /nonexistent/margin-embed-model
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,12 +47,9 @@ jobs:
           echo "CARGO_TARGET_DIR=$cache/target-test-$env_id" >> "$GITHUB_ENV"
           echo "Cargo cache: $cache/target-test-$env_id"
           find "$cache" -maxdepth 1 -name 'target-*' ! -name "target-test-$env_id" -mtime +7 -exec rm -rf {} + 2>/dev/null || true
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --locked --workspace --exclude margin-app --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --locked --workspace --exclude margin-app
+      # The same steps the local check runs (deploy/local/linux-check.sh).
+      - name: Format, clippy, tests
+        run: sh deploy/ci/linux-ci.sh
 
   # The app (desktop, iOS) on the Mac host runner, and a check that the macOS backends of
   # the service still build (the owner's Mac stays a full dev/eval box, plan Q8).
