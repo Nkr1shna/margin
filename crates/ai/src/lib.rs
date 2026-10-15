@@ -50,16 +50,18 @@ pub use model::{
     ProviderKind, RouteModels, StartKind, TextModel, TextOutput, ToolChoice, ToolDef, WebTools,
 };
 pub use responses::{
-    Backoff, ContextManagement, ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream,
-    ResponsesToolChoice, StreamEvent, function_tool, model_events, responses_request,
-    to_model_events,
+    Backoff, ContextManagement, HOSTED_TOOLS, INCLUDE_ENCRYPTED_REASONING, INCLUDE_WEB_SOURCES,
+    ReasoningConfig, ReasoningSummary, ResponseRequest, ResponseStream, ResponsesToolChoice,
+    StreamEvent, function_tool, model_events, models_list, responses_request, to_model_events,
+    web_search_tool,
 };
 
 /// 429 codes that waiting doesn't cure: Anthropic's spend limit and Margin's share of a
-/// ChatGPT plan used up (the docs say not to infer a reset time).
-pub const NOT_RETRYABLE_429: [&str; 2] = [
+/// ChatGPT plan used up or unavailable (the docs say not to infer a reset time).
+pub const NOT_RETRYABLE_429: [&str; 3] = [
     "enforced_spend_limit_reached",
     "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_usage_unavailable",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -131,8 +133,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct ResponsesClient {
     http: Result<reqwest::Client, String>,
+    /// `{base_url}` without a trailing slash; `/responses` and `/models` hang off it.
+    base: String,
     url: String,
     api_key: String,
+    /// The credential is a ChatGPT plan token ("Sign in with ChatGPT"): the parameters
+    /// that route doesn't take are never sent and parallel tool calls are off (the SIWC
+    /// spike saw one response hold 128 calls of one tool).
+    bearer: bool,
     model: String,
     /// The model of each route, when built from a `ProviderConfig`; `None` calls `model`
     /// on every route.
@@ -147,6 +155,7 @@ impl std::fmt::Debug for ResponsesClient {
             .field("url", &self.url)
             .field("model", &self.model)
             .field("kind", &self.kind)
+            .field("bearer", &self.bearer)
             .finish_non_exhaustive()
     }
 }
@@ -158,7 +167,7 @@ impl ResponsesClient {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
-        let base_url = base_url.into();
+        let base = base_url.into().trim().trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
@@ -166,8 +175,10 @@ impl ResponsesClient {
             .map_err(|e| format!("couldn't set up the HTTP client: {}", error_chain(&e)));
         Self {
             http,
-            url: format!("{}/responses", base_url.trim().trim_end_matches('/')),
+            url: format!("{base}/responses"),
+            base,
             api_key: api_key.into(),
+            bearer: false,
             model: model.into(),
             models: None,
             kind: ProviderKind::OpenAi,
@@ -175,7 +186,10 @@ impl ResponsesClient {
     }
 
     /// The client of an OpenAI or ChatGPT `ProviderConfig`: each call's model is
-    /// `config.models.get(opts.route)`.
+    /// `config.models.get(opts.route)`. A `Credential::Bearer` (ChatGPT) turns on the
+    /// plan-token rules: no `max_output_tokens`, `temperature`, `top_p`, `user` or
+    /// `previous_response_id` (none of which Margin sends otherwise either), and
+    /// `parallel_tool_calls: false` on every step with tools.
     pub fn from_config(config: &ProviderConfig) -> Self {
         let mut client = Self::new(
             config.base_url.clone(),
@@ -184,6 +198,7 @@ impl ResponsesClient {
         );
         client.models = Some(config.models.clone());
         client.kind = config.provider;
+        client.bearer = matches!(config.credential, Credential::Bearer(_));
         client
     }
 
@@ -200,12 +215,32 @@ impl ResponsesClient {
         self.kind
     }
 
+    /// Whether the credential is a ChatGPT plan token (the bearer rules apply).
+    pub fn is_bearer(&self) -> bool {
+        self.bearer
+    }
+
+    fn http(&self) -> Result<&reqwest::Client, AiError> {
+        self.http.as_ref().map_err(|e| AiError::Network(e.clone()))
+    }
+
+    /// `GET {base_url}/{path}` as JSON; a non-2xx answer is `AiError::Http`.
+    async fn get_json(&self, path: &str) -> Result<Value, AiError> {
+        let resp = self
+            .http()?
+            .get(format!("{}/{path}", self.base))
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(network)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.map_err(network)
+    }
+
     fn request(&self, body: &Value) -> Result<reqwest::RequestBuilder, AiError> {
-        let http = self
-            .http
-            .as_ref()
-            .map_err(|e| AiError::Network(e.clone()))?;
-        Ok(http
+        Ok(self
+            .http()?
             .post(&self.url)
             .bearer_auth(&self.api_key)
             .header(
@@ -217,7 +252,7 @@ impl ResponsesClient {
 
     /// The `POST /responses` body of a generation call: always streamed, never stored;
     /// `prompt_cache_key`, `max_output_tokens` and a structured-output `text.format`
-    /// only when given.
+    /// only when given (`max_output_tokens` never under a ChatGPT bearer token).
     fn body(
         &self,
         instructions: &str,
@@ -235,7 +270,9 @@ impl ResponsesClient {
         if let Some(key) = &opts.cache_key {
             body["prompt_cache_key"] = json!(key);
         }
-        if let Some(max) = opts.max_output_tokens {
+        if let Some(max) = opts.max_output_tokens
+            && !self.bearer
+        {
             body["max_output_tokens"] = json!(max);
         }
         if let Some(format) = format {
@@ -522,15 +559,49 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, AiEr
 }
 
 /// The machine-readable code of an error body: `error.details.error_code` (Anthropic's
-/// spend limit), else `error.code` (OpenAI), else `error.type` (Anthropic:
-/// `rate_limit_error`, `overloaded_error`, `authentication_error`, …).
+/// spend limit), else `error.code` (OpenAI, and ChatGPT's `subscription_sharing_*`),
+/// else `error.type` (Anthropic: `rate_limit_error`, `overloaded_error`,
+/// `authentication_error`, …); a body without an `error` object may carry the code at
+/// the top level or under `detail` (`{"detail": {"code": …}}`).
 fn error_code(v: &Value) -> Option<String> {
-    let e = v.get("error").filter(|e| e.is_object())?;
+    let Some(e) = v.get("error").filter(|e| e.is_object()) else {
+        return v
+            .get("code")
+            .or_else(|| v.pointer("/detail/code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    };
     e.pointer("/details/error_code")
         .and_then(Value::as_str)
         .or_else(|| e.get("code").and_then(Value::as_str))
         .or_else(|| e.get("type").and_then(Value::as_str))
         .map(str::to_string)
+}
+
+/// The HTTP status ChatGPT answers each `subscription_sharing_*` code with before a
+/// stream starts (the SIWC error reference). The same code can also end a stream
+/// (`response.failed`), and a text call then reports it as that HTTP error, so callers
+/// see one error whichever way it came: `AiError::code`, and `is_retryable` false for
+/// the limits.
+const ACCOUNT_CODES: [(&str, u16); 4] = [
+    ("subscription_sharing_usage_limit_exceeded", 429),
+    ("subscription_sharing_usage_unavailable", 429),
+    ("subscription_sharing_user_not_eligible", 403),
+    ("subscription_sharing_invalid_user", 401),
+];
+
+/// A failure inside a text call's stream: an account code (`ACCOUNT_CODES`) as its HTTP
+/// error, anything else as `Incomplete`.
+fn stream_failure(code: Option<&str>, message: String) -> AiError {
+    match code.and_then(|c| ACCOUNT_CODES.iter().find(|(known, _)| *known == c)) {
+        Some((code, status)) => AiError::Http {
+            status: *status,
+            message,
+            retry_after: None,
+            code: Some((*code).to_string()),
+        },
+        None => AiError::Incomplete(message),
+    }
 }
 
 /// The pause a 429/503 asks for: OpenAI's `retry-after-ms` when sent (it is more
@@ -753,13 +824,20 @@ impl StreamState {
             }
             "response.failed" => {
                 let response = v.get("response").unwrap_or(&Value::Null);
-                return Err(AiError::Incomplete(failed_reason(response)));
+                let code = response
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(Value::as_str);
+                return Err(stream_failure(code, failed_reason(response)));
             }
             "error" => {
+                let err = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
+                let code = err.get("code").and_then(Value::as_str);
                 let msg = error_message(&v).unwrap_or_else(|| "unknown error".into());
-                return Err(AiError::Incomplete(format!(
-                    "the stream reported an error: {msg}"
-                )));
+                return Err(stream_failure(
+                    code,
+                    format!("the stream reported an error: {msg}"),
+                ));
             }
             _ => {} // created, in_progress, output_item.*, content_part.*, reasoning, …
         }
@@ -983,6 +1061,27 @@ mod tests {
         let openai = json!({"error": {"message": "bad key", "type": "invalid_request_error", "code": "invalid_api_key"}});
         assert_eq!(error_code(&openai).as_deref(), Some("invalid_api_key"));
         assert_eq!(error_code(&json!({"error": "plain"})), None);
+        let top = json!({"code": "subscription_sharing_usage_limit_exceeded", "message": "m"});
+        assert_eq!(
+            error_code(&top).as_deref(),
+            Some("subscription_sharing_usage_limit_exceeded")
+        );
+        let detail = json!({"detail": {"code": "subscription_sharing_user_not_eligible"}});
+        assert_eq!(
+            error_code(&detail).as_deref(),
+            Some("subscription_sharing_user_not_eligible")
+        );
+        let limit = stream_failure(Some("subscription_sharing_usage_unavailable"), "m".into());
+        assert!(matches!(limit, AiError::Http { status: 429, .. }));
+        assert!(!limit.is_retryable());
+        assert!(matches!(
+            stream_failure(Some("server_error"), "m".into()),
+            AiError::Incomplete(_)
+        ));
+        assert!(matches!(
+            stream_failure(None, "m".into()),
+            AiError::Incomplete(_)
+        ));
         let http = |status, code: Option<&str>| AiError::Http {
             status,
             message: "m".into(),
