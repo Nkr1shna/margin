@@ -458,6 +458,73 @@ pub async fn run_retrieval(
     run_retrieval_suite(env, "retrieval", variant, store, write_baseline).await
 }
 
+/// `run --suite access` (L2 D8): the variant's index stamped with `evals/access.toml`'s
+/// audiences, searched as every principal and as the owner with and without the
+/// reader's conjuncts (`access::run`), checked against `[access]` in `evals/gates.toml`.
+/// The run is stored with the gates' violations as its notes (invalid when there are
+/// any); the caller decides whether they fail the command.
+pub async fn run_access(
+    env: &Env<'_>,
+    variant: &str,
+    store: &EvalStore,
+) -> anyhow::Result<(EvalRun, crate::access::AccessReport, Vec<String>)> {
+    let (cfg, toml) = env.paths.variant(variant)?;
+    let gates_file = env.paths.evals.join("gates.toml");
+    let gates: crate::Gates = toml::from_str(
+        &std::fs::read_to_string(&gates_file)
+            .with_context(|| format!("couldn't read {}", gates_file.display()))?,
+    )
+    .with_context(|| format!("{} is malformed", gates_file.display()))?;
+    let fx = crate::access::AccessFixture::load(&env.paths.evals.join(crate::access::ACCESS_FILE))?;
+    let corpus = corpus_hash(&env.paths.corpus())?;
+    let mut run = new_run(
+        "access",
+        variant,
+        &cfg,
+        &toml,
+        env.vectors.version(),
+        &corpus,
+    );
+    let index = env.index(&cfg).await?;
+    let queries = env.paths.retrieval_golden()?;
+    let report = crate::access::run(&index, &fx, &queries).await?;
+    let violations = report.violations(&gates.access);
+    let mut rows = Vec::new();
+    for p in &report.principals {
+        for (m, v) in [
+            ("reads", p.reads),
+            ("hits", p.hits),
+            ("removed", p.removed),
+            ("leaks", p.leaks),
+        ] {
+            rows.push(result(&run, &p.name, "principal", m, v as f64, None));
+        }
+    }
+    let flag = |b: bool| f64::from(u8::from(b));
+    for (m, v) in [
+        ("leaks", report.leaks.len() as f64),
+        ("by_id_leaks", report.by_id_leaks.len() as f64),
+        ("owner_rank_identical", flag(report.owner_rank_identical())),
+        ("rank_consistent", flag(report.rank_consistent())),
+        ("owner_p95_ms", report.owner_p95_ms),
+        ("unfiltered_p95_ms", report.unfiltered_p95_ms),
+        ("p95_latency_ratio", report.latency_ratio()),
+    ] {
+        rows.push(result(&run, "_all", "access", m, v, None));
+    }
+    store.add_results(&rows).await?;
+    run.valid = violations.is_empty();
+    run.notes = violations.clone();
+    let run = finish(
+        store,
+        run,
+        vec![crate::report::access_section(&report, &gates.access)],
+        serde_json::to_value(&report)?,
+    )
+    .await?;
+    Ok((run, report, violations))
+}
+
 /// The dogfood suite (`docs/plan-dogfood.md` §6): the retrieval suite over `docs/` with
 /// the questions an agent really asked (`env.paths` from `Paths::dogfood`). It has no
 /// baseline of its own: CI never runs it.

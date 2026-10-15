@@ -37,6 +37,7 @@ pub mod small;
 pub mod store;
 pub mod synth;
 pub mod traces;
+pub mod unfiltered;
 
 /// `evals/gates.toml`: how far a change may move the metrics before CI fails.
 #[derive(Debug, Clone, Deserialize)]

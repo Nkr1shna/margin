@@ -5,6 +5,11 @@
 # computed in Rust, independent of the SQL). Exact membership: a reader in `company` does
 # not read `company/engineering`; the hierarchy is in the reader's expansion.
 
+# The organisation's owner for `owner_rank_identical`: this person as a member of every
+# group (`[company, every group, person/<owner>]`), who reads every document below. Their
+# ranked ids must equal a run without the reader's conjuncts, to the id.
+owner = "alice"
+
 # The group tree (`company` is implicit).
 [groups]
 paths = ["company/engineering", "company/engineering/platform", "company/sales"]
