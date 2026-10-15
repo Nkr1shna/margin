@@ -145,8 +145,15 @@ jobs:
           [ "$id" = "$MARGIN_APP_ID" ] || { echo "::error::$app is $id, expected $MARGIN_APP_ID"; exit 1; }
           codesign --force --deep --sign - "$app"
           mkdir -p dist
-          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$app" -ov -format UDZO \
+          # The disk image holds the app and a link to /Applications, so installing is a
+          # drag from one to the other.
+          stage="$RUNNER_TEMP/dmg-${{ matrix.environment }}"
+          rm -rf "$stage" && mkdir -p "$stage"
+          ditto "$app" "$stage/$(basename "$app")"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$stage" -ov -format UDZO \
             "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
+          rm -rf "$stage"
       - name: Android build
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
