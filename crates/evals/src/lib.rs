@@ -24,6 +24,7 @@ pub mod live;
 pub mod metrics;
 pub mod model;
 pub mod packing;
+pub mod prefix;
 pub mod recorded;
 pub mod report;
 pub mod retrieval;

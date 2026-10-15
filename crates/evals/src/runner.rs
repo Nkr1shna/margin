@@ -18,7 +18,7 @@ use margin_shared::pipeline::{Budget, PipelineConfig};
 use margin_shared::routes::RETRIEVAL_K_FUSED;
 
 use crate::agent::{TaskResult, run_task};
-use crate::compare::{Comparison, compare};
+use crate::compare::{Allow, Comparison, compare, providers_of};
 use crate::corpus::{CorpusDoc, EXTRACTED_FILE, Extraction, corpus_hash, documents};
 use crate::courses::{
     Generation, LessonScore, generate_lesson, generations_dir, load_generations, save_generation,
@@ -178,6 +178,7 @@ fn new_run(
         started_at: now,
         finished_at: None,
         judges: Vec::new(),
+        providers: Vec::new(),
         valid: true,
         notes: Vec::new(),
         summary: serde_json::Value::Null,
@@ -468,6 +469,7 @@ pub async fn run_courses(
             gens
         }
     };
+    run.providers = providers_of(gens.iter().map(|g| g.model.as_str()));
     let canary_reports = canaries(judges, false).await?;
     run.judges = judges.iter().map(|j| j.id()).collect();
     run.valid = canary_reports.iter().all(CanaryReport::valid);
@@ -518,6 +520,7 @@ pub async fn run_agent<M: margin_agent::ModelClient + margin_ai::TextModel>(
         &corpus,
     );
     run.notes.push(format!("agent model {model_id}"));
+    run.providers = vec![margin_ai::Provider::kind(model).as_str().to_string()];
     let mut results = Vec::new();
     let mut rows = Vec::new();
     let mut judged = Vec::new();
@@ -660,6 +663,7 @@ pub async fn synth_questions(
     );
     let grader_canaries = question_canaries(grader).await?;
     run.judges = vec![generator.id(), grader.id()];
+    run.providers = providers_of([generator.id().as_str()]);
     anyhow::ensure!(
         grader_canaries.valid(),
         "the grader {} failed its canaries ({}); no questions were generated",
@@ -866,6 +870,7 @@ pub async fn judge_generations(
         env.vectors.version(),
         &corpus,
     );
+    run.providers = providers_of(gens.iter().map(|g| g.model.as_str()));
     let canary_reports = canaries(judges, true).await?;
     run.judges = judges.iter().map(|j| j.id()).collect();
     run.valid = canary_reports.iter().all(CanaryReport::valid);
@@ -945,7 +950,7 @@ pub async fn compare_runs(
     store: &EvalStore,
     a: &str,
     b: &str,
-    allow_embedder_change: bool,
+    allow: Allow,
 ) -> anyhow::Result<Comparison> {
     let ra = store.run(a).await?.with_context(|| format!("no run {a}"))?;
     let rb = store.run(b).await?.with_context(|| format!("no run {b}"))?;
@@ -954,7 +959,7 @@ pub async fn compare_runs(
         &store.results(a).await?,
         &rb,
         &store.results(b).await?,
-        allow_embedder_change,
+        allow,
     )
 }
 
@@ -1109,7 +1114,7 @@ mod tests {
         assert!(html.is_file());
         // Compare the two runs (same embedder: allowed).
         let runs = store.runs().await.unwrap();
-        let c = compare_runs(&store, &runs[1].id, &runs[0].id, false)
+        let c = compare_runs(&store, &runs[1].id, &runs[0].id, Allow::default())
             .await
             .unwrap();
         assert!(
@@ -1221,6 +1226,10 @@ mod tests {
             .unwrap();
         assert_eq!(again.len(), lessons);
         assert!(run2.notes[0].contains("recorded generations"));
+        // Both runs record the writer's provider (from the recordings for the second),
+        // so `compare` can refuse a provider change.
+        assert_eq!(run.providers, ["claude"]);
+        assert_eq!(run2.providers, ["claude"]);
         // Judging the recordings against themselves: every comparison is decided by
         // length, equal here, so all ties.
         let dir = out.join("recorded/generations/lesson-v2");
@@ -1308,6 +1317,7 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), tasks.len());
         assert!(results.iter().all(|r| r.finished));
+        assert_eq!(run.providers, ["openai"], "the agent model's provider");
         assert_eq!(
             results.iter().filter(|r| r.abstained == Some(true)).count(),
             1

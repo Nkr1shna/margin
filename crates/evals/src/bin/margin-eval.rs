@@ -71,12 +71,15 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             a,
             b,
             allow_embedder_change,
+            allow_provider_change,
         } => {
+            let allow = margin_evals::compare::Allow {
+                embedder_change: *allow_embedder_change,
+                provider_change: *allow_provider_change,
+            };
             print!(
                 "{}",
-                runner::compare_runs(&store, a, b, *allow_embedder_change)
-                    .await?
-                    .markdown()
+                runner::compare_runs(&store, a, b, allow).await?.markdown()
             );
         }
         Command::Export { filter, out } => {
