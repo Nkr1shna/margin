@@ -3,7 +3,7 @@
 # independently of the service's CD (build-service.yml), so a UI-only merge rebuilds only
 # the app and a service-only merge redeploys only the service:
 #
-#   a merge into dev      -> "Margin Dev" .dmg (+ .apk), rolling pre-release "dev-latest"
+#   a merge into dev      -> "Margin Dev" .dmg (+ .apk), pre-release "dev-<date>-<sha>" (newest 5 kept)
 #   a merge into release  -> Margin .dmg (+ .apk), release "prod-<sha>", marked latest
 #   a v* tag              -> both environments, release named after the tag
 #   workflow_dispatch     -> workflow artifacts only, no release
@@ -189,10 +189,17 @@ jobs:
           EOF
           case "$KIND" in
             dev)
-              # One rolling pre-release that always holds the app for what dev runs now.
-              gh release delete dev-latest -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
-              gh release create dev-latest dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
-                --prerelease --title "Margin dev ($short)" --notes-file notes.md
+              # Releases are immutable in this repository (a tag is never reused), so each dev
+              # build gets its own pre-release; the newest is the app for what dev runs now.
+              # Older dev pre-releases beyond the newest 5 are removed (their tags stay).
+              tag="dev-$(date -u +%Y%m%d-%H%M)-${SHA::7}"
+              gh release create "$tag" dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
+                --prerelease --title "Margin Dev ($short)" --notes-file notes.md
+              gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+                --jq '[.[] | select(.tagName | startswith("dev-"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+                while read -r old; do
+                  gh release delete "$old" -R "$GITHUB_REPOSITORY" -y && echo "Removed the older dev release $old."
+                done
               ;;
             prod)
               gh release create "prod-$short" dist/* -R "$GITHUB_REPOSITORY" --target "$SHA" \
