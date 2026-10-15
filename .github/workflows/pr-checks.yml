@@ -1,9 +1,10 @@
 # The pull request itself, not its code, as Zed's danger checks do: the body has
 # `## Testing` and `Release Notes:` (.github/pull_request_template.md), the title has no
 # conventional-commit prefix, and the change fits the size limit (over 1,000 changed lines
-# warns, over 3,000 fails; nothing lifts it). All three are deploy/ci/pr-check.sh. Runs on
-# a GitHub-hosted runner, so it never queues behind CI on the self-hosted ones, and again
-# when the title or body is edited.
+# warns, over 3,000 fails; nothing lifts it). All three are deploy/ci/pr-check.sh, taken
+# from the base branch. Runs on a GitHub-hosted runner, so it never queues behind CI on the
+# self-hosted ones, and again when the title or body is edited. It gates merges only once
+# "PR checks / Body, title and size" is a required status check in the dev ruleset.
 name: PR checks
 
 on:
@@ -28,9 +29,28 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
     steps:
+      # The checks come from the base branch, not the PR, so a PR that edits pr-check.sh
+      # can't pass its own gate (deploy/ci/pr-check-test.sh covers changes to the script).
+      # Until the script is on the base branch, the PR's copy runs instead.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
           persist-credentials: false
+          sparse-checkout: deploy/ci
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+          sparse-checkout: deploy/ci
+      - name: Pick the check script
+        run: |
+          if [ -f base/deploy/ci/pr-check.sh ]; then
+            echo "CHECK=$GITHUB_WORKSPACE/base/deploy/ci/pr-check.sh" >> "$GITHUB_ENV"
+          else
+            echo "::notice::the base branch has no deploy/ci/pr-check.sh yet; running this PR's copy"
+            echo "CHECK=$GITHUB_WORKSPACE/head/deploy/ci/pr-check.sh" >> "$GITHUB_ENV"
+          fi
       # The title, body and author are read from the API rather than the event, so a re-run
       # sees the current ones. Fail closed: a read that fails fails the check.
       - name: Read the PR
@@ -50,11 +70,11 @@ jobs:
             exit 0
           fi
           jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/body.md"
-          sh deploy/ci/pr-check.sh body "$RUNNER_TEMP/body.md"
+          sh "$CHECK" body "$RUNNER_TEMP/body.md"
       # The remaining checks run even when an earlier one failed, so one run lists every problem.
       - name: Title
         if: ${{ !cancelled() }}
-        run: sh deploy/ci/pr-check.sh title "$(jq -r '.title' "$RUNNER_TEMP/pr.json")"
+        run: sh "$CHECK" title "$(jq -r '.title' "$RUNNER_TEMP/pr.json")"
       - name: Size limit
         if: ${{ !cancelled() }}
-        run: sh deploy/ci/pr-check.sh size "$RUNNER_TEMP/files.tsv"
+        run: sh "$CHECK" size "$RUNNER_TEMP/files.tsv"

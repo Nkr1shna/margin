@@ -7,7 +7,8 @@
 #
 # body: the body has a `## Testing` section with something in it and a `Release Notes:`
 # line followed by at least one bullet, neither left as the template's placeholder.
-# HTML comments (the template's guidance, the attribution marker) don't count.
+# HTML comments (the template's guidance, the attribution marker) don't count, and a heading
+# inside a fenced code block isn't one: fenced lines are content of the section around them.
 #
 # size: FILES_TSV holds `path<TAB>changed lines` per file. Lines outside Cargo.lock and
 # generated files are counted: over 1,000 warns, over 3,000 fails. No label or override
@@ -48,6 +49,13 @@ check_body() {
           line = substr(line, start + 4)
           in_comment = 1
         }
+      }
+      fence = out ~ /^[ \t]*(```|~~~)/
+      if (fence) in_fence = !in_fence
+      if (fence || in_fence) {
+        if (section == "testing") testing++
+        if (section == "notes") section = ""
+        next
       }
       lower = tolower(out)
       if (lower ~ /^[ \t]*(#+[ \t]*)?(\*\*)?release notes:?(\*\*)?:?[ \t]*$/) {
@@ -123,7 +131,7 @@ check_size() {
 # (`service: ...`) is fine.
 check_title() {
   ok=1
-  if printf '%s\n' "$1" | grep -Eqi '^(feat|fix|style|refactor|perf|test|chore|build|revert)(\([^)]*\))?!?:'; then
+  if printf '%s\n' "$1" | grep -Eqi '^(feat|fix|docs|style|refactor|perf|test|chore|build|revert)(\([^)]*\))?!?:'; then
     error "The PR title starts with a conventional-commit prefix. Write an imperative title, optionally scoped by area: \`service: Retry the export when the share is busy\`."
     ok=0
   fi

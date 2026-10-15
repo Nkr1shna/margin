@@ -5,7 +5,8 @@
 #
 # Bodies: the empty template, a filled one with the attribution lines first and the
 # generated-by line last, a missing Testing section, an empty Testing section, missing or
-# placeholder release notes, bold headings. Sizes: under the warning, over it, at and over
+# placeholder release notes, bold headings, sections that exist only inside a fenced code
+# block. Sizes: under the warning, over it, at and over
 # the limit (which nothing lifts), Cargo.lock and generated files not counted. Titles.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -123,6 +124,49 @@ Release Notes:
 EOF
 )"
 
+expect fail "a Testing section only inside a fence" body "$(body fenced-testing <<'EOF'
+## Summary
+The template looks like this:
+
+```
+## Testing
+
+Ran it.
+```
+
+Release Notes:
+
+- N/A
+EOF
+)"
+case "$last" in *"## Testing"*) ;; *) echo "FAIL the fenced Testing error names the Testing section"; failures=$((failures + 1)) ;; esac
+
+expect fail "release notes only inside a fence" body "$(body fenced-notes <<'EOF'
+## Testing
+Ran the tests.
+
+~~~
+Release Notes:
+
+- N/A
+~~~
+EOF
+)"
+case "$last" in *"needs a \`Release Notes:\` section"*) ;; *) echo "FAIL the fenced notes error names the Release Notes section"; failures=$((failures + 1)) ;; esac
+
+expect pass "a Testing section that is a fenced command" body "$(body fenced-command <<'EOF'
+## Testing
+
+```sh
+sh deploy/ci/pr-check-test.sh
+```
+
+Release Notes:
+
+- N/A
+EOF
+)"
+
 tab="$(printf '\t')"
 printf 'crates/service/src/a.rs%s400\ndocs/x.md%s100\n' "$tab" "$tab" > "$tmp/small.tsv"
 expect pass "500 lines" size "$tmp/small.tsv"
@@ -149,6 +193,8 @@ expect pass "an imperative title" title "Add a PR template"
 expect pass "a title with an area scope" title "service: Retry the export when the share is busy"
 expect fail "a conventional-commit title" title "fix: retry the export"
 expect fail "a scoped conventional-commit title" title "feat(app)!: new picker"
+expect fail "a docs: title" title "docs: explain the deploy"
+expect pass "a ci: area title" title "ci: Prune the release cache"
 expect fail "a title ending in a period" title "Add a PR template."
 
 if [ "$failures" = 0 ]; then
