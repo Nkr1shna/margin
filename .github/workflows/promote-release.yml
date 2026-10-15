@@ -55,7 +55,7 @@ jobs:
       HAS_PROMOTE_TOKEN: ${{ secrets.PROMOTE_TOKEN != '' }}
       SHA_INPUT: ${{ inputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: dev
           fetch-depth: 0
@@ -138,7 +138,7 @@ jobs:
       BEFORE: ${{ github.event.before }}
     steps:
       # The scripts and the ledger live on dev; release is reached as $GITHUB_SHA.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: dev
           fetch-depth: 0

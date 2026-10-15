@@ -30,6 +30,7 @@ on:
       - "crates/shared/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "deploy/dmg/**"
       - ".github/workflows/apps.yml"
   workflow_dispatch:
@@ -115,7 +116,7 @@ jobs:
       MARGIN_APP_NAME: ${{ matrix.environment == 'dev' && 'Margin Dev' || 'Margin' }}
       MARGIN_APP_ID: ${{ matrix.environment == 'dev' && 'com.krishnanelloore.margin.app.dev' || 'com.krishnanelloore.margin.app' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
@@ -160,14 +161,14 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
           export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
           if [ ! -d "$ANDROID_NDK_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
-            echo "::warning::no Android SDK/NDK or JDK 17 on this runner; skipping the APK"
-            exit 0
+            echo "::error::no Android SDK/NDK or JDK 17 on this runner; the APK can't be built"
+            exit 1
           fi
           dx build -p margin-app --platform android --release
           apk="$(find target/dx/margin-app -name '*.apk' -newer Cargo.toml | head -n 1)"
           [ -n "$apk" ] || { echo "::error::dx built no APK"; exit 1; }
           cp "$apk" "dist/Margin-${{ matrix.environment }}-${SHA::12}.apk"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: margin-apps-${{ matrix.environment }}-${{ needs.plan.outputs.sha }}
           path: dist/
@@ -185,7 +186,7 @@ jobs:
       SHA: ${{ needs.plan.outputs.sha }}
       KIND: ${{ needs.plan.outputs.release }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: margin-apps-*-${{ needs.plan.outputs.sha }}
           path: dist
