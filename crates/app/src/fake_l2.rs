@@ -421,8 +421,10 @@ impl FakeState {
             Event::DocumentChanged { ref document } => {
                 reads(&self.document_audience(document).1).then_some(event)
             }
-            Event::AuditAppended { row } => admin.then(|| Event::AuditAppended {
-                row: self.with_subject_name(person_id, row),
+            // As the service sends it: no name joined (the app names what it holds).
+            Event::AuditAppended { mut row } => admin.then(|| {
+                row.subject_name = None;
+                Event::AuditAppended { row }
             }),
             Event::Trace { .. } => admin.then_some(event),
             other => Some(other),
@@ -901,10 +903,11 @@ pub struct AuditQuery {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     subject: Option<String>,
+    limit: Option<usize>,
 }
 
 /// `GET routes::AUDIT` (admins): JSON lines, oldest first; `to` defaults to now and
-/// `from` to a day before it.
+/// `from` to the start of time; `limit` keeps the newest rows of the window.
 pub async fn audit(
     State(fake): State<Fake>,
     headers: HeaderMap,
@@ -916,7 +919,7 @@ pub async fn audit(
         Err(r) => return r,
     };
     let to = q.to.unwrap_or_else(Utc::now);
-    let from = q.from.unwrap_or(to - chrono::Duration::days(1));
+    let from = q.from.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     if from > to {
         return bad_request("bad_range", "The start of the range is after its end.");
     }
@@ -929,6 +932,10 @@ pub async fn audit(
         .map(|r| s.with_subject_name(&admin.person.id, r.clone()))
         .collect();
     rows.sort_by_key(|r| r.at);
+    if let Some(limit) = q.limit {
+        let keep = limit.clamp(1, 1_000);
+        rows.drain(..rows.len().saturating_sub(keep));
+    }
     let body: String = rows
         .iter()
         .map(|r| serde_json::to_string(r).unwrap() + "\n")

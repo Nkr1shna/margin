@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use margin_shared::context::{AuditRow, Document, Origin};
 use margin_shared::{
     Agent, Audience, AudienceUnit, Chat, ChatDetail, ChatGptStatus, ChatItem, DeltaOutcome, Device,
@@ -80,6 +81,11 @@ pub struct LibraryState {
     pub audit: Vec<AuditRow>,
     /// Whether `audit` was fetched (rows only arrive live after that).
     pub audit_loaded: bool,
+}
+
+/// The same audit row, whether or not a name was joined to it.
+fn same_audit_row(a: &AuditRow, b: &AuditRow) -> bool {
+    a.at == b.at && a.kind == b.kind && a.actor == b.actor && a.subject == b.subject
 }
 
 /// What the sidebar dot shows for a lesson's video.
@@ -293,8 +299,13 @@ impl LibraryState {
                     self.revoke(unit, &id);
                 }
             }
-            Event::AuditAppended { row } => {
-                if self.audit_loaded && !self.audit.contains(&row) {
+            // Live rows come without `subject_name` (the service joins names only when
+            // the log is read): name the subject from what this person already reads.
+            Event::AuditAppended { mut row } => {
+                if self.audit_loaded && !self.audit.iter().any(|r| same_audit_row(r, &row)) {
+                    if row.subject_name.is_none() {
+                        row.subject_name = self.local_subject_name(&row.subject);
+                    }
                     self.audit.push(row);
                 }
             }
@@ -555,6 +566,35 @@ impl LibraryState {
     pub fn replace_audit(&mut self, rows: Vec<AuditRow>) {
         self.audit = rows;
         self.audit_loaded = true;
+    }
+
+    /// Older audit rows ("Load more"): added before those held, without repeats.
+    pub fn extend_audit(&mut self, rows: Vec<AuditRow>) {
+        for row in rows {
+            if !self.audit.iter().any(|r| same_audit_row(r, &row)) {
+                self.audit.push(row);
+            }
+        }
+        self.audit.sort_by_key(|r| r.at);
+        self.audit_loaded = true;
+    }
+
+    /// The oldest audit row held, for the next page's `to`.
+    pub fn oldest_audit(&self) -> Option<DateTime<Utc>> {
+        self.audit.iter().map(|r| r.at).min()
+    }
+
+    /// A subject's name from the library this person reads (a topic, folder, file or
+    /// agent document they hold); `None` when they don't hold it.
+    fn local_subject_name(&self, subject: &margin_shared::context::AuditSubject) -> Option<String> {
+        let id = subject.id.as_str();
+        match subject.kind.as_str() {
+            "topic" => self.topics.get(id).map(|t| t.title.clone()),
+            "workspace" => self.workspaces.get(id).map(|w| w.name.clone()),
+            "source" => self.sources.get(id).map(|s| s.name.clone()),
+            "document" => self.agent_documents.get(id).map(|d| d.name.clone()),
+            _ => None,
+        }
     }
 
     /// Audit rows, newest first.
@@ -2162,6 +2202,29 @@ pub(crate) mod tests {
             row: rows[3].clone(),
         });
         assert_eq!(s.audit.len(), 3);
-        assert_eq!(s.audit_newest_first()[0], &rows[3]);
+        // Named from the agent document this person holds.
+        let mut named = rows[3].clone();
+        named.subject_name = s
+            .agent_documents
+            .get(&named.subject.id)
+            .map(|d| d.name.clone());
+        assert_eq!(s.audit_newest_first()[0], &named);
+        // A live row comes without a name: the subject is named from the library held.
+        s.topics
+            .insert("t-live".into(), topic("t-live", None, "Live topic", 0));
+        let mut live = rows[0].clone();
+        live.at = Utc::now() + chrono::Duration::seconds(5);
+        live.subject.kind = "topic".into();
+        live.subject.id = "t-live".into();
+        live.subject_name = None;
+        s.apply(Event::AuditAppended { row: live.clone() });
+        assert_eq!(
+            s.audit_newest_first()[0].subject_name.as_deref(),
+            Some("Live topic")
+        );
+        // The same row fetched later with a joined name is not a second row.
+        live.subject_name = Some("Live topic".into());
+        s.extend_audit(vec![live]);
+        assert_eq!(s.audit.len(), 4);
     }
 }

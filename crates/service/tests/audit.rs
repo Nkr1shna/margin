@@ -269,7 +269,7 @@ async fn every_change_to_who_may_do_what_is_journaled_without_names() {
     assert_eq!(disabled.after["state"], "disabled");
     let device = find(
         &rows,
-        AuditKind::PersonChange,
+        AuditKind::DeviceRevoked,
         "device-bob",
         "device_revoked",
     );
@@ -459,7 +459,9 @@ async fn sign_ins_are_journaled_approved_and_denied() {
     let r = h.callback(OTHER_CODE, &Harness::state_param(&s)).await;
     assert_eq!(r.status(), 403);
 
-    let rows = audit_rows(&h, &owner, "?kind=person_change").await;
+    let rows = audit_rows(&h, &owner, "?kind=sign_in").await;
+    assert!(rows.iter().all(|r| r.kind == AuditKind::SignIn));
+    let people = audit_rows(&h, &owner, "?kind=person_change").await;
     let owner_row: PersonRow = h
         .state
         .store
@@ -469,12 +471,7 @@ async fn sign_ins_are_journaled_approved_and_denied() {
         .into_iter()
         .find(|p| p.person.org_role == OrgRole::Owner)
         .unwrap();
-    let signed = find(
-        &rows,
-        AuditKind::PersonChange,
-        &owner_row.person.id,
-        "sign_in",
-    );
+    let signed = find(&rows, AuditKind::SignIn, &owner_row.person.id, "sign_in");
     assert_eq!(signed.actor, format!("person/{}", owner_row.person.id));
     let bob_row = h
         .state
@@ -485,14 +482,27 @@ async fn sign_ins_are_journaled_approved_and_denied() {
         .into_iter()
         .find(|p| p.person.github_login == "bob-dev")
         .unwrap();
-    find(&rows, AuditKind::PersonChange, &bob_row.person.id, "joined");
     find(
-        &rows,
+        &people,
         AuditKind::PersonChange,
         &bob_row.person.id,
-        "sign_in",
+        "joined",
     );
-    let denied = find(&rows, AuditKind::PersonChange, "2", "sign_in_denied");
+    find(&rows, AuditKind::SignIn, &bob_row.person.id, "sign_in");
+    // Collecting the approved sign-in mints a device, named in its own row.
+    let minted = rows
+        .iter()
+        .find(|r| {
+            r.after["event"] == "device_signed_in"
+                && r.after["person_id"] == bob_row.person.id.as_str()
+        })
+        .expect("a device_signed_in row for bob");
+    assert_eq!(minted.subject.kind, "device");
+    assert_eq!(
+        minted.device_id.as_deref(),
+        Some(minted.subject.id.as_str())
+    );
+    let denied = find(&rows, AuditKind::SignIn, "2", "sign_in_denied");
     assert_eq!(denied.actor, "github/2");
     assert_eq!(denied.subject.kind, "github_account");
     assert_eq!(denied.after["reason"], "not_invited");

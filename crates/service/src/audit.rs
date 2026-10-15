@@ -13,10 +13,13 @@
 //! - `MembershipChange`: `PUT /api/people/{id}/groups`; an invitation accepted at
 //!   sign-in.
 //! - `GroupChange`: a group created, renamed or deleted.
-//! - `PersonChange`: a person's role or state (disable, enable); a sign-in approved or
-//!   denied (`after.event` `sign_in` / `sign_in_denied`); a device revoked
-//!   (`subject.kind` `device`, `after.event` `device_revoked`); an invitation created
+//! - `PersonChange`: a person's role or state (disable, enable); an invitation created
 //!   or revoked (`subject.kind` `invitation`).
+//! - `SignIn`: a sign-in approved or denied (`after.event` `sign_in` /
+//!   `sign_in_denied`, recorded at admission before a device exists), and the device
+//!   minted when the app collects an approved one (`device_signed_in`, `device_id` set).
+//! - `DeviceRevoked`: a device revoked (`subject.kind` `device`), by `DELETE
+//!   /api/devices/{id}` or with its person disabled (`after.reason`).
 //! - `AgentChange`: an agent created, its ceiling or `disabled` changed, deleted.
 //! - `AgentToken`: a token minted or revoked (its prefix only).
 //! - `Export`: `margin-service export` runs, read from `<data>/exports.log` at start.
@@ -220,7 +223,7 @@ pub fn audience_change(
 pub fn device_revoked(p: &Principal, device: &DeviceRow) -> AuditRow {
     by(
         p,
-        AuditKind::PersonChange,
+        AuditKind::DeviceRevoked,
         "device",
         &device.id,
         json!({"person_id": device.person_id}),

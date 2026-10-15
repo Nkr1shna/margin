@@ -495,22 +495,40 @@ impl Api {
     }
 
     /// Audit rows (admins), oldest first: `kind`, from `from` to `to` (the service's
-    /// defaults when `None`: now, and a day before it).
+    /// defaults when `None`: the start of time, and now).
     pub async fn audit(
         &self,
         kind: Option<AuditKind>,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> ApiResult<Vec<AuditRow>> {
+        self.audit_page(kind, from, to, None).await
+    }
+
+    /// The newest `limit` audit rows of the window (all of them when `None`), oldest
+    /// first. The Audit view pages back with `to` just before the oldest row it has.
+    pub async fn audit_page(
+        &self,
+        kind: Option<AuditKind>,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> ApiResult<Vec<AuditRow>> {
         let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
         if let Some(kind) = kind {
             query.push(("kind", kind.as_str().to_string()));
         }
         if let Some(from) = from {
-            query.push(("from", from.to_rfc3339()));
+            query.push((
+                "from",
+                from.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ));
         }
         if let Some(to) = to {
-            query.push(("to", to.to_rfc3339()));
+            query.push(("to", to.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)));
         }
         let response = self
             .send(self.request(Method::GET, routes::AUDIT).query(&query))

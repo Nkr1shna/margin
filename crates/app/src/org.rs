@@ -537,6 +537,8 @@ pub fn audit_kind_label(kind: AuditKind) -> &'static str {
         AuditKind::MembershipChange => "Groups changed",
         AuditKind::GroupChange => "Group changed",
         AuditKind::PersonChange => "Person changed",
+        AuditKind::SignIn => "Sign-in",
+        AuditKind::DeviceRevoked => "Device revoked",
         AuditKind::AgentChange => "Agent changed",
         AuditKind::AgentToken => "Agent token",
         AuditKind::Export => "Export",

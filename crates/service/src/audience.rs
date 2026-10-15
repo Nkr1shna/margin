@@ -15,7 +15,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
-use margin_shared::context::{AuditKind, AuditRow, AuditSubject, Document, LibraryKind, Origin};
+use margin_shared::context::{Document, LibraryKind, Origin};
 use margin_shared::{
     AGENT_PREFIX, Audience, AudienceUnit, AudienceView, Chat, Derived, Event, Id, Note,
     PERSON_PREFIX, PersonState, Source, Topic, Workspace, access_code, derive, is_group_path,
@@ -514,20 +514,7 @@ pub async fn set(
         };
         crate::audit::record(
             state,
-            AuditRow {
-                kind: AuditKind::AudienceChange,
-                at: Utc::now(),
-                actor: p.id.clone(),
-                on_behalf_of: None,
-                subject: AuditSubject {
-                    kind: unit.as_str().to_string(),
-                    id: id.to_string(),
-                },
-                before: serde_json::json!(change.before),
-                after: serde_json::json!(change.after),
-                device_id: p.device.as_ref().map(|d| d.id.clone()),
-                subject_name: None,
-            },
+            crate::audit::audience_change(p, unit, id, &change.before, &change.after),
         );
         change
     };

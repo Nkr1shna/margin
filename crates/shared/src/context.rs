@@ -302,8 +302,13 @@ pub enum AuditKind {
     MembershipChange,
     /// A group was created, renamed or deleted.
     GroupChange,
-    /// A person's role or state changed.
+    /// A person's role or state changed, or an invitation was created or revoked.
     PersonChange,
+    /// A GitHub sign-in approved or denied (`after.event` `sign_in` / `sign_in_denied`),
+    /// or a device minted for an approved one (`device_signed_in`, with its id).
+    SignIn,
+    /// A device was revoked (by its person or an admin, or with its person disabled).
+    DeviceRevoked,
     /// An agent's ceiling changed, or it was disabled or deleted.
     AgentChange,
     /// An agent token was minted or revoked (its prefix only).
@@ -313,11 +318,13 @@ pub enum AuditKind {
 }
 
 impl AuditKind {
-    pub const ALL: [AuditKind; 7] = [
+    pub const ALL: [AuditKind; 9] = [
         AuditKind::AudienceChange,
         AuditKind::MembershipChange,
         AuditKind::GroupChange,
         AuditKind::PersonChange,
+        AuditKind::SignIn,
+        AuditKind::DeviceRevoked,
         AuditKind::AgentChange,
         AuditKind::AgentToken,
         AuditKind::Export,
@@ -330,6 +337,8 @@ impl AuditKind {
             AuditKind::MembershipChange => "membership_change",
             AuditKind::GroupChange => "group_change",
             AuditKind::PersonChange => "person_change",
+            AuditKind::SignIn => "sign_in",
+            AuditKind::DeviceRevoked => "device_revoked",
             AuditKind::AgentChange => "agent_change",
             AuditKind::AgentToken => "agent_token",
             AuditKind::Export => "export",

@@ -94,7 +94,8 @@ async fn publishing_reaches_new_readers_and_revoking_drops_it_live() {
         other => panic!("{other:?}"),
     }
     assert!(bob_store.topics.contains_key("linalg"));
-    // Alice's gets the topic and the audit row, named for her.
+    // Alice's gets the topic and the audit row (as the service sends it, without a
+    // name: her store names it from the topic she holds).
     assert!(matches!(
         next_event(&mut alice_socket).await,
         Some(Event::TopicChanged { .. })
@@ -104,7 +105,14 @@ async fn publishing_reaches_new_readers_and_revoking_drops_it_live() {
             assert_eq!(row.kind, AuditKind::AudienceChange);
             assert_eq!(row.actor, "person/p-alice");
             assert_eq!(row.subject.id, "linalg");
-            assert_eq!(row.subject_name.as_deref(), Some("Linear Algebra"));
+            assert_eq!(row.subject_name, None);
+            let mut alice_store = LibraryState::from_library(alice.library().await.unwrap());
+            alice_store.replace_audit(Vec::new());
+            alice_store.apply(Event::AuditAppended { row: row.clone() });
+            assert_eq!(
+                alice_store.audit[0].subject_name.as_deref(),
+                Some("Linear Algebra")
+            );
             assert_eq!(
                 row.after["access"],
                 serde_json::json!(["person/p-alice", "company/engineering"])
@@ -183,6 +191,23 @@ async fn publishing_reaches_new_readers_and_revoking_drops_it_live() {
         .await
         .unwrap_err();
     assert_eq!((e.status, e.code.as_str()), (Some(400), "bad_range"));
+    // "Load more": the newest page, then the page before its oldest row, no repeats.
+    let all = alice.audit(None, None, None).await.unwrap();
+    assert!(all.len() >= 3, "{all:?}");
+    let newest = alice.audit_page(None, None, None, Some(2)).await.unwrap();
+    assert_eq!(newest, all[all.len() - 2..]);
+    let oldest = newest.iter().map(|r| r.at).min().unwrap();
+    let earlier = alice
+        .audit_page(None, None, Some(crate::ui::audit::before(oldest)), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(earlier, all[all.len() - 4.min(all.len())..all.len() - 2]);
+    let mut paged = LibraryState::default();
+    paged.replace_audit(newest);
+    paged.extend_audit(earlier.clone());
+    paged.extend_audit(earlier);
+    assert_eq!(paged.audit.len(), 4.min(all.len()));
+    assert!(paged.audit.windows(2).all(|w| w[0].at <= w[1].at));
 }
 
 #[tokio::test]

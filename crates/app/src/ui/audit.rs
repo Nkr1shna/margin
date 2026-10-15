@@ -1,6 +1,7 @@
 //! Settings → Organisation → Audit (L2, `docs/l2-brief.md` D7, D9): who changed who
-//! may read or do what, for admins. Filters by kind and day, "Load earlier" pages back a
-//! week at a time, and new rows arrive live (`Event::AuditAppended`). Members read why
+//! may read or do what, for admins. Filters by kind and day; without a day it shows the
+//! newest `PAGE` rows and "Load more" asks for the `PAGE` before the oldest it has
+//! (`limit`, `to` = that row's time less 1 ns); new rows arrive live (`Event::AuditAppended`). Members read why
 //! they don't see it. Exports have no control here: they run on the service host and
 //! show up as rows.
 
@@ -16,27 +17,23 @@ use crate::ui::common::{ErrorNotice, date};
 /// What a member reads instead of the log.
 pub const ADMINS_ONLY: &str = "Only an organisation admin reads the audit log.";
 
-/// How far back one page of the log goes when no day is picked.
-pub const WEEK: i64 = 7;
+/// Rows one page of the log holds when no day is picked.
+pub const PAGE: usize = 50;
 
-/// The range the view asks for: a picked day (local midnight to midnight), else the last
-/// `weeks` weeks up to `now`.
-pub fn audit_window(
-    day: Option<NaiveDate>,
-    weeks: i64,
-    now: DateTime<Utc>,
-) -> (DateTime<Utc>, DateTime<Utc>) {
-    match day {
-        Some(d) => {
-            let start = Local
-                .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())
-                .earliest()
-                .map(|t| t.with_timezone(&Utc))
-                .unwrap_or(now);
-            (start, start + Duration::days(1))
-        }
-        None => (now - Duration::days(WEEK * weeks.max(1)), now),
-    }
+/// A picked day's range: local midnight to midnight (`now` when the local time is
+/// ambiguous or skipped).
+pub fn day_window(d: NaiveDate, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = Local
+        .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(now);
+    (start, start + Duration::days(1))
+}
+
+/// The `to` of the page before `oldest`: just before it, so it isn't listed again.
+pub fn before(oldest: DateTime<Utc>) -> DateTime<Utc> {
+    oldest - Duration::nanoseconds(1)
 }
 
 /// The rows the view shows, newest first: of `kind` (or every kind), and on `day` when
@@ -69,22 +66,53 @@ pub fn AuditSection() -> Element {
     let admin = app.is_admin();
     let mut kind = use_signal(|| None::<AuditKind>);
     let mut day = use_signal(|| None::<NaiveDate>);
-    let mut weeks = use_signal(|| 1i64);
+    // Whether the last page was full (so an earlier one may exist), and a page loading.
+    let mut more = use_signal(|| false);
+    let mut paging = use_signal(|| false);
+    let mut page_error = use_signal(|| None::<String>);
     let mut load = use_resource(move || async move {
-        let (kind, day, weeks) = (*kind.read(), *day.read(), *weeks.read());
+        let (kind, day) = (*kind.read(), *day.read());
         if !app.is_admin() {
             return Ok(());
         }
         let api = app.api().ok_or_else(|| "Not signed in.".to_string())?;
-        let (from, to) = audit_window(day, weeks, Utc::now());
-        let rows = api
-            .audit(kind, Some(from), Some(to))
-            .await
-            .map_err(|e| app.failure(&e))?;
+        let rows = match day {
+            Some(d) => {
+                let (from, to) = day_window(d, Utc::now());
+                api.audit_page(kind, Some(from), Some(to), None).await
+            }
+            None => api.audit_page(kind, None, None, Some(PAGE)).await,
+        }
+        .map_err(|e| app.failure(&e))?;
+        more.set(day.is_none() && rows.len() >= PAGE);
+        page_error.set(None);
         let mut lib = app.lib;
         lib.write().replace_audit(rows);
         Ok::<(), String>(())
     });
+    let mut load_more = move || {
+        let Some(api) = app.api() else { return };
+        let Some(oldest) = app.lib.peek().oldest_audit() else {
+            return;
+        };
+        let kind = *kind.peek();
+        paging.set(true);
+        spawn(async move {
+            match api
+                .audit_page(kind, None, Some(before(oldest)), Some(PAGE))
+                .await
+            {
+                Ok(rows) => {
+                    more.set(rows.len() >= PAGE);
+                    page_error.set(None);
+                    let mut lib = app.lib;
+                    lib.write().extend_audit(rows);
+                }
+                Err(e) => page_error.set(Some(app.failure(&e))),
+            }
+            paging.set(false);
+        });
+    };
 
     if !admin {
         return rsx! {
@@ -101,8 +129,9 @@ pub fn AuditSection() -> Element {
     };
     let loading = load.read().is_none();
     let picked_day = *day.read();
-    let range = picked_day.map(|d| audit_window(Some(d), 1, Utc::now()));
-    let (from, _) = audit_window(None, *weeks.read(), Utc::now());
+    let range = picked_day.map(|d| day_window(d, Utc::now()));
+    let paging_now = *paging.read();
+    let page_failed = page_error.read().clone();
     let lib = app.lib.read();
     let dir = Directory::of(&lib);
     let loaded = lib.audit_loaded;
@@ -173,7 +202,7 @@ pub fn AuditSection() -> Element {
                 p { class: "faint",
                     match picked_day {
                         Some(d) => format!("Nothing changed on {}.", d.format("%b %-d, %Y")),
-                        None => format!("Nothing changed since {}.", date(&from)),
+                        None => "Nothing has changed yet.".to_string(),
                     }
                 }
             } else {
@@ -196,17 +225,17 @@ pub fn AuditSection() -> Element {
                     }
                 }
             }
-            if picked_day.is_none() {
+            if let Some(err) = page_failed {
+                ErrorNotice { message: err, on_retry: move |_| load_more() }
+            }
+            if picked_day.is_none() && *more.read() {
                 div { class: "row-actions",
                     button {
                         class: "btn btn-secondary btn-sm",
-                        disabled: loading,
-                        onclick: move |_| {
-                            let next = *weeks.peek() + 1;
-                            weeks.set(next);
-                        },
-                        if loading { span { class: "spinner" } }
-                        "Load earlier (before {date(&from)})"
+                        disabled: loading || paging_now,
+                        onclick: move |_| load_more(),
+                        if paging_now { span { class: "spinner" } }
+                        "Load more"
                     }
                 }
             }
@@ -254,7 +283,8 @@ mod tests {
         // Filters and paging.
         assert!(audit.contains("id=\"audit-kind\"") && audit.contains(">Every kind<"));
         assert!(audit.contains("type=\"date\""));
-        assert!(audit.contains("Load earlier (before "));
+        // The fake's few rows are one page: nothing earlier to load.
+        assert!(!audit.contains("Load more"));
     }
 
     #[test]
@@ -272,14 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_a_day_or_the_last_weeks() {
+    fn a_day_is_a_local_day_and_pages_go_back_from_the_oldest() {
         let now = Utc::now();
-        let (from, to) = audit_window(None, 2, now);
-        assert_eq!((to - from).num_days(), 14);
         let day = NaiveDate::from_ymd_opt(2026, 10, 14).unwrap();
-        let (from, to) = audit_window(Some(day), 1, now);
+        let (from, to) = day_window(day, now);
         assert_eq!((to - from).num_hours(), 24);
         assert_eq!(from.with_timezone(&Local).date_naive(), day);
+        assert_eq!(now - before(now), Duration::nanoseconds(1));
         let rows = crate::fake::sample_audit(now);
         let all: Vec<&AuditRow> = rows.iter().collect();
         assert_eq!(shown_rows(&all, None, None).len(), 4);

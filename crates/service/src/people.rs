@@ -513,7 +513,7 @@ fn record_sign_in(
     audit::record(
         state,
         audit::row(
-            AuditKind::PersonChange,
+            AuditKind::SignIn,
             actor,
             subject_kind,
             &subject_id,
