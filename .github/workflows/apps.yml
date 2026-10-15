@@ -146,14 +146,12 @@ jobs:
           codesign --force --deep --sign - "$app"
           mkdir -p dist
           # The disk image holds the app and a link to /Applications, so installing is a
-          # drag from one to the other.
-          stage="$RUNNER_TEMP/dmg-${{ matrix.environment }}"
-          rm -rf "$stage" && mkdir -p "$stage"
-          ditto "$app" "$stage/$(basename "$app")"
-          ln -s /Applications "$stage/Applications"
-          hdiutil create -volname "$MARGIN_APP_NAME" -srcfolder "$stage" -ov -format UDZO \
+          # drag from one to the other, in a styled window (deploy/dmg: background, icon
+          # positions, no toolbar). dmgbuild writes the window's .DS_Store directly, so it
+          # needs no Finder session on the runner.
+          command -v uvx >/dev/null || { echo "::error::uvx not on PATH (brew install uv); it runs dmgbuild"; exit 1; }
+          uvx dmgbuild==1.6.7 -s deploy/dmg/settings.py -D app="$app" "$MARGIN_APP_NAME" \
             "dist/Margin-${{ matrix.environment }}-${SHA::12}.dmg"
-          rm -rf "$stage"
       - name: Android build
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
