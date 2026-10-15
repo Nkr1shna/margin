@@ -177,10 +177,11 @@ impl AppCtx {
             .and_then(|m| m.person.clone())
     }
 
-    /// Whether the signed-in person is an organisation admin (or the owner). Before the
-    /// person is known (or from a service before L1) the controls show as they always did.
+    /// Whether the signed-in person is an organisation admin (or the owner). Until `me`
+    /// has loaded nobody is: a member never sees an admin's controls (or offers the
+    /// service would refuse), and an admin's appear once their role is known.
     pub fn is_admin(&self) -> bool {
-        self.person().is_none_or(|p| p.org_role.is_admin())
+        self.person().is_some_and(|p| p.org_role.is_admin())
     }
 
     /// Change the signed-in person as the session holds them (their own row came back
@@ -247,5 +248,32 @@ impl AppCtx {
         let result = config::save(&next);
         this.config.set(next);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_signed_out_reason_is_the_services_sentence_when_it_gave_one() {
+        // The service still answers 401 `person_disabled` with the sentence in the moment
+        // before a disabled person's devices are deleted (D10).
+        let disabled = ApiFailure {
+            status: Some(401),
+            code: margin_shared::access_code::PERSON_DISABLED.into(),
+            message: "The GitHub account @bob is disabled on this Margin. Ask an admin.".into(),
+        };
+        assert!(signed_out_reason(&disabled).contains("@bob is disabled"));
+        // Once the device is gone it's a plain 401: signed out, no reason given.
+        let gone = ApiFailure {
+            status: Some(401),
+            code: "unauthorized".into(),
+            message: "Sign in again: this device isn't signed in.".into(),
+        };
+        assert_eq!(
+            signed_out_reason(&gone),
+            "This device was signed out by the service. Sign in again."
+        );
     }
 }

@@ -538,14 +538,11 @@ fn follow_me(ctx: AppCtx, event: &Event) {
         .map(|p| p.id.clone());
     let Some(me) = me else { return };
     match event {
-        Event::PersonChanged { person } if person.id == me => ctx.update_person(|p| {
-            // Events don't carry anyone's own settings.
-            let settings = p.settings.clone();
-            *p = person.clone();
-            if p.settings == margin_shared::PersonSettings::default() {
-                p.settings = settings;
-            }
-        }),
+        // Events don't carry anyone's own settings: they're fetched again, so a change
+        // (or a reset) made on another device shows here.
+        Event::PersonChanged { person } if person.id == me => {
+            ui::organisation::follow_own_person(ctx, person.clone())
+        }
         Event::MembershipChanged { person_id, groups } if *person_id == me => {
             ctx.update_person(|p| p.groups = groups.clone())
         }

@@ -126,7 +126,7 @@ pub fn require_token(store: &dyn TokenStore, url: &str) -> anyhow::Result<String
     stored_token(store, url)?.map(|(t, _)| t).ok_or_else(|| {
         anyhow!(
             "not signed in to {url}: create an agent in Margin's Settings → Organisation → Agents, \
-             mint its token and run `margin-mcp token <token>` (or `margin-mcp login` for a device sign-in)"
+             mint its token and run `margin-mcp token -` and paste it (or `margin-mcp login` for a device sign-in)"
         )
     })
 }

@@ -289,7 +289,7 @@ async fn checked(resp: reqwest::Result<Response>, agent: bool) -> Result<Respons
         format!(
             "{message} (the agent token was revoked or rotated, or the agent or its owner is \
              disabled: mint a new token in Settings → Organisation → Agents and run \
-             `margin-mcp token <token>`, or `margin-mcp token --forget` to use \
+             `margin-mcp token -` and paste it, or `margin-mcp token --forget` to use \
              `margin-mcp login` instead)"
         )
     } else if status == StatusCode::UNAUTHORIZED {

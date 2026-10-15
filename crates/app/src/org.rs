@@ -252,9 +252,24 @@ pub fn is_pending(invitation: &Invitation, now: DateTime<Utc>) -> bool {
     invitation.accepted_at.is_none() && invitation.expires_at > now
 }
 
-/// The command that gives `margin-mcp` an agent token.
-pub fn token_command(token: &str, service_url: &str) -> String {
-    format!("margin-mcp token {token} --url {service_url}")
+/// The signed-in person's row after `incoming` (an event, or an answer that may leave out
+/// their settings) arrived, and whether their settings must be fetched
+/// (`GET /api/me/settings`). Events never carry anyone's settings, so a row with the
+/// default settings can't tell "reset on another device" from "not included": it keeps
+/// the known settings for now and asks for them.
+pub fn merge_own_person(known: &Person, incoming: Person) -> (Person, bool) {
+    let mut person = incoming;
+    let unknown = person.settings == margin_shared::PersonSettings::default();
+    if unknown {
+        person.settings = known.settings.clone();
+    }
+    (person, unknown)
+}
+
+/// The command that gives `margin-mcp` an agent token: it reads the token from stdin
+/// (pasted when it asks), so the token stays out of the shell history.
+pub fn token_command(service_url: &str) -> String {
+    format!("margin-mcp token - --url {service_url}")
 }
 
 #[cfg(test)]
@@ -287,6 +302,26 @@ mod tests {
             members,
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn own_settings_are_fetched_when_a_row_cant_say() {
+        let mut known = person("alice", &[]);
+        known.settings.reasoning_effort = Some(margin_shared::ReasoningEffort::High);
+        // An event (never with settings): the known ones stay for now, and are fetched,
+        // since another device may have reset them.
+        let mut event = person("alice", &[]);
+        event.name = "Alice M.".into();
+        let (merged, fetch) = merge_own_person(&known, event);
+        assert_eq!(merged.name, "Alice M.");
+        assert_eq!(merged.settings, known.settings);
+        assert!(fetch);
+        // An answer with the settings: taken as they are.
+        let mut answer = person("alice", &[]);
+        answer.settings.reasoning_effort = Some(margin_shared::ReasoningEffort::Low);
+        let (merged, fetch) = merge_own_person(&known, answer.clone());
+        assert_eq!(merged.settings, answer.settings);
+        assert!(!fetch);
     }
 
     #[test]
@@ -404,8 +439,8 @@ mod tests {
         assert!(!is_pending(&pending, later));
         assert_eq!(invitation_problem("carol-dev", &people, &invs, later), None);
         assert_eq!(
-            token_command("mga_x", "https://m.example"),
-            "margin-mcp token mga_x --url https://m.example"
+            token_command("https://m.example"),
+            "margin-mcp token - --url https://m.example"
         );
     }
 }
