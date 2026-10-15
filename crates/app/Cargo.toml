@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 margin-shared.workspace = true
-dioxus = { version = "=0.7.9", features = ["router"] }
+dioxus = { version = "=0.7.10", features = ["router"] }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -23,7 +23,7 @@ gethostname = "=1.1.0"
 keyring-core = "=1.0.1"
 dirs = "=7.0.0"
 # Folders (phase 4): `find_files` globs and handle bookmarks stored as base64.
-globset = "=0.4.18"
+globset = "=0.4.20"
 base64 = "=0.23.1"
 # Folder file stamps.
 sha2.workspace = true
@@ -75,7 +75,7 @@ dispatch2 = { version = "=0.3.1", default-features = false, features = ["std", "
 
 [dev-dependencies]
 axum = { version = "=0.8.9", features = ["ws"] }
-dioxus-ssr = "=0.7.9"
+dioxus-ssr = "=0.7.10"
 tokio = { version = "1", features = ["full"] }
 
 [features]
