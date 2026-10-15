@@ -51,10 +51,9 @@ read -r answer
 [ "$answer" = restore ] || die "nothing changed"
 
 guest_ssh dev "test -f '$MARGIN_PERSIST_GUEST/$MARGIN_MARKER'" || die "dev's share isn't mounted in margin-dev"
-plist="\$HOME/Library/LaunchAgents/$MARGIN_SERVICE_LABEL.plist"
 cfg="$MARGIN_PERSIST_GUEST/service.toml"
-guest_ssh dev "launchctl bootout gui/\$(id -u)/$MARGIN_SERVICE_LABEL 2>/dev/null; sleep 3; MARGIN_CONFIG='$cfg' /bin/sh '$MARGIN_PERSIST_GUEST/bin/backup-margin.sh' --label pre-restore" \
-  || die "dev's pre-restore backup failed; dev was left stopped: start it with launchctl bootstrap gui/\$(id -u) $plist in the guest"
+guest_ssh dev "sudo systemctl stop $MARGIN_SERVICE_UNIT.service; MARGIN_CONFIG='$cfg' /bin/sh '$MARGIN_PERSIST_GUEST/bin/backup-margin.sh' --label pre-restore" \
+  || die "dev's pre-restore backup failed; dev was left stopped: sudo systemctl start $MARGIN_SERVICE_UNIT in the guest"
 
 stamp="$(date +%Y%m%d-%H%M%S)"
 rm -rf "$dev_dir/data.restoring"
@@ -63,11 +62,11 @@ ditto "$src" "$dev_dir/data.restoring"
 mv "$dev_dir/data.restoring" "$dev_dir/data"
 echo "Copied. Dev's previous data is in $dev_dir/data.before-restore-$stamp."
 
-guest_ssh dev "MARGIN_CONFIG='$cfg' '$MARGIN_PERSIST_GUEST/bin/margin-service' scrub-restored && launchctl bootstrap gui/\$(id -u) $plist"
+guest_ssh dev "MARGIN_CONFIG='$cfg' '$MARGIN_PERSIST_GUEST/bin/margin-service' scrub-restored && sudo systemctl start $MARGIN_SERVICE_UNIT.service"
 i=0
 until guest_ssh dev "curl -fsS -m 2 http://127.0.0.1:8787/health" >/dev/null 2>&1; do
   i=$((i + 1))
-  [ "$i" -le 60 ] || die "dev didn't answer /health after the restore; see ~/Library/Logs/Margin/service.log in the guest"
+  [ "$i" -le 60 ] || die "dev didn't answer /health after the restore; see journalctl -u margin-service in the guest"
   sleep 3
 done
 echo "Dev runs on prod's $name. Sign in to Dev from the app again."

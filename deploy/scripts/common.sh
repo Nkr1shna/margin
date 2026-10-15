@@ -6,17 +6,21 @@
 # disk is scratch; this folder is not.
 #
 #   host:  $MARGIN_VMS_DIR/margin-<env>          (default ~/MarginVMs/margin-<env>)
-#   guest: /Volumes/My Shared Files/margin       (macOS automount of the share "margin")
+#   guest: /mnt/shared/margin                    (the virtiofs share "margin", mounted by
+#                                                 the Orchard startup script)
 #
-# Inside it: .margin-persistent (marker, holds "margin-<env>"), service.toml, data/,
-# backups/, bin/ (margin-service, these scripts), cloudflared/. Logs stay on the guest
-# disk (~/Library/Logs/Margin), so launchd can open them before the share mounts.
+# Inside it: .margin-persistent (marker, holds "margin-<env>"), service.toml,
+# secrets.toml, data/, backups/, bin/ (margin-service, these scripts), cloudflared/,
+# templates/. The guests are Ubuntu 24.04 (deploy/image) running systemd units
+# (deploy/systemd); logs go to the journal (journalctl -u margin-service).
 
 # Not `set -u` safe to source twice; scripts set their own options.
 
-MARGIN_SERVICE_LABEL="com.krishnanelloore.margin.service"
-MARGIN_BACKUP_LABEL="com.krishnanelloore.margin.backup"
-MARGIN_PERSIST_GUEST="${MARGIN_PERSIST_GUEST:-/Volumes/My Shared Files/margin}"
+MARGIN_SERVICE_UNIT="margin-service"
+MARGIN_TUNNEL_UNIT="margin-cloudflared"
+MARGIN_BACKUP_UNIT="margin-backup"
+MARGIN_SHARE_MOUNT="${MARGIN_SHARE_MOUNT:-/mnt/shared}"
+MARGIN_PERSIST_GUEST="${MARGIN_PERSIST_GUEST:-$MARGIN_SHARE_MOUNT/margin}"
 MARGIN_VMS_DIR="${MARGIN_VMS_DIR:-$HOME/MarginVMs}"
 MARGIN_DEPLOY_KEY="${MARGIN_DEPLOY_KEY:-$HOME/.ssh/margin_deploy}"
 MARGIN_KNOWN_HOSTS="${MARGIN_KNOWN_HOSTS:-$HOME/.ssh/margin_known_hosts}"
@@ -89,25 +93,19 @@ toml_value() {
   sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*\$/\1/p" "$1" | head -n 1
 }
 
-# One field of a flat JSON object on stdin (macOS plutil reads JSON).
+# One field of a flat JSON object on stdin (jq in the guests, plutil on the Mac).
 json_field() {
-  plutil -extract "$1" raw -o - - 2>/dev/null
-}
-
-# Which service manager this machine has. Linux guests (docs/plan-linux-service.md)
-# would use systemd; that path isn't built.
-service_manager() {
-  case "$(uname -s)" in
-    Darwin) echo launchd ;;
-    Linux) echo systemd ;;
-    *) echo unknown ;;
-  esac
-}
-
-require_launchd() {
-  if [ "$(service_manager)" != launchd ]; then
-    die "this guest is $(uname -s): only macOS guests (launchd) are supported; Linux service guests are docs/plan-linux-service.md"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+  else
+    plutil -extract "$1" raw -o - - 2>/dev/null
   fi
+}
+
+# In the guest: the service manager is systemd (the Linux guests).
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] \
+    || die "this guest has no systemd: the deploy scripts expect the Ubuntu guest image (deploy/image)"
 }
 
 # In the guest: the folder is the share, mounted, and belongs to this environment.
@@ -120,10 +118,8 @@ check_persistent_mount() {
   want="$(vm_name "$env_name")"
   got="$(cat "$dir/$MARGIN_MARKER")"
   [ "$got" = "$want" ] || die "$dir belongs to $got, not $want: the wrong host folder is shared into this VM"
-  # A share is another file system than the guest's root disk.
-  if [ "$(stat -f %d "$dir")" = "$(stat -f %d /)" ]; then
-    die "$dir is on the guest's own disk, which Orchard recreates: refusing"
-  fi
+  # The share is mounted, i.e. not a folder on the guest's own disk.
+  mountpoint -q "$MARGIN_SHARE_MOUNT" || die "$MARGIN_SHARE_MOUNT isn't mounted: $dir would be on the guest's own disk, which Orchard recreates: refusing"
 }
 
 # In the guest: the service config lives on the share, names this environment and keeps
@@ -131,7 +127,7 @@ check_persistent_mount() {
 check_config() {
   env_name="$1"
   config="$MARGIN_PERSIST_GUEST/service.toml"
-  [ -f "$config" ] || die "no $config yet: run \`margin-service setup\` in the VM's window (MARGIN_CONFIG=\"$config\")"
+  [ -f "$config" ] || die "no $config yet: run provision-guest.sh $env_name on the host"
   got_env="$(toml_value "$config" environment)"
   [ "${got_env:-prod}" = "$env_name" ] || die "$config says environment \"${got_env:-prod}\", not \"$env_name\""
   data_dir="$(toml_value "$config" data_dir)"
