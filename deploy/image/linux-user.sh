@@ -11,7 +11,9 @@ curl -fsSL -o "$tmp/rustup-init.sha256" "$base/rustup-init.sha256"
 [ "$(sha256sum "$tmp/rustup-init" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$tmp/rustup-init.sha256")" ] \
   || { echo "rustup-init checksum mismatch" >&2; exit 1; }
 chmod +x "$tmp/rustup-init"
-"$tmp/rustup-init" -y --profile minimal --default-toolchain stable -c clippy -c rustfmt
+# The toolchain rust-toolchain.toml pins (RUST_TOOLCHAIN from the Packer template), so
+# fresh clones don't download it again.
+"$tmp/rustup-init" -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN:-stable}" -c clippy -c rustfmt
 . "$HOME/.cargo/env"
 rustc --version
 cargo --version

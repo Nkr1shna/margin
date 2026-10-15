@@ -21,16 +21,20 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
     steps:
       - name: Cancel the PR's unfinished CI runs
         run: |
-          ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&per_page=100" \
-            --jq "[.workflow_runs[] | select(.status != \"completed\") | select(any(.pull_requests[]?; .number == $PR)) | .id] | .[]")"
+          # By the PR's branch: GitHub drops a run's link to its PR once the PR is merged,
+          # so matching on the PR number finds nothing at exactly this moment.
+          ids="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f event=pull_request -f branch="$BRANCH" -f per_page=100 \
+            --jq '[.workflow_runs[] | select(.status != "completed") | .id] | .[]')"
           if [ -z "$ids" ]; then
-            echo "No unfinished CI for PR #$PR."
+            echo "No unfinished CI for PR #$PR ($BRANCH)."
             exit 0
           fi
           for id in $ids; do
-            echo "Cancelling run $id (PR #$PR)."
+            echo "Cancelling run $id (PR #$PR, $BRANCH)."
             gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null || true
           done
