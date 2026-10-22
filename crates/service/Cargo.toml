@@ -41,7 +41,7 @@ toml = "=1.1.8"
 base64 = "=0.23.1"
 hex = "=0.4.3"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.3"
 ulid = "=3.0.0"
 # The ChatGPT sign-in's id_token check (RS256 against the auth server's JWKS): the
 # version and crypto backend surrealdb already builds.

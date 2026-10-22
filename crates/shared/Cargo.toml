@@ -8,7 +8,7 @@ publish.workspace = true
 serde.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-unicode-normalization = "=0.1.25"
+unicode-normalization = "=0.1.26"
 unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
