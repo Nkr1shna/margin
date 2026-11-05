@@ -31,4 +31,4 @@ base64 = "=0.23.1"
 axum = "=0.8.9"
 # The gate pins HNSW's level seed (`set_default_hnsw_build_seed`); the version SurrealDB
 # already builds.
-surrealdb-cnf = "=3.3.4"
+surrealdb-cnf = "=3.3.5"
