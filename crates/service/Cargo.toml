@@ -28,7 +28,7 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 reqwest = { workspace = true, features = ["form", "query"] }
-globset = "=0.4.20"
+globset = "=0.4.21"
 futures-util.workspace = true
 axum = { version = "=0.8.9", features = ["ws"] }
 surrealdb = { version = "=3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
@@ -37,11 +37,11 @@ tower = { version = "=0.5.3", features = ["util"] }
 hmac = "=0.13.0"
 sha2 = { workspace = true }
 rand = "=0.10.3"
-toml = "=1.1.8"
+toml = "=1.2.0"
 base64 = "=0.23.1"
 hex = "=0.4.3"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.4"
 ulid = "=3.0.0"
 # The ChatGPT sign-in's id_token check (RS256 against the auth server's JWKS): the
 # version and crypto backend surrealdb already builds.
