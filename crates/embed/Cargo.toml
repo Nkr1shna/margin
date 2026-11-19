@@ -21,8 +21,8 @@ sha2.workspace = true
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "half", "tracing", "download-binaries", "copy-dylibs", "tls-rustls", "api-31"] }
 half = "=2.7.1"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
-realfft = "=3.5.0"
-pdfium-render = "=0.9.4"
+realfft = "=3.5.1"
+pdfium-render = "=0.9.5"
 image = "=0.25.10"
 parakeet-rs = { version = "=0.4.1", default-features = false, features = ["cpu", "api-28"] }
 
